@@ -3794,6 +3794,98 @@ test.describe("the phone's field above a keyboard the platform panned the page f
   }
 
   /**
+   * How many animation frames in a row nothing about the field's layout may change before the page
+   * has finished answering a keyboard. It counts frames and not time: what a frame costs is the
+   * machine's answer, and a page that answers in steps needs frames to take them.
+   */
+  const STEADY_FRAMES = 10
+
+  /**
+   * What the person sees of the field once the page has finished answering the keyboard, and what is
+   * wrong with it while it has not.
+   *
+   * The page answers a keyboard in steps. It places the field at once, and what that moves is worked
+   * out again in the frames after, until nothing has changed for a moment: the field can rest on the
+   * keyboard's edge, whole, in the first reading, then be above the edge and cut by the box around
+   * it in the next frame, and under the keyboard in the one after. A reading taken between steps
+   * says which step it caught, and two readings taken one after the other can each catch another. So
+   * the rest and the view of the field are read from one frame, and only once the layout has not
+   * moved through `STEADY_FRAMES` frames in a row; a field that is not whole or does not rest by
+   * then is said in words, and the wait for it is bounded as the other layout waits are.
+   */
+  async function settledField(page: Page, onTheEdge: boolean, state = 'the keyboard'): Promise<void> {
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            ([steadyFrames, mustRestOnTheEdge]) =>
+              new Promise<string>((resolve) => {
+                let key = ''
+                let steady = 0
+                let frames = 0
+                const look = () => {
+                  const field = document.querySelector('textarea[id^="composer-"]')
+                  const shell = document.querySelector('.m-shell')
+                  if (field === null || shell === null) return { said: 'no field', key: 'none' }
+                  const box = field.getBoundingClientRect()
+                  const shellBox = shell.getBoundingClientRect()
+                  const covered =
+                    parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
+                  // How far the field runs outside what a person sees of it: outside any box around
+                  // it that clips what it holds, as `hiddenPart` reads it.
+                  let top = 0
+                  let bottom = window.innerHeight
+                  const areas: number[] = []
+                  for (let around = field.parentElement; around !== null; around = around.parentElement) {
+                    const style = getComputedStyle(around)
+                    if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
+                    const clip = around.getBoundingClientRect()
+                    top = Math.max(top, clip.top)
+                    bottom = Math.min(bottom, clip.bottom)
+                    areas.push(clip.top, clip.bottom, around.scrollTop)
+                  }
+                  const hidden = Math.max(0, top - box.top) + Math.max(0, box.bottom - bottom)
+                  const off = Math.round(box.bottom - (shellBox.bottom - covered))
+                  // Under the terminal the field is the foot of the session and rests on the
+                  // keyboard's edge. Under the conversation, in a session that fits whole, the
+                  // pickers lie under the field and it is above the edge by their height, as it
+                  // always was.
+                  const rests = mustRestOnTheEdge ? Math.abs(off) <= 1 : off <= 1
+                  const said = !rests
+                    ? off > 0
+                      ? `${off} px under the keyboard`
+                      : `${-off} px above the keyboard`
+                    : hidden > 1
+                      ? `${Math.round(hidden * 10) / 10} px of the field is clipped`
+                      : box.bottom <= shellBox.top
+                        ? 'the field is above the top of what the person sees'
+                        : 'where it rests'
+                  const moved = [box.top, box.bottom, shellBox.top, shellBox.bottom, covered, ...areas]
+                  return { said, key: moved.map((value) => Math.round(value * 10) / 10).join(',') }
+                }
+                const step = () => {
+                  const now = look()
+                  steady = now.key === key ? steady + 1 : 1
+                  key = now.key
+                  if (steady >= steadyFrames) return resolve(now.said === 'where it rests' ? 'settled' : now.said)
+                  frames += 1
+                  // A page still moving after a good many frames is looked at again by the wait.
+                  if (frames >= 600) return resolve(`still moving: ${now.said}`)
+                  requestAnimationFrame(step)
+                }
+                requestAnimationFrame(step)
+              }),
+            [STEADY_FRAMES, onTheEdge] as const
+          ),
+        {
+          timeout: PRESENTATION_DEADLINE,
+          message: `the field rests where it should, whole in view, once the layout is steady under ${state}`
+        }
+      )
+      .toBe('settled')
+  }
+
+  /**
    * Replaces the visual viewport with one the test moves, as a platform does: a keyboard takes
    * `covered` pixels of the height and the page is panned `panned` pixels, and the page measures
    * both from it, as it does from a real one.
@@ -3848,34 +3940,13 @@ test.describe("the phone's field above a keyboard the platform panned the page f
           await field.focus()
           await move(keyboard, pan)
           // What the person sees: from the top of the visual viewport, which the shell goes with, to
-          // where the keyboard begins at the shell's foot.
-          const where = () =>
-            page.evaluate(() => {
-              const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
-              const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
-              const covered = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
-              return box && shell
-                ? { top: box.top - shell.top, bottom: box.bottom, visibleBottom: shell.bottom - covered, shellTop: shell.top }
-                : null
-            })
-          await expect
-            .poll(async () => {
-              const at = await where()
-              if (at === null) return 'no field'
-              const off = Math.round(at.bottom - at.visibleBottom)
-              // Under the terminal the field is the foot of the session and rests on the keyboard's
-              // edge. Under the conversation, in a session that fits whole, the pickers lie under the
-              // field and it is above the keyboard by their height, as it always was; in one that does
-              // not, the session is scrolled until the composer's field is on the keyboard's edge.
-              const rests = pane === 'terminal' || !each.fits ? Math.abs(off) <= 1 : off <= 1
-              return rests ? 'where it rests' : off > 0 ? `${off} px under the keyboard` : `${-off} px above the keyboard`
-            })
-            .toBe('where it rests')
-          const at = await where()
-          expect(at?.bottom, 'the field is not above the top of what the person sees').toBeGreaterThan(at?.shellTop ?? 0)
-          // Whole in view: no box around it (the composer's own scrolling area, the session's, the
-          // shell) clips any of it, which its rectangle alone does not say.
-          expect(await hiddenPart(field), 'no part of the field is clipped').toBeLessThanOrEqual(1)
+          // where the keyboard begins at the shell's foot. Under the terminal the field is the foot of
+          // the session and rests on the keyboard's edge; under the conversation, in a session that
+          // fits whole, the pickers lie under the field and it is above the edge by their height; in
+          // one that does not, the session is scrolled until the composer's field is on the edge.
+          // Whole in view means no box around it (the composer's own scrolling area, the session's,
+          // the shell) clips any of it, which its rectangle alone does not say.
+          await settledField(page, pane === 'terminal' || !each.fits)
         })
       }
     }
@@ -3891,13 +3962,6 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
       const field = page.locator('textarea[id^="composer-"]')
       await field.focus()
-      const off = () =>
-        page.evaluate(() => {
-          const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
-          const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
-          const covered = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
-          return box && shell ? Math.round(box.bottom - (shell.bottom - covered)) : null
-        })
       const scrolled = () => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
       const before = await settledScroll(page)
       // A keyboard first as tall as it is while it announces itself, with the page panned, and then
@@ -3905,8 +3969,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       // it by what the first state needed.
       for (const [covered, panned] of [[399, 297], [259, 0], [312, 241], [259, 227]] as const) {
         await move(covered, panned)
-        await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeLessThanOrEqual(1)
-        await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeGreaterThanOrEqual(-1)
+        await settledField(page, true, `a keyboard of ${covered}px, panned ${panned}px`)
       }
       await field.blur()
       await move(0, 0)
@@ -3928,18 +3991,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       await move(399, 297)
       await expect.poll(() => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? 0)).toBeGreaterThan(0)
       await move(48, 0)
-      await expect
-        .poll(() => hiddenPart(field), { message: 'no part of the field is clipped' })
-        .toBeLessThanOrEqual(1)
-      await expect
-        .poll(() =>
-          page.evaluate(() => {
-            const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
-            const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
-            return box && shell ? Math.round(box.bottom - (shell.bottom - 48)) : null
-          })
-        )
-        .toBeLessThanOrEqual(1)
+      await settledField(page, false, 'a keyboard of 48px')
     })
 
     test(`leaves the shell's scrolling area where it was when the person leaves the session with the keyboard up, on ${surface}`, async ({
@@ -3957,7 +4009,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       await move(399, 297)
       await expect.poll(scrolled, { message: 'the session scrolled to its field' }).toBeGreaterThan(before)
       // Let the session settle on its field, so what is put back is the whole of what it did.
-      await page.waitForTimeout(400)
+      await settledField(page, true, 'a keyboard of 399px, panned 297px')
       // Away from the session while the keyboard is still up: what the destination opens on is not
       // scrolled by what the session did. The tab bar is under the keyboard, so the tab is pressed
       // as a pointer would press it, not scrolled to.
