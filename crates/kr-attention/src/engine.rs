@@ -157,10 +157,12 @@ pub struct Item {
     /// host said what it was.
     ///
     /// It follows the decision time everywhere that does: it is set with it, kept when quiet hours
-    /// release the decision and when a replay finds the condition again. A host that restricts what
-    /// it sends while privacy mode is on reads it to tell what was decided while the mode was on
-    /// from what was decided after, whatever either clock says. `None` is an item decided about
-    /// before the host said, or by a caller that never did; the time is all such an item has.
+    /// release the decision, when a replay finds the condition again and when quiet hours hold a
+    /// later decision over one that has not been taken yet. A host that restricts what it sends
+    /// while privacy mode is on reads it to tell what was decided while the mode was on from what
+    /// was decided after, and a decision of one privacy generation from one of another, whatever
+    /// either clock says. `None` is an item decided about before the host said, or by a caller
+    /// that never did; the time is all such an item has.
     pub decided_privacy: Option<PrivacyStamp>,
     /// Where this item's age is measured from, on the clock that can measure one.
     ///
@@ -1581,23 +1583,20 @@ impl Engine {
         // inside quiet hours is deferred once rather than re-decided on every tick.
         item.since_notified = Some(Elapsed::starting(reading));
         item.last_notified_ms = Some(reading.wall_ms);
-        // The time and the privacy state of the decision a consumer will be handed. A release is
-        // the end of a decision already made, not a new one, so it keeps what that decision
-        // recorded, and an item whose store recorded no time for it stays without one: the
-        // consumer then has to treat it as possibly decided while privacy mode was on, and a
-        // release must not date it by itself. A decision that quiet hours hold back, while an
-        // earlier one has not been taken yet, leaves that one's time alone: the earlier decision is
-        // the one the consumer will be handed, and dating it by the later one could make it look
-        // newer than it is. The cost is that the held decision, when it is released, is dated by
-        // the earlier one.
+        // The time and the privacy state of the decision a consumer will be handed, which are
+        // kept together. A release is the end of a decision already made, not a new one, so it
+        // keeps what that decision recorded, and an item whose store recorded no time for it stays
+        // without one: the consumer then has to treat it as possibly decided while privacy mode
+        // was on, and a release must not date it by itself. A decision that quiet hours hold back,
+        // while an earlier one has not been taken yet, leaves that one's time and state alone: the
+        // earlier decision is the one the consumer will be handed, and dating or stamping it by
+        // the later one could make it look newer than it is, or make a decision of one privacy
+        // generation look as if it were made in another. The cost is that the held decision, when
+        // it is released, is dated and stamped by the earlier one, and a consumer that produces
+        // only under the generation in force drops both when that generation has moved on.
         let held_over_an_untaken_one = quiet && item.pending_handoff.is_some();
         if !released && !held_over_an_untaken_one {
             item.decided_at_ms = Some(reading.wall_ms);
-            item.decided_privacy = reading.privacy;
-        } else if held_over_an_untaken_one && reading.privacy.is_some_and(|stamp| stamp.private) {
-            // The held decision is made while privacy mode is on, whatever the untaken one before it
-            // was decided under, and it is never sent once the mode is off: its state wins over the
-            // earlier one's, which would otherwise carry it past the lift when the hours end.
             item.decided_privacy = reading.privacy;
         }
         item.announced_anchor = Some(reading.anchor());
