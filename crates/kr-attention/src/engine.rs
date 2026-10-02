@@ -68,7 +68,7 @@ use crate::event::{EventCursor, EventKind, Origin, SourceEvent, numbers_every_re
 use crate::rule::rule;
 use crate::scope::Viewer;
 use crate::subject::Subject;
-use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE};
+use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE, PrivacyStamp};
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
 pub const MAX_GAPS: usize = 64;
@@ -152,6 +152,15 @@ pub struct Item {
     /// that was decided about before this was kept carries [`Item::last_notified_ms`] here, the
     /// best time its store has for it.
     pub decided_at_ms: Option<TimestampMs>,
+    /// The privacy state the announcement [`Item::decided_at_ms`] dates was decided under, when the
+    /// host said what it was.
+    ///
+    /// It follows the decision time everywhere that does: it is set with it, kept when quiet hours
+    /// release the decision and when a replay finds the condition again. A host that restricts what
+    /// it sends while privacy mode is on reads it to tell what was decided while the mode was on
+    /// from what was decided after, whatever either clock says. `None` is an item decided about
+    /// before the host said, or by a caller that never did; the time is all such an item has.
+    pub decided_privacy: Option<PrivacyStamp>,
     /// Where this item's age is measured from, on the clock that can measure one.
     ///
     /// [`Item::first_seen_ms`] says when the condition was first seen, for a person reading the
@@ -1471,6 +1480,7 @@ impl Engine {
             anchor,
             last_notified_ms: None,
             decided_at_ms: None,
+            decided_privacy: None,
             announced_anchor: None,
             announced_level: None,
             announcements: 0,
@@ -1579,6 +1589,7 @@ impl Engine {
         let held_over_an_untaken_one = quiet && item.pending_handoff.is_some();
         if (!released && !held_over_an_untaken_one) || item.decided_at_ms.is_none() {
             item.decided_at_ms = Some(reading.wall_ms);
+            item.decided_privacy = reading.privacy;
         }
         item.announced_anchor = Some(reading.anchor());
         if quiet {

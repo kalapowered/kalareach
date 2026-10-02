@@ -99,7 +99,7 @@ use crate::engine::{Item, ItemAck, PendingInput, Text};
 use crate::error::{Error, Result, StoreFault};
 use crate::event::{EventCursor, Origin};
 use crate::review::{ReviewAck, Subject, subject_key};
-use crate::time::{Anchor, BootMark, Elapsed, HostReading};
+use crate::time::{Anchor, BootMark, Elapsed, HostReading, PrivacyStamp};
 use crate::visit::{Change, Omitted, SessionLog, Visit};
 
 /// The schema this build writes and reads.
@@ -547,11 +547,13 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 
 /// Brings a store written under schema 9 forward to this build's, in one transaction.
 ///
-/// What changed is one column on the items: the time the announcement an item last made was first
-/// decided, which an item written before this carries nowhere. Its existing rows are given the time
-/// of their last announcement, which is the best value they have: it is the time the decision was
-/// made, or the time it was made again when quiet hours released it. Nothing reads schema 9 after
-/// this has run.
+/// What changed is three columns on the items: the time the announcement an item last made was
+/// first decided, and the privacy generation and mode it was decided under, none of which an item
+/// written before this carries. Its existing rows are given the time of their last announcement,
+/// which is the best value they have: it is the time the decision was made, or the time it was made
+/// again when quiet hours released it. They are given no privacy state, because nothing recorded it
+/// and a state guessed from a clock is what the column exists to replace: a reader treats a row
+/// with none as decided at that time. Nothing reads schema 9 after this has run.
 fn migrate_from_nine(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction()?;
     // The tables first, because a start that stopped after it recorded its version and before it
@@ -565,6 +567,8 @@ fn migrate_from_nine(connection: &mut Connection) -> Result<()> {
     if has_column == 0 {
         transaction.execute_batch(
             "ALTER TABLE attention_items ADD COLUMN decided_at_ms INTEGER;
+             ALTER TABLE attention_items ADD COLUMN decided_generation INTEGER;
+             ALTER TABLE attention_items ADD COLUMN decided_private INTEGER;
              UPDATE attention_items SET decided_at_ms = last_notified_ms;",
         )?;
     }
@@ -624,7 +628,9 @@ const SCHEMA: &str = "
         pending_handoff INTEGER,
         uncertain INTEGER NOT NULL,
         deferred INTEGER NOT NULL,
-        decided_at_ms INTEGER
+        decided_at_ms INTEGER,
+        decided_generation INTEGER,
+        decided_private INTEGER
     );
     CREATE TABLE IF NOT EXISTS attention_actors (
         actor TEXT PRIMARY KEY,
@@ -804,6 +810,8 @@ const ITEMS: TableDef = TableDef {
         "uncertain",
         "deferred",
         "decided_at_ms",
+        "decided_generation",
+        "decided_private",
     ],
 };
 const ACTORS: TableDef = TableDef {
@@ -1240,6 +1248,14 @@ fn environment_rows(state: &StoredState) -> Result<Vec<Rows>> {
                 flag(item.uncertain),
                 flag(item.deferred),
                 optional_integer(item.decided_at_ms.map(TimestampMs::get), "decided at")?,
+                optional_integer(
+                    item.decided_privacy.map(|stamp| stamp.generation),
+                    "decided under generation",
+                )?,
+                optional_integer(
+                    item.decided_privacy.map(|stamp| u64::from(stamp.private)),
+                    "decided under privacy mode",
+                )?,
             ],
         );
     }
@@ -1984,6 +2000,8 @@ impl Store {
             let uncertain: i64 = row.get(30)?;
             let deferred: i64 = row.get(31)?;
             let decided_at: Option<i64> = row.get(32)?;
+            let decided_generation: Option<i64> = row.get(33)?;
+            let decided_private: Option<i64> = row.get(34)?;
             let session_id = session
                 .map(|text| SessionId::from_str(&text).map_err(|_| unreadable("session")))
                 .transpose()?;
@@ -2014,6 +2032,16 @@ impl Store {
             let decided_at_ms = decided_at
                 .map(|at| as_u64(at, "decided at").map(TimestampMs::new))
                 .transpose()?;
+            // The two columns are one stamp, written together: one without the other is a row this
+            // build did not write.
+            let decided_privacy = match (decided_generation, decided_private) {
+                (None, None) => None,
+                (Some(generation), Some(private)) => Some(PrivacyStamp {
+                    generation: as_u64(generation, "decided under generation")?,
+                    private: private != 0,
+                }),
+                _ => return Err(unreadable("decided under")),
+            };
             items.push(Item {
                 key: AttentionKey::new(key).map_err(|_| unreadable("item key"))?,
                 rule: AttentionRule::from_wire(&rule).ok_or_else(|| unreadable("rule"))?,
@@ -2044,6 +2072,7 @@ impl Store {
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
                 decided_at_ms,
+                decided_privacy,
                 announced_anchor: anchor(
                     announced_boot.as_deref(),
                     announced_continuous,

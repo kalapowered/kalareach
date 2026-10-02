@@ -107,4 +107,4 @@ pub use crate::rule::{RULES, Rule};
 pub use crate::scope::{DeviceScope, Viewer};
 pub use crate::store::{ActionRecord, Claimant, Liveness};
 pub use crate::subject::Subject;
-pub use crate::time::HostReading;
+pub use crate::time::{HostReading, PrivacyStamp};
