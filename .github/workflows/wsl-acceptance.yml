@@ -102,11 +102,19 @@ jobs:
     # Installing the platform on a machine that cannot virtualise can wait for a long time before it
     # says so, and the acceptance itself restarts the platform to change the networking mode.
     timeout-minutes: 150
-    env:
-      KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The Windows daemon the script starts keeps its directories below this one, and the product
+      # refuses a directory that grants access to anybody but its owner and the machine's own
+      # accounts. A directory in the profile of the account that runs the job inherits exactly that;
+      # one at the root of a drive grants access to every authenticated user.
+      - name: Choose where the acceptance writes
+        run: |
+          $directory = Join-Path $env:USERPROFILE 'kr-test-artifacts'
+          New-Item -ItemType Directory -Force $directory | Out-Null
+          "KR_TEST_ARTIFACTS_DIR=$directory" >> $env:GITHUB_ENV
 
       - name: Install the pinned toolchain
         run: |
@@ -177,7 +185,8 @@ jobs:
           KR_WSL_ROOT: /c/wsl-images
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          export KR_TEST_ARTIFACTS_DIR=/c/kr-test-artifacts
+          KR_TEST_ARTIFACTS_DIR="$(cygpath -u "$KR_TEST_ARTIFACTS_DIR")"
+          export KR_TEST_ARTIFACTS_DIR
           bash scripts/e2e-wsl.sh /c/wsl-acceptance.log
 
       - name: Keep the acceptance's own record
@@ -187,7 +196,7 @@ jobs:
           name: wsl-acceptance
           path: |
             C:\wsl-acceptance.log
-            C:\kr-test-artifacts
+            ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: warn
 
       # The first distribution is this job's own, by the name it gave it.
