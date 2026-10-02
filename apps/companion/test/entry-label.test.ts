@@ -28,15 +28,56 @@ function recordedKinds(): string[] {
   const start = bridge.indexOf('pub const fn kind(self)')
   expect(start, 'the worker names its observed kinds in `ObservedEvent::kind`').toBeGreaterThan(0)
   const body = bridge.slice(start, bridge.indexOf('\n    }\n', start))
-  return [...body.matchAll(/Self::\w+ => "([^"]+)"/g)].map((match) => match[1])
+  // Every arm names its kind as a string, however it is spaced; an arm that does anything else
+  // would leave a kind this test cannot read, so there is none.
+  expect(body, 'every arm of `ObservedEvent::kind` is a plain string').not.toMatch(/=>\s*\{/)
+  const arms = body.split('\n').filter((line) => line.includes('=>'))
+  const kinds = [...body.matchAll(/=>\s*"([^"]+)"/g)].map((match) => match[1])
+  expect(kinds, 'a kind read for every arm').toHaveLength(arms.length)
+  return kinds
 }
 
-/** A label a person can read: words, with no identifier's dots or underscores in it. */
+/** What a person can read as words: a capital to begin, and none of an identifier's marks in it. */
 function isWords(label: string): boolean {
-  return /^[A-Z][a-z]+( [A-Za-z]+)*$/.test(label)
+  return /^[A-Z]/.test(label) && !/[._]|[a-z][A-Z]/.test(label)
 }
+
+/** Each kind and what a person is told it is, written out so a change of a label is a change here. */
+const ENTRY_LABELS = {
+  message: 'Agent message',
+  'thread.started': 'Conversation started',
+  'thread.continued': 'Conversation continued',
+  'thread.ended': 'Conversation ended',
+  'tool.finished': 'Tool finished',
+  'tool.failed': 'Tool failed',
+  notification: 'Notice'
+} as const
+
+const NODE_LABELS = {
+  message: 'Message',
+  markdown: 'Message',
+  tool: 'Tool',
+  diff: 'Changes',
+  progress: 'Progress',
+  form: 'Form',
+  attachment: 'Attachment',
+  attachment_entry: 'Request for a file',
+  approval_ref: 'Decision',
+  terminal_ref: 'Terminal',
+  action_button: 'Action',
+  action_group: 'Actions',
+  command_palette: 'Commands'
+} as const
 
 describe('the labels of the history entries (KR-REQ-13.19)', () => {
+  it('are exactly these, in words', () => {
+    for (const [kind, label] of Object.entries(ENTRY_LABELS)) expect(entryLabel(kind), kind).toBe(label)
+    for (const [kind, label] of Object.entries(NODE_LABELS)) expect(nodeKindLabel(kind), kind).toBe(label)
+    // Nothing this application draws, or the worker records, is missing from what is written out.
+    expect(Object.keys(NODE_LABELS).sort()).toEqual([...RENDERED_NODE_KINDS].sort())
+    for (const kind of recordedKinds()) expect(Object.keys(ENTRY_LABELS), kind).toContain(kind)
+  })
+
   it('names a conversation starting in words', () => {
     expect(entryLabel('thread.started')).toBe('Conversation started')
     expect(entryLabel('thread.continued')).toBe('Conversation continued')

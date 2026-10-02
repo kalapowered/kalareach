@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, isInaccessible, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { AttentionItem } from '@kalareach/protocol'
@@ -21,6 +21,7 @@ import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
+import { AttachmentPicker } from '../../src/mobile/components/picker'
 import { Inbox } from '../../src/mobile/views/Inbox'
 import { PURCHASE_WORDS } from '../../src/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
@@ -220,8 +221,8 @@ describe('the attachment controls are one named button each (KR-REQ-13.19)', () 
     const group = screen.getByRole('group', { name: 'Add an attachment' })
     const inputs = [...(group.parentElement?.querySelectorAll<HTMLInputElement>('input[type="file"]') ?? [])]
     expect(inputs).toHaveLength(3)
-    // No input is a control to a screen reader: none is in the tree for a role query to find.
-    for (const input of inputs) expect(input).not.toBeVisible()
+    // No input is a control to a screen reader: none is in the accessibility tree.
+    for (const input of inputs) expect(isInaccessible(input)).toBe(true)
     expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
       'Take a photo',
       'Photo library',
@@ -237,6 +238,25 @@ describe('the attachment controls are one named button each (KR-REQ-13.19)', () 
       await person.click(within(group).getByRole('button', { name }))
     }
     expect(opened).toEqual(['image/*', 'image/*,video/*', '*/*'])
+  })
+})
+
+describe('the attachment controls while a draft cannot take a file (KR-REQ-13.19)', () => {
+  it('refuses a press on each control and opens no picker', async () => {
+    const person = userEvent.setup()
+    render(<AttachmentPicker surface="ios" disabled onPicked={() => undefined} />)
+    const opened: string[] = []
+    for (const input of document.querySelectorAll<HTMLInputElement>('input[type="file"]')) {
+      expect(input).toBeDisabled()
+      input.addEventListener('click', () => {
+        opened.push(input.getAttribute('accept') ?? '')
+      })
+    }
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toBeDisabled()
+      await person.click(button)
+    }
+    expect(opened).toEqual([])
   })
 })
 

@@ -6,6 +6,8 @@
  * offers it.
  */
 
+import { Buffer } from 'node:buffer'
+
 import { expect, test, type Page } from '@playwright/test'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
