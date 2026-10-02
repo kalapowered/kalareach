@@ -627,7 +627,7 @@ fn last_component(path: &str) -> Option<String> {
 /// did not resolve to a file: a token pasted at the prompt, the name of a function or a builtin, or
 /// a command that does not exist. A shell that asks before it has found a file (a word with a
 /// slash in it is the word itself to a shell's search, found or not) is not believed: the file the
-/// answer names has to be there, a regular file this user can run. A missing name is no harm, and a
+/// answer names has to be there, a regular file with an execute bit set. A missing name is no harm, and a
 /// wrong one is a leak of what a person typed.
 fn program_of(invocation: &RootCommandResolveParams) -> Option<String> {
     if !invocation.interactive || !is_executable_file(Path::new(&invocation.executable)) {

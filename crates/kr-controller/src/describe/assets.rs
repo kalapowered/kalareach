@@ -296,13 +296,18 @@ async fn fetch_all(
     if let Err(error) = mark_held(&models, profile) {
         return Ended::Failed(format!("the model's files could not be marked: {error}"));
     }
-    remove_other_revisions(&models, profile);
+    let (kept_models, kept_profile) = (models.clone(), profile.clone());
+    let _ =
+        tokio::task::spawn_blocking(move || remove_other_revisions(&kept_models, &kept_profile))
+            .await;
     host.assets_held(true);
     Ended::Verified
 }
 
-/// Removes the directories of the profile's other revisions, which the held files have replaced.
-fn remove_other_revisions(models: &Path, profile: &ModelProfile) {
+/// Removes the directories of the profile's other revisions, which the held files have replaced. It
+/// runs when a fetch has kept its files and again when a daemon starts that finds them held, so a
+/// removal that failed once (a file still mapped by a process that was going) is tried again.
+pub(crate) fn remove_other_revisions(models: &Path, profile: &ModelProfile) {
     let kept = directory(models, profile);
     let Some(profile_directory) = kept.parent() else {
         return;

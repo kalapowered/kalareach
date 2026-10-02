@@ -345,6 +345,9 @@ impl DescribeHost {
             service.set_assets_held(files_held);
             if files_held {
                 service.note_download(DownloadProgress::Verified);
+                if let Some(profile) = &profile {
+                    super::assets::remove_other_revisions(&models, profile);
+                }
             }
         }
         let driver = Driver::new(service, launch, build);

@@ -161,7 +161,7 @@ async fn setup_shows_the_cost_before_anything_is_fetched() {
         "{shown}"
     );
     assert!(
-        !host.temp.root().join("s").join("models").exists(),
+        !host.temp.environment().state_dir().join("models").exists(),
         "reading fetched nothing and made no model directory: {shown}"
     );
 
