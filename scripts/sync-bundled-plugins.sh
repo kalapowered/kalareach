@@ -35,7 +35,7 @@
 # `--verify` is the offline half. It reads the lock, recomputes every digest under the bundle
 # directory, reports any drift, checks the roots (every numbered root from 1 to the highest, the
 # highest the same bytes as `root.json`, and no root this build would not trust), bounds the
-# embedded index, applies the rules a release scan applies to a file's shape, and regenerates the
+# embedded index, runs the release scan's checks over every file, and regenerates the
 # two Rust files and reports any difference. It reaches no network, runs no build and needs no
 # plugin repository: this repository, `bash` and `python3` are the whole of what it wants.
 
@@ -277,27 +277,6 @@ def key_id(public_hex):
     return sha256(json.dumps(key, sort_keys=True, separators=(",", ":")).encode())
 
 
-def shape_problem(label, content):
-    """The rules a release scan applies to what a file is, for a file the host compiles in.
-
-    A key is the one thing that must never be bundled, whatever it is called: a binary file of
-    exactly 32 or 64 bytes, a file made only of 64 or 128 hexadecimal digits or of 44 or 88
-    base64 characters, and a private-key header anywhere.
-    """
-    printable = all(byte in (9, 10, 13) or 32 <= byte < 127 for byte in content)
-    if len(content) in (32, 64) and not printable:
-        return f"{label} is a binary file of {len(content)} bytes, the length of a key"
-    if printable:
-        text = content.decode("ascii").strip()
-        if re.fullmatch(r"[0-9a-fA-F]{64}|[0-9a-fA-F]{128}", text):
-            return f"{label} is made only of {len(text)} hexadecimal digits"
-        if re.fullmatch(r"[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{86}==", text):
-            return f"{label} is made only of {len(text)} base64 characters"
-    if re.search(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----", content):
-        return f"{label} holds a private key header"
-    return None
-
-
 def render_trust(release_keys, threshold, development_keys, metadata_url, targets_url):
     def listing(keys):
         if not keys:
@@ -461,6 +440,7 @@ check_bundle() {
         "$max_index_bytes" "$max_index_entries" \
         "$(printf '%s,' "${production_root_keys[@]+"${production_root_keys[@]}"}")" \
         "$(printf '%s,' "${development_root_public_keys[@]}")" <<'PY'
+import importlib.util
 import json
 import os
 import sys
@@ -569,13 +549,25 @@ if root_document is not None:
         problems.append(
             "the root says targets are named by their digest, and the bundle names them plain"
         )
-    if not root_role or any(
-        key not in development_keys and key not in production_keys for key in root_role
-    ):
-        problems.append(
-            "the highest root names a root key that is neither a development key nor a"
-            " production key this build commits"
-        )
+    # A store that adopted any earlier root has to be able to follow the chain, and a build trusts
+    # a root only when all of its root keys are the development set's or all are the production
+    # set's, so every shipped root is held to that, not only the highest.
+    for version, path in sorted(roots.items()):
+        if path not in contents:
+            continue
+        try:
+            keys = sorted(json.loads(contents[path])["signed"]["roles"]["root"]["keyids"])
+        except (ValueError, KeyError, TypeError) as error:
+            problems.append(f"{path} is not a root document: {error}")
+            continue
+        if not keys or not (
+            all(key in development_keys for key in keys)
+            or (production_keys and all(key in production_keys for key in keys))
+        ):
+            problems.append(
+                f"{path} names root keys that are not all development keys and not all"
+                " production keys this build commits"
+            )
     if release_only == "true":
         if not production_keys:
             problems.append("a release trusts no root yet: the production set is empty")
@@ -595,6 +587,14 @@ if index_content is not None:
             problems.append(
                 f"{INDEX} has {len(index['entries'])} entries, over the {max_index_entries} budget"
             )
+        if str(index["generation"]) != str(lock["source"]["generation"]) or str(
+            index["produced_at"]
+        ) != str(lock["source"]["produced_at"]):
+            problems.append(
+                f"{INDEX} is generation {index['generation']} built at {index['produced_at']}"
+                f" and the lock names generation {lock['source']['generation']}"
+                f" built at {lock['source']['produced_at']}"
+            )
         for package in lock["packages"]:
             entry = next(
                 (
@@ -612,11 +612,22 @@ if index_content is not None:
     except (ValueError, KeyError) as error:
         problems.append(f"{INDEX} is not a catalogue index: {error}")
 
-# What a file is, by the rules a release scan applies to a key.
-for path, content in sorted(contents.items()):
-    problem = shape_problem(path, content)
-    if problem is not None:
-        problems.append(problem)
+# What a file is, by the release scan's own checks: no private key, key seed or credential,
+# whatever a file is called.
+scan_script = os.path.join(repository_root, "scripts", "check-release-secrets.py")
+# Loading the scan writes nothing beside it.
+sys.dont_write_bytecode = True
+try:
+    spec = importlib.util.spec_from_file_location("check_release_secrets", scan_script)
+    release_scan = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release_scan)
+except (OSError, AttributeError, SyntaxError) as error:
+    release_scan = None
+    problems.append(f"{scan_script} cannot be loaded, so the files are not scanned: {error}")
+if release_scan is not None:
+    for path, content in sorted(contents.items()):
+        for scanned, what in release_scan.scan_member(path, content, 0):
+            problems.append(f"{scanned} {what}")
 
 # What the host compiles in and the trust it commits, regenerated and compared.
 if generated == "true":
@@ -757,9 +768,14 @@ owner_of_publish_lock() {
 # a variable got: a flag is set after the rename it describes, and an interruption lands between the
 # two. The staged bundle is the witness. It is still there when nothing was published, and it is
 # gone when the rename that published it ran.
+cleaned=false
 cleanup() {
     local status=$?
     set +e
+    # Once only: a signal ends the run through its exit, which runs this again, and a second pass
+    # would find the staging directory gone and mistake a published bundle for an unpublished one.
+    [ "$cleaned" = false ] || return "$status"
+    cleaned=true
     local published_here=false
     if [ ! -d "$staged_bundle" ] && [ -e "$bundle_root" ] && [ -d "$stage_root" ]; then
         published_here=true
@@ -790,8 +806,8 @@ cleanup() {
 }
 
 trap 'cleanup; rm -rf "${work:?}"' EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir "$publish_lock" 2>/dev/null ||
     fail "$publish_lock is there, so another sync holds this bundle; remove it if none does"
