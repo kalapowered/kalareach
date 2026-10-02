@@ -51,23 +51,24 @@ fn offline(home: &std::path::Path) -> Catalogue {
 }
 
 /// A generation whose package asks for capabilities past the default ceiling, the way an
-/// adapter's does.
+/// adapter's does, as the generation numbered `generation`.
+fn adapter_spec(generation: u64) -> GenerationSpec {
+    GenerationSpec {
+        generation,
+        capabilities: vec![
+            PluginCapability::MetadataMatch,
+            PluginCapability::DeclarativePresentation,
+            PluginCapability::BrokerSemanticEvents,
+            PluginCapability::TranscriptTail,
+            PluginCapability::TerminalInput,
+            PluginCapability::NativeBridgeInstall,
+        ],
+        ..GenerationSpec::default()
+    }
+}
+
 async fn adapter(home: &std::path::Path) -> Generation {
-    Generation::build(
-        home,
-        GenerationSpec {
-            capabilities: vec![
-                PluginCapability::MetadataMatch,
-                PluginCapability::DeclarativePresentation,
-                PluginCapability::BrokerSemanticEvents,
-                PluginCapability::TranscriptTail,
-                PluginCapability::TerminalInput,
-                PluginCapability::NativeBridgeInstall,
-            ],
-            ..GenerationSpec::default()
-        },
-    )
-    .await
+    Generation::build(home, adapter_spec(1)).await
 }
 
 fn budgets() -> RepositoryBudgets {
@@ -691,12 +692,13 @@ async fn a_stop_between_the_enrolment_and_the_sync_is_resumed() {
     assert_eq!(catalogue.repositories().expect("records").len(), 1);
 }
 
-/// A pin skips the sync only: the generation, the trust checkpoint and the floors do not move, and
-/// the package the seed had not reached is still installed.
+/// A pin skips the sync only: a bundle of a later generation does not move the generation, the
+/// trust checkpoint or the floors, and the package the seed had not reached is still installed.
 #[tokio::test]
 async fn a_pin_skips_the_sync_and_not_the_installs() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let bundle = seed_bundle(&adapter(home.path()).await);
+    let generation = adapter(home.path()).await;
+    let bundle = seed_bundle(&generation);
     let mut catalogue = offline(home.path());
     catalogue.stop_seed_at(Some(SeedPoint::AfterActivation));
     catalogue.seed(&bundle, environment(), budgets()).await;
@@ -707,12 +709,21 @@ async fn a_pin_skips_the_sync_and_not_the_installs() {
     let active = catalogue.active(&id).expect("records");
     let floors = (catalogue.repository(&id).expect("records"), active);
 
+    // The host is updated to a bundle of the next generation, which the pin holds back.
+    generation.rewrite_with(adapter_spec(2)).await;
+    let later = seed_bundle(&generation);
+    assert!(later.generation() > bundle.generation());
     catalogue.stop_seed_at(None);
-    let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
+    let outcome = catalogue.seed(&later, environment(), budgets()).await;
 
     assert!(outcome.failure.is_none(), "{}", outcome.report());
-    assert!(outcome.activated.is_none());
-    assert_eq!(outcome.installed, [plugin()]);
+    assert!(outcome.activated.is_none(), "{}", outcome.report());
+    assert!(
+        outcome.notes.iter().any(|note| note.contains("pinned")),
+        "{}",
+        outcome.report()
+    );
+    assert_eq!(outcome.installed, [plugin()], "{}", outcome.report());
     assert_eq!(
         (
             catalogue.repository(&id).expect("records"),
@@ -1013,13 +1024,33 @@ async fn nothing_is_evicted_for_a_package_that_cannot_arrive() {
     )
     .await;
     let bundle = seed_bundle(&generation);
+    // What the seed caches for the bundled package, measured on a catalogue of its own.
+    let measured_home = tempfile::tempdir().expect("a temporary directory");
+    let mut measured = offline(measured_home.path());
+    measured.seed(&bundle, environment(), budgets()).await;
+    let measured_id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+    let seeded_bytes: u64 = measured
+        .store(&measured_id)
+        .expect("a store")
+        .cached_payloads()
+        .expect("a readable store")
+        .values()
+        .sum();
+    assert!(
+        seeded_bytes > 0,
+        "the control: the seed cached its payloads"
+    );
+
     let mut catalogue = offline(home.path());
     let mut tight = budgets();
-    tight.payload_cache_bytes = U64::new(40_000);
-    catalogue.seed(&bundle, environment(), tight).await;
+    // An installation counts what it stages beside what it caches, so twice what the seed caches
+    // is what it needs; a little more than that leaves no room for another package.
+    tight.payload_cache_bytes = U64::new(seeded_bytes * 2 + 1_000);
+    let outcome = catalogue.seed(&bundle, environment(), tight).await;
     assert!(
         installed(&catalogue).is_some(),
-        "the control: the bundled package was installed"
+        "the control: the bundled package was installed: {}",
+        outcome.report()
     );
     let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
     let store = catalogue.store(&id).expect("a store");
@@ -1049,6 +1080,47 @@ async fn nothing_is_evicted_for_a_package_that_cannot_arrive() {
         held_before,
         "nothing was evicted for a package that could not arrive"
     );
+}
+
+/// A package the host carries is installed again from the host's own bytes when nothing of it is
+/// cached and nothing is reachable: the bundle stays with the catalogue after the seed, so an
+/// owner's reinstall is not stranded by the cache having been reclaimed.
+#[tokio::test]
+async fn a_bundled_package_is_installed_again_from_the_host_with_nothing_cached_or_reachable() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let bundle = seed_bundle(&adapter(home.path()).await);
+    let mut catalogue = offline(home.path());
+    catalogue.seed(&bundle, environment(), budgets()).await;
+    let seeded = installed(&catalogue).expect("the seed installed it");
+    let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+    let store = catalogue.store(&id).expect("a store");
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("the owner uninstalls it");
+    // Nothing of the package is left but what the repository's metadata says about it.
+    let _ = std::fs::remove_dir_all(store.package_dir(seeded.package_digest));
+    for digest in store.cached_payloads().expect("a readable store").keys() {
+        std::fs::remove_file(store.payload_path(*digest)).expect("the cache is removable");
+    }
+    assert!(
+        store
+            .cached_payloads()
+            .expect("a readable store")
+            .is_empty(),
+        "the control: nothing is cached"
+    );
+
+    let digest = catalogue
+        .activate_package(
+            &id,
+            &plugin(),
+            &version(),
+            kr_plugin_catalogue::FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect("the host's own bytes are what it installs from");
+
+    assert_eq!(digest, seeded.package_digest);
 }
 
 // ---------------------------------------------------------------------------------------------
