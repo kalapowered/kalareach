@@ -94,6 +94,58 @@ The other two pin what they take from this one. The website service pins a `@kal
 release archive by URL and digest, and the catalogue pipeline pins `kr-plugin-sdk`, the validator a
 host runs before it trusts a package, by Git revision in its lockfile.
 
+## What KalaReach includes
+
+KalaReach is a host that owns durable terminal sessions on a person's own computers, the clients
+that reach them, and a set of optional services around them. This list says what the product
+includes and where each part is described. Each document states what the code does and where it
+stops, so a limit that a part has is written in that part's own document.
+
+- **Durable sessions.** A worker process for each session owns the pseudo-terminal and the terminal
+  state, and the control daemon can restart without ending a session: [host](host/README.md),
+  [terminal](terminal/README.md) and [cli](cli/README.md).
+- **Agent interfaces.** A broker and gateway in each worker interpret what an agent does through
+  plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi and Qoder CLI, with
+  conversations, drafts, attachments and approvals that only the agent's own protocol can create:
+  [the broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
+  [plugins](plugins/README.md).
+- **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
+  on Linux, macOS, Windows, iOS and Android: [cli](cli/README.md), [companion](companion/README.md)
+  and [mobile](client/mobile.md).
+- **Diff review.** Projects, workspaces and immutable change sets, with the diffs between versions
+  and a review state bound to an exact version: [project](project/README.md) and
+  [host](host/README.md#attention-review-and-what-changed-since-a-visit).
+- **Voice and encrypted push.** Voice through a coordinator on the host ([voice](voice/README.md)
+  and [client voice](client/voice.md)), and push notifications whose previews only the receiving
+  device can open ([delivery](delivery/README.md)).
+- **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
+  quiet hours and review state, and a view of what changed since an actor's last visit:
+  [host](host/README.md#attention-review-and-what-changed-since-a-visit).
+- **Sharing and control.** Grants scoped to environments and sessions, a narrower grant that a
+  holder can delegate, revocation that completes through a per-worker barrier, and an input lease
+  that a controller takes explicitly: [grants](host/README.md#grants-sharing-and-revocation),
+  [pairing](pairing/README.md) and [who may type](host/README.md#who-may-type).
+- **Automation.** Versioned workflows that react to verified events, under causal budgets and a
+  declared grant: [automation](automation/README.md).
+- **Sync, recovery and backup.** Encrypted settings sync and the recovery kit in the shared client
+  library, and the producer that encrypts and signs a history backup with the host's store of its
+  generations. The host does not upload a backup to a service: [client](client/README.md), [the
+  backup service](host/README.md#the-backup-service) and [crypto](crypto/README.md).
+- **The plugin catalogue.** A signed catalogue of adapter packages, searched offline, whose entries
+  carry each release's compatible SDK range and the executable builds it was qualified against:
+  [catalogue](plugins/catalogue.md).
+- **Teams.** Signed membership leases and an organisation's policy-signing chain, which a host
+  verifies without reaching the service ([account authority
+  objects](protocol/README.md#account-authority-objects)). The roles, single sign-on and SCIM that
+  issue them run in the website's account system.
+- **External notification destinations.** Webhook, Slack, Discord, Telegram and email destinations,
+  each with its own credential, recipient and content policy:
+  [delivery](delivery/README.md#external-destinations).
+- **Environments and diagnostics.** WSL, container, SSH and paired environments the owner enrols
+  with `kr bridge`, and `kr doctor`, which reports diagnostics and writes a support bundle that
+  carries content only when the person passes `--include-content` and approves its preview:
+  [host](host/README.md#wsl-and-containers) and [cli](cli/README.md).
+
 ## What is open source, and what is a service
 
 This repository holds the host and every client, and it is open source under the BSD 3-Clause
