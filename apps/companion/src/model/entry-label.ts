@@ -21,13 +21,13 @@ const ENTRY_LABELS: ReadonlyMap<string, string> = new Map([
 
 const NODE_LABELS: ReadonlyMap<string, string> = new Map([
   ['message', 'Message'],
-  ['markdown', 'Agent message'],
+  ['markdown', 'Message'],
   ['tool', 'Tool'],
   ['diff', 'Changes'],
   ['progress', 'Progress'],
   ['form', 'Form'],
   ['attachment', 'Attachment'],
-  ['attachment_entry', 'Attachment'],
+  ['attachment_entry', 'Request for a file'],
   ['approval_ref', 'Decision'],
   ['terminal_ref', 'Terminal'],
   ['action_button', 'Action'],
