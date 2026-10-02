@@ -29,7 +29,8 @@
 #                              the keychain that holds the signing identity, unlocked before a device build
 #   KR_PUSH_TOOL               the script that sends the one test notification (session s1 only)
 # And, optional: KR_TARGET=simulator to run everything on a simulator instead of the phone,
-# KR_WORK (products and results, on the internal disk) and KR_SHOTS (the application's pictures).
+# KR_WORK (products and the record of a session, on the internal disk), KR_RAW (the raw output of a
+# run, which is deleted when the session ends) and KR_SHOTS (the application's pictures).
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -38,6 +39,9 @@ apple="$companion/src-tauri/gen/apple"
 target=${KR_TARGET:-device}
 work=${KR_WORK:-$HOME/Library/Caches/kalareach-device-ios}
 shots=${KR_SHOTS:-/tmp/kalareach-device-ios}
+raw=${KR_RAW:-/tmp/kalareach-device-ios-raw}
+record="$work/session-record"
+devicectl_limit=90
 app_id=to.kala.reach
 runner_id=to.kala.reach.uitests.xctrunner
 tests_scheme=KalaReachUITests
@@ -86,11 +90,11 @@ boot_simulator() {
 # Whether a bundle is installed: yes, no, or unknown when the target did not answer.
 installed_state() { # <bundle id>
   if [ "$target" = device ]; then
-    rm -f "$work/apps.json"
-    xcrun devicectl device info apps --device "$KR_DEVICE" --bundle-id "$1" --quiet --json-output "$work/apps.json" >/dev/null 2>&1 \
-      && [ -s "$work/apps.json" ] || { echo unknown; return; }
+    mkdir -p "$raw"; rm -f "$raw/apps.json"
+    xcrun devicectl --timeout "$devicectl_limit" device info apps --device "$KR_DEVICE" --bundle-id "$1" --quiet --json-output "$raw/apps.json" >/dev/null 2>&1 \
+      && [ -s "$raw/apps.json" ] || { echo unknown; return; }
     # The JSON's exact nesting is not promised, so every object in it is asked.
-    python3 - "$work/apps.json" "$1" <<'PY'
+    python3 - "$raw/apps.json" "$1" <<'PY'
 import json, sys
 
 def holds(node, wanted):
@@ -110,16 +114,16 @@ PY
 }
 
 target_install() { # <path>
-  if [ "$target" = device ]; then xcrun devicectl device install app --device "$KR_DEVICE" "$1" >/dev/null; else xcrun simctl install "$KR_DEVICE" "$1"; fi
+  if [ "$target" = device ]; then xcrun devicectl --timeout "$devicectl_limit" device install app --device "$KR_DEVICE" "$1" >/dev/null; else xcrun simctl install "$KR_DEVICE" "$1"; fi
 }
 
 target_uninstall() { # <bundle id>
-  if [ "$target" = device ]; then xcrun devicectl device uninstall app --device "$KR_DEVICE" "$1" >/dev/null 2>&1; else xcrun simctl uninstall "$KR_DEVICE" "$1" >/dev/null 2>&1; fi
+  if [ "$target" = device ]; then xcrun devicectl --timeout "$devicectl_limit" device uninstall app --device "$KR_DEVICE" "$1" >/dev/null 2>&1; else xcrun simctl uninstall "$KR_DEVICE" "$1" >/dev/null 2>&1; fi
 }
 
 target_launch() { # <args...>: starts the application afresh with these arguments
   if [ "$target" = device ]; then
-    xcrun devicectl device process launch --device "$KR_DEVICE" --terminate-existing "$app_id" "$@" >/dev/null
+    xcrun devicectl --timeout "$devicectl_limit" device process launch --device "$KR_DEVICE" --terminate-existing "$app_id" "$@" >/dev/null
   else
     xcrun simctl terminate "$KR_DEVICE" "$app_id" >/dev/null 2>&1
     xcrun simctl launch "$KR_DEVICE" "$app_id" "$@" >/dev/null
@@ -130,7 +134,7 @@ target_launch() { # <args...>: starts the application afresh with these argument
 target_copy() { # <path inside the container> <local file>
   mkdir -p "$(dirname "$2")"
   if [ "$target" = device ]; then
-    xcrun devicectl device copy from --device "$KR_DEVICE" --domain-type appDataContainer --domain-identifier "$app_id" \
+    xcrun devicectl --timeout "$devicectl_limit" device copy from --device "$KR_DEVICE" --domain-type appDataContainer --domain-identifier "$app_id" \
       --source "$1" --destination "$2" >/dev/null 2>&1
   else
     cp "$(xcrun simctl get_app_container "$KR_DEVICE" "$app_id" data)/$1" "$2" 2>/dev/null
@@ -139,15 +143,21 @@ target_copy() { # <path inside the container> <local file>
 
 # MARK: What a device check leaves
 
-# Starts a device check in the application, waits for its file and prints it.
+# Starts a device check in the application, waits for its file and prints it. Each check is given a
+# run of its own and only a file that names that run is taken: a file an earlier check left is never
+# read as this one's.
 run_check() { # <mode> <file stem>
-  local file="$work/checks/probe-$2.txt"
+  local file="$work/checks/probe-$2.txt" run
+  run=$(uuidgen)
   rm -f "$file"
-  target_launch -KRDeviceProbe "$1"
+  target_launch -KRDeviceProbe "$1" -KRProbeRun "$run" || return 1
   local waited=0
   while [ "$waited" -lt 60 ]; do
     sleep 2; waited=$((waited + 2))
-    if target_copy "Documents/probe-$2.txt" "$file" && [ -s "$file" ]; then cat "$file"; return 0; fi
+    if target_copy "Documents/probe-$2.txt" "$file" && [ -s "$file" ] && grep -q "^run=$run\$" "$file"; then
+      cat "$file"
+      return 0
+    fi
   done
   return 1
 }
@@ -163,14 +173,20 @@ baseline() {
   run_check count count > "$work/checks/count.out" || die "the count did not report"
   [ "$(fact "$work/checks/probe-count.txt" ok)" = 1 ] || die "a keychain query was refused, so the baseline is unknown"
   [ "$(fact "$work/checks/probe-count.txt" total)" = 0 ] || die "the groups are not empty: stop here and ask"
-  echo "empty" > "$work/last-baseline"
+  echo "baseline=empty" >> "$record"
 }
 
-sweep() {
-  say "removing what the application and its libraries filed in the two groups"
+sweep_once() {
   run_check sweep sweep > "$work/checks/sweep.out" || { say "the sweep did not report"; return 1; }
   [ "$(fact "$work/checks/probe-sweep.txt" ok)" = 1 ] && [ "$(fact "$work/checks/probe-sweep.txt" remaining)" = 0 ] \
     || { say "the sweep left something, or was refused: $(grep -E '^(remaining|ok|failed)=' "$work/checks/probe-sweep.txt" | tr '\n' ' ')"; return 1; }
+}
+
+# Removes what the application and its libraries filed in the two groups, and checks that nothing is
+# left; once more if the first did not leave them empty.
+sweep() {
+  say "removing what the application and its libraries filed in the two groups"
+  sweep_once || { say "trying the sweep once more"; sweep_once; }
 }
 
 # MARK: Builds
@@ -191,6 +207,9 @@ write_local_xcconfig() { # <with push: yes|no>
     if [ "$1" = yes ]; then
       [ -f "${KR_GOOGLE_SERVICE_INFO:-}" ] || die "KR_GOOGLE_SERVICE_INFO names no file"
       echo "KR_GOOGLE_SERVICE_INFO = $KR_GOOGLE_SERVICE_INFO"
+    else
+      # A build without push names no configuration, whatever the environment holds.
+      echo "KR_GOOGLE_SERVICE_INFO ="
     fi
   } > "$apple/Local.xcconfig"
 }
@@ -243,22 +262,31 @@ build_tests() {
   ( cd "$apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
       -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" ) \
     > "$work/build-tests-$target.log" 2>&1 || { tail -20 "$work/build-tests-$target.log"; die "the test build failed"; }
-  local plan
-  plan=$(ls "$derived"/Build/Products/*.xctestrun 2>/dev/null | head -1)
+  local plan products="$derived/Build/Products"
+  plan=$(ls "$products"/*.xctestrun 2>/dev/null | head -1)
   [ -f "$plan" ] || die "the test build left no test plan"
-  cp "$plan" "$work/tests-$target.xctestrun"
+  # The plan stays where Xcode left it, since its paths are relative to its own directory.
+  local session_plan="$products/session.xctestrun"
+  cp "$plan" "$session_plan"
   # Nothing the runner can keep is kept: no recording, no picture, no attachment, no diagnostics.
-  local key=":$tests_scheme"
-  /usr/libexec/PlistBuddy -c "Set $key:SystemAttachmentLifetime keepNever" "$work/tests-$target.xctestrun" 2>/dev/null
-  /usr/libexec/PlistBuddy -c "Set $key:UserAttachmentLifetime keepNever" "$work/tests-$target.xctestrun" 2>/dev/null
-  /usr/libexec/PlistBuddy -c "Set $key:DiagnosticCollectionPolicy 0" "$work/tests-$target.xctestrun" 2>/dev/null
-  /usr/libexec/PlistBuddy -c "Delete $key:CommandLineArguments" "$work/tests-$target.xctestrun" 2>/dev/null
-  /usr/libexec/PlistBuddy -c "Add $key:CommandLineArguments array" "$work/tests-$target.xctestrun"
+  local key=":$tests_scheme" plist=/usr/libexec/PlistBuddy
+  $plist -c "Set $key:SystemAttachmentLifetime keepNever" "$session_plan" || die "the test plan has no SystemAttachmentLifetime to set"
+  $plist -c "Set $key:UserAttachmentLifetime keepNever" "$session_plan" || die "the test plan has no UserAttachmentLifetime to set"
+  $plist -c "Set $key:DiagnosticCollectionPolicy 0" "$session_plan" || die "the test plan has no DiagnosticCollectionPolicy to set"
+  $plist -c "Delete $key:CommandLineArguments" "$session_plan" >/dev/null 2>&1
+  $plist -c "Add $key:CommandLineArguments array" "$session_plan" || die "the test plan took no command line arguments"
   local at=0
   for each in -DisableDiagnosticScreenRecordings YES -DisableDiagnosticScreenshots YES; do
-    /usr/libexec/PlistBuddy -c "Add $key:CommandLineArguments:$at string $each" "$work/tests-$target.xctestrun"; at=$((at + 1))
+    $plist -c "Add $key:CommandLineArguments:$at string $each" "$session_plan" || die "the test plan took no argument $each"
+    at=$((at + 1))
   done
-  say "built the test runner, plan at $work/tests-$target.xctestrun"
+  # Every value is read back: a plan that did not take them is not one to run on a phone.
+  [ "$($plist -c "Print $key:SystemAttachmentLifetime" "$session_plan")" = keepNever ] || die "the plan does not keep no system attachments"
+  [ "$($plist -c "Print $key:UserAttachmentLifetime" "$session_plan")" = keepNever ] || die "the plan does not keep no user attachments"
+  [ "$($plist -c "Print $key:DiagnosticCollectionPolicy" "$session_plan")" = 0 ] || die "the plan collects diagnostics"
+  [ "$($plist -c "Print $key:CommandLineArguments:3" "$session_plan")" = YES ] || die "the plan lacks the runner arguments"
+  echo "$session_plan" > "$work/tests-$target.path"
+  say "built the test runner, plan at $session_plan"
   runner_app=$(ls -d "$derived"/Build/Products/*/"$tests_scheme-Runner.app" | head -1)
   echo "$runner_app" > "$work/runner-$target.path"
 }
@@ -283,20 +311,58 @@ session_minutes() { case $1 in s0) echo 20 ;; s1) echo 45 ;; s2) echo 90 ;; s3a)
 session_app() { case $1 in s0 | s1) echo app ;; s2) echo harness-nofirebase ;; *) echo app-nofirebase ;; esac; }
 
 ending=0
-# What every session ends with, however it ends: the sweep, then the application and the runner removed.
+runner_pid=""
+forwarder_pid=""
+unclean=0
+
+# Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
+stop_runner() {
+  [ -n "$forwarder_pid" ] && kill "$forwarder_pid" 2>/dev/null
+  if [ -n "$runner_pid" ] && kill -0 "$runner_pid" 2>/dev/null; then
+    kill "$runner_pid" 2>/dev/null
+    local waited=0
+    while kill -0 "$runner_pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+    kill -9 "$runner_pid" 2>/dev/null
+  fi
+  wait "$runner_pid" 2>/dev/null
+  runner_pid=""
+}
+
+# Copies the application's own pictures out of its container, before the uninstall takes them.
+copy_shots() { # <session>
+  local into="$shots/$1"
+  mkdir -p "$into"
+  if [ "$target" = device ]; then
+    xcrun devicectl --timeout "$devicectl_limit" device copy from --device "$KR_DEVICE" --domain-type appDataContainer \
+      --domain-identifier "$app_id" --source Documents/shots --destination "$into" >/dev/null 2>&1 || say "no pictures to copy"
+  else
+    cp -R "$(xcrun simctl get_app_container "$KR_DEVICE" "$app_id" data)/Documents/shots/." "$into" 2>/dev/null || say "no pictures to copy"
+  fi
+}
+
+# What every session ends with, however it ends: the runner stopped, the pictures copied, the sweep,
+# then the application and the runner removed and checked gone. A session that cannot show all of that
+# keeps its record, so that `cleanup` knows what is left, and ends with a failure.
 finish_session() {
   [ "$ending" = 1 ] && return
   ending=1
+  stop_runner
   say "ending the session"
-  if [ "${baseline_was_empty:-0}" = 1 ]; then sweep; fi
+  local swept=1
+  if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
+    copy_shots "${session_name:-session}"
+    sweep || { say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: run cleanup before anything else"; swept=0; unclean=1; }
+  else
+    say "no empty baseline is on record, so nothing is swept"
+  fi
   target_uninstall "$app_id"
   target_uninstall "$runner_id"
-  local left=0
   for id in "$app_id" "$runner_id"; do
-    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; left=1; fi
+    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
   done
-  [ "$left" = 0 ] && rm -f "$work/last-baseline"
-  rm -rf "${work:?}/push" "${work:?}/checks"
+  if [ "$unclean" = 0 ]; then rm -f "$record"; fi
+  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}"
+  [ "$unclean" = 0 ] || exit 3
 }
 
 session() {
@@ -304,11 +370,15 @@ session() {
   local tests minutes
   tests=$(session_tests "$name") || die "unknown session $name"
   minutes=$(session_minutes "$name")
+  session_name=$name
+  local started
+  started=$(date +%s)
   require_lease
   require_target
-  mkdir -p "$work/checks" "$work/push" "$shots"
+  mkdir -p "$work/checks" "$work/push" "$shots" "$raw"
   [ -f "$work/$(session_app "$name").app/Info.plist" ] || die "build the application first: build-app (the $(session_app "$name") build)"
-  [ -f "$work/tests-$target.xctestrun" ] || die "build the test runner first: build-tests"
+  [ -f "$work/tests-$target.path" ] && [ -f "$(cat "$work/tests-$target.path")" ] || die "build the test runner first: build-tests"
+  [ ! -f "$record" ] || die "a session left its record at $record: run cleanup first"
   boot_simulator
   # The application and the runner are not on the phone to begin with; if either is, it is not this session's.
   for id in "$app_id" "$runner_id"; do
@@ -318,26 +388,38 @@ session() {
       *) die "the phone did not say whether $id is installed" ;;
     esac
   done
-  baseline_was_empty=0
-  trap finish_session EXIT INT TERM
+  # The record says whose installation this is: the target, the phone, and when it began. Cleanup
+  # touches nothing that this record does not name.
+  printf 'target=%s\ndevice=%s\nsession=%s\nstarted=%s\n' "$target" "$KR_DEVICE" "$name" "$started" > "$record"
+  trap 'stop_runner; finish_session; exit 130' INT
+  trap 'stop_runner; finish_session; exit 143' TERM
+  trap finish_session EXIT
   say "installing"
   target_install "$work/$(session_app "$name").app" || die "the application did not install"
   target_install "$(cat "$work/runner-$target.path")" || die "the test runner did not install"
-  rm -f "$work/last-baseline"
   baseline
-  baseline_was_empty=1
 
-  say "session $name: $tests (at most $((minutes + 10)) minutes)"
-  local result="$work/result-$name.xcresult" out="$work/session-$name.out"
+  say "session $name: $tests (at most $((minutes + 10)) minutes in all)"
+  local result="$raw/result-$name.xcresult" out="$raw/session-$name.out"
   rm -rf "$result" "$out"
+  : > "$out"
   local only=()
   for each in $tests; do only+=("-only-testing:$tests_scheme/$each"); done
-  xcodebuild test-without-building -xctestrun "$work/tests-$target.xctestrun" -destination "$(destination)" \
+  xcodebuild test-without-building -xctestrun "$(cat "$work/tests-$target.path")" -destination "$(destination)" \
     -resultBundlePath "$result" -collect-test-diagnostics never "${only[@]}" > "$out" 2>&1 &
-  local runner=$! started waits=0 sent=0
-  started=$(date +%s)
-  while kill -0 "$runner" 2>/dev/null; do
+  runner_pid=$!
+  # What the tests say goes to the person as it is said, with the time it arrived: an instruction to
+  # lock the phone is useless afterwards, and the time shows the output is live.
+  ( tail -n +1 -f "$out" 2>/dev/null | grep --line-buffered -E "KR-" | while IFS= read -r line; do
+      printf 'device-ios: [%s] %s\n' "$(date +%s)" "${line#*KR-}"
+    done ) > "$raw/live.out" &
+  forwarder_pid=$!
+  local sent=0 printed=0
+  while kill -0 "$runner_pid" 2>/dev/null; do
     sleep 2
+    local lines
+    lines=$(wc -l < "$raw/live.out" 2>/dev/null || echo 0)
+    if [ "$lines" -gt "$printed" ]; then tail -n +"$((printed + 1))" "$raw/live.out"; printed=$lines; fi
     # A push leg says it is waiting once the application has its token and has been put away: the
     # one test notification goes then, to the token the application filed, and never twice for a step.
     local waiting
@@ -348,15 +430,34 @@ session() {
     fi
     if [ $(( $(date +%s) - started )) -gt $(( (minutes + 10) * 60 )) ]; then
       say "the session ran past its limit: stopping it"
-      kill "$runner" 2>/dev/null
+      stop_runner
       break
     fi
   done
-  wait "$runner" 2>/dev/null
+  sleep 1
+  tail -n +"$((printed + 1))" "$raw/live.out" 2>/dev/null
+  wait "$runner_pid" 2>/dev/null
   local status=$?
+  runner_pid=""
   report "$out"
+  [ "$name" = s0 ] && proofs "$raw/live.out"
   say "session $name finished, xcodebuild status $status"
+  # The cleanup runs from the trap on this exit; a clean-up that fails ends with its own status.
   exit "$status"
+}
+
+# The first proof of session s0: what a test says reaches this script while the test is running. The
+# two lines are said fifteen seconds apart and their arrival times must show about that.
+proofs() { # <live output>
+  local first second
+  first=$(sed -n 's/^device-ios: \[\([0-9]*\)\] PROOF first.*/\1/p' "$1" | head -1)
+  second=$(sed -n 's/^device-ios: \[\([0-9]*\)\] PROOF second.*/\1/p' "$1" | head -1)
+  if [ -n "$first" ] && [ -n "$second" ] && [ $((second - first)) -ge 10 ]; then
+    say "PROOF live: the two lines arrived $((second - first)) seconds apart"
+  else
+    say "PROOF NOT MET: what a test says does not reach this script while it runs, so a push leg cannot be sent at the right time"
+    unclean=1
+  fi
 }
 
 send_push() {
@@ -369,29 +470,39 @@ send_push() {
   rm -f "$file"
 }
 
-# The names and outcomes of the tests and the lines the tests said, and nothing else of the run.
+# The names and outcomes of the tests, and the lines the tests said; skipped tests are named too, so
+# a session that skipped what it was for does not read as a pass.
 report() { # <output>
-  grep -E "KR-|Test Case '.*' (started|passed|failed)|Executed [0-9]+ test|\*\* TEST" "$1" \
+  grep -E "Test Case '.*' (started|passed|failed|skipped)|Executed [0-9]+ test|\*\* TEST" "$1" \
     | sed -E "s/Test Case '-\[KalaReachUITests\./Test Case '[/" || true
 }
 
 cleanup() {
   require_lease
   require_target
-  mkdir -p "$work/checks"
+  mkdir -p "$work/checks" "$raw"
+  [ -f "$record" ] || { say "no session left a record, so there is nothing of ours to clean up"; return 0; }
+  # Only what the record names: the same kind of target and the same phone.
+  [ "$(sed -n 's/^target=//p' "$record")" = "$target" ] && [ "$(sed -n 's/^device=//p' "$record")" = "$KR_DEVICE" ] \
+    || die "the record at $record is of another target or phone: nothing is touched"
   boot_simulator
-  say "looking for what a session left"
+  say "cleaning up the session the record names"
   if [ "$(installed_state "$app_id")" = yes ]; then
-    # Only a session that began with empty groups may sweep them: otherwise what is there is not ours.
-    if [ -f "$work/last-baseline" ]; then sweep; else say "no empty baseline is on record, so no sweep: report what is there"; fi
+    if grep -q '^baseline=empty$' "$record"; then
+      copy_shots "cleanup"
+      sweep || { say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY"; unclean=1; }
+    else
+      say "that session did not begin with an empty baseline, so nothing is swept: report what is there"
+    fi
   fi
   target_uninstall "$app_id"
   target_uninstall "$runner_id"
-  local left=0
   for id in "$app_id" "$runner_id"; do
-    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; left=1; fi
+    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
   done
-  [ "$left" = 0 ] && rm -f "$work/last-baseline"
+  [ "$unclean" = 0 ] && rm -f "$record"
+  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}"
+  [ "$unclean" = 0 ] || exit 3
 }
 
 command=${1:-}
