@@ -1,15 +1,23 @@
 # Cryptography reference
 
-`crates/kr-crypto` is the only crate in the tree that performs cryptography. It implements no
-primitive. Everything it does is a narrow, typed wrapper around a maintained implementation, plus
-the rules that make those implementations hard to misuse.
+`crates/kr-crypto` implements no primitive. Everything it does is a narrow, typed wrapper around a
+maintained implementation, plus the rules that make those implementations hard to misuse. The same
+holds for the whole tree: no crate, package or application writes a cipher, a hash, a signature
+scheme, a key exchange or a password-authenticated key exchange of its own. A crate that needs one
+calls a maintained library, and the libraries are the ones below.
 
 | What | Implementation |
 | --- | --- |
 | `crypto_box_easy`, Ed25519, `crypto_secretstream_xchacha20poly1305`, XChaCha20-Poly1305, `crypto_kdf`, the CSPRNG | libsodium, through the pinned `libsodium-sys-stable` binding, which builds the C library from source |
 | HKDF-SHA256, HMAC-SHA256, SHA-256 | the maintained RustCrypto `hkdf`, `hmac` and `sha2` crates |
-| Canonical encoding and digests | `crates/kr-cbor` |
+| Canonical encoding and digests | `crates/kr-cbor`, over the RustCrypto `sha2` crate |
 | Wire shapes | `crates/kr-protocol` |
+| The short-code PAKE | the RustCrypto `spake2` crate, which `crates/kr-pairing` alone depends on |
+| Verifying the signed metadata of a plugin catalogue | the `tough` TUF client, built on `aws-lc-rs` |
+| TLS to a service and to a pairing room | `rustls`, with `ring` and the platform's certificate verifier |
+| The transport between devices | iroh |
+| Digests in the TypeScript packages | the platform's WebCrypto |
+| Secrets at rest on a phone, and the voice confirmation's Ed25519 signature | the platform's own libraries: the Keychain and CryptoKit on iOS, the Keystore and the Java security provider on Android |
 
 ## The unsafe boundary
 
