@@ -162,8 +162,9 @@ fn lines(setup: &DescriptionSetup) -> Vec<Line> {
         && setup.download != DescriptionDownload::Running
     {
         lines.push(stdout_line!(
-            "kr host descriptions --download fetches the files. Until then every session shows \
-             its title from metadata."
+            "kr host descriptions --download fetches the files. Until then nothing new is \
+             generated, and a session shows the title it has from metadata, a pin or an earlier \
+             description."
         ));
     }
     if setup.can_cancel {

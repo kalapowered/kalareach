@@ -206,16 +206,19 @@ impl Worker {
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
-            .adopt_worker(&WorkerRecord {
-                session_id,
-                display_number,
-                public_key,
-                process_identity: process.clone(),
-                endpoint: endpoint.as_text(),
-                profile: WorkerProfile::HeadlessUser,
-                state: SessionState::Live,
-                acknowledged_revision: AuthorityRevision::new(0),
-            })
+            .adopt_worker(
+                &WorkerRecord {
+                    session_id,
+                    display_number,
+                    public_key,
+                    process_identity: process.clone(),
+                    endpoint: endpoint.as_text(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+                Some(&DesktopBinding::none()),
+            )
             .expect("the worker is recorded");
         drop(registry);
         kr_ipc::descriptor::publish(
@@ -2802,5 +2805,55 @@ async fn a_partial_left_by_a_daemon_that_went_mid_fetch_is_removed_at_the_next_s
         environment.setup().await.download,
         DescriptionDownload::Verified
     );
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a fetch the owner asked for while descriptions are off goes on through the
+/// requests that read the configuration (every `kr new`, `kr status` and `kr doctor` does) and
+/// through a change to the other setting; only the change to off stops a fetch. The control is the
+/// same fetch stopped by turning descriptions on and then off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_asked_for_while_descriptions_are_off_goes_on_through_other_acceptances() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.configure(Some(false), None).await;
+    environment.download(DescriptionDownloadAction::Start).await;
+    fixture.until_half_sent().await;
+    until("the partial file", || !environment.partials().is_empty()).await;
+
+    // Each of these accepts the configuration again with descriptions still off.
+    environment.configure(None, Some(true)).await;
+    environment
+        .controller()
+        .apply_configuration(
+            &kr_protocol::hostinfo::configuration::Change::Descriptions {
+                enabled: None,
+                on_battery: Some(false),
+            },
+        )
+        .await
+        .expect("the document is changed");
+    let still = environment.setup().await;
+    assert_eq!(still.download, DescriptionDownload::Running, "{still:?}");
+    assert!(
+        !environment.partials().is_empty(),
+        "the partial is still being written"
+    );
+
+    // Turned on and then off again, the change to off stops it.
+    environment.configure(Some(true), None).await;
+    environment.configure(Some(false), None).await;
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(environment.partials().is_empty());
     environment.stop().await;
 }

@@ -564,7 +564,7 @@ names something no longer installed is not an error, because nobody asked for it
 | `--cancel` | Stop the fetch that is running and remove what it wrote |
 | `--environment <id>` | Act in another environment than this installation's own |
 
-The options `--on` and `--off` are mutually exclusive, and `--download` cannot be combined with `--off` or `--cancel`. One action regarding the settings and one regarding the download can be given at the same time. The settings are recorded in the host's configuration and a fetch is started in the daemon, and the command prints what setup shows afterwards, so the output of `--download` is the fetch running. A battery setting that is neither `on` nor `off` is a usage failure and changes nothing.
+The options `--on` and `--off` are mutually exclusive, and `--download` cannot be combined with `--off` or `--cancel`. One action regarding the settings and one regarding the download can be given at the same time. The settings are recorded in the host's configuration and a fetch is started in the daemon, and the command prints what setup shows afterwards, so the output of `--download` is what setup shows once the fetch has been started. A battery setting that is neither `on` nor `off` is a usage failure and changes nothing.
 
 With `--json` the same answer is printed as a document with the fields `offered`, `enabled`, `on_battery`, `profile_id`, `asset_bytes`, `sources`, `download`, `fetched_bytes`, `failure`, `can_cancel`, `can_disable`, `needs_hosted_account`, `unavailable`, `state` and `paused`. The daemon of the environment must be running when this command is run.
 

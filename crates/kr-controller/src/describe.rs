@@ -93,6 +93,9 @@ pub struct DescribeModule {
     links: link::Links,
     /// The fetch of the model's files, when one runs.
     fetches: assets::Fetches,
+    /// Whether descriptions were on at the last acceptance of the configuration, so that a fetch
+    /// is stopped by the change to off and not by every acceptance that finds them off.
+    enabled_seen: std::sync::atomic::AtomicBool,
     /// Where this crate's own tests stop a read.
     #[cfg(test)]
     pub(crate) pauses: Pauses,
@@ -134,6 +137,7 @@ impl DescribeModule {
             host: OnceLock::new(),
             links: link::Links::default(),
             fetches: assets::Fetches::default(),
+            enabled_seen: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             pauses: Pauses::default(),
         })
@@ -152,14 +156,19 @@ impl DescribeModule {
     }
 
     /// Applies the owner's settings, as the configuration document says them: the host takes them
-    /// at its next turn, and turning descriptions off also stops a fetch of the model's files, as
-    /// it stops every other piece of work in flight. Every acceptance of the document comes here,
-    /// whether the daemon wrote it or the owner edited it by hand.
+    /// at its next turn, and the change to off also stops a fetch of the model's files, as it
+    /// stops every other piece of work in flight. Every acceptance of the document comes here,
+    /// whether the daemon wrote it or the owner edited it by hand; one that finds descriptions off
+    /// as they already were changes nothing, so a fetch the owner asked for while they are off
+    /// goes on.
     pub(crate) fn apply_settings(&self, settings: kr_describe::resource::ResourceSettings) {
         if let Some(host) = self.host() {
             host.settings(Some(settings.enabled), Some(settings.on_battery));
         }
-        if !settings.enabled {
+        let was_enabled = self
+            .enabled_seen
+            .swap(settings.enabled, std::sync::atomic::Ordering::AcqRel);
+        if was_enabled && !settings.enabled {
             self.fetches.cancel();
         }
     }

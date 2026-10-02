@@ -40,7 +40,9 @@ natively and then started on the machine that built it. None is only cross-built
 
 The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
 `kr-hook` and `kr-plugin-host`. Each one is built by a Cargo command of its own, as the Windows release builds
-them, so its dependencies resolve exactly as they do for the release.
+them, so its dependencies resolve exactly as they do for the release. The description process is built for every
+target except `aarch64-pc-windows-msvc`, where llama.cpp's CPU backend does not build with MSVC and no model
+profile lists the target.
 
 ## How each floor is read
 
