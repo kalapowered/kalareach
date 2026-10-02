@@ -110,8 +110,8 @@ async fn a_replacement_window_to_a_peer_that_stopped_reading_ends_the_connection
     a_peer_that_never_reads("renewal").await;
 }
 
-/// The control: a peer that reads what it is sent keeps its connection however long the loop goes
-/// on writing, and the loop never has to wait for it.
+/// The control: a peer that reads what it is sent keeps its connection, and stays registered,
+/// however long the loop goes on writing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_reads_keeps_its_connection() {
     let (_temp, controller, endpoint) =

@@ -175,8 +175,8 @@ pub trait AdmissionHook: Send + Sync {
     /// Runs `commit`, which makes one new effect durable, with the admission held standing across
     /// it, or refuses without running it.
     ///
-    /// `commit` is short, synchronous and takes no lock of the host's, and nothing else is asked
-    /// of the hook from inside it.
+    /// `commit` is synchronous, is one store transaction (including its sync to disk) and takes no
+    /// lock of the host's, and nothing else is asked of the hook from inside it.
     ///
     /// # Errors
     ///
