@@ -142,7 +142,8 @@ pub struct HostReading {
     /// moment, because a clock a host trusts is still a clock somebody can set.
     pub wall_proven: bool,
     /// The privacy state in force while this reading is used, when the host says: what every
-    /// decision made under it is stamped with ([`crate::engine::Item::decided_privacy`]).
+    /// decision made under it is stamped with ([`crate::engine::Item::decided_privacy`]), except one
+    /// that quiet hours hold over an earlier decision not yet taken, which keeps that one's stamp.
     pub privacy: Option<PrivacyStamp>,
 }
 
@@ -173,7 +174,7 @@ impl HostReading {
         }
     }
 
-    /// Returns this reading with the privacy state every decision made under it is stamped with.
+    /// Returns this reading with the privacy state a decision made under it is stamped with.
     #[must_use]
     pub const fn under(self, privacy: PrivacyStamp) -> Self {
         Self {

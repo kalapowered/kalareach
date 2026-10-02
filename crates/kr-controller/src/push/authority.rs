@@ -207,10 +207,11 @@ impl GrantedRecipients {
     /// had not been unpaired before that either, and the answer is decided at that one read. The
     /// other order would find a grant withdrawn while the device was being read as standing. A
     /// revocation of one grant is found as well, since the grant is the last read. What this order
-    /// does not find is a mark on the device's record alone landing between the two reads, which
-    /// no path of the daemon makes: the network module's `revoke_device` is the one entry that
-    /// does, and only tests call it. A caller that revokes a device without its grants has to
-    /// withdraw the grants first, or this has to read the device again.
+    /// does not find is a mark on the device's record landing between the two reads while the grant
+    /// still stands, which the daemon's unpairing never leaves, because it withdraws the grants
+    /// first: the network module's `revoke_device` marks the device alone, and only tests call it.
+    /// A caller that revokes a device without its grants has to withdraw the grants first, or this
+    /// has to read the device again.
     fn still_standing(&self, standing: &Standing, bound_to: Option<&DeviceRecord>) -> bool {
         if bound_to.is_some_and(|device| !self.is_still_paired(device)) {
             return false;

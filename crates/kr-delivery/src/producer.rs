@@ -557,7 +557,8 @@ impl Fate {
     ///
     /// A decision is produced only under the privacy generation it was made in, in privacy mode as
     /// out of it. The store stamps each decision with the state it was made under, which no clock
-    /// can change, and that stamp is what decides. An item decided before the store said, or by a
+    /// can change, and that stamp is what decides. A decision that quiet hours hold over one not yet
+    /// taken carries that one's stamp, and is judged by it. An item decided before the store said, or by a
     /// caller that never did, has only the time it was decided at, which quiet hours do not move
     /// when they release it: with privacy mode off, one decided at or before the moment privacy
     /// mode was last turned off may have been decided while it was on, and a time recorded for
@@ -723,10 +724,12 @@ impl Producer {
     /// A decision is produced only under the privacy generation it was made in, in privacy mode as
     /// out of it: the store stamps each decision with the state it was made under, and an
     /// announcement whose stamp is not the state in force becomes an event with no notice, whatever
-    /// the clocks say. Entering privacy mode fences what carries content and turning it off brings
-    /// none of it back, so a decision kept across a private period, held by quiet hours or by the
-    /// offer, is never sent after it. One whose store recorded no stamp is dropped when it was
-    /// decided at or before the moment privacy mode was last turned off.
+    /// the clocks say. A decision that quiet hours hold over one not yet taken carries that one's
+    /// stamp, and is judged by it. Entering privacy mode fences what carries content and turning it
+    /// off brings none of it back, so a decision kept across a private period, held by quiet hours
+    /// or by the offer, is never sent after it. With privacy mode off, one whose store recorded no
+    /// stamp is dropped when it was decided at or before the moment privacy mode was last turned
+    /// off.
     ///
     /// While privacy mode is off, an announcement becomes an event this journal holds the notice
     /// of, and [`Producer::finish_pending`] produces from it. Two further kinds become an event with

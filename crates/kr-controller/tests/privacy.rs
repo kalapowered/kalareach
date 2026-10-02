@@ -2719,10 +2719,10 @@ fn kr_req_24_27_a_send_on_the_wire_is_waited_for_before_the_change_is_recorded()
 }
 
 /// KR-REQ-24.27: a pass of the attention store that is deciding an announcement holds the privacy
-/// state from the moment it reads it to the end of the pass, so a change of privacy mode that comes
-/// meanwhile waits for it: nothing is recorded until the pass ends, and what the pass decided is
-/// stamped with the state it read, the state before the change. The control: the same pass with no
-/// change arriving is stamped the same.
+/// state from the moment it reads it to the end of the pass, so turning privacy mode on meanwhile
+/// waits for it: nothing is recorded until the pass ends, and what the pass decided is stamped with
+/// the state it read, the state before the change. The control: the same pass with no change
+/// arriving is stamped the same.
 #[test]
 fn kr_req_24_27_a_change_of_privacy_mode_waits_for_the_pass_that_is_deciding_an_announcement() {
     for changes in [false, true] {
