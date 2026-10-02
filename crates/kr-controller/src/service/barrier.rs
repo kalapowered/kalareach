@@ -7,6 +7,7 @@ use std::sync::Arc;
 use kr_protocol::action::RevocationBarrier;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
+use kr_transport::lease::WorkerBinding;
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
@@ -287,9 +288,14 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn announce_authority_revision(&self) -> Result<RevocationBarrier> {
+        // Taken before anything is read, so a worker that ends while this runs is held until it is
+        // over, whatever happens to it, and the revision is recorded in the section that reads it.
+        let round = self.leases.begin_round();
         let revision = {
             let registry = self.registry.lock().await;
-            registry.authority_revision()?
+            let revision = registry.authority_revision()?;
+            round.at(revision);
+            revision
         };
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         // Membership comes from the registry, not from the verified directory. A worker whose
@@ -313,8 +319,12 @@ impl Controller {
             // arrives over a control path this daemon has already given up on lifts nothing.
             // The control path is registered before the announcement travels, so an
             // acknowledgement is measured against a binding this daemon actually holds. Without
-            // it a replacement daemon would compare every answer against a binding of zero.
-            let binding = self.leases.bind(session_id);
+            // it a replacement daemon would compare every answer against a binding of zero. A
+            // session that closed since the directory was read has no worker to announce to, and
+            // nothing is made of it.
+            let Some(binding) = self.bind_worker(session_id).await? else {
+                continue;
+            };
             let outcome = {
                 match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await {
                     Ok(Ok(mut link)) => {
@@ -382,11 +392,10 @@ impl Controller {
                     }
                 }
                 // A worker that is confirmed gone answers the question a different way: it can no
-                // longer act under anything.
+                // longer act under anything. A closure this records tells the barrier in the
+                // section that records it.
                 _ => {
-                    if self.reconcile(session_id).await?.is_some() {
-                        self.leases.worker_ended(session_id);
-                    }
+                    self.reconcile(session_id).await?;
                 }
             }
         }
@@ -399,19 +408,65 @@ impl Controller {
             if attempted.contains(session_id) {
                 continue;
             }
-            if self.reconcile(*session_id).await?.is_some() {
-                self.leases.worker_ended(*session_id);
+            self.reconcile(*session_id).await?;
+        }
+        // The report is taken inside one section of the registry, which is also where a closure is
+        // recorded and the barrier is told of it. The workers it covers are those that were
+        // recorded when this began and have no closure: a worker that closed since is ended and
+        // needs no place in it, and a closure cannot land between this read and the report. A row
+        // is removed only by recording a closure, so a session with a closure is not a worker even
+        // where an earlier build's recovery wrote its row again.
+        let mut registry = self.registry.lock().await;
+        let mut covered = Vec::new();
+        for session_id in known {
+            if registry.closure(session_id)?.is_none() {
+                covered.push(session_id);
             }
         }
-        let report = self.leases.report(revision, known);
+        let report = round.report(revision, covered);
         // The one place a fence debt is settled. Every worker has acknowledged this revision or is
         // confirmed ended, which is the whole of what a completed revocation is; nothing else -
         // not an effect that succeeded, not a restart, not a document that stopped being usable -
         // may clear it.
         if report.holds() {
-            self.registry.lock().await.settle_fence(revision)?;
+            registry.settle_fence(revision)?;
         }
         Ok(report)
+    }
+
+    /// Establishes a worker's control path, unless its session has closed.
+    ///
+    /// The one place this daemon makes a record of a worker in its barrier. Taken under the
+    /// registry's lock, which is where a closure is recorded and the barrier is told of it, so the
+    /// worker is either bound before its closure and ended by it, or the closure is seen here and
+    /// nothing is made. A worker that closed is gone for good: its record would never end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn bind_worker(&self, session_id: SessionId) -> Result<Option<WorkerBinding>> {
+        let registry = self.registry.lock().await;
+        if registry.closure(session_id)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.leases.bind(session_id)))
+    }
+
+    /// Returns the binding in force for a worker, binding it first when nothing is held of it, and
+    /// nothing for a session that has closed ([`Self::bind_worker`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn binding_or_bind(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<WorkerBinding>> {
+        let registry = self.registry.lock().await;
+        if registry.closure(session_id)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.leases.binding_or_bind(session_id)))
     }
 
     /// Asks a worker for the rest of the fence evidence it owes, a page at a time.
