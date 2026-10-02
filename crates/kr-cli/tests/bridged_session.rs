@@ -111,11 +111,32 @@ fn stand_in(tools: &Path, destination: &Path, home: &Path, login: Login) -> Stri
     format!(
         r##"#!/bin/sh
 printf '%s\n' "$*" >>'{tools}/invocations'
-# What the platform says of the distribution, which a test sets to say it is stopped. Asking runs
-# nothing in the distribution, as the real command does not.
+# What the platform says of the distribution, which a test sets to say it is stopped
+# (`distribution-state`) and to say it prints its words in another language (`host-language`).
+# Asking runs nothing in the distribution, as the real command does not. Like the real command it
+# writes UTF-16LE, and the listings of names print nothing else.
 if [ "$1" = "--list" ]; then
-  printf '  NAME          STATE      VERSION\n  Test-Distro   %s   2\n' \
-    "$(cat '{tools}/distribution-state' 2>/dev/null || echo Running)"
+  state="$(cat '{tools}/distribution-state' 2>/dev/null || echo Running)"
+  case "$*" in
+    "--list --quiet")
+      printf 'Test-Distro\r\n' | iconv -f UTF-8 -t UTF-16LE
+      ;;
+    "--list --running --quiet")
+      if [ "$state" = Running ]; then printf 'Test-Distro\r\n' | iconv -f UTF-8 -t UTF-16LE; fi
+      ;;
+    "--list --verbose")
+      word="$state"
+      if [ "$(cat '{tools}/host-language' 2>/dev/null)" = de ]; then
+        if [ "$state" = Running ]; then word='Wird ausgeführt'; else word='Beendet'; fi
+      fi
+      printf '  NAME          STATE      VERSION\r\n  Test-Distro   %s   2\r\n' "$word" \
+        | iconv -f UTF-8 -t UTF-16LE
+      ;;
+    *)
+      echo "the stand-in for wsl.exe has no answer for: $*" >&2
+      exit 2
+      ;;
+  esac
   exit 0
 fi
 # The helper is this process, which becomes it, so a test can name the one it means to end.
@@ -1740,6 +1761,67 @@ async fn an_export_from_a_stopped_environment_starts_nothing() {
     assert!(
         !world.destination_answers(),
         "nothing started the destination's daemon"
+    );
+}
+
+/// KR-REQ-03.14: a distribution is read as running or as stopped on a Windows host that prints the
+/// states of `wsl.exe --list --verbose` in a language other than English. A person on that host
+/// enrols the running distribution, has a session exported from it, and is refused the export once
+/// the distribution is stopped, with nothing started to find out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_distribution_is_read_as_running_or_stopped_in_whatever_language_the_host_prints() {
+    let world = World::start().await;
+    std::fs::write(world.tools.join("host-language"), "de").expect("the host's language");
+    world.enrol_destination();
+    let session = a_closed_session_in_the_destination(&world);
+
+    let file = world.export_path("in-german");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    assert!(
+        exported.status.success(),
+        "a running distribution is exported from: {}{}",
+        String::from_utf8_lossy(&exported.stdout),
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert!(file.exists(), "the export made its file");
+
+    world.stop_destination_daemon();
+    std::fs::write(world.tools.join("distribution-state"), "Stopped")
+        .expect("the platform's answer");
+    let before = world.invocations();
+    let refused_file = world.export_path("in-german-stopped");
+    let refused = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        refused_file.to_str().expect("a path"),
+    ]);
+    let said: Value = serde_json::from_slice(&refused.stdout).unwrap_or_else(|error| {
+        panic!(
+            "kr export printed no document ({error}): {}; it said {}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        )
+    });
+    assert!(!refused.status.success(), "{said}");
+    assert_eq!(said["code"], "ENVIRONMENT_UNAVAILABLE", "{said}");
+    assert!(!refused_file.exists(), "no file was made");
+    let asked = std::fs::read_to_string(world.tools.join("invocations")).expect("the record");
+    let since: Vec<&str> = asked.lines().skip(before).collect();
+    assert!(
+        since.iter().all(|line| line.starts_with("--list")),
+        "the platform was asked and nothing was run in the distribution: {since:?}"
     );
 }
 
