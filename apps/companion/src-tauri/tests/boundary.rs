@@ -956,6 +956,266 @@ fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
     );
 }
 
+/* ---- The declared platform floors ------------------------------------------------------------
+ *
+ * Each release build's declared minimum is section 3's baseline: iOS and iPadOS 17, Android 10
+ * (API level 29) and macOS 14. A floor is declared in several places that nothing makes agree: the
+ * Tauri configuration, the generated Apple project and its Podfile, the Swift packages the plugin
+ * is built from, and the Gradle files of the application and of the plugin. A build takes the
+ * highest of them where it takes any one, so a place left at an older release is a floor the
+ * application would declare to a store and not keep. These tests read every file the application
+ * holds that declares one, found by what it is, and hold each declaration to the baseline.
+ */
+
+/// The platforms a floor is declared for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Floor {
+    Ios,
+    Macos,
+    Android,
+}
+
+impl Floor {
+    fn name(self) -> &'static str {
+        match self {
+            Floor::Ios => "iOS",
+            Floor::Macos => "macOS",
+            Floor::Android => "Android",
+        }
+    }
+
+    /// The oldest release the platform supports: the major and minor version.
+    fn baseline(self) -> (u32, u32) {
+        match self {
+            Floor::Ios => (17, 0),
+            Floor::Macos => (14, 0),
+            Floor::Android => (29, 0),
+        }
+    }
+}
+
+/// One floor, as a file declares it.
+#[derive(Debug)]
+struct Declared {
+    file: String,
+    line: usize,
+    platform: Floor,
+    version: (u32, u32),
+    text: String,
+}
+
+/// The major and minor version a declaration writes: `17.0`, `'14.0'`, `29`, `.v17` or `.v10_13`.
+fn version_in(text: &str) -> Option<(u32, u32)> {
+    let digits = text
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ';' || c == ',')
+        .trim_start_matches(".v")
+        .trim_start_matches('v');
+    let mut parts = digits.split(['.', '_']);
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = match parts.next() {
+        Some(minor) => minor.trim().parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor))
+}
+
+/// What follows `marker` on a line, up to `end`.
+fn between<'a>(line: &'a str, marker: &str, end: char) -> Option<&'a str> {
+    let rest = &line[line.find(marker)? + marker.len()..];
+    Some(&rest[..rest.find(end)?])
+}
+
+/// Every floor the application's files declare.
+fn declared_floors() -> Vec<Declared> {
+    let application = crate_root()
+        .parent()
+        .expect("the crate sits in the application")
+        .to_path_buf();
+    let mut found = Vec::new();
+    let mut add = |file: &str, line: usize, platform: Floor, text: &str| {
+        let version =
+            version_in(text).unwrap_or_else(|| panic!("{file}:{line}: no version in {text:?}"));
+        found.push(Declared {
+            file: file.to_owned(),
+            line,
+            platform,
+            version,
+            text: text.trim().to_owned(),
+        });
+    };
+    for file in repository_files(&application) {
+        let name = file.rsplit('/').next().unwrap_or(&file);
+        let path = application.join(&file);
+        if name == "tauri.conf.json" && file == "src-tauri/tauri.conf.json" {
+            let bundle = read(&path)["bundle"].clone();
+            for (key, platform, field) in [
+                ("macOS", Floor::Macos, "minimumSystemVersion"),
+                ("iOS", Floor::Ios, "minimumSystemVersion"),
+                ("android", Floor::Android, "minSdkVersion"),
+            ] {
+                let value = &bundle[key][field];
+                let text = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), std::borrow::ToOwned::to_owned);
+                add(&file, 0, platform, &text);
+            }
+            continue;
+        }
+        let is_gradle = name == "build.gradle" || name == "build.gradle.kts";
+        let is_package = name == "Package.swift";
+        let is_project = name == "project.yml";
+        let is_pbxproj = name == "project.pbxproj";
+        let is_podfile = name == "Podfile";
+        let is_plist = name.ends_with(".plist");
+        if !(is_gradle || is_package || is_project || is_pbxproj || is_podfile || is_plist) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut in_deployment_target = false;
+        let mut previous_key = String::new();
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            let trimmed = line.trim();
+            if is_gradle
+                && (trimmed.starts_with("minSdk =") || trimmed.starts_with("minSdkVersion"))
+            {
+                add(
+                    &file,
+                    number,
+                    Floor::Android,
+                    trimmed.rsplit('=').next().unwrap_or(""),
+                );
+            }
+            if is_package {
+                for (marker, platform) in [(".iOS(", Floor::Ios), (".macOS(", Floor::Macos)] {
+                    if let Some(inside) = between(trimmed, marker, ')') {
+                        add(&file, number, platform, inside);
+                    }
+                }
+            }
+            if is_project {
+                if trimmed == "deploymentTarget:" {
+                    in_deployment_target = true;
+                    continue;
+                }
+                if in_deployment_target {
+                    if !line.starts_with("    ") {
+                        in_deployment_target = false;
+                    } else if let Some((key, value)) = trimmed.split_once(':') {
+                        let platform = match key {
+                            "iOS" => Floor::Ios,
+                            "macOS" => Floor::Macos,
+                            other => panic!("{file}:{number}: a deployment target for {other}"),
+                        };
+                        add(&file, number, platform, value);
+                    }
+                }
+            }
+            if is_pbxproj {
+                for (setting, platform) in [
+                    ("IPHONEOS_DEPLOYMENT_TARGET", Floor::Ios),
+                    ("MACOSX_DEPLOYMENT_TARGET", Floor::Macos),
+                ] {
+                    if let Some(value) = trimmed.strip_prefix(&format!("{setting} = ")) {
+                        add(&file, number, platform, value);
+                    }
+                }
+            }
+            if is_podfile {
+                for (marker, platform) in [
+                    ("platform :ios,", Floor::Ios),
+                    ("platform :osx,", Floor::Macos),
+                ] {
+                    if let Some(value) = trimmed.strip_prefix(marker) {
+                        add(&file, number, platform, value);
+                    }
+                }
+            }
+            if is_plist {
+                if let Some(value) = between(trimmed, "<string>", '<') {
+                    let platform = match previous_key.as_str() {
+                        "MinimumOSVersion" => Some(Floor::Ios),
+                        "LSMinimumSystemVersion" => Some(Floor::Macos),
+                        _ => None,
+                    };
+                    if let Some(platform) = platform {
+                        add(&file, number, platform, value);
+                    }
+                }
+                previous_key = between(trimmed, "<key>", '<').unwrap_or("").to_owned();
+            }
+        }
+    }
+    found
+}
+
+/// KR-REQ-03.05: every floor declared for `platform` is the baseline.
+fn assert_every_floor_is_the_baseline(platform: Floor) {
+    let off: Vec<String> = declared_floors()
+        .into_iter()
+        .filter(|declared| declared.platform == platform && declared.version != platform.baseline())
+        .map(|declared| format!("{}:{}: {}", declared.file, declared.line, declared.text))
+        .collect();
+    assert!(
+        off.is_empty(),
+        "these declare a {} floor other than section 3's baseline {:?}:\n{}",
+        platform.name(),
+        platform.baseline(),
+        off.join("\n")
+    );
+}
+
+#[test]
+fn every_ios_floor_the_application_declares_is_ios_17() {
+    assert_every_floor_is_the_baseline(Floor::Ios);
+}
+
+#[test]
+fn every_android_floor_the_application_declares_is_api_29() {
+    assert_every_floor_is_the_baseline(Floor::Android);
+}
+
+#[test]
+fn every_macos_floor_the_application_declares_is_macos_14() {
+    assert_every_floor_is_the_baseline(Floor::Macos);
+}
+
+/// The scan above finds a floor by the kind of file that declares it, so a file that moved or was
+/// renamed would leave it passing over nothing. These are the places the application declares a
+/// floor now; one that is gone fails here, and one that is new is held to the baseline above.
+#[test]
+fn the_floors_are_declared_where_the_scan_looks() {
+    let declared = declared_floors();
+    for (file, platform) in [
+        ("src-tauri/tauri.conf.json", Floor::Macos),
+        ("src-tauri/tauri.conf.json", Floor::Ios),
+        ("src-tauri/tauri.conf.json", Floor::Android),
+        ("src-tauri/gen/apple/project.yml", Floor::Ios),
+        (
+            "src-tauri/gen/apple/companion-tauri.xcodeproj/project.pbxproj",
+            Floor::Ios,
+        ),
+        ("src-tauri/gen/apple/Podfile", Floor::Ios),
+        ("src-tauri/gen/apple/Podfile", Floor::Macos),
+        ("native/platform/ios/Package.swift", Floor::Ios),
+        ("native/platform/ios/Package.swift", Floor::Macos),
+        ("native/platform/ios/Session/Package.swift", Floor::Ios),
+        ("native/platform/ios/Session/Package.swift", Floor::Macos),
+        ("src-tauri/gen/android/app/build.gradle.kts", Floor::Android),
+        ("native/platform/android/build.gradle.kts", Floor::Android),
+    ] {
+        assert!(
+            declared
+                .iter()
+                .any(|found| found.file == file && found.platform == platform),
+            "{file} declares no {platform:?} floor, or is not where the scan looks"
+        );
+    }
+}
+
 /// KR-REQ-13.19: a change of the system's font scale reaches the page while the application is
 /// open, and it does so because the system restarts the activity, which reloads the page at the new
 /// size. An activity that declares it handles the change itself is not restarted, and its web view

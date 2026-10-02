@@ -8,8 +8,8 @@ import PackageDescription
 let package = Package(
   name: "companion-session",
   platforms: [
-    .iOS(.v14),
-    .macOS(.v10_13),
+    .iOS("17.0"),
+    .macOS("14.0"),
   ],
   products: [
     .library(name: "CompanionSession", targets: ["CompanionSession"])

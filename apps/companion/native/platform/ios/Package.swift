@@ -9,7 +9,10 @@ import PackageDescription
 let package = Package(
   name: "companion-platform",
   platforms: [
-    .iOS(.v14)
+    .iOS("17.0"),
+    // The package is built for the Mac as well, as the build script compiles it for the machine
+    // that builds, and a package cannot depend on one that asks for more than it does.
+    .macOS("14.0"),
   ],
   products: [
     .library(

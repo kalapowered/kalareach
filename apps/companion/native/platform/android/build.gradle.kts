@@ -15,7 +15,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        minSdk = 24
+        minSdk = 29
         consumerProguardFiles("consumer-rules.pro")
         // The secret store's device tests, which need the Android Keystore.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
