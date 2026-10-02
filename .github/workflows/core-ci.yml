@@ -916,6 +916,14 @@ jobs:
             --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation \
             -- --test-threads=1 --include-ignored
 
+      # The startup entries' own tests that need a PowerShell: where each entry goes in a profile,
+      # what PowerShell says of the result, and what a removal gives back. A `--test` target above
+      # leaves a library's unit tests out, and an ordinary run leaves these out for want of a
+      # PowerShell, so this step runs them with --include-ignored where this job has one.
+      - name: Place and remove the PowerShell startup entries
+        run: |
+          cargo test --locked -p kr-shell-integration --lib host::startup:: -- --include-ignored
+
       # Section 7 qualifies the packages against the startup customisations people run. The
       # customisations are pinned by digest and fetched once here. The checks that need a package
       # or a customisation are left out of an ordinary run, and this job has both, so it runs them
