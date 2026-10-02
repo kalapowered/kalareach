@@ -252,6 +252,11 @@ impl EnvironmentPaths {
         for path in [&self.runtime_dir, &self.descriptors_dir()] {
             create_private_tree(&self.runtime_root, path)?;
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        refuse_shared_root(
+            &self.runtime_root,
+            &SHARED_BETWEEN_DISTRIBUTIONS.map(Path::new),
+        )?;
         for path in [
             &self.state_dir,
             &self.journals_dir(),
@@ -2842,6 +2847,32 @@ fn runtime_root_in(
     Ok(home()?.join(".cache").join("kalareach").join("run"))
 }
 
+/// Refuses a runtime root, once it is made, that lies in storage every distribution of a machine
+/// shares.
+///
+/// The root was judged by its name before it existed. A link put where its parent was to be made
+/// between that and the making moves it, and the directories made through the link are in the
+/// shared mount. So where it really lies is judged again, as made.
+///
+/// # Errors
+///
+/// Returns an error naming the root when it is in a shared mount.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn refuse_shared_root(root: &Path, shared: &[&Path]) -> Result<()> {
+    if is_shared(root, shared) {
+        return Err(IpcError::io(
+            "create",
+            root,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the runtime directory is in storage shared between distributions, where every \
+                 other distribution could open its sockets",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `path` is, or may be taken to be, in storage that every distribution of a machine shares.
 ///
 /// It is where the path really lies that decides: the deepest part of it that exists is resolved
@@ -3180,6 +3211,36 @@ mod tests {
             PathBuf::from(BELOW_HOME),
             "and one several levels below it"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A link put where the runtime directory's parent is to be made, after the name was judged,
+    /// moves the root into the shared mount: nothing judged where the directories were made. The
+    /// root as made is judged again, and a root that is in the shared mount is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_made_after_the_runtime_directory_was_judged_does_not_put_the_root_in_the_shared_mount()
+     {
+        let root = temporary_root("late-link");
+        let shared = root.join("wslg");
+        std::fs::create_dir_all(&shared).expect("the shared mount");
+        let named = root.join("user-1000").join("kalareach");
+        // Judged while nothing is there: the distribution's own.
+        assert_eq!(
+            root_for(&root.join("user-1000"), &[&shared]),
+            named,
+            "judged while nothing is there"
+        );
+        // Then a link takes the directory's place, and the root is made through it.
+        std::os::unix::fs::symlink(&shared, root.join("user-1000")).expect("a link");
+        create_private_tree(&named, &named).expect("the root is made in the shared mount");
+        assert!(shared.join("kalareach").is_dir());
+        let refused = refuse_shared_root(&named, &[&shared]).expect_err("the root is shared");
+        assert!(refused.to_string().contains("shared between"), "{refused}");
+        // The control: a root that is the distribution's own is let be.
+        let own = root.join("own").join("kalareach");
+        create_private_tree(&own, &own).expect("an ordinary root");
+        refuse_shared_root(&own, &[&shared]).expect("an ordinary root is not refused");
         std::fs::remove_dir_all(&root).ok();
     }
 
