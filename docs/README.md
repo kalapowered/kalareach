@@ -212,3 +212,49 @@ KalaReach does not adopt a terminal it did not start. Every session is a new pse
 worker created, with a new root shell, made by a create request from `kr new`, the companion
 application, a paired device or a workflow. A shell or terminal window already running elsewhere is
 never taken over.
+
+## How the repositories are kept
+
+None of the three repositories holds an instruction file for a coding assistant. `AGENTS.md`,
+`CLAUDE.md`, `GEMINI.md` and their lower-case and suffixed forms, and the configuration files and
+directories of the common assistants, are ignored at any depth by the first section of each
+repository's `.gitignore`, and no commit in any of the three has tracked one. Product files that
+look similar, such as the installable `skills/kalareach-contact/SKILL.md`, are tracked.
+
+Text in the repositories describes the product and the change. It names no task, review, build tool
+or record kept outside the repositories, and a commit message is one line with no body and no
+trailer. In this repository `scripts/check-clean-checkout.sh` refuses a tracked file that names such
+a record, a commit message longer than one line and a broken relative link, and it passes on the
+whole tree and the whole history. The website's `pnpm records:check` refuses the same kinds of
+record, and build-assistant files, in the commits and the deployment bundle it is about to send.
+
+There is no second specification hierarchy. The protocol reference, its generated method index and
+glossary, and the generated schemas and vectors live beside the code they describe, in
+`docs/protocol/`, `packages/protocol/` and `fixtures/`, and each part's reference lives under
+`docs/` beside its crate. No repository holds a plan, a requirements register or a decision log.
+
+Setup, build and test work from a clean checkout. `scripts/check-clean-checkout.sh` clones one
+commit into an empty directory, gives the run a home directory, Cargo home, pnpm store and temporary
+directory of its own, and runs the lists in the README's "Build and test" section, so nothing a
+machine has collected can stand in for what the repository provides. The website's README lists its
+commands from `pnpm install --frozen-lockfile`, and the catalogue's lists its own from its pinned
+toolchain. Deploying the website needs the operator's credentials, which `pnpm setup:check` names
+and which are never in a repository.
+
+Each part that has a wire format, a stored format or a package contract keeps the fixtures that test
+it with its code, and generates them: `kr-protocol-gen`, `kr-crypto-vectors`, `kr-pairing-vectors`,
+`kr-plugin-sdk-gen`, `kr-term-fixtures`, `kr-shell-fixtures` and the TypeScript generators each
+write theirs, and each has a `--check` mode that the README's list runs. A change to one of those
+contracts is committed with its regenerated outputs and with every consumer in the repository, so
+the check fails when one is left behind. The other two repositories take released packages, vectors
+and revisions, pinned by lockfile.
+
+Internal interfaces change in one commit with every caller in the repository, and the old form is
+deleted. The code keeps no deprecated alias and no versioned copy of an interface that all its
+callers have left. Compatibility is kept at the boundaries where something outside the commit still
+runs or exists. A worker outlives an upgrade of the control daemon
+([host/updates.md](host/updates.md)). A store an earlier build wrote is migrated forward in one
+transaction, inside a stated window, with no branch that reads two schemas
+([Migrations](host/README.md#migrations)). A host and a client of different versions negotiate a
+protocol version ([Version negotiation](protocol/README.md#version-negotiation)). A plugin package
+is built for an SDK and component interface range ([plugins/README.md](plugins/README.md)).
