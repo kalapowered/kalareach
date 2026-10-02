@@ -685,7 +685,10 @@ async fn the_path_an_announcement_bound_before_a_link_was_taken_is_given_up_with
             .acknowledge(session_id, announced_over, revision, None),
         "its acknowledgement is refused"
     );
-    let report = controller.leases.report(revision, [session_id]);
+    let report = controller
+        .leases
+        .begin_round()
+        .report(revision, [session_id]);
     assert!(
         !report.holds() && report.pending() == vec![session_id],
         "and the worker is pending: {report:?}"

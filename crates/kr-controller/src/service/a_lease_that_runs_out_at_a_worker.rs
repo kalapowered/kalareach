@@ -197,7 +197,13 @@ async fn world() -> World {
             omitted: U64::ZERO,
         }),
     ));
-    assert!(controller.leases.report(revision, [session_id]).holds());
+    assert!(
+        controller
+            .leases
+            .begin_round()
+            .report(revision, [session_id])
+            .holds()
+    );
 
     // A paired device whose connection this daemon admitted at that revision.
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -472,7 +478,11 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
         before,
         "no lease was issued"
     );
-    let report = world.controller.leases.report(moved, [world.session_id]);
+    let report = world
+        .controller
+        .leases
+        .begin_round()
+        .report(moved, [world.session_id]);
     assert!(!report.holds(), "the worker is pending: {report:?}");
     assert_eq!(
         report.workers[0].state,

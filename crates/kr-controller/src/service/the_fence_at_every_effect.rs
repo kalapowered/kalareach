@@ -787,7 +787,11 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         }),
     ));
     assert!(
-        controller.leases.report(before, [session_id]).holds(),
+        controller
+            .leases
+            .begin_round()
+            .report(before, [session_id])
+            .holds(),
         "the worker held the revision in force before anything was withdrawn"
     );
     let accepted = accepted(&controller);
@@ -861,7 +865,10 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         Some(lease),
         "the lease the action held is the last one issued"
     );
-    let report = controller.leases.report(withdrawn, [session_id]);
+    let report = controller
+        .leases
+        .begin_round()
+        .report(withdrawn, [session_id]);
     assert!(!report.holds(), "the worker is pending: {report:?}");
     assert_eq!(
         report.workers[0].state,
