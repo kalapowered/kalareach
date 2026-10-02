@@ -241,9 +241,10 @@ signing_before=""
 signing_ended=1
 
 # Puts the search list back as it was recorded and locks the signing keychain, once, whichever way the
-# signing ended, and answers whether both are known to have worked. Nothing releases the lock directory
-# unless both did: a list that could not be put back, or a keychain that could not be locked, keeps it,
-# so that no other build signs on top of an unresolved state.
+# signing ended, and answers whether both are known to have worked. The lock directory is released only
+# when both did and the release itself worked: a list that could not be put back, a keychain that could
+# not be locked or a lock that could not be removed keeps it, so that no other build signs on top of an
+# unresolved state.
 end_signing() {
   [ "$signing_ended" = 1 ] && return 0
   signing_ended=1
@@ -253,26 +254,22 @@ end_signing() {
   read_search_list || clean=0
   say "keychain search list after signing: $(printf '%s' "$listing" | tr '\n' ' ')"
   [ "$listing" = "$signing_before" ] || clean=0
-  if [ "$clean" = 1 ]; then
-    rmdir "$signing_lock" 2>/dev/null
+  if [ "$clean" = 1 ] && rmdir "$signing_lock" 2>/dev/null; then
     holding_lock=0
     return 0
   fi
-  say "THE KEYCHAIN SEARCH LIST OR THE KEYCHAIN'S LOCK IS NOT WHAT IT WAS BEFORE SIGNING: put it right by hand, then remove $signing_lock"
+  say "THE KEYCHAIN SEARCH LIST, THE KEYCHAIN'S LOCK OR THE SIGNING LOCK IS NOT WHAT IT WAS BEFORE SIGNING: put it right by hand, then remove $signing_lock"
   return 1
 }
 
-# A TERM, INT or HUP while signing, or while the signing is being undone: what is being undone is not
-# interrupted again. The command is stopped, then the list is put back and the keychain locked, before
-# this shell goes; a signal before the signing began only lets go of the lock.
+# A TERM, INT or HUP while the signing command runs, the one time signals are not ignored: the command
+# is stopped, then the signing is undone, before this shell goes.
 signing_interrupted() { # <exit status>
   trap '' INT TERM HUP
   [ -n "$signing_child" ] && kill "$signing_child" 2>/dev/null
   [ -n "$signing_child" ] && wait "$signing_child" 2>/dev/null
   signing_child=""
-  if [ "$signing_ended" = 0 ]; then end_signing
-  elif [ "$holding_lock" = 1 ]; then rmdir "$signing_lock" 2>/dev/null; holding_lock=0
-  fi
+  end_signing
   exit "$1"
 }
 
@@ -282,47 +279,51 @@ signing_interrupted() { # <exit status>
 # after. Nothing else changes: the login keychain stays first and the default keychain is not touched.
 # One signing runs at a time on this checkout, and a list that already holds the signing keychain, or
 # cannot be read, is not signed on top of.
+#
+# Signals are ignored from the first line to the last except while the command runs, so that no signal
+# can fall between taking the lock and noting that it is held, between starting the command and noting
+# its process, or inside the undoing: each of those would leave the keychain on the list or unlocked, or
+# release a lock that another build holds. While the command runs a signal stops it and undoes the signing.
 with_signing_keychain() { # <command...>
   [ "$target" = device ] || die "only a device build is signed"
   [ -n "${KR_KEYCHAIN:-}" ] && [ -f "${KR_KEYCHAIN_PASSWORD_FILE:-}" ] || die "KR_KEYCHAIN and KR_KEYCHAIN_PASSWORD_FILE are needed to sign"
+  trap '' INT TERM HUP
   mkdir -p "$work"
   signing_lock="$work/signing.lock"
   signing_ended=1
   holding_lock=0
-  trap 'signing_interrupted 130' INT
-  trap 'signing_interrupted 143' TERM
-  trap 'signing_interrupted 129' HUP
+  signing_child=""
   mkdir "$signing_lock" 2>/dev/null || die "another build is signing, or one ended without restoring the list: see $signing_lock"
   holding_lock=1
-  if ! read_search_list; then rmdir "$signing_lock"; holding_lock=0; die "the keychain search list could not be read, or it is empty"; fi
+  if ! read_search_list; then rmdir "$signing_lock" && holding_lock=0; die "the keychain search list could not be read, or it is empty"; fi
   signing_before=$listing
   if printf '%s\n' "$signing_before" | grep -Fxq "$KR_KEYCHAIN"; then
-    rmdir "$signing_lock"; holding_lock=0
+    rmdir "$signing_lock" && holding_lock=0
     die "the signing keychain is already on the search list: an earlier signing did not put it back, so put it back by hand"
   fi
   say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
   signing_paths=()
-  local each
+  local each status
   while IFS= read -r each; do signing_paths+=("$each"); done <<< "$signing_before"
   signing_ended=0
-  local status
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
     "$@" &
     signing_child=$!
+    trap 'signing_interrupted 130' INT
+    trap 'signing_interrupted 143' TERM
+    trap 'signing_interrupted 129' HUP
     wait "$signing_child"
     status=$?
+    trap '' INT TERM HUP
     signing_child=""
   else
     status=2
   fi
-  # Undoing the signing is not interrupted: it takes a moment, and an interruption in it would leave
-  # the keychain on the list or unlocked.
-  trap '' INT TERM HUP
   local undone=0
   end_signing || undone=1
   trap - INT TERM HUP
-  [ "$undone" = 0 ] || die "the signing left the keychain search list or the keychain's lock changed"
+  [ "$undone" = 0 ] || die "the signing left the keychain search list, the keychain's lock or the signing lock changed"
   return "$status"
 }
 
@@ -461,24 +462,45 @@ forwarded=0
 unclean=0
 unproven=0
 
-# Starts the test run for the phone in the background, writing its own identity into the record before
-# it becomes Xcode: the record line is `runner=<pid>|<start time>|<result bundle>`, written by the new
-# process itself and kept by `exec`, so that no moment exists in which Xcode drives the phone and the
-# record does not say so, whatever happens to this script. Sets runner_pid.
+# The record of a session is only ever appended to once it exists, so that nothing a later step does can
+# take away what an earlier one wrote: the target, the phone, the baseline, the sweep and every driver
+# of the test run are lines in it, and a driver that has ended is a `retired=` line, not a missing one.
+#
+# Starts the test run for the phone in the background as a new process that, before it becomes Xcode,
+# writes its own identity into the record (its number, its start time and its result bundle) and checks
+# that cleanup has not closed the gate; a process that cannot write its identity, or finds the gate
+# closed, ends without starting Xcode. Cleanup closes the gate before it reads the record, so a driver
+# is either in the record cleanup reads or sees the gate closed: no driver can run unseen. Sets runner_pid.
 start_driver() { # <the result bundle> <the output file> <xcodebuild arguments...>
   local result=$1 output=$2
   shift 2
-  bash -c 'printf "runner=%s|%s|%s\n" "$$" "$(ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")" "$1" >> "$2"; shift 2; exec xcodebuild "$@"' \
-    driver "$result" "$record" "$@" > "$output" 2>&1 &
+  bash -c '
+    started=$(ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")
+    [ -n "$started" ] || exit 70
+    printf "runner=%s|%s|%s\n" "$$" "$started" "$1" >> "$2" || exit 71
+    [ ! -e "$2.gate" ] || exit 72
+    shift 2
+    exec xcodebuild "$@"' driver "$result" "$record" "$@" > "$output" 2>&1 &
   runner_pid=$!
 }
 
-# The driver has ended: its line leaves the record, so that a later process with the same number is
-# never taken for it.
+# The driver has ended: a line says so, naming its number and its start time.
 retire_driver() { # <pid>
+  local started
   [ -f "$record" ] || return 0
-  grep -v "^runner=$1|" "$record" > "$record.tmp"
-  mv "$record.tmp" "$record"
+  started=$(sed -n "s/^runner=$1|\([^|]*\)|.*/\1/p" "$record" | tail -1)
+  [ -n "$started" ] || return 0
+  echo "retired=$1|$started" >> "$record"
+}
+
+# Whether a number is the driver a record line names: its start time and its command line both are what
+# the line says. Another process that has the number now is not.
+is_driver() { # <pid> <start time> <result bundle>
+  local now
+  kill -0 "$1" 2>/dev/null || return 1
+  now=$(ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//')
+  [ "$now" = "$2" ] || return 1
+  ps -o command= -p "$1" 2>/dev/null | grep -qF -- "$3"
 }
 
 # Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
@@ -552,7 +574,7 @@ finish_session() {
     if [ "$id" = "$app_id" ] && [ "$keep_app" = 1 ]; then continue; fi
     if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
   done
-  if [ "$unclean" = 0 ]; then rm -f "$record"; fi
+  if [ "$unclean" = 0 ]; then rm -rf "$record" "$record.gate"; fi
   rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}" "$(dirname "$(cat "$work/tests-$target.path" 2>/dev/null)")/attachment-proof.xctestrun"
   [ "$unclean" = 0 ] || exit 3
   [ "$unproven" = 0 ] || exit 4
@@ -585,6 +607,7 @@ session() {
   done
   # The record says whose installation this is: the target, the phone, and when it began. Cleanup
   # touches nothing that this record does not name.
+  rm -rf "$record.gate"
   printf 'target=%s\ndevice=%s\nsession=%s\nstarted=%s\n' "$target" "$KR_DEVICE" "$name" "$started" > "$record"
   trap 'stop_runner; finish_session; exit 130' INT
   trap 'stop_runner; finish_session; exit 143' TERM
@@ -741,27 +764,29 @@ report() { # <output>
     | sed -E "s/Test Case '-\[KalaReachUITests\./Test Case '[/" || true
 }
 
-# Ends the drivers the record names, if they are still running: a session killed with no chance to stop
-# its test run leaves xcodebuild behind, and nothing is uninstalled or deleted while that is still
-# driving the phone. A process is the driver only when its start time and its command line both are
-# what the record says; any other process with the same number is left alone.
+# Ends the drivers the record names that have not ended, and keeps any other from starting: the gate is
+# closed first, so a driver that has not yet written its identity ends by itself. A process is signalled
+# only while it is still the driver the record line names, checked before each signal and while waiting;
+# the process that has the number after the driver ended is never touched.
 stop_recorded_driver() {
-  local entry pid started result now waited
+  local entry pid started result waited
+  mkdir "$record.gate" 2>/dev/null
+  [ -d "$record.gate" ] || { say "THE GATE AGAINST A NEW TEST RUN COULD NOT BE CLOSED: nothing is cleaned up"; exit 3; }
   while IFS= read -r entry; do
     pid=${entry%%|*}; entry=${entry#*|}
     started=${entry%%|*}
     result=${entry#*|}
-    kill -0 "$pid" 2>/dev/null || continue
-    now=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')
-    [ "$now" = "$started" ] || continue
-    ps -o command= -p "$pid" 2>/dev/null | grep -qF -- "$result" || continue
+    grep -qxF "retired=$pid|$started" "$record" && continue
+    is_driver "$pid" "$started" "$result" || continue
     say "stopping the test run $pid that the record names"
     kill "$pid" 2>/dev/null
     waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
-    kill -9 "$pid" 2>/dev/null
-    sleep 1
-    if kill -0 "$pid" 2>/dev/null; then say "THE TEST RUN $pid WOULD NOT STOP: nothing is cleaned up"; exit 3; fi
+    while is_driver "$pid" "$started" "$result" && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+    if is_driver "$pid" "$started" "$result"; then
+      kill -9 "$pid" 2>/dev/null
+      sleep 1
+      if is_driver "$pid" "$started" "$result"; then say "THE TEST RUN $pid WOULD NOT STOP: nothing is cleaned up"; exit 3; fi
+    fi
   done < <(sed -n 's/^runner=//p' "$record")
 }
 
@@ -809,7 +834,7 @@ cleanup() {
     if [ "$id" = "$app_id" ] && [ "$keep_app" = 1 ]; then continue; fi
     if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
   done
-  [ "$unclean" = 0 ] && rm -f "$record"
+  [ "$unclean" = 0 ] && rm -rf "$record" "$record.gate"
   rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}" "$(dirname "$(cat "$work/tests-$target.path" 2>/dev/null)")/attachment-proof.xctestrun"
   [ "$unclean" = 0 ] || exit 3
 }
