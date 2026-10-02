@@ -89,7 +89,9 @@ pub enum Program {
 }
 
 impl Program {
-    /// Every host executable a release carries.
+    /// The host executables the store names a path for. A release's `bin/` carries two more, the
+    /// plugin host and the description process; the daemon finds the description process beside
+    /// the worker, so the store is asked for the path of neither.
     pub const ALL: [Self; 5] = [
         Self::Kr,
         Self::AttachGuard,
