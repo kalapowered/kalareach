@@ -35,8 +35,8 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::automation::{
-    NodeOutput, NodeReceiptSummary, NodeStatus, WorkflowDefinition, WorkflowDefinitionSummary,
-    WorkflowRunStatus, WorkflowRunSummary,
+    NodeOutput, NodeReceiptSummary, NodeStatus, WorkflowActionKind, WorkflowDefinition,
+    WorkflowDefinitionSummary, WorkflowRunStatus, WorkflowRunSummary,
 };
 use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActionId, CausalRootId, GrantId, WorkflowId, WorkflowRunId};
@@ -59,8 +59,12 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 /// kind's typed output rather than as text. Version 6 keeps the admissions the host-wide and
 /// per-grant rates count, a run that waits for a slot as pending, the ceilings a chain inherited,
 /// the descendants an exhausted chain refused, which an authorised rearm continues it from, and
-/// the depth each generation of a chain began at.
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 6;
+/// the depth each generation of a chain began at. Version 7 stores no environment variable in a
+/// create node: a definition that carried any came forward from version 6 without them.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 7;
+
+/// The version whose journals [`WorkflowStore::open`] brings forward to this build's.
+const SCHEMA_WITH_VARIABLES: u32 = 6;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
 const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, generation, depth,
@@ -1862,6 +1866,56 @@ impl std::fmt::Debug for WorkflowStore {
     }
 }
 
+/// A stored definition with the environment variables of its create nodes emptied, or `None` when
+/// it holds none.
+///
+/// A node's parameters are a JSON document kept as text inside the definition's own document, so
+/// both are read. Nothing but the variables changes: every other field of the definition and of
+/// the parameters is the value it was. A definition that is not a document with a list of nodes,
+/// or a create node whose parameters are not a document, cannot be shown to hold no variables, and
+/// the reason is returned. The reason names no value.
+fn without_variables(stored: &str) -> std::result::Result<Option<String>, String> {
+    use serde_json::Value;
+
+    let mut definition: Value = serde_json::from_str(stored)
+        .map_err(|error| format!("it is not a JSON document ({error})"))?;
+    let nodes = definition
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "it has no list of nodes".to_owned())?;
+    let mut changed = false;
+    for node in nodes {
+        if node.get("action_kind").and_then(Value::as_str)
+            != Some(WorkflowActionKind::CreateSession.as_str())
+        {
+            continue;
+        }
+        let text = node
+            .get("action_params")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "a create node's parameters are not text".to_owned())?;
+        let mut params: Value = serde_json::from_str(text).map_err(|error| {
+            format!("a create node's parameters are not a JSON document ({error})")
+        })?;
+        let object = params
+            .as_object_mut()
+            .ok_or_else(|| "a create node's parameters are not an object".to_owned())?;
+        if object
+            .get("environment_snapshot")
+            .is_none_or(|variables| variables.as_array().is_some_and(Vec::is_empty))
+        {
+            continue;
+        }
+        object.insert("environment_snapshot".to_owned(), Value::Array(Vec::new()));
+        node["action_params"] = Value::String(params.to_string());
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(definition.to_string()))
+}
+
 impl WorkflowStore {
     /// Opens the workflow journal in the environment's state directory.
     ///
@@ -1919,12 +1973,130 @@ impl WorkflowStore {
         Ok(value)
     }
 
+    /// Brings a journal at version 6 forward to this build's version.
+    ///
+    /// An earlier build stored a create node's parameters exactly as installed, and the
+    /// parameters of `session.create` carry the environment variables of whoever asked for the
+    /// session: a credential among them would stay in the journal for as long as the revision
+    /// does. Every stored revision, disabled and old ones included, comes forward with the
+    /// variables of its create nodes emptied. The rest of each definition is read as before, and
+    /// nothing else in the journal holds a definition's content: a run, a receipt and the record
+    /// of an action name a revision and never carry it.
+    ///
+    /// The old bytes outlive an update of a row, in free pages and in the write-ahead log, so the
+    /// rewrite is followed by `VACUUM`, which builds the file again from the rows it holds, and by
+    /// a truncating checkpoint, which empties the log. Only then does the version move, so a run
+    /// that stops part way is made again from the start; the step is idempotent. A `VACUUM` that
+    /// cannot finish, a log another connection keeps from being taken in and a definition that
+    /// cannot be read stop the open with the cause and what to do about it: keeping the variables
+    /// on disk is the worse outcome.
+    ///
+    /// This goes in the first release after every install has opened its journal at version 7:
+    /// nothing earlier is installed anywhere it has to be read from again. Then `init_schema`
+    /// refuses version 6 as it refuses every other version it does not read.
+    fn bring_forward(&self) -> Result<()> {
+        self.bring_forward_compacting(|connection| connection.execute_batch("VACUUM"))
+    }
+
+    /// The step of [`Self::bring_forward`], with the compaction it runs after the rewrite given.
+    fn bring_forward_compacting(
+        &self,
+        compact: impl FnOnce(&Connection) -> rusqlite::Result<()>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let found: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let empty: bool = conn.query_row(
+            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )?;
+        if empty || found != SCHEMA_WITH_VARIABLES {
+            return Ok(());
+        }
+        let unreadable = |workflow: &str, revision: i64, why: &str| {
+            AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} holds a definition (workflow {workflow}, revision \
+                 {revision}) that cannot be shown to carry no environment variables, so it is \
+                 not brought forward: {why}",
+                self.path.display()
+            ))
+        };
+        // The keys alone are read up front: a definition can be large, and a journal that holds
+        // many revisions should not hold them all in memory at once.
+        let keys: Vec<(String, i64)> = {
+            let mut statement =
+                conn.prepare("SELECT workflow_id, revision FROM workflow_definitions")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // One immediate transaction, so a second process opening the same journal waits for the
+        // rewrite rather than reading half of it.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (workflow, revision) in keys {
+            let stored: String = tx.query_row(
+                "SELECT definition_json FROM workflow_definitions
+                 WHERE workflow_id = ?1 AND revision = ?2",
+                params![workflow, revision],
+                |row| row.get(0),
+            )?;
+            let emptied =
+                without_variables(&stored).map_err(|why| unreadable(&workflow, revision, &why))?;
+            if let Some(emptied) = emptied {
+                tx.execute(
+                    "UPDATE workflow_definitions SET definition_json = ?3
+                     WHERE workflow_id = ?1 AND revision = ?2",
+                    params![workflow, revision, emptied],
+                )?;
+            }
+        }
+        tx.commit()?;
+        compact(&conn).map_err(|error| self.not_compacted(&error))?;
+        let blocked: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|error| self.not_compacted(&error))?;
+        if blocked != 0 {
+            return Err(AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} was rewritten without the environment variables its \
+                 definitions carried, but its write-ahead log still holds the old copies: it \
+                 could not be taken in while another connection uses the journal. Stop whatever \
+                 else has it open, then start the daemon again",
+                self.path.display()
+            )));
+        }
+        conn.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// The refusal for a compaction that did not finish: what happened and what to do.
+    fn not_compacted(&self, error: &rusqlite::Error) -> AutomationError {
+        let cause = match error {
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.code == rusqlite::ErrorCode::DiskFull =>
+            {
+                "there is no room for it. Free space in the directory that holds the journal and \
+                 in the directory SQLite keeps temporary files in (on Unix, the first of \
+                 SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp and the working directory that it \
+                 can write to; on Windows, the directory that TMP, TEMP or USERPROFILE names, \
+                 otherwise the Windows directory), each up to the size of the journal file"
+                    .to_owned()
+            }
+            other => format!("SQLite said: {other}"),
+        };
+        AutomationError::InvalidArgument(format!(
+            "the workflow journal at {} was rewritten without the environment variables its \
+             definitions carried, but it could not be compacted to remove the old copies: \
+             {cause}. Then start the daemon again",
+            self.path.display()
+        ))
+    }
+
     /// Creates this journal's schema, or refuses a journal written to a different one.
     ///
     /// A journal carries the schema version it was written with. Reading one written to another
     /// version with statements meant for this one would fail later, somewhere unhelpful, so the
     /// refusal happens here and says what it found.
     fn init_schema(&self) -> Result<()> {
+        self.bring_forward()?;
         let mut conn = self.lock();
         // The version is read, the decision is made and the schema is written under one write
         // lock, so two processes opening a new journal at the same time cannot have one of them
@@ -3417,5 +3589,282 @@ mod tests {
             store.recorded_action(&breaching).unwrap(),
             Some(ActionRecord::Refused { code, .. }) if code == "RATE_LIMITED"
         ));
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Bringing a version 6 journal forward.
+    // ----------------------------------------------------------------------------------------
+
+    const PLANTED: &str = "planted-secret-value-9c1e";
+
+    /// A create node's parameters as an earlier build stored them, holding `PLANTED`.
+    fn create_node(
+        node_id: &str,
+        variables: &[(&str, &str)],
+    ) -> kr_protocol::automation::WorkflowNode {
+        let mut params: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&serde_json::json!({
+                "environment_id": "05050505-0505-0505-0505-050505050505",
+                "presentation": "invisible",
+                "shell": null,
+                "shell_mode": "native_compat",
+                "cwd": null,
+                "dimensions": null,
+                "worker_profile": "headless_user",
+                "environment_snapshot": [],
+                "palette": null,
+                "launch_profile": { "command_integrations": [] },
+                "terminal": null,
+            }))
+            .expect("text"),
+        )
+        .expect("parameters");
+        params["environment_snapshot"] = variables
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect();
+        kr_protocol::automation::WorkflowNode {
+            node_id: node_id.to_owned(),
+            action_kind: WorkflowActionKind::CreateSession,
+            action_params: params.to_string(),
+            declared_environment: Nullable::null(),
+        }
+    }
+
+    /// Makes a journal in `directory` as a build at version 6 left it: one revision with a create
+    /// node that carries `PLANTED`, in the given journal mode.
+    fn a_journal_at_version_6(directory: &Path, mode: &str) {
+        let store = WorkflowStore::open(directory).expect("a journal");
+        let mut definition = create_workflow_definition(
+            test_wf_id(1),
+            1,
+            "an-earlier-build",
+            test_grant_id(1),
+            vec![create_node("one", &[("KR_PLANTED", PLANTED)])],
+            vec![],
+        );
+        // Long enough that the nodes, which follow the description, are in pages of their own: a
+        // row that fits one page is rewritten in place, and a row of several leaves pages free
+        // that still hold what it held.
+        definition.description = Nullable::some("d".repeat(24_000));
+        store.save_definition(&definition, 1000).expect("saves");
+        drop(store);
+        let connection = Connection::open(directory.join(WORKFLOW_DB_NAME)).expect("opens");
+        let _: String = connection
+            .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+                row.get(0)
+            })
+            .expect("mode");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_WITH_VARIABLES)
+            .expect("version");
+    }
+
+    fn on_disk(directory: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for name in ["workflows.db", "workflows.db-wal", "workflows.db-journal"] {
+            if let Ok(read) = std::fs::read(directory.join(name)) {
+                bytes.extend(read);
+            }
+        }
+        bytes
+    }
+
+    fn holds(bytes: &[u8], needle: &str) -> bool {
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    fn version_of(directory: &Path) -> u32 {
+        Connection::open(directory.join(WORKFLOW_DB_NAME))
+            .expect("opens")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version")
+    }
+
+    /// A step that stops before the version moves leaves the journal at 6, and the next open does
+    /// it again from the start: the old copies are gone only when it has finished.
+    #[test]
+    fn a_compaction_that_fails_stops_the_open_and_the_next_open_finishes_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        a_journal_at_version_6(directory.path(), "delete");
+        {
+            let path = directory.path().join(WORKFLOW_DB_NAME);
+            let store = WorkflowStore {
+                conn: Mutex::new(Connection::open(&path).expect("opens")),
+                path,
+            };
+            let error = store
+                .bring_forward_compacting(|_| Err(rusqlite::Error::InvalidQuery))
+                .expect_err("a compaction that fails stops the open");
+            let said = error.to_string();
+            assert!(
+                said.contains("could not be compacted") && said.contains("start the daemon again"),
+                "{said}"
+            );
+            assert!(!said.contains(PLANTED), "{said}");
+        }
+        assert_eq!(version_of(directory.path()), SCHEMA_WITH_VARIABLES);
+        assert!(
+            holds(&on_disk(directory.path()), PLANTED),
+            "the old copy is still in a free page: the open that failed did not finish"
+        );
+
+        let finished = WorkflowStore::open(directory.path()).expect("the next open finishes it");
+        assert!(!holds(&on_disk(directory.path()), PLANTED));
+        drop(finished);
+        assert_eq!(version_of(directory.path()), WORKFLOW_SCHEMA_VERSION);
+    }
+
+    /// A log another connection keeps from being taken in still holds the old copies, so the open
+    /// is refused until nothing else has the journal open.
+    #[test]
+    fn a_log_a_reader_keeps_from_being_taken_in_stops_the_open() {
+        let directory = tempfile::tempdir().expect("a directory");
+        a_journal_at_version_6(directory.path(), "wal");
+        let reader = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        reader.execute_batch("BEGIN").expect("begins");
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM workflow_definitions", [], |row| {
+                row.get(0)
+            })
+            .expect("reads, and holds the log");
+
+        let error = WorkflowStore::open(directory.path())
+            .expect_err("a log a reader holds is not taken in");
+        let said = error.to_string();
+        assert!(
+            said.contains("write-ahead log still holds the old copies"),
+            "{said}"
+        );
+        assert!(!said.contains(PLANTED), "{said}");
+        assert_eq!(version_of(directory.path()), SCHEMA_WITH_VARIABLES);
+
+        reader.execute_batch("COMMIT").expect("ends");
+        drop(reader);
+        let store = WorkflowStore::open(directory.path()).expect("the next open finishes it");
+        assert!(!holds(&on_disk(directory.path()), PLANTED));
+        drop(store);
+        assert_eq!(version_of(directory.path()), WORKFLOW_SCHEMA_VERSION);
+    }
+
+    /// A stored definition that cannot be read cannot be shown to hold no variables: the open
+    /// stops, names which one and says nothing of what it holds, and the rows it did read are as
+    /// they were.
+    #[test]
+    fn a_definition_that_cannot_be_read_stops_the_open_and_changes_nothing() {
+        for (case, text) in [
+            ("not a document", "this is not json".to_owned()),
+            ("no nodes", serde_json::json!({ "name": "x" }).to_string()),
+            (
+                "parameters that are not text",
+                serde_json::json!({
+                    "nodes": [{ "node_id": "a", "action_kind": "create_session", "action_params": 7 }]
+                })
+                .to_string(),
+            ),
+            (
+                "parameters that are not a document",
+                serde_json::json!({
+                    "nodes": [{
+                        "node_id": "a",
+                        "action_kind": "create_session",
+                        "action_params": format!("{PLANTED} is not json"),
+                    }]
+                })
+                .to_string(),
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("a directory");
+            a_journal_at_version_6(directory.path(), "delete");
+            let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+            connection
+                .execute(
+                    "INSERT INTO workflow_definitions (
+                        workflow_id, revision, name, description, definition_json,
+                        grant_reference, enabled, paused, installed_at_ms, installed_under
+                    ) VALUES (?1, 1, 'broken', NULL, ?2, ?3, 0, 0, 1000, NULL)",
+                    params![test_wf_id(9).to_string(), text, test_grant_id(9).to_string()],
+                )
+                .expect("a row an earlier build could not have written");
+            drop(connection);
+            let before = on_disk(directory.path());
+
+            let error = WorkflowStore::open(directory.path())
+                .expect_err(&format!("{case}: the open stops"));
+            let said = error.to_string();
+            assert!(
+                said.contains(&test_wf_id(9).to_string()) && said.contains("revision 1"),
+                "{case}: {said}"
+            );
+            assert!(!said.contains(PLANTED), "{case}: {said}");
+            assert_eq!(version_of(directory.path()), SCHEMA_WITH_VARIABLES, "{case}");
+            assert_eq!(on_disk(directory.path()), before, "{case}: nothing was written");
+        }
+    }
+
+    /// A journal that holds no variables is brought forward by its version alone: no definition is
+    /// rewritten, and what the journal keeps of runs and actions is not touched.
+    #[test]
+    fn a_journal_with_no_variables_comes_forward_with_its_rows_as_they_were() {
+        let directory = tempfile::tempdir().expect("a directory");
+        {
+            let store = WorkflowStore::open(directory.path()).expect("a journal");
+            let definition = create_workflow_definition(
+                test_wf_id(1),
+                1,
+                "clean",
+                test_grant_id(1),
+                vec![create_node("one", &[])],
+                vec![],
+            );
+            store.save_definition(&definition, 1000).expect("saves");
+        }
+        let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        connection
+            .execute(
+                "INSERT INTO action_records (
+                    actor_id, action_id, method, payload_digest, result_json, recorded_at_ms
+                ) VALUES ('a', 'b', 'workflow.install', x'0102', '{\"revision\":\"1\"}', 5)",
+                [],
+            )
+            .expect("an action's record");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_WITH_VARIABLES)
+            .expect("version");
+        let dump = |connection: &Connection| -> Vec<String> {
+            [
+                "workflow_definitions",
+                "action_records",
+                "workflow_runs",
+                "node_receipts",
+            ]
+            .iter()
+            .flat_map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .expect("prepares");
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((0..columns)
+                            .map(|at| format!("{:?}", row.get_ref(at).expect("a column")))
+                            .collect::<Vec<_>>()
+                            .join("|"))
+                    })
+                    .expect("queries")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("rows");
+                rows.into_iter().map(move |row| format!("{table}: {row}"))
+            })
+            .collect()
+        };
+        let before = dump(&connection);
+        drop(connection);
+        assert!(!before.is_empty());
+
+        drop(WorkflowStore::open(directory.path()).expect("comes forward"));
+        let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        assert_eq!(dump(&connection), before);
+        assert_eq!(version_of(directory.path()), WORKFLOW_SCHEMA_VERSION);
     }
 }
