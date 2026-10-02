@@ -41,9 +41,10 @@
 //! The rename is the moment a step changes the record, so it is the moment the step's approval has
 //! to stand: the file is written and flushed first, and each attempt at the rename is made through
 //! [`Standing::while_standing`], which refuses it, and leaves the old record, when the approval has
-//! lapsed, and holds the approval standing for as long as the attempt takes. Nothing waits while
-//! it is held: a rename that Windows refuses because a program holds the record is tried again
-//! after a pause, and each attempt asks again.
+//! lapsed, and excludes a withdrawal of the approval while the attempt runs. The check is made
+//! immediately before the attempt: one rename call that the operating system blocks past a deadline
+//! is not interrupted. A rename that Windows refuses because a program holds the record is tried
+//! again after a pause, and each attempt asks again, so nothing is held across the pause.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -197,7 +198,9 @@ pub struct Approval<'a> {
 /// program to let the record go. The store therefore hands the replacement itself to the caller,
 /// which runs it only while the authority stands.
 pub trait Standing: std::fmt::Debug + Sync {
-    /// Runs `publish` while the authority stands, and keeps it standing until `publish` returns.
+    /// Runs `publish` if the authority stands when it is asked, and excludes a withdrawal of the
+    /// authority until `publish` returns. The authority is checked once, immediately before
+    /// `publish` runs; a `publish` that the operating system blocks is not cut short.
     ///
     /// # Errors
     ///

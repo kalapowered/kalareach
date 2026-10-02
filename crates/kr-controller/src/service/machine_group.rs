@@ -387,7 +387,7 @@ impl Controller {
     ) -> Result<MachineGroup> {
         let controller = Arc::clone(self);
         let now_ms = wall_clock_ms();
-        tokio::task::spawn_blocking(move || {
+        let done = tokio::task::spawn_blocking(move || {
             let Held::Serving(store) = &controller.machine.held else {
                 return Err(ControllerError::Storage {
                     operation: "change the machine group record",
@@ -456,31 +456,8 @@ impl Controller {
             };
             written
         })
-        .await
-        .unwrap_or_else(|_| {
-            Err(ControllerError::Uncertain {
-                detail: "the write of the machine group record ended before it answered".to_owned(),
-            })
-        })
-        .map_err(|error| match error {
-            // What the store said names the file and what the system answered, and a step's answer
-            // can reach a paired device. The daemon's own log has the detail.
-            ControllerError::Storage { detail, .. } => {
-                eprintln!("kr-controller: a machine group step wrote nothing: {detail}");
-                ControllerError::Storage {
-                    operation: "change the machine group record",
-                    detail: NOT_WRITTEN.to_owned(),
-                }
-            }
-            // The same, for a step that did write and whose flush failed.
-            ControllerError::Uncertain { detail } => {
-                eprintln!("kr-controller: a machine group step is not confirmed: {detail}");
-                ControllerError::Uncertain {
-                    detail: NOT_CONFIRMED.to_owned(),
-                }
-            }
-            other => other,
-        })
+        .await;
+        after_the_write(done)
     }
 
     /// Keeps what a step came to under the claim that carried it.
@@ -813,6 +790,42 @@ impl Controller {
     }
 }
 
+/// What a step's write came to, as its answer: what the store said with the file's path taken out,
+/// and for a write task that ended without answering, an outcome this host does not know.
+///
+/// The two unknown outcomes are not the same one. The store's own says the record was published and
+/// its directory could not be flushed; a task that ended says nothing of the sort, because it may
+/// have ended before it wrote anything.
+fn after_the_write(
+    done: std::result::Result<Result<MachineGroup>, tokio::task::JoinError>,
+) -> Result<MachineGroup> {
+    let written = done.map_err(|_| ControllerError::Uncertain {
+        detail: "the task that writes the machine group record ended before it answered, and this \
+                 host's records may not show what it did; ask again with the same action to be \
+                 told what it did"
+            .to_owned(),
+    })?;
+    written.map_err(|error| match error {
+        // What the store said names the file and what the system answered, and a step's answer
+        // can reach a paired device. The daemon's own log has the detail.
+        ControllerError::Storage { detail, .. } => {
+            eprintln!("kr-controller: a machine group step wrote nothing: {detail}");
+            ControllerError::Storage {
+                operation: "change the machine group record",
+                detail: NOT_WRITTEN.to_owned(),
+            }
+        }
+        // The same, for a step that did write and whose flush failed.
+        ControllerError::Uncertain { detail } => {
+            eprintln!("kr-controller: a machine group step is not confirmed: {detail}");
+            ControllerError::Uncertain {
+                detail: NOT_CONFIRMED.to_owned(),
+            }
+        }
+        other => other,
+    })
+}
+
 /// Refuses the parameters of a step that are not the ones its method takes.
 ///
 /// # Errors
@@ -891,5 +904,51 @@ fn unfinished_and_unknown() -> ControllerError {
                  host's records do not show it; it is not performed again, so read this \
                  environment's machine group before asking under a new action"
             .to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The answer to a write that the store published and could not flush says so, and the answer to
+    /// a write task that ended without answering does not: it may have ended before the record was
+    /// touched. Neither names a path.
+    #[tokio::test]
+    async fn a_write_task_that_ended_is_not_reported_as_a_write_that_could_not_be_flushed() {
+        let ended = tokio::spawn(async { panic!("the write task ended") }).await;
+        let ended = after_the_write(ended.map(|()| unreachable!()))
+            .expect_err("a task that ended answers nothing");
+        let ControllerError::Uncertain { detail } = ended else {
+            panic!("an outcome this host does not know: {ended:?}");
+        };
+        assert!(
+            !detail.contains("flushed") && !detail.contains("was changed"),
+            "{detail}"
+        );
+
+        // The control: the store's own unknown outcome, with a path in what it said.
+        let unflushed = after_the_write(Ok(Err(ControllerError::Uncertain {
+            detail: "/state/machine-group now names machine group x, but its directory could not \
+                     be flushed"
+                .to_owned(),
+        })))
+        .expect_err("the store could not flush");
+        let ControllerError::Uncertain { detail } = unflushed else {
+            panic!("an outcome this host does not know: {unflushed:?}");
+        };
+        assert_eq!(detail, NOT_CONFIRMED);
+        assert!(!detail.contains("/state"), "{detail}");
+
+        // And a write that failed before the record changed names no path either.
+        let unwritten = after_the_write(Ok(Err(ControllerError::Storage {
+            operation: "write the machine group record",
+            detail: "/state/machine-group: permission denied".to_owned(),
+        })))
+        .expect_err("nothing was written");
+        let ControllerError::Storage { detail, .. } = unwritten else {
+            panic!("a refusal: {unwritten:?}");
+        };
+        assert_eq!(detail, NOT_WRITTEN);
     }
 }
