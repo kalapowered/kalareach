@@ -323,8 +323,21 @@ async fn a_bundle_that_is_not_what_its_lock_names_is_refused() {
 
     let mut disagree: serde_json::Value = serde_json::from_str(&lock).expect("a lock");
     disagree["packages"][0]["version"] = serde_json::json!("0.9.0");
-    let error = build(&disagree.to_string(), files).expect_err("a lock that disagrees");
+    let error = build(&disagree.to_string(), files.clone()).expect_err("a lock that disagrees");
     assert!(error.to_string().contains("disagree"), "{error}");
+
+    // The generation the lock names is the one the index carries: a lock that names another would
+    // make a store skip, or take, a generation on the strength of a number nothing signed.
+    let mut renumbered: serde_json::Value = serde_json::from_str(&lock).expect("a lock");
+    renumbered["source"]["generation"] = serde_json::json!("7");
+    let error = build(&renumbered.to_string(), files.clone())
+        .expect_err("a lock that names another generation than the index");
+    assert!(error.to_string().contains("names generation 7"), "{error}");
+    let mut redated: serde_json::Value = serde_json::from_str(&lock).expect("a lock");
+    redated["source"]["produced_at"] = serde_json::json!("1");
+    let error = build(&redated.to_string(), files)
+        .expect_err("a lock that names another production time than the index");
+    assert!(error.to_string().contains("built at 1"), "{error}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -719,7 +732,7 @@ async fn a_pin_skips_the_sync_and_not_the_installs() {
     assert!(outcome.failure.is_none(), "{}", outcome.report());
     assert!(outcome.activated.is_none(), "{}", outcome.report());
     assert!(
-        outcome.notes.iter().any(|note| note.contains("pinned")),
+        outcome.choices.iter().any(|note| note.contains("pinned")),
         "{}",
         outcome.report()
     );
@@ -731,6 +744,132 @@ async fn a_pin_skips_the_sync_and_not_the_installs() {
         ),
         floors,
         "the pinned repository is unchanged"
+    );
+}
+
+/// A bundle this build does not trust is not seeded, and still serves the payloads an accepted
+/// generation of an owner's repository pins by digest: those bytes are checked against the digest
+/// and length that generation signed, whatever the bundle's root.
+#[tokio::test]
+async fn a_bundle_this_build_refuses_still_serves_the_payloads_a_generation_pins() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = adapter(home.path()).await;
+    let mut catalogue = offline(home.path());
+    let id = kr_plugin_catalogue::RepositoryId::new("mine").expect("an identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                id.clone(),
+                RepositoryKind::Community,
+                generation.metadata_url(),
+                generation.targets_url(),
+                generation.root_bytes(),
+                budgets(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrolment"),
+            true,
+        )
+        .expect("the owner adopts the root");
+    catalogue
+        .sync(&id)
+        .await
+        .expect("the owner's repository syncs");
+
+    // The bundle is one this build refuses: it trusts no root at all.
+    let refused = support::seed_bundle_trusting(&generation, SeedTrust::named(Vec::new(), 1, None));
+    let outcome = catalogue.seed(&refused, environment(), budgets()).await;
+    assert!(
+        !outcome.enrolled && outcome.installed.is_empty(),
+        "{}",
+        outcome.report()
+    );
+
+    // The repository is gone from where it was; its payloads are in the bundle.
+    std::fs::remove_dir_all(generation.directory().join("targets")).expect("the targets go");
+    let digest = catalogue
+        .activate_package(
+            &id,
+            &plugin(),
+            &version(),
+            kr_plugin_catalogue::FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect("the host's own bytes are what it installs from");
+    assert_eq!(digest, refused.packages()[0].manifest.digest);
+}
+
+/// A bundle whose highest root alone has expired is reported expired, as one whose roles have: the
+/// update client waives the root's expiry for the bundled generation too, so the host's own reading
+/// is what says so.
+#[tokio::test]
+async fn a_bundle_whose_root_alone_has_expired_is_reported_expired() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = adapter(home.path()).await;
+    let control = seed_bundle(&generation);
+    assert!(
+        control
+            .earliest_expiry()
+            .is_some_and(|at| at > jiff::Timestamp::now()),
+        "the control: nothing in the bundle has expired"
+    );
+    for name in ["metadata/1.root.json", "metadata/root.json"] {
+        let path = generation.directory().join(name);
+        let text = std::fs::read_to_string(&path).expect("a root");
+        assert!(text.contains("2036-01-01T00:00:00Z"));
+        std::fs::write(
+            &path,
+            text.replace("2036-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+        )
+        .expect("a root");
+    }
+    let bundle = seed_bundle(&generation);
+
+    assert!(
+        bundle
+            .earliest_expiry()
+            .is_some_and(|at| at < jiff::Timestamp::now()),
+        "the root's own expiry is read"
+    );
+}
+
+/// The seeded repository's provenance is written with the commit that activates a bundled
+/// generation, so it always names the generation in use: nothing before the activation, the first
+/// bundle's generation after it, and the later bundle's after an update.
+#[tokio::test]
+async fn the_provenance_names_the_bundled_generation_in_use() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = adapter(home.path()).await;
+    let first = seed_bundle(&generation);
+    let mut catalogue = offline(home.path());
+    let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+
+    catalogue.stop_seed_at(Some(SeedPoint::AfterEnrolment));
+    catalogue.seed(&first, environment(), budgets()).await;
+    assert!(
+        catalogue.seed_provenance(&id).expect("records").is_none(),
+        "an enrolment that has activated nothing names no generation"
+    );
+
+    catalogue.stop_seed_at(None);
+    catalogue.seed(&first, environment(), budgets()).await;
+    let provenance = catalogue
+        .seed_provenance(&id)
+        .expect("records")
+        .expect("recorded with the activation");
+    assert_eq!(provenance["generation"], 1);
+
+    generation.rewrite_with(adapter_spec(2)).await;
+    let later = seed_bundle(&generation);
+    let outcome = catalogue.seed(&later, environment(), budgets()).await;
+    assert!(outcome.activated.is_some(), "{}", outcome.report());
+    let provenance = catalogue
+        .seed_provenance(&id)
+        .expect("records")
+        .expect("recorded");
+    assert_eq!(
+        provenance["generation"], 2,
+        "the record follows the generation in use"
     );
 }
 
@@ -927,10 +1066,23 @@ async fn an_expired_seed_is_reported_and_a_fresh_sync_replaces_it() {
 // A network that moved on
 // ---------------------------------------------------------------------------------------------
 
+/// Marks the release revoked, as a later generation publishes it.
+fn revoked(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.revocation =
+        kr_protocol::scalars::Nullable(Some(kr_plugin_sdk::catalogue::RevocationRecord {
+            reason: kr_plugin_sdk::catalogue::RevocationReason::Vulnerable,
+            revoked_at: kr_plugin_sdk::scalars::TimestampMs::new(1_760_000_100_000),
+            statement: kr_plugin_sdk::text::Summary::new("Replaced by a later release")
+                .expect("a valid statement"),
+        }));
+}
+
 /// A store a network sync moved past the bundle finishes the packages the seed had not reached,
 /// from the active index and the bundle's bytes; an index that no longer lists the package, or
-/// lists it revoked or at another digest, skips it with a reason and records nothing, so a later
-/// index that lists it is taken.
+/// lists it revoked, skips it with a reason and records nothing, so a later index that lists it is
+/// taken. An index that lists it at another digest is skipped the same way, and is not reached
+/// here: the bundle holds no bytes for any other digest, so the later guard in the fetch refuses
+/// it too.
 #[tokio::test]
 async fn a_store_moved_past_the_bundle_finishes_what_it_can() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -968,22 +1120,36 @@ async fn a_store_moved_past_the_bundle_finishes_what_it_can() {
         "nothing is recorded for a skip"
     );
 
-    // A later generation lists it again, at the digest the bundle carries, and it is installed
-    // from the bundle's bytes with the network unreachable.
+    // A generation lists it revoked: the release is skipped with the reason, nothing is recorded
+    // and nothing is installed.
     generation
         .rewrite_with(GenerationSpec {
             generation: 3,
-            capabilities: vec![
-                PluginCapability::MetadataMatch,
-                PluginCapability::DeclarativePresentation,
-                PluginCapability::BrokerSemanticEvents,
-                PluginCapability::TranscriptTail,
-                PluginCapability::TerminalInput,
-                PluginCapability::NativeBridgeInstall,
-            ],
-            ..GenerationSpec::default()
+            edit_entry: Some(revoked),
+            ..adapter_spec(3)
         })
         .await;
+    catalogue
+        .sync(&id)
+        .await
+        .expect("a generation that revokes it");
+    let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
+    assert!(outcome.installed.is_empty(), "{}", outcome.report());
+    assert_eq!(outcome.skipped.len(), 1, "{}", outcome.report());
+    assert!(
+        outcome.skipped[0].1.contains("revoked"),
+        "{}",
+        outcome.report()
+    );
+    assert!(installed(&catalogue).is_none());
+    assert!(
+        !has_record(&catalogue, "seed_installed:"),
+        "nothing is recorded for a revoked release"
+    );
+
+    // A later generation lists it again, at the digest the bundle carries, and it is installed
+    // from the bundle's bytes with the network unreachable.
+    generation.rewrite_with(adapter_spec(4)).await;
     catalogue.sync(&id).await.expect("a later generation");
     let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
     assert_eq!(outcome.installed, [plugin()], "{}", outcome.report());
@@ -1015,6 +1181,14 @@ async fn nothing_is_evicted_for_a_package_that_cannot_arrive() {
         total += 4_000;
     }
     other.total_size_bytes = U64::new(total);
+    // What the release consists of, by digest and length.
+    let mut consists_of = vec![(other.manifest_digest, other.manifest_size_bytes.get())];
+    consists_of.extend(
+        other
+            .payloads
+            .iter()
+            .map(|payload| (payload.digest, payload.size_bytes.get())),
+    );
     let generation = Generation::build(
         home.path(),
         GenerationSpec {
@@ -1079,6 +1253,32 @@ async fn nothing_is_evicted_for_a_package_that_cannot_arrive() {
         store.cached_payloads().expect("a readable store"),
         held_before,
         "nothing was evicted for a package that could not arrive"
+    );
+
+    // The same with the release's files cached at the right lengths and with other contents: they
+    // are not what their names say, so the release still cannot arrive and nothing is evicted.
+    for (digest, length) in &consists_of {
+        std::fs::write(store.payload_path(*digest), vec![0u8; *length as usize])
+            .expect("a damaged file in the cache");
+    }
+    let held_with_damage = store.cached_payloads().expect("a readable store");
+    let error = catalogue
+        .activate_package(
+            &id,
+            &plugin(),
+            &PackageVersion::parse("9.9.9").expect("a version"),
+            kr_plugin_catalogue::FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect_err("the repository cannot be reached");
+    assert!(
+        matches!(error, CatalogueError::UnavailableOffline { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        store.cached_payloads().expect("a readable store"),
+        held_with_damage,
+        "damaged files in the cache do not make a package look held, so nothing is evicted"
     );
 }
 
