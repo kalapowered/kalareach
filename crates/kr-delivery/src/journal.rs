@@ -3420,20 +3420,15 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
     Ok(())
 }
 
-/// What a delivery whose outcome this host cannot establish is recorded as.
-///
-/// A notification the gateway holds can be asked about by its identifier, so it is the outcome
-/// nobody knows, outstanding until a question resolves it. An external message has no such
-/// question: section 25 marks the duplicate-delivery uncertainty instead. Neither keeps its
-/// request, because neither will be presented again.
-///
-/// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
 /// Brings a version 6 journal forward to version 7, in one transaction.
 ///
 /// Version 7 adds one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
 /// credential, so every row gets none and every binding it computed is computed the same way. The
 /// version is read again inside the transaction, so two openers cannot both add the column.
+///
+/// Remove this upgrade, with the version 6 arm of the open and `PREVIOUS_SCHEMA_VERSION`, once no
+/// supported upgrade starts from a journal written under version 6.
 fn migrate_from_6(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3457,6 +3452,14 @@ fn migrate_from_6(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// What a delivery whose outcome this host cannot establish is recorded as.
+///
+/// A notification the gateway holds can be asked about by its identifier, so it is the outcome
+/// nobody knows, outstanding until a question resolves it. An external message has no such
+/// question: section 25 marks the duplicate-delivery uncertainty instead. Neither keeps its
+/// request, because neither will be presented again.
+///
+/// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
 const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
     match kind {
         DestinationKind::Push => DeliveryState::OutcomeUnknown,

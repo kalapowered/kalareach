@@ -431,6 +431,9 @@ impl Journal {
     ///
     /// One transaction, like every other step: a migration that failed part way would leave a
     /// store at a version describing neither the shape before it nor the shape after.
+    ///
+    /// This serves a journal written under version 3. Remove it, with its entry in the ladder, once
+    /// no supported upgrade starts from a version 3 journal.
     fn migrate_3_to_4(&self) -> Result<()> {
         self.connection
             .execute_batch(
@@ -475,6 +478,9 @@ impl Journal {
     }
 
     /// Adds the privacy generation this host records when privacy mode is enabled.
+    ///
+    /// This serves a journal written under version 4. Remove it, with its entry in the ladder, once
+    /// no supported upgrade starts from a version 4 journal.
     fn migrate_4_to_5(&self) -> Result<()> {
         self.connection
             .execute_batch(
@@ -502,6 +508,9 @@ impl Journal {
     /// of, so its heads are where the sources stand now: nothing written before this migration is
     /// served as attention text for that session again. A journal without one never changed privacy
     /// mode, and gets the starting record, under which everything it holds is served.
+    ///
+    /// This serves a journal written under version 5. Remove it, with its entry in the ladder, once
+    /// no supported upgrade starts from a version 5 journal.
     fn migrate_5_to_6(&self) -> Result<()> {
         // Either source can be missing from a journal an earlier build wrote: the question ledger
         // is another service's, and the host events are created with the current schema once the
@@ -557,6 +566,10 @@ impl Journal {
     /// is the conservative value for what it holds: it matches no controller generation this host
     /// accepts, so nothing an earlier build recorded is read as delivered to the daemon asking now,
     /// and the names stay until that daemon says it has them.
+    ///
+    /// This runs outside the ladder, every time the journal is opened, because the journal it
+    /// serves is at the current version. Remove it once no supported upgrade starts from a journal
+    /// that an earlier build wrote with the three-column table.
     fn add_delivery_generation(&self) -> Result<()> {
         let mut statement = self
             .connection
