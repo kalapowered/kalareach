@@ -233,12 +233,40 @@ struct PushCheckReport {
     }
 }
 
+/// When a stream of callbacks ran: how many, when the last did, and the longest interval between two
+/// of them since it was last asked.
+///
+/// A timer that looks at the age of the last callback sees a long stop only if it runs while the
+/// stop lasts. The interval between the callbacks on either side of the stop is what the stop was,
+/// whenever the timer runs.
+struct CallbackClock {
+    private(set) var count = 0
+    private(set) var last: TimeInterval?
+    private var longest: TimeInterval?
+
+    mutating func ran(at time: TimeInterval) {
+        if let last { longest = max(longest ?? 0, time - last) }
+        last = time
+        count += 1
+    }
+
+    /// The longest interval between two callbacks since the last time this was asked, or nothing when
+    /// no two ran. The interval between the last callback before the asking and the first after it
+    /// is counted in the next answer.
+    mutating func longestIntervalSinceLastReading() -> TimeInterval? {
+        defer { longest = nil }
+        return longest
+    }
+}
+
 /// What a run of the audio check saw, second by second.
 ///
-/// Each tick says how long ago the check's own input and output last ran and whether the device's
-/// protected data was available, which is how a locked phone shows itself to an application. The
-/// gaps over every tick and over the ticks while the phone was locked are kept apart, because
-/// audio that carries on through a lock is the thing being asked.
+/// Each tick says how long ago the check's own input and output last ran, the longest interval
+/// between two of their callbacks since the tick before, and whether the device's protected data was
+/// available, which is how a locked phone shows itself to an application. A gap is the longer of the
+/// two, so a stop that ended before the timer ran is still seen. The gaps over every tick and over the
+/// ticks while the phone was locked are kept apart, because audio that carries on through a lock is
+/// the thing being asked.
 struct AudioTickLog {
     private let start: TimeInterval
     private(set) var ticks = 0
@@ -251,9 +279,16 @@ struct AudioTickLog {
     init(start: TimeInterval) { self.start = start }
 
     /// One reading. A time that has never been seen counts from the start of the check.
-    mutating func tick(now: TimeInterval, lastInput: TimeInterval?, lastOutput: TimeInterval?, protectedDataAvailable: Bool) {
-        let input = now - (lastInput ?? start)
-        let output = now - (lastOutput ?? start)
+    mutating func tick(
+        now: TimeInterval,
+        lastInput: TimeInterval?,
+        lastOutput: TimeInterval?,
+        longestInputInterval: TimeInterval? = nil,
+        longestOutputInterval: TimeInterval? = nil,
+        protectedDataAvailable: Bool
+    ) {
+        let input = max(now - (lastInput ?? start), longestInputInterval ?? 0)
+        let output = max(now - (lastOutput ?? start), longestOutputInterval ?? 0)
         ticks += 1
         inputGap = max(inputGap, input)
         outputGap = max(outputGap, output)
