@@ -1780,7 +1780,7 @@ async fn a_worker_that_is_connected_and_silent_does_not_hold_the_list() {
     let script = Scripted::new();
     let world = reported_late(&script).await;
     script.mute_reads(true);
-    let listed = tokio::time::timeout(Duration::from_secs(120), list(&world, false))
+    let listed = tokio::time::timeout(Duration::from_secs(60), list(&world, false))
         .await
         .expect("the list is answered although a worker is silent");
     assert_eq!(listed, vec![(world.session_id, SessionState::Live)]);

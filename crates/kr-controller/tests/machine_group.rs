@@ -703,6 +703,52 @@ async fn a_daemon_that_stopped_between_a_write_and_its_receipt_settles_it_at_sta
     restarted.stop().await;
 }
 
+/// KR-REQ-03.07: a claim whose attempt ended before it recorded anything, for an action the record
+/// does not name, is an outcome nobody knows, and is never performed: the record's last change is
+/// another step's, and answering this action with it would tell the owner a step happened that did
+/// not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_nobody_finished_that_the_record_does_not_name_is_an_outcome_nobody_knows() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    // The record's last change is this owner's step under another action.
+    let earlier = join(&host, &mut client, some_group(0xe1), &minted)
+        .await
+        .expect("takes a step");
+
+    // A step claimed by an attempt that ended before it wrote anything.
+    let unfinished = composed_join(&host, &mut client, some_group(0xe2), &earlier.machine).await;
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("the local principal");
+    let digest = kr_protocol::digest::mutation_digest(&unfinished, &actor).expect("a digest");
+    let claimed = host
+        .controller()
+        .sharing()
+        .grants()
+        .claim_action(&actor, unfinished.action_id, &digest, 1_000)
+        .expect("claims the action");
+    let kr_controller::grants::ActionClaim::Claimed { hold } = claimed else {
+        panic!("nothing held this action before");
+    };
+    drop(hold);
+
+    let answer = client
+        .repeat(&unfinished)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the record does not name this action");
+    assert_eq!(answer.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        group_of(&mut client).await,
+        earlier.machine,
+        "it was not performed"
+    );
+
+    drop(client);
+    host.stop().await;
+}
+
 /// The bytes and metadata of the files that a step must leave alone: the host's identity file, the
 /// environment's markers and the secret store.
 fn untouched_files(host: &Host) -> BTreeMap<PathBuf, (Vec<u8>, u64)> {
