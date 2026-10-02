@@ -298,8 +298,8 @@ version 0.4.0, with explicit A and B roles.
   rejected through the library's own error path.
 - `spake2::Password` does not clear itself. The six characters therefore live in a heap buffer the
   library owns until it is dropped, which this crate cannot reach. Everything on this side of the
-  boundary — `CodeSecret`, `GeneratedCode`, `EnteredCode`, the shared key and the five derived keys
-  — zeroises. Closing this needs a change in the dependency.
+  boundary (`CodeSecret`, `GeneratedCode`, `EnteredCode`, the shared key and the five derived keys)
+  zeroises. Closing this needs a change in the dependency.
 
 ## Profile decisions
 
