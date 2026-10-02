@@ -4739,13 +4739,13 @@ the rest of its life, and its later transitions are written down like anything e
 A launched agent reaches its worker-owned backend on a private Unix socket inside the owner-only
 runtime directory on Unix, and on a named pipe on Windows. On Windows this is a named pipe, which
 has an access list that includes only the owner. When connecting to it with a different account,
-opening the pipe will fail. An elevated worker's pipe is owned by the Administrators group, so
-another administrator can open it, and the first read of that connection refuses any account that is
-not the worker's own. On both platforms the kernel names the process at the other end. The
-directory's ownership and mode (its access list on Windows, read from the opened directory) are
-checked before an address is handed out, and an address something other than this machine could
-reach is refused before it is published rather than filtered afterwards, which is what keeps the
-listener off iroh.
+opening the pipe will fail. An elevated worker's pipe may be owned by the Administrators group, in
+which case another elevated administrator can open it, and the first read of that connection refuses
+any account that is not the worker's own. On both platforms the kernel names the process at the
+other end. The directory's ownership and mode (its access list on Windows, read from the opened
+directory) are checked before an address is handed out, and an address something other than this
+machine could reach is refused before it is published rather than filtered afterwards, which is what
+keeps the listener off iroh.
 
 Binding the socket, accepting on it and serving what connects is one composition. It binds the
 endpoint, builds the registration from the address it actually bound, reads the connecting bridge's
@@ -4784,15 +4784,16 @@ credential, and neither does any address a diagnostic prints or any argument vec
 The credential itself travels in an owner-only file the launched process opens. The host, before
 writing to it, reads the protection of the directory that it will write to: on Unix it must check
 the user that owns the directory and its mode, and on Windows it must check the access list of the
-directory it writes to, which can be read from the opened directory. The directory must be protected,
-and its list may name only the account running the worker, the system account, the Administrators
-group and the creator-owner and owner-rights entries. The forwarder, when opening the
-credential file, reads the protection of the opened file: on Windows this is its access list. It
-presents nothing from a file another account was granted. If the host cannot ensure that a file will
-not be readable by other accounts, it must not write a credential to a file, because a credential in
-a file whose protection cannot be ensured is worse than no file at all. A launch there is refused
-before any process starts, because a launched process that could never be told its credential would
-only have to be stopped again.
+directory it writes to, which can be read from the opened directory. The directory must be
+protected, and its list may grant access only to the account running the worker or the account that
+owns what the worker creates, the system account, the Administrators group, and the creator-owner
+and owner-rights entries; an entry that denies access grants nothing and is not read as a grant. The
+forwarder, when opening the credential file, reads the protection of the opened file: on Windows
+this is its access list. It presents nothing from a file another account was granted. If the host
+cannot ensure that a file will not be readable by other accounts, it must not write a credential to
+a file, because a credential in a file whose protection cannot be ensured is worse than no file at
+all. A launch there is refused before any process starts, because a launched process that could
+never be told its credential would only have to be stopped again.
 
 An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
 and adapter version it was bound to, because the identity is pinned when the process starts and
