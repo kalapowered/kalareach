@@ -381,8 +381,11 @@ impl Controller {
             crate::push::runtime::Cadence::DEFAULT,
             tokio::runtime::Handle::current(),
         );
-        // What the environment's attention store announces is taken on every pass of the runtime.
+        // What the environment's attention store announces is taken on every pass of the runtime,
+        // and every announcement it decides is stamped with the privacy state the delivery module
+        // publishes its send gate from.
         delivery_runtime.attach_attention(Arc::clone(&attention));
+        attention.attach_privacy(delivery.privacy_state().clone());
         // Privacy mode's record comes before anything the subsystems it drives do. It is read and
         // published into the delivery module's send gate here, and whatever it asks for is taken
         // through the backup service, the delivery journal and the descriptions again, before the

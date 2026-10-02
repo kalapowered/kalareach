@@ -484,6 +484,9 @@ pub struct AttentionModule {
     automation_pass: std::sync::Mutex<()>,
     /// Set once the workflow journal is being read, so it is read by one loop.
     automation_started: std::sync::OnceLock<()>,
+    /// The privacy state every announcement the store decides is stamped with, once the daemon has
+    /// attached it.
+    privacy: std::sync::OnceLock<crate::privacy::PrivacyState>,
     /// Whether the last pass over the workflow journal stopped short, so a failure that persists is
     /// reported once rather than at every pass.
     automation_failing: AtomicBool,
@@ -590,6 +593,7 @@ impl AttentionModule {
             wake: Arc::new(tokio::sync::Notify::new()),
             automation_pass: std::sync::Mutex::new(()),
             automation_started: std::sync::OnceLock::new(),
+            privacy: std::sync::OnceLock::new(),
             automation_failing: AtomicBool::new(false),
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
@@ -668,6 +672,37 @@ impl AttentionModule {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Hands the module the privacy state the daemon publishes, so that every announcement the
+    /// store decides is stamped with the generation in force and whether privacy mode was on in
+    /// it. Attached once, before the store decides anything; a second call changes nothing.
+    pub fn attach_privacy(&self, state: crate::privacy::PrivacyState) {
+        let _ = self.privacy.set(state);
+    }
+
+    /// Runs one pass that may decide announcements, under a reading that carries the privacy state
+    /// in force.
+    ///
+    /// The state's read side is held for the whole pass, so a change of privacy mode is published
+    /// wholly before the pass or wholly after it, and no decision is stamped with a state that was
+    /// replaced while it was being made. It is taken before the store, never inside it, and nothing
+    /// here waits for anything while holding it, so it only delays a change of privacy mode by the
+    /// pass. Not held across an await.
+    fn deciding<T>(&self, pass: impl FnOnce(HostReading) -> T) -> T {
+        let held = self
+            .privacy
+            .get()
+            .map(crate::privacy::PrivacyState::reading);
+        let mut reading = self.reading();
+        if let Some(held) = &held {
+            let published = held.published();
+            reading = reading.under(kr_attention::PrivacyStamp {
+                generation: published.generation.get(),
+                private: published.private,
+            });
+        }
+        pass(reading)
     }
 
     /// Returns what the host's clocks read now, in the form the store takes.
@@ -1363,12 +1398,13 @@ impl AttentionModule {
     ///
     /// Returns the store's refusal; nothing about the events is kept then.
     pub fn observe(&self, events: &[SourceEvent]) -> Answer<()> {
-        let reading = self.reading();
-        let mut store = self.store()?;
-        for event in events {
-            store.apply(event, reading).map_err(refusal)?;
-        }
-        drop(store);
+        self.deciding(|reading| -> Answer<()> {
+            let mut store = self.store()?;
+            for event in events {
+                store.apply(event, reading).map_err(refusal)?;
+            }
+            Ok(())
+        })?;
         self.wake.notify_one();
         Ok(())
     }
@@ -1913,40 +1949,43 @@ impl AttentionModule {
                 .last()
                 .map(|record| record.sequence.get()),
         );
-        let reading = self.reading();
-        let mut store = self.store()?;
-        if !self
-            .origins()
-            .links
-            .get(&session_id)
-            .is_some_and(|current| Arc::ptr_eq(current, link))
-        {
-            return Ok(Taken::Stale);
-        }
-        store.rebuild(&events, reading).map_err(refusal)?;
-        let certified = {
-            let mut origins = self.origins();
-            if complete {
-                let certified = origins.certified.entry(session_id).or_insert(0);
-                *certified = (*certified).max(page.built_at_boot_ms.get());
+        let taken = self.deciding(|reading| -> Answer<Taken> {
+            let mut store = self.store()?;
+            if !self
+                .origins()
+                .links
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, link))
+            {
+                return Ok(Taken::Stale);
             }
-            if let Some(floor) = page.output_floor.0 {
-                origins.output_floor.insert(session_id, floor.get());
-            }
-            Certificates::of(&origins)
-        };
-        store
-            .tick(reading, &|origin| certified.at(origin))
-            .map_err(refusal)?;
-        drop(store);
+            store.rebuild(&events, reading).map_err(refusal)?;
+            let certified = {
+                let mut origins = self.origins();
+                if complete {
+                    let certified = origins.certified.entry(session_id).or_insert(0);
+                    *certified = (*certified).max(page.built_at_boot_ms.get());
+                }
+                if let Some(floor) = page.output_floor.0 {
+                    origins.output_floor.insert(session_id, floor.get());
+                }
+                Certificates::of(&origins)
+            };
+            store
+                .tick(reading, &|origin| certified.at(origin))
+                .map_err(refusal)?;
+            Ok(if complete {
+                Taken::Complete
+            } else {
+                Taken::Partial
+            })
+        })?;
         // A certificate that moved may let a timer be decided that the maintenance loop had put
         // aside.
-        self.wake.notify_one();
-        Ok(if complete {
-            Taken::Complete
-        } else {
-            Taken::Partial
-        })
+        if !matches!(taken, Taken::Stale) {
+            self.wake.notify_one();
+        }
+        Ok(taken)
     }
 
     fn certificates(&self) -> Certificates {
@@ -2345,27 +2384,29 @@ impl AttentionModule {
     /// A record read from the journal announces nothing by itself: the timer pass decides what an
     /// item it raised is owed, once a read has reached the end of the journal's records.
     fn certify_environment(&self, at: u64) -> Answer<()> {
-        let reading = self.reading();
-        let mut store = self.store()?;
-        let certified = {
-            let mut origins = self.origins();
-            origins.environment_certified = Some(
-                origins
-                    .environment_certified
-                    .map_or(at, |earlier| earlier.max(at)),
-            );
-            Certificates::of(&origins)
-        };
-        let undecided = store
-            .engine()
-            .map_err(refusal)?
-            .items()
-            .any(|item| item.origin == Origin::Environment && item.since_notified.is_none());
-        if undecided {
-            store
-                .tick(reading, &|origin| certified.at(origin))
-                .map_err(refusal)?;
-            drop(store);
+        let ticked = self.deciding(|reading| -> Answer<bool> {
+            let mut store = self.store()?;
+            let certified = {
+                let mut origins = self.origins();
+                origins.environment_certified = Some(
+                    origins
+                        .environment_certified
+                        .map_or(at, |earlier| earlier.max(at)),
+                );
+                Certificates::of(&origins)
+            };
+            let undecided =
+                store.engine().map_err(refusal)?.items().any(|item| {
+                    item.origin == Origin::Environment && item.since_notified.is_none()
+                });
+            if undecided {
+                store
+                    .tick(reading, &|origin| certified.at(origin))
+                    .map_err(refusal)?;
+            }
+            Ok(undecided)
+        })?;
+        if ticked {
             self.wake.notify_one();
         }
         Ok(())
@@ -2384,23 +2425,26 @@ impl AttentionModule {
                     return;
                 };
                 held.finish_again(reach.as_ref()).await;
-                let reading = held.reading();
-                if let Ok(mut store) = held.store() {
-                    // Read with the store held: a closure and a replacement take the store before
-                    // they take a certificate away, so this tick never decides on one they took.
-                    let certified = held.certificates();
-                    let _ = store.tick(reading, &|origin| certified.at(origin));
-                    // Expired records are let go of only on a wall clock this host can prove, so a
-                    // rollback cannot make a live record look expired.
-                    if held.time.may_collect_expired()
-                        && reading.wall_ms.get().saturating_sub(forgot_at) > FORGET_EVERY_MS
-                    {
-                        forgot_at = reading.wall_ms.get();
-                        let _ = store.forget_actions_before(
-                            reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
-                        );
+                let reading = held.deciding(|reading| {
+                    if let Ok(mut store) = held.store() {
+                        // Read with the store held: a closure and a replacement take the store
+                        // before they take a certificate away, so this tick never decides on one
+                        // they took.
+                        let certified = held.certificates();
+                        let _ = store.tick(reading, &|origin| certified.at(origin));
+                        // Expired records are let go of only on a wall clock this host can prove,
+                        // so a rollback cannot make a live record look expired.
+                        if held.time.may_collect_expired()
+                            && reading.wall_ms.get().saturating_sub(forgot_at) > FORGET_EVERY_MS
+                        {
+                            forgot_at = reading.wall_ms.get();
+                            let _ = store.forget_actions_before(
+                                reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
+                            );
+                        }
                     }
-                }
+                    reading
+                });
                 let mut wait = held
                     .next_decidable_deadline(reading)
                     .map_or(MAINTENANCE, |due| {
@@ -4949,6 +4993,63 @@ mod tests {
             "an approval naming a session no longer closing",
             true,
         );
+    }
+
+    /// An announcement the store decides is stamped with the privacy state the daemon publishes at
+    /// the moment it is decided, so that what is decided while privacy mode is on can be told from
+    /// what is decided after by that state and not by a clock. The control: a module that was
+    /// attached no privacy state stamps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_is_stamped_with_the_privacy_state_the_daemon_publishes() {
+        let failure = |session_id: SessionId| {
+            SourceEvent::new(
+                kr_attention::EventCursor::in_session(session_id, AttentionSource::Receipts, 1),
+                TimestampMs::new(kr_ipc::now_ms().get()),
+                EventKind::CommandCompleted {
+                    session_id,
+                    command: "make".to_owned(),
+                    exit_code: 2,
+                },
+            )
+        };
+        let stamped = |module: &AttentionModule| {
+            module
+                .take_for_delivery(|store, _| {
+                    store
+                        .engine()
+                        .expect("the store is this owner's")
+                        .items()
+                        .map(|item| item.decided_privacy)
+                        .collect::<Vec<_>>()
+                })
+                .expect("the store is taken")
+        };
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        module.attach_privacy(crate::privacy::PrivacyState::at(
+            crate::privacy::Published {
+                generation: kr_worker::privacy::PrivacyGeneration::new(3),
+                private: true,
+            },
+        ));
+        module
+            .observe(&[failure(SessionId::new(kr_ipc::new_uuid()))])
+            .expect("the store records the failure");
+        assert_eq!(
+            stamped(&module),
+            vec![Some(kr_attention::PrivacyStamp {
+                generation: 3,
+                private: true
+            })]
+        );
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        module
+            .observe(&[failure(SessionId::new(kr_ipc::new_uuid()))])
+            .expect("the store records the failure");
+        assert_eq!(stamped(&module), vec![None]);
     }
 
     /// A reach whose answer to "was the closure unaccounted for" is held until the test lets it go,
