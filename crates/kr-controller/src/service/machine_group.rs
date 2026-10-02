@@ -11,15 +11,20 @@
 //!
 //! **One step at a time.** A step is claimed in the same store as every other action the daemon
 //! performs on its own account, performed, and its receipt kept there. The whole sequence runs on a
-//! task of its own, behind one lock, so a caller that goes away does not cancel a write, and a
-//! second step cannot replace the record between the first one's write and its receipt. Before each
-//! step, and once at start, the claim the record's last change names is settled from the record: if
-//! an attempt ended after its write and before its receipt, its answer is kept before anything can
-//! change the record again.
+//! task of its own, behind one lock, so a caller that goes away does not cancel a write that has
+//! started, and a second step cannot replace the record between the first one's write and its
+//! receipt. A caller that goes before the write loses its registration, so the check at the write
+//! refuses the step, and that refusal is what a retry of the action is answered with. Before each
+//! step, and once at start, the claim the record's last change names is settled from the record,
+//! after the record's directory has been flushed: if an attempt ended after its write and before
+//! its receipt, its answer is kept before anything can change the record again, and a step is not
+//! taken while that cannot be done.
 //!
 //! **What a step is answered with.** A retry is answered from the receipt. A claim an earlier
-//! attempt left unfinished is answered from the record when its last change names that actor and
-//! action, and otherwise as an outcome this host does not know. It is never performed again.
+//! attempt left unfinished is settled from the record under the same lock, and answered from the
+//! receipt that gives when the record's last change names that actor and action; otherwise, and
+//! while what the record shows cannot be confirmed to survive a crash, it is answered as an
+//! outcome this host does not know. It is never performed again.
 
 use std::sync::Arc;
 
@@ -49,14 +54,29 @@ pub(super) struct Machine {
     /// Holds a step from its first look at the record to its receipt, so that one step's write is
     /// never followed by another's before the first has its answer kept.
     steps: tokio::sync::Mutex<()>,
-    /// Where this host's own tests end the next step after its write and before its receipt, as a
-    /// daemon that stopped there would. Compiled away in every shipped build.
+    /// Where this host's own tests make a step fail in the ways a stopped daemon or a failing disk
+    /// would. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    receipt_lost: std::sync::atomic::AtomicBool,
+    faults: Faults,
     /// Where this host's own tests stop a step once it has claimed its action, before it checks
     /// its admission again and writes. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_write: super::ReadPause,
+}
+
+/// What this host's own tests make fail. Each flag but the last is taken by the first step to meet
+/// it.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct Faults {
+    /// The step ends after its write and before its receipt, as a daemon that stopped there would.
+    receipt_lost: std::sync::atomic::AtomicBool,
+    /// The step's receipt cannot be kept, as when the registry cannot be written.
+    receipt_unwritable: std::sync::atomic::AtomicBool,
+    /// The step's write is reported as one whose directory could not be flushed.
+    write_unconfirmed: std::sync::atomic::AtomicBool,
+    /// The flush that settles an earlier step fails for as long as this is set.
+    recovery_flush_fails: std::sync::atomic::AtomicBool,
 }
 
 /// The record, or why there is none to use.
@@ -100,7 +120,7 @@ impl Machine {
             held,
             steps: tokio::sync::Mutex::new(()),
             #[cfg(feature = "testing")]
-            receipt_lost: std::sync::atomic::AtomicBool::new(false),
+            faults: Faults::default(),
             #[cfg(feature = "testing")]
             before_the_write: super::ReadPause::default(),
         })
@@ -118,6 +138,17 @@ enum Move {
 /// The sentence a refused step carries, which names no path: the answer can reach a paired device.
 const NO_RECORD: &str = "this environment has no usable machine group record, so no step is taken; \
                          host.doctor says what is wrong with it";
+
+/// What a step that cannot be taken, because an earlier step's change is not confirmed to survive a
+/// crash, is refused with.
+const UNCONFIRMED: &str = "an earlier change to this environment's machine group record could not \
+                           be confirmed to survive a crash, so no step is taken until it can be";
+
+/// What a step whose write was published, and whose directory could not be flushed, is answered
+/// with: no path, because the answer can reach a paired device.
+const NOT_CONFIRMED: &str = "this environment's machine group record was changed, but its directory \
+                             could not be flushed, so whether the change survives a crash is not \
+                             known; asking again under the same action says what the record shows";
 
 /// What a step that wrote nothing is answered with.
 const NOT_WRITTEN: &str = "this environment's machine group record could not be written, and it \
@@ -199,7 +230,7 @@ impl Controller {
         let _serial = self.machine.steps.lock().await;
         // The step before this one may have written the record and ended before its receipt. Its
         // answer is kept now, from the record, before this step can replace the record.
-        self.settle_machine_record()?;
+        self.settle_machine_record().await?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let hold = match self.sharing.grants().claim_action(
@@ -210,7 +241,7 @@ impl Controller {
         )? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.machine_recorded(actor_id, mutation.action_id, record);
+                return self.machine_recorded(record);
             }
         };
         let approval = Approval {
@@ -227,6 +258,7 @@ impl Controller {
         #[cfg(feature = "testing")]
         if self
             .machine
+            .faults
             .receipt_lost
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
@@ -235,9 +267,16 @@ impl Controller {
                 detail: "a test ended this step after its write and before its receipt".to_owned(),
             });
         }
-        let kept = self.settle_machine_claim(&hold, &outcome);
+        // A receipt that cannot be kept does not change what the step did, and the caller is told
+        // that: the claim stays unfinished, and the record, which names the step, is what the next
+        // step and a retry settle it from.
+        if let Err(unrecorded) = self.settle_machine_claim(&hold, &outcome) {
+            eprintln!(
+                "kr-controller: a machine group step's receipt could not be kept: {unrecorded}"
+            );
+        }
         drop(hold);
-        kept.and(outcome)
+        outcome
     }
 
     /// Writes the step to the record on a blocking thread, with the admission checked again at
@@ -266,13 +305,37 @@ impl Controller {
                 });
             };
             let lock = &controller.lock;
-            controller
+            let written = controller
                 .under_registration(&carried, || match movement {
                     Move::Join(into) => store.join(lock, into, expected, &approval, now_ms),
                     Move::Merge(into) => store.merge(lock, into, expected, &approval, now_ms),
                     Move::Split => store.split(lock, expected, &approval, now_ms),
                 })
-                .and_then(|written| written)
+                .and_then(|written| written);
+            // A write whose directory could not be flushed, as the store reports it.
+            #[cfg(feature = "testing")]
+            let written = match written {
+                Ok(_)
+                    if controller
+                        .machine
+                        .faults
+                        .write_unconfirmed
+                        .swap(false, std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    Err(ControllerError::Uncertain {
+                        detail: format!(
+                            "{} now names a machine group, but its directory could not be flushed",
+                            controller
+                                .paths
+                                .state_dir()
+                                .join(crate::machine::RECORD_FILE)
+                                .display()
+                        ),
+                    })
+                }
+                other => other,
+            };
+            written
         })
         .await
         .unwrap_or_else(|_| {
@@ -288,6 +351,13 @@ impl Controller {
                 ControllerError::Storage {
                     operation: "change the machine group record",
                     detail: NOT_WRITTEN.to_owned(),
+                }
+            }
+            // The same, for a step that did write and whose flush failed.
+            ControllerError::Uncertain { detail } => {
+                eprintln!("kr-controller: a machine group step is not confirmed: {detail}");
+                ControllerError::Uncertain {
+                    detail: NOT_CONFIRMED.to_owned(),
                 }
             }
             other => other,
@@ -306,6 +376,18 @@ impl Controller {
         hold: &crate::grants::ClaimHold,
         outcome: &Result<ParamsValue>,
     ) -> Result<()> {
+        #[cfg(feature = "testing")]
+        if self
+            .machine
+            .faults
+            .receipt_unwritable
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControllerError::Storage {
+                operation: "keep a machine group step's receipt",
+                detail: "a test made the receipt unwritable".to_owned(),
+            });
+        }
         if let Err(error @ ControllerError::Storage { .. }) = outcome {
             if let Err(unrecorded) = self.sharing.grants().retain_refusal(
                 hold,
@@ -325,34 +407,33 @@ impl Controller {
     ///
     /// Both doors call this for the three methods, ahead of everything that decides a first
     /// admission: section 9 keeps a receipt readable after the window that admitted it has gone.
-    pub(super) fn machine_retained(
-        &self,
+    pub(super) async fn machine_retained(
+        self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Option<ControlFrame> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
-        match self
-            .sharing
-            .grants()
-            .recorded_action(actor_id, mutation.action_id, &digest)
-        {
-            Ok(Some(record)) => Some(respond(
-                mutation.request_id,
-                self.machine_recorded(actor_id, mutation.action_id, record),
-            )),
-            Ok(None) => None,
-            Err(error) => Some(respond(mutation.request_id, Err(error))),
-        }
+        let answer =
+            match self
+                .sharing
+                .grants()
+                .recorded_action(actor_id, mutation.action_id, &digest)
+            {
+                Ok(None) => return None,
+                Ok(Some(crate::grants::ActionRecord::Unfinished)) => {
+                    self.machine_unfinished(actor_id, mutation.action_id, &digest)
+                        .await
+                }
+                Ok(Some(record)) => self.machine_recorded(record),
+                Err(error) => Err(error),
+            };
+        Some(respond(mutation.request_id, answer))
     }
 
-    /// The answer a claimed step is owed: its result, its refusal, that it is still running, or,
-    /// for a claim whose attempt ended without recording what it did, what the record shows.
-    fn machine_recorded(
-        &self,
-        actor_id: &ActorId,
-        action_id: ActionId,
-        record: crate::grants::ActionRecord,
-    ) -> Result<ParamsValue> {
+    /// The answer a claimed step is owed once its claim is known to have a result, a refusal, or
+    /// an attempt still running. A claim that is none of those is
+    /// [`Self::machine_unfinished`]'s.
+    fn machine_recorded(&self, record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         match record {
             crate::grants::ActionRecord::Answered { result } => decoded(&result),
             crate::grants::ActionRecord::Refused { code, detail } => {
@@ -362,51 +443,101 @@ impl Controller {
                 code: ErrorCode::ResourceUnavailable,
                 detail: "another attempt under this action identifier has not finished".to_owned(),
             }),
-            crate::grants::ActionRecord::Unfinished => {
-                let Held::Serving(store) = &self.machine.held else {
-                    return Err(unfinished_and_unknown());
-                };
-                match store.group() {
-                    Ok(record) if names(&record, actor_id, action_id) => {
-                        encode(&result_of(self.paths.environment_id(), &record))
-                    }
-                    _ => Err(unfinished_and_unknown()),
-                }
-            }
+            crate::grants::ActionRecord::Unfinished => Err(unfinished_and_unknown()),
+        }
+    }
+
+    /// The answer to a step whose attempt ended without recording what it did.
+    ///
+    /// It is settled from the record under the step lock, so that no other step can replace the
+    /// record between the record being read and the receipt being kept, and after the record's
+    /// directory has been flushed, so that a result is never given for a change that a crash can
+    /// still take back. What the claim then holds is the answer. Where it holds none, or the
+    /// record could not be settled, the outcome is not known.
+    async fn machine_unfinished(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        digest: &kr_protocol::scalars::Digest256,
+    ) -> Result<ParamsValue> {
+        let _serial = self.machine.steps.lock().await;
+        if let Err(error) = self.settle_machine_record().await {
+            eprintln!(
+                "kr-controller: an unfinished machine group step could not be settled: {error}"
+            );
+        }
+        match self
+            .sharing
+            .grants()
+            .recorded_action(actor_id, action_id, digest)?
+        {
+            Some(crate::grants::ActionRecord::Unfinished) | None => Err(unfinished_and_unknown()),
+            Some(record) => self.machine_recorded(record),
         }
     }
 
     /// Keeps, under its claim, the answer to the step the record's last change names, if its
     /// attempt ended without recording one.
     ///
-    /// Run at start, before anything is served, and before every step. What the record shows has
-    /// to be on disk before a receipt says so, so the state directory is flushed first, and a
-    /// flush that fails leaves the claim as it is: the step it names was never reported as done.
+    /// Run at start, before anything is served, before every step, and before a retry of an
+    /// unfinished step is answered; the last two hold the step lock. What the record shows has to
+    /// be on disk before a receipt says so, so the state directory is flushed first on a blocking
+    /// thread.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the receipt cannot be written.
-    pub(super) fn settle_machine_record(&self) -> Result<()> {
+    /// Returns a storage failure, naming no path, when the record cannot be read now, when its
+    /// directory cannot be flushed, or when the receipt cannot be written: a step is not taken, and
+    /// an unfinished one is not answered, while the change the record shows cannot be confirmed.
+    pub(super) async fn settle_machine_record(self: &Arc<Self>) -> Result<()> {
+        let controller = Arc::clone(self);
+        tokio::task::spawn_blocking(move || controller.settle_machine_record_blocking())
+            .await
+            .unwrap_or_else(|_| {
+                Err(ControllerError::Storage {
+                    operation: "change the machine group record",
+                    detail: UNCONFIRMED.to_owned(),
+                })
+            })
+    }
+
+    fn settle_machine_record_blocking(&self) -> Result<()> {
         let Held::Serving(store) = &self.machine.held else {
             return Ok(());
         };
-        let Ok(record) = store.group() else {
-            return Ok(());
+        let unconfirmed = |why: &dyn std::fmt::Display| {
+            eprintln!("kr-controller: a machine group change cannot be confirmed: {why}");
+            ControllerError::Storage {
+                operation: "change the machine group record",
+                detail: UNCONFIRMED.to_owned(),
+            }
         };
+        let record = store.group().map_err(|error| unconfirmed(&error))?;
         let step = match &record.change {
             Change::Created { .. } => return Ok(()),
             Change::Joined(step) | Change::Merged(step) | Change::Split(step) => step,
         };
-        if kr_flush::flush_directory(self.paths.state_dir(), kr_flush::NameKind::File).is_err() {
-            return Ok(());
+        #[cfg(feature = "testing")]
+        if self
+            .machine
+            .faults
+            .recovery_flush_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(unconfirmed(&"a test made the flush fail"));
         }
+        kr_flush::flush_directory(self.paths.state_dir(), kr_flush::NameKind::File)
+            .map_err(|error| unconfirmed(&error))?;
         let result = encode(&result_of(self.paths.environment_id(), &record))?;
-        self.sharing.grants().settle_unfinished(
-            &step.actor,
-            step.action_id,
-            &kr_cbor::encode(result.as_value()),
-            kr_ipc::now_ms().get(),
-        )?;
+        self.sharing
+            .grants()
+            .settle_unfinished(
+                &step.actor,
+                step.action_id,
+                &kr_cbor::encode(result.as_value()),
+                kr_ipc::now_ms().get(),
+            )
+            .map_err(|error| unconfirmed(&error))?;
         Ok(())
     }
 
@@ -432,9 +563,13 @@ impl Controller {
                 Sentence::new()
                     .stated("the record is at revision ")
                     .number(record.revision)
-                    .stated(", written by a ")
-                    .stated(change_of(&record.change).as_str())
-                    .stated(" of this environment's own"),
+                    .stated(", last written by ")
+                    .stated(match change_of(&record.change) {
+                        MachineChange::Created => "this environment's first start",
+                        MachineChange::Joined => "a join the owner took",
+                        MachineChange::Merged => "a merge the owner took part in",
+                        MachineChange::Split => "a split the owner took",
+                    }),
                 None,
             ),
             Err(error) => DoctorCheck::new(
@@ -449,12 +584,15 @@ impl Controller {
                     )
                     .withheld(ContentClass::Message, &error.to_string()),
                 Some(
-                    "If the machine-group file is damaged or belongs to another environment, move \
-                     it aside under a name that does not begin with .machine-group. and end with \
-                     .tmp, then restart this environment's control daemon: a missing record is a \
-                     first start and mints a group of one. Run kr host machine join to put the \
+                    "A file that is whole is read again when this environment's control daemon \
+                     restarts, so restart it first. If the machine-group file is damaged or \
+                     belongs to another environment, move it aside under a name that does not \
+                     both begin with .machine-group. and end with .tmp, such as \
+                     machine-group.damaged, and restart the daemon: a missing record is a first \
+                     start and mints a group of one. Run kr host machine join to put the \
                      environment back in a known group if you want one. If the file could not be \
-                     created, make the state directory writable and restart the daemon.",
+                     created, make the state directory writable (kr doctor names it) and restart \
+                     the daemon.",
                 ),
             ),
         }
@@ -478,8 +616,39 @@ impl Controller {
     #[cfg(feature = "testing")]
     pub fn lose_the_next_machine_receipt(&self) {
         self.machine
+            .faults
             .receipt_lost
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the receipt of the next machine group step unwritable, as when the registry cannot be
+    /// written, after the step has written its record. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn make_the_next_machine_receipt_unwritable(&self) {
+        self.machine
+            .faults
+            .receipt_unwritable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reports the next machine group step as one whose record was written and whose directory
+    /// could not be flushed, as the store reports it. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn report_the_next_machine_write_as_unconfirmed(&self) {
+        self.machine
+            .faults
+            .write_unconfirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the flush that settles an earlier machine group step fail, or work again. For this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn fail_the_machine_recovery_flush(&self, failing: bool) {
+        self.machine
+            .faults
+            .recovery_flush_fails
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -515,16 +684,6 @@ fn read_step(method: Method, params: &ParamsValue) -> Result<(Move, Expected)> {
             "{} is not a machine group step",
             other.as_str()
         ))),
-    }
-}
-
-/// Whether the record's last change is the step this actor took under this action.
-fn names(record: &MachineGroup, actor_id: &ActorId, action_id: ActionId) -> bool {
-    match &record.change {
-        Change::Created { .. } => false,
-        Change::Joined(step) | Change::Merged(step) | Change::Split(step) => {
-            step.actor == *actor_id && step.action_id == action_id
-        }
     }
 }
 
