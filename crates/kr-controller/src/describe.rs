@@ -285,7 +285,9 @@ impl DescribeModule {
                 (
                     DoctorStatus::NotApplicable,
                     processor_lacks_sentence(lacks),
-                    None,
+                    Some(
+                        "In a virtual machine, give it a CPU type that passes these instruction sets through, such as the host's own.",
+                    ),
                 )
             }
             Some(_) if !settings.enabled => (
@@ -857,18 +859,11 @@ fn processor_lacks_sentence(
     use kr_protocol::hostinfo::export::Sentence;
 
     let mut sentence = Sentence::new().stated("this processor lacks ");
-    for (index, feature) in lacks.iter().enumerate() {
-        if index > 0 {
-            sentence = sentence.stated(if index + 1 == lacks.len() {
-                " and "
-            } else {
-                ", "
-            });
-        }
-        sentence = sentence.stated(feature.as_str());
+    for part in kr_describe::processor::name_parts(lacks) {
+        sentence = sentence.stated(part);
     }
     sentence.stated(
-        ", which the description process needs, so nothing is generated on this host, and a session shows the title it has from metadata or a pin",
+        ", which the description process needs, so nothing new is generated on this host, and a session shows the title it has from metadata, a pin or an earlier description",
     )
 }
 

@@ -1709,7 +1709,11 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_processor_without_an_instruction_set_the_process_uses_is_named_and_starts_no_process() {
     let target = "x86_64-unknown-linux-gnu";
-    let lacking = Features::of([Feature::Sse42, Feature::Avx, Feature::Fma, Feature::F16c]);
+    let lacking = Features::of(
+        Feature::X86_64
+            .into_iter()
+            .filter(|feature| !matches!(feature, Feature::Avx2 | Feature::Bmi2)),
+    );
     let environment = Environment::start(Setup {
         catalogue: Some(catalogue_for(target)),
         machine: Some((target.to_owned(), lacking)),
@@ -1753,6 +1757,18 @@ async fn a_processor_without_an_instruction_set_the_process_uses_is_named_and_st
             .starts_with("this processor lacks AVX2 and BMI2, which the description process needs"),
         "{}",
         check.detail()
+    );
+    assert!(
+        check.detail().ends_with("a pin or an earlier description"),
+        "{}",
+        check.detail()
+    );
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|fix| fix.starts_with("In a virtual machine")),
+        "{:?}",
+        check.remedy()
     );
 
     let described = environment

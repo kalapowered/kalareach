@@ -42,8 +42,9 @@ The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-d
 `kr-hook` and `kr-plugin-host`. Each one is built by a Cargo command of its own, as the Windows release builds
 them, so its dependencies resolve exactly as they do for the release. The description process is built for every
 target except `aarch64-pc-windows-msvc`, where llama.cpp's CPU backend does not build with MSVC and no model
-profile lists the target. On x86-64 the description process also needs a processor with AVX2, FMA, F16C and BMI2;
-`docs/describe/README.md` says what a host without them does.
+profile lists the target. On x86-64 the description process also needs a processor with the x86-64-v3 instruction sets (SSE4.2,
+POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT and MOVBE); `docs/describe/README.md` says what a host
+without them does.
 
 ## How each floor is read
 
