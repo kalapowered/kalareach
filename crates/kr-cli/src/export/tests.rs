@@ -21,6 +21,8 @@ use kr_protocol::session::{
     ShellMode,
 };
 
+use serde_json::Value;
+
 use super::*;
 use crate::bridge::link::Answer;
 
@@ -201,13 +203,18 @@ fn page(from: u64, bytes: &[u8]) -> Step {
 
 /// A page that starts at `from`, after a gap that began at `gap_from` where one is given.
 fn page_with(from: u64, bytes: &[u8], gap_from: Option<u64>) -> Step {
+    page_after(from, bytes, gap_from, 0)
+}
+
+/// The same, for an archive whose oldest retained cursor is `oldest`.
+fn page_after(from: u64, bytes: &[u8], gap_from: Option<u64>, oldest: u64) -> Step {
     Step::Ok(
         Method::HistoryPage,
         ParamsValue::from_typed(&HistoryPageResult {
             from_cursor: U64::new(from),
             next_cursor: U64::new(from + bytes.len() as u64),
             bytes: Bytes::new(bytes.to_vec()),
-            oldest_retained_cursor: U64::new(0),
+            oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap_from.map(|gap_from| HistoryGap {
                 from_cursor: U64::new(gap_from),
                 to_cursor: U64::new(from),
@@ -271,7 +278,8 @@ impl Read {
 
     fn count(&self, kind: &str) -> Option<u64> {
         self.omission(kind)
-            .and_then(|omission| omission["count"].as_u64())
+            .and_then(|omission| omission["count"].as_str())
+            .map(|count| count.parse().expect("digits"))
     }
 }
 
@@ -388,13 +396,13 @@ async fn the_file_names_the_session_its_closure_and_what_the_archive_does_not_ke
     assert_eq!(file.0["format"], FORMAT);
     assert_eq!(file.0["exported_at_ms"], "42");
     assert_eq!(file.0["session"]["session_id"], session_id().to_string());
-    assert_eq!(file.0["session"]["display_number"], 1);
+    assert_eq!(file.0["session"]["display_number"], "1");
     assert_eq!(file.0["session"]["shell"], "/bin/sh");
     assert_eq!(file.0["session"]["created_at_ms"], "1000");
     assert_eq!(file.0["closure"]["reason"], "root_exit", "{}", file.0);
     assert_eq!(file.0["closure"]["closed_at_ms"], "9000", "{}", file.0);
-    assert_eq!(file.0["dimensions"]["columns"], 100);
-    assert_eq!(file.0["dimensions"]["rows"], 30);
+    assert_eq!(file.0["dimensions"]["columns"], "100");
+    assert_eq!(file.0["dimensions"]["rows"], "30");
     assert_eq!(file.chunks(), vec![(0, b"abc".to_vec())]);
     assert_eq!(file.0["output"]["next_cursor"], "3");
     assert_eq!(file.0["output"]["truncated"], false);
@@ -440,7 +448,7 @@ async fn a_gap_is_carried_and_what_follows_it_is_not_read_as_a_continuation() {
     // the output is text, which a reader that carried the command over would have swallowed up to
     // the next terminator.
     let before = b"before\r\n\x1b]0;a title that is cut";
-    let after = b"after the gap\r\n";
+    let after = b"\x1b[32mafter the gap\r\n";
     let mut daemon = Scripted::new(vec![
         listing(vec![closed(1)]),
         privacy(false, 4, &[]),
@@ -474,6 +482,209 @@ async fn a_gap_is_carried_and_what_follows_it_is_not_read_as_a_continuation() {
         contains(&file.output(), b"before"),
         "what came before the gap is carried"
     );
+}
+
+/// Output that begins after a range the archive no longer holds can begin inside a control string
+/// whose start is gone: the end of a clipboard write is base64 text and a bell. It is not read up to
+/// the first point a sequence can be taken to begin at, so the rest of the secret appears nowhere in
+/// the file, and the bytes not read are counted. The same for the start of what an archive still
+/// retains when its oldest output has been evicted.
+#[tokio::test]
+async fn output_that_resumes_inside_a_clipboard_write_does_not_carry_the_rest_of_it() {
+    // After a gap: the end of a write the gap cut, ended by a bell, then ordinary output.
+    let tail = b"c2VjcmV0LXRva2Vu\x07visible after\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"before\r\n"),
+        page_with(1_000, tail, Some(8)),
+        end(1_000 + tail.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    let whole = String::from_utf8_lossy(&exported.document);
+    assert!(!whole.contains("c2VjcmV0"), "{whole}");
+    assert!(
+        !whole.contains(&kr_protocol::scalars::to_base64url(b"c2VjcmV0")),
+        "{whole}"
+    );
+    assert!(contains(&file.output(), b"visible after"), "{}", file.0);
+    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
+    assert_eq!(
+        file.count("output_resumed_mid_stream"),
+        Some(b"c2VjcmV0LXRva2Vu\x07".len() as u64),
+        "{}",
+        file.0
+    );
+
+    // Ended by a string terminator instead: the escape is where reading begins.
+    let tail = b"c2VjcmV0LXRva2Vu\x1b\\then this\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"before\r\n"),
+        page_with(1_000, tail, Some(8)),
+        end(1_000 + tail.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
+    assert!(contains(&file.output(), b"then this"), "{}", file.0);
+
+    // The head of the archive was evicted: what is retained begins inside the stream.
+    let retained = b"cmV0LXRva2Vu\x07\x1b[1mbold\x1b[0m\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page_after(500, retained, Some(0), 500),
+        end(500 + retained.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert!(!contains(&file.output(), b"cmV0"), "{}", file.0);
+    assert!(contains(&file.output(), b"bold"), "{}", file.0);
+    assert_eq!(file.0["output"]["from_cursor"], "500");
+
+    // The control: output that begins at the start of the stream is read from its first byte.
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"first line\r\n"),
+        end(12),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(file.output(), b"first line\r\n");
+    assert!(file.omission("output_resumed_mid_stream").is_none());
+}
+
+/// An archive that cannot say where its output got to reports the same gap on every page, though no
+/// page skipped anything. It is listed once, and the pages are one stretch of output: a control
+/// string that runs across two of them stays one string, and is not cut where a page ends.
+#[tokio::test]
+async fn a_gap_every_page_repeats_is_listed_once_and_does_not_cut_a_sequence() {
+    let same = |from: u64, bytes: &[u8]| {
+        Step::Ok(
+            Method::HistoryPage,
+            ParamsValue::from_typed(&HistoryPageResult {
+                from_cursor: U64::new(from),
+                next_cursor: U64::new(from + bytes.len() as u64),
+                bytes: Bytes::new(bytes.to_vec()),
+                oldest_retained_cursor: U64::new(0),
+                gap: Nullable::some(HistoryGap {
+                    from_cursor: U64::new(0),
+                    to_cursor: U64::new(0),
+                    cause: Some(HistoryGapCause::SpoolUnavailable),
+                }),
+            })
+            .expect("a page"),
+        )
+    };
+    let first = b"a\x1b]0;a title that";
+    let second = b" runs on\x07b\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        same(0, first),
+        same(first.len() as u64, second),
+        end(first.len() as u64 + second.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(exported.summary.gaps, 1, "{}", file.0);
+    assert_eq!(file.0["output"]["gaps"].as_array().map(Vec::len), Some(1));
+    // The title is a window title, rendering data, and it comes through whole: one string that ran
+    // across two pages, and not text and a stray bell.
+    assert!(
+        contains(&file.output(), b"\x1b]0;a title that runs on\x07"),
+        "{}",
+        file.0
+    );
+    assert!(contains(&file.output(), b"b\r\n"), "{}", file.0);
+}
+
+/// A program that asks the terminal to read the clipboard is answered by the terminal engine itself,
+/// with no side effect to count. The request is not in the file, and the file counts it as one of the
+/// questions the program asked the terminal.
+#[tokio::test]
+async fn a_clipboard_read_is_not_carried_and_is_counted_as_a_question() {
+    let output = b"x\x1b]52;c;?\x07y\x1b[c\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, output),
+        end(output.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert!(!contains(&file.output(), b"\x1b]52"), "{}", file.0);
+    assert!(!contains(&file.output(), b"\x1b[c"), "{}", file.0);
+    assert_eq!(file.count("terminal_query"), Some(2), "{}", file.0);
+    assert!(file.omission("clipboard_read").is_none(), "{}", file.0);
+}
+
+/// Every 64-bit value in the file is a decimal string, as the protocol writes one, so a value past
+/// what a floating-point number holds is not rounded by the reader: the display number here is one
+/// past 2^53.
+#[tokio::test]
+async fn a_value_past_what_a_float_holds_is_written_whole() {
+    let mut summary = closed(1);
+    summary.display_number = DisplayNumber::new(9_007_199_254_740_993);
+    let mut daemon = Scripted::new(vec![
+        listing(vec![summary]),
+        privacy(false, 4, &[]),
+        page(0, b"abc"),
+        end(3),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = read(
+        &mut daemon,
+        &SessionSelector::Display(9_007_199_254_740_993),
+        DEFAULT_MAX_BYTES,
+        42,
+    )
+    .await
+    .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(file.0["session"]["display_number"], "9007199254740993");
+}
+
+/// A bound of no bytes is refused before the daemon is asked anything; the least there is, one byte,
+/// is read.
+#[tokio::test]
+async fn a_bound_of_no_bytes_is_refused_before_anything_is_asked() {
+    let mut daemon = Scripted::new(Vec::new());
+    let refused = export(&mut daemon, 0).await.expect_err("is refused");
+    assert!(matches!(refused, CliError::Usage(_)), "{refused}");
+    assert!(daemon.methods().is_empty());
+
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"a"),
+        page(1, b"b"),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, 1).await.expect("one byte is read");
+    assert_eq!(Read::of(&exported).output(), b"a");
 }
 
 /// The read stops at the byte bound and says so, and it keeps the start of what is retained. The
