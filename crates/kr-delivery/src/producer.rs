@@ -496,6 +496,10 @@ pub struct Taken {
     pub alerts: usize,
     /// How many announcements became an event with nothing produced from it.
     pub dropped: usize,
+    /// How many of those were dropped because they were decided under another privacy generation
+    /// than the one in force, or, with no privacy state recorded for them, at or before the moment
+    /// privacy mode was last turned off: a decision kept across a private period.
+    pub across_privacy: usize,
     /// Whether the journal and the published privacy state did not agree, or privacy mode moved
     /// part of the way through, so that some or all of what the store offered is offered again.
     pub skipped: bool,
@@ -507,15 +511,41 @@ impl Taken {
             taken: 0,
             alerts: 0,
             dropped: 0,
+            across_privacy: 0,
             skipped: true,
         }
+    }
+}
+
+/// Why an announcement becomes an event with nothing produced from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dropped {
+    /// The item is gone, nobody's grant could name its audience, or it is routed to a lease
+    /// holder, which is not a destination of this host.
+    Unaddressed,
+    /// Privacy mode is on and the announcement is not a pending question or approval, which are
+    /// the only kinds that owe an alert while it is.
+    Withheld,
+    /// It was decided under another privacy generation than the one in force, or in privacy mode
+    /// when the mode is off. Entering privacy mode fences what carries content and turning it off
+    /// brings none back, so a decision kept across a private period is not produced after it.
+    OtherPrivacyState,
+    /// Nothing recorded the privacy state it was decided under, and it was decided at or before the
+    /// moment privacy mode was last turned off, so it may have been decided while the mode was on.
+    BeforeTheLift,
+}
+
+impl Dropped {
+    /// Whether this is a decision kept across a private period.
+    const fn across_privacy(self) -> bool {
+        matches!(self, Self::OtherPrivacyState | Self::BeforeTheLift)
     }
 }
 
 /// What becomes of one announcement.
 enum Fate {
     /// An event with no notice: nothing is produced from it.
-    Drop,
+    Drop(Dropped),
     /// An event that holds this notice, which [`Producer::finish_pending`] produces from.
     Produce(Notice),
     /// An alert admitted while privacy mode is on.
@@ -524,6 +554,14 @@ enum Fate {
 
 impl Fate {
     /// Decides one announcement from the item it is about and the privacy state.
+    ///
+    /// A decision is produced only under the privacy generation it was made in, in privacy mode as
+    /// out of it. The store stamps each decision with the state it was made under, which no clock
+    /// can change, and that stamp is what decides. An item decided before the store said, or by a
+    /// caller that never did, has only the time it was decided at, which quiet hours do not move
+    /// when they release it: one decided at or before the moment privacy mode was last turned off
+    /// may have been decided while it was on, and a time recorded for none is treated the same once
+    /// a lift is recorded.
     fn of(
         engine: &Engine,
         announcement: &Announcement,
@@ -532,47 +570,46 @@ impl Fate {
         now_ms: u64,
     ) -> Self {
         let Some(item) = engine.item(&announcement.key) else {
-            return Self::Drop;
+            return Self::Drop(Dropped::Unaddressed);
         };
         let Some(audience) = Audience::of_item(engine, item) else {
-            return Self::Drop;
+            return Self::Drop(Dropped::Unaddressed);
         };
         // A lease holder is not a destination of this host, whatever the state of privacy mode.
         if announcement.routing == AttentionRouting::LeaseHolder {
-            return Self::Drop;
+            return Self::Drop(Dropped::Unaddressed);
         }
+        let in_force = |stamp: kr_attention::PrivacyStamp| {
+            stamp.generation == privacy.generation && stamp.private == privacy.private
+        };
         if privacy.private {
-            return if matches!(
+            if !matches!(
                 announcement.rule,
                 AttentionRule::PendingApproval
                     | AttentionRule::PendingInput
                     | AttentionRule::InputIdleReminder
             ) {
-                Self::Alert(Notice::alert_only(
-                    announcement,
-                    audience,
-                    privacy.generation,
-                    now_ms,
-                ))
-            } else {
-                Self::Drop
-            };
+                return Self::Drop(Dropped::Withheld);
+            }
+            if item.decided_privacy.is_some_and(|stamp| !in_force(stamp)) {
+                return Self::Drop(Dropped::OtherPrivacyState);
+            }
+            return Self::Alert(Notice::alert_only(
+                announcement,
+                audience,
+                privacy.generation,
+                now_ms,
+            ));
         }
-        // What was decided while privacy mode was on is never sent once it is off. The store says
-        // what privacy state it decided under, which no clock can change, and that is what
-        // decides it. An item decided before the store said, or by a caller that never did, has
-        // only the time it was decided at, which quiet hours do not move when they release it: one
-        // decided at or before the moment privacy mode was last turned off may have been decided
-        // while it was on.
-        let decided_while_private = match item.decided_privacy {
-            Some(stamp) => stamp.private,
+        match item.decided_privacy {
+            Some(stamp) if !in_force(stamp) => return Self::Drop(Dropped::OtherPrivacyState),
+            Some(_) => {}
             None => {
                 let decided_at_ms = item.decided_at_ms.map_or(0, |at| at.get());
-                lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms
+                if lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms {
+                    return Self::Drop(Dropped::BeforeTheLift);
+                }
             }
-        };
-        if decided_while_private {
-            return Self::Drop;
         }
         Self::Produce(Notice::from_announcement(announcement, audience, now_ms))
     }
@@ -681,15 +718,22 @@ impl Producer {
     /// or one it has not lifted, is a state this does not decide anything under, and nothing is
     /// taken until the two agree.
     ///
+    /// A decision is produced only under the privacy generation it was made in, in privacy mode as
+    /// out of it: the store stamps each decision with the state it was made under, and an
+    /// announcement whose stamp is not the state in force becomes an event with no notice, whatever
+    /// the clocks say. Entering privacy mode fences what carries content and turning it off brings
+    /// none of it back, so a decision kept across a private period, held by quiet hours or by the
+    /// offer, is never sent after it. One whose store recorded no stamp is dropped when it was
+    /// decided at or before the moment privacy mode was last turned off.
+    ///
     /// While privacy mode is off, an announcement becomes an event this journal holds the notice
-    /// of, and [`Producer::finish_pending`] produces from it. Two kinds become an event with no
-    /// notice: one decided before privacy mode was last turned off, which may have been decided
-    /// while it was on and is never sent once it is off, and one routed to a lease holder, which
-    /// is not a destination of this host. While privacy mode is on, a pending approval or question
-    /// still owes an alert, with nothing in it but the generic alert ([`Notice::alert_only`]),
-    /// and it is admitted in the transaction that takes it; every other announcement becomes an
-    /// event with no notice, and the fence's own rule that nothing carrying content is produced
-    /// stands.
+    /// of, and [`Producer::finish_pending`] produces from it. Two further kinds become an event with
+    /// no notice: one routed to a lease holder, which is not a destination of this host, and one
+    /// whose item or audience the store no longer holds. While privacy mode is on, a pending
+    /// approval or question still owes an alert, with nothing in it but the generic alert
+    /// ([`Notice::alert_only`]), and it is admitted in the transaction that takes it; every other
+    /// announcement becomes an event with no notice, and the fence's own rule that nothing carrying
+    /// content is produced stands.
     ///
     /// # Errors
     ///
@@ -739,11 +783,12 @@ impl Producer {
             .map_or(0, |held| held.cursor);
         if privacy.private {
             for (announcement, fate) in announcements.iter().zip(fates) {
+                let across_privacy = matches!(fate, Fate::Drop(why) if why.across_privacy());
                 let entry = match fate {
                     Fate::Alert(notice) => {
                         self.alert(&notice, announcement.number, authority, now_ms)?
                     }
-                    Fate::Drop | Fate::Produce(_) => PrivateEntry {
+                    Fate::Drop(_) | Fate::Produce(_) => PrivateEntry {
                         event: observed_announcement(announcement, now_ms),
                         records: Vec::new(),
                         spent: Vec::new(),
@@ -760,6 +805,7 @@ impl Producer {
                         taken.taken += usize::from(new);
                         taken.alerts += alerts;
                         taken.dropped += usize::from(entry.records.is_empty());
+                        taken.across_privacy += usize::from(across_privacy);
                     }
                     // Privacy mode moved while this was being decided. What was taken stays
                     // taken, and the rest is offered again.
@@ -775,10 +821,12 @@ impl Producer {
             let mut events = Vec::with_capacity(announcements.len());
             for (announcement, fate) in announcements.iter().zip(fates) {
                 cursor = cursor.max(announcement.number);
+                let across_privacy = matches!(fate, Fate::Drop(why) if why.across_privacy());
                 match fate {
                     Fate::Produce(notice) => events.push(notice.taken(announcement.number)?),
-                    Fate::Drop | Fate::Alert(_) => {
+                    Fate::Drop(_) | Fate::Alert(_) => {
                         taken.dropped += 1;
+                        taken.across_privacy += usize::from(across_privacy);
                         events.push(observed_announcement(announcement, now_ms));
                     }
                 }
@@ -3316,6 +3364,11 @@ mod tests {
                 usize::from(!sent),
                 "decided under generation {decided_under}"
             );
+            assert_eq!(
+                taken.across_privacy,
+                usize::from(!sent),
+                "decided under generation {decided_under}"
+            );
             let produced = producer
                 .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
                 .expect("production");
@@ -3374,6 +3427,11 @@ mod tests {
             );
             assert_eq!(
                 taken.dropped,
+                usize::from(!alerted),
+                "decided under {stamp:?}"
+            );
+            assert_eq!(
+                taken.across_privacy,
                 usize::from(!alerted),
                 "decided under {stamp:?}"
             );

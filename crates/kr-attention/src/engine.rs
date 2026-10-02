@@ -150,7 +150,8 @@ pub struct Item {
     /// know what was decided before some moment, such as the moment a mode that withholds content
     /// was turned off, is told the time of the decision and not the time of its release. An item
     /// that was decided about before this was kept carries [`Item::last_notified_ms`] here, the
-    /// best time its store has for it.
+    /// best time its store has for it, and where that had been cleared it carries none and keeps
+    /// none through a release.
     pub decided_at_ms: Option<TimestampMs>,
     /// The privacy state the announcement [`Item::decided_at_ms`] dates was decided under, when the
     /// host said what it was.
@@ -1580,14 +1581,17 @@ impl Engine {
         // inside quiet hours is deferred once rather than re-decided on every tick.
         item.since_notified = Some(Elapsed::starting(reading));
         item.last_notified_ms = Some(reading.wall_ms);
-        // The time of the decision a consumer will be handed. A release is the end of a decision
-        // already made, not a new one, so it keeps the time that decision was made at, unless
-        // nothing recorded it. A decision that quiet hours hold back, while an earlier one has not
-        // been taken yet, leaves that one's time alone: the earlier decision is the one the
-        // consumer will be handed, and dating it by the later one could make it look newer than it
-        // is. The cost is that the held decision, when it is released, is dated by the earlier one.
+        // The time and the privacy state of the decision a consumer will be handed. A release is
+        // the end of a decision already made, not a new one, so it keeps what that decision
+        // recorded, and an item whose store recorded no time for it stays without one: the
+        // consumer then has to treat it as possibly decided while privacy mode was on, and a
+        // release must not date it by itself. A decision that quiet hours hold back, while an
+        // earlier one has not been taken yet, leaves that one's time alone: the earlier decision is
+        // the one the consumer will be handed, and dating it by the later one could make it look
+        // newer than it is. The cost is that the held decision, when it is released, is dated by
+        // the earlier one.
         let held_over_an_untaken_one = quiet && item.pending_handoff.is_some();
-        if (!released && !held_over_an_untaken_one) || item.decided_at_ms.is_none() {
+        if !released && !held_over_an_untaken_one {
             item.decided_at_ms = Some(reading.wall_ms);
             item.decided_privacy = reading.privacy;
         } else if held_over_an_untaken_one && reading.privacy.is_some_and(|stamp| stamp.private) {
