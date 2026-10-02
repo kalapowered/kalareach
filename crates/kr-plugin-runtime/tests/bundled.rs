@@ -506,4 +506,177 @@ fn the_script_verifies_the_committed_bundle_and_refuses_a_changed_one() {
             "{what} is drift and the check has to say so"
         );
     }
+
+    // A lock that names another generation than the index carries is refused.
+    let (_directory, bundle_root, lock_path) = copy();
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).expect("a lock"))
+            .expect("a readable lock");
+    lock["source"]["generation"] = serde_json::json!("1");
+    std::fs::write(&lock_path, lock.to_string()).expect("a lock");
+    let outcome = verify(&bundle_root, &lock_path, &[]);
+    assert!(
+        !outcome.status.success()
+            && String::from_utf8_lossy(&outcome.stderr).contains("the lock names generation 1"),
+        "{}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+
+    // A file that is a private key, locked consistently with what it now holds, is refused by the
+    // release scan's own checks, whatever the file is called.
+    let (_directory, bundle_root, lock_path) = copy();
+    let path = bundle_root.join(example).join("README.md");
+    let secret = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        "A".repeat(64)
+    );
+    std::fs::write(&path, &secret).expect("a payload");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).expect("a lock"))
+            .expect("a readable lock");
+    let digest = kr_plugin_sdk::digest::PayloadDigest::of(secret.as_bytes()).to_string();
+    let package = lock["packages"]
+        .as_array_mut()
+        .expect("packages")
+        .iter_mut()
+        .find(|package| package["plugin_id"] == "kalareach/example-declarative")
+        .expect("the example package");
+    let old_total: u64 = package["total_size_bytes"]
+        .as_str()
+        .expect("a total")
+        .parse()
+        .expect("a number");
+    let readme = package["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "README.md")
+        .expect("the README");
+    let old_size: u64 = readme["size_bytes"]
+        .as_str()
+        .expect("a size")
+        .parse()
+        .expect("a number");
+    readme["digest"] = serde_json::json!(digest);
+    readme["size_bytes"] = serde_json::json!(secret.len().to_string());
+    package["total_size_bytes"] =
+        serde_json::json!((old_total - old_size + secret.len() as u64).to_string());
+    std::fs::write(&lock_path, lock.to_string()).expect("a lock");
+    let outcome = verify(&bundle_root, &lock_path, &[]);
+    assert!(
+        !outcome.status.success()
+            && String::from_utf8_lossy(&outcome.stderr).contains("holds a PEM private key"),
+        "{}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+}
+
+/// The cleanup the script runs when it is interrupted, taken from the script's own text: from the
+/// function that names the lock's owner, through the traps, to the line that takes the lock.
+fn cleanup_block() -> String {
+    let text = std::fs::read_to_string(repository().join("scripts/sync-bundled-plugins.sh"))
+        .expect("the script reads");
+    let start = text
+        .find("owner_of_publish_lock() {")
+        .expect("the script names the lock's owner");
+    let end = text
+        .find("mkdir \"$publish_lock\"")
+        .expect("the script takes the lock after its traps");
+    assert!(start < end && text[start..end].contains("trap "));
+    text[start..end].to_owned()
+}
+
+/// What the cleanup leaves on disk when a signal ends a run that has published its bundle and not
+/// yet its lock, and when it ends one that has published nothing. A signal runs the cleanup once:
+/// the pending lock is the only copy of the lock that describes the new bundle, so a second pass
+/// that took the run for an unpublished one would delete it.
+#[test]
+fn an_interrupted_sync_keeps_what_it_published_and_puts_back_what_it_did_not() {
+    use std::process::Command;
+
+    if Command::new("bash").arg("--version").output().is_err()
+        || Command::new("python3").arg("--version").output().is_err()
+    {
+        eprintln!("skipping: bash and python3 are needed to run the script's cleanup");
+        return;
+    }
+    let block = cleanup_block();
+    let run = |published: bool, signal: &str| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let root = directory.path();
+        let harness = format!(
+            r#"set -euo pipefail
+root="$1"
+work="$root/work"; mkdir -p "$work"
+bundle_root="$root/bundled-plugins"
+lock_file="$root/bundled-plugins.lock"
+publish_lock="$root/.sync.lock"; held_lock=false
+stage_root="$root/stage"; staged_bundle="$stage_root/bundle"
+pending_lock="$root/.bundled-plugins.lock.pending"
+retiring="$root/.bundled-plugins.retiring"
+rename_path() {{ python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2"; }}
+{block}
+mkdir -p "$stage_root"
+echo previous > "$lock_file"
+if [ "$2" = published ]; then
+  mkdir -p "$retiring" "$bundle_root"; echo previous > "$retiring/file"; echo new > "$bundle_root/file"
+  echo new > "$pending_lock"
+else
+  mkdir -p "$staged_bundle" "$retiring"; echo previous > "$retiring/file"; echo new > "$pending_lock"
+fi
+kill -{signal} $$
+sleep 5
+"#
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .arg("harness")
+            .arg(root)
+            .arg(if published {
+                "published"
+            } else {
+                "unpublished"
+            })
+            .output()
+            .expect("bash runs");
+        (
+            directory,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.code(),
+        )
+    };
+
+    let (directory, stderr, code) = run(true, "TERM");
+    let root = directory.path();
+    assert_eq!(code, Some(143), "{stderr}");
+    assert!(
+        root.join(".bundled-plugins.lock.pending").is_file(),
+        "the pending lock is the only copy of the lock for the new bundle: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("bundled-plugins/file")).expect("the new bundle"),
+        "new\n",
+        "{stderr}"
+    );
+    assert!(
+        root.join(".bundled-plugins.retiring/file").is_file(),
+        "the previous bundle is kept: {stderr}"
+    );
+    assert!(!root.join("stage").exists(), "{stderr}");
+    assert!(stderr.contains("the new lock is at"), "{stderr}");
+
+    let (directory, stderr, code) = run(false, "INT");
+    let root = directory.path();
+    assert_eq!(code, Some(130), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("bundled-plugins/file")).expect("the old bundle"),
+        "previous\n",
+        "the previous bundle is put back: {stderr}"
+    );
+    assert!(
+        !root.join(".bundled-plugins.lock.pending").exists(),
+        "an unpublished run drops its pending lock: {stderr}"
+    );
+    assert!(!root.join("stage").exists(), "{stderr}");
 }
