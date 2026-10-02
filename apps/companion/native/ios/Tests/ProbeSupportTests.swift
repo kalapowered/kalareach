@@ -202,6 +202,17 @@ final class ProbeSupportTests: XCTestCase {
         XCTAssertEqual(effects.finished.first?["token.error"], "com.firebase.installations/501")
     }
 
+    func testNoEndAfterTheFirstReportsOrFilesAnything() {
+        let effects = Effects()
+        var check = report(effects)
+        check.token("fcm-1", facts: [:])
+        check.refused(facts: [:])
+        check.timedOut(facts: [:], state: "registered", permission: "granted")
+        check.failed(facts: [:], domain: "d", code: 1)
+        XCTAssertEqual(effects.log, ["file", "finish"])
+        XCTAssertEqual(effects.finished.first?["token"], "ready")
+    }
+
     func testTheCheckKnowsWhenItHasReported() {
         let effects = Effects()
         var check = report(effects)
