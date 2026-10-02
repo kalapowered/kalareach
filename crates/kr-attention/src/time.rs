@@ -141,6 +141,23 @@ pub struct HostReading {
     /// the silent one. It says nothing about intervals: no interval is measured from a wall-clock
     /// moment, because a clock a host trusts is still a clock somebody can set.
     pub wall_proven: bool,
+    /// The privacy state in force while this reading is used, when the host says: what every
+    /// decision made under it is stamped with ([`crate::engine::Item::decided_privacy`]).
+    pub privacy: Option<PrivacyStamp>,
+}
+
+/// The privacy mode a decision was made under: the generation in force, and whether privacy mode
+/// was on in it.
+///
+/// A host that restricts what it sends while privacy mode is on stamps each decision with it, so
+/// that what was decided while the mode was on is told from what was decided after, by the state
+/// the decision was made under and not by what the clocks say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivacyStamp {
+    /// The privacy generation in force.
+    pub generation: u64,
+    /// Whether privacy mode was on in it.
+    pub private: bool,
 }
 
 impl HostReading {
@@ -152,6 +169,16 @@ impl HostReading {
             continuous_ms,
             wall_ms: TimestampMs::new(wall_ms),
             wall_proven,
+            privacy: None,
+        }
+    }
+
+    /// Returns this reading with the privacy state every decision made under it is stamped with.
+    #[must_use]
+    pub const fn under(self, privacy: PrivacyStamp) -> Self {
+        Self {
+            privacy: Some(privacy),
+            ..self
         }
     }
 
@@ -184,6 +211,7 @@ impl HostReading {
             continuous_ms: self.continuous_ms.saturating_add(millis),
             wall_ms: TimestampMs::new(self.wall_ms.get().saturating_add(millis)),
             wall_proven: self.wall_proven,
+            privacy: self.privacy,
         }
     }
 
@@ -204,6 +232,7 @@ impl HostReading {
             continuous_ms,
             wall_ms: TimestampMs::new(self.wall_ms.get().saturating_sub(back)),
             wall_proven: self.wall_proven,
+            privacy: self.privacy,
         }
     }
 }

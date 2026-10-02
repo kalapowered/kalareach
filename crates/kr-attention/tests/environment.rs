@@ -2103,6 +2103,8 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
     let raw = rusqlite::Connection::open(&path).expect("the file opens");
     raw.execute_batch(
         "ALTER TABLE attention_items DROP COLUMN decided_at_ms;
+         ALTER TABLE attention_items DROP COLUMN decided_generation;
+         ALTER TABLE attention_items DROP COLUMN decided_private;
          UPDATE attention_schema SET version = 9;",
     )
     .expect("the previous shape");
@@ -2114,6 +2116,11 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
         only_item(&attention).decided_at_ms,
         announced,
         "the best time its store has for it"
+    );
+    assert_eq!(
+        only_item(&attention).decided_privacy,
+        None,
+        "and no privacy state, which nothing recorded"
     );
     drop(attention);
     let raw = rusqlite::Connection::open(&path).expect("the file opens");
@@ -2265,4 +2272,68 @@ fn a_held_repeat_leaves_the_time_of_the_announcement_still_waiting_to_be_taken()
         only_item(&attention).decided_at_ms,
         Some(TimestampMs::new(NOON + repeat))
     );
+}
+
+/// The privacy state a decision was made under is stamped on it, kept through the release quiet
+/// hours give it and through a replay that finds the condition again, and written to the store and
+/// read back. A reading that says nothing stamps nothing. The control: a decision made later under
+/// another state carries that one.
+#[test]
+fn a_decision_keeps_the_privacy_state_it_was_made_under() {
+    use kr_attention::PrivacyStamp;
+
+    let private = PrivacyStamp {
+        generation: 3,
+        private: true,
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()))
+        .expect("the store records the window");
+    attention
+        .apply(&failed(1, 1_000), reading(1_000).under(private))
+        .expect("the store records the decision");
+    assert!(only_item(&attention).deferred);
+    assert_eq!(only_item(&attention).decided_privacy, Some(private));
+
+    // A replay under another state, after the window, does not restamp a decision it did not make.
+    let later = 2 * DEDUPLICATION_WINDOW_MS;
+    let normal = PrivacyStamp {
+        generation: 4,
+        private: false,
+    };
+    attention
+        .rebuild(&[failed(2, later)], reading(later).under(normal))
+        .expect("the store replays the page");
+    assert_eq!(only_item(&attention).decided_privacy, Some(private));
+
+    // It is written down and read back.
+    drop(attention);
+    let mut attention =
+        Attention::open(&path, reading(2_000), &opener()).expect("the feature store opens");
+    assert_eq!(only_item(&attention).decided_privacy, Some(private));
+
+    // The release at the end of the hours is the end of that decision, and keeps its state.
+    let after = HostReading::new(boot(), 7_200_000, NOON + 7_200_000, true).under(normal);
+    attention
+        .tick(after, &all_read)
+        .expect("the store records the release");
+    assert!(!only_item(&attention).deferred);
+    assert_eq!(only_item(&attention).decided_privacy, Some(private));
+
+    // The control: a decision made later under another state carries that one, and a reading that
+    // says nothing stamps nothing.
+    let mut attention = engine();
+    attention
+        .apply(&failed(1, 1_000), reading(1_000).under(normal))
+        .expect("the store records the decision");
+    assert_eq!(only_item(&attention).decided_privacy, Some(normal));
+    let mut attention = engine();
+    attention
+        .apply(&failed(1, 1_000), reading(1_000))
+        .expect("the store records the decision");
+    assert_eq!(only_item(&attention).decided_privacy, None);
 }
