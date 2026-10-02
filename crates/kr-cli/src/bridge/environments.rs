@@ -102,7 +102,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
             if access_class != EnvironmentAccess::SshHost {
                 probe_permitted(access_class, &target, &arguments.user, &arguments.helper)?;
             }
-            let answered =
+            let (answered, answered_user) =
                 query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
                     .await
                     .map_err(|error| {
@@ -112,6 +112,15 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
                             error
                         ))
                     })?;
+            // A refresh checks the user the helper runs as against the record, so a record that
+            // names another would fail at its first one. It is refused here, where the person can
+            // say which user they meant.
+            if answered_user != arguments.user {
+                return Err(CliError::Usage(Shown::said(
+                    "the helper in the destination runs as a different user from the one --user \
+                     names; name the user the helper runs as there",
+                )));
+            }
             // A socket forwarded from here is answered by this host's own daemon, so an answer
             // that is one of this host's own environments says nothing about the destination.
             if resolve::environments(&paths)?
@@ -245,19 +254,19 @@ fn probe_decision(observed: EnvironmentPresence) -> Result<()> {
     }
 }
 
-/// Asks the destination which environment it is.
+/// Asks the destination which environment it is, and which user its helper runs as.
 ///
 /// The helper runs inside the destination and acknowledges with that environment's own identity,
 /// the user it runs as and the role it serves. The invoker checks the protocol major and the role;
 /// the identity is what is being learned here, so there is nothing yet to compare it against. An
-/// SSH or paired environment has no process bridge, and is enrolled with the identity its owner
-/// already knows.
+/// SSH host is asked through ssh, which starts nothing, and a paired environment has no process
+/// bridge and is enrolled with the identity its owner already knows.
 async fn query_helper_identity(
     access: EnvironmentAccess,
     target: &str,
     user: &str,
     helper: &str,
-) -> std::result::Result<EnvironmentId, Shown> {
+) -> std::result::Result<(EnvironmentId, String), Shown> {
     // What the launch and the destination said is not repeated: it carries the target, the user
     // and whatever the destination wrote.
     let command = kr_controller::bridge::launch::identity_command(access, target, user, helper)
@@ -276,7 +285,7 @@ async fn query_helper_identity(
     let acknowledgement = kr_controller::bridge::invoke::discover(&command, &hello)
         .await
         .map_err(|_| Shown::said("the helper did not answer with its environment"))?;
-    Ok(acknowledgement.environment_id)
+    Ok((acknowledgement.environment_id, acknowledgement.os_user))
 }
 
 /// The environment the invocation is made from, for the opening frame.
