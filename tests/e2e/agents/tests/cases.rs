@@ -27,7 +27,7 @@ use kr_e2e_agents::account::{
     reported_rewrites, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
-    Account, AccountHome, Action, Build, Confinement, Inputs, Launch, quote, with_dates,
+    Account, AccountHome, Action, Build, Confinement, Inputs, Launch, quote, read_build, with_dates,
 };
 use kr_e2e_agents::confine::{self, Layout, Setup};
 use kr_e2e_agents::conversation::answers;
@@ -37,6 +37,7 @@ use kr_e2e_agents::detect::{
     checker_controls, detected_evidence, wait_for_detection, wait_for_no_instance,
 };
 use kr_e2e_agents::keychain::RunKeychain;
+use kr_e2e_agents::keys;
 use kr_e2e_agents::network::{Policy, Proxy};
 use kr_e2e_agents::observe::{
     AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
@@ -45,16 +46,16 @@ use kr_e2e_agents::observe::{
 use kr_e2e_agents::outcome::{Failure, Outcome};
 use kr_e2e_agents::provenance::{
     ENVIRONMENT_NOT_CLEAR, ENVIRONMENT_NOT_READ, Expected, NOT_PINNED, Provenance, StopSampling,
-    beneath_parent,
+    beneath_parent, exported_clear,
 };
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
-    kill_daemon, launch, mapped_files, open_session, place_forwarder, prepare_home, runtime,
-    session_variables, text_image,
+    kill_daemon, launch, mapped_files, names_a_session_exports, open_session, place_forwarder,
+    prepare_home, runtime, session_variables, text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
-use kr_e2e_agents::{REQUIRE_VARIABLE, RESULT_VARIABLE};
+use kr_e2e_agents::{BUILD_VARIABLE, REQUIRE_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::LIVENESS;
 use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::Device;
@@ -784,6 +785,9 @@ struct Login {
     account: Account,
     ledger: Ledger,
     key: Option<(String, String)>,
+    /// The values of the other keys the harness's own shell holds, which no session is given and
+    /// which the part's data is searched for.
+    others: Vec<String>,
     person_home: PathBuf,
     /// For a confined agent: what its data directory said before the part, read once.
     setup: Option<Setup>,
@@ -1962,6 +1966,18 @@ fn staged(
             });
             (name.clone(), value)
         });
+        // The other keys the harness's shell holds, whose values the part's data is searched for;
+        // the login's own value is searched for by the part's key scan.
+        let others: Vec<String> = keys::scan_values_from_descriptor()
+            .unwrap_or_else(|why| {
+                panic!(
+                    "part {part} searches its data for the keys the person's shell holds, and the \
+                     harness gave none: {why}"
+                )
+            })
+            .into_iter()
+            .filter(|value| key.as_ref().is_none_or(|(_, own)| own != value))
+            .collect();
         let person_home =
             PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
         let mut account = account;
@@ -2002,6 +2018,7 @@ fn staged(
             ledger: Ledger::from_environment(&account.budget, account.turns),
             account,
             key,
+            others,
             person_home,
             setup,
             proxy,
@@ -2206,10 +2223,23 @@ fn staged(
     let searched = login
         .as_ref()
         .and_then(|login| confine_scan(login, guards.as_ref(), &root));
+    // Every string a result is held out of: the login's files' strings, the login's own value
+    // where it is a variable, and the values of the other keys the person's shell holds.
     let secret_values: Vec<String> = searched
         .as_ref()
         .map(|searched| searched.values.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .chain(login.iter().flat_map(|login| {
+            login.others.iter().cloned().chain(
+                login
+                    .key
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .filter(|value| confine::searchable(value)),
+            )
+        }))
+        .collect();
     let removable: Vec<PathBuf> = login
         .as_ref()
         .map(|login| {
@@ -2233,6 +2263,15 @@ fn staged(
         .as_ref()
         .and_then(|login| login.key.as_ref())
         .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
+    // The values of the other keys the person's shell holds, searched for in the same directory:
+    // no session was given one, so a file that holds one is a leak.
+    let others_found = login
+        .as_ref()
+        .filter(|login| !login.others.is_empty())
+        .map(|login| {
+            let values: Vec<&[u8]> = login.others.iter().map(String::as_bytes).collect();
+            files_holding_any(&root, &values)
+        });
     // The configuration directory of the run's own goes whatever became of the part, and is
     // checked gone.
     let config_gone = login
@@ -2284,6 +2323,16 @@ fn staged(
             "complete": scan.complete(),
             "run_gone": gone,
         }));
+    }
+    if let Some(found) = &others_found
+        && !found.complete()
+        && key_failure.is_none()
+    {
+        key_failure = Some(format!(
+            "the run's directory was not searched whole for the keys the person's shell holds \
+             ({} entries unread)",
+            found.unread.len()
+        ));
     }
     // The person's watched files as the part leaves them: a guarded one changed, or a shared one
     // changed and naming the run's directory or the part's mark, stops the agent.
@@ -2440,6 +2489,19 @@ fn staged(
     // file of the person's that must not change did.
     let mut stop = watched_stop;
     stop.extend(confinement_stop);
+    if let Some(found) = others_found
+        .as_ref()
+        .filter(|found| !found.held_by.is_empty())
+    {
+        stop.push((
+            "provider_key_found",
+            format!(
+                "the value of a key the person's shell holds is in {} file(s) of the run's \
+                 directory, which no session was given it in",
+                found.held_by.len()
+            ),
+        ));
+    }
     // A look the stop of the watcher did not see: the sample taken once the part's steps ended.
     if guard_change.is_none()
         && let Some(what) = tree_broken(&provenance)
@@ -3313,6 +3375,9 @@ fn prepare_login(stage: &Stage<'_, '_>) -> (Installation, Variables, Variables) 
         variables.retain(|(existing, _)| existing != &config.variable);
         variables.push((config.variable.clone(), directory.display().to_string()));
     }
+    // Whatever put one there, the session gets no variable the account clears but the ones the
+    // build list sets itself.
+    let _ = stage.build.without_provider_keys(&mut variables);
     (installation, setup, variables)
 }
 
@@ -7794,6 +7859,182 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
         }),
     )
     .append(&result);
+}
+
+/// The variables a person's own shell can hold that would give an agent another model account,
+/// with the harmless one a control passes alongside them: each with a value that is no key.
+const PROVIDER_KEYS_HELD: [&str; 32] = [
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_SECRET_ACCESS_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "CLOUDSDK_CONFIG",
+    "KIMI_API_KEY",
+    "KIMI_CODE_HOME",
+    "MOONSHOT_API_KEY",
+    "MOONSHOT_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "OPENCODE_CONFIG",
+    "GROQ_API_KEY",
+    "CEREBRAS_API_KEY",
+    "MISTRAL_API_KEY",
+    "XAI_API_KEY",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "HF_TOKEN",
+    "AZURE_API_KEY",
+    "CLOUDFLARE_API_TOKEN",
+    "SOME_PROVIDER_BASE_URL",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "KR_SESSION_TOKEN",
+];
+
+/// A session a part with a login creates exports no variable its account clears but the ones the
+/// build list sets itself, though the environment it was made from held the person's keys, and
+/// a harmless variable passes through the same route. This builds the session environment a part
+/// builds from the entry the harness names, adds to it what a person's own shell holds (keys with
+/// values that are no keys, and one harmless variable), takes the entry's cleared names out as a
+/// part does, starts a real session on that and reads the names its shell exports. Control: the
+/// same environment with nothing taken out starts a session whose names the part's own check
+/// refuses, naming each variable, and not the harmless one.
+#[test]
+fn a_session_exports_no_provider_key_but_those_the_build_list_sets_and_a_harmless_variable_passes()
+{
+    let required = std::env::var(REQUIRE_VARIABLE).is_ok_and(|value| value == "1");
+    let Some(file) = std::env::var_os(BUILD_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        assert!(
+            !required,
+            "{REQUIRE_VARIABLE}=1 and {BUILD_VARIABLE} names no file"
+        );
+        eprintln!("skipping: the provider-key check: {BUILD_VARIABLE} names no build");
+        return;
+    };
+    let build = read_build(&file);
+    let Some(account) = build.account.as_ref() else {
+        eprintln!("skipping: the provider-key check: the build list names no login for this agent");
+        return;
+    };
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the provider-key check's managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: the provider-key check: {why}");
+            return;
+        }
+    };
+    let run = Run::start("provider keys");
+    let host = Host::start(
+        &run,
+        &HostOptions {
+            shell_packages: Some(shell.prefix.clone()),
+        },
+    );
+    let base = session_variables(
+        &host,
+        &shell,
+        &std::collections::BTreeMap::new(),
+        closed_port(),
+    );
+    prepare_home(&host, &base);
+    // What the environment is made from when the person's own shell passes it on.
+    let mut held = base.clone();
+    for name in PROVIDER_KEYS_HELD {
+        held.push((name.to_owned(), format!("kr-not-a-key-{name}")));
+    }
+    held.push(("HARMLESS_CONTROL".to_owned(), "1".to_owned()));
+    let allowed = build.names_it_sets();
+    let mut cleared = held.clone();
+    let mut taken = build.without_provider_keys(&mut cleared);
+    taken.sort();
+    let mut expected: Vec<String> = PROVIDER_KEYS_HELD
+        .iter()
+        .filter(|name| {
+            keys::cleared(&account.cleared, name) && !allowed.iter().any(|set| set == *name)
+        })
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        taken, expected,
+        "the names the build list's cleared list takes out"
+    );
+    assert!(
+        expected.len() >= 20,
+        "the entry clears most of what a person's shell holds: {expected:?}"
+    );
+    assert!(
+        !taken.contains(&"KR_SESSION_TOKEN".to_owned())
+            && !taken.contains(&"HARMLESS_CONTROL".to_owned()),
+        "a product's own name and a harmless one stay"
+    );
+
+    // The launched session: none of what was taken out, every harmless name and every name the
+    // build list sets itself, and the part's own check passes.
+    let exported = names_a_session_exports(&host, &shell, &cleared);
+    exported_clear(&exported, &account.cleared, &allowed).unwrap_or_else(|why| panic!("{why}"));
+    let names: Vec<&str> = exported.lines().collect();
+    for name in &expected {
+        assert!(
+            !names.contains(&name.as_str()),
+            "{name} reached the session"
+        );
+    }
+    for name in [
+        "HARMLESS_CONTROL",
+        "KR_SESSION_TOKEN",
+        "PATH",
+        "HOME",
+        "ZDOTDIR",
+    ] {
+        assert!(
+            names.contains(&name),
+            "{name} is exported: a harmless variable passes"
+        );
+    }
+    for name in PROVIDER_KEYS_HELD
+        .iter()
+        .filter(|name| allowed.iter().any(|set| set == *name))
+    {
+        assert!(
+            names.contains(name),
+            "{name}, which the build list sets, is exported"
+        );
+    }
+
+    // Control, breaking the property: nothing taken out, and the session's names fail the check.
+    let dirty = names_a_session_exports(&host, &shell, &held);
+    let refused = exported_clear(&dirty, &account.cleared, &allowed)
+        .expect_err("the session exports what the build list clears");
+    assert!(refused.starts_with(ENVIRONMENT_NOT_CLEAR), "{refused}");
+    for name in &expected {
+        assert!(
+            refused.contains(name.as_str()),
+            "the check names {name}: {refused}"
+        );
+    }
+    assert!(
+        !refused.contains("HARMLESS_CONTROL") && !refused.contains("KR_SESSION_TOKEN"),
+        "{refused}"
+    );
+
+    host.stop()
+        .unwrap_or_else(|why| panic!("the host did not stop cleanly: {why}"));
+    let checked = run
+        .closing_check()
+        .unwrap_or_else(|left| panic!("still running after the provider-key check: {left}"));
+    println!("{checked}");
 }
 
 /// Processes a test started, in a process group of their own, killed when it ends however it ends:
