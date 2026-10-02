@@ -26,10 +26,7 @@ A view and a read never delete. `workspace.remove` is the only method that remov
 and what it may remove is the whole of the section below on retention; a reconciliation removes
 only a staging directory this host can prove it made.
 
-A paired device is refused the five repository operations (`project.init`, `project.clone`,
-`project.adopt`, `workspace.create`, `workspace.remove`) on every platform, because each would run
-the Git program for it and this host does not bound what that program reaches; `docs/host/README.md`
-says why. It keeps the four reads, and `project.operation.cancel` for work it started itself.
+A paired device is served the five repository operations (`project.init`, `project.clone`, `project.adopt`, `workspace.create`, `workspace.remove`) on a Linux host that has proved it can confine what Git reads, and is refused them on every other host. Even where they are served, a device reaches a repository only through the locations the owner authorised for its own grant, and it never clones a remote. `docs/host/README.md` says how a host proves the confinement and what the device is promised. A device keeps the four reads, and `project.operation.cancel` for work it started itself.
 
 ## Identity is the object, not the path
 
@@ -79,8 +76,7 @@ created in, as one entry, and removed from again; a `source` is one a repository
 working copy taken of. A directory wanted as both is authorised twice, so each record is exactly
 what its confirmation covered.
 
-**A location is the owner's.** One that names a grant is not authorised: no paired device reaches a
-repository operation on this host, so there is nothing such a location could admit a device to.
+**A location belongs to the owner's decision, and may be for a device.** A location that names no grant is the owner's own, and admits the owner's operations. One that names a grant is a paired device's: it admits the operations of the caller bounded by that grant and nobody else's, and the owner's confirmation of it is bound to the four public keys of the device that holds the grant. A device whose keys this host does not hold in full is named by no confirmation until it has declared them.
 
 **Authorising takes two submissions of one action.** The first carries no confirmation. The host
 opens the path, holds that handle beside a challenge whose digest covers the request and the
@@ -829,7 +825,7 @@ names for the owner.
 | `REPOSITORY_UNTRUSTED` | A transport, a URL, a broker or a configuration this host will not use |
 | `SOURCE_CHANGED` | A repository or a workspace is no longer the object its record names |
 | `RESOURCE_UNAVAILABLE` | No such repository, workspace, operation or location; a workspace a live session still holds; an operation its owner stopped |
-| `PERMISSION_DENIED` | A cancellation of another actor's work that names no location; a caller bounded by a grant that names a location; a location that is not active, not the owner's destination or does not contain the path; a repository operation for a paired device |
+| `PERMISSION_DENIED` | A cancellation of another actor's work that names no location; a caller bounded by a grant that names a location, or a location its grant does not own; a location that is not active, not authorised as the purpose asked for or does not contain the path; a repository operation for a paired device on a host that has not proved it confines what Git reads |
 | `ID_CONFLICT` | One action identifier used for two different requests |
 | `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, a reconciliation a daemon ended in the middle of, or an action a copy of itself is still performing |
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
@@ -854,6 +850,8 @@ nothing ever changes what an earlier test or review was about.
 | `changeset.materialize` | An independent copy of one exact version, in a directory of this host's own | `workspace.manage` |
 | `diff.apply` | Applies a version at a named destination class | `files.apply_diff` |
 | `diff.revert` | Puts the base's own content back for the paths a version changed | `files.apply_diff` |
+
+A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
 
 ### The base is the commit, and the index is not it
 
