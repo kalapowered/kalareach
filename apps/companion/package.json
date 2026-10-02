@@ -26,7 +26,8 @@
     "test:preview": "node scripts/preview-selftest.mjs",
     "debug-code": "node scripts/debug-code.mjs",
     "test:debug-code": "node scripts/debug-code-selftest.mjs",
-    "test:firebase-configuration": "node scripts/firebase-configuration-selftest.mjs"
+    "test:firebase-configuration": "node scripts/firebase-configuration-selftest.mjs",
+    "test:sign-ios": "node scripts/sign-ios-selftest.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
