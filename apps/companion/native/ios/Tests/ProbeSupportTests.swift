@@ -220,5 +220,36 @@ final class ProbeSupportTests: XCTestCase {
         check.refused(facts: [:])
         XCTAssertTrue(check.reported)
     }
+
+    // MARK: What the audio check saw
+
+    func testGapsAreKeptForEveryTickAndApartForTheTicksWhileLocked() {
+        var log = AudioTickLog(start: 100)
+        log.tick(now: 101, lastInput: 100.9, lastOutput: 100.95, protectedDataAvailable: true)
+        log.tick(now: 102, lastInput: 101.5, lastOutput: 101.9, protectedDataAvailable: false)
+        log.tick(now: 103, lastInput: 101.5, lastOutput: 102.99, protectedDataAvailable: false)
+        XCTAssertEqual(log.ticks, 3)
+        XCTAssertEqual(log.lockedTicks, 2)
+        XCTAssertEqual(log.facts["gap.input.max"], "1500")
+        XCTAssertEqual(log.facts["gap.input.locked.max"], "1500")
+        XCTAssertEqual(log.facts["gap.output.max"], "100")
+        XCTAssertEqual(log.facts["gap.output.locked.max"], "100")
+    }
+
+    func testAGapBeforeTheLockIsNotAGapWhileLocked() {
+        var log = AudioTickLog(start: 0)
+        log.tick(now: 5, lastInput: 1, lastOutput: 5, protectedDataAvailable: true)
+        log.tick(now: 6, lastInput: 5.9, lastOutput: 5.9, protectedDataAvailable: false)
+        XCTAssertEqual(log.facts["gap.input.max"], "4000")
+        XCTAssertEqual(log.facts["gap.input.locked.max"], "100")
+    }
+
+    func testSomethingNeverSeenCountsFromTheStartOfTheCheck() {
+        var log = AudioTickLog(start: 10)
+        log.tick(now: 14, lastInput: nil, lastOutput: nil, protectedDataAvailable: false)
+        XCTAssertEqual(log.facts["gap.input.max"], "4000")
+        XCTAssertEqual(log.facts["gap.output.locked.max"], "4000")
+        XCTAssertEqual(log.facts["locked.ticks"], "1")
+    }
 }
 #endif
