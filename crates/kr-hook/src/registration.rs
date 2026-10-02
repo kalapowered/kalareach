@@ -749,19 +749,21 @@ mod tests {
     /// The credential is read only from beside the registration, where the worker wrote it.
     #[test]
     fn a_credential_is_read_only_from_the_registration_s_own_directory() {
-        let registration = Path::new("/run/kr/agents/a/registration");
-        assert!(check_beside(registration, Path::new("/run/kr/agents/a/credential")).is_ok());
+        let root = std::env::temp_dir().join("kr-agents");
+        let registration = root.join("a").join("registration");
+        assert!(check_beside(&registration, &root.join("a").join("credential")).is_ok());
         for elsewhere in [
-            "/run/kr/agents/b/credential",
-            "/run/kr/agents/credential",
-            "/run/kr/agents/a/sub/credential",
-            "credential",
-            "agents/a/credential",
-            "/",
+            root.join("b").join("credential"),
+            root.join("credential"),
+            root.join("a").join("sub").join("credential"),
+            PathBuf::from("credential"),
+            PathBuf::from("agents").join("a").join("credential"),
+            PathBuf::from("/"),
         ] {
             assert!(
-                check_beside(registration, Path::new(elsewhere)).is_err(),
-                "{elsewhere} is refused"
+                check_beside(&registration, &elsewhere).is_err(),
+                "{} is refused",
+                elsewhere.display()
             );
         }
     }

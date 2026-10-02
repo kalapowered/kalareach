@@ -619,20 +619,28 @@ mod tests {
         );
     }
 
-    // Off Unix only: the case above is Unix's, and here no credential file is written at all.
-    #[cfg(not(unix))]
+    /// A credential is written only into a directory the host can show is private: an ordinary
+    /// directory takes none, and one the host made takes it as a file it can read back.
     #[test]
     fn a_credential_is_never_written_where_its_protection_cannot_be_proved() {
-        let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&directory).expect("the directory is created");
+        assert!(ManagedProcess::publishes_credential_file());
+        let ordinary = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&ordinary).expect("the directory is created");
         let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
-        assert!(!ManagedProcess::publishes_credential_file());
         assert!(
             managed
-                .write_registration(&directory.join("registration"))
+                .write_registration(&ordinary.join("registration"))
                 .is_err()
         );
-        let _ = std::fs::remove_dir_all(&directory);
+        assert!(!ordinary.join("registration").exists());
+
+        let private = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        kr_ipc::paths::create_private_directory(&private).expect("a private directory is made");
+        managed
+            .write_registration(&private.join("registration"))
+            .expect("a directory the host made takes it");
+        let _ = std::fs::remove_dir_all(&ordinary);
+        let _ = std::fs::remove_dir_all(&private);
     }
 
     #[test]

@@ -353,6 +353,83 @@ mod tests {
         }
     }
 
+    /// On Windows the endpoint a registration names is a local pipe: the bridge opens it with the
+    /// client the host's own listener is proved against, and its first frame is the hello that
+    /// names the launch's credential and this process as the operating system reads it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_bridge_reaches_the_pipe_its_registration_names_and_says_who_it_is() {
+        use tokio::io::AsyncBufReadExt as _;
+        let directory = std::env::temp_dir().join(format!("kr-exch-{}", kr_ipc::new_uuid()));
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
+        let fresh: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .collect();
+        let name = format!("kr-a-{fresh}");
+        let credential = "cd".repeat(32);
+        let credential_path = directory.join("credential");
+        kr_ipc::paths::create_new_owner_only_file(&credential_path, credential.as_bytes())
+            .expect("the credential is written");
+        let registration_path = directory.join("registration");
+        kr_ipc::paths::write_owner_only_file(
+            &registration_path,
+            format!(
+                "endpoint={}{name}\nprofile=lp-1\ninstance=i\npid=1\nstart=2\ncredential={}\n\
+                 framing=json_lines\n",
+                crate::registration::PIPE_PREFIX,
+                credential_path.display()
+            )
+            .as_bytes(),
+        )
+        .expect("the registration is written");
+
+        let listener = kr_ipc::endpoint::Listener::bind(
+            &kr_ipc::paths::Endpoint::from_name(name).expect("a usable name"),
+        )
+        .expect("the pipe binds");
+        let registration = Registration::read(
+            &crate::registration::Paths {
+                registration: registration_path,
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the registration reads");
+        let opening = tokio::spawn(async move {
+            Exchange::open(
+                &registration,
+                Bridge {
+                    application: "claude-code",
+                    surface: "hook",
+                },
+            )
+            .await
+            .expect("the exchange opens")
+        });
+        let (connection, peer) = listener
+            .accept()
+            .await
+            .expect("the pipe accepts the bridge");
+        assert_eq!(
+            peer.pid,
+            Some(std::process::id()),
+            "the kernel names the connecting process"
+        );
+        let mut reader = tokio::io::BufReader::new(connection);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("the hello is read");
+        let hello: serde_json::Value = serde_json::from_str(&line).expect("the hello is JSON");
+        assert_eq!(hello["kr_hello"]["credential"], credential);
+        assert_eq!(hello["kr_hello"]["pid"], u64::from(std::process::id()));
+        assert_eq!(hello["kr_hello"]["bridge"]["application"], "claude-code");
+        drop(opening.await.expect("the exchange task finishes"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[tokio::test]
     async fn a_line_is_read_whole_and_a_cut_one_is_refused() {
         let read = lines(b"{\"a\":1}\n{\"b\":2}\n").await;
