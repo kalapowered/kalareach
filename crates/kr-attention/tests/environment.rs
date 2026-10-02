@@ -2132,3 +2132,137 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
         })
     ));
 }
+
+/// A failed command in session one at `sequence`, seen at `at_ms`: the same condition each time.
+fn failed(sequence: u64, at_ms: u64) -> SourceEvent {
+    in_session(
+        session(1),
+        AttentionSource::Receipts,
+        sequence,
+        at_ms,
+        EventKind::CommandCompleted {
+            session_id: session(1),
+            command: "make".to_owned(),
+            exit_code: 2,
+        },
+    )
+}
+
+/// A replay that finds the condition again while quiet hours hold its decision, after the
+/// de-duplication window, keeps the time that decision was made: nothing decided it again, and the
+/// release at the end of the hours is the end of that decision. The control: the same replay on a
+/// decision nothing held is decided again at the next tick, and dated then.
+#[test]
+fn a_replay_that_finds_a_held_condition_again_keeps_the_time_of_the_held_decision() {
+    let mut attention = engine();
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()))
+        .expect("the store records the window");
+    attention
+        .apply(&failed(1, 1_000), reading(1_000))
+        .expect("the store records the decision");
+    let decided = TimestampMs::new(NOON + 1_000);
+    assert!(only_item(&attention).deferred);
+    assert_eq!(only_item(&attention).decided_at_ms, Some(decided));
+
+    // Longer than the de-duplication window later, inside the hours still.
+    let later = 2 * DEDUPLICATION_WINDOW_MS;
+    attention
+        .rebuild(&[failed(2, later)], reading(later))
+        .expect("the store replays the page");
+    let held = only_item(&attention);
+    assert!(held.deferred, "still held");
+    assert_eq!(
+        held.decided_at_ms,
+        Some(decided),
+        "a replay does not date a decision it did not make"
+    );
+
+    // The hours end: the held decision is released and keeps the time it was made at.
+    let after = HostReading::new(boot(), 7_200_000, NOON + 7_200_000, true);
+    let outcomes = attention
+        .tick(after, &all_read)
+        .expect("the store records the release");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Released { .. })),
+        "released: {outcomes:?}"
+    );
+    assert_eq!(only_item(&attention).decided_at_ms, Some(decided));
+
+    // The control: with no hours, the replayed repeat is decided again at the next tick.
+    let mut attention = engine();
+    attention
+        .apply(&failed(1, 1_000), reading(1_000))
+        .expect("the store records the decision");
+    attention
+        .rebuild(&[failed(2, later)], reading(later))
+        .expect("the store replays the page");
+    let outcomes = attention
+        .tick(reading(later), &all_read)
+        .expect("the store records the decision");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Notified { .. })),
+        "decided again: {outcomes:?}"
+    );
+    assert_eq!(
+        only_item(&attention).decided_at_ms,
+        Some(TimestampMs::new(NOW + later)),
+        "and dated when it was decided"
+    );
+}
+
+/// A repeat that quiet hours hold back while the announcement before it has not been taken leaves
+/// the time of that announcement alone, since that is the one a consumer is handed. The control: a
+/// repeat nothing holds back is a new announcement, dated when it was decided.
+#[test]
+fn a_held_repeat_leaves_the_time_of_the_announcement_still_waiting_to_be_taken() {
+    use kr_attention::rule::REMINDER_INTERVAL_MS;
+
+    let mut attention = engine();
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    let first = TimestampMs::new(NOON + 1_000);
+    assert_eq!(only_item(&attention).decided_at_ms, Some(first));
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()))
+        .expect("the store records the window");
+    let repeat = 1_000 + REMINDER_INTERVAL_MS;
+    let outcomes = attention
+        .tick(reading(repeat), &all_read)
+        .expect("the store records the decision");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Deferred { .. })),
+        "the repeat is held: {outcomes:?}"
+    );
+    let held = only_item(&attention);
+    assert_eq!(
+        held.last_notified_ms,
+        Some(TimestampMs::new(NOON + repeat)),
+        "the last announcement moved"
+    );
+    assert_eq!(
+        held.decided_at_ms,
+        Some(first),
+        "the announcement still to be taken keeps its own time"
+    );
+
+    // The control: with no hours, the repeat is its own announcement.
+    let mut attention = engine();
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    attention
+        .tick(reading(repeat), &all_read)
+        .expect("the store records the decision");
+    assert_eq!(
+        only_item(&attention).decided_at_ms,
+        Some(TimestampMs::new(NOON + repeat))
+    );
+}

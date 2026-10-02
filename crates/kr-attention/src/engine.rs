@@ -145,11 +145,12 @@ pub struct Item {
     ///
     /// A decision that quiet hours hold back is decided when it is made and released when the hours
     /// end, and the release is a decision of its own: [`Item::last_notified_ms`] moves to it. This
-    /// does not. It stays where the decision was first made, so a consumer that has to know what
-    /// was decided before some moment, such as the moment a mode that withholds content was turned
-    /// off, is told the time of the decision and not the time of its release. An item that was
-    /// decided about before this was kept carries [`Item::last_notified_ms`] here, the best time
-    /// its store has for it.
+    /// does not. It stays where the decision was first made, through the release and through a
+    /// replay that finds the condition again while the decision is held, so a consumer that has to
+    /// know what was decided before some moment, such as the moment a mode that withholds content
+    /// was turned off, is told the time of the decision and not the time of its release. An item
+    /// that was decided about before this was kept carries [`Item::last_notified_ms`] here, the
+    /// best time its store has for it.
     pub decided_at_ms: Option<TimestampMs>,
     /// Where this item's age is measured from, on the clock that can measure one.
     ///
@@ -1425,7 +1426,6 @@ impl Engine {
                 if !inside && let Some(item) = self.items.get_mut(&key) {
                     item.since_notified = None;
                     item.last_notified_ms = None;
-                    item.decided_at_ms = None;
                     item.announced_level = None;
                     item.notification = NotificationState::Pending;
                 }
@@ -1570,9 +1570,14 @@ impl Engine {
         // inside quiet hours is deferred once rather than re-decided on every tick.
         item.since_notified = Some(Elapsed::starting(reading));
         item.last_notified_ms = Some(reading.wall_ms);
-        // A release is the end of a decision already made, not a new one, so it keeps the time
-        // that decision was made at unless nothing recorded it.
-        if !released || item.decided_at_ms.is_none() {
+        // The time of the decision a consumer will be handed. A release is the end of a decision
+        // already made, not a new one, so it keeps the time that decision was made at, unless
+        // nothing recorded it. A decision that quiet hours hold back, while an earlier one has not
+        // been taken yet, leaves that one's time alone: the earlier decision is the one the
+        // consumer will be handed, and dating it by the later one could make it look newer than it
+        // is. The cost is that the held decision, when it is released, is dated by the earlier one.
+        let held_over_an_untaken_one = quiet && item.pending_handoff.is_some();
+        if (!released && !held_over_an_untaken_one) || item.decided_at_ms.is_none() {
             item.decided_at_ms = Some(reading.wall_ms);
         }
         item.announced_anchor = Some(reading.anchor());
