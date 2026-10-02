@@ -11,10 +11,11 @@ use std::future::Future;
 use std::task::Poll;
 
 use kr_protocol::action::BarrierState;
-use kr_protocol::ids::SessionId;
+use kr_protocol::ids::{AuthorityRevision, SessionId};
 
 use super::a_close_a_worker_never_answers::Silent;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
+use crate::authority::Round;
 
 /// The lock a closure's recording is parked at.
 #[derive(Clone, Copy, Debug)]
@@ -29,10 +30,9 @@ enum Parked {
     Presentations,
 }
 
-/// What the barrier says about a session's worker.
-fn state_of(controller: &crate::service::Controller, session_id: SessionId) -> BarrierState {
-    let revision = controller.leases.authority_revision();
-    controller.leases.report(revision, [session_id]).workers[0].state
+/// What a round that began while the worker ran says about it.
+fn state_of(round: &Round<'_>, session_id: SessionId, revision: AuthorityRevision) -> BarrierState {
+    round.report(revision, [session_id]).workers[0].state
 }
 
 /// Whether the registry's file holds the closure, read on a connection of this test's own: the
@@ -64,10 +64,13 @@ const POLLS: usize = 10_000;
 /// then at: the lock the test holds, unless another task of the daemon holds a lock the closure
 /// needs for a moment, in which case it is an earlier wait after the record. Either way it is a wait
 /// between the record and what is done once the closure is out.
-async fn cancelled_at(parked: Parked) -> (bool, BarrierState) {
+async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     let script = Scripted::new();
     let world = scripted(&script).await;
     let record = closure_of(world.session_id);
+    let revision = world.controller.leases.authority_revision();
+    // A round that began while the worker ran, which is what holds an ended worker for it to report.
+    let round = world.controller.leases.begin_round();
     let held: Box<dyn Send + '_> = match parked {
         Parked::Registry => Box::new(world.controller.registry.lock().await),
         Parked::Directory => Box::new(world.controller.directory.lock().await),
@@ -92,9 +95,12 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState) {
     drop(closing);
     drop(held);
     let closed = recorded(&world).await;
-    let state = state_of(&world.controller, world.session_id);
+    let state = state_of(&round, world.session_id, revision);
+    // Once the round is over nothing can ask about an ended worker that named nothing.
+    drop(round);
+    let held = world.controller.leases.workers_held();
     world.serving.abort();
-    (closed, state)
+    (closed, state, held)
 }
 
 /// The control: a closure that is not dropped ends the worker, whichever way it is reached.
@@ -102,8 +108,10 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState) {
 async fn a_closure_that_is_not_dropped_ends_the_worker() {
     let script = Scripted::new();
     let world = scripted(&script).await;
+    let revision = world.controller.leases.authority_revision();
+    let round = world.controller.leases.begin_round();
     assert_ne!(
-        state_of(&world.controller, world.session_id),
+        state_of(&round, world.session_id, revision),
         BarrierState::Ended
     );
     world
@@ -113,40 +121,47 @@ async fn a_closure_that_is_not_dropped_ends_the_worker() {
         .expect("the closure is recorded");
     assert!(recorded(&world).await);
     assert_eq!(
-        state_of(&world.controller, world.session_id),
+        state_of(&round, world.session_id, revision),
         BarrierState::Ended
     );
+    drop(round);
+    assert_eq!(world.controller.leases.workers_held(), 0);
     world.serving.abort();
 }
 
 /// A closure dropped before it is recorded leaves the worker as it was: nothing ended, nothing
-/// recorded, and a later closure still ends it.
+/// recorded, and the worker still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_dropped_before_it_is_recorded_ends_nothing() {
-    let (closed, state) = cancelled_at(Parked::Registry).await;
+    let (closed, state, held) = cancelled_at(Parked::Registry).await;
     assert!(!closed);
     assert_ne!(state, BarrierState::Ended);
+    assert_eq!(held, 1);
 }
 
 /// A closure that is recorded and then dropped, wherever it waits next, has told the barrier the
-/// worker ended.
+/// worker ended: a round that began while it ran reports it ended, and once that round is over
+/// nothing of it is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_dropped_at_the_directory_has_ended_the_worker() {
-    let (closed, state) = cancelled_at(Parked::Directory).await;
+    let (closed, state, held) = cancelled_at(Parked::Directory).await;
     assert!(closed);
     assert_eq!(state, BarrierState::Ended);
+    assert_eq!(held, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_dropped_at_the_connections_has_ended_the_worker() {
-    let (closed, state) = cancelled_at(Parked::Connections).await;
+    let (closed, state, held) = cancelled_at(Parked::Connections).await;
     assert!(closed);
     assert_eq!(state, BarrierState::Ended);
+    assert_eq!(held, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_dropped_at_the_presentations_has_ended_the_worker() {
-    let (closed, state) = cancelled_at(Parked::Presentations).await;
+    let (closed, state, held) = cancelled_at(Parked::Presentations).await;
     assert!(closed);
     assert_eq!(state, BarrierState::Ended);
+    assert_eq!(held, 0);
 }

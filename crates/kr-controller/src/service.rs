@@ -820,6 +820,10 @@ mod a_lease_that_runs_out_at_a_worker;
 #[cfg(test)]
 mod a_closure_that_is_cancelled;
 
+/// A session whose closure is recorded: not bound, not adopted, not pending in a revocation.
+#[cfg(test)]
+mod a_session_that_closed_is_not_bound_again;
+
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
 #[cfg(test)]

@@ -372,7 +372,7 @@ impl Controller {
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
     /// description of its session it gave after its challenge, where it gave one.
-    async fn adopt(
+    pub(super) async fn adopt(
         &self,
         display_number: kr_protocol::session::DisplayNumber,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
@@ -394,6 +394,12 @@ impl Controller {
         };
         {
             let mut registry = self.registry.lock().await;
+            // The challenge waited for the worker, and the session may have closed meanwhile. Its
+            // closure is the fact, and a row written after it would be a worker for a session that
+            // has ended, with nothing left to end it.
+            if registry.closure(proof.session_id)?.is_some() {
+                return Ok(());
+            }
             // The desktop it says it is bound to, where it was asked and described its own session:
             // one that could not be asked, or described another, keeps the identity its row already
             // has.
