@@ -18,7 +18,7 @@ shells/zsh/                          shells/bash/              shells/fish/
 ```
 
 The fourth rebuilds no shell. PSReadLine is the editor the person already has, so what
-`shells/psreadline/` holds is a module of Kala Powered's own and the marked profile block that
+`shells/psreadline/` holds is a module written for KalaReach and the marked profile block that
 loads it:
 
 ```
@@ -387,9 +387,9 @@ other people's shells:
 | everything else, including `scripts/build-shells.sh` and this document | BSD 3-Clause |
 
 The patch files change each shell's own source, and the sources under `src/` are compiled into that
-shell, so both travel under the licence of the work they join. Kala Powered holds the copyright in
-the added sources and in the changes the patches make, and licenses them on those terms as part of
-each package.
+shell, so both travel under the licence of the work they join. The added sources and the changes the
+patches make are Copyright (c) 2026, KalaReach contributors, who license them on those terms as part
+of each package.
 
 No code under any of those licences is compiled into a crate. The crates speak to these packages over a
 socket and share nothing but the wire format, and `crates/kr-shell-integration` is a pure contract

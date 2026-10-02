@@ -40,7 +40,7 @@
     "category": "DeveloperTool",
     "shortDescription": "Your terminal sessions and coding agents, on every device you own.",
     "longDescription": "KalaReach keeps your terminal sessions and coding agents running on your own machines and reachable from the devices you carry. The companion application shows the attention inbox, the sessions on each host, the semantic conversation and the raw terminal.",
-    "copyright": "Copyright (c) Kala Powered",
+    "copyright": "Copyright (c) 2026, KalaReach contributors",
     "licenseFile": "../../../LICENSE",
     "icon": [
       "icons/32x32.png",
