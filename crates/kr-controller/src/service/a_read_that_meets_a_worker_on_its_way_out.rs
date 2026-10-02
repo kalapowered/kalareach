@@ -1773,7 +1773,7 @@ async fn a_session_whose_worker_cannot_answer_is_still_listed() {
 }
 
 /// A worker that is connected and answers nothing does not hold the list: the list is answered
-/// once the worker has had one exchange, and its session is listed from the registry's record. The
+/// once the worker has had two exchanges, and its session is listed from the registry's record. The
 /// test decides by whether the list is answered at all; the bound is generous.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_is_connected_and_silent_does_not_hold_the_list() {

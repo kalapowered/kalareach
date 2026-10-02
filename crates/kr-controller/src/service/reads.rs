@@ -30,7 +30,7 @@ impl Controller {
         // could not resolve when it started is looked at again for the same reason.
         let _ = self.recover_claims().await;
         let _ = self.recover_workers().await;
-        let mut sessions = Vec::new();
+        let mut sessions = Listed::default();
         // The sessions the pass over the workers has settled, whether it listed them or not: a
         // session whose worker said it is closed is not one this daemon lists as live because its
         // closure is not recorded yet, and one whose closure is recorded is the closed pass's.
@@ -79,7 +79,7 @@ impl Controller {
             if let Some(session) = session
                 && (params.include_closed || session.state != SessionState::Closed)
             {
-                sessions.push(session);
+                sessions.describe(session);
             }
         }
         if params.include_closed {
@@ -92,12 +92,17 @@ impl Controller {
             }
             drop(registry);
             for (closure, display_number) in closed {
-                sessions.push(self.closed_session(&closure, display_number).await);
+                // A closure recorded after a worker described the session as it was is the later
+                // word on it.
+                sessions.describe(self.closed_session(&closure, display_number).await);
             }
         }
-        sessions.extend(self.unresolved_sessions(&settled).await?);
-        sessions.sort_by_key(|session| session.display_number.get());
-        encode(&SessionListResult { sessions })
+        for session in self.unresolved_sessions(&settled).await? {
+            sessions.describe_unless_described(session);
+        }
+        encode(&SessionListResult {
+            sessions: sessions.into_sorted(),
+        })
     }
 
     pub(super) async fn session_read(
@@ -379,6 +384,35 @@ impl Controller {
     }
 }
 
+/// The sessions a list describes, one for each session identifier.
+///
+/// A session is described by its worker, by its closure, or from the registry's rows when neither
+/// does, and a list takes those one pass after another. Holding them by identifier makes a
+/// session listed twice impossible however the passes interleave with a closure being recorded: a
+/// closure replaces what a worker said of the session before it, and a description from the
+/// registry's rows never replaces another.
+#[derive(Default)]
+struct Listed(std::collections::BTreeMap<SessionId, SessionSummary>);
+
+impl Listed {
+    /// Describes a session, replacing any earlier description of it.
+    fn describe(&mut self, session: SessionSummary) {
+        self.0.insert(session.session_id, session);
+    }
+
+    /// Describes a session unless it is already described.
+    fn describe_unless_described(&mut self, session: SessionSummary) {
+        self.0.entry(session.session_id).or_insert(session);
+    }
+
+    /// The descriptions, by display number.
+    fn into_sorted(self) -> Vec<SessionSummary> {
+        let mut sessions: Vec<SessionSummary> = self.0.into_values().collect();
+        sessions.sort_by_key(|session| session.display_number.get());
+        sessions
+    }
+}
+
 impl Controller {
     /// Describes every session this daemon holds that no worker described and no closure covers.
     ///
@@ -506,5 +540,50 @@ fn closed_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::some(closure.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(session: u8, display: u64, state: SessionState) -> SessionSummary {
+        let mut summary = closed_summary(
+            &super::super::a_read_that_meets_a_worker_on_its_way_out::closure_of(SessionId::new(
+                kr_protocol::scalars::Uuid::from_bytes([session; 16]),
+            )),
+            EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            kr_protocol::session::DisplayNumber::new(display),
+        );
+        summary.state = state;
+        summary
+    }
+
+    /// A session a worker described and whose closure was recorded after it is listed once, as the
+    /// closure has it; a description from the registry's rows never replaces another; and the list
+    /// is in display order.
+    #[test]
+    fn a_session_is_listed_once_however_the_passes_describe_it() {
+        let mut listed = Listed::default();
+        listed.describe(summary(2, 2, SessionState::Live));
+        listed.describe(summary(1, 1, SessionState::Live));
+        // The closure of session 2 is recorded after its worker described it.
+        listed.describe(summary(2, 2, SessionState::Closed));
+        // The registry's rows describe session 1 as creating, and a session no worker described.
+        listed.describe_unless_described(summary(1, 1, SessionState::Creating));
+        listed.describe_unless_described(summary(3, 3, SessionState::Creating));
+
+        let sessions = listed.into_sorted();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| (session.display_number.get(), session.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, SessionState::Live),
+                (2, SessionState::Closed),
+                (3, SessionState::Creating)
+            ]
+        );
     }
 }
