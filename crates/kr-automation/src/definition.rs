@@ -351,7 +351,15 @@ fn validate_typed_action_params(
         }
         WorkflowActionKind::CreateSession => {
             // Before the parameters are decoded: a decoder's own message quotes the value it could
-            // not read, and the refusal is recorded with the action.
+            // not read, and the refusal is recorded with the action. A derived decoder reads the
+            // values of the fields as an array as well as an object, so a node's parameters are an
+            // object, whose field is looked for by name.
+            if !parsed.is_object() {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} creates a session with parameters that are not an object: \
+                     name each of them"
+                )));
+            }
             if parsed
                 .get("environment_snapshot")
                 .is_some_and(|variables| !variables.as_array().is_some_and(Vec::is_empty))
