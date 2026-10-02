@@ -2869,7 +2869,7 @@ async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
 /// keys it names in the same transaction: a device that rotated its preview key after the owner
 /// confirmed, and before the record was written, is not authorised by that confirmation. The
 /// controls are the same confirmation before the rotation, and the owner's own location after it,
-/// which names no device.
+/// which names no device. A device revoked in the same interval is not authorised either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_holds_the_keys_it_names()
  {
@@ -2906,10 +2906,20 @@ async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_hold
     let now = kr_ipc::now_ms;
     let rows = host.network().pairing().rows();
 
-    // Every challenge is issued before the device rotates its key.
+    let other_device = net_support::Device::create().await;
+    let other = net_support::pair_with(
+        &host,
+        &other_device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+
+    // Every challenge is issued before the device rotates its key or the other is revoked.
     let before = proof_for(0x71, Some(held.grant.grant_id));
     let late = proof_for(0x72, Some(held.grant.grant_id));
     let own = proof_for(0x73, None);
+    let withdrawn = proof_for(0x74, Some(other.grant.grant_id));
 
     rows.record_consumed(&before, "project.location", now())
         .expect("the control: while the device holds the keys the confirmation names, it is spent");
@@ -2956,6 +2966,27 @@ async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_hold
 
     rows.record_consumed(&own, "project.location", now())
         .expect("the control: the owner's own location names no device and is spent");
+
+    // A device revoked after the owner confirmed is not authorised either, whatever keys it held.
+    assert!(
+        host.network()
+            .devices()
+            .revoke(other.device_id, now())
+            .expect("the other device is revoked")
+    );
+    let refusal = rows
+        .record_consumed(&withdrawn, "project.location", now())
+        .expect_err("a confirmation naming a device that is no longer paired is not recorded");
+    assert!(
+        matches!(
+            refusal,
+            kr_controller::error::ControllerError::Refused {
+                code: ErrorCode::OwnerConfirmationRequired,
+                ..
+            }
+        ),
+        "the refusal asks the owner to confirm again: {refusal:?}"
+    );
     host.stop().await;
 }
 
