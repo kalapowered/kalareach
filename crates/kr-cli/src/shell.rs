@@ -17,6 +17,7 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
+use kr_shell_integration::host::refusal::Refusal;
 use kr_shell_integration::host::startup::{
     self, Change, EntryRecord, HomeLayout, RecordError, StartupTarget,
 };
@@ -289,13 +290,7 @@ fn install_targets(
     // with its own body and placement by position and never by the file: one file can take two
     // entries.
     for ((entry, target), body) in reported.entries.iter_mut().zip(targets).zip(&bodies) {
-        let io_failure = |error: std::io::Error| {
-            CliError::Other(shown!(
-                "{}: {}",
-                Shown::root(&entry.file),
-                Shown::io(&error)
-            ))
-        };
+        let io_failure = |error: std::io::Error| startup_failure(&entry.file, &error);
         let change = if dry_run {
             startup::plan(&entry.file, body, &target.placement).map_err(io_failure)?
         } else {
@@ -389,17 +384,11 @@ pub fn remove(
             .find(|target| target.path == file)
             .map_or(RECORDED, |target| target.reason);
         let change = match &held {
-            None => {
-                if startup::holds_an_entry(&file) {
-                    Change::Removed
-                } else {
-                    Change::Absent
-                }
-            }
+            None => startup::plan_removal(&file, kind)
+                .map_err(|error| startup_failure(&file, &error))?,
             Some(held) => {
-                let change = startup::remove(&file, record).map_err(|error| {
-                    CliError::Other(shown!("{}: {}", Shown::root(&file), Shown::io(&error)))
-                })?;
+                let change = startup::remove(&file, record, kind)
+                    .map_err(|error| startup_failure(&file, &error))?;
                 held.forget(kind, &file)
                     .map_err(|error| record_failure(record, &error))?;
                 change
@@ -432,6 +421,22 @@ pub fn remove(
         package: None,
         entries,
     })
+}
+
+/// What a failure to write into, or take out of, a startup file says: the file, and then why.
+///
+/// A refusal of the shell integration is said in its own words, which name what stopped the change
+/// and that the file is as it was. Any other failure is an ordinary one of the file system or of
+/// the process, and is said by its kind and its operating system code, as every such failure is.
+fn startup_failure(file: &std::path::Path, error: &std::io::Error) -> CliError {
+    match Refusal::of(error) {
+        Some(refusal) => CliError::Other(shown!(
+            "{}: {}",
+            Shown::root(file),
+            crate::shown::startup_refusal(refusal)
+        )),
+        None => CliError::Other(shown!("{}: {}", Shown::root(file), Shown::io(error))),
+    }
 }
 
 /// What a failure of the record says: where it is, and what to do about one that is not a record.
@@ -660,6 +665,238 @@ mod tests {
             "{error}"
         );
         assert!(selected(&set, None).expect("every package").is_empty());
+    }
+
+    /// A package of one shell that is never started: what a refusal that is decided before
+    /// PowerShell is asked needs of it is a name.
+    fn a_package_that_is_never_started(kind: ShellKind) -> ShellPackage {
+        use kr_shell_integration::host::package::{
+            PackageManifest, PackageShell, PackageStartupEntry,
+        };
+
+        let directory = std::path::PathBuf::from("/opt/kr/powershell/identity-1");
+        ShellPackage {
+            manifest: PackageManifest {
+                identity: "identity-1".to_owned(),
+                shell: PackageShell {
+                    kind,
+                    executable: directory.join("bin/pwsh"),
+                    upstream_version: "7.6".to_owned(),
+                    editor_abi: "psreadline-2".to_owned(),
+                    integration_version: "1".to_owned(),
+                    patches: Vec::new(),
+                    modules: Vec::new(),
+                },
+                startup_entry: PackageStartupEntry {
+                    file: "startup/entry".to_owned(),
+                },
+            },
+            directory,
+        }
+    }
+
+    /// KR-REQ-07.23: an install that refuses a profile says why, in the host's own words, and the
+    /// profile is as it was.
+    ///
+    /// The refusal reaches the command line as what it is, and not as the "other error" that any
+    /// failure carrying a sentence of its own is said as.
+    #[test]
+    fn an_install_that_refuses_a_profile_says_why_and_leaves_it_as_it_was() {
+        let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
+        let package = a_package_that_is_never_started(ShellKind::PowerShell);
+        for (name, text, says) in [
+            (
+                "signed",
+                "$x = 1\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n",
+                "it is signed, and any change to it breaks its signature, so nothing was written",
+            ),
+            (
+                "a second byte-order mark",
+                "\u{feff}\u{feff}$x = 1\n",
+                "it begins with a second byte-order mark, so nothing was written",
+            ),
+        ] {
+            let all_hosts = home.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            let current_host = home.path().join("current-host.ps1");
+            std::fs::write(&all_hosts, text).expect("writes");
+            let targets =
+                startup::powershell_targets(&package.executable(), all_hosts.clone(), current_host);
+            for dry_run in [true, false] {
+                let refused = install_targets(&package, &targets, &record, false, dry_run)
+                    .expect_err(&format!("{name}: refused"));
+                let said = refused.to_string();
+                assert!(
+                    said.contains(&format!("this profile cannot take the entry: {says}")),
+                    "{name}, dry_run {dry_run}: {said}"
+                );
+                assert!(
+                    !said.contains("other error"),
+                    "{name}, dry_run {dry_run}: the reason was said as an ordinary failure: {said}"
+                );
+                assert_eq!(std::fs::read_to_string(&all_hosts).expect("reads"), text);
+            }
+        }
+    }
+
+    /// KR-REQ-07.23: every refusal the shell integration makes is said as the refusal it is, one
+    /// case for each class, and an ordinary failure of the file system is said as it always was.
+    #[test]
+    fn every_refusal_is_said_in_the_hosts_words_and_an_ordinary_failure_is_not() {
+        use kr_shell_integration::host::refusal::ParserError;
+
+        let file = std::path::Path::new("/home/someone/profile.ps1");
+        let errors = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| ParserError::named(name).expect("a name"))
+                .collect::<Vec<_>>()
+        };
+        // Every class, and one place that fails to compile when a class is added without a case.
+        let classes = [
+            Refusal::SignedForInstall,
+            Refusal::SignedForRemoval,
+            Refusal::SecondByteOrderMark,
+            Refusal::LoneCarriageReturn,
+            Refusal::CommentOrStringRunsOver,
+            Refusal::StatementSharesTheLine,
+            Refusal::WouldReport(errors(&["MissingEndCurlyBrace", "UnexpectedToken"])),
+            Refusal::WouldChangeTheErrors,
+            Refusal::EntryNotOneBlock,
+            Refusal::EntryInsideAStatement,
+            Refusal::EntryInsideABlock,
+            Refusal::StatementBeforeTheEntry,
+            Refusal::StatementAfterTheEntry,
+            Refusal::PrologueAfterTheEntry,
+            Refusal::StatementsChanged,
+            Refusal::PrologueChanged,
+            Refusal::PlacementUnanswered,
+            Refusal::CheckUnanswered,
+            Refusal::PlacementNotUnderstood,
+            Refusal::PlacementOutsideTheProfile,
+            Refusal::CheckNotUnderstood,
+        ];
+        let counted = |refusal: &Refusal| match refusal {
+            Refusal::SignedForInstall
+            | Refusal::SignedForRemoval
+            | Refusal::SecondByteOrderMark
+            | Refusal::LoneCarriageReturn
+            | Refusal::CommentOrStringRunsOver
+            | Refusal::StatementSharesTheLine
+            | Refusal::WouldReport(_)
+            | Refusal::WouldChangeTheErrors
+            | Refusal::EntryNotOneBlock
+            | Refusal::EntryInsideAStatement
+            | Refusal::EntryInsideABlock
+            | Refusal::StatementBeforeTheEntry
+            | Refusal::StatementAfterTheEntry
+            | Refusal::PrologueAfterTheEntry
+            | Refusal::StatementsChanged
+            | Refusal::PrologueChanged
+            | Refusal::PlacementUnanswered
+            | Refusal::CheckUnanswered
+            | Refusal::PlacementNotUnderstood
+            | Refusal::PlacementOutsideTheProfile
+            | Refusal::CheckNotUnderstood => 1,
+        };
+        assert_eq!(classes.iter().map(counted).sum::<usize>(), 21);
+        for refusal in classes {
+            let said = startup_failure(file, &refusal.clone().into()).to_string();
+            assert!(
+                said.starts_with("/home/someone/profile.ps1: ")
+                    && said.ends_with(&refusal.to_string()),
+                "{refusal:?} is said as {said:?}"
+            );
+            assert!(!said.contains("other error"), "{refusal:?}: {said}");
+        }
+        assert!(
+            startup_failure(
+                file,
+                &Refusal::WouldReport(errors(&["MissingEndCurlyBrace", "UnexpectedToken"])).into()
+            )
+            .to_string()
+            .contains("PowerShell would report MissingEndCurlyBrace, UnexpectedToken in it"),
+            "the names of the parse errors are listed"
+        );
+
+        // The control: anything else is said as it always was, by its kind and its code, and a
+        // sentence some other library put in one is not repeated.
+        let marker = "kr-marker-4f2a-from-another-library";
+        let other = startup_failure(file, &std::io::Error::other(marker)).to_string();
+        assert_eq!(other, "/home/someone/profile.ps1: other error");
+        assert!(!other.contains(marker));
+        let missing = startup_failure(file, &std::io::Error::from_raw_os_error(2)).to_string();
+        assert!(missing.contains("(os error 2)"), "{missing}");
+    }
+
+    #[test]
+    fn a_signed_profile_is_not_changed_by_a_removal_and_keeps_its_record() {
+        // A profile signed after its entries were written cannot lose them without losing its
+        // signature, so a removal, a real one and a dry run alike, refuses it, says why and what to
+        // do, changes nothing and leaves the file in the record for the removal that follows.
+        let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+            powershell: None,
+        };
+        let entries = format!(
+            "{}\nImport-Module x\n{}\n",
+            startup::MARKER_BEGIN,
+            startup::MARKER_END
+        );
+        let signed = format!(
+            "{entries}$x = 1\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n"
+        );
+        let profile = home.path().join("profile.ps1");
+        std::fs::write(&profile, &signed).expect("writes");
+        record
+            .hold()
+            .expect("holds")
+            .add(ShellKind::PowerShell, std::slice::from_ref(&profile))
+            .expect("records");
+
+        for dry_run in [true, false] {
+            let refused = remove(ShellKind::PowerShell, &layout, &record, dry_run)
+                .expect_err("a signed profile is refused");
+            let said = refused.to_string();
+            assert!(
+                said.contains("it is signed") && said.contains("sign the profile again"),
+                "dry_run {dry_run}: {said}"
+            );
+            assert_eq!(std::fs::read_to_string(&profile).expect("reads"), signed);
+            assert_eq!(
+                record.files(ShellKind::PowerShell).expect("reads"),
+                vec![profile.clone()],
+                "the file stays in the record"
+            );
+        }
+
+        // The control: the same profile without the signature is cleaned and leaves the record.
+        let unsigned = format!("{entries}$x = 1\r\n");
+        std::fs::write(&profile, &unsigned).expect("writes");
+        let report = remove(ShellKind::PowerShell, &layout, &record, false).expect("removes");
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.change == Some(Change::Removed)),
+            "{report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&profile).expect("reads"),
+            "$x = 1\r\n"
+        );
+        assert!(
+            record
+                .files(ShellKind::PowerShell)
+                .expect("reads")
+                .is_empty()
+        );
     }
 
     #[test]

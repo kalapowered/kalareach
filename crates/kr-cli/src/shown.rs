@@ -17,6 +17,7 @@
 //! * [`git_revision`], [`git_mode`] and [`hex_digest`], identifiers that arrived as text, said only
 //!   when they match their grammar, and [`socket_address`] and [`host_name`], the two network forms
 //!   a configuration value can take besides a URL;
+//! * [`startup_refusal`], why a shell's startup file was left as it was, in the host's own words;
 //! * [`help`], this program's own help and version, as clap renders its declarations.
 //!
 //! Each type here is made only by the function beside it, so a value of it is always what that
@@ -531,6 +532,28 @@ pub fn wire_word<T: crate::output::Closed>(value: T) -> Shown {
         Ok(serde_json::Value::String(word)) => shown!("{}", Withheld(word)),
         _ => Shown::said("[a value this build does not name]"),
     }
+}
+
+/// Why a shell's startup file was left as it was.
+///
+/// The sentence is one of a closed set the shell integration owns, and nothing of the person's file
+/// is in it: the one thing that came from outside, a name PowerShell gave a parse error, was kept
+/// only because it is a name.
+pub struct StartupRefusal(String);
+
+impl fmt::Display for StartupRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for StartupRefusal {}
+
+/// What a refusal to write into, or take out of, a startup file says: the host's own sentence for
+/// it, which says what stopped the change and that the file is as it was.
+#[must_use]
+pub fn startup_refusal(refusal: &kr_shell_integration::host::refusal::Refusal) -> Shown {
+    shown!("{}", StartupRefusal(refusal.to_string()))
 }
 
 /// An identifier that arrived as text and matched its grammar.
