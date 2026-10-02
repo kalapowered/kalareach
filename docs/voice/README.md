@@ -53,7 +53,7 @@ daemon supplies less of it, as the section on what this daemon performs and supp
   decisions waiting on a person, and the last twenty semantic messages;
 - capped at eight thousand text tokens, enforced by dropping whole items rather than cutting one in
   half. The host cannot run the provider's encoder, so what it counts is a bound no byte-level
-  tokenizer can exceed — the selection's own byte count — and a selection is therefore often
+  tokenizer can exceed (the selection's own byte count), and a selection is therefore often
   smaller than the cap rather than larger;
 - file contents, environment variables, raw terminal scrollback and attachment bytes are **excluded
   until the person selects them**, and the four are a closed list rather than a rule to remember.
