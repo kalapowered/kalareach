@@ -400,6 +400,16 @@ impl Pair {
         pair
     }
 
+    /// How many more times the stand-in will start a helper: it drops by one for each helper a
+    /// command started, so a test can tell by condition that B was reached.
+    fn starts_left(&self) -> u32 {
+        std::fs::read_to_string(self.bridges.path().join("fixture/allowed"))
+            .expect("the stand-in's allowance")
+            .trim()
+            .parse()
+            .expect("a number")
+    }
+
     /// How many more times the stand-in starts a helper.
     fn allow(&self, starts: u32) {
         std::fs::write(
@@ -994,15 +1004,66 @@ async fn an_environment_that_cannot_read_its_record_is_not_taken_to_have_refused
     kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
         .expect("damages the record");
 
+    let before = pair.starts_left();
     let (status, still) = pair
         .a
         .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert!(
+        pair.starts_left() < before,
+        "B was reached, so its answer is what kept the step sent, not an unreachable bridge"
+    );
     assert_eq!(status, Some(1), "{still}");
     assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
     assert_eq!(still["steps"][1]["state"], "sent", "{still}");
     assert_eq!(still["kept"], Value::Bool(true), "{still}");
     assert!(pair.a.plan_file().exists());
 
+    kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
+    assert_eq!(pair.b.group().machine_id, into);
+}
+
+/// KR-REQ-03.07: an environment that cannot look up its receipts says nothing of a step it took. B
+/// took its step and lost its answer; its record is damaged and its receipts cannot be read. `finish`
+/// is told by B that it does not know, and keeps the step `sent` and the plan, where an answer that
+/// B refused the step would have given it up; once B can read both again the step is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_that_cannot_read_its_receipts_or_its_record_has_not_refused_its_step() {
+    let pair = Pair::start().await;
+    let (_shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.lose_the_next_machine_receipt();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    let record = pair.b.temp.environment().state_dir().join("machine-group");
+    let whole = std::fs::read(&record).expect("B's record");
+    kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
+        .expect("damages the record");
+    let database = pair.b.temp.environment().registry_database();
+    let renamed = |from: &str, to: &str| {
+        let connection = rusqlite::Connection::open(&database).expect("opens B's registry");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits");
+        connection
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))
+            .expect("renames the table");
+    };
+    renamed("authority_receipts", "authority_receipts_aside");
+
+    let before = pair.starts_left();
+    let (status, still) = pair
+        .a
+        .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert!(pair.starts_left() < before, "B was reached");
+    assert_eq!(status, Some(1), "{still}");
+    assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
+    assert_eq!(still["steps"][1]["state"], "sent", "{still}");
+    assert_eq!(still["kept"], Value::Bool(true), "{still}");
+    assert!(pair.a.plan_file().exists(), "the plan was not given up");
+
+    renamed("authority_receipts_aside", "authority_receipts");
     kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
     let finished = pair.at_a(&["host", "machine", "finish"]);
     assert_eq!(finished["steps"][1]["state"], "done", "{finished}");

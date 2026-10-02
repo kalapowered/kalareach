@@ -28,10 +28,13 @@
 //!   it answers from its receipt. A step the environment refuses without a receipt is read against
 //!   what the environment reports: at the precondition nothing was applied, and the step is
 //!   composed again under a new action identity (unless its first action is still running, in which
-//!   case it waits for that); one step on, the record shows it was taken; and anywhere else it can
-//!   never apply and is given its refusal. A step whose outcome the environment does not know, or
-//!   could not confirm, or could not write, is not given a result it was not given: it stays sent.
-//!   An environment that cannot be reached stays pending.
+//!   case it waits for that); one step on, the record shows it was taken, unless the environment
+//!   could not say whether it survives a crash or its action is still running, which stay sent;
+//!   and anywhere else it can never apply and is given its refusal. A step whose outcome the
+//!   environment does not know, or could not confirm, or could not write, is not given a result it
+//!   was not given: it stays sent. An environment that reports no record takes no step: what it
+//!   refused before it claimed the action is refused, and what it could not answer stays sent. An
+//!   environment that cannot be reached stays pending.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
 //!   never sent is given up. One that may or may not have been taken has to be finished first,
@@ -1477,7 +1480,8 @@ mod tests {
 
     /// KR-REQ-03.07: an environment that took the step another way, or whose record shows it, has
     /// the step taken; one that moved elsewhere has it refused for good; one with no record has
-    /// it refused; and no answer that leaves it unknown whether the step was taken is called taken.
+    /// it refused where it refused it before it claimed the action; and no answer that leaves it
+    /// unknown whether the step was taken is called taken.
     #[test]
     fn what_an_environment_reports_decides_what_a_refused_step_has_come_to() {
         let step = step();
