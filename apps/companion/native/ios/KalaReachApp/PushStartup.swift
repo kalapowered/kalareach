@@ -18,6 +18,9 @@ import UIKit
 
 /// Starts push as the launch plan says.
 enum PushStartup {
+    /// Why Firebase was left alone, when it was: a device check reports it.
+    private(set) static var skippedBecause: String?
+
     /// Does each action in order.
     static func carryOut(_ plan: [LaunchAction]) {
         for action in plan {
@@ -27,8 +30,9 @@ enum PushStartup {
                 DeviceProbe.run(mode)
                 #endif
                 _ = mode
-            case .skipFirebase:
-                NSLog("KalaReach: Firebase skipped, this build holds no GoogleService-Info.plist")
+            case .skipFirebase(let reason):
+                skippedBecause = reason
+                NSLog("KalaReach: Firebase skipped, %@", reason)
             case .configureFirebase:
                 FirebaseApp.configure()
                 PushRegistration.shared.onTokenUsable = { Messaging.messaging().apnsToken = $0 }
