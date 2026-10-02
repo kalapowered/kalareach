@@ -308,24 +308,18 @@ impl RemoteConnection {
                 // A recorded version is read only inside the grant: its environment, its session
                 // and the moment its history reaches back to, the check `changeset.materialize`
                 // and `diff.read` of a recorded version are held to.
-                if entry.method == Method::ChangesetRead {
-                    let checked = match request
-                        .params
-                        .to_typed::<kr_protocol::changeset::ChangesetReadParams>()
-                    {
-                        Ok(params) => {
-                            self.check_version(params.change_set_id, params.version.0)
-                                .await
+                let pinned;
+                let request = if entry.method == Method::ChangesetRead {
+                    match self.pinned_change_set_read(request).await {
+                        Ok(request) => {
+                            pinned = request;
+                            &pinned
                         }
-                        Err(error) => Err(ProtocolError::new(
-                            ErrorCode::InvalidArgument,
-                            kr_project::git::redact(&error.to_string()),
-                        )),
-                    };
-                    if let Err(error) = checked {
-                        return failure(request.request_id, error);
+                        Err(error) => return failure(request.request_id, error),
                     }
-                }
+                } else {
+                    request
+                };
                 let answer = self.controller.read_method(&actor_id, request).await;
                 let narrowed = self.narrow(answer);
                 if entry.method == Method::ChangesetRead {

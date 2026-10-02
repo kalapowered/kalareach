@@ -2195,6 +2195,92 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     recorded.stop().await;
 }
 
+/// KR-REQ-23.44: a `changeset.read` that names no version reads the latest one, and it is the
+/// latest version that is held to the grant, and exactly that version that is read.
+///
+/// One change set holds a version captured for a session and a later one captured for none. A
+/// grant that names the session reaches the first by its number and not the second, so the read
+/// that names no number, which would be the second, is refused. The control is the grant over any
+/// session, which reads the latest and is told it is the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
+    use kr_protocol::grant::SessionSelector;
+
+    let mut recorded = Recorded::start().await;
+    // A second version of the change set that holds the one captured for the session, captured
+    // for no session.
+    let later: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &local_mutation(
+            &mut recorded.control,
+            recorded.host.environment_id,
+            Method::ChangesetCapture,
+            &kr_protocol::changeset::ChangesetCaptureParams {
+                workspace_id: recorded.workspace,
+                change_set_id: Nullable::some(recorded.for_a_session.change_set_id),
+                label: "later".to_owned(),
+                policy: InclusionPolicy {
+                    dirty_files: InclusionChoice::Include,
+                    untracked_files: InclusionChoice::Include,
+                    submodules: InclusionChoice::Exclude,
+                    binary_files: InclusionChoice::Exclude,
+                    generated_artefacts: InclusionChoice::Exclude,
+                },
+                grant: kr_protocol::changeset::FileGrant {
+                    included_paths: Vec::new(),
+                    excluded_paths: Vec::new(),
+                    secret_rules_applied: true,
+                },
+                quiescence_declared: false,
+                required_consistency: Nullable::null(),
+                pin: true,
+                session_id: Nullable::null(),
+                workflow_run_id: Nullable::null(),
+                note: String::new(),
+            },
+        )
+        .await
+        .expect("the owner captures a later version of the same change set"),
+    );
+    assert_eq!(later.version.version.get(), 2);
+    let change_set_id = recorded.for_a_session.change_set_id;
+    let latest = kr_protocol::changeset::ChangesetReadParams {
+        change_set_id,
+        version: Nullable::null(),
+    };
+    let named = |version: u64| kr_protocol::changeset::ChangesetReadParams {
+        change_set_id,
+        version: Nullable::some(kr_protocol::ids::ChangeSetVersion::new(version)),
+    };
+    let session = recorded.session;
+    let (_a, narrow) = recorded
+        .device(|grant| {
+            grant.session_selector = SessionSelector::These {
+                session_ids: [session].into_iter().collect(),
+            };
+        })
+        .await;
+    narrow
+        .read::<_, kr_protocol::changeset::ChangesetReadResult>(Method::ChangesetRead, &named(1))
+        .await
+        .expect("the version captured for the session is reached by its number");
+    let refusal = narrow
+        .read::<_, kr_protocol::changeset::ChangesetReadResult>(Method::ChangesetRead, &latest)
+        .await
+        .expect_err("the latest version records no session, so it is out of scope");
+    assert!(
+        said(&refusal).contains("does not reach change set"),
+        "{refusal}"
+    );
+    // The control: a grant over any session reads the latest, and is told which version it is.
+    let (_b, any) = recorded.device(|_| {}).await;
+    let read: kr_protocol::changeset::ChangesetReadResult = any
+        .read(Method::ChangesetRead, &latest)
+        .await
+        .expect("a grant over any session reads the latest version");
+    assert_eq!(read.version.version.get(), 2);
+    recorded.stop().await;
+}
+
 /// KR-REQ-23.44: capture, apply, revert and the diff of a working copy are refused to a device,
 /// each by name and for the reason that is so: each reads or writes a working tree by running the
 /// Git program, outside the boundary that confines what that program reads for a device's
@@ -2719,6 +2805,63 @@ async fn a_confirmation_issued_for_one_devices_location_does_not_verify_for_anot
     authority
         .consume(&enlargement(held.grant.grant_id), &proof)
         .expect("it is spent for the device it names");
+    host.stop().await;
+}
+
+/// A device that rotates its notification-preview key after a challenge for its location was
+/// issued is not the device the challenge names: the proof neither verifies nor is spent, and the
+/// owner confirms again. The control is the same proof before the rotation, which verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
+    use kr_project::policy::{Enlargement, OwnerAuthority as _};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let held = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let authority =
+        kr_controller::project::HostOwner::new(std::sync::Arc::clone(host.network().pairing()));
+    let enlargement = Enlargement {
+        action_digest: kr_protocol::scalars::Digest256::from_bytes([0x6b; 32]),
+        rights: [ActionRight::ProjectCreate, ActionRight::WorkspaceManage]
+            .into_iter()
+            .collect(),
+        destination: Some(held.grant.grant_id),
+    };
+    let request = authority
+        .challenge(&enlargement)
+        .expect("a challenge for the device's location");
+    let proof = signed_by(&owner, &request);
+    authority
+        .verify(&enlargement, &proof)
+        .expect("before the rotation the proof verifies");
+    let rotated = host
+        .network()
+        .devices()
+        .update_preview_key(
+            held.device_id,
+            kr_protocol::scalars::NotificationPreviewKey::from_bytes([0x9c; 32]),
+            kr_protocol::ids::DeviceKeyRevision::new(held.device_key_revision.get() + 1),
+        )
+        .expect("the device rotates its preview key");
+    assert!(matches!(
+        rotated,
+        kr_controller::service::net::devices::PreviewKeyOutcome::Recorded
+    ));
+    let refusal = authority
+        .verify(&enlargement, &proof)
+        .expect_err("after the rotation it names keys the device no longer holds");
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    let refusal = authority
+        .consume(&enlargement, &proof)
+        .expect_err("and it is not spent");
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
     host.stop().await;
 }
 

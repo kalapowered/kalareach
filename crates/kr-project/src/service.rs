@@ -4118,7 +4118,13 @@ impl Narrowing {
                 .map(|text| text.trim().to_owned())
         };
         let table = std::fs::read_to_string("/proc/self/mountinfo").ok();
-        let fstab = std::fs::read_to_string("/etc/fstab").ok();
+        // A host with no filesystem table asks for no automount through one; a table this account
+        // cannot read leaves the count unknown.
+        let fstab = match std::fs::read_to_string("/etc/fstab") {
+            Ok(table) => Some(table),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+            Err(_) => None,
+        };
         let home_config = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -4158,7 +4164,7 @@ impl Narrowing {
             automounts: table.as_deref().and_then(|table| {
                 Some(
                     autofs_mounts(table)
-                        + fstab.as_deref().map_or(0, fstab_automounts)
+                        + fstab.as_deref().map(fstab_automounts)?
                         + units_across(
                             &[
                                 PathBuf::from("/etc/systemd/system"),
@@ -4247,9 +4253,11 @@ fn units_across(directories: &[PathBuf], kinds: &[&str]) -> Option<u64> {
     let mut count = 0;
     for directory in directories {
         match units_in(directory, kinds) {
-            Some(found) => count += found,
-            None if !directory.exists() => {}
-            None => return None,
+            Ok(found) => count += found,
+            // Only a directory that is not there holds none. One this account cannot reach, or
+            // one it cannot list, leaves the count unknown.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
     }
     Some(count)
@@ -4274,12 +4282,12 @@ fn fstab_automounts(table: &str) -> u64 {
         .count() as u64
 }
 
-/// Counts the units of the given kinds in one directory, or `None` when it cannot be read.
+/// Counts the units of the given kinds in one directory, or says why it cannot be read.
 #[cfg(any(target_os = "linux", test))]
-fn units_in(directory: &Path, kinds: &[&str]) -> Option<u64> {
+fn units_in(directory: &Path, kinds: &[&str]) -> std::io::Result<u64> {
     let mut count = 0;
-    for entry in std::fs::read_dir(directory).ok()? {
-        let name = entry.ok()?.file_name();
+    for entry in std::fs::read_dir(directory)? {
+        let name = entry?.file_name();
         if Path::new(&name)
             .extension()
             .and_then(OsStr::to_str)
@@ -4288,7 +4296,7 @@ fn units_in(directory: &Path, kinds: &[&str]) -> Option<u64> {
             count += 1;
         }
     }
-    Some(count)
+    Ok(count)
 }
 
 /// What this host proved about running Git for a caller bounded by a grant, such as a paired
@@ -4482,16 +4490,24 @@ mod tests {
     #[test]
     fn units_are_counted_by_kind() {
         let directory = tempfile::tempdir().expect("a directory");
-        assert_eq!(units_in(directory.path(), &["mount", "automount"]), Some(0));
+        assert_eq!(
+            units_in(directory.path(), &["mount", "automount"]).ok(),
+            Some(0)
+        );
         for name in ["data.mount", "data.automount", "work.service", "notes"] {
             std::fs::write(directory.path().join(name), "").expect("a unit");
         }
-        assert_eq!(units_in(directory.path(), &["mount", "automount"]), Some(2));
-        assert_eq!(units_in(directory.path(), &["automount"]), Some(1));
         assert_eq!(
-            units_in(&directory.path().join("missing"), &["mount"]),
-            None,
-            "a directory that cannot be read is no reading"
+            units_in(directory.path(), &["mount", "automount"]).ok(),
+            Some(2)
+        );
+        assert_eq!(units_in(directory.path(), &["automount"]).ok(), Some(1));
+        assert_eq!(
+            units_in(&directory.path().join("missing"), &["mount"])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "a directory that is not there says so"
         );
     }
 
@@ -4513,6 +4529,29 @@ mod tests {
         assert_eq!(
             units_across(&[first.path().join("data.mount")], &["mount"]),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_this_account_cannot_reach_is_unknown_and_not_empty() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let outer = tempfile::tempdir().expect("a directory");
+        let inner = outer.path().join("units");
+        std::fs::create_dir(&inner).expect("a directory");
+        std::fs::write(inner.join("data.mount"), "").expect("a unit");
+        assert_eq!(units_across(&[inner.clone()], &["mount"]), Some(1));
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+        let reached = units_across(&[inner], &["mount"]);
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("permissions");
+        // An account that bypasses the mode (root) reaches it anyway, and then counts what is
+        // there; what it never does is report none for a directory it could not reach.
+        assert!(
+            reached == None || reached == Some(1),
+            "an unreachable ancestor is not an empty directory: {reached:?}"
         );
     }
 
