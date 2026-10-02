@@ -46,6 +46,15 @@ fn target(host: &Host) -> ActionTarget {
     ActionTarget::environment(host.environment_id)
 }
 
+/// A target that names a session of the environment, with the epoch a session target carries.
+fn a_session_target(host: &Host) -> ActionTarget {
+    ActionTarget {
+        session_id: Nullable::some(kr_protocol::ids::SessionId::new(Uuid::from_bytes([5; 16]))),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        ..target(host)
+    }
+}
+
 fn expecting(group: &MachineGroup) -> MachineExpected {
     MachineExpected {
         machine_id: group.machine_id,
@@ -90,7 +99,7 @@ async fn local_step<P: serde::Serialize>(
         .map(|value| typed(&value))
 }
 
-async fn join<'a>(
+async fn join(
     host: &Host,
     client: &mut LocalClient,
     into: MachineId,
@@ -241,10 +250,7 @@ async fn the_owner_at_the_local_socket_joins_merges_and_splits_against_the_recor
     assert_eq!(group_of(&mut client).await, joined.machine);
 
     // A target that names a session is refused: a group belongs to the environment.
-    let session_target = kr_protocol::envelope::ActionTarget {
-        session_id: Nullable::some(kr_protocol::ids::SessionId::new(Uuid::from_bytes([5; 16]))),
-        ..target(&host)
-    };
+    let session_target = a_session_target(&host);
     let named = client
         .mutate(
             Method::MachineSplit,
@@ -406,12 +412,7 @@ async fn a_paired_device_changes_the_group_only_where_its_grant_carries_host_man
         .mutate(
             Method::MachineSplit,
             action(),
-            kr_protocol::envelope::ActionTarget {
-                session_id: Nullable::some(kr_protocol::ids::SessionId::new(Uuid::from_bytes(
-                    [6; 16],
-                ))),
-                ..target(&host)
-            },
+            a_session_target(&host),
             &MachineSplitParams {
                 expected: expecting(&joined.machine),
             },
