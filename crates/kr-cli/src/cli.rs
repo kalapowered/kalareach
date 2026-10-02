@@ -1269,8 +1269,9 @@ pub struct ListArguments {
 pub struct ExportArguments {
     /// The closed session, by display number or identifier.
     pub session: String,
-    /// The file to write. It is created new and readable by you alone; an existing file is never
-    /// replaced.
+    /// The file to write. It is created new: an existing file, or a link to one, is refused and
+    /// never replaced. Its mode is 0600 on Unix; on Windows it takes the access list of the folder
+    /// it is in.
     #[arg(long)]
     pub output: PathBuf,
     /// The environment the session is in: one of this host's own, by identifier, or an enrolled
