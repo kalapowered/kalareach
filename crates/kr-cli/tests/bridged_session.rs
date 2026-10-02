@@ -770,8 +770,12 @@ impl Terminal {
                 let values: Vec<&str> = line.split('|').collect();
                 // The last part is what follows the final separator, and a line still being
                 // written has not reached it.
-                (values.len() == count + 1)
-                    .then(|| values[..count].iter().map(|value| (*value).to_owned()).collect())
+                (values.len() == count + 1).then(|| {
+                    values[..count]
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect()
+                })
             });
             if let Some(printed) = printed {
                 return printed;
@@ -969,9 +973,8 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
     ));
     // The command asks this terminal for its colours, and the person types while it does.
     terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
-    terminal.types(
-        "\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
-    );
+    terminal
+        .types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
     if answer_the_attachment {
         terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
         terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
@@ -1027,7 +1030,10 @@ async fn a_helper_that_dies_during_an_attachment_ends_it_as_a_lost_connection_an
         "the connection to the session ended",
         "the attachment said the connection was lost",
     );
-    terminal.expect_within("attach-finished-3", "with the code of a host that was not reached");
+    terminal.expect_within(
+        "attach-finished-3",
+        "with the code of a host that was not reached",
+    );
     let started = Instant::now();
     let after = loop {
         let modes = terminal.modes();
@@ -1127,9 +1133,8 @@ async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_she
     ));
     terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
     // The five bytes begin a command, which the person finishes once the shell is theirs.
-    terminal.types(
-        "\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
-    );
+    terminal
+        .types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
     terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
     terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
     terminal.types("delivered-$((1+1))\r");
