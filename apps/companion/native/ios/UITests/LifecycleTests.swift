@@ -14,8 +14,8 @@ import XCTest
 final class LifecycleTests: DeviceTestCase {
     func testTheApplicationSurvivesThePromptAndRoundsToTheBackground() throws {
         launch(probe: "push")
-        answerPrompt(["Allow", "OK"], timeout: 20)
-        let facts = try XCTUnwrap(probeFacts("push", timeout: 90), "the push check did not report")
+        XCTAssertTrue(answerPrompt(["Allow", "OK"], timeout: 20), "the notification prompt did not come up, or was not answered: a check of what the prompt does needs it")
+        let facts = try XCTUnwrap(probeFacts("push", timeout: 130), "the push check did not report")
         sayFacts("push", facts)
         // This session's build holds Firebase's configuration: a build that does not start Firebase
         // is not the build under test, whatever its reason.

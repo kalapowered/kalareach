@@ -135,6 +135,15 @@ class DeviceTestCase: XCTestCase {
         return false
     }
 
+    /// Posts a Darwin notification the application's debug build listens for. Nothing travels with it.
+    func post(_ name: String) {
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName(name as CFString),
+            nil, nil, true
+        )
+    }
+
     // MARK: The application's own picture of itself
 
     /// Has the application render its own windows to a file, which a script copies out afterwards.
@@ -146,11 +155,7 @@ class DeviceTestCase: XCTestCase {
     func shot(_ step: String) {
         let element = probeElement("shots")
         let before = element.value as? String
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName("to.kala.reach.probe.shot" as CFString),
-            nil, nil, true
-        )
+        post("to.kala.reach.probe.shot")
         let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
             if let now = element.value as? String, now != before, !now.isEmpty {
