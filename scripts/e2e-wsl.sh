@@ -11,19 +11,26 @@
 #   1. WSL 2 is installed, the default version is 2, and two distributions are registered. A second
 #      one is made by exporting and importing the first when only one is there, and is removed
 #      again at the end.
-#   2. Each distribution runs KalaReach on its own: its own control daemon, its own worker, its own
-#      Linux paths and process identifiers, with the native Windows installation taking no part. A
+#   2. Argument vectors cross `wsl.exe --exec` unchanged, including values a shell would rewrite.
+#   3. Each distribution runs KalaReach on its own: its own control daemon, its own worker, its own
+#      Linux paths and process identifiers, with the native Windows installation taking no part, and
+#      with no socket of either in storage that every distribution of the machine shares. A
 #      distribution this run imported is a copy, so the installation it inherited is removed before
 #      anything starts in it and it becomes an installation of its own.
-#   3. Argument vectors cross `wsl.exe --exec` unchanged, including values a shell would rewrite.
 #   4. Windows reaches each distribution through the process bridge alone, learns that
 #      distribution's own environment identity, and gets an answer to a real read across it.
 #   5. A listing of stopped distributions comes from the cache and starts nothing. A refresh that
 #      was told to start one does. So does creating a session in one from Windows, which also has
 #      the distribution's own startup start the control daemon inside it, and so does attaching to
 #      a session there, which is told by the distribution that the session has closed.
-#   6. The bridge behaves the same in NAT and in mirrored networking mode, which is what decides
+#   6. The bridge behaves the same in NAT and in mirrored networking, which is what decides
 #      whether any automatic behaviour is needed.
+#   7. The helper refuses what may not cross: input that is not a frame, and a handshake that
+#      declares a network origin, which the bridge suite checks inside the distribution.
+#
+# It changes the machine it runs on, which is why it is run on a machine made for it: it sets the
+# default WSL version to 2, makes and removes a distribution, shuts WSL down to change the
+# networking mode in step 6, and restores `.wslconfig` when it ends.
 #
 # Every artefact is written under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}. The Windows
 # daemon this starts keeps its keys in its own run directory (never the Credential Manager).
@@ -142,7 +149,7 @@ inherited_reset='
       # is asked as the product runs, with none, and the root it names is the one it has.
       if [ "$name" = XDG_RUNTIME_DIR ]; then
         case "$(readlink -m "$value")/" in
-          /mnt/wslg/*)
+          /mnt/wslg/* | /mnt/wsl/*)
             unset XDG_RUNTIME_DIR
             continue
             ;;
@@ -304,8 +311,10 @@ inherited_reset='
 '
 
 # The path of every Unix socket a process holds open, one to a line, with the process identifier as
-# its argument: each descriptor that names a socket is looked up by its number in the kernel's table
-# of them, which also holds the path the socket was bound to. A socket with no path is not listed.
+# its argument. Each descriptor that names a socket is looked up by its number in the table of
+# Unix sockets the process sees, which also holds the path the socket was bound to as it was given
+# to bind. A directory in that path can be a link into somewhere else, so the path is listed with
+# its directory resolved: where the socket really is. A socket with no path is not listed.
 # shellcheck disable=SC2016  # read by the shell inside the distribution, which is the point
 open_socket_paths='for fd in /proc/$1/fd/*; do
     target="$(readlink "$fd")" || continue
@@ -314,8 +323,15 @@ open_socket_paths='for fd in /proc/$1/fd/*; do
         inode="${target#socket:[}"
         inode="${inode%]}"
         while read -r _ _ _ _ _ _ number path; do
-          [ "$number" = "$inode" ] && [ -n "$path" ] && echo "$path"
-        done </proc/net/unix
+          [ "$number" = "$inode" ] && [ -n "$path" ] || continue
+          case "$path" in
+            /*)
+              directory="${path%/*}"
+              echo "$(readlink -f "${directory:-/}" || echo "$directory")/${path##*/}"
+              ;;
+            *) echo "$path" ;;
+          esac
+        done </proc/$1/net/unix
         ;;
     esac
   done'
@@ -799,7 +815,28 @@ time.sleep(60)' "$d/held.sock" >"$d/said" 2>&1 &
   listed="$(/bin/sh -c "$open_socket_paths" sh "$holder" 2>>"$d/said")"
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
-  [ "$listed" = "$d/held.sock" ] || {
+  [ "$listed" = "$(readlink -f "$d")/held.sock" ] || {
+    echo "  the listing was: $listed" >>"$d/said"
+    return 1
+  }
+  # A socket bound through a link is listed where it really is, which is where a link into shared
+  # storage would show.
+  mkdir -p "$d/real" || return 1
+  ln -s "$d/real" "$d/link" || return 1
+  python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen()
+time.sleep(60)' "$d/link/linked.sock" >>"$d/said" 2>&1 &
+  holder=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -S "$d/real/linked.sock" ] && break
+    sleep 0.25
+  done
+  listed="$(/bin/sh -c "$open_socket_paths" sh "$holder" 2>>"$d/said")"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$listed" = "$(readlink -f "$d/real")/linked.sock" ] || {
     echo "  the listing was: $listed" >>"$d/said"
     return 1
   }
@@ -1042,6 +1079,10 @@ second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
 keep="${KR_WSL_KEEP:-0}"
 network_modes="${KR_WSL_NETWORK_MODES:-nat mirrored}"
+[ "$(printf '%s' "$network_modes" | wc -w)" -gt 0 ] || {
+  echo "FAIL: KR_WSL_NETWORK_MODES names no mode, so step 6 would measure nothing" >&2
+  exit 1
+}
 for mode in $network_modes; do
   case "$mode" in
     nat | mirrored) ;;
@@ -1195,6 +1236,9 @@ if [ "${#distributions[@]}" -lt 2 ]; then
     "$(windows_path "$tarball")" --version 2 >"$run_dir/import.log" 2>&1 ||
     fail "$second_name could not be imported into $target_dir: $(cat "$run_dir/import.log")"
   made_distribution="$second_name"
+  # The image has done its work: the distribution holds what it carried. It is several gigabytes,
+  # and it is a copy of an installation, so it is not left in the evidence this run keeps.
+  rm -f "${tarball:?}"
   # The one this run made, by the name it gave it. Reading a position out of the listing again
   # would take whichever name the registry happens to put second.
   second="$second_name"
@@ -1381,6 +1425,23 @@ fi
 start_daemon_inside "$second"
 pass "each distribution started its own KalaReach, from its own installed set, with no native Windows installation"
 
+# The sockets one process of a distribution holds are the distribution's own: none is in storage
+# WSL shares between every distribution of the machine (/mnt/wslg and /mnt/wsl), where another
+# distribution could open it. Where each really is decides, with its directory resolved through
+# links. A process with no socket that has a path fails, because its runtime root is then not
+# known.
+not_in_shared_storage() {
+  local distribution="$1" what="$2" pid="$3" sockets shared
+  sockets="$(inside "$distribution" "/bin/sh -c '$open_socket_paths' sh $pid")" ||
+    fail "$distribution could not be asked what its $what $pid listens on"
+  [ -n "$sockets" ] ||
+    fail "$distribution's $what $pid holds no socket with a path, so its runtime root is not known"
+  shared="$(printf '%s\n' "$sockets" | grep -c -E '^/mnt/(wslg|wsl)/')" || [ "$shared" = "0" ]
+  if [ "$shared" != "0" ]; then
+    fail "$distribution's $what holds sockets in storage WSL shares between distributions: $(printf '%s' "$sockets" | tr '\n' ';')"
+  fi
+}
+
 # Linux paths, binaries and process identifiers stay inside the distribution. Each assertion below
 # names the process it is about and reads that process's own Linux paths out of /proc.
 installed_dir="$(dirname "$helper_path")"
@@ -1403,16 +1464,7 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its daemon $daemon_pid has for a root"
   [ "$daemon_root" = "/" ] ||
     fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
-  # The sockets it listens on are the distribution's own: none is in the directory WSLg shares
-  # between every distribution of the machine, where another distribution could open it.
-  daemon_sockets="$(inside "$distribution" "/bin/sh -c '$open_socket_paths' sh $daemon_pid")" ||
-    fail "$distribution could not be asked what its daemon $daemon_pid listens on"
-  [ -n "$daemon_sockets" ] ||
-    fail "$distribution's daemon $daemon_pid holds no socket with a path, so its runtime root is not known"
-  shared_sockets="$(printf '%s\n' "$daemon_sockets" | grep -c '^/mnt/wslg/')" || [ "$shared_sockets" = "0" ]
-  if [ "$shared_sockets" != "0" ]; then
-    fail "$distribution's daemon holds sockets in the directory WSLg shares between distributions: $(printf '%s' "$daemon_sockets" | tr '\n' ';')"
-  fi
+  not_in_shared_storage "$distribution" daemon "$daemon_pid"
   # A session of the distribution's own, named by the identifier the create answered with.
   session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)" ||
     fail "$distribution could not be asked to create a session of its own"
@@ -1453,18 +1505,22 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its worker $worker_pid has for a root"
   [ "$worker_root" = "/" ] ||
     fail "$distribution's worker has root $worker_root rather than this distribution's own"
+  not_in_shared_storage "$distribution" worker "$worker_pid"
   # What the worker has open that lives on the Windows side: a file under one of the drive mounts
   # (`/mnt/c`, `/mnt/d`), or on a 9p filesystem, which is how WSL2 serves them. The listing is made
   # first and counted afterwards, so a listing that could not be made is a failure here rather than
   # a partial one counted as no crossings. Other files below /mnt are not Windows files: WSLg,
   # where it is installed, keeps what it serves to every distribution in /mnt/wslg, a memory-backed
-  # directory of the virtual machine. The product keeps nothing of its own there, which the
-  # daemon's sockets above are checked for.
+  # directory of the virtual machine, and the platform keeps its own in /mnt/wsl. What WSLg serves
+  # is not the product's and is left alone, but a file there whose path names the product is the
+  # product's, and it is counted: the product keeps nothing of its own in storage every
+  # distribution shares.
   # shellcheck disable=SC2016  # read by the shell inside the distribution, which is the point
   crossings_script='for fd in /proc/$1/fd/*; do
     target="$(readlink "$fd")" || continue
     case "$target" in
       /mnt/[a-z] | /mnt/[a-z]/*) echo "$target on a drive mount" ;;
+      /mnt/wslg/*kalareach* | /mnt/wsl/*kalareach*) echo "$target in storage WSL shares between distributions" ;;
       /*) case "$(stat -L -f -c %T "$fd" 2>/dev/null)" in v9fs | 9p) echo "$target on a 9p filesystem" ;; esac ;;
     esac
   done'
