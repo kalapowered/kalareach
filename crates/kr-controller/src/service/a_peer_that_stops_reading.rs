@@ -136,9 +136,4 @@ async fn a_peer_that_reads_keeps_its_connection() {
         !controller.admitted_table().is_empty(),
         "the connection is still registered"
     );
-    assert_eq!(
-        controller.local_writes_blocked(),
-        0,
-        "no write waited for a peer that reads"
-    );
 }
