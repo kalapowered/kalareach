@@ -25,6 +25,7 @@ worker directly for what a session owns.
 | `kr host install` | — | Put a first release into this user's store of releases and make it current |
 | `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
 | `kr host versions` | — | The releases this host keeps, and which one is current |
+| `kr host machine [join/merge/split/plan/finish/undo]` | — | Show the machine group an environment records for itself, take one owner-approved step that changes it, or keep a merge over several environments as a plan |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -1425,6 +1426,39 @@ platform's own listing said of it, and why none is held can carry what its facil
 line says each as its class and its length; `pmset -g assertions` on macOS lists the assertion
 itself. `docs/host/platforms.md` has the facility each platform uses and what an assertion does not
 promise.
+
+## `kr host machine`
+
+A machine group is a random grouping of environments, chosen and approved by the owner. It grants nothing, and each environment records its own group and changes it only by its own step. `kr host machine` shows the group an environment records and takes those steps at the owner's own command line:
+
+```sh
+kr host machine                                         # the group, its revision and how it last changed
+kr host machine join <group> --expect <group>@<revision>
+kr host machine merge <into> --expect <group>@<revision>
+kr host machine split --expect <group>@<revision>
+kr host machine merge <into> --from <group> --environment <id> --environment <label>
+kr host machine plan                                    # the merge plan this client keeps
+kr host machine finish                                  # send each step that has no result again
+kr host machine undo                                    # put the environments the plan moved back
+```
+
+Without a step, `kr host machine` reads the environment's record of its machine group and displays it: the group and its revision, how it was last changed and which group the environment left by that change. It also says what to pass to `--expect`, in the form `<group>@<revision>`, to refer to that record.
+
+Each step takes `--expect`, in the same form, to refer to the environment's record of its machine group, because a step is approved against the record the owner saw. If it does not refer to the record the environment holds now, the step is refused with `DRAFT_CONFLICT`, the command exits with status 8 and no change is made. `join` takes the group to join, any identifier, including one that nobody is in. `merge` takes the group into which the environment's group is to be merged. `split` takes no group; the environment mints a fresh group of its own. After taking a step, `kr host machine` displays the environment's new record of its machine group and the action it was taken under.
+
+Unless `--environment` is given, the environment in which the step is taken or whose record is read is the environment of this installation. If it is given, it must be the identifier of one of the environments on this host, or the identifier or label of an environment enrolled for a process bridge. In either case the group is what that environment says it is, read from its own `host.info`, through the bridge if there is one. An enrolment does not record a machine group and is never where one is read from. Steps are taken as the owner at this machine, and no step reaches an environment other than the one named.
+
+### A merge over several environments
+
+Merging two groups of independent environments takes a separate step on each environment that is in the group being merged away, and each is taken over that environment's own connection. So `merge <into> --from <group>`, with one `--environment` for each of them, is a plan, and this client keeps it. The command reads the machine group from each of the environments first, and if any of them does not report `<group>`, it refuses the plan and records nothing. Otherwise it composes the steps, with an action identity of its own for each environment, from the machine group each of them reports, and records the plan in a file before sending any of the steps.
+
+The plan is a file called `machine-merge-plan` that only the owner can read, in this user's state directory and never in an environment's. It is updated as the answer to each step is received. Each step is `unsent`, `sent`, `done` or `refused`. When every step is in one of the last two states, the plan is removed. A lost plan is not rebuilt from what the environments report of their machine groups: the owner selects the environments again. While a plan is kept, a new merge is refused and says so.
+
+`kr host machine plan` prints the plan and the state of each step in it. `kr host machine finish` takes each step that has no result again. It sends each step exactly as it was composed, so an environment that took it answers from its receipt, and one that did not takes it now. If an environment answers no receipt, the command reads its machine group. If that is still the record the step was approved against, nothing was applied and the step is composed again under a new action; if it shows the step taken, the step is taken; anywhere else the step can never apply and it is refused. If an environment cannot be reached, its step stays pending and the command exits with status 1 and `ENVIRONMENT_UNAVAILABLE`.
+
+`kr host machine undo` takes steps to put each environment the plan moved back into the machine group it left, each against the record that environment's first step left. A step that was never sent is given up. Where a step was sent and what the environment did with it is not known, `undo` refuses and says that `finish` must be run first: undoing the others while that one could still move would leave the merge half undone the other way round. Where a step was refused and the plan is gone because every step has a result, the output shows how to put each environment the merge moved back, as a `kr host machine join` command to type, and the command exits with status 1 and `DRAFT_CONFLICT`.
+
+`--json` prints `{ "ok": ..., "environment_id": ..., "machine": { "machine_id", "revision", "change", "previous" } }` for the group and for a step, and a step adds `action_id`. A plan prints `{ "ok": ..., "kept": ..., "into": ..., "from": ..., "steps": [ ... ], "undo": [ ... ] }`, each step with its `environment_id`, `action_id` and `state`, which is `unsent`, `sent`, `done` or `refused`, and a refused step adds `code` and `reason`.
 
 ## `kr privacy`
 
