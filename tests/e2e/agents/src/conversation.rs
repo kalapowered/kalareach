@@ -1,7 +1,7 @@
 //! What a part reads in an agent's own record of a conversation: a file of JSON lines, one per
 //! prompt, reply, tool call or event, each told apart by a mark the build list names.
 
-use crate::build::RequestRecord;
+use crate::build::{RecordedCalls, RequestRecord};
 
 /// The identifier a conversation line gives the tool call it records or answers: its first string
 /// member named `call_id`, at any depth.
@@ -184,6 +184,46 @@ pub fn turn_between(text: &str, from: usize, to: usize, marker: &str) -> Option<
     })
 }
 
+/// The distinct commands the agent's record holds for its shell tool after the line `after` of
+/// `text`: every call of `recorded.tool` listed in the member `recorded.member` of a line, its
+/// command being the member `recorded.command` of the call's `args`, whole and not trimmed. The
+/// record repeats a call as its status changes, so a command is counted once.
+///
+/// # Errors
+///
+/// Returns that a call of the shell tool holds no command, which cannot be compared.
+pub fn recorded_commands(
+    text: &str,
+    after: Option<usize>,
+    recorded: &RecordedCalls,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut commands = std::collections::BTreeSet::new();
+    for line in text.lines().skip(after.map_or(0, |line| line + 1)) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(calls) = value
+            .get(recorded.member.as_str())
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for call in calls {
+            if call["name"].as_str() != Some(recorded.tool.as_str()) {
+                continue;
+            }
+            let command = call["args"][recorded.command.as_str()].as_str().ok_or_else(|| {
+                format!(
+                    "a call of {} records no {}, so it cannot be compared with the part's command",
+                    recorded.tool, recorded.command
+                )
+            })?;
+            commands.insert(command.to_owned());
+        }
+    }
+    Ok(commands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +389,55 @@ mod tests {
         assert_eq!(turn_between(CONVERSATION, 1, 7, marker), Some(true));
         assert_eq!(turn_between(CONVERSATION, 1, 5, marker), Some(false));
         assert_eq!(turn_between(CONVERSATION, 5, 1, marker), None);
+    }
+
+    fn calls() -> RecordedCalls {
+        RecordedCalls {
+            member: "toolCalls".to_owned(),
+            tool: "run_shell_command".to_owned(),
+            command: "command".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_commands_an_agent_recorded_for_its_shell_tool_are_read_exactly() {
+        let chat = r#"{"sessionId":"s","startTime":"t"}
+{"id":"1","type":"user","content":[{"text":"run it"}]}
+{"id":"2","type":"gemini","content":"","toolCalls":[{"name":"run_shell_command","args":{"command":"echo kr1 >> a","description":"d"},"status":"awaiting_approval"}]}
+{"id":"2","type":"gemini","content":"","toolCalls":[{"name":"run_shell_command","args":{"command":"echo kr1 >> a","description":"d"},"status":"success"}]}
+{"id":"3","type":"gemini","content":"","toolCalls":[{"name":"read_file","args":{"path":"x"},"status":"success"}]}
+{"$set":{"lastUpdated":"t"}}
+"#;
+        let want = |texts: &[&str]| -> std::collections::BTreeSet<String> {
+            texts.iter().map(|text| (*text).to_owned()).collect()
+        };
+        // The record repeats a call as its status changes; it is one command, and other tools are
+        // not the shell tool's.
+        assert_eq!(
+            recorded_commands(chat, Some(0), &calls()),
+            Ok(want(&["echo kr1 >> a"]))
+        );
+        // Before the prompt's line nothing counts.
+        assert_eq!(recorded_commands(chat, Some(5), &calls()), Ok(want(&[])));
+        // A command that differs by a trailing space, or a second command, is a different one: the
+        // dialog's rows cannot show either.
+        let spaced = chat.replace("echo kr1 >> a\"", "echo kr1 >> a \"");
+        assert_eq!(
+            recorded_commands(&spaced, Some(0), &calls()),
+            Ok(want(&["echo kr1 >> a "]))
+        );
+        let two = format!(
+            "{chat}{}\n",
+            r#"{"id":"4","type":"gemini","content":"","toolCalls":[{"name":"run_shell_command","args":{"command":"echo kr1 >> a; rm x"},"status":"cancelled"}]}"#
+        );
+        assert_eq!(
+            recorded_commands(&two, Some(0), &calls()),
+            Ok(want(&["echo kr1 >> a", "echo kr1 >> a; rm x"]))
+        );
+        // A call of the shell tool with no command in its arguments cannot be read, so it stops
+        // the part rather than counting as none.
+        let bare =
+            r#"{"id":"5","type":"gemini","toolCalls":[{"name":"run_shell_command","args":{}}]}"#;
+        assert!(recorded_commands(bare, None, &calls()).is_err());
     }
 }
