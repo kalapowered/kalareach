@@ -110,7 +110,13 @@ final class AudioTests: DeviceTestCase {
                 if (Int(now["locked.ticks"] ?? "0") ?? 0) >= 30 { break }
             }
         }
-        let result = try XCTUnwrap(seen, "nothing could be read after the phone was unlocked")
+        let first = try XCTUnwrap(seen, "nothing could be read after the phone was unlocked")
+        // What the check shows is what it saw at its last tick, which may be from before the unlock:
+        // two more ticks are waited for, so that the reading holds what the first ticks after the
+        // unlock saw, a stop that suspended the application included.
+        let base = Int(first["ticks"] ?? "0") ?? 0
+        let result = facts(until: { (Int($0["ticks"] ?? "0") ?? 0) >= base + 2 }, timeout: 20) ?? first
+        XCTAssertGreaterThanOrEqual(Int(result["ticks"] ?? "0") ?? 0, base + 2, "the check did not go on ticking after the unlock")
         sayFacts("audio", result)
         XCTAssertGreaterThanOrEqual(Int(result["locked.ticks"] ?? "0") ?? 0, 30, "the phone was not locked for thirty seconds")
         XCTAssertLessThanOrEqual(Int(result["gap.input.locked.max"] ?? "99999") ?? 99999, 2000, "input stopped while the phone was locked")
