@@ -310,16 +310,27 @@ async fn connect(endpoint: &Endpoint) -> Result<Halves, ExchangeError> {
             endpoint: path.display().to_string(),
             detail: "this platform has no private socket".to_owned(),
         }),
-        Endpoint::Loopback(address) => {
-            let stream = tokio::net::TcpStream::connect(address)
+        #[cfg(windows)]
+        Endpoint::NamedPipe(name) => {
+            let unreachable = |detail: String| ExchangeError::Unreachable {
+                endpoint: format!("{}{name}", crate::registration::PIPE_PREFIX),
+                detail,
+            };
+            // The client opens the pipe for identification only and refuses a pipe whose own list
+            // is not this account's, so a pipe another account created first is never written to.
+            let address = kr_ipc::paths::Endpoint::from_name(name.clone())
+                .map_err(|error| unreachable(error.to_string()))?;
+            let connection = kr_ipc::endpoint::Connection::connect(&address)
                 .await
-                .map_err(|error| ExchangeError::Unreachable {
-                    endpoint: address.to_string(),
-                    detail: error.to_string(),
-                })?;
-            let (reader, writer) = stream.into_split();
+                .map_err(|error| unreachable(error.to_string()))?;
+            let (reader, writer) = tokio::io::split(connection);
             Ok((Box::new(reader), Box::new(writer)))
         }
+        #[cfg(not(windows))]
+        Endpoint::NamedPipe(name) => Err(ExchangeError::Unreachable {
+            endpoint: format!("{}{name}", crate::registration::PIPE_PREFIX),
+            detail: "this platform has no named pipe".to_owned(),
+        }),
     }
 }
 

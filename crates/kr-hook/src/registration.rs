@@ -14,7 +14,6 @@
 //! it was, and it is never authority. A process whose environment names no registration is outside
 //! a KalaReach launch, and says so rather than guessing at a socket.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -149,40 +148,53 @@ impl Paths {
     }
 }
 
+/// The prefix every local named pipe's path has.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// The longest name a launch's pipe may have, in characters.
+pub const MAX_PIPE_NAME: usize = 64;
+
 /// Where the worker's endpoint for this launch is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Endpoint {
     /// A socket file inside the worker's owner-only runtime directory.
     PrivateSocket(PathBuf),
-    /// Loopback, where the platform has no private socket.
-    Loopback(SocketAddr),
+    /// A named pipe in the local pipe namespace, by its one name.
+    NamedPipe(String),
 }
 
 impl Endpoint {
     /// Reads the endpoint as the registration renders it.
     ///
-    /// A private socket is an absolute path and loopback is an address and a port. An address that
-    /// is not loopback is refused: nothing this forwarder connects to may be reachable from
-    /// another machine.
+    /// A private socket is an absolute path, and a named pipe is the local pipe namespace's prefix
+    /// and one name of letters, digits, hyphens and underscores. Anything that could name a pipe on
+    /// another machine or elsewhere in the namespace is refused: nothing this forwarder connects to
+    /// may be reachable from another machine.
     ///
     /// # Errors
     ///
     /// Returns [`RegistrationError::Malformed`] for anything else.
     pub fn parse(text: &str) -> Result<Self, RegistrationError> {
-        if let Ok(address) = text.parse::<SocketAddr>() {
-            if !address.ip().is_loopback() {
-                return Err(RegistrationError::Malformed {
-                    detail: format!("names {address}, which is not a loopback address"),
-                });
-            }
-            return Ok(Self::Loopback(address));
+        if let Some(name) = text.strip_prefix(PIPE_PREFIX) {
+            let one_component = !name.is_empty()
+                && name.len() <= MAX_PIPE_NAME
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+            return if one_component {
+                Ok(Self::NamedPipe(name.to_owned()))
+            } else {
+                Err(RegistrationError::Malformed {
+                    detail: format!("names the pipe {text:?}, which is not one local pipe name"),
+                })
+            };
         }
         let path = Path::new(text);
         if cfg!(unix) && path.is_absolute() {
             return Ok(Self::PrivateSocket(path.to_path_buf()));
         }
         Err(RegistrationError::Malformed {
-            detail: format!("names the endpoint {text:?}, which is neither a socket nor loopback"),
+            detail: format!("names the endpoint {text:?}, which is neither a socket nor a pipe"),
         })
     }
 }
@@ -505,8 +517,8 @@ fn wait_for(
     loop {
         let expired = Instant::now() >= deadline;
         match read_bounded(directory, name, limit) {
-            Ok((content, metadata)) => {
-                check_owner_only(path, &metadata)?;
+            Ok((content, standing)) => {
+                check_owner_only(path, &standing)?;
                 return Ok(content);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -528,13 +540,23 @@ fn wait_for(
     }
 }
 
+/// What the opened file itself says about who may read it: its metadata, where the platform keeps an
+/// owner and mode bits there.
+#[cfg(unix)]
+type Standing = cap_std::fs::Metadata;
+
+/// What the opened file itself says about who may read it: its access-control list, read from the
+/// handle that was opened, checked against what this host trusts.
+#[cfg(windows)]
+type Standing = Result<(), kr_ipc::paths::AccessListRefusal>;
+
 /// Reads at most `limit` bytes of one file in `directory`, refusing a link and a file longer than
-/// that, and returns what the opened file's own metadata says.
+/// that, and returns what the opened file itself says about who may read it.
 fn read_bounded(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
     limit: u64,
-) -> std::io::Result<(Vec<u8>, cap_std::fs::Metadata)> {
+) -> std::io::Result<(Vec<u8>, Standing)> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Read as _;
     let mut options = cap_std::fs::OpenOptions::new();
@@ -554,6 +576,11 @@ fn read_bounded(
             "it is not a regular file",
         ));
     }
+    #[cfg(windows)]
+    let standing = {
+        use std::os::windows::io::AsHandle as _;
+        kr_ipc::paths::check_access_list(file.as_handle(), "the credential file", false)
+    };
     let mut content = Vec::new();
     file.take(limit + 1).read_to_end(&mut content)?;
     if content.len() as u64 > limit {
@@ -562,7 +589,9 @@ fn read_bounded(
             format!("it is longer than {limit} bytes"),
         ));
     }
-    Ok((content, metadata))
+    #[cfg(unix)]
+    let standing = metadata;
+    Ok((content, standing))
 }
 
 /// Refuses a credential file that is not in the registration's own directory.
@@ -595,12 +624,9 @@ fn check_beside(registration: &Path, credential: &Path) -> Result<(), Registrati
 /// account is not a file this forwarder presents: the exchange it holds is already somebody else's
 /// too.
 #[cfg(unix)]
-fn check_owner_only(
-    path: &Path,
-    metadata: &cap_std::fs::Metadata,
-) -> Result<(), RegistrationError> {
+fn check_owner_only(path: &Path, standing: &Standing) -> Result<(), RegistrationError> {
     use cap_std::fs::MetadataExt as _;
-    if metadata.uid() != kr_ipc::paths::current_uid() || metadata.mode() & 0o077 != 0 {
+    if standing.uid() != kr_ipc::paths::current_uid() || standing.mode() & 0o077 != 0 {
         return Err(RegistrationError::Exposed {
             path: path.to_path_buf(),
         });
@@ -608,14 +634,26 @@ fn check_owner_only(
     Ok(())
 }
 
-/// Where the platform has no mode bits to read, the worker publishes no credential file, and one
-/// that is there was written by the host's own protected publication or not at all.
-#[cfg(not(unix))]
-fn check_owner_only(
-    _path: &Path,
-    _metadata: &cap_std::fs::Metadata,
-) -> Result<(), RegistrationError> {
-    Ok(())
+/// Refuses a credential file whose access-control list, read from the opened file, names an
+/// account this host does not trust, or cannot be read.
+///
+/// The worker writes the file into a directory whose own list is protected and owner-only, so the
+/// file is owner-only by inheritance; a list another account has been added to is not one this
+/// forwarder presents from, because the exchange the file holds is already that account's too.
+#[cfg(windows)]
+fn check_owner_only(path: &Path, standing: &Standing) -> Result<(), RegistrationError> {
+    match standing {
+        Ok(()) => Ok(()),
+        Err(kr_ipc::paths::AccessListRefusal::Policy(_)) => Err(RegistrationError::Exposed {
+            path: path.to_path_buf(),
+        }),
+        Err(kr_ipc::paths::AccessListRefusal::Unreadable(detail)) => {
+            Err(RegistrationError::Unreadable {
+                path: path.to_path_buf(),
+                detail: detail.clone(),
+            })
+        }
+    }
 }
 
 /// Drops the whitespace around a credential without leaving an unwiped copy of it.
@@ -639,7 +677,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_socket_path_and_loopback_are_endpoints_and_nothing_else_is() {
+    fn a_socket_path_and_a_local_pipe_are_endpoints_and_nothing_else_is() {
         if cfg!(unix) {
             assert_eq!(
                 Endpoint::parse("/run/kr/a-1.sock").expect("a socket"),
@@ -647,19 +685,31 @@ mod tests {
             );
         }
         assert_eq!(
-            Endpoint::parse("127.0.0.1:49152").expect("loopback"),
-            Endpoint::Loopback("127.0.0.1:49152".parse().expect("an address"))
+            Endpoint::parse(r"\\.\pipe\kr-a-0123456789abcdef").expect("a local pipe"),
+            Endpoint::NamedPipe("kr-a-0123456789abcdef".to_owned())
         );
-        assert!(Endpoint::parse("[::1]:49152").is_ok());
         for refused in [
+            "127.0.0.1:49152",
+            "[::1]:49152",
             "0.0.0.0:49152",
-            "192.0.2.7:49152",
             "example.test:49152",
             "a-1.sock",
             "",
+            r"\\.\pipe\",
+            r"\\.\pipe\a\b",
+            r"\\.\pipe\..\x",
+            r"\\.\pipe\a.b",
+            r"\\host\pipe\x",
+            r"\\?\pipe\x",
+            r"\\.\pipe\é",
+            "kr-a-0123456789abcdef",
         ] {
             assert!(Endpoint::parse(refused).is_err(), "{refused:?} is refused");
         }
+        assert!(
+            Endpoint::parse(&format!("{PIPE_PREFIX}{}", "x".repeat(MAX_PIPE_NAME + 1))).is_err()
+        );
+        assert!(Endpoint::parse(&format!("{PIPE_PREFIX}{}", "x".repeat(MAX_PIPE_NAME))).is_ok());
     }
 
     /// Only a whole record is a registration: every field, and the line break after the last.
@@ -714,6 +764,46 @@ mod tests {
                 "{elsewhere} is refused"
             );
         }
+    }
+
+    /// On Windows the credential file's protection is its access-control list, read from the opened
+    /// file: one the worker's own publication made is presented, and the same file once another
+    /// account has been granted it is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_credential_file_another_account_was_granted_is_not_presented() {
+        let directory = std::env::temp_dir().join(format!("kr-reg-{}", kr_ipc::new_uuid()));
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
+        let credential = directory.join("credential");
+        kr_ipc::paths::create_new_owner_only_file(&credential, "ab".repeat(32).as_bytes())
+            .expect("the credential is written");
+        let registration = directory.join("registration");
+        let text = format!(
+            "endpoint={PIPE_PREFIX}kr-a-1\nprofile=lp-1\ninstance=i\npid=1\nstart=2\n\
+             credential={}\nframing=json_lines\n",
+            credential.display()
+        );
+        kr_ipc::paths::write_owner_only_file(&registration, text.as_bytes())
+            .expect("the registration is written");
+        let paths = Paths { registration };
+
+        let read = Registration::read(&paths, Duration::from_millis(500))
+            .expect("a credential the worker's own publication wrote is presented");
+        assert_eq!(read.endpoint, Endpoint::NamedPipe("kr-a-1".to_owned()));
+
+        let granted = std::process::Command::new("icacls.exe")
+            .arg(&credential)
+            .args(["/grant", "*S-1-1-0:F"])
+            .output()
+            .expect("icacls starts");
+        assert!(granted.status.success(), "{granted:?}");
+        let refused = Registration::read(&paths, Duration::from_millis(500))
+            .expect_err("a credential another account was granted is not presented");
+        assert!(
+            matches!(refused, RegistrationError::Exposed { .. }),
+            "{refused}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

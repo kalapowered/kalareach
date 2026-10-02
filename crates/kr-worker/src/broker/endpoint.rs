@@ -14,11 +14,11 @@
 //! * **The address is local.** An address something other than this machine could reach is refused
 //!   before it is published; section 12 never exposes this listener through iroh.
 //!
-//! Where the platform has no Unix socket the endpoint is loopback with a random per-launch
-//! credential. The kernel names no peer there, so the credential is the whole authentication and
-//! the process identity is the one the bridge presents, checked against the launch this host made.
-//! That difference is stated rather than hidden: [`PeerIdentity::from_operating_system`] says
-//! which of the two a given admission came from.
+//! Windows has no Unix socket, so its endpoint is a named pipe that carries its owner's own access
+//! list: another account is refused when it opens the pipe, and the kernel names the process on the
+//! other end, exactly as on a private socket. The two platforms differ only in the transport. A
+//! connection whose peer the kernel will not name is refused on both, so no admission rests on an
+//! identity the connecting side presented.
 
 use kr_protocol::identity::ProcessStartIdentity;
 
@@ -31,61 +31,33 @@ use crate::broker::listener::ListenerAddress;
 /// it evidence rather than a claim. A caller cannot construct one to assert its own identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerIdentity {
-    process: Option<ProcessStartIdentity>,
+    process: ProcessStartIdentity,
     owner: bool,
-    from_operating_system: bool,
 }
 
 impl PeerIdentity {
-    /// The identity a bridge presented, where the kernel names no peer.
-    ///
-    /// This is the loopback case and nothing else. [`Registration::authenticate`] refuses one of
-    /// these wherever the platform binds a private socket, so it cannot be used to put a presented
-    /// identity in front of a kernel that would have named the real one.
-    ///
-    /// [`Registration::authenticate`]: crate::broker::listener::Registration::authenticate
-    #[must_use]
-    pub const fn presented(process: Option<ProcessStartIdentity>, owner: bool) -> Self {
-        Self {
-            process,
-            owner,
-            from_operating_system: false,
-        }
-    }
-
     /// The identity the kernel reported for one connection.
     ///
-    /// Only [`BoundEndpoint::accept`] produces one in the product; it is visible inside this crate
-    /// so a unit test can state which process the kernel named without binding a socket.
-    #[cfg(test)]
+    /// Only [`BoundEndpoint::accept`] produces one in the product. It is visible to this crate's
+    /// own tests, and to the integration suites through the `testing` feature, so a test can state
+    /// which process the kernel named, or that the peer was another user, without binding an
+    /// endpoint. No shipped build compiles it.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub(crate) const fn from_kernel(process: ProcessStartIdentity, owner: bool) -> Self {
-        Self {
-            process: Some(process),
-            owner,
-            from_operating_system: true,
-        }
+    pub const fn from_kernel(process: ProcessStartIdentity, owner: bool) -> Self {
+        Self { process, owner }
     }
 
-    /// Returns the process the kernel named on this connection, where it named one.
+    /// Returns the process the kernel named on this connection.
     #[must_use]
-    pub const fn process(&self) -> Option<&ProcessStartIdentity> {
-        self.process.as_ref()
+    pub const fn process(&self) -> &ProcessStartIdentity {
+        &self.process
     }
 
     /// Returns true when the connecting user owns this session.
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         self.owner
-    }
-
-    /// Returns true when the identity came from the kernel rather than from the bridge.
-    ///
-    /// A private socket always answers true. Loopback answers false, because the kernel names no
-    /// peer on a stream socket and the credential is what decides there.
-    #[must_use]
-    pub const fn from_operating_system(&self) -> bool {
-        self.from_operating_system
     }
 }
 
@@ -104,8 +76,9 @@ pub enum Stream {
     /// A private socket inside the owner-only runtime directory.
     #[cfg(unix)]
     Socket(tokio::net::UnixStream),
-    /// Loopback, where the platform has no private socket.
-    Loopback(tokio::net::TcpStream),
+    /// A named pipe that carries its owner's access list.
+    #[cfg(windows)]
+    Pipe(kr_ipc::endpoint::Connection),
 }
 
 /// The endpoint a launched agent's bridge connects to.
@@ -119,7 +92,8 @@ pub struct BoundEndpoint {
 enum Bound {
     #[cfg(unix)]
     Socket(tokio::net::UnixListener),
-    Loopback(tokio::net::TcpListener),
+    #[cfg(windows)]
+    Pipe(kr_ipc::endpoint::Listener),
 }
 
 impl BoundEndpoint {
@@ -127,11 +101,12 @@ impl BoundEndpoint {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PermissionDenied`] when the runtime directory is not owner-only or
-    /// the resulting address is not local, and [`BrokerError::LedgerUnavailable`] when the socket
-    /// cannot be created.
+    /// Returns [`BrokerError::PermissionDenied`] when the address is not local,
+    /// [`BrokerError::LedgerUnavailable`] when the runtime directory is not private or the
+    /// endpoint cannot be created, and [`BrokerError::UnsupportedCapability`] for an address this
+    /// platform does not bind.
     pub fn bind(runtime_directory: &std::path::Path) -> Result<Self> {
-        let address = ListenerAddress::for_launch(runtime_directory, 0)?;
+        let address = ListenerAddress::for_launch(runtime_directory)?;
         address.require_local()?;
         match &address {
             #[cfg(unix)]
@@ -171,32 +146,32 @@ impl BoundEndpoint {
             ListenerAddress::PrivateSocket(_) => Err(BrokerError::UnsupportedCapability {
                 detail: "this platform has no private socket".to_owned(),
             }),
-            ListenerAddress::Loopback { address: host, .. } => {
-                let listener = std::net::TcpListener::bind((*host, 0)).map_err(|error| {
-                    BrokerError::ledger(format!("could not bind {host}: {error}"))
+            #[cfg(windows)]
+            ListenerAddress::NamedPipe(name) => {
+                // The directory holds the registration and the credential, so it is read again
+                // here rather than trusted from a moment ago.
+                crate::broker::process::check_private_directory(runtime_directory)?;
+                let endpoint =
+                    kr_ipc::paths::Endpoint::from_name(name.clone()).map_err(|error| {
+                        BrokerError::ledger(format!("the pipe name {name} is not usable: {error}"))
+                    })?;
+                // The pipe's own list is its owner's, and the first instance is created
+                // exclusively, so a name another account made first is refused.
+                let listener = kr_ipc::endpoint::Listener::bind(&endpoint).map_err(|error| {
+                    BrokerError::ledger(format!(
+                        "could not bind {}: {error}",
+                        address.for_diagnostics()
+                    ))
                 })?;
-                listener.set_nonblocking(true).map_err(|error| {
-                    BrokerError::ledger(format!("could not prepare the endpoint: {error}"))
-                })?;
-                let port = listener
-                    .local_addr()
-                    .map_err(|error| {
-                        BrokerError::ledger(format!("the endpoint has no address: {error}"))
-                    })?
-                    .port();
-                let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
-                    BrokerError::ledger(format!("could not prepare the endpoint: {error}"))
-                })?;
-                let address = ListenerAddress::Loopback {
-                    address: *host,
-                    port,
-                };
-                address.require_local()?;
                 Ok(Self {
                     address,
-                    listener: Bound::Loopback(listener),
+                    listener: Bound::Pipe(listener),
                 })
             }
+            #[cfg(not(windows))]
+            ListenerAddress::NamedPipe(_) => Err(BrokerError::UnsupportedCapability {
+                detail: "this platform has no named pipe".to_owned(),
+            }),
         }
     }
 
@@ -243,27 +218,36 @@ impl BoundEndpoint {
                     })?;
                 Ok(Accepted {
                     peer: PeerIdentity {
-                        process: Some(process),
+                        process,
                         owner: credentials.uid() == kr_ipc::paths::current_uid(),
-                        from_operating_system: true,
                     },
                     stream: Stream::Socket(stream),
                 })
             }
-            Bound::Loopback(listener) => {
-                let (stream, _) = listener.accept().await.map_err(|error| {
+            #[cfg(windows)]
+            Bound::Pipe(listener) => {
+                // The caller's account is proved at the connection's first read, before any byte
+                // reaches a reader, and another account is refused when it opens the pipe.
+                let (connection, peer) = listener.accept().await.map_err(|error| {
                     BrokerError::ledger(format!("the endpoint could not accept: {error}"))
+                })?;
+                let pid = peer.pid.ok_or_else(|| {
+                    BrokerError::denied(
+                        "the operating system named no process on this connection, so nothing \
+                         about it can be bound to a launch",
+                    )
+                })?;
+                let process = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
+                    BrokerError::denied(format!(
+                        "the connecting process could not be identified: {error}"
+                    ))
                 })?;
                 Ok(Accepted {
                     peer: PeerIdentity {
-                        // The kernel names no peer on a loopback stream. The credential is what
-                        // decides there, and the identity the bridge presents is compared with
-                        // the launch this host made rather than believed on its own.
-                        process: None,
+                        process,
                         owner: true,
-                        from_operating_system: false,
                     },
-                    stream: Stream::Loopback(stream),
+                    stream: Stream::Pipe(connection),
                 })
             }
         }
@@ -323,15 +307,9 @@ mod tests {
                 .expect("the bridge connects")
         });
         let accepted = endpoint.accept().await.expect("the connection is accepted");
-        assert!(accepted.peer.from_operating_system());
         assert!(accepted.peer.is_owner());
         assert_eq!(
-            accepted
-                .peer
-                .process()
-                .expect("the kernel named the connecting process")
-                .pid
-                .get(),
+            accepted.peer.process().pid.get(),
             u64::from(std::process::id()),
             "the identity is the kernel's reading of the connecting process"
         );
@@ -340,37 +318,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Where the platform has no private socket, the endpoint is loopback: reachable from this
-    /// machine only, and naming no process, because the kernel names none on a loopback stream.
-    /// What decides there is the per-launch credential, not anything this endpoint reports.
-    #[cfg(not(unix))]
+    /// On Windows the endpoint is a named pipe: reachable from this machine only, named by the
+    /// kernel's own reading of the process that connects, and bound only in a private directory.
+    #[cfg(windows)]
     #[tokio::test]
-    async fn a_loopback_endpoint_is_local_and_names_no_process() {
-        let endpoint = BoundEndpoint::bind(&std::env::temp_dir()).expect("the endpoint binds");
-        let ListenerAddress::Loopback { address, port } = endpoint.address().clone() else {
-            panic!("this platform has no private socket");
+    async fn a_bound_pipe_names_the_process_that_connects() {
+        use tokio::io::AsyncWriteExt as _;
+        let directory = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
+        let endpoint = BoundEndpoint::bind(&directory).expect("the endpoint binds");
+        let ListenerAddress::NamedPipe(name) = endpoint.address().clone() else {
+            panic!("this platform binds a named pipe");
         };
-        assert!(
-            address.is_loopback(),
-            "nothing off this machine can reach it"
-        );
-        assert_ne!(port, 0, "the address is the port the listener holds");
+        assert!(endpoint.address().is_local());
 
         let connect = tokio::spawn(async move {
-            tokio::net::TcpStream::connect((address, port))
+            let address = kr_ipc::paths::Endpoint::from_name(name).expect("a usable name");
+            let mut connection = kr_ipc::endpoint::Connection::connect(&address)
                 .await
-                .expect("the bridge connects")
+                .expect("the bridge connects");
+            // The caller's account is proved at its first read, so it speaks first.
+            connection
+                .write_all(b"hello\n")
+                .await
+                .expect("the bridge writes");
+            connection
         });
         let accepted = endpoint.accept().await.expect("the connection is accepted");
-        assert!(
-            !accepted.peer.from_operating_system(),
-            "the kernel names nobody on a loopback stream"
-        );
-        assert!(
-            accepted.peer.process().is_none(),
-            "so no process is claimed for the connection"
+        assert!(accepted.peer.is_owner());
+        assert_eq!(
+            accepted.peer.process().pid.get(),
+            u64::from(std::process::id()),
+            "the identity is the kernel's reading of the connecting process"
         );
         drop(connect.await.expect("the connecting task finishes"));
+        drop(endpoint);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A runtime directory that is not private binds nothing, where the list says so: an ordinary
+    /// directory under the temporary one carries the profile's own inherited entries.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_that_is_not_private_binds_nothing() {
+        let directory = std::env::temp_dir().join(format!("kr-e-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        assert!(BoundEndpoint::bind(&directory).is_err());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // Unix only: the directory decides who may connect only where the endpoint is a socket in it.

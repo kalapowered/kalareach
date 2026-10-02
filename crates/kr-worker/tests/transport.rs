@@ -21,7 +21,6 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
-#[cfg(unix)]
 use kr_worker::broker::BoundEndpoint;
 use kr_worker::broker::{
     Broker, BrokerTransport, Carried, Credential, Duplex, FileAccess, Framing, HostFiles,
@@ -262,13 +261,7 @@ fn private_directory() -> std::path::PathBuf {
         .take(8)
         .collect();
     let directory = std::env::temp_dir().join(format!("kr-t-{name}"));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("the directory is made private");
-    }
+    kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
     directory
 }
 
@@ -395,7 +388,7 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
 }
 
 /// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
-/// and otherwise a loopback connection, which is what this host's own endpoint is there.
+/// and otherwise a loopback connection.
 #[cfg(unix)]
 type SocketStream = tokio::net::UnixStream;
 #[cfg(not(unix))]
@@ -533,7 +526,9 @@ fn acknowledge(
     })
 }
 
-async fn next_line(stream: &mut tokio::io::BufReader<SocketStream>) -> String {
+async fn next_line<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut tokio::io::BufReader<R>,
+) -> String {
     let mut line = String::new();
     tokio::time::timeout(LIVENESS_DEADLINE, stream.read_line(&mut line))
         .await
@@ -1781,20 +1776,13 @@ async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_ne
 
 /// KR-REQ-12.14 and KR-REQ-11.43: the endpoint the transport runs over is one the host bound, and
 /// a connection that reaches it is one the kernel named.
-// Unix only: the kernel names a peer only on a private socket, and Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_14_the_transport_runs_over_an_endpoint_this_host_bound() {
     let directory = private_directory();
     let endpoint = BoundEndpoint::bind(&directory).expect("the endpoint binds");
     let address = endpoint.address().clone();
-    let kr_worker::broker::ListenerAddress::PrivateSocket(path) = address.clone() else {
-        panic!("this platform prefers a private socket");
-    };
     let connecting = tokio::spawn(async move {
-        let mut stream = tokio::net::UnixStream::connect(&path)
-            .await
-            .expect("the bridge connects");
+        let mut stream = common::connect_to(&address).await;
         stream
             .write_all(b"{\"id\":1,\"method\":\"session/request_permission\",\"params\":{}}\n")
             .await
@@ -1802,14 +1790,15 @@ async fn kr_req_12_14_the_transport_runs_over_an_endpoint_this_host_bound() {
         stream
     });
     let accepted = endpoint.accept().await.expect("the connection is accepted");
-    assert!(accepted.peer.from_operating_system());
     assert!(accepted.peer.is_owner());
+    assert_eq!(
+        accepted.peer.process().pid.get(),
+        u64::from(std::process::id()),
+        "the peer is the kernel's reading of the connecting process"
+    );
 
     // And the frame the bridge wrote is read with the connection's own framing.
-    let kr_worker::broker::Stream::Socket(stream) = accepted.stream else {
-        panic!("a private socket was bound");
-    };
-    let mut reader = tokio::io::BufReader::new(stream);
+    let mut reader = tokio::io::BufReader::new(common::bridge_of(accepted.stream));
     let frame = next_line(&mut reader).await;
     let framing = Framing::new(NativeFraming::JsonLines);
     let mut buffer = frame.into_bytes();
@@ -2144,7 +2133,6 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
 ///
 /// The production composition is what registers the instance, with the process it actually
 /// started. Nothing here pretends to have launched anything.
-#[cfg(unix)]
 fn broker_for_launch() -> Arc<Broker> {
     Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"))
 }
@@ -2154,7 +2142,6 @@ fn broker_for_launch() -> Arc<Broker> {
 /// The launch itself is proved by the test that starts the forwarder. These two are about what
 /// happens to a connection once one reaches the endpoint, so the process the kernel names is this
 /// one and the instance's record says so.
-#[cfg(unix)]
 fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
@@ -2189,7 +2176,6 @@ fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
 }
 
 /// Binds the component whose decoder interprets this connector's approvals.
-#[cfg(unix)]
 fn bind_component(broker: &Broker) {
     broker
         .bind_descriptor(
@@ -2220,14 +2206,17 @@ fn bind_component(broker: &Broker) {
 /// Panics, naming where the forwarder should be and how to build it, when the build has not
 /// produced one. A test that returned early instead would report a pass for a launch it never
 /// made. A test run of the whole workspace builds the forwarder, because its own tests start it.
-#[cfg(unix)]
 fn forwarder() -> std::path::PathBuf {
     let mut directory = std::env::current_exe().expect("the test binary");
     directory.pop();
     if directory.file_name().is_some_and(|name| name == "deps") {
         directory.pop();
     }
-    let path = directory.join("kr-hook");
+    let path = directory.join(if cfg!(windows) {
+        "kr-hook.exe"
+    } else {
+        "kr-hook"
+    });
     assert!(
         path.is_file(),
         "this test launches the forwarder and there is none at {}; build it with \
@@ -2238,7 +2227,6 @@ fn forwarder() -> std::path::PathBuf {
 }
 
 /// The launch profile that starts that forwarder.
-#[cfg(unix)]
 fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
     kr_protocol::broker::LaunchProfile {
         profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
@@ -2645,61 +2633,6 @@ async fn kr_req_12_02_a_second_launch_for_a_live_instance_starts_nothing_and_kee
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-12.02: on a platform that cannot publish the launch credential as a file, a launch
-/// starts nothing.
-///
-/// Windows has no mode bits for the host to read back, so the credential is never written to a
-/// file there, and a launch that could not publish it is refused before any process starts rather
-/// than after one is running.
-#[cfg(windows)]
-#[tokio::test]
-async fn kr_req_12_02_a_launch_that_cannot_publish_its_credential_starts_nothing() {
-    let directory = private_directory();
-    let broker =
-        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
-    let profile = kr_protocol::broker::LaunchProfile {
-        profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
-        environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
-        binary: kr_protocol::broker::BinaryIdentity {
-            resolved_path: "C:\\Windows\\System32\\cmd.exe".to_owned(),
-            digest: Digest256::from_bytes([3; 32]),
-            version: "1".to_owned(),
-            distribution: "system".to_owned(),
-        },
-        arguments: vec!["/c".to_owned(), "exit".to_owned()],
-        authentication: kr_protocol::broker::AuthenticationState::Authenticated,
-        mode: IntegrationMode::Gateway,
-        resolved_at: TimestampMs::new(1),
-    };
-    let intent = broker
-        .prepare_launch(profile, kr_worker::broker::ForegroundMark::idle(4), None)
-        .expect("the launch is prepared");
-    let refused = gateway
-        .launch(
-            &intent,
-            &kr_worker::broker::ForegroundMark::idle(4),
-            IntegrationMode::Gateway,
-            TimestampMs::new(1),
-        )
-        .expect_err("the credential cannot be published here");
-    assert_eq!(
-        refused.code(),
-        kr_protocol::error::ErrorCode::UnsupportedCapability
-    );
-    assert!(
-        gateway.last_started().is_none(),
-        "and no process was started only to be stopped"
-    );
-    assert!(broker.binding_state(instance()).is_err());
-    let _ = std::fs::remove_dir_all(&directory);
-}
-
 /// The launch one of these endpoints publishes.
 fn launch_for(
     expected: Option<ProcessStartIdentity>,
@@ -2719,7 +2652,6 @@ fn launch_for(
 }
 
 /// The hello a bridge writes, as hexadecimal over the credential this launch generated.
-#[cfg(unix)]
 fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<u8> {
     let credential: String = CREDENTIAL
         .iter()
@@ -2742,8 +2674,6 @@ fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<
 /// dispatch is registered by the composition, and the owner reads both ends. The bridge is a task
 /// in this process rather than a separate executable, so what the kernel names on the accepted
 /// socket is this process, which is exactly the process the registration expects.
-// Unix only: Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connection() {
     let directory = private_directory();
@@ -2861,8 +2791,6 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
 ///
 /// Three refusals, each one of the three things section 11 requires: the private exchange of the
 /// launch, the process the launch started, and a connection carrying anything a browser adds.
-// Unix only: Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -2905,14 +2833,9 @@ async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() 
             launch_for(Some(expected.clone()), None),
         )
         .expect("the endpoint binds");
-        let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone()
-        else {
-            panic!("this platform prefers a private socket");
-        };
+        let address = gateway.address().clone();
         let connecting = tokio::spawn(async move {
-            let mut stream = tokio::net::UnixStream::connect(&path)
-                .await
-                .expect("the bridge connects");
+            let mut stream = common::connect_to(&address).await;
             let _ = stream.write_all(&hello).await;
             stream
         });
