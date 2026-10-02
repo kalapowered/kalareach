@@ -19,7 +19,10 @@
 //! A paired device's destination asks too. Its content is sealed to the device's own key, and that
 //! says who can read it, not whether the device's grant admits it. The destination is named by the
 //! device's identifier and its rule names a grant, and the grant has to be the device's own: a rule
-//! that names another device's grant, or a device that is no longer paired, admits nothing.
+//! that names another device's grant, or a device that is no longer paired, admits nothing. A grant
+//! of the grant store that was issued to the device is still only as good as the device's own
+//! pairing, so that has to be in force as well, on both clocks, and is read again once the policy's
+//! lock is held.
 
 use std::sync::{Arc, Mutex};
 
@@ -230,8 +233,8 @@ impl GrantedRecipients {
                     return None;
                 }
                 // The grant's anchor in this boot, taken the first time anything asks and read back
-                // after that, so what follows reads no store. An end already on record reads as
-                // over. An expiring grant this host cannot anchor, or whose end it cannot write
+                // after that, so its deadline is read from memory. An end already on record reads
+                // as over. An expiring grant this host cannot anchor, or whose end it cannot write
                 // down, admits nothing.
                 self.lifetimes.stored(self.sharing.grants(), record).ok()?
             }
@@ -243,7 +246,8 @@ impl GrantedRecipients {
             }
         };
         // The device a stored grant is read for is anchored the same way, in this boot, so what
-        // follows reads no store: an expiring pairing this host cannot anchor admits nothing.
+        // follows reads its deadline from memory: an expiring pairing this host cannot anchor
+        // admits nothing.
         let bound = match bound_to {
             Some(device) => Some((device, self.lifetimes.paired(device).ok()?)),
             None => None,
@@ -254,17 +258,19 @@ impl GrantedRecipients {
         // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
         // a decision takes have to be those of the lease whose time it loads.
         let policy = self.policy.lock().ok()?;
-        if !self.still_standing(standing, bound_to) {
-            return None;
-        }
-        // What the configuration allows, read with the policy's lock held, so that a change of it
-        // made while this waited for the lock narrows the answer.
+        // What the configuration allows, read with the policy's lock held and before the records
+        // are read again, so that a change of it made while this waited for the lock narrows the
+        // answer, and a revocation that lands while this waits for the ceiling, which a
+        // configuration change holds across its own write, is found by the reading below.
         let ceiling = self.ceiling.as_ref().and_then(|ceiling| {
             ceiling
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         });
+        if !self.still_standing(standing, bound_to) {
+            return None;
+        }
         // Both clocks, read once the lock is held, so a bound that ran out while this waited for it
         // is found, and everything below is decided at these readings. UTC is read through this
         // host's floor, which the reading raises, so a clock wound back after this message does not
@@ -1459,6 +1465,92 @@ mod tests {
                 asking.join().expect("the question ends").is_some(),
                 !revokes,
                 "device revoked {revokes}"
+            );
+        }
+    }
+
+    /// A revocation that lands while the question waits for the configured ceiling, which a
+    /// configuration change holds across its own write, is found: the records are read again after
+    /// the ceiling has been read, with the policy's lock held. The test holds the ceiling and waits
+    /// for the question to be holding the policy's lock, which it takes first, and then revokes.
+    /// The controls: the same wait with nothing revoked admits the recipient.
+    #[test]
+    fn a_revocation_that_lands_while_the_question_waits_for_the_ceiling_is_found() {
+        #[derive(Clone, Copy, Debug)]
+        enum Revokes {
+            Nothing,
+            TheGrant,
+            TheDevice,
+        }
+
+        for revokes in [Revokes::Nothing, Revokes::TheGrant, Revokes::TheDevice] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let ceiling = Arc::new(Mutex::new(None));
+            let policy = personal();
+            let recipients = Arc::new(
+                GrantedRecipients::at(
+                    Arc::clone(&sharing),
+                    Arc::clone(&policy),
+                    environment(),
+                    Arc::new(kr_transport::clock::ManualClock::new()),
+                    || NOW,
+                )
+                .with_ceiling(Arc::clone(&ceiling)),
+            );
+            issued(
+                &sharing,
+                Grant {
+                    recipient_device_id: DeviceId::new(uuid(2)),
+                    ..grant(46, SessionSelector::Any, &[ActionRight::SessionView])
+                },
+                true,
+            );
+            recipients
+                .lifetimes()
+                .devices()
+                .commit(&device(
+                    DeviceId::new(uuid(2)),
+                    grant(47, SessionSelector::Any, &[ActionRight::SessionView]),
+                ))
+                .expect("a device");
+
+            let held = ceiling.lock().expect("not poisoned");
+            let asking = {
+                let recipients = Arc::clone(&recipients);
+                std::thread::spawn(move || recipients.device_scope(&destination(Some(46))))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !matches!(policy.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the question never held the policy's lock while it waited for the ceiling"
+                );
+                std::thread::yield_now();
+            }
+            match revokes {
+                Revokes::Nothing => {}
+                Revokes::TheGrant => {
+                    sharing
+                        .grants()
+                        .revoke(GrantId::new(uuid(46)), NOW, || Ok(()))
+                        .expect("a revocation");
+                }
+                Revokes::TheDevice => {
+                    recipients
+                        .lifetimes()
+                        .devices()
+                        .revoke(
+                            DeviceId::new(uuid(2)),
+                            kr_protocol::scalars::TimestampMs::new(NOW),
+                        )
+                        .expect("a revocation");
+                }
+            }
+            drop(held);
+            assert_eq!(
+                asking.join().expect("the question ends").is_some(),
+                matches!(revokes, Revokes::Nothing),
+                "{revokes:?}"
             );
         }
     }
