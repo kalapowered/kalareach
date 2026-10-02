@@ -2399,6 +2399,8 @@ fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
 /// the credential has been renewed, waits on this host's own locks. A push whose deadline passed
 /// during that question is settled and not presented, though the authority it answers is the one it
 /// was admitted under. The control: with the clock left where it was, the same push is presented.
+/// The clock here moves at that question; that the deadline is then read after the privacy
+/// admission too, which can wait as well, is its place in the send and not something this decides.
 #[test]
 fn a_push_that_expires_during_the_final_authority_check_is_not_presented() {
     use std::sync::atomic::{AtomicUsize, Ordering};

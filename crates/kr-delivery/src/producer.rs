@@ -559,9 +559,11 @@ impl Fate {
     /// out of it. The store stamps each decision with the state it was made under, which no clock
     /// can change, and that stamp is what decides. An item decided before the store said, or by a
     /// caller that never did, has only the time it was decided at, which quiet hours do not move
-    /// when they release it: one decided at or before the moment privacy mode was last turned off
-    /// may have been decided while it was on, and a time recorded for none is treated the same once
-    /// a lift is recorded.
+    /// when they release it: with privacy mode off, one decided at or before the moment privacy
+    /// mode was last turned off may have been decided while it was on, and a time recorded for
+    /// none is treated the same once a lift is recorded. With privacy mode on, such an item that is
+    /// a pending question or approval gets the generic alert whatever its time, which carries no
+    /// content.
     fn of(
         engine: &Engine,
         announcement: &Announcement,
