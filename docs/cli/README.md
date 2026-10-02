@@ -674,11 +674,14 @@ clipboard write appears nowhere in the file.
 
 The archive can have lost the start of the output, or a range inside it. Output that resumes after
 such a gap can begin inside a control string whose start is gone: the end of a clipboard write looks
-like text, and the byte that closes it looks like a bell. So after a gap nothing is read until the
-first escape, bell, cancel or substitute character. A line ending does not count, because a control
-string carries line endings as part of what it holds. The bytes skipped are counted under
-`output_resumed_mid_stream`. A gap the archive reports on every page without skipping anything is
-listed once.
+like text, and the byte that closes it looks like a bell. The archive does not say what state the
+terminal was in, so after a gap nothing is read until a point that ends every state: a cancel or a
+substitute character, or a string terminator (an escape and a backslash) that follows a byte other
+than an escape. A bell, an escape alone and a line ending do not count: a bell ends only some
+strings, a string being discarded for its size keeps an escape, and a string carries line endings as
+part of what it holds. Output with no such point after a gap is not read, and every byte skipped is
+counted under `output_resumed_mid_stream`. A gap the archive reports on every page without skipping
+anything is listed once.
 
 The file is one JSON document of the format `kalareach-session-export/1`. It names the session and
 its environment, and carries the session's summary, its closure record and the last size the session
