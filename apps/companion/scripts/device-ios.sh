@@ -8,8 +8,9 @@
 #
 # Sessions (the tests each runs are listed in `session_tests` below):
 #   s0   the proofs, the keychain boundary and the application's lifecycle with push started, 20 minutes
-#   s1   push to this phone through Firebase, with the person not touching notifications, 45 minutes
-#   s2   the keyboard, rotation, accessibility, file pickers, recovery: person at the phone, 90 minutes
+#   s1   push to this phone through Firebase, with the person not touching notifications, 30 minutes
+#   s2a  recovery, the keyboard and rotation, the file pickers and the camera: person at the phone, 30 minutes
+#   s2b  the accessibility audit, target sizes and text size: person at the phone, 15 minutes
 #   s3a  the microphone refused: person at the phone, 10 minutes
 #   s3b  the microphone allowed and a change of route: person at the phone, 15 minutes
 #   s4   the screen locked and unlocked under the audio check: person at the phone, 10 minutes
@@ -20,13 +21,17 @@
 # pictures, under KR_SHOTS.
 #
 # What it needs from the environment, none of it kept in the repository:
-#   KR_DEVICE                  the phone's identifier for devicectl (or the simulator's name)
+#   KR_DEVICE                  the phone's UDID, which devicectl and xcodebuild both take (or the simulator's name)
 #   KR_DEVICE_LEASE            the lease that is held while this runs
-#   KR_SIGN_IDENTITY, KR_SIGN_FLAGS, KR_APP_PROFILE, KR_EXTENSION_PROFILE, KR_RUNNER_PROFILE
-#                              the signing choices of a device build (see Build.xcconfig)
+#   KR_SIGN_IDENTITY           the SHA-1 of the signing certificate, in capitals: never its name, since a
+#                              name can match another identity in another keychain
+#   KR_APP_PROFILE, KR_EXTENSION_PROFILE, KR_RUNNER_PROFILE
+#                              the UUIDs of the three provisioning profiles, found in KR_PROFILE_DIR
+#                              (default ~/Library/MobileDevice/Provisioning Profiles)
 #   KR_GOOGLE_SERVICE_INFO     the Firebase configuration, for a build that has push
 #   KR_KEYCHAIN, KR_KEYCHAIN_PASSWORD_FILE
-#                              the keychain that holds the signing identity, unlocked before a device build
+#                              the keychain that holds the signing identity, and the file holding its
+#                              password, for a device build
 #   KR_PUSH_TOOL               the script that sends the one test notification (session s1 only)
 # And, optional: KR_TARGET=simulator to run everything on a simulator instead of the phone,
 # KR_WORK (products and the record of a session, on the internal disk), KR_RAW (the raw output of a
@@ -123,7 +128,8 @@ target_uninstall() { # <bundle id>
 
 target_launch() { # <args...>: starts the application afresh with these arguments
   if [ "$target" = device ]; then
-    xcrun devicectl --timeout "$devicectl_limit" device process launch --device "$KR_DEVICE" --terminate-existing "$app_id" "$@" >/dev/null
+    # The arguments go after `--`: without it devicectl takes `-KRDeviceProbe` for an option of its own.
+    xcrun devicectl --timeout "$devicectl_limit" device process launch --device "$KR_DEVICE" --terminate-existing "$app_id" -- "$@" >/dev/null
   else
     xcrun simctl terminate "$KR_DEVICE" "$app_id" >/dev/null 2>&1
     xcrun simctl launch "$KR_DEVICE" "$app_id" "$@" >/dev/null
@@ -191,19 +197,15 @@ sweep() {
 
 # MARK: Builds
 
-# The signing and push choices go to Local.xcconfig, which Build.xcconfig reads and the repository ignores.
+# The team that owns the application, as the project names it.
+team() { sed -n 's/^ *DEVELOPMENT_TEAM: *//p' "$apple/project.yml" | head -1; }
+
+# The push choice goes to Local.xcconfig, which Build.xcconfig reads and the repository ignores. A
+# device build is made with signing off, so the team's prefix, which the build takes from a profile
+# when it signs, is given here for the keychain groups and the bundle's own names to carry.
 write_local_xcconfig() { # <with push: yes|no>
   {
-    if [ "$target" = device ]; then
-      [ -n "${KR_SIGN_IDENTITY:-}" ] && [ -n "${KR_APP_PROFILE:-}" ] && [ -n "${KR_EXTENSION_PROFILE:-}" ] && [ -n "${KR_RUNNER_PROFILE:-}" ] \
-        || die "a device build needs KR_SIGN_IDENTITY, KR_APP_PROFILE, KR_EXTENSION_PROFILE and KR_RUNNER_PROFILE"
-      echo "KR_SIGN_STYLE = Manual"
-      echo "KR_SIGN_IDENTITY = $KR_SIGN_IDENTITY"
-      echo "KR_SIGN_FLAGS = ${KR_SIGN_FLAGS:-}"
-      echo "KR_APP_PROFILE = $KR_APP_PROFILE"
-      echo "KR_EXTENSION_PROFILE = $KR_EXTENSION_PROFILE"
-      echo "KR_RUNNER_PROFILE = $KR_RUNNER_PROFILE"
-    fi
+    [ "$target" = device ] && echo "AppIdentifierPrefix = $(team)."
     if [ "$1" = yes ]; then
       [ -f "${KR_GOOGLE_SERVICE_INFO:-}" ] || die "KR_GOOGLE_SERVICE_INFO names no file"
       echo "KR_GOOGLE_SERVICE_INFO = $KR_GOOGLE_SERVICE_INFO"
@@ -214,10 +216,64 @@ write_local_xcconfig() { # <with push: yes|no>
   } > "$apple/Local.xcconfig"
 }
 
-unlock_keychain() {
-  [ "$target" = device ] || return 0
+# MARK: Signing
+
+profiles=${KR_PROFILE_DIR:-$HOME/Library/MobileDevice/Provisioning Profiles}
+profile_file() { # <uuid>
+  [ -f "$profiles/$1.mobileprovision" ] || die "there is no profile $1 in $profiles"
+  echo "$profiles/$1.mobileprovision"
+}
+
+# The user's keychain search list, one path a line.
+search_list() { security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//'; }
+
+# Runs a command with the signing keychain at the end of the user's keychain search list, where
+# codesign has to find the identity, and puts the list back as it was however the command ends. The
+# keychain is unlocked from its password file just before, which is never printed, and locked again
+# after. Nothing else changes: the login keychain stays first and the default keychain is not touched.
+with_signing_keychain() { # <command...>
+  [ "$target" = device ] || die "only a device build is signed"
   [ -n "${KR_KEYCHAIN:-}" ] && [ -f "${KR_KEYCHAIN_PASSWORD_FILE:-}" ] || die "KR_KEYCHAIN and KR_KEYCHAIN_PASSWORD_FILE are needed to sign"
-  security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" || die "the signing keychain would not unlock"
+  local before after status
+  before=$(search_list) || die "the keychain search list could not be read"
+  say "keychain search list before signing: $(echo "$before" | tr '\n' ' ')"
+  (
+    paths=()
+    while IFS= read -r each; do [ -n "$each" ] && paths+=("$each"); done <<< "$before"
+    restore() { security list-keychains -d user -s "${paths[@]}"; }
+    trap 'restore; exit 130' INT
+    trap 'restore; exit 143' TERM
+    trap restore EXIT
+    security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" || exit 2
+    security list-keychains -d user -s "${paths[@]}" "$KR_KEYCHAIN" || exit 2
+    "$@"
+  )
+  status=$?
+  after=$(search_list)
+  say "keychain search list after signing: $(echo "$after" | tr '\n' ' ')"
+  security lock-keychain "$KR_KEYCHAIN"
+  [ "$after" = "$before" ] || die "THE KEYCHAIN SEARCH LIST IS NOT WHAT IT WAS BEFORE SIGNING: put it back by hand"
+  return "$status"
+}
+
+signer() { echo "$companion/scripts/sign-ios.mjs"; }
+
+# Signs the application, its extension and what they hold, and checks every signature and the
+# entitlements it is sealed with.
+sign_application() { # <KalaReach.app>
+  [ -n "${KR_SIGN_IDENTITY:-}" ] && [ -n "${KR_APP_PROFILE:-}" ] && [ -n "${KR_EXTENSION_PROFILE:-}" ] \
+    || die "a device build needs KR_SIGN_IDENTITY, KR_APP_PROFILE and KR_EXTENSION_PROFILE"
+  with_signing_keychain node "$(signer)" sign-app "$1" --identity "$KR_SIGN_IDENTITY" --keychain "$KR_KEYCHAIN" \
+    --app-profile "$(profile_file "$KR_APP_PROFILE")" --extension-profile "$(profile_file "$KR_EXTENSION_PROFILE")" \
+    --app-entitlements "$apple/companion-tauri_iOS/companion-tauri_iOS.entitlements" \
+    --extension-entitlements "$apple/KalaReachNotificationService/KalaReachNotificationService.entitlements" \
+    --device "$KR_DEVICE"
+}
+
+sign_runner() { # <Runner.app>
+  [ -n "${KR_SIGN_IDENTITY:-}" ] && [ -n "${KR_RUNNER_PROFILE:-}" ] || die "a device build needs KR_SIGN_IDENTITY and KR_RUNNER_PROFILE"
+  with_signing_keychain node "$(signer)" sign-runner "$1" --identity "$KR_SIGN_IDENTITY" --keychain "$KR_KEYCHAIN" \
+    --profile "$(profile_file "$KR_RUNNER_PROFILE")" --device "$KR_DEVICE"
 }
 
 build_app() {
@@ -231,12 +287,11 @@ build_app() {
   done
   mkdir -p "$work"
   write_local_xcconfig "$push"
-  unlock_keychain
   local flavour=app
   [ "$harness" = yes ] && flavour=harness
   [ "$push" = no ] && flavour=$flavour-nofirebase
   local arguments=(--debug --ci)
-  if [ "$target" = device ]; then arguments+=(--target aarch64 --archive-only); else arguments+=(--target aarch64-sim); fi
+  if [ "$target" = device ]; then arguments+=(--target aarch64 --archive-only --no-sign); else arguments+=(--target aarch64-sim); fi
   if [ "$harness" = yes ]; then
     arguments+=(--config '{"build":{"frontendDist":"../dist-harness","beforeBuildCommand":"pnpm build:harness"},"app":{"windows":[{"label":"main","create":false,"title":"KalaReach","width":1180,"height":800,"minWidth":480,"minHeight":480,"dragDropEnabled":true,"titleBarStyle":"Transparent","hiddenTitle":true,"url":"harness.html"}]}}')
   fi
@@ -251,16 +306,19 @@ build_app() {
   [ -d "$built" ] || die "the build left no application"
   rm -rf "${work:?}/$flavour.app"
   cp -R "$built" "$work/$flavour.app"
+  [ "$target" = device ] && { sign_application "$work/$flavour.app" || die "the application did not sign"; }
   say "built $work/$flavour.app"
 }
 
 build_tests() {
   mkdir -p "$work"
   write_local_xcconfig no
-  unlock_keychain
-  local derived="$work/tests-$target"
+  local derived="$work/tests-$target" unsigned=()
+  # A device build is made with signing off and signed by hand afterwards.
+  [ "$target" = device ] && unsigned=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
   ( cd "$apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
-      -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" ) \
+      -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" \
+      ${unsigned[@]+"${unsigned[@]}"} ) \
     > "$work/build-tests-$target.log" 2>&1 || { tail -20 "$work/build-tests-$target.log"; die "the test build failed"; }
   local plan products="$derived/Build/Products"
   plan=$(ls "$products"/*.xctestrun 2>/dev/null | head -1)
@@ -288,6 +346,10 @@ build_tests() {
   echo "$session_plan" > "$work/tests-$target.path"
   say "built the test runner, plan at $session_plan"
   runner_app=$(ls -d "$derived"/Build/Products/*/"$tests_scheme-Runner.app" | head -1)
+  [ -d "$runner_app" ] || die "the test build left no runner"
+  # The debug symbols of the test bundle are not a plug-in and have no place in an installed bundle.
+  rm -rf "${runner_app:?}"/PlugIns/*.dSYM
+  [ "$target" = device ] && { sign_runner "$runner_app" || die "the runner did not sign"; }
   echo "$runner_app" > "$work/runner-$target.path"
 }
 
@@ -297,23 +359,27 @@ build_tests() {
 # whether the person is at the phone.
 session_tests() { # <name>
   case $1 in
-    s0) echo "ProofTests KeychainTests LifecycleTests" ;;
+    s0) echo "ProofTests/testWhatATestSaysReachesTheScriptWhileItRuns ProofTests/testHomePressesKeepThePhoneAwake ProofTests/testTheApplicationDrawsItsOwnWindowsForTheScriptToCopy KeychainTests LifecycleTests" ;;
     s1) echo "PushTests/testALegWithTheApplicationTerminated PushTests/testALegWithTheApplicationInTheBackground" ;;
-    s2) echo "RecoveryTests LayoutTests AccessibilityTests PickerTests" ;;
+    s2a) echo "RecoveryTests LayoutTests PickerTests" ;;
+    s2b) echo "AccessibilityTests" ;;
     s3a) echo "AudioTests/testARefusedMicrophoneIsSaidAndNothingOpens" ;;
     s3b) echo "AudioTests/testAnAllowedMicrophoneOpensTheSessionAndAChangeOfRouteIsCounted" ;;
     s4) echo "AudioTests/testAudioCarriesOnThroughALockedScreen" ;;
     *) return 1 ;;
   esac
 }
-session_minutes() { case $1 in s0) echo 20 ;; s1) echo 45 ;; s2) echo 90 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
-# Which build of the application a session installs: s0 and s1 hold Firebase's configuration, s2 runs the harness page.
-session_app() { case $1 in s0 | s1) echo app ;; s2) echo harness-nofirebase ;; *) echo app-nofirebase ;; esac; }
+session_minutes() { case $1 in s0) echo 20 ;; s1) echo 30 ;; s2a) echo 30 ;; s2b) echo 15 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
+# Which build of the application a session installs: s0 and s1 hold Firebase's configuration, s2a and s2b run the harness page.
+session_app() { case $1 in s0 | s1) echo app ;; s2a | s2b) echo harness-nofirebase ;; *) echo app-nofirebase ;; esac; }
 
 ending=0
 runner_pid=""
 forwarder_pid=""
+# Whether the phone is clean afterwards, and whether the session's proofs held. A session that
+# leaves something behind keeps its record; one whose proof was not met ends with its own status.
 unclean=0
+unproven=0
 
 # Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
 stop_runner() {
@@ -351,6 +417,7 @@ finish_session() {
   local swept=1
   if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
     copy_shots "${session_name:-session}"
+    [ "${session_name:-}" = s0 ] && check_shot_proof "$shots/s0"
     sweep || { say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: run cleanup before anything else"; swept=0; unclean=1; }
   else
     say "no empty baseline is on record, so nothing is swept"
@@ -363,6 +430,7 @@ finish_session() {
   if [ "$unclean" = 0 ]; then rm -f "$record"; fi
   rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}"
   [ "$unclean" = 0 ] || exit 3
+  [ "$unproven" = 0 ] || exit 4
 }
 
 session() {
@@ -398,6 +466,10 @@ session() {
   target_install "$work/$(session_app "$name").app" || die "the application did not install"
   target_install "$(cat "$work/runner-$target.path")" || die "the test runner did not install"
   baseline
+  if [ "$name" = s0 ]; then
+    attachment_proof
+    [ "$unproven" = 0 ] || { say "the attachment check did not hold, so the session ends here"; exit 4; }
+  fi
 
   say "session $name: $tests (at most $((minutes + 10)) minutes in all)"
   local result="$raw/result-$name.xcresult" out="$raw/session-$name.out"
@@ -456,7 +528,65 @@ proofs() { # <live output>
     say "PROOF live: the two lines arrived $((second - first)) seconds apart"
   else
     say "PROOF NOT MET: what a test says does not reach this script while it runs, so a push leg cannot be sent at the right time"
-    unclean=1
+    unproven=1
+  fi
+}
+
+# The second proof of session s0: the application's own picture of itself reached this Mac, and it
+# is a picture of a window with something in it. The size is the window's, and a picture that is one
+# colour compresses to almost nothing, so its file is small.
+check_shot_proof() { # <folder>
+  local picture size width height
+  picture=$(ls "$1"/shot-*.png 2>/dev/null | head -1)
+  if [ -z "$picture" ]; then say "PROOF NOT MET: the application's picture of itself did not come out of its container"; unproven=1; return; fi
+  width=$(sips -g pixelWidth "$picture" 2>/dev/null | awk '/pixelWidth/ {print $2}')
+  height=$(sips -g pixelHeight "$picture" 2>/dev/null | awk '/pixelHeight/ {print $2}')
+  size=$(stat -f %z "$picture")
+  if [ -n "$width" ] && [ -n "$height" ] && [ "$width" -ge 300 ] && [ "$height" -ge 600 ] && [ "$size" -ge 50000 ]; then
+    say "PROOF the application's picture of itself came out: ${width} by ${height} points scaled, ${size} bytes"
+  else
+    say "PROOF NOT MET: the application's picture is ${width:-?} by ${height:-?} and ${size} bytes, which is not a picture of a page"
+    unproven=1
+  fi
+}
+
+# The third proof of session s0: a test that fails on purpose is run with every attachment asked to
+# be kept and the runner's arguments that suppress pictures and recordings, and what its result
+# holds is listed by kind alone. A picture or a recording among them means the arguments do not
+# hold, and nothing else is run on this phone until they do. What was exported is deleted without
+# being opened.
+attachment_proof() {
+  local plan proof_plan out bundle exported plist=/usr/libexec/PlistBuddy key=":$tests_scheme"
+  plan=$(cat "$work/tests-$target.path")
+  proof_plan="$(dirname "$plan")/attachment-proof.xctestrun"
+  out="$raw/attachment-proof.out"; bundle="$raw/attachment-proof.xcresult"; exported="$raw/attachment-proof-files"
+  rm -rf "$bundle" "$exported"
+  cp "$plan" "$proof_plan" || { say "PROOF NOT MET: no plan to run the attachment check with"; unproven=1; return; }
+  $plist -c "Set $key:SystemAttachmentLifetime keepAlways" "$proof_plan" \
+    && $plist -c "Set $key:UserAttachmentLifetime keepAlways" "$proof_plan" \
+    && $plist -c "Add $key:TestingEnvironmentVariables:KR_ATTACHMENT_PROOF string 1" "$proof_plan" \
+    || { say "PROOF NOT MET: the plan for the attachment check could not be written"; unproven=1; return; }
+  say "running a test that fails on purpose, with every attachment kept"
+  xcodebuild test-without-building -xctestrun "$proof_plan" -destination "$(destination)" -resultBundlePath "$bundle" \
+    -collect-test-diagnostics never "-only-testing:$tests_scheme/ProofTests/testAFailureLeavesNothingBehind" > "$out" 2>&1
+  if ! grep -q "Test Case '.*testAFailureLeavesNothingBehind.*' failed" "$out"; then
+    say "PROOF NOT MET: the test that fails on purpose did not run and fail, so what a failure leaves is not known"
+    unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
+  fi
+  if ! xcrun xcresulttool export attachments --path "$bundle" --output-path "$exported" >/dev/null 2>&1; then
+    say "PROOF NOT MET: the result of the test that fails on purpose could not be read"
+    unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
+  fi
+  # By kind alone: the file name's extension, counted. Nothing is opened.
+  local kinds pictures
+  kinds=$(find "$exported" -type f ! -name manifest.json | sed 's/.*\.//' | sort | uniq -c | awk '{printf "%s %s, ", $2, $1}')
+  pictures=$(find "$exported" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' -o -iname '*.mp4' -o -iname '*.mov' \) | wc -l | tr -d ' ')
+  rm -rf "$bundle" "$exported" "$proof_plan"
+  if [ "$pictures" = 0 ]; then
+    say "PROOF the failure left no picture or recording (kinds left: ${kinds:-none})"
+  else
+    say "PROOF NOT MET: the failure left $pictures picture or recording files (kinds: $kinds), which were deleted unopened: tell the lead before anything else runs"
+    unproven=1
   fi
 }
 
@@ -473,7 +603,7 @@ send_push() {
 # The names and outcomes of the tests, and the lines the tests said; skipped tests are named too, so
 # a session that skipped what it was for does not read as a pass.
 report() { # <output>
-  grep -E "Test Case '.*' (started|passed|failed|skipped)|Executed [0-9]+ test|\*\* TEST" "$1" \
+  grep -E "Test Case '.*' (started|passed|failed|skipped)|Executed [0-9]+ test|\*\* TEST|Restarting after|crashed" "$1" \
     | sed -E "s/Test Case '-\[KalaReachUITests\./Test Case '[/" || true
 }
 
