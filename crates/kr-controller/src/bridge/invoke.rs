@@ -72,6 +72,14 @@ pub const MUTATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(4
 /// nothing for this long is not an idle session but a frozen bridge, and it ends.
 pub const STREAM_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// What a helper of a release before the opening's `start` member says when it refuses an opening it
+/// cannot read.
+///
+/// The sentence is fixed in every such release, and a destination keeps the helper it was installed
+/// with until somebody updates it, so this host recognises it. Remove it once no release that says
+/// it can still be installed in a destination.
+const EARLIER_HELPER_CANNOT_READ_OPENING: &str = "a bridge begins with its opening frame";
+
 /// How much of a helper's standard error is kept, from the end.
 const DIAGNOSTIC_TAIL: usize = 4096;
 
@@ -701,6 +709,13 @@ async fn start_and_acknowledge(
             return Err(
                 if error.code == kr_protocol::error::ErrorCode::SessionClosed {
                     Refusal::SessionClosed
+                } else if error.code == kr_protocol::error::ErrorCode::UnsupportedSchema
+                    && error.message == EARLIER_HELPER_CANNOT_READ_OPENING
+                {
+                    // A helper of an earlier release, which a distribution keeps until somebody
+                    // updates it, refuses an opening it cannot read with this sentence. It says
+                    // what to do, which the sentence does not.
+                    Refusal::Level { destination: None }
                 } else {
                     Refusal::Destination(error)
                 },
@@ -2385,6 +2400,33 @@ mod tests {
     /// The descendant a helper leaves behind, which keeps its standard streams open for a while.
     #[cfg(unix)]
     const HOLDING_THE_PIPES: &str = "sleep 4 &";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_earlier_helper_that_cannot_read_the_opening_is_said_to_need_an_update() {
+        // What a helper of a release before the opening's `start` member answers.
+        let (_directory, opening) = writing(
+            &[BridgeFrame::Refused(ProtocolError::new(
+                ErrorCode::UnsupportedSchema,
+                EARLIER_HELPER_CANNOT_READ_OPENING,
+            ))],
+            "exit 0",
+        );
+        let refusal = opening.launch().await.expect_err("a refusal");
+        assert_eq!(refusal, Refusal::Level { destination: None });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn another_refusal_of_the_same_kind_is_the_destinations_own_and_is_not_rewritten() {
+        let said = ProtocolError::new(
+            ErrorCode::UnsupportedSchema,
+            "the daemon here is of an earlier build; restart it",
+        );
+        let (_directory, opening) = writing(&[BridgeFrame::Refused(said.clone())], "exit 0");
+        let refusal = opening.launch().await.expect_err("a refusal");
+        assert_eq!(refusal, Refusal::Destination(said));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
