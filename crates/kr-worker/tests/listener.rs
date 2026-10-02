@@ -152,8 +152,14 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
     // And nothing a person or a diagnostic reads carries the credential.
     let diagnostic = address.for_diagnostics();
     let file = registration.to_file();
+    // The credential is judged by its whole text: the address carries a random name and the file
+    // carries numbers, so any short run of digits can turn up in them by chance.
+    let secret = CREDENTIAL
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     for rendering in [&diagnostic, &file] {
-        assert!(!rendering.contains("0909"), "{rendering} carries a secret");
+        assert!(!rendering.contains(&secret), "{rendering} carries a secret");
         assert!(
             !rendering.contains('@'),
             "a credential never travels in a URL"
