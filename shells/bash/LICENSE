@@ -4,8 +4,8 @@ The KalaReach managed Bash package
 Everything in this directory belongs to the packaged Bash. The patch files under patches/ modify
 GNU Bash's own source and the Readline it bundles, and the sources under src/ are added to that
 source tree and compiled into the shell, so both are distributed under the GNU General Public
-Licence, version 3 or later, reproduced below. Kala Powered holds the copyright in the added
-sources and in the changes the patches make, and licenses them on these terms as part of this
+Licence, version 3 or later, reproduced below. The added sources and the changes the patches make
+are Copyright (c) 2026, KalaReach contributors, who license them on these terms as part of this
 package. The rest of the repository, including the build script and the documentation, stays under
 the BSD 3-Clause Licence in the repository root.
 
