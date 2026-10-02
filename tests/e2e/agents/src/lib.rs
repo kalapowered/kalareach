@@ -81,6 +81,8 @@ pub mod detect;
 #[cfg(unix)]
 pub mod keychain;
 #[cfg(unix)]
+pub mod keys;
+#[cfg(unix)]
 pub mod network;
 #[cfg(unix)]
 pub mod observe;
