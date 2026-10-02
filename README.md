@@ -2,20 +2,18 @@
 
 KalaReach host, controller, workers, CLI, shared protocol and transport, Tauri desktop and mobile apps, plugin runtime and SDK, contact skill and conformance fixtures.
 
-Except as otherwise noted, KalaReach is licenced under the BSD 3-Clause License. See
-[LICENSE](LICENSE) for details. KalaReach is Copyright (C) KalaReach contributors. Each crate of the
-cargo workspace and each package of the pnpm workspace declares it with the SPDX identifier
-`BSD-3-Clause` in its manifest. The same applies to the website and catalogue repositories.
+KalaReach is licensed under the BSD 3-Clause License, in [LICENSE](LICENSE). Every crate of the
+Cargo workspace and every package of the pnpm workspace declares it with the SPDX identifier
+`BSD-3-Clause`. The website and catalogue repositories carry the same licence in the same way.
 
-The exception are the managed shell packages in `shells/`. The `shells/zsh/` directory is licenced
-under the Zsh licence, the `shells/bash/` directory is licenced under the GNU General Public Licence
-v3 or later and the `shells/fish/` directory is licenced under the GNU General Public Licence v2.
-Each directory contains a `LICENSE` file that keeps the corresponding upstream licence text. The
-`shells/psreadline/` directory doesn't copy anything from the upstream package and is therefore
-licenced under the BSD 3-Clause licence as well. All crates, scripts, and documents are licenced
-under the BSD 3-Clause licence. No code under any of those licences is ever compiled into a crate.
-The Gradle wrapper scripts in `apps/companion/src-tauri/gen/android/` contain a Apache Licence 2.0
-header.
+The managed shell packages under `shells/` are the exception, because they are built from other
+people's shells. `shells/zsh/` carries the Zsh licence, `shells/bash/` the GNU General Public
+Licence, version 3 or later, and `shells/fish/` version 2 of that licence, each with its own
+`LICENSE` file that keeps the upstream licence text. `shells/psreadline/` copies nothing from
+upstream and stays BSD 3-Clause. Every crate, script and document written for KalaReach stays BSD
+3-Clause, and no code under any of those licences is compiled into a crate. The Gradle wrapper
+scripts under `apps/companion/src-tauri/gen/android/` are Gradle's own and keep their Apache License
+2.0 headers.
 
 ## Repository layout
 
