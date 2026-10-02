@@ -87,8 +87,10 @@ impl Placed {
 /// A listener standing in for the worker's own, on the private endpoint this platform gives a
 /// launch: a socket inside an owner-only directory on Unix, a named pipe on Windows.
 ///
-/// It is the worker's own listener type, so the forwarder connects to it as it connects to the
-/// worker's, and the process the system names on an accepted connection is the forwarder.
+/// It is kr-ipc's own listener, the one the worker binds on Windows and the same kind of socket the
+/// worker binds on Unix, so the forwarder connects to it as it connects to the worker's. `accept`
+/// gives the process the system names on the connection, which a test compares with the process the
+/// forwarder presents.
 pub struct StandIn {
     /// The bound listener.
     pub listener: kr_ipc::endpoint::Listener,

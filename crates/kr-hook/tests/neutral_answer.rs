@@ -282,7 +282,9 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
             tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()));
         let case = format!("{} {event}", hooks.application);
 
-        let (mut stream, _) = tokio::select! {
+        let (mut stream, _peer) = tokio::select! {
+            // A connection already made is taken before the forwarder's end is looked at.
+            biased;
             accepted = stand_in.listener.accept() => accepted.expect("the hook connects"),
             ran = &mut running => {
                 let ran = ran.expect("the hook ran");
