@@ -887,6 +887,77 @@ pub enum HostCommand {
     Update(UpdateArguments),
     /// Show the releases this host keeps, and which one is current.
     Versions,
+    /// Show the machine group an environment records for itself, or take one owner-approved step
+    /// that changes it.
+    Machine(MachineArguments),
+}
+
+/// `kr host machine`.
+///
+/// A machine group is a random grouping of environments that the owner approves. It grants
+/// nothing, and each environment records its own and changes it only by its own step.
+#[derive(Args)]
+pub struct MachineArguments {
+    /// The step to take. Without one, the group the environment records is shown.
+    #[command(subcommand)]
+    pub command: Option<MachineCommand>,
+    /// The environment to act in: one of this host's own, by identifier, or one enrolled for a
+    /// process bridge, by identifier or label. Without it, this installation's own. A merge over
+    /// several environments takes the option once for each of them.
+    #[arg(long, global = true)]
+    pub environment: Vec<String>,
+}
+
+/// One `kr host machine` step.
+#[derive(Subcommand)]
+pub enum MachineCommand {
+    /// Move the environment into a group the owner names.
+    Join(MachineJoinArguments),
+    /// Take the environment's part in merging its group into another: one step here, or a plan
+    /// over several environments that the client keeps until each has its result.
+    Merge(MachineMergeArguments),
+    /// Move the environment into a fresh group of its own.
+    Split(MachineSplitArguments),
+    /// Show the merge plan this client keeps, and what each step has come to.
+    Plan,
+    /// Send each step of the plan that has no result again, under the action it was first sent
+    /// under, and say what each came to. An environment that cannot be reached stays pending.
+    Finish,
+    /// Move each environment the plan moved back into the group it left, one step at a time.
+    Undo,
+}
+
+/// `kr host machine join`.
+#[derive(Args)]
+pub struct MachineJoinArguments {
+    /// The group to join, by identifier.
+    pub group: String,
+    /// The record this step is approved against: the group the environment is in and its revision,
+    /// as `kr host machine` shows them, written `<group>@<revision>`.
+    #[arg(long)]
+    pub expect: String,
+}
+
+/// `kr host machine merge`.
+#[derive(Args)]
+pub struct MachineMergeArguments {
+    /// The group the environment's group is merged into, by identifier.
+    pub into: String,
+    /// One step here: the record it is approved against, written `<group>@<revision>`.
+    #[arg(long, conflicts_with = "from")]
+    pub expect: Option<String>,
+    /// A plan over the environments named with `--environment`: the group they are in now, which
+    /// each of them has to report, by identifier.
+    #[arg(long)]
+    pub from: Option<String>,
+}
+
+/// `kr host machine split`.
+#[derive(Args)]
+pub struct MachineSplitArguments {
+    /// The record this step is approved against, written `<group>@<revision>`.
+    #[arg(long)]
+    pub expect: String,
 }
 
 /// `kr host install`.

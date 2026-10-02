@@ -1017,6 +1017,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+            HostCommand::Machine(machine) => kr_cli::machine::run(&paths, machine, cli.json).await,
             HostCommand::Versions => {
                 let kept = kr_cli::update::versions()?;
                 if cli.json {
