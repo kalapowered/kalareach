@@ -2271,6 +2271,7 @@ async fn two_confirmation_submissions_overlap_before_the_claim() {
             &kr_project::policy::Enlargement {
                 action_digest: request.action_digest,
                 rights: request.destination_rights.clone(),
+                destination: None,
             },
             &signed(&owner, &request),
         )

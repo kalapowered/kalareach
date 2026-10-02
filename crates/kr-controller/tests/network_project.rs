@@ -1963,3 +1963,341 @@ async fn owner_methods_reject_every_nonlocal_ingress() {
     session.close();
     host.stop().await;
 }
+
+// ----- a device's location -------------------------------------------------------------------
+
+/// The parameters of an authorisation of `path` for `purpose`, for the grant a device holds.
+fn location_for(
+    host: &Host,
+    path: &Path,
+    purpose: kr_protocol::project::LocationPurpose,
+    grant: Option<kr_protocol::ids::GrantId>,
+) -> kr_protocol::project::ProjectLocationAuthoriseParams {
+    kr_protocol::project::ProjectLocationAuthoriseParams {
+        location_id: Nullable::null(),
+        environment_id: host.environment_id,
+        grant_id: Nullable(grant),
+        purpose,
+        label: "a place the owner chose".to_owned(),
+        path: path.display().to_string(),
+        owner_confirmation: Nullable::null(),
+    }
+}
+
+/// The owner's proof for one challenge, after its own ceremony.
+fn signed_by(
+    owner: &DeviceKeys,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> kr_protocol::pairing::OwnerConfirmationProof {
+    kr_pairing::confirm::sign_confirmation(
+        &owner.authorisation,
+        request,
+        kr_protocol::pairing::ConfirmationChannel::OwnerDevicePresence,
+    )
+    .expect("the proof is signed")
+}
+
+/// Submits the first half of an authorisation on the owner's own socket, and returns the
+/// challenge it was answered with.
+async fn challenge_of(
+    control: &mut LocalClient,
+    host: &Host,
+    action: ActionId,
+    params: &kr_protocol::project::ProjectLocationAuthoriseParams,
+) -> std::result::Result<kr_protocol::pairing::OwnerConfirmationRequest, ProtocolError> {
+    let answered: kr_protocol::project::ProjectLocationAuthoriseResult = typed(
+        &control
+            .mutate(
+                Method::ProjectLocationAuthorise,
+                action,
+                ActionTarget::environment(host.environment_id),
+                params,
+            )
+            .await
+            .expect("the call reaches the daemon")?,
+    );
+    match answered.outcome {
+        kr_protocol::project::LocationAuthorisation::ConfirmationRequired { request } => {
+            Ok(request)
+        }
+        kr_protocol::project::LocationAuthorisation::Authorised { .. } => {
+            panic!("an authorisation with no proof authorises nothing")
+        }
+    }
+}
+
+/// Submits the second half, carrying `proof`.
+async fn authorised_with(
+    control: &mut LocalClient,
+    host: &Host,
+    action: ActionId,
+    params: &kr_protocol::project::ProjectLocationAuthoriseParams,
+    proof: kr_protocol::pairing::OwnerConfirmationProof,
+) -> std::result::Result<kr_protocol::project::AuthorisedLocation, ProtocolError> {
+    let proven = kr_protocol::project::ProjectLocationAuthoriseParams {
+        owner_confirmation: Nullable(Some(proof)),
+        ..params.clone()
+    };
+    let answered: kr_protocol::project::ProjectLocationAuthoriseResult = typed(
+        &control
+            .mutate(
+                Method::ProjectLocationAuthorise,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &proven,
+            )
+            .await
+            .expect("the call reaches the daemon")?,
+    );
+    match answered.outcome {
+        kr_protocol::project::LocationAuthorisation::Authorised { location } => Ok(location),
+        kr_protocol::project::LocationAuthorisation::ConfirmationRequired { .. } => {
+            panic!("a submission carrying its proof is not answered with another challenge")
+        }
+    }
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43, and the specification's sensitive owner confirmation: the
+/// owner's confirmation of a device's location is bound to that device's four public keys.
+///
+/// The challenge names all four keys the host holds for the device that holds the grant, a proof
+/// for a challenge naming another device's keys authorises nothing, and the confirmation then
+/// authorises the location for that grant. The control is the owner's own location, whose
+/// challenge names no device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owners_confirmation_of_a_devices_location_names_that_devices_four_keys() {
+    use kr_protocol::project::LocationPurpose;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let first = net_support::Device::create().await;
+    let held =
+        net_support::pair_with(&host, &first, &owner, net_support::proposal(PROJECT_RIGHTS)).await;
+    let second = net_support::Device::create().await;
+    let _other = net_support::pair_with(
+        &host,
+        &second,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let grant = held.grant.grant_id;
+    let root = host.work().join("devices");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let params = location_for(&host, &root, LocationPurpose::Source, Some(grant));
+
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenge_of(&mut control, &host, action, &params)
+        .await
+        .expect("a device's location is given a challenge");
+    assert_eq!(
+        request.action,
+        kr_protocol::pairing::SensitiveAction::EnlargeGrant
+    );
+    assert_eq!(
+        request.destination_keys.0,
+        Some(first.keys().public_keys()),
+        "the challenge names the device that holds the grant by all four of its keys"
+    );
+    assert_eq!(request.destination_keys.0, held.public_keys());
+
+    // A challenge that names another device's keys is not this one, and its proof is refused
+    // without spending this one.
+    let mut elsewhere = request.clone();
+    elsewhere.destination_keys = Nullable(Some(second.keys().public_keys()));
+    let refusal = authorised_with(
+        &mut control,
+        &host,
+        action,
+        &params,
+        signed_by(&owner, &elsewhere),
+    )
+    .await
+    .expect_err("a confirmation naming another device's keys authorises nothing");
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+
+    let location = authorised_with(
+        &mut control,
+        &host,
+        action,
+        &params,
+        signed_by(&owner, &request),
+    )
+    .await
+    .expect("the confirmation for this device authorises its location");
+    assert_eq!(location.grant_id.0, Some(grant));
+
+    // The control: the owner's own location names no device, and is as it always was.
+    let own = location_for(&host, host.work(), LocationPurpose::Source, None);
+    let own_request = challenge_of(&mut control, &host, ActionId::new(kr_ipc::new_uuid()), &own)
+        .await
+        .expect("the owner's own location is given a challenge");
+    assert!(own_request.destination_keys.0.is_none());
+
+    host.stop().await;
+}
+
+/// The same binding at the owner's own seam: a challenge issued for one device's grant does not
+/// verify as the confirmation of another device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_issued_for_one_devices_location_does_not_verify_for_anothers() {
+    use kr_project::policy::{Enlargement, OwnerAuthority as _};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let first = net_support::Device::create().await;
+    let held =
+        net_support::pair_with(&host, &first, &owner, net_support::proposal(PROJECT_RIGHTS)).await;
+    let second = net_support::Device::create().await;
+    let other = net_support::pair_with(
+        &host,
+        &second,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let authority =
+        kr_controller::project::HostOwner::new(std::sync::Arc::clone(host.network().pairing()));
+    let rights: kr_protocol::scalars::CanonicalSet<ActionRight> =
+        [ActionRight::ProjectCreate, ActionRight::WorkspaceManage]
+            .into_iter()
+            .collect();
+    let enlargement = |grant| Enlargement {
+        action_digest: kr_protocol::scalars::Digest256::from_bytes([0x5a; 32]),
+        rights: rights.clone(),
+        destination: Some(grant),
+    };
+    let request = authority
+        .challenge(&enlargement(held.grant.grant_id))
+        .expect("a challenge for the first device's location");
+    assert_eq!(request.destination_keys.0, held.public_keys());
+    let proof = signed_by(&owner, &request);
+    authority
+        .verify(&enlargement(held.grant.grant_id), &proof)
+        .expect("it verifies for the device it names");
+    let refusal = authority
+        .verify(&enlargement(other.grant.grant_id), &proof)
+        .expect_err("it does not verify for another device's location");
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    // And the owner's own enlargement is not this device's: the same digest and rights with no
+    // destination are a different confirmation.
+    let own = Enlargement {
+        destination: None,
+        ..enlargement(held.grant.grant_id)
+    };
+    let refusal = authority
+        .verify(&own, &proof)
+        .expect_err("a challenge naming a device is not the owner's own location's");
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    // Spent once, for the device it names.
+    authority
+        .consume(&enlargement(other.grant.grant_id), &proof)
+        .expect_err("it is not spent for another device's location");
+    authority
+        .consume(&enlargement(held.grant.grant_id), &proof)
+        .expect("it is spent for the device it names");
+    host.stop().await;
+}
+
+/// A device that has not declared all four keys cannot be named in a confirmation, and the owner
+/// is told to have it declare them first. Once it has, the same request is given its challenge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until_it_does() {
+    use kr_protocol::project::LocationPurpose;
+    use kr_protocol::sharing::{
+        DEVICE_KEYS_DOMAIN, DeviceKeysCompleteParams, DeviceKeysDeclaration,
+    };
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    // The row as a host that kept two of the device's keys wrote it.
+    let connection = rusqlite::Connection::open(host.registry_database()).expect("the registry");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("a timeout");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE network_devices
+                    SET stored_envelope_key = NULL, notification_preview = NULL
+                  WHERE device_id = ?1",
+                rusqlite::params![record.device_id.get().as_bytes().as_slice()],
+            )
+            .expect("the row is written"),
+        1
+    );
+    let session = net_support::connect(&host, &device, &record).await;
+    let root = host.work().join("devices");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let params = location_for(
+        &host,
+        &root,
+        LocationPurpose::Source,
+        Some(record.grant.grant_id),
+    );
+    let refusal = challenge_of(
+        &mut control,
+        &host,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await
+    .expect_err("a device with two keys on record cannot be named");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal
+            .message
+            .contains("has not declared all four of its public keys")
+            && refusal.message.contains("device.keys.complete"),
+        "{}",
+        refusal.message
+    );
+
+    // The control: the device declares its own keys, signed by the key its pairing recorded, and
+    // the same request is given its challenge.
+    let keys = device.keys().public_keys();
+    let declaration = DeviceKeysCompleteParams {
+        keys,
+        signature: kr_crypto::sign::sign_object(
+            &device.keys().authorisation,
+            DEVICE_KEYS_DOMAIN,
+            &DeviceKeysDeclaration {
+                device_id: record.device_id,
+                keys,
+            },
+        )
+        .expect("a signature"),
+    };
+    session
+        .mutate(
+            Method::DeviceKeysComplete,
+            ActionTarget::environment(host.environment_id),
+            None,
+            &ParamsValue::empty(),
+            &declaration,
+            LIFETIME,
+        )
+        .await
+        .expect("the device declares its own keys");
+    let request = challenge_of(
+        &mut control,
+        &host,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await
+    .expect("with its keys declared the device is named");
+    assert_eq!(request.destination_keys.0, Some(keys));
+    session.close();
+    host.stop().await;
+}
