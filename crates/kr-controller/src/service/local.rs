@@ -203,7 +203,7 @@ impl Controller {
             method,
             Method::MachineJoin | Method::MachineMerge | Method::MachineSplit
         ) {
-            return self.machine_retained(actor_id, mutation);
+            return self.machine_retained(actor_id, mutation).await;
         }
         // A declaration of a device's keys is answered the same way, from the outcome the device
         // directory recorded beside the keys: a completion or a refusal alike, so a retry whose

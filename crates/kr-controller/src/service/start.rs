@@ -641,9 +641,15 @@ impl Controller {
             machine,
             lock,
         });
-        // A step that wrote the machine group record and ended before its receipt is answered from
-        // the record before anything is served, so no later step can take the answer with it.
-        controller.settle_machine_record()?;
+        // A step that wrote the machine group record and ended before its receipt has its answer
+        // kept from the record before anything is served, so no later step can take it away. A
+        // record that cannot be settled now does not stop the daemon: every step and every retry
+        // of that step settles it again first, and is refused or left unanswered while it cannot.
+        if let Err(error) = controller.settle_machine_record().await {
+            eprintln!(
+                "kr-controller: an earlier machine group change could not be settled at start: {error}"
+            );
+        }
         // Bound before anything can reach the module: from here on a workflow's grant is decided
         // under this daemon's policy, its configured ceiling and its clock model, and a node's
         // change-set write is held under this daemon's registry.
