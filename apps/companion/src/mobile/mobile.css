@@ -788,8 +788,11 @@
 .m-composer-line textarea {
   flex: 1 1 0;
   inline-size: auto;
-  /* With the text large enough that the field would be left a few letters wide, Send goes under it. */
-  min-inline-size: 5rem;
+  /*
+   * With the text large enough that the field would be left a few letters wide beside Send, Send goes
+   * under it. At twice the base size and below the field keeps the room it always had.
+   */
+  min-inline-size: min(3.5rem, 100%);
   min-block-size: var(--target);
   padding-block: var(--gap-2);
 }

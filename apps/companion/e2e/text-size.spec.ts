@@ -154,6 +154,27 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     }
   }
 
+  // With the text at its largest, Send beside the message field would leave the field a few letters
+  // wide: Send goes on a row of its own instead, and the field keeps room to type in.
+  for (const surface of ['ios', 'android'] as const) {
+    test(`keeps the message field wide enough to type in, with Send on a row of its own, on ${surface}`, async ({ page }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      const field = page.getByLabel('Message this session')
+      await field.fill('hello there')
+      const send = page.getByRole('button', { name: 'Send' })
+      const fieldBox = await field.boundingBox()
+      const sendBox = await send.boundingBox()
+      expect(fieldBox?.width ?? 0, 'the field is wide enough to read what is typed').toBeGreaterThan(150)
+      const fieldTop = fieldBox?.y ?? 0
+      const fieldBottom = fieldTop + (fieldBox?.height ?? 0)
+      const sendTop = sendBox?.y ?? 0
+      const sendBottom = sendTop + (sendBox?.height ?? 0)
+      expect(sendTop >= fieldBottom - 1 || sendBottom <= fieldTop + 1, 'Send is not beside the field').toBe(true)
+    })
+  }
+
   test('holds the two bars at one and a half times the base size, with the rest of the screen left to the content', async ({
     page
   }) => {
