@@ -1177,10 +1177,12 @@ command -v wsl.exe >/dev/null 2>&1 ||
 # wsl.exe writes UTF-16LE. Dropping the null bytes is enough to read it as text here.
 wsl_text() { wsl.exe "$@" 2>&1 | tr -d '\000\r'; }
 
-version_text="$(wsl_text --version)"
+# The label of the line that names the version is translated with the rest of what wsl.exe prints,
+# so it is the command's own success that says this is WSL from the Microsoft installer: the
+# platform that ships with Windows does not know the option and refuses it.
+version_text="$(wsl.exe --version 2>&1 | tr -d '\000\r'; exit "${PIPESTATUS[0]}")" ||
+  fail "wsl.exe --version did not succeed; this needs WSL 2 from the Microsoft installer: $version_text"
 echo "$version_text"
-echo "$version_text" | grep -qi "WSL version" ||
-  fail "wsl.exe --version did not report a WSL version; this needs WSL 2 from the Microsoft installer"
 
 wsl_text --set-default-version 2 >/dev/null ||
   fail "the default WSL version could not be set to 2"
