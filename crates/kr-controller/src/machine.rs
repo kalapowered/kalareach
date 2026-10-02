@@ -2678,6 +2678,102 @@ mod tests {
         );
     }
 
+    /// A standing that holds for the first `allowed` attempts at the replacement and lapses for
+    /// every one after, counting the attempts.
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct LapsesAfter {
+        allowed: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(windows)]
+    impl LapsesAfter {
+        const fn new(allowed: usize) -> Self {
+            Self {
+                allowed,
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Standing for LapsesAfter {
+        fn while_standing(
+            &self,
+            publish: &mut dyn FnMut() -> std::io::Result<()>,
+        ) -> Result<std::io::Result<()>> {
+            if self.asked.fetch_add(1, Ordering::SeqCst) >= self.allowed {
+                return Err(ControllerError::WindowExpired {
+                    detail: "the step's window closed while its rename was being tried again"
+                        .to_owned(),
+                });
+            }
+            Ok(publish())
+        }
+    }
+
+    /// KR-REQ-03.07: every attempt at the rename asks whether the approval stands, so a record that
+    /// is let go after the approval lapsed is not replaced: the step ends at the attempt the lapse
+    /// meets, with the old record and no temporary file. The control is the same step with an
+    /// approval that never lapses, which replaces the record at its second attempt.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_let_go_after_its_approval_lapsed_is_not_replaced() {
+        for lapses in [true, false] {
+            let environment = Environment::create();
+            let store = environment.open();
+            let before = store.group().expect("reads the group");
+            let kept = std::fs::read(environment.record()).expect("reads the record");
+            let standing = LapsesAfter::new(if lapses { 1 } else { usize::MAX });
+            let mut holding = Some(hold_without_shared_deletion(&environment.record()));
+            // The first attempt is refused because the record is held, and the holder lets go
+            // before the second.
+            let hook = kr_flush::testing::after_held_refusal(move || {
+                holding.take();
+            });
+            let started = std::time::Instant::now();
+            let answer = store.join(
+                &environment.lock,
+                some_group(),
+                before.expected(),
+                &approval_standing(&standing),
+                2_000,
+            );
+            drop(hook);
+            assert_eq!(standing.asked(), 2, "each attempt asked once");
+            if lapses {
+                let refused = answer.expect_err("the lapsed approval does not replace the record");
+                assert!(
+                    matches!(refused, ControllerError::WindowExpired { .. }),
+                    "the refusal is the standing's own: {refused:?}"
+                );
+                assert!(
+                    started.elapsed() < kr_flush::HELD_RENAME_BOUND,
+                    "the step did not wait out the bound"
+                );
+                assert_eq!(
+                    std::fs::read(environment.record()).expect("reads the record"),
+                    kept,
+                    "the record was replaced after the approval lapsed"
+                );
+                assert_eq!(environment.reopened(), before);
+            } else {
+                let joined = answer.expect("the record is replaced at the second attempt");
+                assert_eq!(environment.reopened(), joined);
+            }
+            assert_eq!(
+                leftovers(environment.paths().state_dir()),
+                Vec::<String>::new(),
+                "no temporary file is left"
+            );
+        }
+    }
+
     /// Runs `publication` held at the point its record's name changed, while `directory` is held
     /// without shared writing, and returns its answer once it has been let go on.
     #[cfg(windows)]
