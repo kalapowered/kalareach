@@ -1684,14 +1684,14 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // A bare file name, which is made in the directory the command is run in. The command writes the
+    // file and then makes the name durable, and a name with no directory in it is not a failure.
     let file = world.export_path("here");
-    let exported = world.run(&[
-        "--json",
-        "export",
-        &display,
-        "--output",
-        file.to_str().expect("a path"),
-    ]);
+    let exported = world
+        .kr(&["--json", "export", &display, "--output", "here.json"])
+        .current_dir(world.source.root())
+        .output()
+        .expect("runs kr");
     assert!(
         exported.status.success(),
         "kr export: {}; it said {}",
@@ -2082,9 +2082,10 @@ async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_li
     assert_eq!(here["sessions"].as_array().map_or(0, Vec::len), 0, "{here}");
 }
 
-/// KR-REQ-03.14, 03.17: a stopped container is listed from the cache and started by nothing but a
-/// refresh that is told to, a create or an attach; the container's own daemon is then started by the
-/// container's own startup, and the identity is the one it had before it stopped.
+/// KR-REQ-03.14, 03.17: a stopped container is listed from the cache and started by a create, and by
+/// nothing a listing does; the container's own daemon is then started by the container's own startup,
+/// and the identity is the one it had before it stopped. A refresh told to start it and an attach
+/// start it by the same step, which this test does not drive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
     if !runtime_available() {
