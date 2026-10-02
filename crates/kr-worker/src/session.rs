@@ -42,11 +42,11 @@ use crate::attachments::AttachmentTable;
 use crate::error::{Result, WorkerError};
 use crate::history::{OutputHistory, SpoolLayout};
 use crate::input::{InputLease, LeaseRefusal, PasteFramer};
-use crate::journal::Journal;
+use crate::journal::{Journal, Kept};
 use crate::output::{EffectOutcome, OutputHub, OutputStream, OwedEffect};
 use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
-use kr_term::sideeffect::{SideEffect, SideEffectDestination};
+use kr_term::sideeffect::{SideEffect, SideEffectDestination, SideEffectKind};
 
 /// What section 7 tells a caller whose attachment this host cannot name.
 pub const DETACH_HINT: &str = "Use kr detach --attachment <id> to detach";
@@ -140,6 +140,18 @@ impl Piece {
             Self::Effect(owed) => (owed.effect.at, true),
         }
     }
+}
+
+/// The side effects one delivery kept as host events instead of sending, by why.
+///
+/// They are recorded together, in the order the application caused them, whichever way each was
+/// kept.
+#[derive(Default)]
+struct Unrecorded {
+    /// Effects with no destination, or whose destination could not take them.
+    undelivered: Vec<Arc<SideEffect>>,
+    /// Clipboard writes whose destination's terminal takes none.
+    declined: Vec<Arc<SideEffect>>,
 }
 
 /// What ending a lease established, read on the boundary the writer shares.
@@ -1871,6 +1883,16 @@ impl Session {
         })
     }
 
+    /// Records that the terminal an attachment presents takes no clipboard writes.
+    ///
+    /// A clipboard write the application asks for while that attachment holds the input lease is
+    /// then a durable host event of its own kind and is sent to nobody. It narrows what this
+    /// attachment is sent and nothing else: another attachment is never given what this one
+    /// declines, and every other effect still reaches it.
+    pub fn decline_clipboard_writes(&mut self, attachment_id: AttachmentId) {
+        self.attachments.decline_clipboard_writes(attachment_id);
+    }
+
     /// Returns the attachment the capability one accepted line holds names.
     ///
     /// # Errors
@@ -3191,10 +3213,22 @@ impl Session {
     /// What is kept is what each effect asked for and where in the stream it happened. A journal
     /// that cannot take them has faulted, and says so to everything that reads the journal's
     /// condition.
-    fn record_host_events(&mut self, effects: &mut [Arc<SideEffect>]) {
-        effects.sort_by_key(|effect| effect.at);
+    fn record_host_events(&mut self, unrecorded: &mut Unrecorded) {
+        let mut kept: Vec<(&SideEffect, Kept)> = unrecorded
+            .undelivered
+            .iter()
+            .map(|effect| (effect.as_ref(), Kept::Undelivered))
+            .chain(
+                unrecorded
+                    .declined
+                    .iter()
+                    .map(|effect| (effect.as_ref(), Kept::Declined)),
+            )
+            .collect();
+        // The order they began in, whichever way each was kept.
+        kept.sort_by_key(|(effect, _)| effect.at);
         if let Some(journal) = self.journal.as_mut() {
-            let _ = journal.record_host_events(effects.iter().map(AsRef::as_ref), kr_ipc::now_ms());
+            let _ = journal.record_kept_host_events(kept, kr_ipc::now_ms());
         }
     }
 
@@ -3205,7 +3239,10 @@ impl Session {
     /// never sent the beginning of its stream, because only a gap notice reached it or its
     /// restoration stopped part way. Each is a host event rather than something lost.
     pub fn record_abandoned_effects(&mut self, effects: &mut [Arc<SideEffect>]) {
-        self.record_host_events(effects);
+        self.record_host_events(&mut Unrecorded {
+            undelivered: effects.to_vec(),
+            declined: Vec::new(),
+        });
     }
 
     /// Delivers one side effect to the attachment it was routed to, or leaves it to be recorded.
@@ -3222,23 +3259,37 @@ impl Session {
         owed: &OwedEffect,
         oldest: u64,
         resynchronised: &mut Vec<AttachmentId>,
-        unrecorded: &mut Vec<Arc<SideEffect>>,
+        unrecorded: &mut Unrecorded,
     ) {
         let SideEffectDestination::Attachment { id, epoch } = owed.effect.destination else {
-            unrecorded.push(Arc::clone(&owed.effect));
+            unrecorded.undelivered.push(Arc::clone(&owed.effect));
             return;
         };
         if self.lease.holder() != Some(id) || self.lease.epoch() != epoch.get() {
-            unrecorded.push(Arc::clone(&owed.effect));
+            unrecorded.undelivered.push(Arc::clone(&owed.effect));
+            return;
+        }
+        // The holder's terminal may take no clipboard writes: an attachment that arrived over a
+        // process bridge from an environment whose owner named no clipboard destination says so.
+        // The write is sent to nobody, which is what makes a destination the owner chose the only
+        // one a clipboard write reaches, and is a host event of its own kind so that what was
+        // asked, and when, is not lost.
+        if matches!(owed.effect.kind, SideEffectKind::ClipboardWrite { .. })
+            && self
+                .attachments
+                .get(id)
+                .is_some_and(|attachment| !attachment.clipboard_writes)
+        {
+            unrecorded.declined.push(Arc::clone(&owed.effect));
             return;
         }
         match self.hub.publish_effect(id, owed, oldest) {
             EffectOutcome::Queued => {}
             EffectOutcome::Overflowed => {
                 resynchronised.push(id);
-                unrecorded.push(Arc::clone(&owed.effect));
+                unrecorded.undelivered.push(Arc::clone(&owed.effect));
             }
-            EffectOutcome::Refused => unrecorded.push(Arc::clone(&owed.effect)),
+            EffectOutcome::Refused => unrecorded.undelivered.push(Arc::clone(&owed.effect)),
         }
     }
 
@@ -3256,7 +3307,7 @@ impl Session {
         oldest: u64,
         effects: &mut Vec<OwedEffect>,
         resynchronised: &mut Vec<AttachmentId>,
-        unrecorded: &mut Vec<Arc<SideEffect>>,
+        unrecorded: &mut Unrecorded,
     ) {
         let (owed, rest): (Vec<_>, Vec<_>) =
             std::mem::take(effects).into_iter().partition(|owed| {
@@ -3318,8 +3369,10 @@ impl Session {
         // makes each a durable host event rather than something shown to whoever is watching, and so
         // is every effect below that has nowhere to go: they are all kept at the end of the call,
         // in one transaction.
-        let mut unrecorded: Vec<Arc<SideEffect>> =
-            filtered.host_events.into_iter().map(Arc::new).collect();
+        let mut unrecorded = Unrecorded {
+            undelivered: filtered.host_events.into_iter().map(Arc::new).collect(),
+            declined: Vec::new(),
+        };
         let oldest = self.history.oldest_retained_cursor();
         let next = self.history.next_cursor();
         let mut resynchronised = Vec::new();

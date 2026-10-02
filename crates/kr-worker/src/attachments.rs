@@ -73,6 +73,14 @@ pub struct Attachment {
     /// reset that brings a window above the live page back to the live screen. Every screen
     /// installed on the attachment names the revision of the window it is drawn for.
     pub window_revision: u64,
+    /// Whether the terminal this attachment presents takes the clipboard writes the application
+    /// asks for.
+    ///
+    /// It starts true: an attachment that said nothing about its terminal is one on this host,
+    /// which is the terminal the write is for. It is turned off by an attachment that arrived
+    /// over a process bridge from an environment whose owner named no clipboard destination, and
+    /// it only ever narrows what that attachment is sent. It grants nothing to anybody else.
+    pub clipboard_writes: bool,
 }
 
 impl Attachment {
@@ -441,6 +449,7 @@ impl AttachmentTable {
             anchor: crate::projection::ViewportAnchor::default(),
             column: 0,
             window_revision: 0,
+            clipboard_writes: true,
         };
         let eligible = attachment.is_eligible();
         self.attachments.insert(ordinal, attachment);
@@ -630,6 +639,20 @@ impl AttachmentTable {
         if let Some(attachment) = self.attachments.get_mut(ordinal) {
             attachment.restoration_continues = continues;
         }
+    }
+
+    /// Records that the terminal one attachment presents takes no clipboard writes.
+    ///
+    /// Returns whether the attachment is there to be told.
+    pub fn decline_clipboard_writes(&mut self, id: AttachmentId) -> bool {
+        let Some(ordinal) = self.by_id.get(&id) else {
+            return false;
+        };
+        let Some(attachment) = self.attachments.get_mut(ordinal) else {
+            return false;
+        };
+        attachment.clipboard_writes = false;
+        true
     }
 
     /// Records whether one attachment is being held out of live byte forwarding.

@@ -5902,6 +5902,14 @@ impl WorkerService {
                     // it: a revision or the grant's own expiry takes its input lease away.
                     session.note_granted_attachment(attachment_id);
                 }
+                // An invoker that attached through a process bridge says whether the terminal it
+                // attaches from takes the clipboard writes this session asks for. One that says it
+                // does not is sent none: its owner named no clipboard destination for this
+                // environment, so no write leaves it. A connection that declared no origin is a
+                // local client, whose terminal is the destination.
+                if state.origin.is_some_and(|origin| !origin.clipboard_writes) {
+                    session.decline_clipboard_writes(attachment_id);
+                }
                 state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
@@ -6688,7 +6696,10 @@ pub struct ConnectionState {
     ///
     /// It is a record of how the connection arrived and never authority. What a request may do is
     /// decided by the operating-system identity of the peer and the actor envelope built from it,
-    /// and no decision reads this, so a later reader must not take it for something checked.
+    /// and no decision about authority reads this, so a later reader must not take it for
+    /// something checked. One thing does read it: an attachment made on a connection whose origin
+    /// says its terminal takes no clipboard writes is sent none. That only narrows what the
+    /// attachment is sent.
     pub origin: Option<kr_protocol::local::BridgeOrigin>,
     /// What the peer said it can receive. Nothing this worker sends exceeds it.
     pub peer_limits: kr_protocol::hello::ReceiveLimits,

@@ -239,6 +239,7 @@ impl Store {
     ) -> Result<EnvironmentInventoryRow> {
         enrolment
             .validate()
+            .and_then(|()| enrolment.validate_clipboard_destination())
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The approval is this host's own record of when the owner approved it, not a value the
         // caller supplies: a request that set it into the future would make a row look fresher
@@ -663,6 +664,43 @@ mod tests {
                 .approved(EnvironmentId::new(Uuid::from_bytes([9; 16])), 300)
                 .is_none()
         );
+    }
+
+    /// KR-REQ-18.11: a record is made with the terminal as its clipboard destination or with none, and
+    /// a record that names any other destination is not made. One that was made with another, by a
+    /// build that took any text, is still a record of an environment this host reaches: it is listed,
+    /// its helper is launched, and it takes no clipboard writes.
+    #[test]
+    fn a_clipboard_destination_is_the_terminal_or_none_when_a_record_is_made() {
+        let (directory, mut store) = store();
+        let mut named = enrolment(1, "ubuntu");
+        named.clipboard_destination = Nullable::some("terminal".to_owned());
+        store
+            .enrol(named, 100)
+            .expect("the terminal is a destination");
+        assert_eq!(store.list(None, 100).len(), 1);
+
+        let mut other = enrolment(2, "debian");
+        other.clipboard_destination = Nullable::some("clipboard-sync".to_owned());
+        let refused = store.enrol(other.clone(), 100).expect_err("refused");
+        assert!(
+            refused.to_string().contains("only clipboard destination"),
+            "{refused}"
+        );
+        assert_eq!(store.list(None, 100).len(), 1, "and nothing was recorded");
+
+        // What an earlier build recorded: written into the file as it was, then read.
+        let path = directory.path().join("environments.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the record")).expect("JSON");
+        document["enrolments"][0]["clipboard_destination"] = serde_json::json!("clipboard-sync");
+        std::fs::write(&path, serde_json::to_vec(&document).expect("encodes")).expect("written");
+        let reopened = Store::open(directory.path()).expect("an earlier record is read");
+        let rows = reopened.list(None, 100);
+        assert_eq!(rows.len(), 1, "it is still listed");
+        assert!(!rows[0].enrolment.takes_clipboard_writes());
+        crate::bridge::launch::command(&rows[0].enrolment)
+            .expect("and a helper is still launched for it");
     }
 
     #[test]
