@@ -1418,10 +1418,10 @@ mod tests {
             let revision = self.controller.policy().authority_revision();
             self.controller.admitted_table().insert(
                 connection_id,
-                AdmittedConnection {
-                    actor_id: kr_transport::listener::device_principal(&self.device_id),
-                    admitted_revision: revision,
-                },
+                AdmittedConnection::new(
+                    kr_transport::listener::device_principal(&self.device_id),
+                    revision,
+                ),
             );
             AdmittedMutation {
                 connection_id,
