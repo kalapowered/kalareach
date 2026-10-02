@@ -1590,6 +1590,11 @@ impl Engine {
         if (!released && !held_over_an_untaken_one) || item.decided_at_ms.is_none() {
             item.decided_at_ms = Some(reading.wall_ms);
             item.decided_privacy = reading.privacy;
+        } else if held_over_an_untaken_one && reading.privacy.is_some_and(|stamp| stamp.private) {
+            // The held decision is made while privacy mode is on, whatever the untaken one before it
+            // was decided under, and it is never sent once the mode is off: its state wins over the
+            // earlier one's, which would otherwise carry it past the lift when the hours end.
+            item.decided_privacy = reading.privacy;
         }
         item.announced_anchor = Some(reading.anchor());
         if quiet {

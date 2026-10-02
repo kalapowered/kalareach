@@ -105,7 +105,7 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// The schema this build writes and reads.
 ///
 /// A store written under any other version is refused rather than read, except the one before it,
-/// which is brought forward once as it is opened ([`migrate_from_nine`]). Two things in here are
+/// which is brought forward once as it is opened. Two things in here are
 /// derived rather than stored on their own - an item's key, and the order a review page continues
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
