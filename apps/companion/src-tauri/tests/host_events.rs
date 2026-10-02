@@ -36,7 +36,7 @@ mod scripted_worker;
 #[cfg(target_os = "macos")]
 mod macos {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use kr_protocol::envelope::ParamsValue;
@@ -101,15 +101,26 @@ mod macos {
         returned.max(verdict.load(Ordering::SeqCst))
     }
 
-    fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) -> Result<(), String> {
+    /// How long the check waits for something the web view does, before it calls the thing never
+    /// done. What it waits for is the web view's own work: a web process that starts, a page that
+    /// loads and runs its script, and an event that crosses to it and back as a new title. On a
+    /// machine with every core busy each of those takes as long as the machine takes, and the wait
+    /// ends the moment the thing is done, so the bound only says that it will not be.
+    const LIVENESS: Duration = Duration::from_secs(120);
+
+    /// Waits until `done` holds and says how long that took, so that a run under load shows how
+    /// much of the bound it used.
+    fn wait_for(what: &str, done: impl Fn() -> bool) -> Result<Duration, String> {
         let started = Instant::now();
         while !done() {
-            if started.elapsed() > limit {
-                return Err(format!("{what} did not happen within {limit:?}"));
+            if started.elapsed() > LIVENESS {
+                return Err(format!("{what} did not happen within {LIVENESS:?}"));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Ok(())
+        let took = started.elapsed();
+        println!("host_events: {what} took {took:.1?}");
+        Ok(took)
     }
 
     /// What the page says, which it says in the window's title.
@@ -127,16 +138,30 @@ mod macos {
         runtime: &tokio::runtime::Runtime,
         mut worker: ScriptedWorker,
     ) -> Result<(), String> {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&loads);
         let window =
             WebviewWindowBuilder::new(app, INTERFACE_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("opening")
                 .inner_size(320.0, 240.0)
+                .on_page_load(move |_window, payload| {
+                    if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                        counting.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
                 .build()
                 .map_err(|error| error.to_string())?;
-        // The listener is registered through the event IPC before the page says so.
-        wait_for("the page listening", Duration::from_secs(20), || {
-            said(&window) != "opening"
+        // The listener is registered through the event IPC before the page says so. A failed wait
+        // says how far the page got, which tells a page that never loaded from one that loaded and
+        // never said it listened.
+        wait_for("the page listening", || said(&window) != "opening").map_err(|failure| {
+            format!(
+                "{failure}; {} page loads finished and the window's title is {:?}",
+                loads.load(Ordering::SeqCst),
+                said(&window)
+            )
         })?;
+        let listened_after = loads.load(Ordering::SeqCst);
         if said(&window) != "listening" {
             return Err(format!(
                 "the page could not listen for the host's events: {}",
@@ -175,10 +200,16 @@ mod macos {
             )
             .await;
         });
-        wait_for(
-            "the page hearing both events",
-            Duration::from_secs(20),
-            || heard(&window).len() >= 2,
+        wait_for("the page hearing both events", || heard(&window).len() >= 2).map_err(
+            |failure| {
+                format!(
+                    "{failure}; the page has heard {:?}, its window's title is {:?}, and {} page loads \
+                     finished, {listened_after} of them before it listened",
+                    heard(&window),
+                    said(&window),
+                    loads.load(Ordering::SeqCst)
+                )
+            },
         )?;
         let expected = vec![
             json!({
