@@ -213,13 +213,22 @@ enum DeviceProbe {
         let filed = container().appendingPathComponent("probe-push.json")
         try? FileManager.default.removeItem(at: filed)
         try? FileManager.default.removeItem(at: container().appendingPathComponent("probe-push.txt"))
+        // Nor may an arrival an earlier leg recorded be taken for this leg's.
+        NotificationRecorder.forget()
         guard FirebaseApp.app() != nil else {
             finish(.push, ["firebase": "skipped", "firebase.reason": PushStartup.skippedBecause ?? "not configured"])
             return
         }
         NotificationRecorder.install()
+        // A leg that keeps this process alive asks it to read what was delivered, which a fresh
+        // start would do by launching in that mode.
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, { _, _, _, _, _ in
+            DispatchQueue.main.async { DeviceProbe.pushRead() }
+        }, "to.kala.reach.probe.push-read" as CFString, nil, .deliverImmediately)
         let nonce = UUID().uuidString
         var facts = fileFixtures(nonce: nonce)
+        // Which process this is, so a leg can tell the same one from one started afterwards.
+        facts["pid"] = String(ProcessInfo.processInfo.processIdentifier)
         facts["nonce.digest"] = SHA256.hash(data: Data(nonce.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
 
         pushReport = PushCheckReport(
@@ -279,7 +288,7 @@ enum DeviceProbe {
         }
     }
 
-    private static func pushRead() {
+    fileprivate static func pushRead() {
         // The nonce of the send being read, which the push check filed with its token.
         let filed = (try? Data(contentsOf: container().appendingPathComponent("probe-push.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
@@ -296,6 +305,7 @@ enum DeviceProbe {
             facts["other_marked"] = String(sorted.otherMarked)
             facts["nonce.known"] = nonce == nil ? "0" : "1"
             facts["presented_in_front"] = String(NotificationRecorder.presented())
+            facts["pid"] = String(ProcessInfo.processInfo.processIdentifier)
             UNUserNotificationCenter.current().removeAllDeliveredNotifications()
             DispatchQueue.main.async { finish(.pushRead, facts) }
         }
@@ -311,6 +321,11 @@ final class NotificationRecorder: NSObject, UNUserNotificationCenterDelegate {
 
     static func install() {
         UNUserNotificationCenter.current().delegate = shared
+    }
+
+    /// Forgets the arrivals an earlier check recorded.
+    static func forget() {
+        try? FileManager.default.removeItem(at: file)
     }
 
     static func presented() -> Int {
@@ -348,7 +363,33 @@ enum Shots {
         CFNotificationCenterAddObserver(center, nil, { _, _, _, _, _ in
             DispatchQueue.main.async { Shots.capture() }
         }, name, nil, .deliverImmediately)
+        // The insets alone, with no picture, for a test that waits for the phone to finish turning.
+        CFNotificationCenterAddObserver(center, nil, { _, _, _, _, _ in
+            DispatchQueue.main.async {
+                if let window = ProbeSurface.keyWindow() { Shots.publishInsets(of: window) }
+            }
+        }, "to.kala.reach.probe.insets" as CFString, nil, .deliverImmediately)
         ProbeSurface.shared.show("shots", "0")
+    }
+
+    private static var readings = 0
+
+    /// The safe-area insets and the way up the interface is, as the application has them now, which
+    /// a test cannot see from outside. Every reading has a number of its own, so a test can tell a
+    /// new reading from the one before it when nothing changed.
+    fileprivate static func publishInsets(of window: UIWindow) {
+        let insets = window.safeAreaInsets
+        readings += 1
+        let orientation = window.windowScene?.interfaceOrientation
+        let up: String
+        switch orientation {
+        case .portrait: up = "portrait"
+        case .portraitUpsideDown: up = "portraitUpsideDown"
+        case .landscapeLeft: up = "landscapeLeft"
+        case .landscapeRight: up = "landscapeRight"
+        default: up = "unknown"
+        }
+        ProbeSurface.shared.show("insets", "reading=\(readings);orientation=\(up);top=\(Int(insets.top.rounded()));left=\(Int(insets.left.rounded()));bottom=\(Int(insets.bottom.rounded()));right=\(Int(insets.right.rounded()))")
     }
 
     private static func capture() {
@@ -369,10 +410,7 @@ enum Shots {
         taken += 1
         let file = directory.appendingPathComponent(String(format: "shot-%02d.png", taken))
         try? image.pngData()?.write(to: file)
-        // The safe-area insets as the application has them now, which a test cannot see from outside
-        // and compares its controls against after a turn of the phone.
-        let insets = first.safeAreaInsets
-        ProbeSurface.shared.show("insets", "top=\(Int(insets.top.rounded()));left=\(Int(insets.left.rounded()));bottom=\(Int(insets.bottom.rounded()));right=\(Int(insets.right.rounded()))")
+        publishInsets(of: first)
         ProbeSurface.shared.show("shots", String(taken))
     }
 }
