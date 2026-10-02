@@ -178,6 +178,18 @@ impl SeedTrust {
         }
     }
 
+    /// The trust of a test that admits the development set, naming the key identifiers of
+    /// `root`'s own role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::Untrusted`] when the root cannot be read.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn trusting_root_of(root: &[u8]) -> CatalogueResult<Self> {
+        let (keys, _) = root_role(root)?;
+        Ok(Self::named(Vec::new(), 1, Some(keys)))
+    }
+
     /// Decides whether this trust names the root, from its own bytes.
     ///
     /// # Errors
@@ -264,6 +276,148 @@ impl SeedBundle {
         trust: SeedTrust,
     ) -> CatalogueResult<Self> {
         Self::assemble(lock, files, trust)
+    }
+
+    /// A bundle made of a generation published in a directory (`metadata/` and `targets/`), with a
+    /// lock written for every package its index lists whose files are there, trusting `trust`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::embedded`] returns for the files found.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn from_directory(directory: &std::path::Path, trust: SeedTrust) -> CatalogueResult<Self> {
+        let unreadable = |error: std::io::Error| CatalogueError::StorageUnavailable {
+            detail: format!("{} cannot be read: {error}", directory.display()),
+        };
+        let mut files = BTreeMap::new();
+        let mut pending = vec![directory.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).map_err(unreadable)? {
+                let path = entry.map_err(unreadable)?.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(directory)
+                    .map_or_else(|_| path.clone(), std::path::Path::to_path_buf)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative.starts_with("metadata/") || relative.starts_with("targets/") {
+                    files.insert(relative, std::fs::read(&path).map_err(unreadable)?);
+                }
+            }
+        }
+        let integrity = |detail: String| CatalogueError::Integrity { detail };
+        let index: CatalogueIndex = serde_json::from_slice(
+            files
+                .get("targets/index.json")
+                .ok_or_else(|| integrity("the directory carries no index".to_owned()))?,
+        )
+        .map_err(|source| integrity(format!("its index cannot be read: {source}")))?;
+        let highest = files
+            .keys()
+            .filter_map(|path| {
+                path.strip_prefix("metadata/")?
+                    .strip_suffix(".root.json")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .ok_or_else(|| integrity("the directory ships no numbered root".to_owned()))?;
+        let root_bytes = files[&format!("metadata/{highest}.root.json")].clone();
+        let root: serde_json::Value = serde_json::from_slice(&root_bytes)
+            .map_err(|source| integrity(format!("its root cannot be read: {source}")))?;
+        let describe = |path: &str| {
+            let bytes = &files[path];
+            serde_json::json!({
+                "path": path,
+                "digest": PayloadDigest::of(bytes).to_string(),
+                "size_bytes": bytes.len().to_string(),
+            })
+        };
+        let mut metadata: Vec<serde_json::Value> = files
+            .keys()
+            .filter(|path| path.starts_with("metadata/") || path.as_str() == "targets/index.json")
+            .map(|path| describe(path))
+            .collect();
+        metadata.sort_by_key(|entry| entry["path"].as_str().map(str::to_owned));
+        let mut packages = Vec::new();
+        let mut kept: Vec<String> = Vec::new();
+        for entry in &index.entries {
+            let prefix = format!(
+                "targets/packages/{}/{}/{}",
+                entry.publisher_id, entry.plugin_name, entry.version
+            );
+            let names: Vec<String> = std::iter::once("plugin.json".to_owned())
+                .chain(
+                    entry
+                        .payloads
+                        .iter()
+                        .map(|payload| payload.path.to_string()),
+                )
+                .collect();
+            if names
+                .iter()
+                .any(|name| !files.contains_key(&format!("{prefix}/{name}")))
+            {
+                continue;
+            }
+            kept.extend(names.iter().map(|name| format!("{prefix}/{name}")));
+            let payloads: Vec<serde_json::Value> = entry
+                .payloads
+                .iter()
+                .map(|payload| {
+                    serde_json::json!({
+                        "role": serde_json::to_value(payload.role).unwrap_or_default(),
+                        "path": payload.path.as_str(),
+                        "digest": payload.digest.to_string(),
+                        "size_bytes": payload.size_bytes.get().to_string(),
+                    })
+                })
+                .collect();
+            packages.push(serde_json::json!({
+                "directory": prefix,
+                "plugin_id": entry.plugin_id.to_string(),
+                "publisher_id": entry.publisher_id.to_string(),
+                "plugin_name": entry.plugin_name.to_string(),
+                "version": entry.version.to_string(),
+                "sdk_range": entry.sdk_range.to_string(),
+                "wit_range": entry.wit_range.to_string(),
+                "manifest": {
+                    "path": "plugin.json",
+                    "digest": entry.manifest_digest.to_string(),
+                    "size_bytes": entry.manifest_size_bytes.get().to_string(),
+                },
+                "payloads": payloads,
+                "total_size_bytes": entry.total_size_bytes.get().to_string(),
+            }));
+        }
+        files.retain(|path, _| {
+            path.starts_with("metadata/")
+                || path == "targets/index.json"
+                || kept.iter().any(|name| name == path)
+        });
+        let lock = serde_json::json!({
+            "lock_version": 2,
+            "source": {
+                "repository": "https://example.invalid/plugins",
+                "commit": "0123456789abcdef0123456789abcdef01234567",
+                "generation_path": "snapshots/test",
+                "tree_url": "https://example.invalid/tree",
+                "generation": index.generation.get().to_string(),
+                "produced_at": index.produced_at.get().to_string(),
+            },
+            "trust_root": {
+                "digest": PayloadDigest::of(&root_bytes).to_string(),
+                "version": highest,
+                "expires": root["signed"]["expires"],
+                "key_ids": root["signed"]["roles"]["root"]["keyids"],
+            },
+            "metadata": metadata,
+            "packages": packages,
+        });
+        Self::assemble(lock.to_string().as_bytes(), files, trust)
     }
 
     fn assemble(
@@ -983,6 +1137,24 @@ impl Catalogue {
                 Ok(((), Transition::SeedRecorded))
             },
         )
+    }
+
+    /// Where the generation the seed activated for `id` came from, as the seed recorded it, where
+    /// the seed made that enrolment and its owner has not removed it: the repository and commit
+    /// the bundle was copied at, the generation, and the root it was verified against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the records cannot be read.
+    pub fn seed_provenance(&self, id: &RepositoryId) -> CatalogueResult<Option<serde_json::Value>> {
+        let Some(enrolled) = self.db.read(|records| records.enrolment(id))? else {
+            return Ok(None);
+        };
+        let name = format!("{PROVENANCE}{}", enrolled.key);
+        Ok(self
+            .db
+            .read(|records| records.setting(&name))?
+            .and_then(|text| serde_json::from_str(&text).ok()))
     }
 
     /// What the seed has recorded, by record name: which enrolment it made, where the generation
