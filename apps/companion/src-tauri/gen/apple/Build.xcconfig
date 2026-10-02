@@ -9,6 +9,8 @@
 // build setting does not expand `~`.
 //
 //   KR_GOOGLE_SERVICE_INFO   the path of this account's GoogleService-Info.plist
+//   AppIdentifierPrefix      the team's prefix with its dot, for a build made with signing off, which
+//                            cannot take it from a provisioning profile as a signed build does
 //   KR_SIGN_STYLE            Manual, to sign with the profiles below; Automatic otherwise
 //   KR_SIGN_IDENTITY         the signing identity
 //   KR_SIGN_FLAGS            extra flags for codesign, such as --keychain <file>
