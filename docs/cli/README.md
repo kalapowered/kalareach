@@ -1488,10 +1488,18 @@ A control daemon the update stopped that does not start again, from either relea
 with 1 and name the daemon; the update stays recorded, and the next `kr host update` starts that
 daemon before anything else.
 
-With `--json`, `kr host update` answers with `source`, `target`, whether it only checked
-(`checked_only`), the environments whose daemons it started again (`restarted`) and the releases it
-removed (`removed`), and `kr host versions` with one
-object per release: `release`, `sequence`, and whether it is `current`, `previous`, `staged` or
+An environment whose daemon has not run since an earlier schema step does not stop an update: the
+update brings its registry forward before it classes it, and says so. An environment that is no
+longer present (perhaps the container has been removed) will be named by its recorded roots, and skipped. See
+`docs/host/updates.md` for details.
+
+With `--json`, `kr host update` returns JSON with the keys `source`, `target`, `checked_only`
+(whether it only checked), `restarted` (the environments whose daemons it started again), `carried`
+(the registries it brought forward, each a map with the keys `environment`, `from` and `to`, where
+`from` is the schema the registry was at and `to` the schema the migration brought it to), `not_reached` (the
+recorded environments it could not reach, each a map with the keys `runtime_root`, `state_root` and
+`reason`) and `removed` (the releases it removed). `kr host versions` returns one object per
+release, with the keys `release`, `sequence`, and whether it is `current`, `previous`, `staged` or
 `held` by a running program. `docs/host/updates.md` has the store, how a release is checked, the
 handover and what happens when an update stops part way.
 

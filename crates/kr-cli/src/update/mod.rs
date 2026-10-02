@@ -25,9 +25,12 @@
 //!    told to stop, in turn. The first that answers that it does not stop ends the telling: the
 //!    daemons not yet told resume, and those told are waited for to have gone, up to thirty
 //!    seconds from the last telling, before anything is started again. Every environment's lock is
-//!    held, and every record of every registry is classed (`inventory::classify`). Anything
-//!    that holds the update restarts the daemons it stopped, from the release still current, and
-//!    the update waits.
+//!    held, a registry that records an earlier schema than this release reads is brought forward
+//!    (`inventory::carry_forward`: the environment's daemon did not run since the earlier schema
+//!    step), and every record of every registry is classed (`inventory::classify`). A recorded
+//!    environment whose identity cannot be looked at because what holds it is gone is named in the
+//!    outcome and passed over. Anything that holds the update restarts the daemons it stopped, from
+//!    the release still current, and the update waits.
 //! 6. `current` is switched in one rename, the locks are let go, each daemon is started as it was
 //!    before, from the new release, and each is waited for to answer as a daemon of it.
 //! 7. Releases nothing needs are removed: not the current one, not the previous one, not one
