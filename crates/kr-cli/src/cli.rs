@@ -1279,7 +1279,7 @@ pub struct ExportArguments {
     #[arg(long)]
     pub environment: Option<String>,
     /// The most retained output to read, in bytes. The start of what is retained is kept.
-    #[arg(long, default_value_t = crate::export::DEFAULT_MAX_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = crate::export::DEFAULT_MAX_BYTES)]
     pub max_bytes: u64,
 }
 
