@@ -434,6 +434,19 @@ impl World {
         }
     }
 
+    /// What the destination's daemon wrote to its log, from the end, for a failure to say.
+    fn destination_daemon_log(&self) -> String {
+        let log = self
+            .destination
+            .environment()
+            .state_dir()
+            .join("controller.log");
+        let text = std::fs::read_to_string(&log)
+            .unwrap_or_else(|error| format!("(no log at {}: {error})", log.display()));
+        let from = text.len().saturating_sub(4000);
+        text[text.ceil_char_boundary(from)..].to_owned()
+    }
+
     /// Creates an invisible session in the destination through the bridge, and returns what `kr`
     /// printed of it.
     fn create_in_destination(&self) -> Value {
@@ -451,9 +464,10 @@ impl World {
         ]);
         assert!(
             created.status.success(),
-            "kr new --environment dest: {}; it said {}",
+            "kr new --environment dest: {}; it said {}; the destination's daemon logged {}",
             String::from_utf8_lossy(&created.stdout),
-            String::from_utf8_lossy(&created.stderr)
+            String::from_utf8_lossy(&created.stderr),
+            self.destination_daemon_log()
         );
         serde_json::from_slice(&created.stdout).expect("kr printed JSON")
     }
