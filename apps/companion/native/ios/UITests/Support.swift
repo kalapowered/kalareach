@@ -41,13 +41,17 @@ class DeviceTestCase: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
-    /// On a simulator a failure leaves the application's tree and picture under /tmp, to find out
-    /// what was on the screen. A device test never does: nothing of a real phone is kept.
+    /// On a simulator, and only when the test run is asked for it with `KR_FAILURE_DUMP=1`, a failure
+    /// leaves the application's tree and picture under /tmp, to find out what was on the screen. A
+    /// device test never does: nothing of a real phone is kept. It is off by default because asking a
+    /// crashed or unresponsive application to describe itself can end the runner with a stack overflow.
     override func record(_ issue: XCTIssue) {
-        let name = name.replacingOccurrences(of: " ", with: "-").filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        try? FileManager.default.createDirectory(atPath: "/tmp/kalareach-ui-failures", withIntermediateDirectories: true)
-        try? app.debugDescription.write(toFile: "/tmp/kalareach-ui-failures/failure-\(name).txt", atomically: true, encoding: .utf8)
-        try? app.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/kalareach-ui-failures/failure-\(name).png"))
+        if ProcessInfo.processInfo.environment["KR_FAILURE_DUMP"] == "1", app.state == .runningForeground {
+            let name = name.replacingOccurrences(of: " ", with: "-").filter { $0.isLetter || $0.isNumber || $0 == "-" }
+            try? FileManager.default.createDirectory(atPath: "/tmp/kalareach-ui-failures", withIntermediateDirectories: true)
+            try? app.debugDescription.write(toFile: "/tmp/kalareach-ui-failures/failure-\(name).txt", atomically: true, encoding: .utf8)
+            try? app.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/kalareach-ui-failures/failure-\(name).png"))
+        }
         super.record(issue)
     }
     #endif

@@ -101,7 +101,9 @@ final class AccessibilityTests: HarnessTestCase {
             }
             if screen == .conversation {
                 for name in Self.attachmentLabels {
-                    let label = app.staticTexts[name].firstMatch
+                    // The label the finger meets is the element that carries the control's name and holds
+                    // its text; the static text inside it is only the text's own box.
+                    let label = app.otherElements.matching(NSPredicate(format: "label == %@", name)).firstMatch
                     guard label.exists else {
                         XCTFail("the \(name) control is not on the conversation")
                         continue
