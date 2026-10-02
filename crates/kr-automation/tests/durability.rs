@@ -529,3 +529,162 @@ fn a_journal_at_an_earlier_development_version_is_refused() {
         );
     }
 }
+
+/// What a journal an earlier build wrote holds for a create node that carried environment
+/// variables, and how the test finds it again on disk.
+const PLANTED: &str = "planted-secret-value-4f2a";
+
+/// Writes a journal as an earlier build left it: several revisions of two workflows, each with a
+/// create node whose parameters carry `PLANTED`, a create node that carries none, and a node of
+/// another kind, in `mode` (`delete` for a rollback journal, `wal` for a write-ahead log), at
+/// schema version 6.
+///
+/// The tables do not differ between version 6 and the version that follows it, so a journal of
+/// this build with the version put back is the journal an earlier build wrote.
+fn a_version_6_journal_that_holds_variables(directory: &std::path::Path, mode: &str) {
+    use kr_protocol::automation::{WorkflowActionKind, WorkflowNode};
+
+    let create_with = |variables: &[(&str, &str)]| {
+        let mut params = serde_json::from_str::<serde_json::Value>(&common::params(
+            WorkflowActionKind::CreateSession,
+        ))
+        .expect("the parameters of a create node");
+        params["environment_snapshot"] = variables
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect();
+        params.to_string()
+    };
+    let store = WorkflowStore::open(directory).expect("a journal");
+    // Several revisions of one workflow and a revision of another, the first with a description
+    // long enough that the nodes after it are not on the first page of the row.
+    for (workflow, revision, description) in [(1_u8, 1_u64, 24_000), (1, 2, 24_000), (2, 1, 0)] {
+        let mut definition = create_workflow_definition(
+            test_wf_id(workflow),
+            revision,
+            "installed-by-an-earlier-build",
+            test_grant_id(workflow),
+            vec![
+                WorkflowNode {
+                    node_id: "with-a-variable".to_owned(),
+                    action_kind: WorkflowActionKind::CreateSession,
+                    action_params: create_with(&[("KR_PLANTED", PLANTED), ("PATH", "/opt/x")]),
+                    declared_environment: Nullable::null(),
+                },
+                WorkflowNode {
+                    node_id: "with-none".to_owned(),
+                    action_kind: WorkflowActionKind::CreateSession,
+                    action_params: create_with(&[]),
+                    declared_environment: Nullable::null(),
+                },
+                common::node("another-kind", WorkflowActionKind::RunTests),
+            ],
+            vec![],
+        );
+        definition.description = Nullable::some("d".repeat(description));
+        store
+            .save_definition(&definition, 1000)
+            .expect("an earlier build's definition");
+    }
+    drop(store);
+    let connection =
+        rusqlite::Connection::open(directory.join(kr_automation::store::WORKFLOW_DB_NAME))
+            .expect("the journal opens");
+    let _: String = connection
+        .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+            row.get(0)
+        })
+        .expect("the journal's mode");
+    connection
+        .pragma_update(None, "user_version", 6_u32)
+        .expect("the earlier version");
+}
+
+/// Every byte the journal keeps on disk, the file and its write-ahead log.
+fn journal_bytes(directory: &std::path::Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for name in ["workflows.db", "workflows.db-wal", "workflows.db-journal"] {
+        if let Ok(read) = std::fs::read(directory.join(name)) {
+            bytes.extend(read);
+        }
+    }
+    bytes
+}
+
+fn holds(bytes: &[u8], needle: &str) -> bool {
+    bytes
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+/// KR-REQ-07.25: a journal an earlier build wrote held the environment variables a create node
+/// carried, in the text of each stored revision. Opening it takes them out of every revision, old
+/// and disabled ones included, and out of the file and its log, leaves the rest of each
+/// definition as it was, and moves the version, so that a second open finds nothing to do.
+#[test]
+fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carried() {
+    for mode in ["delete", "wal"] {
+        let directory = tempfile::tempdir().expect("a journal directory");
+        a_version_6_journal_that_holds_variables(directory.path(), mode);
+        assert!(
+            holds(&journal_bytes(directory.path()), PLANTED),
+            "{mode}: the journal this test starts from holds the variable"
+        );
+
+        let store = WorkflowStore::open(directory.path()).expect("the journal comes forward");
+        // Before the store is dropped: a log the last connection closes would be taken in then,
+        // and what is left of it after the open is what a crash would leave.
+        let bytes = journal_bytes(directory.path());
+        assert!(
+            !holds(&bytes, PLANTED),
+            "{mode}: the variable is still on disk after the open"
+        );
+        assert!(
+            !holds(&bytes, "KR_PLANTED"),
+            "{mode}: the variable's name is still on disk after the open"
+        );
+
+        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1)] {
+            let installed = store
+                .get_definition(test_wf_id(workflow), revision)
+                .expect("reads")
+                .expect("the revision is still installed");
+            let nodes = &installed.definition.nodes;
+            assert_eq!(nodes.len(), 3, "{mode}: {workflow}/{revision}");
+            for node in &nodes[..2] {
+                let params: serde_json::Value =
+                    serde_json::from_str(&node.action_params).expect("the node's parameters");
+                assert_eq!(
+                    params["environment_snapshot"],
+                    serde_json::json!([]),
+                    "{mode}: {workflow}/{revision} {}",
+                    node.node_id
+                );
+            }
+            // The rest of the definition is as it was installed.
+            assert_eq!(
+                nodes[2].action_params,
+                common::params(kr_protocol::automation::WorkflowActionKind::RunTests)
+            );
+            assert_eq!(installed.definition.name, "installed-by-an-earlier-build");
+        }
+        drop(store);
+
+        let connection = rusqlite::Connection::open(
+            directory
+                .path()
+                .join(kr_automation::store::WORKFLOW_DB_NAME),
+        )
+        .expect("the journal opens");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("the version");
+        assert_eq!(version, kr_automation::store::WORKFLOW_SCHEMA_VERSION);
+        assert_eq!(version, 7, "{mode}");
+        drop(connection);
+        assert!(
+            WorkflowStore::open(directory.path()).is_ok(),
+            "{mode}: a second open finds the journal as it is"
+        );
+    }
+}
