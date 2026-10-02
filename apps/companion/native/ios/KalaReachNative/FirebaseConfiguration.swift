@@ -64,7 +64,9 @@ enum FirebaseConfigurationCheck {
         }
         _ = text("PROJECT_ID")
         _ = text("GCM_SENDER_ID")
-        if let made = text("BUNDLE_ID"), made != bundleIdentifier {
+        // Firebase takes a file with no bundle identifier; one made for another application would
+        // never be sent a message for this one.
+        if let made = values["BUNDLE_ID"] as? String, !made.isEmpty, made != bundleIdentifier {
             found.append("BUNDLE_ID is not this application's identifier")
         }
         return found
@@ -73,8 +75,9 @@ enum FirebaseConfigurationCheck {
     /// The rules Firebase's installations library raises an exception for.
     private static func apiKeyProblems(_ key: String) -> [String] {
         var found: [String] = []
-        if key.count != 39 { found.append("API_KEY is not 39 characters") }
-        if !key.hasPrefix("A") { found.append("API_KEY does not start with A") }
+        // Firebase counts UTF-16 units and reads the first unit, so these do too.
+        if key.utf16.count != 39 { found.append("API_KEY is not 39 characters") }
+        if key.utf16.first != 0x41 { found.append("API_KEY does not start with A") }
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-_")
         if !allowed.isSuperset(of: CharacterSet(charactersIn: key)) {

@@ -73,6 +73,8 @@ enum DeviceProbe {
     static func finish(_ mode: ProbeMode, _ facts: [String: String]) {
         var report = ProbeReport()
         facts.forEach { report.set($0.key, $0.value) }
+        // Which run this is, so that a script reads its own check's file and never an old one.
+        if let run = ProbeArguments.run(from: CommandLine.arguments) { report.set("run", run) }
         let text = report.text
         try? text.write(to: container().appendingPathComponent("probe-\(mode.rawValue).txt"), atomically: true, encoding: .utf8)
         ProbeSurface.shared.show(mode.rawValue, text.replacingOccurrences(of: "\n", with: ";"))
@@ -361,6 +363,9 @@ enum Shots {
         }
         let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("shots")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if taken == 0 {
+            taken = ShotNumbering.next(existing: (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []) - 1
+        }
         taken += 1
         let file = directory.appendingPathComponent(String(format: "shot-%02d.png", taken))
         try? image.pngData()?.write(to: file)
