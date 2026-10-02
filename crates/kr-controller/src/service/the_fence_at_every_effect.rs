@@ -104,6 +104,7 @@ async fn performed_once(
             &mutation,
             Method::PrivacySet,
             connection_id,
+            None,
             Some(accepted(controller)),
             Some(revision),
         )
@@ -141,7 +142,7 @@ async fn a_fence_this_host_owes_stops_a_local_retrys_retained_answer() {
     let (connection_id, actor_id, mutation) = performed_once(&temp, &controller).await;
 
     let answered = controller
-        .perform(&actor_id, connection_id, mutation.clone())
+        .perform(&actor_id, connection_id, None, mutation.clone())
         .await;
     assert!(
         refusal(&answered).is_none(),
@@ -150,7 +151,7 @@ async fn a_fence_this_host_owes_stops_a_local_retrys_retained_answer() {
 
     controller.hold_fence(true);
     let refused = controller
-        .perform(&actor_id, connection_id, mutation.clone())
+        .perform(&actor_id, connection_id, None, mutation.clone())
         .await;
     let error = refusal(&refused).unwrap_or_else(|| {
         panic!("a retained answer is not given back while a fence is owed: {refused:?}")
@@ -159,7 +160,7 @@ async fn a_fence_this_host_owes_stops_a_local_retrys_retained_answer() {
     assert!(error.message.contains("fence"), "{error:?}");
 
     controller.hold_fence(false);
-    let answered = controller.perform(&actor_id, connection_id, mutation).await;
+    let answered = controller.perform(&actor_id, connection_id, None, mutation).await;
     assert!(
         refusal(&answered).is_none(),
         "once the fence is gone the retry is answered again: {answered:?}"
@@ -178,7 +179,7 @@ async fn a_registration_replaced_while_a_retry_waits_stops_its_retained_answer()
     let (arrived, release) = controller.pause_retained_lookup();
     let retrying = tokio::spawn({
         let controller = Arc::clone(&controller);
-        async move { controller.perform(&actor_id, connection_id, mutation).await }
+        async move { controller.perform(&actor_id, connection_id, None, mutation).await }
     });
     tokio::time::timeout(Duration::from_secs(30), arrived)
         .await
@@ -220,7 +221,7 @@ async fn a_retained_answer_outlives_the_window_that_admitted_its_action() {
 
     clock.advance(STANDING * 10);
 
-    let answered = controller.perform(&actor_id, connection_id, mutation).await;
+    let answered = controller.perform(&actor_id, connection_id, None, mutation).await;
     assert!(
         refusal(&answered).is_none(),
         "the receipt is read after its window is gone: {answered:?}"
@@ -320,6 +321,7 @@ async fn a_create_admitted_before_a_revocation_starts_nothing_after_it() {
             &create(1),
             Method::SessionCreate,
             connection_id,
+            None,
             Some(accepted(&controller)),
             Some(captured),
         )
@@ -348,6 +350,7 @@ async fn a_create_admitted_before_a_revocation_starts_nothing_after_it() {
             &create(2),
             Method::SessionCreate,
             connection_id,
+            None,
             Some(accepted(&controller)),
             Some(current),
         )
@@ -397,6 +400,7 @@ async fn a_close_admitted_before_a_revocation_is_not_forwarded_after_it() {
             &world::close_request(environment_id, session_id),
             Method::SessionClose,
             connection_id,
+            None,
             Some(window),
             Some(captured),
         )
@@ -421,6 +425,7 @@ async fn a_close_admitted_before_a_revocation_is_not_forwarded_after_it() {
             &world::close_request(environment_id, session_id),
             Method::SessionClose,
             connection_id,
+            None,
             Some(window),
             Some(current),
         )
@@ -470,6 +475,7 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
             &stale,
             Method::DeviceRevoke,
             connection_id,
+            None,
             Some(accepted(&controller)),
             Some(captured),
         )
@@ -498,6 +504,7 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
             &revoke(2),
             Method::DeviceRevoke,
             connection_id,
+            None,
             Some(accepted(&controller)),
             Some(current),
         )
@@ -549,6 +556,7 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
                 &request(method),
                 method,
                 connection_id,
+                None,
                 Some(accepted(&controller)),
                 Some(captured),
             )
@@ -567,6 +575,7 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
                 &request(method),
                 method,
                 connection_id,
+                None,
                 Some(accepted(&controller)),
                 Some(captured),
             )

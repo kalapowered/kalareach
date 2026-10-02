@@ -1138,6 +1138,7 @@ async fn claim(
             client: LocalClientKind::Worker,
             capabilities: kr_protocol::scalars::CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: None,
         }))
         .await
         .expect("writes the hello");
