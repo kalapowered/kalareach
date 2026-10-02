@@ -244,6 +244,41 @@ final class ProbeSupportTests: XCTestCase {
         XCTAssertEqual(log.facts["gap.input.locked.max"], "100")
     }
 
+    func testAnIntervalBetweenTwoCallbacksTheTimerNeverSawIsAGap() {
+        // The callbacks stopped for four seconds and began again before the timer ran, so the age of
+        // the last one is small; the interval between the two around the stop is what happened.
+        var log = AudioTickLog(start: 100)
+        log.tick(now: 110, lastInput: 109.95, lastOutput: 109.99, longestInputInterval: 4.2, longestOutputInterval: 0.02, protectedDataAvailable: false)
+        XCTAssertEqual(log.facts["gap.input.max"], "4200")
+        XCTAssertEqual(log.facts["gap.input.locked.max"], "4200")
+        XCTAssertEqual(log.facts["gap.output.max"], "20")
+    }
+
+    func testTheLongerOfTheLastCallbacksAgeAndTheLongestIntervalIsTheGap() {
+        var log = AudioTickLog(start: 0)
+        log.tick(now: 10, lastInput: 7, lastOutput: 9.9, longestInputInterval: 1, longestOutputInterval: 0.5, protectedDataAvailable: true)
+        XCTAssertEqual(log.facts["gap.input.max"], "3000")
+        XCTAssertEqual(log.facts["gap.output.max"], "500")
+    }
+
+    func testACallbackClockCountsCallbacksAndHandsOverTheLongestIntervalOnce() {
+        var clock = CallbackClock()
+        XCTAssertNil(clock.longestIntervalSinceLastReading(), "nothing ran, so there is no interval")
+        clock.ran(at: 1.0)
+        XCTAssertNil(clock.longestIntervalSinceLastReading(), "one callback makes no interval")
+        clock.ran(at: 1.1)
+        clock.ran(at: 1.5)
+        clock.ran(at: 1.6)
+        XCTAssertEqual(clock.count, 4)
+        XCTAssertEqual(clock.last, 1.6)
+        XCTAssertEqual(clock.longestIntervalSinceLastReading() ?? 0, 0.4, accuracy: 0.0001)
+        XCTAssertNil(clock.longestIntervalSinceLastReading(), "read once, then it starts again")
+        // The interval across a reading counts: the callback after the reading is measured from the
+        // one before it.
+        clock.ran(at: 5.6)
+        XCTAssertEqual(clock.longestIntervalSinceLastReading() ?? 0, 4.0, accuracy: 0.0001)
+    }
+
     func testSomethingNeverSeenCountsFromTheStartOfTheCheck() {
         var log = AudioTickLog(start: 10)
         log.tick(now: 14, lastInput: nil, lastOutput: nil, protectedDataAvailable: false)
