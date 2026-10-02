@@ -37,7 +37,9 @@ use std::process::Command;
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE;
-use kr_shell_integration::host::startup::{MARKER_BEGIN, MARKER_END};
+use kr_shell_integration::host::startup::{
+    CHECK_MARKER_BEGIN, CHECK_MARKER_END, MARKER_BEGIN, MARKER_END,
+};
 use shellpkg::{CaseSetup, Package, QualificationCase, Session, StackIndex, cases, package_root};
 
 /// One thing in a home.
@@ -86,27 +88,64 @@ fn snapshot(root: &Path) -> Snapshot {
     found
 }
 
-/// Whether `text` is exactly one marked block: the begin line, whatever the block holds, the end
-/// line, and nothing else, each marker on a line of its own once.
-fn is_one_block(text: &str) -> bool {
+/// The two marker pairs an entry can have: the one every shell's entry has, and the one that checks
+/// PowerShell's reader at the end of its last profile.
+const MARKERS: [(&str, &str); 2] = [
+    (MARKER_BEGIN, MARKER_END),
+    (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
+];
+
+/// Whether `text` is exactly one marked block with these markers: the begin line, whatever the
+/// block holds, the end line, and nothing else, each marker on a line of its own once.
+fn is_one_block_of(text: &str, begin: &str, end: &str) -> bool {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let begins = lines
-        .iter()
-        .filter(|line| line.trim_end() == MARKER_BEGIN)
-        .count();
-    let ends = lines
-        .iter()
-        .filter(|line| line.trim_end() == MARKER_END)
-        .count();
+    let begins = lines.iter().filter(|line| line.trim_end() == begin).count();
+    let ends = lines.iter().filter(|line| line.trim_end() == end).count();
     begins == 1
         && ends == 1
-        && lines
-            .first()
-            .is_some_and(|line| line.trim_end() == MARKER_BEGIN)
-        && lines
-            .last()
-            .is_some_and(|line| line.trim_end() == MARKER_END)
+        && lines.first().is_some_and(|line| line.trim_end() == begin)
+        && lines.last().is_some_and(|line| line.trim_end() == end)
         && text.ends_with('\n')
+}
+
+/// Whether `text` is exactly one marked block of either entry.
+fn is_one_block(text: &str) -> bool {
+    MARKERS
+        .iter()
+        .any(|(begin, end)| is_one_block_of(text, begin, end))
+}
+
+/// Whether `after` is `before` with one marked block put in at a line boundary and nothing else
+/// changed: cutting the block's lines out gives the person's own text again, or that text and the
+/// line break the block needed when it did not end in one.
+///
+/// A shell's entry goes after everything the person wrote; PowerShell's first entry goes below the
+/// `using` statements and `param` block at the start of its profile, and its second at the end of
+/// the last one. A byte-order mark is the file's encoding and belongs to no line.
+fn one_block_put_in(before: &[u8], after: &[u8]) -> bool {
+    let (Ok(before), Ok(after)) = (std::str::from_utf8(before), std::str::from_utf8(after)) else {
+        return false;
+    };
+    let unmarked = |text: &str| text.strip_prefix('\u{feff}').unwrap_or(text).to_owned();
+    let (before, after) = (unmarked(before), unmarked(after));
+    MARKERS.iter().any(|(begin, end)| {
+        let lines: Vec<&str> = after.split_inclusive('\n').collect();
+        let begins: Vec<usize> = (0..lines.len())
+            .filter(|index| lines[*index].trim_end() == *begin)
+            .collect();
+        let ends: Vec<usize> = (0..lines.len())
+            .filter(|index| lines[*index].trim_end() == *end)
+            .collect();
+        let (&[from], &[to]) = (begins.as_slice(), ends.as_slice()) else {
+            return false;
+        };
+        if to < from || !is_one_block_of(&lines[from..=to].concat(), begin, end) {
+            return false;
+        }
+        let rest = [&lines[..from], &lines[to + 1..]].concat().concat();
+        rest == before
+            || (!before.is_empty() && !before.ends_with('\n') && rest == format!("{before}\n"))
+    })
 }
 
 /// The only change an install may make: one marked block added to each startup file the section
@@ -154,21 +193,10 @@ fn only_marked_entries(
                     if mode != after_mode {
                         return Err(format!("{} changed its mode", path.display()));
                     }
-                    let Some(rest) = after_bytes.strip_prefix(bytes.as_slice()) else {
-                        return Err(format!("{} changed what the person wrote", path.display()));
-                    };
-                    // A file that does not end in a line break gets one, so the block starts on a
-                    // line of its own.
-                    let rest = if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-                        rest.strip_prefix(b"\n").unwrap_or(rest)
-                    } else {
-                        rest
-                    };
-                    if !is_one_block(&String::from_utf8_lossy(rest)) {
+                    if !one_block_put_in(bytes, after_bytes) {
                         return Err(format!(
-                            "{} gained more than one marked block: {:?}",
-                            path.display(),
-                            String::from_utf8_lossy(rest)
+                            "{} changed what the person wrote, or gained more than one marked block: {after_text:?}",
+                            path.display()
                         ));
                     }
                 }
@@ -267,9 +295,12 @@ fn startup_files(kind: ShellKind, home: &Snapshot) -> Vec<PathBuf> {
             vec![PathBuf::from(".bashrc"), PathBuf::from(login)]
         }
         ShellKind::Fish => vec![PathBuf::from(".config/fish/conf.d/kalareach.fish")],
-        ShellKind::PowerShell => vec![PathBuf::from(
-            ".config/powershell/Microsoft.PowerShell_profile.ps1",
-        )],
+        // The profile every host reads gets the entry that opens the bridge, and the profile its
+        // own host reads after it gets the one that checks the reader.
+        ShellKind::PowerShell => vec![
+            PathBuf::from(".config/powershell/profile.ps1"),
+            PathBuf::from(".config/powershell/Microsoft.PowerShell_profile.ps1"),
+        ],
     }
 }
 
@@ -376,6 +407,89 @@ fn the_checks_refuse_an_installer_that_does_more_than_the_marked_entry() {
             &bare,
             &with(&[(".zshrc", &format!("export EDITOR=vim\n{block}"))]),
             &startup
+        ),
+        Ok(())
+    );
+
+    // PowerShell's two profiles: the entry that opens the bridge goes below the person's `using`
+    // statements in the profile every host reads, and the entry that checks the reader goes at the
+    // end of the profile its own host reads, each with markers of its own.
+    let load = format!("{MARKER_BEGIN}\nImport-Module x\n{MARKER_END}\n");
+    let check = format!("{CHECK_MARKER_BEGIN}\nConfirm-KalaReachReadLine\n{CHECK_MARKER_END}\n");
+    let all_hosts = ".config/powershell/profile.ps1";
+    let current_host = ".config/powershell/Microsoft.PowerShell_profile.ps1";
+    let powershell = [PathBuf::from(all_hosts), PathBuf::from(current_host)];
+    let (using, mine) = ("using namespace System\n$x = 1\n", "Get-Date\n");
+    let before_ps = with(&[(all_hosts, using), (current_host, mine)]);
+    assert_eq!(
+        only_marked_entries(
+            &before_ps,
+            &with(&[
+                (
+                    all_hosts,
+                    &format!("using namespace System\n{load}$x = 1\n")
+                ),
+                (current_host, &format!("{mine}{check}")),
+            ]),
+            &powershell
+        ),
+        Ok(()),
+        "each entry in its place is the whole of the change"
+    );
+    // Neither a statement the installer adds, nor a change to the person's own lines, nor a block
+    // that is not whole, is accepted in either profile.
+    for hacked in [
+        with(&[
+            (
+                all_hosts,
+                &format!("using namespace System\n{load}$x = 1\nexit\n"),
+            ),
+            (current_host, &format!("{mine}{check}")),
+        ]),
+        with(&[
+            (
+                all_hosts,
+                &format!("using namespace System\n{load}$x = 2\n"),
+            ),
+            (current_host, &format!("{mine}{check}")),
+        ]),
+        with(&[
+            (
+                all_hosts,
+                &format!("using namespace System\n{load}$x = 1\n"),
+            ),
+            (current_host, &format!("{mine}{check}{check}")),
+        ]),
+        with(&[
+            (
+                all_hosts,
+                &format!("using namespace System\n{load}$x = 1\n"),
+            ),
+            (
+                current_host,
+                &format!("{mine}{MARKER_BEGIN}\nImport-Module x\n"),
+            ),
+        ]),
+    ] {
+        assert!(
+            only_marked_entries(&before_ps, &hacked, &powershell).is_err(),
+            "{hacked:?} was accepted"
+        );
+    }
+    // A profile that did not end in a line break, and one that begins with a byte-order mark, gain
+    // the block and, in the first case, the line break it needed.
+    let bare_ps = with(&[
+        (all_hosts, "using namespace System"),
+        (current_host, "\u{feff}Get-Date"),
+    ]);
+    assert_eq!(
+        only_marked_entries(
+            &bare_ps,
+            &with(&[
+                (all_hosts, &format!("using namespace System\n{load}")),
+                (current_host, &format!("\u{feff}Get-Date\n{check}")),
+            ]),
+            &powershell
         ),
         Ok(())
     );
@@ -536,6 +650,29 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
         written >= 1,
         "{label}: the install wrote no entry in {startup:?}"
     );
+    if home.kind == ShellKind::PowerShell {
+        // The entry that opens the bridge is in the profile every host reads, and the one that
+        // checks the reader is in the profile its own host reads: neither is in the other.
+        let holds = |path: &str, marker: &str| {
+            matches!(installed.get(Path::new(path)),
+                Some(Node::File { bytes, .. }) if String::from_utf8_lossy(bytes).lines().any(|line| line == marker))
+        };
+        assert!(
+            holds(".config/powershell/profile.ps1", MARKER_BEGIN)
+                && !holds(".config/powershell/profile.ps1", CHECK_MARKER_BEGIN),
+            "{label}: the profile every host reads does not hold the bridge entry alone"
+        );
+        assert!(
+            holds(
+                ".config/powershell/Microsoft.PowerShell_profile.ps1",
+                CHECK_MARKER_BEGIN
+            ) && !holds(
+                ".config/powershell/Microsoft.PowerShell_profile.ps1",
+                MARKER_BEGIN
+            ),
+            "{label}: the profile its own host reads does not hold the reader check alone"
+        );
+    }
 
     let package_directory = package
         .executable
