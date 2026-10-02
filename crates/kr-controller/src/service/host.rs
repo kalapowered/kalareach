@@ -242,9 +242,11 @@ impl Controller {
                 // with, and the answer a person needs is that this environment is reached another
                 // way rather than that a command was missing.
                 let reading = state_dir.clone();
-                let cached = tokio::task::spawn_blocking(move || {
+                // The row and the approved record it belongs to are read under one lock, so what an
+                // answer is later recorded against is the record the row describes.
+                let (cached, approved) = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&reading, |store| {
-                        store.row_of(environment_id, now_ms).ok_or_else(|| {
+                        store.approved(environment_id, now_ms).ok_or_else(|| {
                             ControllerError::InvalidArgument(format!(
                                 "this host has no enrolled environment {environment_id}"
                             ))
@@ -258,7 +260,7 @@ impl Controller {
                 // helper holds there.
                 if cached.enrolment.access == kr_protocol::identity::EnvironmentAccess::SshHost {
                     return self
-                        .register_ssh(actor, bridged, cached, environment_id, now_ms)
+                        .register_ssh(actor, bridged, cached, approved, environment_id, now_ms)
                         .await;
                 }
                 if !cached.enrolment.access.is_process_bridge() {
@@ -380,38 +382,27 @@ impl Controller {
 
     /// Registers an SSH host's identity and scoped channel from its helper's own answer.
     ///
-    /// The evidence belongs to the approved record that was read, and a refusal takes back what an
-    /// earlier answer established for that record, exactly as for a process bridge.
+    /// The evidence belongs to the approved record that was read with `cached`, and a refusal takes
+    /// back what an earlier answer established for that record, exactly as for a process bridge.
     async fn register_ssh(
         &self,
         actor: &kr_protocol::actor::ActorEnvelope,
         bridged: bool,
         cached: kr_protocol::identity::EnvironmentInventoryRow,
+        instance: crate::bridge::store::EnrolmentInstance,
         environment_id: kr_protocol::ids::EnvironmentId,
         now_ms: u64,
     ) -> Result<ParamsValue> {
         use kr_protocol::identity::EnvironmentRefreshResult;
 
         let state_dir = self.paths.state_dir().to_path_buf();
-        let reading = state_dir.clone();
-        let instance = tokio::task::spawn_blocking(move || {
-            crate::bridge::store::Store::with_locked(&reading, |store| {
-                store.instance_of(environment_id).ok_or_else(|| {
-                    ControllerError::supervision(format!(
-                        "this host has no approved record for environment {environment_id}"
-                    ))
-                })
-            })
-        })
-        .await
-        .map_err(|error| ControllerError::supervision(error.to_string()))??;
         let opened_for = cached.enrolment.clone();
         let mut row = cached;
         let (verification, connection) = match crate::bridge::verify::through_identity_probe(
             actor,
             bridged,
             &opened_for,
-            self.paths.environment_id(),
+            &self.paths,
             self.build_id.clone(),
         )
         .await
