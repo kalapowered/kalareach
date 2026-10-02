@@ -978,6 +978,14 @@ impl Drop for Host {
     fn drop(&mut self) {
         let unresolved = self.end_what_is_left();
         drop(self.daemon.take());
+        // Whatever the ending above did not reach has a worker that nothing will close afterwards.
+        if let Err(left) = support::leave_no_worker_of(self.root()) {
+            if std::thread::panicking() {
+                eprintln!("{left}");
+            } else {
+                panic!("{left}");
+            }
+        }
         if unresolved.is_empty() {
             return;
         }

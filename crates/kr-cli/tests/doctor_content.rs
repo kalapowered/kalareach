@@ -110,6 +110,11 @@ impl Drop for Host {
         for task in &self.serving {
             task.abort();
         }
+        // Whatever the closes above did not reach, such as a session this test made that it did
+        // not record, has a worker that nothing will close afterwards.
+        if let Err(left) = support::leave_no_worker_of(self.temp.root()) {
+            failures.push(left);
+        }
         if !failures.is_empty() && !std::thread::panicking() {
             panic!("cleanup failed: {failures:?}");
         }
