@@ -50,7 +50,12 @@
 #     any whitespace up to the next whitespace or unbalanced `)`; every line that starts with a
 #     bracketed label and `]:` is a definition, whose destination is the first word after the first
 #     `]:` or, when nothing follows it, the first word of the next line. A destination that starts
-#     with `<` or holds a backslash or `&` is refused as unreadable: write the path plainly.
+#     with `<` or holds a backslash or `&` is refused as unreadable: write the path plainly;
+#   - the clone's `.gitignore` does not ignore a local workspace name. Each name in `local_names`,
+#     the instruction files and directories of the common coding assistants, is created in the
+#     clone, and `git check-ignore` must name the file ignored, so a name that is missing from
+#     the section, a pattern a later negation undoes and a file that is already tracked under
+#     such a name are all refused.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
@@ -132,6 +137,20 @@ record_patterns=(
   'kalareach-goa[l]'
   'kalareach-artifact[s]'
   "(^|[^[:alnum:]_./-])/Volume[s]/[^/[:space:]\"'*)\`\\]"
+)
+
+# The local workspace names `.gitignore` has to keep out of every commit: the instruction files
+# and directories of the common coding assistants, at the root of the tree and below it. Each is
+# created in the clone and removed again, and `git check-ignore` has to say it is ignored.
+local_names=(
+  AGENTS.md AGENTS-notes.md agents.md agents-notes.md docs/AGENTS.md
+  CLAUDE.md CLAUDE-notes.md claude.md claude-notes.md docs/CLAUDE.md
+  GEMINI.md GEMINI-notes.md gemini.md gemini-notes.md docs/GEMINI.md
+  .claude/settings.json .codex/config.toml .agents/skills/example/SKILL.md .gemini/settings.json
+  .cursor/rules/example.mdc .cursorrules .windsurf/rules/example.md .windsurfrules
+  .aider.conf.yml .aider.chat.history.md .clinerules
+  .github/copilot-instructions.md .github/instructions/example.instructions.md
+  .github/prompts/example.prompt.md docs/.github/copilot-instructions.md
 )
 
 # The programs README.md's list runs. A step's PATH holds the directories these are found in, in
@@ -324,6 +343,54 @@ refuse_links() {
   say "every relative Markdown link names a path the tree has"
 }
 
+# Creates each name in `local_names` in the clone, asks `git check-ignore` whether it is ignored,
+# and removes what it created. A name the clone already holds is refused rather than replaced: a
+# tracked file under such a name is the defect this check looks for.
+refuse_ignores() {
+  local clone="$1" name path created=() directories=() directory held=() missing=() item
+  for name in "${local_names[@]}"; do
+    if [ -e "$clone/$name" ] || [ -L "$clone/$name" ]; then
+      held+=("$name")
+    fi
+  done
+  if [ "${#held[@]}" -ne 0 ]; then
+    say "refused: the tree already holds a file or directory under a local workspace name:"
+    printf '  %s\n' "${held[@]}"
+    return 1
+  fi
+  for name in "${local_names[@]}"; do
+    path="$clone/$name"
+    directory="$(dirname "$path")"
+    while [ ! -d "$directory" ]; do
+      directories+=("$directory")
+      directory="$(dirname "$directory")"
+    done
+    mkdir -p "$(dirname "$path")"
+    : > "$path"
+    created+=("$path")
+  done
+  for name in "${local_names[@]}"; do
+    if ! clean git -C "$clone" check-ignore -q -- "$name"; then
+      missing+=("$name")
+    fi
+  done
+  for item in "${created[@]}"; do
+    rm -f "${item:?}"
+  done
+  # A directory is longer than the one that holds it, so the longest goes first.
+  if [ "${#directories[@]}" -ne 0 ]; then
+    while IFS= read -r item; do
+      rmdir "$item" 2>/dev/null || true
+    done < <(printf '%s\n' "${directories[@]}" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
+  fi
+  if [ "${#missing[@]}" -ne 0 ]; then
+    say "refused: .gitignore does not ignore these local workspace names:"
+    printf '  %s\n' "${missing[@]}"
+    return 1
+  fi
+  say "the .gitignore ignores every local workspace name it lists"
+}
+
 # Prints each step README.md lists, as its group, a tab and its command, in README.md's order.
 read_steps() {
   clean python3 - "$1/README.md" <<'PYTHON'
@@ -386,12 +453,41 @@ fixture_git() {
     GIT_COMMITTER_EMAIL=fixture@example.invalid git "$@"
 }
 
+# Writes the .gitignore a fixture starts with: the local workspace section a repository carries,
+# which `local_names` has to find ignored.
+write_fixture_ignore() {
+  cat > "$1/.gitignore" <<'EOF'
+# Local workspace files
+AGENTS*.md
+agents*.md
+CLAUDE*.md
+claude*.md
+GEMINI*.md
+gemini*.md
+.claude/
+.codex/
+.agents/
+.gemini/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.clinerules
+**/.github/copilot-instructions.md
+**/.github/instructions/
+**/.github/prompts/
+EOF
+}
+
 # Creates a fixture repository with a README whose steps check the environment they run in,
-# documents whose links are sound in every form the check reads, and one commit.
+# documents whose links are sound in every form the check reads, a .gitignore with the local
+# workspace section, and one commit.
 make_fixture() {
   local directory="$1"
   mkdir -p "$directory/docs"
   fixture_git init -q -b main "$directory"
+  write_fixture_ignore "$directory"
   cat > "$directory/README.md" <<'EOF'
 # fixture
 
@@ -613,6 +709,39 @@ self_test() {
   } > "$directory/docs/words.md"
   commit_fixture "$directory" "Add the product's own words"
   expect "the product's own words pass" pass "no tracked file names a record"
+  expect "a clean fixture's .gitignore ignores every local workspace name" pass \
+    "the .gitignore ignores every local workspace name it lists" --no-steps
+
+  directory="$work/ignore-missing"
+  make_fixture "$directory"
+  grep -v -e '^\.claude/$' -e '^CLAUDE' "$directory/.gitignore" > "$directory/.gitignore.next"
+  mv "$directory/.gitignore.next" "$directory/.gitignore"
+  commit_fixture "$directory" "Drop two patterns"
+  expect "a .gitignore that lacks a pattern is refused" refuse \
+    "does not ignore these local workspace names" --no-steps
+
+  directory="$work/ignore-negated"
+  make_fixture "$directory"
+  printf '!docs/AGENTS.md\n' >> "$directory/.gitignore"
+  commit_fixture "$directory" "Re-include one name"
+  expect "a pattern that a later negation undoes is refused" refuse \
+    "does not ignore these local workspace names" --no-steps
+
+  directory="$work/ignore-absent"
+  make_fixture "$directory"
+  fixture_git -C "$directory" rm -q --cached .gitignore
+  rm "$directory/.gitignore"
+  fixture_git -C "$directory" commit -q -m "Remove the .gitignore"
+  expect "a repository with no .gitignore is refused" refuse \
+    "does not ignore these local workspace names" --no-steps
+
+  directory="$work/ignore-tracked"
+  make_fixture "$directory"
+  printf 'notes\n' > "$directory/CLAUDE.md"
+  fixture_git -C "$directory" add -f CLAUDE.md
+  fixture_git -C "$directory" commit -q -m "Track an instruction file"
+  expect "a tracked file under a local workspace name is refused" refuse \
+    "the tree already holds a file or directory under a local workspace name" --no-steps
 
   directory="$work/commit-body"
   make_fixture "$directory"
@@ -1025,6 +1154,7 @@ refused=0
 refuse_records "$clone" || refused=1
 refuse_messages "$clone" "${commits:-$commit}" || refused=1
 refuse_links "$clone" || refused=1
+refuse_ignores "$clone" || refused=1
 if security_agent_opened; then
   refused=1
 fi
