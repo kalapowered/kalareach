@@ -38,10 +38,12 @@ impl Controller {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
             let session_id = worker.descriptor.session_id;
-            // A worker that is connected and does not answer holds the list for one exchange, and
-            // no longer: every other session is listed whatever it does.
+            // A worker that is connected and does not answer holds the list for two exchanges, and
+            // no longer: every other session is listed whatever it does. Two, because the daemon's
+            // own link to the worker can be held by an exchange of its own, which takes up to one,
+            // and the read then waits for its turn and for the answer.
             let session = match self
-                .read_from_worker_within(&worker, Some(WORKER_EXCHANGE))
+                .read_from_worker_within(&worker, Some(WORKER_EXCHANGE * 2))
                 .await
             {
                 Ok(read) => {
