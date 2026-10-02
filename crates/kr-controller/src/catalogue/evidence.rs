@@ -61,6 +61,21 @@ pub fn repositories(catalogue: &Catalogue) -> CatalogueResult<Vec<RepositoryEvid
                 false,
             ),
         };
+        // Where a repository the host seeded came from is part of what it reports, so a person
+        // reading the doctor can tell the generation the host shipped with from one it fetched.
+        let detail = match catalogue.seed_provenance(&view.enrolment.id)? {
+            Some(provenance) => format!(
+                "{detail}, seeded from the bundled generation {} of {} at commit {}",
+                provenance["generation"],
+                provenance["repository"]
+                    .as_str()
+                    .unwrap_or("its repository"),
+                provenance["commit"]
+                    .as_str()
+                    .map_or("", |commit| &commit[..commit.len().min(12)]),
+            ),
+            None => detail,
+        };
         records.push(RepositoryEvidence {
             name,
             generation: view.active.map_or(0, |active| active.generation),

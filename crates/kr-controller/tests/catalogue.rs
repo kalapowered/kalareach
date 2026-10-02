@@ -1225,6 +1225,98 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
     assert_eq!(restarted.receipt, first.receipt);
 }
 
+/// A daemon seeds its catalogue only when it is asked to: the control is a daemon started as the
+/// binary starts a debug build with no `--seed`, which lists no catalogue; asked, it seeds the
+/// generation compiled into this build on a build that trusts it, and tells its cadence the
+/// admissions moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_seeds_its_catalogue_only_when_it_is_asked_to() {
+    use kr_crypto::store::{StoreSelection, open_store_in};
+    use kr_protocol::local::LocalClientKind;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let build = kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier");
+    let controller =
+        kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+            identity: Box::new(move || {
+                let store = open_store_in(&secrets).expect("a secret store");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(NoWorkers),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build.clone(),
+            release: "0".to_owned(),
+            shell_packages: None,
+        })
+        .await
+        .expect("the daemon starts");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+    let mut client = kr_ipc::client::LocalClient::connect(&endpoint, LocalClientKind::Cli, build)
+        .await
+        .expect("connects");
+    async fn list(
+        client: &mut kr_ipc::client::LocalClient,
+        environment_id: EnvironmentId,
+    ) -> Vec<wire::CatalogueSummary> {
+        let listed: wire::CatalogueListResult = client
+            .request(
+                Method::CatalogueList,
+                &wire::CatalogueListParams { environment_id },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("and is answered")
+            .to_typed()
+            .expect("a readable result");
+        listed.catalogues
+    }
+
+    assert!(
+        list(&mut client, environment_id).await.is_empty(),
+        "a daemon that is not asked to seed lists no catalogue"
+    );
+
+    let bundle = kr_plugin_catalogue::SeedBundle::embedded().expect("the bundle compiled in");
+    let passes = controller.passes_asked();
+    let outcome = controller.seed_catalogue(&bundle).await;
+
+    if cfg!(debug_assertions) {
+        assert!(outcome.failure.is_none(), "{}", outcome.report());
+        assert_eq!(
+            outcome.installed.len(),
+            bundle.packages().len(),
+            "{}",
+            outcome.report()
+        );
+        let catalogues = list(&mut client, environment_id).await;
+        assert_eq!(catalogues.len(), 1);
+        assert_eq!(catalogues[0].catalogue_id, "official");
+        assert!(
+            controller.passes_asked() > passes,
+            "the cadence was told the admissions moved"
+        );
+    } else {
+        // A release trusts no development root: the bundle is refused and nothing is written.
+        assert!(outcome.installed.is_empty(), "{}", outcome.report());
+        assert!(list(&mut client, environment_id).await.is_empty());
+    }
+}
+
 /// Reads one action's receipt through `action.read`.
 async fn read_receipt(
     client: &mut kr_ipc::client::LocalClient,
@@ -4855,5 +4947,235 @@ mod native_bridges {
                 Some(host.confirmations()),
             )
             .await);
+    }
+
+    /// The bundle of the bridge generation, trusting its own root as a development lineage: every
+    /// package the generation publishes, with its Claude Code release 0.3.0.
+    #[cfg(unix)]
+    fn seed_bundle() -> kr_plugin_catalogue::SeedBundle {
+        let root = std::fs::read(generation().join("root.json")).expect("a root");
+        kr_plugin_catalogue::SeedBundle::from_directory(
+            &generation(),
+            kr_plugin_catalogue::SeedTrust::trusting_root_of(&root)
+                .expect("a root this test trusts"),
+        )
+        .expect("a bundle of the generation")
+    }
+
+    /// Release 0.3.0's hash in the repository the seed made.
+    #[cfg(unix)]
+    async fn seeded_digest(host: &Host) -> String {
+        let catalogue = host.module.catalogue().lock().await;
+        catalogue
+            .index(&RepositoryId::new("official").expect("a valid identifier"))
+            .expect("an activated index")
+            .find(
+                &claude_code(),
+                &kr_plugin_sdk::version::PackageVersion::parse("0.3.0").expect("a version"),
+            )
+            .expect("release 0.3.0")
+            .manifest_digest
+            .to_string()
+    }
+
+    /// KR-REQ-11.42 for a seeded package: the seed installs the bridge's package enabled with an
+    /// empty grant and applies nothing; `plugin.grant` adding a capability to it is refused,
+    /// naming `plugin.install`, without spending the owner's proof; and the install of the same
+    /// release with the owner's confirmation of the publisher's statement grants it and applies the
+    /// recipe. The control is the same install with no confirmation, which changes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_seeded_bridge_is_granted_by_installing_it_and_by_nothing_else() {
+        let site = Site::new();
+        let host = host(&site);
+        let before = site.tree();
+
+        let outcome = host.module.seed(&seed_bundle()).await;
+
+        assert!(outcome.failure.is_none(), "{}", outcome.report());
+        assert!(
+            outcome.installed.contains(&claude_code()),
+            "{}",
+            outcome.report()
+        );
+        assert_eq!(site.tree(), before, "seeding applies no bridge");
+        assert!(
+            host.module
+                .native_bridges()
+                .reports()
+                .expect("reads")
+                .is_empty(),
+            "and keeps no record of one"
+        );
+        let digest = seeded_digest(&host).await;
+        {
+            let catalogue = host.module.catalogue().lock().await;
+            let installation = catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .expect("installed by the seed");
+            assert!(installation.enabled);
+            assert!(installation.grant.capabilities().is_empty());
+            assert_eq!(installation.repository.as_str(), "official");
+        }
+
+        // `plugin.grant` adds nothing to a package that asks for a bridge, whatever it adds, and
+        // spends no proof for the refusal.
+        for added in ["native_bridge.install", "upstream.action"] {
+            let grant = vec![added.to_owned()];
+            let plan = PluginGrantPlan {
+                environment_id: host.environment_id,
+                plugin_id: claude_code(),
+                version: "0.3.0".to_owned(),
+                package_digest: digest.clone(),
+                grant: grant.iter().cloned().collect(),
+            };
+            let digest_of_plan = plan.action_digest().expect("a digest");
+            let proof = host
+                .ceremony
+                .approve(SensitiveAction::GrantExecutableCapability, digest_of_plan);
+            let params = wire::PluginGrantParams {
+                environment_id: host.environment_id,
+                plugin_id: claude_code(),
+                package_digest: digest.clone(),
+                grant,
+                owner_confirmation: proof.clone(),
+            };
+            let refused = refusal(
+                host.module
+                    .write_frame_admitted(
+                        &mutation(Method::PluginGrant, host.environment_id, &params),
+                        Method::PluginGrant,
+                        Some(host.confirmations()),
+                    )
+                    .await,
+            );
+            assert_eq!(
+                refused.code,
+                ErrorCode::PluginGrantRequired,
+                "{added}: {refused:?}"
+            );
+            assert!(refused.message.contains("plugin.install"), "{refused:?}");
+            host.confirmations()
+                .accept(
+                    SensitiveAction::GrantExecutableCapability,
+                    digest_of_plan,
+                    &proof,
+                )
+                .expect("the refusal did not spend the owner's proof");
+        }
+        assert_eq!(site.tree(), before, "nothing was applied");
+
+        // The install of the same release, with its whole grant.
+        let grant: Vec<String> = GRANT.iter().map(|name| (*name).to_owned()).collect();
+        let ceiling = listed_ceiling(&host, "official").await;
+        let plan = PluginInstallPlan {
+            environment_id: host.environment_id,
+            catalogue_id: "official".to_owned(),
+            ceiling: ceiling.into_iter().collect(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: grant.iter().cloned().collect(),
+            grant_statement: Some(release_statement()),
+        };
+        let params = |owner_confirmation| wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "official".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: grant.clone(),
+            owner_confirmation,
+        };
+        let refused = refusal(
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::PluginInstall,
+                        host.environment_id,
+                        &params(Nullable::null()),
+                    ),
+                    Method::PluginInstall,
+                    Some(host.confirmations()),
+                )
+                .await,
+        );
+        assert_eq!(
+            refused.code,
+            ErrorCode::OwnerConfirmationRequired,
+            "{refused:?}"
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "an unconfirmed install changes nothing"
+        );
+
+        let confirmation = host.ceremony.approve(
+            SensitiveAction::GrantExecutableCapability,
+            plan.action_digest().expect("a digest"),
+        );
+        let _: wire::PluginInstallResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginInstall,
+                    host.environment_id,
+                    &params(Nullable::some(confirmation)),
+                ),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await);
+        assert_eq!(
+            site.tree(),
+            applied(&before, &host.working),
+            "the confirmed install applies the recipe"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+    }
+
+    /// A seed that has been made is not repeated by a restart, and one that is asked again does
+    /// nothing: no commit, no revision, and the owner's disable stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seeded_catalogue_is_not_seeded_again() {
+        let site = Site::new();
+        let mut host = host(&site);
+        let bundle = seed_bundle();
+        host.module.seed(&bundle).await;
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginDisable).await);
+        let revision = host
+            .module
+            .admission_revision_within(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("a revision");
+
+        restarted(&mut host, &site);
+        let outcome = host.module.seed(&bundle).await;
+
+        assert!(!outcome.committed, "{}", outcome.report());
+        assert!(outcome.installed.is_empty());
+        assert_eq!(
+            host.module
+                .admission_revision_within(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+                )
+                .await
+                .expect("a revision"),
+            revision
+        );
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            !catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .expect("installed")
+                .enabled,
+            "the owner's disable stays"
+        );
     }
 }

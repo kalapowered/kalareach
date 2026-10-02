@@ -55,6 +55,15 @@ struct Arguments {
     #[cfg(unix)]
     #[arg(long)]
     own_session: bool,
+    /// Seed the catalogue from the signed generation compiled into this build.
+    ///
+    /// A shipped build always seeds, and refuses the bundle until the production root exists. A
+    /// build with debug assertions trusts the development lineage's root, which anybody can sign
+    /// with, so it seeds only when asked: a test that starts this daemon and expects an empty
+    /// catalogue is not changed by it.
+    #[cfg(debug_assertions)]
+    #[arg(long)]
+    seed: bool,
     /// Run as the environment's starter rather than as its daemon.
     ///
     /// Windows only, where the environment's scheduled task runs this: it takes the one launch
@@ -226,6 +235,25 @@ async fn run(
         })
         .await?
     };
+    // The catalogue is seeded from the generation compiled into this build, once, before an
+    // endpoint a client could reach is bound: a request that came meanwhile would wait for the
+    // catalogue, and none can come. A seed that fails or does nothing is reported and the daemon
+    // starts all the same.
+    #[cfg(debug_assertions)]
+    let seeds = arguments.seed;
+    #[cfg(not(debug_assertions))]
+    let seeds = true;
+    if seeds {
+        match kr_plugin_catalogue::SeedBundle::embedded() {
+            Ok(bundle) => {
+                let outcome = controller.seed_catalogue(&bundle).await;
+                println!("kr-controller: bundled catalogue: {}", outcome.report());
+            }
+            Err(error) => {
+                eprintln!("kr-controller: the bundled catalogue is not whole: {error}");
+            }
+        }
+    }
     // Every delivery exchange goes to an origin it already knows: a notification, a status
     // question and a renewal to the gateway its credential names, and a webhook message to the
     // address its owner configured. Each goes through the managed transport of that origin, and
