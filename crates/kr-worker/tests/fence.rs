@@ -5694,12 +5694,14 @@ async fn a_shell_refused_at_the_handshake_ends_the_create_with_the_named_error()
 async fn an_answer_leaves_the_lane_with_the_lanes_deadline() {
     let temp = kr_ipc::testing::TempHost::create();
     let config = configuration(&temp, ShellMode::NativeCompat);
+    // The lane's deadlines are readings of the session's own continuous clock.
+    let clock = std::sync::Arc::clone(&config.time.continuous);
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let before = kr_ipc::now_ms().get();
+    let before = clock.boot_elapsed_ms();
     // The terminal's own question about what it is talking to, which the host answers itself.
     session.ingest_output(b"\x1b[c");
-    let after = kr_ipc::now_ms().get();
+    let after = clock.boot_elapsed_ms();
     let replies: Vec<_> = session
         .take_pending_input()
         .into_iter()
