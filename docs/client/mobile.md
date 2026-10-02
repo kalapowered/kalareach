@@ -120,14 +120,17 @@ failures, and offers nothing to decide. Elapsed time is reported as elapsed time
 
 ## Input
 
-- **Camera, photo library and files** are the platform's own pickers, reached through the file
-  input each WebView already maps to them. `capture` opens the camera; an image filter opens the
-  photo library; no filter opens the file browser. A picked file is uploaded, not held in the
-  screen: the page hands its bytes to native code, which sends them through the transfer service,
-  and the file stays on the draft, uploading, uploaded or failed, until the person removes it. The
-  phone takes a picked file of up to 1,020 KB, what its connection carries in one chunk; a larger
-  one is refused with that reason. A prompt sent from the phone carries its text inline and cannot
-  carry the file, so a draft that holds one is not sent until the person removes it.
+- The Camera, photo library, and files items are provided by the platform, and there are buttons
+  that will open them. When these buttons are pressed, they open a file input that has already been
+  mapped to the correct picker in the webview, and is hidden from assistive technology. This means
+  that a screen reader will see one button for each item, with the appropriate name. `capture` opens
+  the camera; an image filter opens the photo library; no filter opens the file browser. A picked
+  file is uploaded, not held in the screen: the page hands its bytes to native code, which sends
+  them through the transfer service, and the file stays on the draft, uploading, uploaded or failed,
+  until the person removes it. The phone takes a picked file of up to 1,020 KB, what its connection
+  carries in one chunk; a larger one is refused with that reason. A prompt sent from the phone
+  carries its text inline and cannot carry the file, so a draft that holds one is not sent until the
+  person removes it.
 - **The accessory row** carries the keys a software keyboard buries: escape, tab, control, alt, the
   arrows, home, end and the punctuation a shell needs. A modifier has three states (off, held for
   one key, and held) and says which one it is in rather than leaving it to a colour. A tap on a key
@@ -177,7 +180,19 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 ## Targets, type and motion
 
 - 44 points on iOS, 48 density-independent pixels on Android, in both dimensions.
-- Spacing in `rem`, so the system text size scales the layout with the text.
+- **Text follows the person's text size**, from the smallest setting to the largest accessibility
+  size, and spacing is in `rem` so the layout grows with it. Android's web view multiplies the root
+  by the font scale itself, and the system restarts the activity when the scale changes, which
+  reloads the page at the new size. The activity does not take the change itself, because its web
+  view would then keep the old size. iOS's leaves the root at 16px, so the page reads the size of an
+  element set in `-apple-system-body`, the one font keyword WebKit ties to Dynamic Type, and
+  multiplies the root by its ratio to the size at the default setting, as `--text-scale`. That
+  follows a change made while the application runs. Sizes on iOS reach three times the base size, so
+  there the two bars stop growing at one and a half times it and the terminal grid at twice it, and
+  a screen 320 points wide keeps room for its content.
+- **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
+  finished", and never by its identifier. A kind this build does not know is called "Update from the
+  agent", and its identifier stays on the entry as data.
 - Safe-area insets on every edge that can be under a notch, a home indicator or a rounded corner.
 - Transitions of 120 to 200 ms; navigation does not animate at all, and neither does streamed text
   or a repeated key.
@@ -234,6 +249,12 @@ pnpm -C apps/companion exec tauri ios build --debug --target aarch64-sim
 scripts/e2e-mobile.sh              # both
 scripts/e2e-mobile.sh ios
 scripts/e2e-mobile.sh android
+
+# The page's text at each Dynamic Type size on the iOS Simulator, and at each font scale on the
+# Android emulator, with the setting changed while the application is open.
+pnpm -C apps/companion build:harness
+apps/companion/e2e/system-text-size.sh
+apps/companion/e2e/system-text-size-android.sh path/to/the/harness/app-universal-debug.apk
 
 # The native decisions, on their own, without the application.
 cd apps/companion/src-tauri/gen/apple && xcodebuild test \
