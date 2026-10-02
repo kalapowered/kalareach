@@ -722,7 +722,16 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
             None => appended(existing, body, begin),
         },
         Placement::AfterPrologue { shell } => {
-            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement)?;
+            // An entry that owns the line break before it keeps owning it when something is still
+            // after it in the file, as the other PowerShell entry is when both profiles are one
+            // file: the break stays in the text it is placed into, and the note stays with it.
+            let body = match &stripped {
+                Some((_, block, after)) if owns_separator(block) && !after.is_empty() => {
+                    with_separator_note(body, begin)
+                }
+                _ => body.to_owned(),
+            };
+            let (rebuilt, _) = after_the_prologue(shell, &theirs, &body, placement)?;
             rebuilt
         }
         Placement::Last { .. } => {
@@ -1038,12 +1047,14 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
 /// what the person has to do, and nothing is written.
 fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<String>> {
     // Each of the entries a file can hold, with its own markers: PowerShell's two can be in one
-    // file when its two profiles are.
+    // file when its two profiles are. The one that checks the reader is the last thing in the file
+    // and the one that opens the bridge is near its start, so they come out in that order: the
+    // entry that owns a line break then finds nothing of the other's after it, and gives it back.
     let mut rebuilt = existing.to_owned();
     let mut found = false;
     for (begin, end) in [
-        (MARKER_BEGIN, MARKER_END),
         (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
+        (MARKER_BEGIN, MARKER_END),
     ] {
         if let Some((before, block, after)) = strip(&rebuilt, begin, end) {
             // The line break the entry took with it goes with it, where the entry is still the last
@@ -3277,8 +3288,8 @@ mod tests {
                 for (at, _) in script.match_indices(opening) {
                     let rest = &script[at + opening.len()..];
                     let code = rest.split('\'').next().unwrap_or("").trim();
-                    // The scripts' own `kr-placed` and `kr-signature` answers are not refusals, and
-                    // the generic `'kr-refused ' + $why` passes on a code found elsewhere.
+                    // The script's own `kr-placed` answer is not a refusal, and the generic
+                    // `'kr-refused ' + $why` passes on a code found elsewhere.
                     if !code.is_empty()
                         && !code.contains('$')
                         && !codes.iter().any(|known| known == code)
@@ -3535,6 +3546,74 @@ mod tests {
         );
         assert_eq!(remove(&real).expect("removes"), Change::Removed);
         assert_eq!(std::fs::read_to_string(&real).expect("reads"), theirs);
+    }
+
+    /// KR-REQ-26.05: one file that holds both PowerShell entries is given back exactly too.
+    ///
+    /// Both profiles are one file, or a link to each other, and the person's text has no final line
+    /// break: the entry that opens the bridge owns the break it needed, and the entry that checks the
+    /// reader follows it. Installing again changes nothing and keeps the note, and one removal takes
+    /// both entries and the break out and leaves the person's text as it was.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn one_file_holding_both_powershell_entries_is_given_back_exactly() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        for (name, theirs) in [
+            ("a prologue", "using namespace System"),
+            ("a param block and a comment", "param() # note"),
+            ("a byte-order mark", "\u{feff}using namespace System"),
+            (
+                "crlf line ends",
+                "using namespace System\r\nusing namespace System.Text",
+            ),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            let targets = powershell_targets(&a_powershell(), path.clone(), path.clone());
+            let bodies = targets
+                .iter()
+                .map(|target| entry(target, package, false).expect("the path is text"))
+                .collect::<Vec<_>>();
+            std::fs::write(&path, theirs).expect("writes");
+            for (target, body) in targets.iter().zip(&bodies) {
+                assert_eq!(
+                    install(&path, body, &target.placement)
+                        .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    Change::Added,
+                    "{name}"
+                );
+            }
+            let installed = std::fs::read_to_string(&path).expect("reads");
+            // Again, whichever order, a dry run and a real one: nothing changes, and the note stays.
+            for _ in 0..2 {
+                for (target, body) in targets.iter().zip(&bodies) {
+                    assert_eq!(
+                        plan(&path, body, &target.placement)
+                            .unwrap_or_else(|error| panic!("{name}: {error}")),
+                        Change::Unchanged,
+                        "{name}: a dry run of an install that is in place"
+                    );
+                    assert_eq!(
+                        install(&path, body, &target.placement)
+                            .unwrap_or_else(|error| panic!("{name}: {error}")),
+                        Change::Unchanged,
+                        "{name}: an install that is in place"
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                installed,
+                "{name}: installing again changed the file"
+            );
+            assert_eq!(remove(&path).expect("removes"), Change::Removed, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}: the profile did not come back as it was"
+            );
+        }
     }
 
     /// KR-REQ-07.23: each of the two entries goes where its placement says, into a profile of its
