@@ -291,21 +291,21 @@ version 0.4.0, with explicit A and B roles.
 - It is **not** the RFC 9382 P-256 ciphersuite.
 - The crate's documentation references its earlier draft profile, discloses the absence of an
   independent security audit, and cautions that its implementation is probably not constant-time.
-- **External review of this profile, its side-channel behaviour and its integration here is a
-  release gate.** Its status stays open until that evidence and the remediation decisions exist. A
-  rejected implementation needs a separately reviewed profile revision; a different RFC name or a
-  longer ad hoc shared secret is not an automatic security-equivalent substitution.
+- **No external review of this profile has been made.** Nobody outside the project has reviewed this
+  profile, the `spake2` crate's source, its side-channel behaviour or its use here, and the release
+  does not wait for such a review. The owner of the product decided to release without it, and the
+  release documentation records that as an exception to the review gate. What the release relies on
+  instead is the crate's own maintenance and exact pinning, this crate's exchange checked against
+  the library driven on its own in both roles, and the steps around the PAKE that do not rest on it
+  alone. Five failed confirmation tags spend an invitation, an invitation lasts five minutes, no
+  device is paired without the owner's fresh confirmation of the exact transcript, and the
+  connection is bound to the iroh endpoint identities the authenticated bundles pinned.
 - No PAKE is implemented here. Malformed messages, a wrong role and invalid group elements are all
   rejected through the library's own error path.
 - `spake2::Password` does not clear itself. The six characters therefore live in a heap buffer the
   library owns until it is dropped, which this crate cannot reach. Everything on this side of the
   boundary — `CodeSecret`, `GeneratedCode`, `EnteredCode`, the shared key and the five derived keys
-  — zeroises. Closing this needs a change in the dependency, so it belongs to the same release gate
-  as the profile itself.
-
-The review artefact must cover the exact source and dependency hashes and build configurations:
-role and transcript binding, element validation, the confirmation and HKDF domains, RNG failure,
-side-channel behaviour, zeroisation, and positive and negative cross-language vectors.
+  — zeroises. Closing this needs a change in the dependency.
 
 ## Profile decisions
 
