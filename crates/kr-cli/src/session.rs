@@ -3129,6 +3129,52 @@ mod tests {
         assert_eq!(window.next(), None);
     }
 
+    /// A bridge that has to shed the view a second time, while a new subscription is being asked
+    /// for, leaves the old stream's marker ahead of the new stream's opening and keeps the opening:
+    /// the marker is the old stream's and asks for nothing more, and the opening begins the new
+    /// stream, which is then told apart from the one before it. An opening that was dropped leaves
+    /// the terminal waiting for one that never comes, and everything after it is the old stream's.
+    #[test]
+    fn a_marker_ahead_of_the_new_streams_opening_does_not_hide_it() {
+        let mut subscriptions = Subscriptions::new();
+        assert_eq!(
+            subscriptions.heard(0, "session.projection.reset"),
+            Heard::First
+        );
+        assert!(
+            subscriptions.replace(),
+            "a marker asked for a new subscription"
+        );
+        // What the bridge delivers after a second overflow.
+        assert_eq!(
+            subscriptions.heard(8, "session.resync"),
+            Heard::Replaced,
+            "the marker is the old stream's, and asks for nothing more"
+        );
+        assert_eq!(
+            subscriptions.heard(0, "session.projection.reset"),
+            Heard::First,
+            "the opening begins the new stream"
+        );
+        assert_eq!(
+            subscriptions.heard(1, "session.projection.snapshot"),
+            Heard::Later
+        );
+        assert!(subscriptions.replace(), "and its marker asks again");
+
+        // The control: without the opening, nothing is ever the new stream's.
+        let mut lost = Subscriptions::new();
+        assert_eq!(lost.heard(0, "session.projection.reset"), Heard::First);
+        assert!(lost.replace());
+        for sequence in 1..=5 {
+            assert_eq!(
+                lost.heard(sequence, "session.projection.delta"),
+                Heard::Replaced,
+                "{sequence}"
+            );
+        }
+    }
+
     /// While a new subscription replaces the old one, the old stream's notifications are told
     /// apart from the new stream's, whose first delivery other than a gap is its screen.
     #[test]

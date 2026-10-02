@@ -1001,6 +1001,16 @@ fn is_a_view(event_type: &str) -> bool {
         || event_type.starts_with("session.projection.")
 }
 
+/// Whether a frame opens a subscription's stream: the first of the notifications a subscription
+/// sends, which restart their sequence at zero.
+///
+/// A caller that asked for a new subscription ignores everything of the old stream and waits for
+/// this one, and knows nothing of the new stream until it arrives. Dropping it leaves the caller
+/// waiting for good, so it is never dropped.
+fn opens_a_stream(notification: &kr_protocol::envelope::Notification) -> bool {
+    notification.sequence.get() == 0
+}
+
 /// Drops what the caller holds of the view, and leaves a marker that says to take it again.
 ///
 /// A client of a worker on this host that stops reading backs the socket up, and the worker replaces
@@ -1008,30 +1018,47 @@ fn is_a_view(event_type: &str) -> bool {
 /// because a caller waiting to write to a helper that waits to write to the reader would hold all
 /// three for good, so it is here that the same thing is done: past the bound, the output and screen
 /// frames held are dropped, one marker takes their place, and the caller asks for the screen
-/// again. Answers and the events that carry no bytes stay. Where nothing can be dropped the
-/// caller gets nothing to recover from and the stream ends.
+/// again. Answers and the events that carry no bytes stay, and so does the frame that opens a
+/// stream, because a caller that asked for a new one cannot tell the stream has begun without it.
+/// Where nothing can be dropped the caller is not left without a marker: [`ensure_a_marker`] puts
+/// one where the frame that does not fit would have been.
 fn shed_a_view(pending: &mut Pending) {
     let mut last: Option<(kr_protocol::ids::StreamId, u64)> = None;
-    let mut marked = false;
     let mut kept = VecDeque::with_capacity(pending.frames.len());
     let mut bytes = 0;
     for (frame, charged) in std::mem::take(&mut pending.frames) {
-        if let ControlFrame::Notification(notification) = &frame {
-            if notification.event_type.as_str() == "session.resync" {
-                marked = true;
-            } else if is_a_view(notification.event_type.as_str()) {
-                last = Some((notification.stream_id.clone(), notification.sequence.get()));
-                continue;
-            }
+        if let ControlFrame::Notification(notification) = &frame
+            && is_a_view(notification.event_type.as_str())
+            && !opens_a_stream(notification)
+        {
+            last = Some((notification.stream_id.clone(), notification.sequence.get()));
+            continue;
         }
         bytes += charged;
         kept.push_back((frame, charged));
     }
     pending.frames = kept;
     pending.bytes = bytes;
-    let (Some((stream_id, sequence)), false) = (last, marked) else {
+    if let Some((stream_id, sequence)) = last {
+        ensure_a_marker(pending, stream_id, sequence);
+    }
+}
+
+/// Leaves the caller a marker that says to take the view again, unless one is already held.
+///
+/// `sequence` is the sequence of the frame the marker stands in for, which a marker is never
+/// below the first of: a client reads sequence zero as a new subscription beginning.
+fn ensure_a_marker(pending: &mut Pending, stream_id: kr_protocol::ids::StreamId, sequence: u64) {
+    let held = pending.frames.iter().any(|(frame, _)| {
+        matches!(
+            frame,
+            ControlFrame::Notification(notification)
+                if notification.event_type.as_str() == "session.resync"
+        )
+    });
+    if held {
         return;
-    };
+    }
     let marker = kr_protocol::recovery::ResyncRequired {
         reason: kr_protocol::recovery::ResyncReason::SendQueueFull,
         cursor: kr_protocol::scalars::U64::new(0),
@@ -1045,7 +1072,6 @@ fn shed_a_view(pending: &mut Pending) {
     };
     let frame = ControlFrame::Notification(kr_protocol::envelope::Notification {
         stream_id,
-        // Not the first of a stream, which a client reads as a new subscription beginning.
         sequence: kr_protocol::ids::EventSequence::new(sequence.max(1)),
         event_type,
         payload,
@@ -1079,20 +1105,35 @@ async fn read_stream(mut stdout: tokio::process::ChildStdout, shared: Arc<Shared
                         shed_a_view(&mut pending);
                     }
                     if pending.bytes.saturating_add(charged) > ceiling {
-                        // A view frame that still does not fit is covered by the marker that
-                        // stands in its place. Anything else is something the caller is owed.
-                        if matches!(
-                            &other,
-                            ControlFrame::Notification(held) if is_a_view(held.event_type.as_str())
-                        ) {
-                            drop(pending);
-                            shared.arrived.notify_waiters();
-                            continue;
+                        match &other {
+                            // The frame that opens a stream is what a caller waits for after it
+                            // has asked for a new one, and it is one frame: it is held past the
+                            // bound rather than dropped.
+                            ControlFrame::Notification(held)
+                                if is_a_view(held.event_type.as_str()) && opens_a_stream(held) => {}
+                            // A view frame that still does not fit is replaced by a marker, which
+                            // is left where it would have been if none is held: the caller is
+                            // never left without one that says it has missed something.
+                            ControlFrame::Notification(held)
+                                if is_a_view(held.event_type.as_str()) =>
+                            {
+                                ensure_a_marker(
+                                    &mut pending,
+                                    held.stream_id.clone(),
+                                    held.sequence.get(),
+                                );
+                                drop(pending);
+                                shared.arrived.notify_waiters();
+                                continue;
+                            }
+                            // Anything else is something the caller is owed.
+                            _ => {
+                                pending.ended = Some(Refusal::Backlog { limit: ceiling });
+                                drop(pending);
+                                shared.arrived.notify_waiters();
+                                return;
+                            }
                         }
-                        pending.ended = Some(Refusal::Backlog { limit: ceiling });
-                        drop(pending);
-                        shared.arrived.notify_waiters();
-                        return;
                     }
                     pending.bytes += charged;
                     pending.frames.push_back((other, charged));
@@ -2318,6 +2359,142 @@ mod tests {
             "the marker is what the caller reads first of the view: {types:?}"
         );
         // And the stream is alive: the caller was told to recover, not ended.
+        assert!(stream.shared.lock().ended.is_none());
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    /// What a stream's caller reads of the view, as (event, sequence), until nothing more comes.
+    #[cfg(unix)]
+    async fn view_read(stream: &mut BridgeStream) -> Vec<(String, u64)> {
+        let mut types = Vec::new();
+        while let Ok(Ok(ControlFrame::Notification(held))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
+        {
+            types.push((held.event_type.as_str().to_owned(), held.sequence.get()));
+        }
+        types
+    }
+
+    /// A caller that asked for a new subscription ignores the old stream and waits for the frame
+    /// that opens the new one, so that frame is what a second overflow must never drop: the output
+    /// of the old stream, a new stream's opening and its first frames arrive past the bound, and
+    /// the opening is still held, with a marker after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_overflow_never_drops_the_frame_that_opens_the_new_stream() {
+        let (_directory, opening) = writing(
+            &[
+                BridgeFrame::HelloAck(Box::new(acknowledgement())),
+                notification(7),
+                notification(8),
+                notification(0),
+                notification(1),
+                notification(2),
+                notification(3),
+            ],
+            "exec sleep 600",
+        );
+        let ceiling = charged(&notification(1)) * 2 + 1;
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(SILENCE_LIMIT, ceiling);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let types = view_read(&mut stream).await;
+        // The caller is waiting for the new stream: what it reads of the old one, a marker among it,
+        // is ignored, and the opening is what it takes for the new stream's beginning.
+        assert!(
+            types.iter().any(|(_, sequence)| *sequence == 0),
+            "the stream's opening was dropped: {types:?}"
+        );
+        assert!(
+            types.iter().any(|(event, _)| event == "session.resync"),
+            "no marker was left: {types:?}"
+        );
+        assert!(
+            types
+                .iter()
+                .filter(|(event, _)| event == "session.resync")
+                .all(|(_, sequence)| *sequence >= 1),
+            "a marker is never the first of a stream: {types:?}"
+        );
+        assert!(stream.shared.lock().ended.is_none(), "and the stream lives");
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    /// The opening of a stream is one frame, held past the bound where the bound is met by what
+    /// cannot be dropped, and the stream is not ended for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_frame_that_opens_a_stream_is_held_past_a_bound_met_by_answers() {
+        let answers: Vec<BridgeFrame> = (1..=2).map(answer_to).collect();
+        let mut frames = vec![BridgeFrame::HelloAck(Box::new(acknowledgement()))];
+        frames.extend(answers.clone());
+        frames.push(notification(0));
+        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut taken = Vec::new();
+        while let Ok(Ok(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
+        {
+            taken.push(match frame {
+                ControlFrame::Notification(held) => format!("notification {}", held.sequence.get()),
+                ControlFrame::Response(_) => "response".to_owned(),
+                other => format!("{other:?}"),
+            });
+        }
+        assert_eq!(taken, ["response", "response", "notification 0"]);
+        assert!(stream.shared.lock().ended.is_none());
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    /// Where the bound is met by what cannot be dropped, a view frame that does not fit is replaced
+    /// by a marker rather than by nothing: the caller is told it has missed something, and the
+    /// stream is not ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_view_frame_that_does_not_fit_beside_answers_leaves_a_marker() {
+        let answers: Vec<BridgeFrame> = (1..=2).map(answer_to).collect();
+        let mut frames = vec![BridgeFrame::HelloAck(Box::new(acknowledgement()))];
+        frames.extend(answers.clone());
+        frames.push(notification(3));
+        frames.push(notification(4));
+        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut taken = Vec::new();
+        while let Ok(Ok(frame)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
+        {
+            taken.push(match frame {
+                ControlFrame::Notification(held) => {
+                    format!("{} {}", held.event_type.as_str(), held.sequence.get())
+                }
+                ControlFrame::Response(_) => "response".to_owned(),
+                other => format!("{other:?}"),
+            });
+        }
+        assert_eq!(
+            taken,
+            ["response", "response", "session.resync 3"],
+            "one marker stands for both frames that did not fit"
+        );
         assert!(stream.shared.lock().ended.is_none());
         let _ = stream
             .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
