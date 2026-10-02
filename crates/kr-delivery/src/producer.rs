@@ -3204,7 +3204,18 @@ mod tests {
         let files = Files::new();
         let phones = {
             let mut producer = files.producer();
-            two_phones(&mut producer)
+            let phones = two_phones(&mut producer);
+            // A take that finds nothing registers the consumer, as the first pass of a daemon does,
+            // so that the failure below is the commit's and not the registration's.
+            let mut attention = files.attention();
+            let taken = take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                NORMAL,
+            );
+            assert_eq!(taken, Taken::default());
+            phones
         };
         {
             let mut attention = files.attention();

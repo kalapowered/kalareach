@@ -2714,16 +2714,21 @@ async fn send_in_chunks(
     width: usize,
     mut before: impl AsyncFnMut(usize),
 ) -> (Vec<String>, bool) {
-    let mut sent = Vec::new();
+    let sent = std::sync::Mutex::new(Vec::new());
     for (index, chunk) in text.as_bytes().chunks(width).enumerate() {
         before(index).await;
         let chunk = String::from_utf8_lossy(chunk).into_owned();
-        match module.release_delivery(ticket, || chunk.clone()).await {
-            Some(written) => sent.push(written),
-            None => return (sent, false),
+        // The write to the transport is the release's own work, made while the release is held.
+        let written = module
+            .release_delivery(ticket, || {
+                sent.lock().expect("not poisoned").push(chunk.clone());
+            })
+            .await;
+        if written.is_none() {
+            return (sent.into_inner().expect("not poisoned"), false);
         }
     }
-    (sent, true)
+    (sent.into_inner().expect("not poisoned"), true)
 }
 
 /// KR-REQ-18.08, KR-REQ-24.11: a message that carries session text goes out through the daemon's
