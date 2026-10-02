@@ -6,13 +6,13 @@ an explicit data-access boundary, separate from the encryption of terminal trans
 document is that boundary written down.
 
 This daemon attaches no voice provider, managed or of a person's own, so no call starts:
-`voice.start` answers that the host has no voice service configured, and `voice.prepare` reports no
-managed terms. `voice.grant` and `voice.prepare` act as this document describes. With no call there
-is no voice session, so `voice.context` and `voice.delegate` are refused as naming no such session.
-The sections on what a call may read and send, where it goes, the managed operator, what is never
-authority, the session-bound grant, the rate and the account token describe what the coordinator
-does once a provider is attached, which its code and its tests establish. The section on what this
-daemon performs and supplies says which of that this daemon carries out itself.
+`voice.start` answers that the host has no voice service configured. `voice.grant` acts as this
+document describes, and `voice.prepare` returns the scope a call would have, with no managed terms.
+With no call there is no voice session, so `voice.context` and `voice.delegate` are refused as naming
+no such session. The sections on what a call may read and send, where it goes, the managed operator,
+what is never authority, the session-bound grant, the rate and the account token describe what the
+coordinator does once a provider is attached, which its code and its tests establish. The section on
+what this daemon performs and supplies says which of that this daemon carries out itself.
 
 ## What the parts are
 
@@ -167,8 +167,9 @@ The context the daemon supplies is the session's description and the directory t
 in, each with the moment the session was created. It supplies no active application, because it
 cannot say when the foreground last changed, and no pending-decision summaries or messages, because
 it does not hold the worker's semantic history; the selection carries those two reasons as
-withheld. It supplies no file contents, environment variables, scrollback or attachment bytes, since
-nothing has been selected.
+withheld. It supplies none of the four classes a person can select (file contents, environment
+variables, scrollback and attachment bytes): the companion selects none, and this daemon has no
+source for them, so a request that selects one gets nothing for it and no withheld entry.
 
 ## A voice session is not a terminal session
 
