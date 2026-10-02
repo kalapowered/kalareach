@@ -2338,14 +2338,15 @@ fn a_decision_keeps_the_privacy_state_it_was_made_under() {
     assert_eq!(only_item(&attention).decided_privacy, None);
 }
 
-/// A decision held back by quiet hours while privacy mode is on, over an announcement decided
-/// before it and not yet taken, carries the private state it was made under, not the normal one of
-/// the announcement before it: it is the held decision the release will hand over, and it was made
-/// while the mode was on. The control: a held repeat made under the normal state keeps the earlier
-/// one's.
+/// A decision held back by quiet hours over an announcement decided before it and not yet taken
+/// keeps that announcement's privacy state with its time, whatever state the held decision was
+/// made under: one of the two is the decision the release will hand over, and a consumer that
+/// produces only under the generation in force drops both when that generation has moved on, where
+/// a stamp of the later state would let an earlier generation's announcement pass for a later one's.
+/// The control: when the earlier announcement has been taken and settled, the held decision takes
+/// the state it was made under.
 #[test]
-fn a_held_decision_made_in_privacy_mode_is_not_stamped_with_the_normal_state_of_the_one_before_it()
-{
+fn a_decision_held_over_an_untaken_one_keeps_the_privacy_state_of_the_one_before_it() {
     use kr_attention::PrivacyStamp;
     use kr_attention::rule::REMINDER_INTERVAL_MS;
 
@@ -2357,28 +2358,43 @@ fn a_held_decision_made_in_privacy_mode_is_not_stamped_with_the_normal_state_of_
         generation: 3,
         private: true,
     };
-    for (during, expected) in [(private, private), (normal, normal)] {
-        let mut attention = engine();
-        attention
-            .apply(
-                &approval(session(1), 1, "req-1"),
-                reading(1_000).under(normal),
-            )
-            .expect("the store records the decision");
-        attention
-            .set_quiet_hours(Some(quiet_over_noon()))
-            .expect("the store records the window");
-        let repeat = 1_000 + REMINDER_INTERVAL_MS;
-        attention
-            .tick(reading(repeat).under(during), &all_read)
-            .expect("the store records the decision");
-        let held = only_item(&attention);
-        assert!(held.deferred, "the repeat is held");
-        assert_eq!(
-            held.decided_privacy,
-            Some(expected),
-            "decided during {during:?}"
-        );
+    for settled in [false, true] {
+        for during in [private, normal] {
+            let mut attention = engine();
+            attention
+                .apply(
+                    &approval(session(1), 1, "req-1"),
+                    reading(1_000).under(normal),
+                )
+                .expect("the store records the decision");
+            if settled {
+                let taken = attention
+                    .take_announcements(&|_| true)
+                    .expect("the announcements are read");
+                let identities: Vec<_> = taken
+                    .iter()
+                    .map(|announcement| (announcement.key.clone(), announcement.number))
+                    .collect();
+                assert_eq!(identities.len(), 1, "one announcement waits to be taken");
+                attention
+                    .settle_announcements(&identities)
+                    .expect("the announcement is settled");
+            }
+            attention
+                .set_quiet_hours(Some(quiet_over_noon()))
+                .expect("the store records the window");
+            let repeat = 1_000 + REMINDER_INTERVAL_MS;
+            attention
+                .tick(reading(repeat).under(during), &all_read)
+                .expect("the store records the decision");
+            let held = only_item(&attention);
+            assert!(held.deferred, "the repeat is held");
+            assert_eq!(
+                held.decided_privacy,
+                Some(if settled { during } else { normal }),
+                "decided during {during:?}, the earlier one settled {settled}"
+            );
+        }
     }
 }
 
