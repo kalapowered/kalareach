@@ -18,6 +18,7 @@
 //! | [`changeset`] | `kr changeset`: exact versions of a workspace's work |
 //! | [`diff`] | `kr diff`: reading changes, and applying or reverting one at a named destination |
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
+//! | [`machine`] | `kr host machine`: the machine group an environment records, and the steps that change it |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`startup`] | `kr host startup`, and `kr new` starting the control daemon when none is running |
@@ -54,6 +55,7 @@ pub mod diff;
 pub mod doctor;
 pub mod error;
 pub mod import;
+pub mod machine;
 pub mod output;
 pub mod pair;
 pub mod platform;
