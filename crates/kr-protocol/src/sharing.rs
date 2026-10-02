@@ -664,19 +664,19 @@ impl RevocationResult {
     /// decoder's limits (4,096 members a collection, 65,536 items and 1 MiB a frame).
     ///
     /// The worker list is cut as well, when a host holds more workers than a frame can carry. The
-    /// workers whose barrier has not held are kept before any that has, and at least one of them
-    /// whenever there is one, so what the caller reads of the cut barrier ([`RevocationBarrier::holds`])
-    /// is what it would read of the whole. Their totals say what was left out.
+    /// workers whose barrier has not held are taken before any that has, and one of them is always
+    /// kept when there is one, so what the caller reads of the cut barrier
+    /// ([`RevocationBarrier::holds`]) is what it would read of the whole. Their totals say what was
+    /// left out.
     ///
-    /// `barrier` is whole: each of its totals is how many its list held.
+    /// `barrier` is whole: its lists hold every worker and every name, and a total beside a list
+    /// that is below the list's length is raised to it.
     #[must_use]
     pub fn bounded(
         authority_revision: AuthorityRevision,
         revoked_grants: impl IntoIterator<Item = GrantId>,
         barrier: RevocationBarrier,
     ) -> Self {
-        use crate::action::BarrierState;
-
         let limits = kr_cbor::Limits::DEFAULT;
         let collection = limits.max_collection_len;
         let revoked: CanonicalSet<GrantId> = revoked_grants.into_iter().collect();
@@ -689,9 +689,25 @@ impl RevocationResult {
         );
         let RevocationBarrier {
             authority_revision: barrier_revision,
-            workers,
+            mut workers,
             ..
         } = barrier;
+        // A total is never below how many names its list holds, so what is measured below is what
+        // is kept.
+        for worker in &mut workers {
+            worker.rejected_actions_total = U64::new(
+                worker
+                    .rejected_actions_total
+                    .get()
+                    .max(worker.rejected_actions.len() as u64),
+            );
+            worker.possibly_executed_total = U64::new(
+                worker
+                    .possibly_executed_total
+                    .get()
+                    .max(worker.possibly_executed.len() as u64),
+            );
+        }
 
         // The answer with every list empty: what the answer's own fields cost.
         let shell = |workers: Vec<crate::action::WorkerBarrier>| Self {
@@ -717,33 +733,24 @@ impl RevocationResult {
                 .saturating_sub(fixed.bytes),
         };
 
-        // The workers kept: those whose barrier has not held first, then session order, each
-        // measured with its lists empty and the first pending one always kept.
+        // The workers kept, in this order: those whose barrier has not held, then the rest, each
+        // group in session order, as many as fit with their lists empty. The first one whose
+        // barrier has not held is kept whatever the frame has left.
         let mut order: Vec<usize> = (0..workers.len()).collect();
-        order.sort_by_key(|&index| {
-            (
-                workers[index].state != BarrierState::Pending,
-                workers[index].session_id,
-            )
-        });
+        order.sort_by_key(|&index| (workers[index].state.holds(), workers[index].session_id));
         let mut keep = vec![false; workers.len()];
         let mut kept = 0_usize;
-        for index in order {
+        for (position, index) in order.into_iter().enumerate() {
             let emptied = crate::action::WorkerBarrier {
                 rejected_actions: Vec::new(),
                 possibly_executed: Vec::new(),
                 ..workers[index].clone()
             };
             let cost = Cost::of(&emptied).unwrap_or_default();
-            let pending = workers[index].state == BarrierState::Pending;
-            let first_pending = pending
-                && !keep
-                    .iter()
-                    .zip(&workers)
-                    .any(|(held, worker)| *held && worker.state == BarrierState::Pending);
+            let first_waiting = position == 0 && !workers[index].state.holds();
             let fits = kept < collection && left.take(cost, kept);
-            if !fits && !first_pending {
-                continue;
+            if !fits && !first_waiting {
+                break;
             }
             if !fits {
                 // Whatever the frame has left, the barrier is read as it would be whole.
@@ -775,13 +782,9 @@ impl RevocationResult {
         for worker in &mut workers {
             let mut names = std::mem::take(&mut worker.rejected_actions);
             names.sort_by(|a, b| (&a.actor_id, a.action_id).cmp(&(&b.actor_id, b.action_id)));
-            worker.rejected_actions_total =
-                U64::new(worker.rejected_actions_total.get().max(names.len() as u64));
             worker.rejected_actions = prefix_within(names, &mut rejected, collection);
             let mut names = std::mem::take(&mut worker.possibly_executed);
             names.sort_by(|a, b| (a.action_id, &a.actor_id).cmp(&(b.action_id, &b.actor_id)));
-            worker.possibly_executed_total =
-                U64::new(worker.possibly_executed_total.get().max(names.len() as u64));
             worker.possibly_executed = prefix_within(names, &mut possibly, collection);
         }
         let mut answer = shell(workers);

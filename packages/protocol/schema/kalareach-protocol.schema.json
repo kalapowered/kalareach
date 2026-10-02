@@ -29017,7 +29017,7 @@
           "description": "The revision being installed."
         },
         "workers": {
-          "description": "One entry per affected worker, in session order, cut to what one answer carries.\n\nA cut keeps every worker whose barrier has not held before any that has, and at least one\nof them whenever there is one, so a reader finds the barrier held on the cut list exactly\nwhen it holds on the whole. `workers_total` says how many there were.",
+          "description": "One entry per affected worker, in session order, cut to what one answer carries.\n\nA cut takes the workers whose barrier has not held before any that has, and always keeps\none of them when there is one, so a reader finds the barrier held on the cut list exactly\nwhen it holds on the whole. `workers_total` says how many there were.",
           "items": {
             "$ref": "#/$defs/WorkerBarrier"
           },

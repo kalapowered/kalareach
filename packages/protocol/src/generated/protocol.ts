@@ -22464,8 +22464,8 @@ export interface RevocationBarrier {
   /**
    * One entry per affected worker, in session order, cut to what one answer carries.
    *
-   * A cut keeps every worker whose barrier has not held before any that has, and at least one
-   * of them whenever there is one, so a reader finds the barrier held on the cut list exactly
+   * A cut takes the workers whose barrier has not held before any that has, and always keeps
+   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
    * when it holds on the whole. `workers_total` says how many there were.
    */
   workers: WorkerBarrier[]
@@ -22559,8 +22559,8 @@ export interface RevocationBarrier1 {
   /**
    * One entry per affected worker, in session order, cut to what one answer carries.
    *
-   * A cut keeps every worker whose barrier has not held before any that has, and at least one
-   * of them whenever there is one, so a reader finds the barrier held on the cut list exactly
+   * A cut takes the workers whose barrier has not held before any that has, and always keeps
+   * one of them when there is one, so a reader finds the barrier held on the cut list exactly
    * when it holds on the whole. `workers_total` says how many there were.
    */
   workers: WorkerBarrier[]
