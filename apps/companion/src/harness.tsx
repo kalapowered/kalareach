@@ -17,7 +17,7 @@ import { fakeHost, type FakeHostControls } from './host/fake'
 // the phone's one without pretending to be a phone.
 import { Shell, surfaceOf } from './mobile/entry'
 import { followTheSystemTextSize } from './mobile/text-size'
-import { HarnessStrip, applyPendingReset } from './harness-strip'
+import { HarnessStrip, TapAwayPutsTheKeyboardAway, applyPendingReset } from './harness-strip'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -47,6 +47,7 @@ createRoot(root).render(
     <AppProvider port={port}>
       <Shell surface={surfaceOf(window.location.search)} />
       <HarnessStrip controls={controls} />
+      <TapAwayPutsTheKeyboardAway />
     </AppProvider>
   </StrictMode>
 )
