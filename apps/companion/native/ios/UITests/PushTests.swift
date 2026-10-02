@@ -27,9 +27,10 @@ final class PushTests: DeviceTestCase {
         answerPrompt(["Allow", "OK"])
         let facts = try XCTUnwrap(probeFacts("push", timeout: 90), "the push check did not report")
         sayFacts("push", facts)
-        if facts["firebase"] == "skipped" {
-            throw XCTSkip("this build holds no Firebase configuration, so there is no push to test")
-        }
+        // A push session's build holds Firebase's configuration: a build that does not start Firebase
+        // is not the build under test, whatever its reason.
+        XCTAssertNotEqual(facts["firebase"], "skipped", "Firebase was left alone: \(facts["firebase.reason"] ?? "no reason given")")
+        if facts["firebase"] == "skipped" { throw XCTSkip("no Firebase in this build") }
         return facts
     }
 
