@@ -10,6 +10,7 @@ worker directly for what a session owns.
 | `kr new` | `kr n` | Create one worker, pseudo-terminal and root shell under an idempotent create token |
 | `kr attach <id>` | `kr a` | Attach to an existing session. It never resumes or creates a replacement |
 | `kr detach [--attachment <id>]` | `kr d` | Remove an attachment |
+| `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, in this environment or an enrolled one |
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
 | `kr list` | `kr l` | List sessions with their display numbers, states and shells |
 | `kr status [id]` | `kr s` | Show one session's state |
@@ -540,6 +541,49 @@ link slow enough to lose the terminator fails that attach rather than continuing
 still deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection
 before the attachment sees it, exactly as it does inside any other full-screen application.
 
+### In an enrolled environment
+
+`kr new` and `kr attach` take an enrolled WSL distribution or container for `--environment`, by
+label or identifier. They open a process bridge to it, ask the helper there for the environment's
+own control daemon or session worker, and carry the same frames a local `kr` would send over a local
+socket. The two actions that may start an environment are the only ones that do. A create or an
+attach starts a stopped distribution by running the helper in it, and starts a stopped container
+with the container runtime. The helper then reaches the daemon through that environment's own
+configured startup, and says what to set up when none is configured. A listing, a refresh without
+`--start`, an enrolment and an export start nothing.
+
+Sessions started in this way will have an initial working directory of the home directory of the
+user that the kr helper process is running as in the environment, unless `--cwd` is specified with a
+path that exists in the environment. Their environment variables will consist of a small allowlisted
+subset of the environment variables that the kr helper process itself has access to, with the `HOME`
+environment variable set to the resolved path to that user's home directory. The `--terminal` option
+is not supported for sessions in enrolled environments, as there is no way to start a terminal
+application in an enrolled environment from the host. If the connection to the enrolled environment
+is lost while waiting for a `kr new` action to complete, kr will report that it doesn't know whether
+the session has been created and will not retry; it will also report the identifier of the action it
+was asked as. To determine whether a session has been created in this case, use `kr attach`.
+
+Attempting to attach to a session that has already closed will fail, before attempting to connect to
+the session's terminal, with the reason that the session closed. This behaviour is the same as for
+local sessions, and will involve starting the kr control daemon in the environment if necessary
+(which `kr attach` may do).
+
+A bridge to a daemon, worker or helper of an earlier release is refused with a sentence that names
+both builds and says what to do. An earlier helper cannot read the opening frame, so the command
+says to update kr there; an earlier daemon or worker answers an ordinary connection but not the one
+a bridge makes, so the command says to restart it or to attach from inside the environment with the
+kr of its own build.
+
+A terminal that falls behind does not end the attachment. When what the bridge holds for it passes 8
+MiB, the output and screen frames are dropped, and one resynchronise marker is left in their place.
+Answers stay, and so does the frame that opens a stream. The terminal then asks for the screen
+again, as it does when a worker on this host replaces a stream. Why a bridge stopped is said once
+the terminal is yours again.
+
+Session clipboard writes will be sent to attached terminals if they have taken a lease on the
+session's input and if the environment has been enrolled with that terminal as the clipboard
+destination (see `kr bridge`).
+
 ## `kr host terminal`
 
 `kr host terminal` prints the terminal applications this host has, in the order it would choose
@@ -591,6 +635,79 @@ The packaged shells do not export the capability yet. It reaches them in the ans
 capability in the environment of the command they are about to run. Until they do, `kr detach`
 inside a managed shell names its attachment with `--attachment <id>`, and a bare `kr detach` there
 is answered with that instruction rather than with an attachment the host cannot stand behind.
+
+## `kr export`
+
+`kr export` writes the output a closed session retained to a file you name. The session is named by
+display number or identifier. `--environment` says where it lives, as it does for `kr attach`: one
+of this host's own environments by identifier, or an enrolled WSL distribution or container by label
+or identifier.
+
+```text
+kr export <session> --output <file> [--environment <id|label>] [--max-bytes <bytes>]
+```
+
+A session that has not closed is refused, because its worker still owns its output. Export it after
+it ends. A session whose worker the daemon has not confirmed ended is refused with the daemon's own
+answer. For an enrolled environment the command opens a bridge that starts nothing. A distribution
+or container that is stopped is reported as `ENVIRONMENT_UNAVAILABLE` and no file is made. A create
+or an attach starts an environment, and an export does not.
+
+Privacy mode fences the read. While an environment's privacy mode is on, nothing is exported from
+it, closed sessions included. A session that still owes the cleanup privacy mode asked for is not
+exported either, because what its worker retained is not known to be gone. Both are refused with
+`PERMISSION_DENIED`, and the message names the reason. The command reads privacy mode before the
+first page of output and again after the last. If it changed in between, nothing is written and the
+command tells you to export again. Turning privacy mode on after the file exists cannot recall the
+file.
+
+The retained output is the raw bytes the program wrote, and those bytes include what the program
+asked the terminal to do: write the clipboard, raise a notification, ring the bell, ask what the
+terminal is. A file that kept them would do those things again to whoever replayed it. So the
+command reads the output through the terminal engine that read it the first time, and the file
+carries only the spans the engine clears for a terminal to draw. Everything else is counted by kind
+under `omissions`: clipboard writes, notifications, progress reports, bells, questions the program
+asked the terminal (a read of the clipboard is one), image and window requests, sequences the engine
+has no class for, control strings it dropped, malformed text, and the bytes not carried. The kinds
+are the ones the engine counts; the bytes not carried include others it does not. The content of a
+clipboard write appears nowhere in the file.
+
+The archive can have lost the start of the output, or a range inside it. Output that resumes after
+such a gap can begin inside a control string whose start is gone: the end of a clipboard write looks
+like text, and the byte that closes it looks like a bell. So after a gap nothing is read until the
+first escape, bell or line ending, and the bytes skipped are counted under
+`output_resumed_mid_stream`. A gap the archive reports on every page without skipping anything is
+listed once.
+
+The file is one JSON document of the format `kalareach-session-export/1`. It names the session and
+its environment, and carries the session's summary, its closure record and the last size the session
+had. The output is a list of chunks, each with the cursor it starts at and its bytes as unpadded
+base64url. Beside it are the cursor the read began at, the next cursor, the oldest cursor the
+archive still retains, and under `gaps` every range the archive no longer holds, each with its
+cause. Every 64-bit value in the file, such as a cursor, a time, a count or a display number, is a
+decimal string, as the protocol writes it, so a reader that holds numbers as floating point loses no
+digits.
+
+The file says what it does not hold. The archive keeps no time for any piece of output, so the file
+carries none, and an asciicast recording cannot be made from it. The archive keeps the session's
+last size and not the sizes before it, and it does not report whether it lost output beyond the gaps
+it lists. Each of these is declared under `omissions`. A session whose own record is gone is
+exported with its shell, working directory, execution context, shell mode, creation time and size
+set to null, and `omissions` says they are not known.
+
+`--max-bytes` bounds how much retained output is read, 16 MiB by default, and must be at least one.
+The start of what is retained is kept, and when output is left behind the file says `truncated`. The
+file is created new. Something already at the name, a link included, is refused before the output is
+read and again where the file is made, and is left as it was. The bytes go into a file beside the
+final name, which is given its name without replacing anything, so a failed export leaves no partial
+file. The mode is 0600 on Unix, and on Windows the file takes the access list of the folder it is
+in. Giving a file its name this way needs a file system that supports hard links, so an export to a
+FAT or exFAT volume, or to some network shares, is refused. Nothing is uploaded, and no destination
+is chosen for you.
+
+With `--json` the command prints one document: `ok`, `session_id`, `display_number`, `path`,
+`format`, `bytes_read`, `bytes_carried`, `gaps`, `truncated`, and `omissions`, the kinds the file
+declares. As in every other command, its counts are numbers.
 
 ## `kr question`
 
@@ -1035,7 +1152,7 @@ The other four operations act on the environments this host has enrolled:
 kr bridge list [--access wsl|container|ssh|paired]
 kr bridge enrol --access wsl --label ubuntu --target Ubuntu-24.04 \
   --user kala --helper /usr/local/bin/kr \
-  (--environment-id <uuid> | --probe) [--clipboard <destination>]
+  (--environment-id <uuid> | --probe) [--clipboard terminal]
 kr bridge forget <label>
 kr bridge refresh <label> [--start]
 ```
@@ -1063,6 +1180,21 @@ environment identity, the user the helper runs as inside it, the protocol versio
 bound. That line is the connection diagnostic, and it says what stopped the bridge when one could
 not be opened — the program that would not start, the environment that answered with another
 identity, or the destination's own refusal.
+
+An SSH host is enrolled with `--access ssh`, and `--probe` asks its helper over ssh which
+environment it is. The same refresh registers it: the helper answers once, over ssh, and the answer
+has to be the environment the record names, run as the user the record names, and not one of this
+host's own. A socket forwarded from here answers as this host, so it is refused. No request crosses
+ssh.
+
+`--clipboard` names where the environment's clipboard writes go. The one destination there is is
+`terminal`: the terminal an attachment is made from, which writes the escape sequence itself. Any
+other name is refused when the record is made. Without it, a session in that environment that asks
+to write the clipboard reaches nobody: the write is not sent to any terminal, and the session's own
+journal records that a write was declined, with its selection and size and none of its content. A
+write goes to the attachment that holds the input lease and to no other. Enrolling again replaces
+the record, and an attach reads it once, when it opens its bridge. A read of the clipboard is
+answered empty in every case.
 
 ## `kr pair`
 
