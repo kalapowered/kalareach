@@ -1295,14 +1295,29 @@ impl CatalogueModule {
             }
             None => Vec::new(),
         };
-        // A bridge the admissions carry may move here, whether or not the change committed, so the
-        // admission revision rises first, under the change's own authority, every time: every
-        // snapshot computed before this write is below every one after it, and every worker is
-        // sent the bridges as they are now. A change that raised it already raises it once more,
-        // which costs nothing a round does not. Where the revision cannot rise, no bridge moves;
-        // the daemon's next start or the next change follows them.
+        self.follow_after_commit(&mut catalogue, subjects, &*admission)
+            .await;
+        answer
+    }
+
+    /// Brings each native bridge `subjects` names to what its installation now wants, after a
+    /// change committed or stopped: the subjects first, then the admission revision rising where
+    /// there are any, then each bridge read and followed.
+    ///
+    /// A bridge the admissions carry may move here, whether or not the change committed, so the
+    /// admission revision rises first, under the change's own authority, every time: every
+    /// snapshot computed before this is below every one after it, and every worker is sent the
+    /// bridges as they are now. A change that raised it already raises it once more, which costs
+    /// nothing a round does not. Where the revision cannot rise, no bridge moves; the daemon's next
+    /// start or the next change follows them.
+    async fn follow_after_commit(
+        &self,
+        catalogue: &mut Catalogue,
+        subjects: Vec<PluginId>,
+        authority: &dyn Authority,
+    ) {
         let raised = subjects.is_empty()
-            || match catalogue.raise_admission_revision(&*admission) {
+            || match catalogue.raise_admission_revision(authority) {
                 Ok(_) => true,
                 Err(error) => {
                     eprintln!(
@@ -1313,9 +1328,34 @@ impl CatalogueModule {
                 }
             };
         let subjects = if raised { subjects } else { Vec::new() };
-        let wanted = self.wanted_bridges(&catalogue, subjects);
+        let wanted = self.wanted_bridges(catalogue, subjects);
         self.follow_bridges(wanted).await;
-        answer
+    }
+
+    /// Seeds the catalogue from the generation compiled into this host, under the catalogue's own
+    /// lock: a request that reaches the catalogue meanwhile waits for it.
+    ///
+    /// The seed enrols with the budgets this host's configuration allows (the SDK's defaults, each
+    /// capped by the configured maximum, and no mirror). What it committed is followed as any
+    /// change is: the bridges its installations now want are brought to that, after the admission
+    /// revision rises for them. A seed that did nothing, or only recorded its own decision, moves
+    /// no revision and no bridge.
+    pub async fn seed(
+        &self,
+        bundle: &kr_plugin_catalogue::SeedBundle,
+    ) -> kr_plugin_catalogue::SeedOutcome {
+        let mut catalogue = self.catalogue.lock().await;
+        let budgets = seed_budgets(&self.budgets_in_force());
+        let outcome = catalogue.seed(bundle, self.environment_id, budgets).await;
+        let installed_something = !outcome.installed.is_empty()
+            || !outcome.left.is_empty()
+            || outcome.activated.is_some();
+        if outcome.committed && installed_something {
+            let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
+            self.follow_after_commit(&mut catalogue, subjects, &Owner::acting())
+                .await;
+        }
+        outcome
     }
 
     // Each argument is one part of the change: what was asked, by whom, under which admission,
@@ -1625,6 +1665,22 @@ impl CatalogueModule {
                             params.plugin_id, installed.package_digest, named
                         ),
                     ));
+                }
+                // A release that asks for a native bridge is granted to only by installing it, where
+                // the owner is shown the publisher's own statement of what the bridge does and the
+                // host's notice that it runs outside the plugin sandbox. This refuses before the
+                // owner's proof is spent, so a refused widening consumes no confirmation; the
+                // catalogue refuses it again inside the commit.
+                if let Some(added) = installed.widening_for_a_bridge(&grant) {
+                    return Err(ProtocolError::from(CatalogueError::GrantRequired {
+                        capability: added,
+                        requirement: "plugin.install of the installed release: it asks for a \
+                                      native bridge, so a grant that adds to what it holds is \
+                                      made when the owner confirms the release, which shows the \
+                                      publisher's own statement of what the bridge does and the \
+                                      host's notice that it runs outside the plugin sandbox"
+                            .to_owned(),
+                    }));
                 }
                 let plan = kr_protocol::confirmation::PluginGrantPlan {
                     environment_id: params.environment_id,
@@ -2488,6 +2544,29 @@ fn off_the_network(subject: &str) -> ProtocolError {
              network, so it has none to ask; select a network and restart it"
         ),
     )
+}
+
+/// The budgets the seeded repository is enrolled with: the SDK's defaults, each capped by what
+/// this host's configuration allows, and never a full offline mirror, which the bundle could not
+/// supply.
+fn seed_budgets(
+    allowed: &kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+) -> kr_plugin_sdk::limits::RepositoryBudgets {
+    let defaults = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
+    let capped = |default: kr_protocol::scalars::U64, allowed: u64| {
+        kr_protocol::scalars::U64::new(default.get().min(allowed))
+    };
+    kr_plugin_sdk::limits::RepositoryBudgets {
+        metadata_bytes: capped(defaults.metadata_bytes, allowed.metadata_bytes),
+        metadata_entries: capped(defaults.metadata_entries, allowed.metadata_entries),
+        retained_generations: capped(defaults.retained_generations, allowed.retained_generations),
+        retained_metadata_bytes: capped(
+            defaults.retained_metadata_bytes,
+            allowed.retained_metadata_bytes,
+        ),
+        payload_cache_bytes: capped(defaults.payload_cache_bytes, allowed.cached_payload_bytes),
+        full_offline_mirror: false,
+    }
 }
 
 /// Refuses, by name, an enrolment that asks for more than this host's configuration allows.

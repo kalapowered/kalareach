@@ -89,6 +89,8 @@ kr-client = { workspace = true, features = ["terminal"] }
 kr-changeset.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
+# The bundle a test seeds a catalogue from is made of files of its own, trusting what the test names.
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 kr-term.workspace = true
 kr-transfer.workspace = true
 # The connector packages a test publishes and installs are the worker's own test packages, so the

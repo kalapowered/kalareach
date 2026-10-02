@@ -402,6 +402,33 @@ impl Controller {
         });
     }
 
+    /// Seeds the catalogue from the generation compiled into this host, and tells the cadence when
+    /// the admission revision moved.
+    ///
+    /// The `kr-controller` binary calls this once, right after the daemon starts and before it
+    /// binds any endpoint a client could reach, so nothing is served from a catalogue the seed is
+    /// still making. A daemon that never calls it seeds nothing: a test seeds only when it asks.
+    /// What the run did, skipped or stopped at is kept for the doctor's catalogue check; a seed
+    /// that fails does not stop the daemon.
+    pub async fn seed_catalogue(
+        &self,
+        bundle: &kr_plugin_catalogue::SeedBundle,
+    ) -> kr_plugin_catalogue::SeedOutcome {
+        let before = self.catalogue.admission_revision().await.ok();
+        let outcome = self.catalogue.seed(bundle).await;
+        if self.catalogue.admission_revision().await.ok() != before {
+            self.admissions_due();
+        }
+        if outcome.failure.is_some()
+            || !outcome.skipped.is_empty()
+            || !outcome.notes.is_empty()
+            || outcome.expired.is_some()
+        {
+            self.note_admissions(format!("the bundled catalogue: {}", outcome.report()));
+        }
+        outcome
+    }
+
     /// Asks the cadence for a pass now.
     pub(crate) fn admissions_due(&self) {
         #[cfg(feature = "testing")]
