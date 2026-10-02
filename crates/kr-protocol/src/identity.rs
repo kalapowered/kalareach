@@ -992,6 +992,117 @@ mod tests {
         assert_eq!(decoded, ack);
     }
 
+    /// The bridge's opening and acknowledgement as an invoker and a helper of a build before the
+    /// start, build and base members declare them, member for member. Frames are closed schemas, so
+    /// each build refuses what the other writes, and neither reads the other's as something else.
+    #[test]
+    fn the_bridge_handshake_is_refused_both_ways_between_builds_with_and_without_the_new_members() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EarlierHello {
+            protocol_version: crate::hello::ProtocolVersion,
+            build_id: BuildId,
+            origin_environment_id: EnvironmentId,
+            origin_ingress: ActorIngress,
+            already_bridged: bool,
+            target: BridgeTarget,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EarlierAck {
+            protocol_version: crate::hello::ProtocolVersion,
+            environment_id: EnvironmentId,
+            os_user: String,
+            role: LocalRole,
+            connection_id: ConnectionId,
+            boot_identity: BootIdentity,
+            max_frame_len: U64,
+            action_window: ActionWindow,
+        }
+
+        let limits = kr_cbor::Limits::DEFAULT;
+        let connection_id = ConnectionId::new(crate::scalars::Uuid::from_bytes([5; 16]));
+        let window = ActionWindow {
+            action_window_id: crate::ids::ActionWindowId::new("w-test").expect("a window"),
+            connection_id,
+            boot_epoch: crate::ids::BootEpoch::new(1),
+            issued_at_ms: TimestampMs::new(100),
+            valid_for_ms: crate::scalars::DurationMs::new(120_000),
+        };
+        let origin = EnvironmentId::new(crate::scalars::Uuid::from_bytes([3; 16]));
+
+        // The opening: an earlier invoker's has no `start`, and this helper refuses it; this
+        // invoker's has one, and an earlier helper refuses that.
+        let earlier_hello = kr_cbor::to_canonical_vec(&EarlierHello {
+            protocol_version: crate::hello::PROTOCOL_VERSION,
+            build_id: BuildId::new("kr/0.0.9").expect("a build"),
+            origin_environment_id: origin,
+            origin_ingress: ActorIngress::LocalIpc,
+            already_bridged: false,
+            target: BridgeTarget::Controller,
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<BridgeFrame>(&earlier_hello, &limits).is_err(),
+            "this helper does not read an opening without `start`"
+        );
+        let hello = kr_cbor::to_canonical_vec(&BridgeHello {
+            protocol_version: crate::hello::PROTOCOL_VERSION,
+            build_id: BuildId::new("kr/0.1.0").expect("a build"),
+            origin_environment_id: origin,
+            origin_ingress: ActorIngress::LocalIpc,
+            already_bridged: false,
+            start: false,
+            target: BridgeTarget::Controller,
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<EarlierHello>(&hello, &limits).is_err(),
+            "an earlier helper does not read an opening with `start`"
+        );
+
+        // The acknowledgement: the same, for `build` and `base`.
+        let boot_identity = BootIdentity {
+            source: BootIdentitySource::LinuxBootId,
+            value: Bytes::new(b"boot-123".to_vec()),
+        };
+        let earlier_ack = kr_cbor::to_canonical_vec(&EarlierAck {
+            protocol_version: crate::hello::PROTOCOL_VERSION,
+            environment_id: origin,
+            os_user: "kala".to_owned(),
+            role: LocalRole::Controller,
+            connection_id,
+            boot_identity: boot_identity.clone(),
+            max_frame_len: U64::new(65536),
+            action_window: window.clone(),
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<BridgeHelloAck>(&earlier_ack, &limits).is_err(),
+            "this invoker does not read an acknowledgement without `base`"
+        );
+        let ack = kr_cbor::to_canonical_vec(&BridgeHelloAck {
+            protocol_version: crate::hello::PROTOCOL_VERSION,
+            environment_id: origin,
+            os_user: "kala".to_owned(),
+            build: None,
+            base: DestinationBase {
+                home: "/home/kala".to_owned(),
+                variables: Vec::new(),
+            },
+            role: LocalRole::Controller,
+            connection_id,
+            boot_identity,
+            max_frame_len: U64::new(65536),
+            action_window: window,
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<EarlierAck>(&ack, &limits).is_err(),
+            "an earlier invoker does not read an acknowledgement with `base`"
+        );
+    }
+
     fn wsl_enrolment() -> EnvironmentEnrolment {
         EnvironmentEnrolment {
             environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([7; 16])),
