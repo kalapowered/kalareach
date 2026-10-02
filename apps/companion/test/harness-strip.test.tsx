@@ -6,13 +6,13 @@
  * and a reset of what the page keeps, so that no test starts from another's leftovers.
  */
 
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
-import { HarnessStrip, applyPendingReset } from '../src/harness-strip'
+import { HarnessStrip, TapAwayPutsTheKeyboardAway, applyPendingReset } from '../src/harness-strip'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { DRAFTS_KEY } from '../src/mobile/model/store'
 
@@ -176,5 +176,25 @@ describe('the harness control strip', () => {
     storage.setItem(DRAFTS_KEY, '[]')
     applyPendingReset(storage, session)
     expect(storage.getItem(DRAFTS_KEY)).toBe('[]')
+  })
+
+  it('puts the keyboard away when a finger lifts from text, and leaves it for a control', () => {
+    render(
+      <div>
+        <TapAwayPutsTheKeyboardAway />
+        <textarea aria-label="Field" />
+        <button type="button">Control</button>
+        <p>Some text</p>
+      </div>
+    )
+    const field = screen.getByLabelText('Field')
+    field.focus()
+    expect(field).toHaveFocus()
+    fireEvent.pointerUp(screen.getByRole('button', { name: 'Control' }))
+    expect(field).toHaveFocus()
+    fireEvent.pointerUp(field)
+    expect(field).toHaveFocus()
+    fireEvent.pointerUp(screen.getByText('Some text'))
+    expect(field).not.toHaveFocus()
   })
 })
