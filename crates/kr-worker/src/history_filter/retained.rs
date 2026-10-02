@@ -230,7 +230,9 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::WorkflowEnable
         | Method::WorkflowPause
         | Method::WorkflowRun
-        | Method::HostUpdateHandover => Environment,
+        | Method::HostUpdateHandover
+        | Method::DescriptionConfigure
+        | Method::DescriptionDownload => Environment,
         _ => Unclassified,
     }
 }
@@ -747,6 +749,26 @@ mod tests {
                 assert!(
                     matches!(refused, WorkerError::PermissionDenied { .. }),
                     "{method:?}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-22.09: the two writes that change how a host describes its sessions are records of an
+    /// operation on the environment, answered with the setup they leave and no session's text, so
+    /// a device whose grant reaches them is shown them as it is shown the other host settings.
+    #[test]
+    fn the_description_writes_are_records_of_an_operation_on_the_environment() {
+        for method in [Method::DescriptionConfigure, Method::DescriptionDownload] {
+            assert_eq!(result_content(method), ResultContent::Environment);
+        }
+        let kept = ParamsValue::empty();
+        for disclosure in [Disclosure::Whole, Disclosure::StateOnly] {
+            for method in [Method::DescriptionConfigure, Method::DescriptionDownload] {
+                assert_eq!(
+                    shown_result(&disclosure, method, kept.clone(), Occasion::Replay)
+                        .expect("shown"),
+                    kept
                 );
             }
         }
