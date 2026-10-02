@@ -33,9 +33,11 @@ fails while it produces is finished by the next pass, without a restart.
 Some announcements are taken and produce nothing. One about a session the daemon is still closing is
 held back until the closure is read to its end, because its condition ends with the session; so is a
 pending question or approval that names a session being closed. One routed to the input lease holder
-is not for a destination of this host. One decided while privacy mode was on is never sent after it
-ends, even when quiet hours held it back and released it later: the store keeps the privacy state a
-decision was made under through its release.
+is not for a destination of this host. One decided under another privacy generation than the one in
+force is never sent. The store stamps each decision with the generation it was made in and keeps the
+stamp through a quiet-hours hold and its release, so a decision made while privacy mode was on is
+dropped when it is taken once the mode is off, and so is one kept across a private period, however
+long quiet hours held it.
 
 ## What travels, and what does not
 
@@ -87,12 +89,20 @@ and it is read again once the policy's lock is held. A destination whose rule na
 grant store issued to a paired device is told nothing once that pairing has ended, as the device's
 own requests would not be served either.
 
-The grant is asked three times: when the notification is produced, when it is claimed, and once more
-after the credential has been renewed, which can wait on the gateway. That last asking comes before
-the send is admitted under privacy mode, which can wait for an exchange already under way. A bound
-that ends in that wait is not caught, and neither is a revocation, an unpairing or a narrower rights
-ceiling: the notification is presented. What the grant reaches is digested with the notification, so
-a change to it settles the notification as revoked rather than sending it.
+A paired device's destination asks the grant three times: when the notification is produced, when it
+is claimed, and once more after the credential has been renewed, which can wait on the gateway. A
+grant of the grant store that was issued to the device is read through two records, the device's and
+then the grant's, and the grant is read last, because revoking a device withdraws the grants issued
+to it before it marks the device. The last asking comes before the send is admitted under privacy
+mode, which can wait for an exchange already under way, and the notification's own deadline is read
+once more after that admission, just before the send. A bound, a revocation, an unpairing or a
+narrower rights ceiling that lands after the last asking is not caught: the notification is
+presented. What the grant reaches is digested with the notification, so a change to it settles the
+notification as revoked rather than sending it.
+
+An external destination asks twice, when the notification is produced and when it is claimed. After
+the claim, the send reads the destination's credential from the secret store and takes the privacy
+admission before it sends. A bound that ends in those waits is not caught.
 
 ## Two sizes, measured rather than estimated
 
@@ -319,12 +329,15 @@ session. It is the only thing the outbox takes under the fence, and it is admitt
 transaction as its event. Every other announcement decided while privacy mode is on is taken from
 the store and settled with nothing produced, and it is never sent after privacy mode ends, because
 turning privacy mode off cannot reconstruct what was withheld. The store stamps each decision with
-the privacy state it was made under, and an announcement decided while privacy mode was on is
-dropped once it is off, whatever either clock says. One decided before the store stamped decisions
-has only the time it was decided at, and is dropped when that time is at or before the moment
-privacy mode was last turned off. A journal brought forward from an earlier build that had been
-through privacy mode records the time of that migration as the moment privacy mode ended, because
-the earlier build did not record when.
+the privacy generation it was made in and whether privacy mode was on in it, and a decision is
+produced only under the generation in force, with privacy mode on or off, whatever either clock
+says. One decided in an earlier generation, such as one quiet hours held across a private period, is
+settled with nothing produced. So is a question or approval decided before privacy mode was turned
+on and not yet taken, which gets no alert. One decided before the store stamped decisions has only
+the time it was decided at, and is dropped when that time is at or before the moment privacy mode
+was last turned off. One with no time at all is dropped once any end of privacy mode is on record. A
+journal brought forward from an earlier build that had been through privacy mode records the time of
+that migration as the moment privacy mode ended, because the earlier build did not record when.
 
 The alerts are the only rows of the generation the fence stands at. Cleanup acts on rows of earlier
 generations, so running it again at every start leaves them alone, and turning privacy mode off
