@@ -41,6 +41,15 @@ final class FirebaseConfigurationTests: XCTestCase {
         XCTAssertEqual(problems(), [])
     }
 
+    func testAnApplicationIdWithTheLongHashFirebaseIssuesPasses() {
+        // The hash in a real application identifier is longer than sixteen hex digits.
+        XCTAssertEqual(problems(["GOOGLE_APP_ID": "1:123456789012:ios:0123456789abcdef012345"]), [])
+    }
+
+    func testAFileWithNoBundleIdentifierIsLeftToFirebase() {
+        XCTAssertEqual(problems(["BUNDLE_ID": nil]), [])
+    }
+
     func testAnApplicationIdOfAnotherKnownFormatVersionIsLeftToFirebase() {
         // Firebase permits a version it does not know, when the id is otherwise formed.
         XCTAssertEqual(problems(["GOOGLE_APP_ID": "2:whatever:ios:abc"]), [])
@@ -60,6 +69,14 @@ final class FirebaseConfigurationTests: XCTestCase {
     func testAnApiKeyWithACharacterOutsideTheUrlSafeSetIsFound() {
         XCTAssertTrue(problems(["API_KEY": "AIzaSyA 0123456789abcdefghijklmnopqrstu"]).contains { $0.contains("API_KEY") })
         XCTAssertTrue(problems(["API_KEY": "AIzaSyA+0123456789abcdefghijklmnopqrstu"]).contains { $0.contains("API_KEY") })
+    }
+
+    func testAnApiKeyIsMeasuredInUTF16UnitsAsFirebaseDoes() {
+        // One letter outside the basic plane is one character and two units: 39 characters, 40 units.
+        let key = "A" + String(repeating: "b", count: 37) + "\u{1D4D0}"
+        XCTAssertEqual(key.count, 39)
+        XCTAssertEqual(key.utf16.count, 40)
+        XCTAssertTrue(problems(["API_KEY": key]).contains { $0.contains("API_KEY") })
     }
 
     func testAMissingOrEmptyRequiredValueIsFoundByName() {
