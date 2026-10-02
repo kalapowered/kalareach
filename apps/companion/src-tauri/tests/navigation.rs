@@ -149,10 +149,12 @@ mod macos {
                     // A failed expectation inside a scripted worker panics this thread; it is
                     // a failed check like any other, and must not leave the window loop running.
                     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        check(&handle, &messages).and_then(|()| {
-                            let (first, second) = workers.expect("the workers, once");
-                            page_load(&handle, &runtime, first, second)
-                        })
+                        resending()
+                            .and_then(|()| check(&handle, &messages))
+                            .and_then(|()| {
+                                let (first, second) = workers.expect("the workers, once");
+                                page_load(&handle, &runtime, first, second)
+                            })
                     }))
                     .unwrap_or_else(|_| Err("a check panicked".to_owned()));
                     let code = match checked {
@@ -187,6 +189,168 @@ mod macos {
                 return Err(format!("{what} did not happen within {LIVENESS:?}"));
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    /// Sends a script to a page and waits for what it does, sending it again each time the page has
+    /// loaded again since it was sent. Returns how many times it was sent.
+    ///
+    /// A script waits in the web view's content process until the page runs it, and it is lost with
+    /// that process. The system ends the process when the graphics process it depends on stops
+    /// answering, which a machine with every core busy brings about, and the application then loads
+    /// the page again: a script sent once is never run, and nothing says so. A page that loads again
+    /// is a condition the check can see, since `loads` moves, so a script is sent again when it does
+    /// and the wait is for what the script does, bounded by `limit` whatever the page does: one that
+    /// never runs the script, and one that keeps loading again.
+    fn send_until(
+        what: &str,
+        limit: Duration,
+        loads: &Loads,
+        mut send: impl FnMut() -> Result<(), String>,
+        done: impl Fn() -> bool,
+    ) -> Result<usize, String> {
+        let started = Instant::now();
+        let mut sent = 0;
+        loop {
+            let seen = loads.load(std::sync::atomic::Ordering::SeqCst);
+            send()?;
+            sent += 1;
+            loop {
+                if done() {
+                    return Ok(sent);
+                }
+                if started.elapsed() > limit {
+                    return Err(format!(
+                        "{what} did not happen within {limit:?}, after {sent} sendings"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                if loads.load(std::sync::atomic::Ordering::SeqCst) != seen {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Sends a window's page a script and waits for what it does, within the liveness bound.
+    fn send_script(
+        what: &str,
+        window: &WebviewWindow,
+        loads: &Loads,
+        script: &str,
+        done: impl Fn() -> bool,
+    ) -> Result<usize, String> {
+        send_until(
+            what,
+            LIVENESS,
+            loads,
+            || window.eval(script).map_err(|error| error.to_string()),
+            done,
+        )
+    }
+
+    /// The resend rule held to itself, without a web view: a script lost with the page that held it
+    /// is sent again, one that ran is not, and a page that stays and never runs it is given up on
+    /// at the limit with no second sending.
+    fn resending() -> Result<(), String> {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let loads = Loads::default();
+        let sends = AtomicUsize::new(0);
+        let ran = AtomicUsize::new(0);
+        let sent = send_until(
+            "a script lost with its page",
+            Duration::from_secs(30),
+            &loads,
+            || {
+                if sends.fetch_add(1, SeqCst) == 0 {
+                    // The page is lost with the script and loaded again.
+                    loads.fetch_add(1, SeqCst);
+                } else {
+                    ran.fetch_add(1, SeqCst);
+                }
+                Ok(())
+            },
+            || ran.load(SeqCst) > 0,
+        )?;
+        if sent != 2 {
+            return Err(format!("a script lost with its page was sent {sent} times"));
+        }
+
+        let sends = AtomicUsize::new(0);
+        let ran = AtomicUsize::new(0);
+        let sent = send_until(
+            "a script that ran",
+            Duration::from_secs(30),
+            &loads,
+            || {
+                sends.fetch_add(1, SeqCst);
+                ran.fetch_add(1, SeqCst);
+                Ok(())
+            },
+            || ran.load(SeqCst) > 0,
+        )?;
+        if sent != 1 {
+            return Err(format!("a script that ran was sent {sent} times"));
+        }
+
+        let sends = AtomicUsize::new(0);
+        let never = send_until(
+            "a script that does nothing",
+            Duration::from_millis(300),
+            &loads,
+            || {
+                sends.fetch_add(1, SeqCst);
+                Ok(())
+            },
+            || false,
+        );
+        if never.is_ok() || sends.load(SeqCst) != 1 {
+            return Err(format!(
+                "a page that never ran the script was given up on after {} sendings: {never:?}",
+                sends.load(SeqCst)
+            ));
+        }
+
+        // A page that loads again after every sending, and never runs the script, is given up on at
+        // the limit too: the wait ends, which a page that never stops loading would otherwise prevent.
+        let sends = AtomicUsize::new(0);
+        let churning = send_until(
+            "a script on a page that keeps loading again",
+            Duration::from_millis(400),
+            &loads,
+            || {
+                sends.fetch_add(1, SeqCst);
+                loads.fetch_add(1, SeqCst);
+                Ok(())
+            },
+            || false,
+        );
+        if churning.is_ok() {
+            return Err(format!(
+                "a page that kept loading again was not given up on after {} sendings",
+                sends.load(SeqCst)
+            ));
+        }
+
+        // A refusal is reported as often as the script was sent at most, and at least once: a
+        // second sending whose report arrives late is one more refusal, and one more than the
+        // sendings is a window that was not meant to refuse.
+        for (reported, sent, held) in [
+            (0, 1, false),
+            (1, 1, true),
+            (2, 1, false),
+            (1, 2, true),
+            (2, 2, true),
+            (3, 2, false),
+        ] {
+            if reported_for(reported, sent) != held {
+                return Err(format!(
+                    "{reported} refusals for {sent} sendings were taken as {}",
+                    !held
+                ));
+            }
         }
         Ok(())
     }
@@ -260,23 +424,32 @@ mod macos {
         )
     }
 
+    /// Whether a refusal was reported as often as a script that could have caused it was sent: at
+    /// least once, and no more often than it was sent, which is once unless its page loaded again.
+    fn reported_for(reported: usize, sent: usize) -> bool {
+        (1..=sent).contains(&reported)
+    }
+
     fn check(app: &AppHandle, messages: &Messages) -> Result<(), String> {
         // Navigation, with the production handler: the handler refuses it and the window stays on
         // the bundled interface.
         let (guarded, loads) = open(app, "guarded", true)?;
-        guarded
-            .eval(format!("location.assign('{WEBSITE}')"))
-            .map_err(|error| error.to_string())?;
-        wait_for("the production handler refusing the navigation", || {
-            messages.count(NAVIGATION_REFUSED) >= 1
-        })
+        let navigations = send_script(
+            "the production handler refusing the navigation",
+            &guarded,
+            &loads,
+            &format!("location.assign('{WEBSITE}')"),
+            || messages.count(NAVIGATION_REFUSED) >= 1,
+        )
         .map_err(|failure| {
             refusal_failure(&failure, messages, NAVIGATION_REFUSED, &guarded, &loads)
         })?;
         std::thread::sleep(Duration::from_secs(2));
-        if messages.count(NAVIGATION_REFUSED) != 1 {
+        if !reported_for(messages.count(NAVIGATION_REFUSED), navigations) {
             return Err(refusal_failure(
-                "the navigation was refused once",
+                &format!(
+                    "the navigation, sent {navigations} times, was not reported once at least and as often at most"
+                ),
                 messages,
                 NAVIGATION_REFUSED,
                 &guarded,
@@ -292,17 +465,20 @@ mod macos {
 
         // Popups, with the production handler: it is asked and refuses, and no second web view
         // exists.
-        guarded
-            .eval(format!("window.open('{WEBSITE}')"))
-            .map_err(|error| error.to_string())?;
-        wait_for("the production handler refusing the popup", || {
-            messages.count(WINDOW_REFUSED) >= 1
-        })
+        let popups = send_script(
+            "the production handler refusing the popup",
+            &guarded,
+            &loads,
+            &format!("window.open('{WEBSITE}')"),
+            || messages.count(WINDOW_REFUSED) >= 1,
+        )
         .map_err(|failure| refusal_failure(&failure, messages, WINDOW_REFUSED, &guarded, &loads))?;
         std::thread::sleep(Duration::from_secs(2));
-        if messages.count(WINDOW_REFUSED) != 1 {
+        if !reported_for(messages.count(WINDOW_REFUSED), popups) {
             return Err(refusal_failure(
-                "the popup was refused once",
+                &format!(
+                    "the popup, asked for {popups} times, was not reported once at least and as often at most"
+                ),
                 messages,
                 WINDOW_REFUSED,
                 &guarded,
@@ -319,23 +495,32 @@ mod macos {
 
         // The controls: without the handlers the same page leaves, and a permissive handler
         // creates the popup, so the two checks above are checks of the handlers.
-        let (control, _) = open(app, "control", false)?;
-        control
-            .eval(format!("window.open('{WEBSITE}')"))
-            .map_err(|error| error.to_string())?;
-        wait_for("the control's popup", || app.webview_windows().len() == 3)?;
-        control
-            .eval(format!("location.assign('{WEBSITE}')"))
-            .map_err(|error| error.to_string())?;
-        wait_for("the control leaving the bundle", || {
-            address(&control).starts_with(WEBSITE)
-        })?;
-        // The control's windows have no production handler, so nothing more was refused.
-        if messages.count(NAVIGATION_REFUSED) != 1 || messages.count(WINDOW_REFUSED) != 1 {
+        let (control, control_loads) = open(app, "control", false)?;
+        send_script(
+            "the control's popup",
+            &control,
+            &control_loads,
+            &format!("window.open('{WEBSITE}')"),
+            || app.webview_windows().len() >= 3,
+        )?;
+        send_script(
+            "the control leaving the bundle",
+            &control,
+            &control_loads,
+            &format!("location.assign('{WEBSITE}')"),
+            || address(&control).starts_with(WEBSITE),
+        )?;
+        // The control's windows have no production handler, so nothing more was refused: no more
+        // refusals than the guarded window's scripts were sent, which is exactly one each unless
+        // a page loaded again, and then a late report of a script sent twice is one of them.
+        if !reported_for(messages.count(NAVIGATION_REFUSED), navigations)
+            || !reported_for(messages.count(WINDOW_REFUSED), popups)
+        {
             return Err("a window without the production handlers reported a refusal".to_owned());
         }
         Ok(())
     }
+
     /// The page-load check: two pages each hold a view, and reloading one ends only its own.
     fn page_load(
         app: &AppHandle,
@@ -347,7 +532,7 @@ mod macos {
 
         // Each page's first load has finished before a view is opened on it, which `open` waits
         // for, so the load that ends a view here is the reload and nothing earlier.
-        let (one, _) = open(app, "view-one", true)?;
+        let (one, one_loads) = open(app, "view-one", true)?;
         let (_two, _) = open(app, "view-two", true)?;
         let heard: Arc<Mutex<Vec<(u8, TerminalViewState)>>> = Arc::default();
         let publish = |page: u8| -> companion_tauri::terminal::Publish {
@@ -383,8 +568,13 @@ mod macos {
             return Err(format!("{} views held, not two", views.held()));
         }
 
-        one.eval("location.reload()")
-            .map_err(|error| error.to_string())?;
+        send_script(
+            "the first page's view ending with its page",
+            &one,
+            &one_loads,
+            "location.reload()",
+            || views.held() == 1,
+        )?;
         let sent = runtime.block_on(async { one_link.closed().await });
         if sent.len() != 1
             || sent[0].method != kr_protocol::method::Method::SessionDetach.to_string()
@@ -393,7 +583,6 @@ mod macos {
                 "the reloaded page's view sent {sent:?} rather than its detach"
             ));
         }
-        wait_for("one view left", || views.held() == 1)?;
         let quiet = runtime.block_on(async { two_link.quiet_for(Duration::from_secs(1)).await });
         if !quiet {
             return Err("the other page's view was sent something".to_owned());
