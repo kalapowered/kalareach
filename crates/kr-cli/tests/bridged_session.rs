@@ -111,6 +111,8 @@ fn stand_in(tools: &Path, destination: &Path, home: &Path, login: Login) -> Stri
     format!(
         r##"#!/bin/sh
 printf '%s\n' "$*" >>'{tools}/invocations'
+# The helper is this process, which becomes it, so a test can name the one it means to end.
+printf '%s\n' "$$" >'{tools}/last-bridge.pid'
 # A test that wants the destination unreachable from some run onward says from which.
 if [ -f '{tools}/unreachable-after' ] \
   && [ "$(wc -l <'{tools}/invocations')" -gt "$(cat '{tools}/unreachable-after')" ]; then
@@ -671,13 +673,37 @@ async fn an_attach_to_a_closed_session_in_a_stopped_environment_says_how_it_ende
 
 /// A terminal, with `kr attach` running on it through a shell that reports how it ended.
 struct Terminal {
-    _pty: portable_pty::PtyPair,
+    pty: portable_pty::PtyPair,
+    /// The modes the terminal was in before anything ran on it, which a command has to leave it in.
+    before: rustix::termios::Termios,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
     seen: Arc<std::sync::Mutex<Vec<u8>>>,
     writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
 }
 
+/// The descriptor a terminal's state is read through: a pseudo-terminal pair shares one line
+/// discipline, so the master answers for the state the command set on the slave.
+fn terminal_fd(pty: &portable_pty::PtyPair) -> std::os::fd::BorrowedFd<'_> {
+    let raw = pty
+        .master
+        .as_raw_fd()
+        .expect("the terminal has a descriptor");
+    // The descriptor belongs to the pair, which outlives every use of this borrow.
+    #[expect(
+        unsafe_code,
+        reason = "borrowing a descriptor the caller owns has no safe form"
+    )]
+    unsafe {
+        std::os::fd::BorrowedFd::borrow_raw(raw)
+    }
+}
+
 impl Terminal {
+    /// The terminal's modes now.
+    fn modes(&self) -> rustix::termios::Termios {
+        rustix::termios::tcgetattr(terminal_fd(&self.pty)).expect("reads the modes")
+    }
+
     fn text(&self) -> String {
         String::from_utf8_lossy(
             &self
@@ -759,6 +785,7 @@ impl World {
                 pixel_height: 0,
             })
             .expect("opens a terminal");
+        let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the modes");
         let mut builder = CommandBuilder::new("/bin/sh");
         builder.arg("-c");
         builder.arg(command);
@@ -796,7 +823,8 @@ impl World {
             pty.master.take_writer().expect("a writer"),
         ));
         Terminal {
-            _pty: pty,
+            before,
+            pty,
             shell,
             seen,
             writer,
@@ -943,6 +971,104 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
         "the attachment tried the destination"
     );
     text
+}
+
+/// KR-REQ-03.14, 03.15: the helper of an attachment dying is a lost connection and not the end of
+/// the session. The attachment ends saying so, with the code a host that cannot be reached has, the
+/// terminal is the person's again as it was before, and the session is still alive where it lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_that_dies_during_an_attachment_ends_it_as_a_lost_connection_and_frees_the_terminal()
+ {
+    let world = World::start().await;
+    world.enrol_destination();
+    let created = world.create_in_destination();
+    let display = created["display_number"].to_string();
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+
+    let terminal = world.attach_on_a_terminal(&display);
+    terminal.types("printf 'live-%s\\n' 1\r");
+    terminal.expect_within("live-1", "the attachment is carrying a session");
+    assert!(
+        !terminal
+            .modes()
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON),
+        "the attachment holds the terminal in raw mode while it is live"
+    );
+
+    // The helper is the bridge's far end. It is ended outright, as a distribution shut down under
+    // it would end it.
+    let helper = std::fs::read_to_string(world.tools.join("last-bridge.pid"))
+        .expect("the stand-in recorded the helper it became");
+    let ended = std::process::Command::new("kill")
+        .args(["-KILL", helper.trim()])
+        .status()
+        .expect("sends the signal");
+    assert!(ended.success(), "the helper was ended");
+
+    terminal.expect_within(
+        "the connection to the session ended",
+        "the attachment said the connection was lost",
+    );
+    terminal.expect_within("attach-finished-3", "with the code of a host that was not reached");
+    let started = Instant::now();
+    let after = loop {
+        let modes = terminal.modes();
+        if modes
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON)
+        {
+            break modes;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the terminal was not given back"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        after.local_modes.bits(),
+        terminal.before.local_modes.bits(),
+        "the terminal's local modes are as they were"
+    );
+    assert_eq!(
+        after.input_modes.bits(),
+        terminal.before.input_modes.bits(),
+        "and its input modes"
+    );
+    assert!(
+        terminal
+            .text()
+            .as_bytes()
+            .windows(kr_cli::terminal::RESET_SEQUENCES.len())
+            .any(|window| window == kr_cli::terminal::RESET_SEQUENCES),
+        "and what the session had set on it was reset: {}",
+        terminal.text().escape_debug()
+    );
+
+    // The helper was a way to the session, and the session did not end with it.
+    let listed: kr_protocol::session::SessionListResult = world.ask(
+        Method::SessionList,
+        &kr_protocol::session::SessionListParams {
+            environment_id: kr_protocol::scalars::Nullable::null(),
+            include_closed: true,
+        },
+    );
+    let summary = listed
+        .sessions
+        .iter()
+        .find(|summary| summary.session_id.to_string() == session)
+        .expect("the destination still lists the session");
+    assert_ne!(
+        summary.state,
+        kr_protocol::session::SessionState::Closed,
+        "a lost bridge does not close the session"
+    );
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
 }
 
 /// KR-REQ-03.14, 03.15, 07.04: what the person typed while the creating terminal was asked for its
