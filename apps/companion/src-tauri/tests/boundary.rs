@@ -1054,6 +1054,8 @@ fn value_after<'a>(line: &'a str, name: &str) -> Option<&'a str> {
         if before_ok && after_ok {
             let rest = after.trim_start().trim_start_matches(['=', ':']).trim();
             let rest = rest.split("//").next().unwrap_or(rest);
+            // A YAML comment, which the line may end in.
+            let rest = rest.split(" #").next().unwrap_or(rest);
             return Some(rest.trim().trim_end_matches([';', ',']).trim());
         }
         from = end;
@@ -1069,6 +1071,10 @@ fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim();
+        // A comment line says nothing a floor is read from, whatever words it holds.
+        if name == "project.yml" && trimmed.starts_with('#') {
+            continue;
+        }
         if name == "build.gradle" || name == "build.gradle.kts" {
             for key in ["minSdk", "minSdkVersion"] {
                 if let Some(value) = value_after(trimmed, key) {
@@ -1107,6 +1113,8 @@ fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
                         "macOS" => Floor::Macos,
                         other => panic!("{name}:{number}: a deployment target for {other}"),
                     };
+                    // The value ends where a comment on its line begins.
+                    let value = value.split(" #").next().unwrap_or(value);
                     found.push((number, platform, value.to_owned()));
                 }
             }
@@ -1378,6 +1386,14 @@ fn the_floor_scan_reads_each_way_a_file_can_write_a_floor() {
             "options:\n  deploymentTarget:\n    iOS: 17.0\nsettings:\n  base:\n    IPHONEOS_DEPLOYMENT_TARGET: 16.0\n"
         ),
         [(Floor::Ios, (17, 0, 0)), (Floor::Ios, (16, 0, 0))]
+    );
+    // A comment that holds a setting's name is not a floor, and a comment after a value is not part of it.
+    assert_eq!(
+        read(
+            "project.yml",
+            "# IPHONEOS_DEPLOYMENT_TARGET comes from deploymentTarget\noptions:\n  deploymentTarget:\n    iOS: 17.0 # the baseline\nsettings:\n  base:\n    # MACOSX_DEPLOYMENT_TARGET: 10.0\n    IPHONEOS_DEPLOYMENT_TARGET: 17.0 # the same\n"
+        ),
+        [(Floor::Ios, (17, 0, 0)), (Floor::Ios, (17, 0, 0))]
     );
     // A target's own override, nested deeper, beside a correct global floor, and a later key at the
     // same depth that is not a floor.
