@@ -21,9 +21,6 @@ name: wsl-acceptance
 # It is not part of the landing workflow: the run takes the better part of an hour.
 
 on:
-  push:
-    branches: ["task/T-025b-phase2-rebased1"]
-    paths: [".github/workflows/wsl-acceptance.yml", "scripts/e2e-wsl.sh"]
   workflow_dispatch:
 
 permissions:

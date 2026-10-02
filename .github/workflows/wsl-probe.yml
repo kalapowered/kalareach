@@ -15,9 +15,6 @@ name: wsl-probe
 # It is not part of the landing workflow. `docs/releases/platforms.md` says what it found and when.
 
 on:
-  push:
-    branches: ["task/T-025b-phase2-rebased1"]
-    paths: [".github/workflows/wsl-probe.yml"]
   workflow_dispatch:
     inputs:
       runner:
