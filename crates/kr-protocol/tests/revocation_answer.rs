@@ -2,7 +2,7 @@
 //!
 //! | Requirement | Tests |
 //! | --- | --- |
-//! | KR-REQ-09.12 | `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
+//! | KR-REQ-09.12 | `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
 
 use kr_cbor::Limits;
 use kr_protocol::action::{
@@ -266,6 +266,86 @@ fn a_cut_barrier_reads_as_the_whole_one_would() {
     assert!(!cut.holds());
     assert_eq!(cut.workers_total.get(), workers as u64);
     assert_eq!(cut.pending().len(), cut.workers.len());
+}
+
+/// The workers kept are a prefix of the order the cut takes them in: those whose barrier has not
+/// held first, then the rest, each in session order. A worker that does not fit ends the cut, and
+/// no smaller one behind it takes its room, whether it waits or not.
+#[test]
+fn a_cut_takes_the_workers_that_have_not_held_before_any_that_has() {
+    // One waiting worker whose detail alone is larger than a frame can spare, among small ones.
+    let barrier = RevocationBarrier::new(
+        revision(),
+        (0..50)
+            .map(|index| {
+                let state = if index < 10 {
+                    BarrierState::Pending
+                } else {
+                    BarrierState::Acknowledged
+                };
+                let mut one = worker(index, state);
+                if index == 5 {
+                    one.detail = "x".repeat(1_045_000);
+                }
+                one
+            })
+            .collect(),
+    );
+    let answer = RevocationResult::bounded(revision(), std::iter::empty(), barrier);
+    let kept: Vec<SessionId> = answer
+        .barrier
+        .workers
+        .iter()
+        .map(|worker| worker.session_id)
+        .collect();
+    assert_eq!(
+        kept,
+        (0..5).map(session).collect::<Vec<_>>(),
+        "the cut ends at the worker that does not fit"
+    );
+    assert_eq!(answer.barrier.workers_total.get(), 50);
+    assert!(!answer.barrier.holds(), "a waiting worker is still kept");
+    assert!(answer.fits_a_frame());
+
+    // The same workers without the one that does not fit: every waiting worker, then the others in
+    // session order, as many as fit, which is all of them.
+    let barrier = RevocationBarrier::new(
+        revision(),
+        (0..50)
+            .map(|index| {
+                worker(
+                    index,
+                    if index % 7 == 0 {
+                        BarrierState::Pending
+                    } else {
+                        BarrierState::Acknowledged
+                    },
+                )
+            })
+            .collect(),
+    );
+    let whole = RevocationResult::bounded(revision(), std::iter::empty(), barrier);
+    assert_eq!(whole.barrier.workers.len(), 50);
+    assert_eq!(whole.barrier.workers_total.get(), 50);
+}
+
+/// A total below the length of the list beside it is raised to it before anything is measured, so
+/// an answer made of totals that understate their lists still fits a frame and still counts them.
+#[test]
+fn a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits() {
+    let mut understated = worker(1, BarrierState::Acknowledged);
+    understated.rejected_actions = (0..300).map(fenced).collect();
+    understated.possibly_executed = (0..300).map(executed).collect();
+    let answer = RevocationResult::bounded(
+        revision(),
+        std::iter::empty(),
+        RevocationBarrier::new(revision(), vec![understated]),
+    );
+    let kept = &answer.barrier.workers[0];
+    assert_eq!(kept.rejected_actions_total.get(), 300);
+    assert_eq!(kept.possibly_executed_total.get(), 300);
+    assert!(answer.fits_a_frame());
+    assert_eq!(through_a_control_frame(&answer), answer);
 }
 
 /// Names that alone fill a frame are cut by what the frame carries, not by a count: a worker with a
