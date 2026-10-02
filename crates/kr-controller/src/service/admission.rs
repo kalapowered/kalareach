@@ -415,9 +415,9 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`LeaseDenied::NotAcknowledged`] when the worker has not acknowledged the revision in
-    /// force, which an announcement to it can change, and [`LeaseDenied::Stopped`] for what one
-    /// cannot: a generation this daemon no longer holds, a fence it owes, or a revision that moved
-    /// while the lease was taken.
+    /// force, or the revision moved while the lease was taken, which an announcement to it can
+    /// change, and [`LeaseDenied::Stopped`] for what one cannot: a generation this daemon no longer
+    /// holds, or a fence it owes.
     pub(super) async fn dispatch_lease(
         &self,
         session_id: SessionId,
