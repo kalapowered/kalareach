@@ -1,9 +1,14 @@
 # Voice on the host
 
-The voice coordinator runs on the host. It selects what a call may know, interprets what a call
-asks for, and submits every action through the checks the host already applies to a typed request.
-Voice processing has an explicit data-access boundary, separate from the encryption of terminal
-transport, and this document is that boundary written down.
+The voice coordinator runs on the host. It selects what a call may know and interprets what a call
+asks for, and it decides each action against the grants the host already keeps. Voice processing has
+an explicit data-access boundary, separate from the encryption of terminal transport, and this
+document is that boundary written down.
+
+This daemon starts no managed call. It attaches no managed voice broker, so `voice.prepare` reports
+no managed terms and `voice.start` answers that the host has no voice service configured. The
+sections on the rate and the account token describe what the coordinator does when a broker is
+attached, which its code and tests establish, and every other section holds on this daemon as it is.
 
 ## What the parts are
 
@@ -11,7 +16,7 @@ transport, and this document is that boundary written down.
 | --- | --- | --- |
 | The native client | The paired device | The microphone, the speaker and the WebRTC media path |
 | The coordinator | The host | Context selection, delegation, the voice grant, verification of the unlocked-screen confirmation |
-| The managed service | KalaReach | Creating the provider call, the money, the metering channel and the six commands it will carry |
+| The managed service | KalaReach | Creating the provider call, the money, the metering channel and the six commands it carries |
 | The provider | OpenAI | The model, the audio and the delegations it announces |
 
 Audio travels between the device and the provider. It does not pass through the host, and it does
@@ -134,7 +139,7 @@ needs host-management authority, and this host does not resolve that right for a
 
 ## How a device reaches it
 
-The five voice methods are served to a paired device over its own authenticated connection, which
+The six voice methods are served to a paired device over its own authenticated connection, which
 is the ingress section 23 gives them. `voice.grant` is also served on the host's own socket, to the
 person sitting at the machine. A device holds its ordinary grant and, separately, a voice grant; the
 connection's own check resolves the voice right against that second grant, and the coordinator takes
@@ -142,6 +147,18 @@ the intersection of the two again at the moment of every decision.
 
 One device starts one call at a time, and one change to a device's voice grant runs at a time, so
 two requests can never each decide about the authority the other is writing.
+
+## What this daemon performs and supplies
+
+The daemon performs one kind of voice action itself, the reading of a session, which covers
+navigating, status queries, briefing and composing a prompt. For every other action it admits the
+proposal and reports it as admitted and not done, because the daemon does not dispatch to a
+session's worker, and a receipt stands for what was done. A decision on an approval is refused: the
+daemon holds no approval's details to check a spoken decision against.
+
+The context the daemon supplies is the session's description and its working directory, each with
+the moment it was produced. It supplies no active application, no pending-decision summaries and no
+messages, because it holds no semantic history, and the selection says so as withheld.
 
 ## A voice session is not a terminal session
 
@@ -170,5 +187,7 @@ is the authorisation header of the request it authorises. The token lasts as lon
 said when it issued it, ten minutes for the managed service, and the host does not refresh it; a
 token issued without the `voice` scope is refused before any request carries it.
 
-A host with no token, and a host with no broker configured, are both complete hosts. A provider
-credential of your own and the agent already running in the session both still work.
+A host with no token and a host with no broker configured are both complete hosts. They start no
+managed call, and nothing else on them depends on one: sessions, agents and their questions work as
+they do without voice. The coordinator takes its provider through a seam, so a provider of a
+person's own can stand where the managed one does, and this host ships none.
