@@ -1087,9 +1087,12 @@ fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<Strin
             found = true;
         }
     }
-    // The line break an owner added is a bare line feed: one that follows a carriage return is the
-    // person's own line end, and is not taken.
-    if owners.contains(&rebuilt.len()) && rebuilt.ends_with('\n') && !rebuilt.ends_with("\r\n") {
+    // The line break an owner added is a bare line feed. A PowerShell profile refuses a carriage
+    // return alone, so there a line feed that follows a carriage return is the person's own line end
+    // and is not taken; the other shells' files accept one, and the break an owner added after it is
+    // its own.
+    let persons_line_end = kind == ShellKind::PowerShell && rebuilt.ends_with("\r\n");
+    if owners.contains(&rebuilt.len()) && rebuilt.ends_with('\n') && !persons_line_end {
         rebuilt.pop();
     }
     if !found {
@@ -3341,8 +3344,42 @@ mod tests {
         }
     }
 
+    /// KR-REQ-26.05: a startup file of another shell whose last line ends in a carriage return alone
+    /// is given back exactly: the install adds the line feed it needs, and the removal takes it.
+    ///
+    /// Only a PowerShell profile refuses a lone carriage return, so only there is a line feed that
+    /// follows one the person's own line end and not the entry's.
+    #[test]
+    fn a_file_of_another_shell_ending_in_a_lone_carriage_return_is_given_back_exactly() {
+        let root = tempfile::tempdir().expect("a directory");
+        for (kind, name) in [
+            (ShellKind::Zsh, ".zshrc"),
+            (ShellKind::Bash, ".bashrc"),
+            (ShellKind::Fish, "config.fish"),
+        ] {
+            let path = root.path().join(name);
+            let body = entry(&for_shell(kind), Path::new("/opt/kr/zsh-entry.zsh"), false)
+                .expect("the path is text");
+            let theirs = "# personal comment\r";
+            std::fs::write(&path, theirs).expect("writes");
+            assert_eq!(
+                install(&path, &body, &Placement::End).expect("installs"),
+                Change::Added
+            );
+            assert_eq!(
+                super::remove(&path, record(), kind).expect("removes"),
+                Change::Removed
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{kind:?}: the file did not come back as it was"
+            );
+        }
+    }
+
     /// KR-REQ-26.05: a removal whose second entry's lines hold the first one's owner does not
-    /// panic or take anything it should not.
+    /// panic, and takes no line break of the person's.
     ///
     /// A person's own text can repeat an entry's begin line above the entry. The span from it to the
     /// entry's end line then holds the line break the other entry owned, which goes with the span.
@@ -3356,6 +3393,11 @@ mod tests {
             format!("{CHECK_MARKER_BEGIN}\nthe person's own line\n{load}{CHECK_MARKER_END}\n");
         let rebuilt = removed_from(&text, ShellKind::Zsh).expect("reads");
         assert_eq!(rebuilt.as_deref(), Some(""));
+        // With a line of the person's in front, it keeps its line end: an owner that the span held
+        // is gone with the span and is not moved to the start of it.
+        let text = format!("$w = 1\n{text}");
+        let rebuilt = removed_from(&text, ShellKind::Zsh).expect("reads");
+        assert_eq!(rebuilt.as_deref(), Some("$w = 1\n"));
     }
 
     /// KR-REQ-07.23: removal never changes a signed profile either, and says what to do.
@@ -3729,11 +3771,16 @@ mod tests {
             "using namespace System\n$x = 1",
             "the owner at the end of the person's text did not give its break back"
         );
-        // A line the person wrote directly in front of an entry that owns a break is theirs, with
-        // either line end: a removal never leaves half of a CRLF.
+        // A line the person wrote directly in front of an entry that owns a break is theirs when it
+        // ends in CRLF: a removal never leaves half of one. A bare line feed there is still taken,
+        // because the entry's note does not record what its break followed.
         std::fs::write(&path, "$x = 1").expect("writes");
         install(&path, &check, &last.placement).expect("installs");
         let installed = std::fs::read_to_string(&path).expect("reads");
+        assert!(
+            installed.contains(SEPARATOR_NOTE),
+            "the entry owns the break"
+        );
         let at = installed.find(CHECK_MARKER_BEGIN).expect("the entry");
         let written = format!("{}$y = 1\r\n{}", &installed[..at], &installed[at..]);
         std::fs::write(&path, written).expect("writes");
