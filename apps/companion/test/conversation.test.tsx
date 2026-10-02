@@ -515,3 +515,30 @@ describe('what packages show arrives on the stream (KR-REQ-11.48)', () => {
     expect(said('n-7')).toContain('The newer n-7.')
   })
 })
+
+describe('the conversation names each kind of entry in words (KR-REQ-13.19)', () => {
+  it('names a kind it does not know by a generic label and keeps the identifier as data', async () => {
+    const { port, controls } = fakeHost()
+    openConversation(port)
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    controls.records.appendEntry(SESSION_MAIN, 'tool.failed', 'cargo test exited 101')
+    controls.records.appendEntry(SESSION_MAIN, 'plan.revised', 'Two steps were added.')
+    await shownAgain()
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY, entry(6), entry(7)])
+    })
+
+    expect(said(entry(4))).toContain('Tool finished')
+    expect(said(entry(6))).toContain('Tool failed')
+    expect(said(entry(7))).toContain('Update from the agent')
+    expect(said(entry(7))).toContain('Two steps were added.')
+    // What a person reads has no identifier in it; the identifier is data on the entry.
+    const scroll = screen.getByTestId('conversation-scroll').textContent ?? ''
+    expect(scroll).not.toMatch(/plan\.revised|tool\.failed|tool\.finished/)
+    expect(
+      document.querySelector(`[data-node-id="${entry(7)}"]`)?.getAttribute('data-kind')
+    ).toBe('plan.revised')
+  })
+})

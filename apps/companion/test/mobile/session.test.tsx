@@ -1799,3 +1799,53 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
     }
   })
 })
+
+describe("the phone's conversation names each kind of entry in words (KR-REQ-13.19)", () => {
+  /** What each entry of the conversation is called, in the order the phone shows them. */
+  const roles = (): string[] =>
+    [...document.querySelectorAll('[data-testid="mobile-conversation"] .m-node-role')].map(
+      (role) => role.textContent ?? ''
+    )
+
+  it('says a conversation started, a tool finished and a notice in words, never as identifiers', async () => {
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    expect(roles()).toEqual([
+      'Conversation started',
+      'Agent message',
+      'Agent message',
+      'Tool finished',
+      'Notice'
+    ])
+    const shown = screen.getByTestId('mobile-conversation').textContent ?? ''
+    expect(shown).not.toMatch(/thread\.|tool\.|notification/)
+  })
+
+  it('names the end of a turn, a failed tool and a kind it does not know in words', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.appendEntry(SESSION_MAIN, 'thread.continued', 'The turn was cancelled.')
+    controls.records.appendEntry(SESSION_MAIN, 'thread.ended', 'Closed by the person.')
+    controls.records.appendEntry(SESSION_MAIN, 'tool.failed', 'cargo test exited 101')
+    controls.records.appendEntry(SESSION_MAIN, 'plan.revised', 'Two steps were added.')
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Two steps were added.')
+    expect(roles().slice(-4)).toEqual([
+      'Conversation continued',
+      'Conversation ended',
+      'Tool failed',
+      'Update from the agent'
+    ])
+    // The identifier of the kind it does not know is data on the entry, not a word on the screen.
+    expect(screen.getByTestId('mobile-conversation').textContent).not.toContain('plan.revised')
+    expect(document.querySelector('[data-kind="plan.revised"]')).not.toBeNull()
+  })
+})
