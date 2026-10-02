@@ -11,11 +11,12 @@
 import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { get } from 'node:http'
-import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout } from 'node:timers'
+import { clearTimeout, setTimeout } from 'node:timers'
 import { URL, fileURLToPath } from 'node:url'
+
+import { EPHEMERAL_STARTS, SERVING_LINE, startPreview } from './preview-serve.mjs'
 
 const entry = fileURLToPath(new URL('./preview-harness.mjs', import.meta.url))
 
@@ -29,17 +30,6 @@ const END_WITHIN_MS = 15_000
 const CONTROL_MS = 2_500
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-/** A port the system hands out for a new listener. */
-const unusedPort = () =>
-  new Promise((resolve, reject) => {
-    const server = createServer()
-    server.once('error', reject)
-    server.listen(0, () => {
-      const { port } = server.address()
-      server.close(() => resolve(port))
-    })
-  })
 
 /** Whether the page the bundle holds is served on `port` now. */
 const answers = (port) =>
@@ -104,16 +94,31 @@ const run = () => {
   return child
 }
 
-/** The server, started as the end-to-end run starts it, for `owner`. */
+/** The server, started as the end-to-end run starts it, for `owner`, on the port it chose. */
 const server = async (owner) => {
-  const port = await unusedPort()
-  const child = spawn(process.execPath, [entry, String(port), String(owner.pid)], {
+  const child = spawn(process.execPath, [entry, '0', String(owner.pid)], {
     cwd: directory,
     detached: true,
-    stdio: 'ignore'
+    stdio: ['ignore', 'pipe', 'ignore']
   })
   const ended = new Promise((resolve) => child.once('exit', resolve))
   started.push(child)
+  const port = await new Promise((resolve, reject) => {
+    const gaveUp = setTimeout(() => reject(new Error('the server did not say its port')), START_WITHIN_MS)
+    let said = ''
+    child.stdout.on('data', (chunk) => {
+      said += chunk
+      const serving = SERVING_LINE.exec(said)
+      if (serving) {
+        clearTimeout(gaveUp)
+        resolve(Number(serving[1]))
+      }
+    })
+    child.once('exit', () => {
+      clearTimeout(gaveUp)
+      reject(new Error('the server ended before it served'))
+    })
+  })
   if (!(await until(() => answers(port), START_WITHIN_MS))) throw new Error('the server did not start serving')
   return { child, port, ended }
 }
@@ -165,6 +170,42 @@ await check('a server keeps serving while its run is there', async () => {
   }
   owner.kill('SIGKILL')
   if (!(await gone(serving))) throw new Error('the server outlived its run')
+})
+
+/** A stand-in for Vite's `preview` that fails as it is told to, and says how often it was asked. */
+const standIn = (failures) => {
+  const asked = { count: 0 }
+  const start = async () => {
+    asked.count += 1
+    if (asked.count <= failures.length) throw failures[asked.count - 1]
+    return { started: asked.count }
+  }
+  return { asked, start }
+}
+const taken = (port) => new Error(`Port ${port} is already in use`)
+
+await check('a server asked for port 0 asks again when the port it was given is taken', async () => {
+  const { asked, start } = standIn([taken(50001), taken(50002), taken(50003)])
+  const server = await startPreview({ outDir: 'dist', port: '0', start })
+  if (asked.count !== 4 || server.started !== 4) throw new Error(`it was started ${asked.count} times`)
+})
+
+await check('a server asked for port 0 stops asking when the bound is spent', async () => {
+  const { asked, start } = standIn(Array.from({ length: 100 }, () => taken(50001)))
+  const failed = await startPreview({ outDir: 'dist', port: '0', start }).then(() => false, () => true)
+  if (!failed) throw new Error('a start that never worked was reported as started')
+  if (asked.count !== EPHEMERAL_STARTS) throw new Error(`it was started ${asked.count} times`)
+})
+
+await check('a start that fails for another reason, or on a named port, is not asked again', async () => {
+  for (const [port, failure] of [
+    ['0', new Error('listen EACCES: permission denied')],
+    ['4188', taken(4188)]
+  ]) {
+    const { asked, start } = standIn([failure, failure])
+    const failed = await startPreview({ outDir: 'dist', port, start }).then(() => false, () => true)
+    if (!failed || asked.count !== 1) throw new Error(`port ${port} was started ${asked.count} times`)
+  }
 })
 
 process.exit(failures.length === 0 ? 0 : 1)
