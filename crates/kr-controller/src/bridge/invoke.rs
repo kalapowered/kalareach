@@ -1007,6 +1007,11 @@ fn is_a_view(event_type: &str) -> bool {
 /// A caller that asked for a new subscription ignores everything of the old stream and waits for
 /// this one, and knows nothing of the new stream until it arrives. Dropping it leaves the caller
 /// waiting for good, so it is never dropped.
+///
+/// The bridge counts only a view frame of sequence zero as an opening, where the caller takes any
+/// notification of sequence zero as the beginning of a stream. That is safe because the worker
+/// queues the screen first, under the session's lock, before it sends anything else of the new
+/// stream.
 fn opens_a_stream(notification: &kr_protocol::envelope::Notification) -> bool {
     notification.sequence.get() == 0
 }
