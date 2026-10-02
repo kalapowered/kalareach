@@ -558,12 +558,20 @@ impl Fate {
                 Self::Drop
             };
         }
-        // The store decided it at a time of its own, which quiet hours do not move when they
-        // release it. One decided at or before the moment privacy mode was last turned off may have
-        // been decided while it was on, and what was decided while it was on is never sent once it
-        // is off.
-        let decided_at_ms = item.decided_at_ms.map_or(0, |at| at.get());
-        if lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms {
+        // What was decided while privacy mode was on is never sent once it is off. The store says
+        // what privacy state it decided under, which no clock can change, and that is what
+        // decides it. An item decided before the store said, or by a caller that never did, has
+        // only the time it was decided at, which quiet hours do not move when they release it: one
+        // decided at or before the moment privacy mode was last turned off may have been decided
+        // while it was on.
+        let decided_while_private = match item.decided_privacy {
+            Some(stamp) => stamp.private,
+            None => {
+                let decided_at_ms = item.decided_at_ms.map_or(0, |at| at.get());
+                lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms
+            }
+        };
+        if decided_while_private {
             return Self::Drop;
         }
         Self::Produce(Notice::from_announcement(announcement, audience, now_ms))
@@ -2780,6 +2788,31 @@ mod tests {
         raise_failure_of(attention, sequence, wall_ms, "cargo test");
     }
 
+    /// A failure of `command` in session one, seen and decided at `wall_ms`, under the privacy state
+    /// `stamp` says.
+    fn raise_failure_under(
+        attention: &mut Attention,
+        sequence: u64,
+        wall_ms: u64,
+        command: &str,
+        stamp: kr_attention::PrivacyStamp,
+    ) {
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Receipts, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::CommandCompleted {
+                        session_id: session(1),
+                        command: command.to_owned(),
+                        exit_code: 101,
+                    },
+                ),
+                reading(0, wall_ms).under(stamp),
+            )
+            .expect("the store records the failure");
+    }
+
     /// A failure of `command` in session one, seen at `wall_ms`.
     fn raise_failure_of(attention: &mut Attention, sequence: u64, wall_ms: u64, command: &str) {
         attention
@@ -3115,6 +3148,91 @@ mod tests {
         assert_eq!(
             produced.admitted, 2,
             "the control, decided after the lift, is sent to each phone"
+        );
+    }
+
+    /// What was decided while privacy mode was on is never sent once it is off, and what was
+    /// decided after is, whatever either clock says: the store's stamp of the privacy state a
+    /// decision was made under is what decides, not the time. The wall clock here is set back across
+    /// the lift, so the decision made while private carries a later time than the lift and the one
+    /// made after carries an earlier one, which a rule by time would send and drop the wrong way
+    /// round.
+    #[test]
+    fn what_was_decided_while_privacy_mode_was_on_is_not_sent_after_it_whatever_the_clock_says() {
+        use kr_attention::PrivacyStamp;
+
+        let mut producer = producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = store();
+        let in_an_hour = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a time")
+                .as_millis(),
+        )
+        .expect("a time")
+            + 3_600_000;
+        producer.journal_mut().fence(1).expect("a fence");
+        let private = PrivacyView {
+            generation: 1,
+            private: true,
+        };
+        // Decided while privacy mode is on, at a time later than the moment it is lifted at, and
+        // held back from the take until after the lift.
+        raise_failure_under(
+            &mut attention,
+            1,
+            in_an_hour,
+            "cargo test",
+            PrivacyStamp {
+                generation: 1,
+                private: true,
+            },
+        );
+        let held = producer
+            .take_from_attention(
+                &mut attention,
+                &|_| false,
+                &Everything(BTreeSet::new()),
+                SCOPE,
+                private,
+                1_000,
+            )
+            .expect("a take");
+        assert_eq!(held.taken, 0, "held back, so nothing is taken");
+        producer.journal_mut().lift_fence(2).expect("a lift");
+        // Decided after the lift, at a time earlier than the lift: the wall clock was set back.
+        raise_failure_under(
+            &mut attention,
+            2,
+            NOON,
+            "cargo build",
+            PrivacyStamp {
+                generation: 2,
+                private: false,
+            },
+        );
+        let lifted = PrivacyView {
+            generation: 2,
+            private: false,
+        };
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            lifted,
+        );
+        assert_eq!(taken.taken, 2);
+        assert_eq!(
+            taken.dropped, 1,
+            "the one decided while privacy mode was on is never sent"
+        );
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(
+            produced.admitted, 2,
+            "the one decided after is sent to each phone, whatever time it carries"
         );
     }
 
