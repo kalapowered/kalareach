@@ -2857,3 +2857,43 @@ async fn a_fetch_asked_for_while_descriptions_are_off_goes_on_through_other_acce
     assert!(environment.partials().is_empty());
     environment.stop().await;
 }
+
+/// KR-REQ-22.01: after a restart with the document unchanged, descriptions that were turned off
+/// before it are still off and not a change: a fetch asked for then goes on through the next
+/// acceptance of the configuration (a battery change, a `host.info`), and only a request to turn
+/// descriptions off stops it, whether or not they were on a moment ago.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_asked_for_after_a_restart_with_descriptions_off_goes_on_and_off_stops_it() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.configure(Some(false), None).await;
+    let environment = environment.restart().await;
+    assert!(
+        !environment.setup().await.enabled,
+        "still off after the restart"
+    );
+
+    environment.download(DescriptionDownloadAction::Start).await;
+    fixture.until_half_sent().await;
+    until("the partial file", || !environment.partials().is_empty()).await;
+    environment.configure(None, Some(true)).await;
+    let still = environment.setup().await;
+    assert_eq!(still.download, DescriptionDownload::Running, "{still:?}");
+    assert!(!environment.partials().is_empty());
+
+    // Asked to turn them off while they are already off, the fetch stops.
+    environment.configure(Some(false), None).await;
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(environment.partials().is_empty());
+    environment.stop().await;
+}
