@@ -305,19 +305,28 @@ fn validate_typed_action_params(
     action_kind: WorkflowActionKind,
     params_json: &str,
 ) -> Result<()> {
-    let parsed = match read_parameters(params_json) {
-        Reading::Document(parsed) => parsed,
-        Reading::Repeats => {
-            return Err(AutomationError::InvalidArgument(format!(
-                "node {node_id} action_params repeats a parameter name, so what it says depends on \
-                 which copy a reader takes"
-            )));
+    let invalid = |e: serde_json::Error| {
+        AutomationError::InvalidArgument(format!(
+            "node {node_id} action_params is not valid JSON: {e}"
+        ))
+    };
+    // A create node's parameters can carry environment variables, and a name repeated in them
+    // would hide the first copy from a reader that keeps one value for a name while the text
+    // that is stored keeps both. The other kinds carry nothing of the kind, and a definition
+    // already installed with a repeated name in one of them is still admitted when it runs.
+    let parsed = if action_kind == WorkflowActionKind::CreateSession {
+        match read_parameters(params_json) {
+            Reading::Document(parsed) => parsed,
+            Reading::Repeats => {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} action_params repeats a parameter name, so what it says \
+                     depends on which copy a reader takes"
+                )));
+            }
+            Reading::NotJson(e) => return Err(invalid(e)),
         }
-        Reading::NotJson(e) => {
-            return Err(AutomationError::InvalidArgument(format!(
-                "node {node_id} action_params is not valid JSON: {e}"
-            )));
-        }
+    } else {
+        serde_json::from_str(params_json).map_err(invalid)?
     };
 
     // Recursively check decoded strings for forbidden template patterns
