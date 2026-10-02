@@ -827,7 +827,7 @@ impl SessionRuntime {
                             || answer_lapsed(
                                 lane_deadline,
                                 delivered_so_far.get(),
-                                kr_ipc::now_ms().get(),
+                                writer_clock.boot_elapsed_ms(),
                             )
                     },
                     &mut |written| {
@@ -2154,7 +2154,9 @@ mod tests {
         use crate::session::InputBatch;
 
         let (_host, runtime) = echoing_runtime();
-        let now = kr_ipc::now_ms().get();
+        // The lane's deadlines are readings of the session's continuous clock, the clock the writer
+        // holds.
+        let now = runtime.shared_clock.boot_elapsed_ms();
         runtime
             .input
             .send(InputBatch::Reply {

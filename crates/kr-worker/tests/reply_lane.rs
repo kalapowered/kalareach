@@ -113,7 +113,7 @@ impl Fixture {
             .take_pending_input()
             .into_iter()
             .filter_map(|batch| match batch {
-                InputBatch::Reply { bytes } => Some(bytes),
+                InputBatch::Reply { bytes, .. } => Some(bytes),
                 _ => None,
             })
             .collect()
