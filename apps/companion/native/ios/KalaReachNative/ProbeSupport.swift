@@ -174,9 +174,9 @@ enum DeliveredMarks {
 ///
 /// The check waits on Firebase with a timeout and on the person's answer, and can hear from either
 /// after the other has ended it. Whichever comes first reports; what a second would have reported
-/// or left behind is never reported or left. The one thing the check leaves behind is the file the
-/// next step reads to find the token it sends to, and it is left by the report that counts, before
-/// that report is made, so a reader that waits for the report finds the file whole.
+/// or left behind is never reported or left. What a report leaves behind, other than the report, is
+/// the file the next step reads to find the token it sends to, and it is left by the report that
+/// counts, before that report is made, so a reader that waits for the report finds the file whole.
 struct PushCheckReport {
     private(set) var reported = false
     let nonce: String
