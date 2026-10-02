@@ -1575,6 +1575,52 @@ impl GrantDirectory {
         })
     }
 
+    /// Records what an action produced for a claim that no attempt holds any more, once.
+    ///
+    /// A claim whose attempt ended before it recorded anything is never performed again, and what
+    /// the action did is whatever this host's own records prove. When a record the action itself
+    /// wrote names it, the daemon calls this before it serves, or before it takes the next action
+    /// of the same kind, so that the answer is kept under the claim and does not depend on that
+    /// record staying as it is.
+    ///
+    /// The row takes the result only while it holds no outcome, as [`Self::retain_result`] does,
+    /// and only while no attempt in this daemon holds its claim: a live attempt records its own
+    /// result under its hold. Returns whether the row took it, which is false for a claim that is
+    /// already answered or refused, one that is held, and an action with no claim at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn settle_unfinished(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        result: &[u8],
+        now_ms: u64,
+    ) -> Result<bool> {
+        let key = claim_key(actor_id, action_id);
+        self.with(|connection| {
+            // Asked while the connection is held, which is the lock a result is recorded under,
+            // so an attempt that has just recorded its own result is not settled over.
+            if self.live.held().contains(&key) {
+                return Ok(false);
+            }
+            connection
+                .execute(
+                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+                      WHERE actor_id = ?1 AND action_id = ?2
+                        AND result IS NULL AND refusal_code IS NULL",
+                    params![
+                        key.0,
+                        key.1.as_slice(),
+                        result,
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map(|changed| changed == 1)
+        })
+    }
+
     /// Records the refusal the action `hold` claimed was given, once.
     ///
     /// Immutable in the same way as a result, and for the same reason.
