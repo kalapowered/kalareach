@@ -779,7 +779,7 @@ async fn a_step_the_owner_took_another_way_meanwhile_is_taken_as_done_and_not_ta
 
 /// KR-REQ-03.07: a record that shows a step taken is not called taken while its environment cannot
 /// confirm that the record survives a crash. The owner took B's part by hand and B could not confirm
-/// the write; every step the plan sends B meanwhile is refused before B has looked at its record,
+/// the write; every step the plan sends B meanwhile is refused before B can confirm its record,
 /// whether it is composed for the first time or sent again, so none of them says the record is
 /// confirmed. The step stays `sent` and the plan is kept until B can confirm its record, and then a
 /// step that finds the record moved on is what takes it as done.
@@ -820,8 +820,11 @@ async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_
     assert_eq!(written.revision, own.revision + 1);
 
     pair.allow(10);
-    // The first `finish` composes B's step and is refused before B reads its record; each later one
-    // sends what the plan holds, or composes it again.
+    let mut identity = text(&pair.at_a(&["host", "machine", "plan"])["steps"][1]["action_id"]);
+    // The first `finish` composes B's step under the identity the plan holds, and B refuses it
+    // before it can confirm its record. Each later one sends the step again, which B refuses for
+    // its window, and then composes it again under a new action, which B refuses before it can
+    // confirm its record: the identity changes every time B is reached.
     for round in 1..=3 {
         let (status, still) = pair
             .a
@@ -834,6 +837,16 @@ async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_
         assert_eq!(still["steps"][1]["state"], "sent", "round {round}: {still}");
         assert_eq!(still["kept"], Value::Bool(true), "round {round}: {still}");
         assert!(pair.a.plan_file().exists(), "round {round}");
+        let now = text(&still["steps"][1]["action_id"]);
+        if round == 1 {
+            assert_eq!(now, identity, "the first send is under the plan's identity");
+        } else {
+            assert_ne!(
+                now, identity,
+                "round {round}: the step was sent again and composed again under a new action"
+            );
+        }
+        identity = now;
     }
     assert_eq!(pair.b.group(), written, "B took no second step");
 
