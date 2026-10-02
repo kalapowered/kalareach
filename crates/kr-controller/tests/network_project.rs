@@ -1778,7 +1778,7 @@ impl Recorded {
             .expect("a creation returns the workspace")
             .workspace_id;
         let session = SessionId::new(kr_ipc::new_uuid());
-        let mut capture = |session: Option<SessionId>, label: &str| {
+        let capture = |session: Option<SessionId>, label: &str| {
             kr_protocol::changeset::ChangesetCaptureParams {
                 workspace_id: workspace,
                 change_set_id: Nullable::null(),
@@ -2892,6 +2892,7 @@ async fn bind_for(
 struct Granted {
     host: Host,
     control: LocalClient,
+    device: net_support::Device,
     session: Session,
     owner: DeviceKeys,
     record: kr_controller::service::net::devices::DeviceRecord,
@@ -2972,6 +2973,7 @@ impl Granted {
         Some(Self {
             host,
             control,
+            device,
             session,
             owner,
             record,
