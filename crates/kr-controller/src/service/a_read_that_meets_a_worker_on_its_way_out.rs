@@ -1849,7 +1849,14 @@ async fn a_reservation_no_worker_has_reported_for_is_listed_as_creating() {
         by_id(failed.session_id).is_none(),
         "a launch confirmed not to have produced a worker holds nothing"
     );
-    assert!(by_id(world.session_id).is_some());
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.session_id == world.session_id)
+            .count(),
+        1,
+        "a session its worker described is listed once, not again from the registry"
+    );
     assert_eq!(
         sessions.len() as u64,
         world
