@@ -534,6 +534,24 @@ convention:
   and it receives what it asked for. `ForwardedMutation.grant_rights` is how the rights reach the
   component that admits the attachment; it is empty for such a caller.
 
+### What version 1 offers an agent
+
+An agent running in a session reaches the host through its contact tools, which call four
+private-IPC methods under the caller token of its own verified application: `question.create`,
+`question.read_own`, `question.cancel_own` and `alert.create`. Each names one question or one
+session, and none is a listing or a search. No method lets an agent list sessions, search a
+session's history, read another session's output, send input to another session, route a message
+between sessions or schedule other agents. The method table is the whole of what a host answers, so
+this is a property of the table. The methods a person uses to find sessions and page history,
+`session.list`, `history.page` and `events.subscribe`, need a person's rights, and no method at all
+accepts the plugin ingress.
+
+This is a statement about what the product offers an agent as an agent. Code an agent runs under the
+person's own operating-system account has that account's authority, which no table narrows.
+`crates/kr-protocol/tests/future_access.rs` reads the table and holds both halves of the statement,
+and `crates/kr-cli/tests/contact.rs` drives a helper in a host with two sessions and shows it
+reaching only its own.
+
 ## The root integration
 
 Six methods carry the trusted root shell's side of section 7, and `crates/kr-protocol/src/root.rs`
