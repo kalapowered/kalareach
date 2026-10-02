@@ -31,11 +31,11 @@
 //!   reported as unavailable, because what it retained is the archive's and nothing here removes
 //!   it.
 //! * **A launch is recorded before its worker runs.** A session created while privacy mode is on
-//!   owes its cleanup from the moment its worker is asked for ([`EnvironmentPrivacy::note_session_launching`]),
-//!   and its worker is told the state in its launch specification and applies it before its shell
-//!   starts. A launch that never produced a worker, as the registry and the daemon's own creates
-//!   show, has its obligation discharged ([`EnvironmentPrivacy::discharge_unstarted`]): nothing
-//!   ran, so nothing was kept.
+//!   owes its cleanup from the moment its worker is asked for
+//!   ([`EnvironmentPrivacy::note_session_launching`]), and its worker is told the state in its
+//!   launch specification and applies it before its shell starts. A launch that never produced a
+//!   worker, as the registry, the daemon's own creates and the kernel show, has its obligation
+//!   discharged ([`EnvironmentPrivacy::discharge_unstarted`]): nothing ran, so nothing was kept.
 //! * **Disabling is two phases.** It is refused while a daemon step, or a session whose worker is
 //!   running or may still start, owes cleanup. Otherwise the new generation is recorded first and
 //!   then each fence is released; a release that is still pending, or that a store refused, is
@@ -879,11 +879,11 @@ impl EnvironmentPrivacy {
     ///
     /// A launch that failed or was fenced before its worker claimed its reservation, whose launcher
     /// has ended without claiming it, or whose create stopped waiting without recording a launcher,
-    /// was never given a launch specification, so no shell ran and nothing was retained: what its obligation recorded is not
-    /// owed, and an obligation kept for it would be reported for good as the archive's. Each
-    /// obligation is deleted from the record first, and the session forgotten only once that has
-    /// landed; a delete the store refuses leaves the session owed, and the next pass tries it
-    /// again.
+    /// was never given a launch specification, so no shell ran and nothing was retained: what its
+    /// obligation recorded is not owed, and an obligation kept for it would be reported for good as
+    /// the archive's. Each obligation is deleted from the record first, and the session forgotten
+    /// only once that has landed; a delete the store refuses leaves the session owed, and the next
+    /// pass tries it again.
     ///
     /// # Errors
     ///
@@ -1559,8 +1559,8 @@ impl crate::service::Controller {
     /// The sessions the environment holds content for are every worker the registry records, every
     /// launch whose worker may be starting or running (a reservation that is spawned, claimed or
     /// fenced after a claim) and every session whose journal or spool is still on disk, and each
-    /// owes its own cleanup when privacy mode is turned on. The admission is asked again immediately before the change is
-    /// written, after every wait ([`EnvironmentPrivacy::set`]).
+    /// owes its own cleanup when privacy mode is turned on. The admission is asked again
+    /// immediately before the change is written, after every wait ([`EnvironmentPrivacy::set`]).
     ///
     /// # Errors
     ///

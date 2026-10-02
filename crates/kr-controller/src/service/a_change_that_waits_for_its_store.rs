@@ -1145,10 +1145,11 @@ async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of(
 }
 
 /// KR-REQ-24.28: a create whose supervisor cannot say what it started leaves its reservation
-/// spawned, and what the launch owes depends on whether a claim can still come. With no process
-/// reported, no launcher is recorded and no claim can be accepted, so the tick forgets the session
-/// and its obligation; with the launcher's process reported and running, the launcher is recorded
-/// and a worker may still claim, so the session stays owed and holds privacy mode on.
+/// spawned and stops waiting for its worker, so no claim of it can be accepted. With no process
+/// reported, no launcher is recorded, and the tick forgets the session and its obligation. With
+/// the launcher's process reported and running, a launcher is recorded, and the launch is neither
+/// over nor never started as far as the registry and the kernel can tell: nothing yet shows that
+/// its launcher has ended or that a claim has been refused, and either settles it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unless_its_launcher_runs()
  {
@@ -1181,19 +1182,15 @@ async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unle
             forgotten(&controller, &[session_id]).await;
             assert_eq!(obligations_on_disk(&temp), 0);
         } else {
-            tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
-            assert_eq!(
-                obligations_on_disk(&temp),
-                1,
-                "{pid:?}: a worker may still claim, so the session stays owed"
+            // Asked directly rather than through the tick, which may have looked in the moment
+            // between the create ending its wait and recording the launcher, and forgotten the
+            // session then, which is safe.
+            let launches = super::start::launches_over(&controller, &[session_id]).await;
+            assert!(
+                launches.ended.is_empty() && launches.never_started.is_empty(),
+                "{pid:?}: a recorded launcher that is running is not shown to have ended or to \
+                 have been refused: {launches:?}"
             );
-            controller
-                .privacy
-                .disable(
-                    kr_ipc::now_ms(),
-                    &|write: &mut dyn FnMut() -> crate::error::Result<()>| write(),
-                )
-                .expect_err("and holds privacy mode on");
         }
     }
 }
