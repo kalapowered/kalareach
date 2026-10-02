@@ -4452,6 +4452,14 @@ One saved conversation takes one live execution. A second launch against it is r
 the instance that owns it. A native thread selection moves the reservation with it, so the
 conversation an instance left is free and the one it took is not.
 
+Nothing in the host replaces a running agent with a second run of its saved conversation. It starts
+an agent process only by executing a launch intent. It refuses to execute one while another live
+instance holds the conversation the intent names. An instance holds a conversation from the launch
+that named it, or from a thread selection its bridge reports. If a bridge reports that an instance
+selected a conversation another live instance holds, the host refuses the selection: the instance is
+left with no thread vouched for, and rich mutations stay suspended until the binding is verified
+again.
+
 ### What a native exit ends
 
 A native terminal application's intentional exit ends its instance and names the backend to stop,
