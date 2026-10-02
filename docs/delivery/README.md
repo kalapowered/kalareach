@@ -37,7 +37,8 @@ is not for a destination of this host. One decided under another privacy generat
 force is never sent. The store stamps each decision with the generation it was made in and keeps the
 stamp through a quiet-hours hold and its release, so a decision made while privacy mode was on is
 dropped when it is taken once the mode is off, and so is one kept across a private period, however
-long quiet hours held it.
+long quiet hours held it. A decision that quiet hours hold over one not yet taken keeps that one's
+time and stamp, and the two are produced or dropped together.
 
 ## What travels, and what does not
 
@@ -92,17 +93,18 @@ own requests would not be served either.
 A paired device's destination asks the grant three times: when the notification is produced, when it
 is claimed, and once more after the credential has been renewed, which can wait on the gateway. A
 grant of the grant store that was issued to the device is read through two records, the device's and
-then the grant's, and the grant is read last, because revoking a device withdraws the grants issued
-to it before it marks the device. The last asking comes before the send is admitted under privacy
-mode, which can wait for an exchange already under way, and the notification's own deadline is read
-once more after that admission, just before the send. A bound, a revocation, an unpairing or a
-narrower rights ceiling that lands after the last asking is not caught: the notification is
-presented. What the grant reaches is digested with the notification, so a change to it settles the
-notification as revoked rather than sending it.
+then the grant's, and the grant is read last, because the daemon's unpairing withdraws the grants
+issued to a device before it marks the device, and a read that comes last cannot be made stale by a
+wait that follows it. The last asking comes before the send is admitted under privacy mode, which
+can wait for an exchange already under way, and the notification's own deadline is read once more
+after that admission, just before the send. A bound, a revocation, an unpairing or a narrower rights
+ceiling that lands after the last asking is not caught: the notification is presented. What the
+grant reaches is digested with the notification, so a change to it settles the notification as
+revoked rather than sending it.
 
 An external destination asks twice, when the notification is produced and when it is claimed. After
 the claim, the send reads the destination's credential from the secret store and takes the privacy
-admission before it sends. A bound that ends in those waits is not caught.
+admission before it sends. A bound or a deadline that ends in those waits is not caught.
 
 ## Two sizes, measured rather than estimated
 
@@ -333,11 +335,14 @@ the privacy generation it was made in and whether privacy mode was on in it, and
 produced only under the generation in force, with privacy mode on or off, whatever either clock
 says. One decided in an earlier generation, such as one quiet hours held across a private period, is
 settled with nothing produced. So is a question or approval decided before privacy mode was turned
-on and not yet taken, which gets no alert. One decided before the store stamped decisions has only
-the time it was decided at, and is dropped when that time is at or before the moment privacy mode
-was last turned off. One with no time at all is dropped once any end of privacy mode is on record. A
-journal brought forward from an earlier build that had been through privacy mode records the time of
-that migration as the moment privacy mode ended, because the earlier build did not record when.
+on and not yet taken, which gets no alert. A decision that quiet hours held over one not yet taken
+shares that one's stamp, so the two are judged together. One decided before the store stamped
+decisions has only the time it was decided at. With privacy mode off it is dropped when that time is
+at or before the moment privacy mode was last turned off, and one with no time at all is dropped
+once any end of privacy mode is on record. With privacy mode on, such a question or approval still
+gets the generic alert, whatever its time. A journal brought forward from an earlier build that had
+been through privacy mode records the time of that migration as the moment privacy mode ended,
+because the earlier build did not record when.
 
 The alerts are the only rows of the generation the fence stands at. Cleanup acts on rows of earlier
 generations, so running it again at every start leaves them alone, and turning privacy mode off
