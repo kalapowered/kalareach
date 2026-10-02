@@ -353,6 +353,7 @@ impl RemoteConnection {
         })?;
         self.check_version(params.change_set_id, Some(params.version))
             .await
+            .map(|_| ())
     }
 
     /// Answers a repeat of a materialisation this device asked for, from the record the first
