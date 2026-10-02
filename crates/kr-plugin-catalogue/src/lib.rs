@@ -1501,8 +1501,14 @@ impl Catalogue {
                 entries,
                 versions,
             };
-            if seeded {
+            if let Via::Bundle(bundle) = via {
                 require_seeded_in(changes, &key)?;
+                // Where the generation in use came from is kept with the commit that activates it,
+                // so the record always names the bundle the active generation was taken from.
+                changes.put_setting(
+                    &format!("{}{key}", seed::PROVENANCE),
+                    &seed::provenance_of(bundle),
+                )?;
             }
             changes.activate(&key, &active, &accepted_targets)?;
             // The generations it no longer keeps go in the same commit that moves it on, the
@@ -1929,7 +1935,12 @@ impl Catalogue {
             )
         {
             staging = staging.saturating_add(size.get());
-            if cached.get(&digest) != Some(&size.get()) && fetching.insert(digest) {
+            // A payload counts as held only when its bytes are the ones its name says: a file of
+            // the right length with other contents is fetched again, and where it comes from is
+            // decided with the rest, before anything is made room for.
+            let held = cached.get(&digest) == Some(&size.get())
+                && store.holds_payload(digest, size.get())?;
+            if !held && fetching.insert(digest) {
                 fetched = fetched.saturating_add(size.get());
             }
         }
@@ -3327,6 +3338,51 @@ mod tests {
             .enrol(enrolment, true)
             .expect("the owner adopted the root");
         (home, catalogue, id)
+    }
+
+    /// The bundled generation is read only for the enrolment the seed made: a sync through the
+    /// bundle, and a fetch for the seed's own reason, of an owner's enrolment are refused before
+    /// anything is read or kept, whatever root that enrolment holds.
+    #[tokio::test]
+    async fn the_bundle_is_read_only_for_the_enrolment_the_seed_made() {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = crate::test_support::Generation::build(
+            home.path(),
+            crate::test_support::GenerationSpec::default(),
+        )
+        .await;
+        let bundle = crate::test_support::seed_bundle(&generation);
+        let (mut catalogue, id) = enrolled_generation(home.path(), &generation);
+        let enrolled = catalogue
+            .enrolled(&id)
+            .expect("an enrolment of the owner's");
+        let before = catalogue.repository(&id).expect("records");
+
+        let owner = Owner::acting();
+        let mut change = Change::new(&owner);
+        let refused = catalogue
+            .sync_from(&id, &mut change, Via::Bundle(&bundle))
+            .await
+            .expect_err("the owner's enrolment is not the seed's to read");
+        assert!(
+            matches!(refused, CatalogueError::Untrusted { .. }),
+            "{refused}"
+        );
+        assert!(
+            catalogue
+                .check_reason(
+                    &enrolled,
+                    None,
+                    &PluginId::new("kalareach/example-declarative").expect("an identifier"),
+                    &PackageVersion::parse("0.1.0").expect("a version"),
+                    None,
+                    Why::Seed(&bundle),
+                )
+                .is_err(),
+            "the seed's own reason holds only for the enrolment the seed made"
+        );
+        assert_eq!(catalogue.repository(&id).expect("records"), before);
+        assert!(catalogue.active(&id).expect("records").is_none());
     }
 
     /// A kept root that resets the role floors says so until a verified checkpoint is published,
