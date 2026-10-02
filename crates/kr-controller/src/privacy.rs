@@ -33,8 +33,9 @@
 //! * **A launch is recorded before its worker runs.** A session created while privacy mode is on
 //!   owes its cleanup from the moment its worker is asked for ([`EnvironmentPrivacy::note_session_launching`]),
 //!   and its worker is told the state in its launch specification and applies it before its shell
-//!   starts. A launch that never produced a worker, as the registry shows, has its obligation
-//!   discharged ([`EnvironmentPrivacy::discharge_unstarted`]): nothing ran, so nothing was kept.
+//!   starts. A launch that never produced a worker, as the registry and the daemon's own creates
+//!   show, has its obligation discharged ([`EnvironmentPrivacy::discharge_unstarted`]): nothing
+//!   ran, so nothing was kept.
 //! * **Disabling is two phases.** It is refused while a daemon step, or a session whose worker is
 //!   running or may still start, owes cleanup. Otherwise the new generation is recorded first and
 //!   then each fence is released; a release that is still pending, or that a store refused, is
@@ -873,10 +874,11 @@ impl EnvironmentPrivacy {
         Ok(())
     }
 
-    /// Forgets the sessions whose launches the daemon's registry shows never produced a worker,
-    /// with their obligations.
+    /// Forgets the sessions whose launches the daemon shows never produced a worker, with their
+    /// obligations.
     ///
-    /// A launch that failed before its worker claimed its reservation was never given a launch
+    /// A launch that failed or was fenced before its worker claimed its reservation, whose launcher
+    /// has ended, or whose create returned without recording one, was never given a launch
     /// specification, so no shell ran and nothing was retained: what its obligation recorded is not
     /// owed, and an obligation kept for it would be reported for good as the archive's. Each
     /// obligation is deleted from the record first, and the session forgotten only once that has

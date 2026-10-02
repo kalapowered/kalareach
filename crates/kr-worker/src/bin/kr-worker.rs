@@ -11,7 +11,7 @@
 //! ```text
 //! job definition ──▶ worker ──rendezvous──▶ controller
 //!                          ◀──launch spec──
-//!                    open pty, launch shell, bind endpoint
+//!                    bind endpoint, open pty, apply privacy, launch shell
 //!                          ───worker ready──▶  (controller publishes the descriptor)
 //! ```
 
