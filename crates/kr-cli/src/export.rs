@@ -350,10 +350,10 @@ fn decode<T: kr_protocol::wire::WireMessage>(answer: crate::bridge::link::Answer
 struct Run {
     /// Where the bytes the engine was fed begin in the session's output.
     start: u64,
-    /// Whether the stretch begins somewhere in the stream that is not known, so that its first
-    /// bytes may be the end of a sequence the output before it began, and nothing is read until a
-    /// point a sequence can be taken to begin at.
-    resuming: bool,
+    /// Set where the stretch begins somewhere in the stream that is not known, so that its first
+    /// bytes may be the end of a sequence the output before it began: nothing is read until the
+    /// point [`Skipping`] finds, and then this is clear.
+    skipping: Option<Skipping>,
     /// Every byte fed to the engine, so the spans it clears can be cut out.
     fed: Vec<u8>,
     engine: Engine,
@@ -383,7 +383,7 @@ impl Run {
         })?;
         Ok(Self {
             start,
-            resuming,
+            skipping: resuming.then(Skipping::default),
             fed: Vec::new(),
             engine,
             spans: Vec::new(),
@@ -394,10 +394,10 @@ impl Run {
     fn feed(&mut self, from: u64, bytes: &[u8], tally: &mut Tally) {
         let mut bytes = bytes;
         let mut from = from;
-        if self.resuming {
-            let Some(skipped) = resumption_point(bytes) else {
-                // Nothing in this page is somewhere a sequence can be taken to begin at, so the
-                // next page is asked the same.
+        if let Some(skipping) = &mut self.skipping {
+            let Some(skipped) = skipping.point(bytes) else {
+                // Nothing in this page is somewhere reading can begin, so the next page is asked
+                // the same.
                 tally.bytes_resumed += bytes.len() as u64;
                 self.start = from + bytes.len() as u64;
                 return;
@@ -407,7 +407,7 @@ impl Run {
             from += skipped as u64;
             self.start = from;
             // Reading has begun, even where the point was the last byte of the page.
-            self.resuming = false;
+            self.skipping = None;
             if bytes.is_empty() {
                 return;
             }
@@ -434,6 +434,11 @@ impl Run {
             }
         }
         tally.absorb(outcome);
+        // A reply the lane refused for want of room is a question all the same, and the record of
+        // those refusals is read once and cleared, so the next outcome has its own.
+        let refused = self.engine.lane().degradation();
+        tally.replies += refused.dropped + refused.over_budget + refused.oversized;
+        self.engine.lane_mut().clear_degradation();
     }
 
     /// Ends the stretch: what the engine held back is released, and what it cleared is cut out.
@@ -464,21 +469,48 @@ impl Run {
     }
 }
 
-/// How many of the first bytes of output that begins somewhere in the stream are not read, or
-/// `None` when none of it is somewhere reading can begin.
+/// Finds where output that begins somewhere in the stream can first be read, a page at a time.
 ///
-/// Output that begins after a range the archive no longer holds can begin inside a control string:
-/// the rest of a clipboard write, a title or a notification looks like text, and the byte that
-/// ends it like a bell. So nothing is read until a point where one can be taken to begin: before an
-/// escape, which begins a sequence or ends a string, or after a bell, a cancel or a substitute,
-/// which end one. A line ending is not such a point, because a terminal's control string carries
-/// carriage returns and line feeds as part of its payload, as a clipboard write wrapped at a fixed
-/// width does. Everything before the point is counted as not carried.
-fn resumption_point(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .iter()
-        .position(|byte| matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b))
-        .map(|at| if bytes[at] == 0x1b { at } else { at + 1 })
+/// Output that begins after a range the archive no longer holds can begin inside any state the
+/// terminal's lexer keeps a sequence in: the rest of a clipboard write, a title or a notification
+/// looks like text, and what ends it can look like a bell. A point where reading can begin has to
+/// end every one of those states, so it is one of two things:
+///
+/// * a cancel or a substitute, which end every string and every sequence;
+/// * a string terminator, an escape and a backslash, that follows a byte of the output's own and
+///   that byte is not an escape. A multiplexer's pass-through string doubles the escapes inside it,
+///   so an escape that follows another is not the one that ends it, and the first byte of the output
+///   may follow the escape the gap took.
+///
+/// A bell is not such a point, because it ends an operating-system command and is payload in the
+/// other strings. An escape alone is not, because a string thrown away for its size keeps an escape
+/// and what follows it. A line ending is not, because a string carries carriage returns and line
+/// feeds, as a clipboard write wrapped at a fixed width does. Everything before the point is counted
+/// as not carried, and output with no such point is not read at all.
+#[derive(Default)]
+struct Skipping {
+    /// The last two bytes skipped, the earlier first.
+    last: [Option<u8>; 2],
+}
+
+impl Skipping {
+    /// How many of `bytes`, which follow what was skipped before, are not read: those up to and
+    /// including the point reading begins after. None when there is no such point in them.
+    fn point(&mut self, bytes: &[u8]) -> Option<usize> {
+        for (at, &byte) in bytes.iter().enumerate() {
+            let [before, previous] = self.last;
+            let ends = match byte {
+                0x18 | 0x1a => true,
+                b'\\' => previous == Some(0x1b) && before.is_some_and(|before| before != 0x1b),
+                _ => false,
+            };
+            if ends {
+                return Some(at + 1);
+            }
+            self.last = [previous, Some(byte)];
+        }
+        None
+    }
 }
 
 /// What the engines found in the output that the file does not carry.

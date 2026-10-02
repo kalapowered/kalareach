@@ -446,9 +446,10 @@ async fn the_file_names_the_session_its_closure_and_what_the_archive_does_not_ke
 async fn a_gap_is_carried_and_what_follows_it_is_not_read_as_a_continuation() {
     // The first stretch ends inside an operating-system command that was never ended; after the gap
     // the output is text, which a reader that carried the command over would have swallowed up to
-    // the next terminator.
+    // the next terminator. The first byte after the gap is a cancel, which ends whatever string the
+    // gap cut, so reading begins after it.
     let before = b"before\r\n\x1b]0;a title that is cut";
-    let after = b"\x1b[32mafter the gap\r\n";
+    let after = b"\x18\x1b[32mafter the gap\r\n";
     let mut daemon = Scripted::new(vec![
         listing(vec![closed(1)]),
         privacy(false, 4, &[]),
@@ -476,69 +477,138 @@ async fn a_gap_is_carried_and_what_follows_it_is_not_read_as_a_continuation() {
         "{chunks:?}"
     );
     let (cursor, bytes) = chunks.last().expect("a chunk after the gap");
-    assert_eq!(*cursor, 1_000, "{chunks:?}");
-    assert_eq!(bytes, after, "{chunks:?}");
+    assert_eq!(*cursor, 1_001, "{chunks:?}");
+    assert_eq!(bytes, &after[1..], "{chunks:?}");
     assert!(
         contains(&file.output(), b"before"),
         "what came before the gap is carried"
     );
 }
 
+/// What one export carries of the output that follows a gap, given as the tail and what is left of
+/// the file once the gap has been crossed: the bytes after the first point the output can be taken
+/// to begin again at, and how many bytes came before it.
+async fn after_a_gap(tails: &[&[u8]]) -> (Vec<u8>, Option<u64>) {
+    let mut steps = vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"before\r\n"),
+    ];
+    let mut at = 1_000_u64;
+    for (index, tail) in tails.iter().enumerate() {
+        steps.push(if index == 0 {
+            page_with(at, tail, Some(8))
+        } else {
+            page(at, tail)
+        });
+        at += tail.len() as u64;
+    }
+    steps.push(end(at));
+    steps.push(privacy(false, 4, &[]));
+    let mut daemon = Scripted::new(steps);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    let after: Vec<u8> = file
+        .chunks()
+        .into_iter()
+        .filter(|(cursor, _)| *cursor >= 1_000)
+        .flat_map(|(_, bytes)| bytes)
+        .collect();
+    (after, file.count("output_resumed_mid_stream"))
+}
+
 /// Output that begins after a range the archive no longer holds can begin inside a control string
-/// whose start is gone: the end of a clipboard write is base64 text and a bell. It is not read up to
-/// the first point a sequence can be taken to begin at, so the rest of the secret appears nowhere in
-/// the file, and the bytes not read are counted. The same for the start of what an archive still
-/// retains when its oldest output has been evicted.
+/// whose start is gone, in any state the lexer keeps one in. It is not read until a point that ends
+/// every one of them: a string terminator that follows a byte of its own, or a cancel or a
+/// substitute. What came before is not carried, whatever it looks like, and is counted.
 #[tokio::test]
-async fn output_that_resumes_inside_a_clipboard_write_does_not_carry_the_rest_of_it() {
-    // After a gap: the end of a write the gap cut, ended by a bell, then ordinary output.
-    let tail = b"c2VjcmV0LXRva2Vu\x07visible after\r\n";
-    let mut daemon = Scripted::new(vec![
-        listing(vec![closed(1)]),
-        privacy(false, 4, &[]),
-        page(0, b"before\r\n"),
-        page_with(1_000, tail, Some(8)),
-        end(1_000 + tail.len() as u64),
-        privacy(false, 4, &[]),
-    ]);
-    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
-        .await
-        .expect("exports");
-    let file = Read::of(&exported);
-    let whole = String::from_utf8_lossy(&exported.document);
-    assert!(!whole.contains("c2VjcmV0"), "{whole}");
-    assert!(
-        !whole.contains(&kr_protocol::scalars::to_base64url(b"c2VjcmV0")),
-        "{whole}"
-    );
-    assert!(contains(&file.output(), b"visible after"), "{}", file.0);
-    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
+async fn output_after_a_gap_is_read_only_from_a_point_every_state_ends_at() {
+    let secret = b"c2VjcmV0LXRva2Vu";
+
+    // A string terminator ends a clipboard write the gap cut.
+    let (after, skipped) = after_a_gap(&[b"c2VjcmV0LXRva2Vu\x1b\\visible after\r\n"]).await;
+    assert_eq!(after, b"visible after\r\n");
+    assert_eq!(skipped, Some(secret.len() as u64 + 2));
+
+    // A cancel and a substitute end any string and any sequence.
+    for end in [0x18_u8, 0x1a] {
+        let tail = [secret.as_slice(), &[end], b"visible after\r\n"].concat();
+        let (after, skipped) = after_a_gap(&[&tail]).await;
+        assert_eq!(after, b"visible after\r\n", "{end:#x}");
+        assert_eq!(skipped, Some(secret.len() as u64 + 1));
+    }
+
+    // A bell ends an operating-system command and nothing else: in a device control string, an
+    // application program command, a privacy message or a start-of-string it is payload, and what
+    // follows it is payload too.
+    let (after, skipped) = after_a_gap(&[b"tail\x07secret\x1b\\visible\r\n"]).await;
+    assert_eq!(after, b"visible\r\n", "a bell is not where reading begins");
+    assert_eq!(skipped, Some(b"tail\x07secret\x1b\\".len() as u64));
+
+    // An escape is not where reading begins either: inside a string that was being thrown away for
+    // its size an escape and the bytes after it stay in the string.
+    let (after, skipped) = after_a_gap(&[b"secret\x1b[31mmore secret\x07\x18visible\r\n"]).await;
+    assert_eq!(after, b"visible\r\n");
     assert_eq!(
-        file.count("output_resumed_mid_stream"),
-        Some(b"c2VjcmV0LXRva2Vu\x07".len() as u64),
-        "{}",
-        file.0
+        skipped,
+        Some(b"secret\x1b[31mmore secret\x07\x18".len() as u64)
     );
 
-    // Ended by a string terminator instead: the escape is where reading begins.
-    let tail = b"c2VjcmV0LXRva2Vu\x1b\\then this\r\n";
-    let mut daemon = Scripted::new(vec![
-        listing(vec![closed(1)]),
-        privacy(false, 4, &[]),
-        page(0, b"before\r\n"),
-        page_with(1_000, tail, Some(8)),
-        end(1_000 + tail.len() as u64),
-        privacy(false, 4, &[]),
-    ]);
-    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
-        .await
-        .expect("exports");
-    let file = Read::of(&exported);
-    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
-    assert!(contains(&file.output(), b"then this"), "{}", file.0);
+    // A line ending is payload to a string, as a clipboard write wrapped at a fixed width is.
+    let (after, _) = after_a_gap(&[b"c2VjcmV0\r\ncmV0LXRva2Vu\nZW5k\x1b\\visible after\r\n"]).await;
+    assert_eq!(after, b"visible after\r\n");
 
-    // The head of the archive was evicted: what is retained begins inside the stream.
-    let retained = b"cmV0LXRva2Vu\x07\x1b[1mbold\x1b[0m\r\n";
+    // Inside a multiplexer's pass-through string an escape is doubled, so a terminator is an escape
+    // that follows something else: the second of two is not one, and neither is the first byte of
+    // the output, which may follow an escape the gap took.
+    let (after, _) = after_a_gap(&[b"x\x1b\x1b\\secret\x07\x1b\\after\r\n"]).await;
+    assert_eq!(
+        after, b"after\r\n",
+        "an escape that follows an escape is not a terminator"
+    );
+    let (after, _) = after_a_gap(&[b"\x1b\\secret\x07\x1b\\after\r\n"]).await;
+    assert_eq!(after, b"after\r\n", "nor is one the output begins with");
+
+    // Output with no such point is not read at all, and every byte of it is counted.
+    let tail = b"plain text\x1b[1mbold\x1b[0m\x07\r\nmore\r\n";
+    let (after, skipped) = after_a_gap(&[tail]).await;
+    assert!(after.is_empty(), "{after:?}");
+    assert_eq!(skipped, Some(tail.len() as u64));
+}
+
+/// The point reading begins at can come where a page ends, or be spread over two pages: the
+/// terminator is an escape and a backslash, one on each, or the last bytes of a page.
+#[tokio::test]
+async fn the_point_reading_begins_at_can_end_a_page_or_be_split_over_two() {
+    // The terminator is the last of the page; the next page is read from its first byte.
+    let (after, skipped) = after_a_gap(&[b"c2VjcmV0\x1b\\", b"visible after\r\n"]).await;
+    assert_eq!(after, b"visible after\r\n");
+    assert_eq!(skipped, Some(b"c2VjcmV0\x1b\\".len() as u64));
+
+    // The escape ends one page and the backslash begins the next.
+    let (after, skipped) = after_a_gap(&[b"c2VjcmV0\x1b", b"\\visible after\r\n"]).await;
+    assert_eq!(after, b"visible after\r\n");
+    assert_eq!(skipped, Some(b"c2VjcmV0\x1b\\".len() as u64));
+
+    // The same split where the escape follows an escape: not a terminator.
+    let (after, _) = after_a_gap(&[b"c2Vj\x1b\x1b", b"\\secret\x07\x1b\\after\r\n"]).await;
+    assert_eq!(after, b"after\r\n");
+
+    // A page with no point in it is skipped, and the next is asked the same.
+    let (after, skipped) = after_a_gap(&[b"c2VjcmV0", b"cmV0LXRva2Vu\x18", b"visible\r\n"]).await;
+    assert_eq!(after, b"visible\r\n");
+    assert_eq!(skipped, Some(b"c2VjcmV0cmV0LXRva2Vu\x18".len() as u64));
+}
+
+/// The head of the archive was evicted: what is retained begins inside the stream, and is read from
+/// a point that ends every state. The control: output that begins at the start of the stream is read
+/// from its first byte.
+#[tokio::test]
+async fn an_evicted_head_is_read_from_a_point_that_ends_every_state_and_a_whole_stream_from_its_start()
+ {
+    let retained = b"cmV0LXRva2Vu\x07\x1b\\\x1b[1mbold\x1b[0m\r\n";
     let mut daemon = Scripted::new(vec![
         listing(vec![closed(1)]),
         privacy(false, 4, &[]),
@@ -554,7 +624,6 @@ async fn output_that_resumes_inside_a_clipboard_write_does_not_carry_the_rest_of
     assert!(contains(&file.output(), b"bold"), "{}", file.0);
     assert_eq!(file.0["output"]["from_cursor"], "500");
 
-    // The control: output that begins at the start of the stream is read from its first byte.
     let mut daemon = Scripted::new(vec![
         listing(vec![closed(1)]),
         privacy(false, 4, &[]),
@@ -568,67 +637,6 @@ async fn output_that_resumes_inside_a_clipboard_write_does_not_carry_the_rest_of
     let file = Read::of(&exported);
     assert_eq!(file.output(), b"first line\r\n");
     assert!(file.omission("output_resumed_mid_stream").is_none());
-}
-
-/// A clipboard write that a program wrapped over several lines, as a tool that breaks base64 at 76
-/// characters does, can be cut by a gap in the middle of a line: the lines that remain are text to a
-/// reader that takes a line ending for the end of a string, and a terminal's string runs through them
-/// to its terminator. Nothing is read up to a terminator, so none of the write is in the file.
-#[tokio::test]
-async fn a_write_wrapped_over_lines_that_a_gap_cut_does_not_carry_the_rest_of_it() {
-    let tail = b"c2VjcmV0\r\ncmV0LXRva2Vu\nZW5k\x07visible after\r\n";
-    let mut daemon = Scripted::new(vec![
-        listing(vec![closed(1)]),
-        privacy(false, 4, &[]),
-        page(0, b"before\r\n"),
-        page_with(1_000, tail, Some(8)),
-        end(1_000 + tail.len() as u64),
-        privacy(false, 4, &[]),
-    ]);
-    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
-        .await
-        .expect("exports");
-    let file = Read::of(&exported);
-    let whole = String::from_utf8_lossy(&exported.document);
-    for part in ["c2VjcmV0", "cmV0LXRva2Vu", "ZW5k"] {
-        assert!(!contains(&file.output(), part.as_bytes()), "{whole}");
-    }
-    assert!(contains(&file.output(), b"visible after"), "{}", file.0);
-    assert_eq!(
-        file.count("output_resumed_mid_stream"),
-        Some(b"c2VjcmV0\r\ncmV0LXRva2Vu\nZW5k\x07".len() as u64),
-        "{}",
-        file.0
-    );
-}
-
-/// Where the byte that ends a string is the last one of a page, reading begins with the next page:
-/// the text on it is not skipped to a second boundary.
-#[tokio::test]
-async fn a_terminator_that_ends_a_page_ends_the_skipping_with_it() {
-    let first = b"c2VjcmV0LXRva2Vu\x07";
-    let second = b"visible after\r\n";
-    let mut daemon = Scripted::new(vec![
-        listing(vec![closed(1)]),
-        privacy(false, 4, &[]),
-        page(0, b"before\r\n"),
-        page_with(1_000, first, Some(8)),
-        page(1_000 + first.len() as u64, second),
-        end(1_000 + (first.len() + second.len()) as u64),
-        privacy(false, 4, &[]),
-    ]);
-    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
-        .await
-        .expect("exports");
-    let file = Read::of(&exported);
-    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
-    assert!(contains(&file.output(), b"visible after\r\n"), "{}", file.0);
-    assert_eq!(
-        file.count("output_resumed_mid_stream"),
-        Some(first.len() as u64),
-        "{}",
-        file.0
-    );
 }
 
 /// An archive that cannot say where its output got to reports the same gap on every page, though no
@@ -699,6 +707,28 @@ async fn every_question_the_program_asked_is_counted_however_many() {
     let file = Read::of(&exported);
     assert_eq!(file.count("terminal_query"), Some(questions), "{}", file.0);
     assert!(!contains(&file.output(), b"\x1b[c"), "{}", file.0);
+}
+
+/// A page that holds more questions than the engine's queue has room for the replies to is counted
+/// in full: the count is of what the program asked, not of the answers that were kept.
+#[tokio::test]
+async fn questions_past_the_size_of_the_reply_queue_in_one_page_are_counted() {
+    // Each cursor report is six bytes, and the queue holds 128 KiB, so 21,845 fit and these do not.
+    let questions = 30_000_u64;
+    let output: Vec<u8> = b"\x1b[6n".repeat(usize::try_from(questions).expect("a small count"));
+    assert!(output.len() < 1 << 20, "the page is within the page bound");
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, &output),
+        end(output.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(file.count("terminal_query"), Some(questions), "{}", file.0);
 }
 
 /// A program that asks the terminal to read the clipboard is answered by the terminal engine itself,
