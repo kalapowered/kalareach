@@ -196,11 +196,23 @@ impl GrantedRecipients {
             .map(Standing::Paired)
     }
 
-    /// Reads the standing of the same grant again, and of the device it is bound to, once the
+    /// Reads the standing of the device a grant is bound to, and then of the grant itself, once the
     /// policy's lock is held, so that what a revocation completed while this waited for the lock is
     /// found.
+    ///
+    /// Each read can wait behind a writer of its own store, and a revocation can commit in that
+    /// wait. The grant is read last because of the order a revocation of a device writes in: it
+    /// withdraws the grants issued to the device first and marks the device second. A grant that
+    /// still stands when it is read last therefore says the device had not been unpaired before
+    /// that either, and the answer is decided at that one read. The other order would find a grant
+    /// withdrawn while the device was being read as standing.
     fn still_standing(&self, standing: &Standing, bound_to: Option<&DeviceRecord>) -> bool {
-        let grant_stands = match standing {
+        if bound_to.is_some_and(|device| !self.is_still_paired(device)) {
+            return false;
+        }
+        #[cfg(test)]
+        self.between_the_records.wait();
+        match standing {
             Standing::Stored(record) => self
                 .sharing
                 .grants()
@@ -209,10 +221,7 @@ impl GrantedRecipients {
                 .flatten()
                 .is_some_and(|fresh| fresh.revoked_at_ms.is_none() && fresh.is_active()),
             Standing::Paired(device) => self.is_still_paired(device),
-        };
-        #[cfg(test)]
-        self.between_the_records.wait();
-        grant_stands && bound_to.is_none_or(|device| self.is_still_paired(device))
+        }
     }
 
     /// Whether the directory still holds `device` as paired: not revoked and not recorded expired.

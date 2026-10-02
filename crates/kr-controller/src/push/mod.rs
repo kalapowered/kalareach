@@ -1077,6 +1077,18 @@ impl DeliveryModule {
         let Some(_admission) = self.admitted(delivery) else {
             return self.taken_back(delivery, now_ms);
         };
+        // The authority question and the admission both wait, on this host's own locks, and the
+        // notification's own deadline is read once more, as late as it can be before the send: an
+        // authority that did not change is no reason to present a notification that has expired.
+        let now_ms = clock.now_ms().max(now_ms);
+        if now_ms >= delivery.expires_at_ms.get() {
+            return self.settle(
+                delivery,
+                DeliveryState::Expired,
+                "the notification expired while its recipient's authority was being asked",
+                now_ms,
+            );
+        }
         let outcome =
             if delivery.next == NextAction::Receipt {
                 // The gateway is holding this notification and retrying the provider itself. What is
