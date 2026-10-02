@@ -40,13 +40,15 @@ use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
 use kr_protocol::recovery::{HistoryGap, HistoryPageParams, HistoryPageResult};
 use kr_protocol::scalars::{Nullable, U64};
-use kr_protocol::session::{SessionListParams, SessionListResult, SessionState, SessionSummary};
+use kr_protocol::session::{
+    ClosureRecord, Dimensions, SessionListParams, SessionListResult, SessionState, SessionSummary,
+};
 use kr_term::budget::GridSize;
 use kr_term::diag::DiagnosticKind;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
 use kr_term::sideeffect::SideEffectKind;
 use kr_term::span::ByteSpan;
-use serde_json::{Value, json};
+use serde::Serialize;
 
 use crate::bridge::link::Link;
 use crate::error::{CliError, Result};
@@ -102,6 +104,12 @@ pub async fn read<L: Link>(
     max_bytes: u64,
     exported_at_ms: u64,
 ) -> Result<Exported> {
+    if max_bytes == 0 {
+        return Err(CliError::Usage(Shown::said(
+            "--max-bytes names how much retained output to read, and an export reads at least one \
+             byte",
+        )));
+    }
     let listed: SessionListResult = ask(
         link,
         Method::SessionList,
@@ -146,7 +154,7 @@ pub async fn read<L: Link>(
         });
     }
 
-    Ok(compose(&session, read, exported_at_ms))
+    compose(&session, read, exported_at_ms)
 }
 
 /// Refuses a session privacy mode keeps from an export.
@@ -236,24 +244,32 @@ async fn pages<L: Link>(link: &mut L, session: &SessionSummary, max_bytes: u64) 
             read.oldest_retained = page.oldest_retained_cursor.get();
             first = false;
         }
-        if let Some(gap) = page.gap.0 {
-            // What follows a gap does not continue what came before it: a sequence cut by the
-            // missing range must not swallow the output after it.
-            if let Some(ended) = run.take() {
-                ended.finish(&mut read);
-            }
+        if let Some(gap) = page.gap.0
+            && !read.gaps.contains(&gap)
+        {
             read.gaps.push(gap);
         }
         let from = page.from_cursor.get();
         let next = page.next_cursor.get();
+        // Output that does not continue from where the last page ended: a range the archive no
+        // longer holds came between. What follows it is not a continuation of what came before, so a
+        // control string cut by the gap does not swallow the output after it, and what follows
+        // begins somewhere in the stream that is not known, which is the start of the first
+        // sequence the output is read from. A page that reports a gap it did not skip, because the
+        // archive cannot say where its output got to, is a continuation.
+        if from != cursor
+            && let Some(ended) = run.take()
+        {
+            ended.finish(&mut read);
+        }
         let bytes = page.bytes.into_vec();
         read.bytes_read += bytes.len() as u64;
         if !bytes.is_empty() {
             let current = match run.as_mut() {
                 Some(current) => current,
-                None => run.insert(Run::start(from, size)?),
+                None => run.insert(Run::start(from, size, from != 0)?),
             };
-            current.feed(&bytes, &mut read.tally);
+            current.feed(from, &bytes, &mut read.tally);
         }
         read.next_cursor = read.next_cursor.max(next);
         if next <= cursor && bytes.is_empty() {
@@ -318,8 +334,12 @@ fn decode<T: kr_protocol::wire::WireMessage>(answer: crate::bridge::link::Answer
 
 /// One unbroken stretch of retained output, read by an engine of its own.
 struct Run {
-    /// Where the stretch begins in the session's output.
+    /// Where the bytes the engine was fed begin in the session's output.
     start: u64,
+    /// Whether the stretch begins somewhere in the stream that is not known, so that its first
+    /// bytes may be the end of a sequence the output before it began, and nothing is read until a
+    /// point a sequence can be taken to begin at.
+    resuming: bool,
     /// Every byte fed to the engine, so the spans it clears can be cut out.
     fed: Vec<u8>,
     engine: Engine,
@@ -331,7 +351,7 @@ impl Run {
     /// Starts a stretch at `start`, read by an engine whose screen is the session's last size.
     ///
     /// The clock does not change which bytes are cleared for a terminal, so it never moves.
-    fn start(start: u64, size: GridSize) -> Result<Self> {
+    fn start(start: u64, size: GridSize, resuming: bool) -> Result<Self> {
         let engine = Engine::new(EngineConfig {
             size,
             ..EngineConfig::DEFAULT
@@ -343,13 +363,30 @@ impl Run {
         })?;
         Ok(Self {
             start,
+            resuming,
             fed: Vec::new(),
             engine,
             spans: Vec::new(),
         })
     }
 
-    fn feed(&mut self, bytes: &[u8], tally: &mut Tally) {
+    /// Feeds the bytes of one page, which begin at `from` in the session's output.
+    fn feed(&mut self, from: u64, bytes: &[u8], tally: &mut Tally) {
+        let mut bytes = bytes;
+        let mut from = from;
+        if self.resuming {
+            let skipped = resumption_point(bytes);
+            tally.bytes_resumed += skipped as u64;
+            bytes = &bytes[skipped..];
+            from += skipped as u64;
+            if bytes.is_empty() {
+                // Nothing in this page is somewhere a sequence can be taken to begin at.
+                self.start = from;
+                return;
+            }
+            self.resuming = false;
+            self.start = from;
+        }
         self.fed.extend_from_slice(bytes);
         let outcome = self.engine.feed(bytes, 0);
         self.take(&outcome, tally);
@@ -392,17 +429,39 @@ impl Run {
     }
 }
 
+/// How many of the first bytes of output that begins somewhere in the stream are not read.
+///
+/// Output that begins after a range the archive no longer holds can begin inside a control string:
+/// the rest of a clipboard write, a title or a notification looks like text, and the byte that
+/// ends it like a bell. So nothing is read until a point where one can be taken to begin: before
+/// an escape, which begins a sequence or ends a string, or after a bell or a line ending, which
+/// ends one. Everything before it is counted as not carried. Output with none of these in it is not
+/// read at all.
+fn resumption_point(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|byte| matches!(byte, 0x07 | b'\n' | b'\r' | 0x1b))
+        .map_or(
+            bytes.len(),
+            |at| if bytes[at] == 0x1b { at } else { at + 1 },
+        )
+}
+
 /// What the engines found in the output that the file does not carry.
 #[derive(Default)]
 struct Tally {
     bytes_fed: u64,
     bytes_carried: u64,
+    /// Bytes at the start of output that began after a gap, which were not read.
+    bytes_resumed: u64,
     clipboard_writes: u64,
-    clipboard_reads: u64,
     notifications: u64,
     progress_reports: u64,
     bells: u64,
     refused_effects: u64,
+    /// What the engine answered itself where the program asked the terminal something, among them
+    /// reads of the clipboard.
+    replies: u64,
     diagnostics: std::collections::BTreeMap<DiagnosticKind, u64>,
 }
 
@@ -414,10 +473,12 @@ impl Tally {
                 SideEffectKind::Notification { .. } => self.notifications += 1,
                 SideEffectKind::Progress { .. } => self.progress_reports += 1,
                 SideEffectKind::ClipboardWrite { .. } => self.clipboard_writes += 1,
-                SideEffectKind::ClipboardRead { .. } => self.clipboard_reads += 1,
+                // The engine's own policy answers a read itself, so it routes none.
+                SideEffectKind::ClipboardRead { .. } => self.replies += 1,
             }
         }
         self.refused_effects += outcome.refusals.len() as u64;
+        self.replies += outcome.responses as u64;
     }
 
     fn diagnosed(&self, kind: DiagnosticKind) -> u64 {
@@ -497,14 +558,16 @@ fn omissions(session: &SessionSummary, read: &Read) -> Vec<Omission> {
     declared.extend(
         [
             Omission::counted(
+                "output_resumed_mid_stream",
+                "bytes at the start of output that began after a range the archive no longer \
+                 holds, which are not read: they may be the end of a control string, such as a \
+                 clipboard write, whose start is gone",
+                tally.bytes_resumed,
+            ),
+            Omission::counted(
                 "clipboard_write",
                 "requests to write the clipboard, which a replay would perform",
                 tally.clipboard_writes,
-            ),
-            Omission::counted(
-                "clipboard_read",
-                "requests to read the clipboard",
-                tally.clipboard_reads,
             ),
             Omission::counted(
                 "notification",
@@ -519,13 +582,15 @@ fn omissions(session: &SessionSummary, read: &Read) -> Vec<Omission> {
             Omission::counted("bell", "bells", tally.bells),
             Omission::counted(
                 "side_effect_refused",
-                "requests of a terminal that policy refused when they were made",
+                "requests of a terminal that the terminal engine refused whole, such as a clipboard \
+                 write past its bound or one that was not well formed",
                 tally.refused_effects,
             ),
             Omission::counted(
                 "terminal_query",
-                "questions the program asked the terminal, which a replay would answer again",
-                diagnosed(DiagnosticKind::QueryAnswered),
+                "questions the program asked the terminal, among them reads of the clipboard, \
+                 which the terminal engine answers itself and a replay would be asked again",
+                tally.replies,
             ),
             Omission::counted(
                 "image_sequence",
@@ -555,8 +620,10 @@ fn omissions(session: &SessionSummary, read: &Read) -> Vec<Omission> {
             ),
             Omission::counted(
                 "bytes_not_carried",
-                "bytes of the retained output that are not safe rendering data: the sequences \
-                 above, and what a terminal has to be redrawn for",
+                "bytes of the retained output that are not carried. The kinds above are the ones \
+                 that are counted; the rest, such as raw eight-bit controls, hyperlinks and titles \
+                 the terminal engine refused, and the controls inside a sequence, are counted only \
+                 here, with those that need the screen drawn again",
                 tally.bytes_fed.saturating_sub(tally.bytes_carried),
             ),
         ]
@@ -572,57 +639,120 @@ fn session_record_unavailable(session: &SessionSummary) -> bool {
     session.shell_path.is_empty()
 }
 
+/// The file, as it is written. Every 64-bit value is a [`U64`], which the protocol writes as a
+/// decimal string.
+#[derive(Serialize)]
+struct File<'a> {
+    format: &'static str,
+    exported_at_ms: U64,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session: SessionPart<'a>,
+    closure: Option<&'a ClosureRecord>,
+    dimensions: Option<DimensionsPart>,
+    output: OutputPart<'a>,
+    omissions: Vec<OmissionPart<'a>>,
+}
+
+/// What the file says of the session, each member null where the session's own record is gone.
+#[derive(Serialize)]
+struct SessionPart<'a> {
+    session_id: SessionId,
+    display_number: U64,
+    created_at_ms: Option<U64>,
+    shell_mode: Option<&'static str>,
+    shell: Option<&'a str>,
+    cwd: Option<&'a str>,
+    worker_profile: Option<&'static str>,
+}
+
+/// The session's last size.
+#[derive(Serialize)]
+struct DimensionsPart {
+    #[serde(flatten)]
+    size: Dimensions,
+    as_of: &'static str,
+}
+
+/// The retained output the file carries.
+#[derive(Serialize)]
+struct OutputPart<'a> {
+    from_cursor: U64,
+    next_cursor: U64,
+    oldest_retained_cursor: U64,
+    chunks: Vec<ChunkPart>,
+    gaps: &'a [HistoryGap],
+    truncated: bool,
+}
+
+/// One piece of output, and where in the session's output it begins.
+#[derive(Serialize)]
+struct ChunkPart {
+    cursor: U64,
+    base64url: String,
+}
+
+/// One thing the file does not hold.
+#[derive(Serialize)]
+struct OmissionPart<'a> {
+    kind: &'static str,
+    detail: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<U64>,
+}
+
 /// Composes the file from what was read.
-fn compose(session: &SessionSummary, read: Read, exported_at_ms: u64) -> Exported {
+fn compose(session: &SessionSummary, read: Read, exported_at_ms: u64) -> Result<Exported> {
     let unknown = session_record_unavailable(session);
     let declared = omissions(session, &read);
-    let known = |value: Value| if unknown { Value::Null } else { value };
-    let document = json!({
-        "format": FORMAT,
-        "exported_at_ms": U64::new(exported_at_ms),
-        "environment_id": session.environment_id.to_string(),
-        "session": {
-            "session_id": session.session_id.to_string(),
-            "display_number": session.display_number.get(),
-            "created_at_ms": known(json!(U64::new(session.created_at_ms.get()))),
-            "shell_mode": known(json!(session.shell_mode.as_str())),
-            "shell": known(json!(session.shell_path)),
-            "cwd": known(json!(session.cwd)),
-            "worker_profile": known(json!(session.worker_profile.as_str())),
+    let file = File {
+        format: FORMAT,
+        exported_at_ms: U64::new(exported_at_ms),
+        environment_id: session.environment_id,
+        session: SessionPart {
+            session_id: session.session_id,
+            display_number: U64::new(session.display_number.get()),
+            created_at_ms: (!unknown).then(|| U64::new(session.created_at_ms.get())),
+            shell_mode: (!unknown).then(|| session.shell_mode.as_str()),
+            shell: (!unknown).then_some(session.shell_path.as_str()),
+            cwd: (!unknown).then_some(session.cwd.as_str()),
+            worker_profile: (!unknown).then(|| session.worker_profile.as_str()),
         },
-        "closure": session
-            .closure
-            .as_ref()
-            .and_then(|closure| serde_json::to_value(closure).ok())
-            .unwrap_or(Value::Null),
-        "dimensions": known(json!({
-            "columns": session.dimensions.columns(),
-            "rows": session.dimensions.rows(),
-            "as_of": "the session's last size",
-        })),
-        "output": {
-            "from_cursor": U64::new(read.from_cursor),
-            "next_cursor": U64::new(read.next_cursor),
-            "oldest_retained_cursor": U64::new(read.oldest_retained),
-            "chunks": read.chunks.iter().map(|chunk| json!({
-                "cursor": U64::new(chunk.cursor),
-                "base64url": kr_protocol::scalars::to_base64url(&chunk.bytes),
-            })).collect::<Vec<_>>(),
-            "gaps": read.gaps.iter().map(|gap| serde_json::to_value(gap).unwrap_or(Value::Null))
-                .collect::<Vec<_>>(),
-            "truncated": read.truncated,
+        closure: session.closure.as_ref(),
+        dimensions: (!unknown).then_some(DimensionsPart {
+            size: session.dimensions,
+            as_of: "the session's last size",
+        }),
+        output: OutputPart {
+            from_cursor: U64::new(read.from_cursor),
+            next_cursor: U64::new(read.next_cursor),
+            oldest_retained_cursor: U64::new(read.oldest_retained),
+            chunks: read
+                .chunks
+                .iter()
+                .map(|chunk| ChunkPart {
+                    cursor: U64::new(chunk.cursor),
+                    base64url: kr_protocol::scalars::to_base64url(&chunk.bytes),
+                })
+                .collect(),
+            gaps: &read.gaps,
+            truncated: read.truncated,
         },
-        "omissions": declared.iter().map(|omission| {
-            let mut entry = json!({ "kind": omission.kind, "detail": omission.detail });
-            if let (Some(count), Some(object)) = (omission.count, entry.as_object_mut()) {
-                object.insert("count".to_owned(), json!(count));
-            }
-            entry
-        }).collect::<Vec<_>>(),
-    });
-    let mut bytes = serde_json::to_vec(&document).unwrap_or_default();
+        omissions: declared
+            .iter()
+            .map(|omission| OmissionPart {
+                kind: omission.kind,
+                detail: &omission.detail,
+                count: omission.count.map(U64::new),
+            })
+            .collect(),
+    };
+    let mut bytes = serde_json::to_vec(&file).map_err(|_| {
+        CliError::Other(Shown::said(
+            "the export could not be written out as a document",
+        ))
+    })?;
     bytes.push(b'\n');
-    Exported {
+    Ok(Exported {
         document: bytes,
         summary: Summary {
             session_id: session.session_id,
@@ -633,7 +763,7 @@ fn compose(session: &SessionSummary, read: Read, exported_at_ms: u64) -> Exporte
             truncated: read.truncated,
             omissions: declared.iter().map(|omission| omission.kind).collect(),
         },
-    }
+    })
 }
 
 /// Refuses an output name that is already taken, before anything is read.
@@ -671,16 +801,20 @@ fn taken(path: &Path) -> CliError {
 /// Returns a usage failure when something is at `path`, and the failure to write otherwise. A
 /// failure leaves nothing at `path`.
 pub fn write(path: &Path, exported: &Exported) -> Result<()> {
-    kr_ipc::paths::create_new_owner_only_file(path, &exported.document).map_err(
-        |error| match &error {
+    // A bare file name has no directory to flush once the file is in place, so the name is made
+    // whole first: where the file goes is where the command was run.
+    let whole = std::path::absolute(path)
+        .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("resolve", path, error)))?;
+    kr_ipc::paths::create_new_owner_only_file(&whole, &exported.document).map_err(|error| {
+        match &error {
             kr_ipc::IpcError::Io { source, .. }
                 if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {
                 taken(path)
             }
             _ => CliError::Ipc(error),
-        },
-    )
+        }
+    })
 }
 
 #[cfg(test)]
