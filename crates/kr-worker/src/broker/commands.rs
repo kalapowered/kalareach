@@ -1777,21 +1777,27 @@ const fn executable_here(_path: &Path) -> bool {
     true
 }
 
-/// Makes a directory owner-only, creating it where it is not there.
-fn make_private_directory(directory: &Path) -> Result<()> {
-    match std::fs::create_dir(directory) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(BrokerError::ledger(format!(
-                "could not make {}: {error}",
-                directory.display()
-            )));
-        }
-    }
+/// Makes one new owner-only directory at `directory`: `Ok(false)` when the name is already taken,
+/// and a directory the host cannot show is private is an error, not a success.
+///
+/// On Unix the directory is made and then given its mode. On Windows it is made with its own
+/// protected list in the one call, so there is no moment at which it carries the list of the
+/// directory above it; the name is looked for first, and a name another launch took in the instant
+/// between is read back by its list like any other directory this host publishes into.
+fn create_new_private_directory(directory: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        match std::fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => {
+                return Err(BrokerError::ledger(format!(
+                    "could not make {}: {error}",
+                    directory.display()
+                )));
+            }
+        }
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).map_err(
             |error| {
                 BrokerError::ledger(format!(
@@ -1801,7 +1807,20 @@ fn make_private_directory(directory: &Path) -> Result<()> {
             },
         )?;
     }
-    crate::broker::process::check_private_directory(directory)
+    #[cfg(windows)]
+    {
+        if directory.exists() {
+            return Ok(false);
+        }
+        kr_ipc::paths::create_private_directory(directory).map_err(|error| {
+            BrokerError::ledger(format!(
+                "could not make {} owner-only: {error}",
+                directory.display()
+            ))
+        })?;
+    }
+    crate::broker::process::check_private_directory(directory)?;
+    Ok(true)
 }
 
 /// Makes a new owner-only directory with a short fresh name, `prefix` then eight hexadecimal
@@ -1815,18 +1834,8 @@ fn new_private_directory(root: &Path, prefix: &str) -> Result<PathBuf> {
             .take(8)
             .collect();
         let directory = root.join(format!("{prefix}{name}"));
-        match std::fs::create_dir(&directory) {
-            Ok(()) => {
-                make_private_directory(&directory)?;
-                return Ok(directory);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(BrokerError::ledger(format!(
-                    "could not make a backend directory in {}: {error}",
-                    root.display()
-                )));
-            }
+        if create_new_private_directory(&directory)? {
+            return Ok(directory);
         }
     }
     Err(BrokerError::ledger(format!(
@@ -1924,6 +1933,27 @@ mod tests {
         assert!(!runnable(&directory), "a directory is not runnable");
         assert!(!runnable(&directory.join("absent")), "nor is nothing");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A backend's directory is made owner-only and is read back as such, and a name that is taken
+    /// is drawn again rather than shared: the directories two backends get are two.
+    #[test]
+    fn a_backend_directory_is_made_owner_only_and_is_not_shared() {
+        let root = std::env::temp_dir().join(format!("kr-backend-{}", kr_ipc::new_uuid()));
+        kr_ipc::paths::create_private_directory(&root).expect("a private root");
+        let first = new_private_directory(&root, "c").expect("a backend directory");
+        let second = new_private_directory(&root, "c").expect("another backend directory");
+        assert_ne!(first, second);
+        for directory in [&first, &second] {
+            assert!(directory.starts_with(&root));
+            crate::broker::process::check_private_directory(directory)
+                .expect("a directory this host made is owner-only");
+        }
+        assert!(
+            !create_new_private_directory(&first).expect("a taken name is not an error"),
+            "a name that is taken is not made again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn summary() -> kr_protocol::projection::AgentInstanceSummary {
