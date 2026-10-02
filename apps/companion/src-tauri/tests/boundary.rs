@@ -1065,7 +1065,7 @@ fn value_after<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 /// file is read by what it is: a floor that is declared and cannot be read stops the test.
 fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
     let mut found = Vec::new();
-    let mut in_deployment_target = false;
+    let mut in_deployment_target: Option<usize> = None;
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim();
@@ -1084,13 +1084,23 @@ fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
             }
         }
         if name == "project.yml" {
-            if trimmed == "deploymentTarget:" {
-                in_deployment_target = true;
+            let indent = line.len() - line.trim_start().len();
+            if let Some(rest) = trimmed.strip_prefix("deploymentTarget:") {
+                // A scalar on the same line is a form this scan does not read, and it is refused
+                // rather than passed over.
+                assert!(
+                    rest.trim().is_empty() || rest.trim().starts_with('#'),
+                    "{name}:{number}: a deployment target written on one line, which the scan does not read"
+                );
+                in_deployment_target = Some(indent);
                 continue;
             }
-            if in_deployment_target {
-                if !line.starts_with("    ") {
-                    in_deployment_target = false;
+            if let Some(opened_at) = in_deployment_target {
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if indent <= opened_at {
+                    in_deployment_target = None;
                 } else if let Some((key, value)) = trimmed.split_once(':') {
                     let platform = match key.trim() {
                         "iOS" => Floor::Ios,
@@ -1359,6 +1369,15 @@ fn the_floor_scan_reads_each_way_a_file_can_write_a_floor() {
         ),
         [(Floor::Ios, (14, 0, 0)), (Floor::Macos, (12, 0, 0))]
     );
+    // A target's own override, nested deeper, beside a correct global floor, and a later key at the
+    // same depth that is not a floor.
+    assert_eq!(
+        read(
+            "project.yml",
+            "options:\n  deploymentTarget:\n    iOS: 17.0\ntargets:\n  App:\n    deploymentTarget:\n      iOS: 16.0\n    settings:\n      base:\n        X: 1\n"
+        ),
+        [(Floor::Ios, (17, 0, 0)), (Floor::Ios, (16, 0, 0))]
+    );
     // A key and its value on one line, or on two.
     assert_eq!(
         read(
@@ -1394,4 +1413,14 @@ fn a_floor_the_scan_cannot_read_stops_it() {
     assert_eq!(found.len(), 1);
     let (line, platform, value) = &found[0];
     declared("project.pbxproj", *line, *platform, value);
+}
+
+/// A deployment target written on one line is a form the scan does not read, so it stops the scan.
+#[test]
+#[should_panic(expected = "written on one line")]
+fn a_deployment_target_written_on_one_line_stops_the_scan() {
+    floors_in(
+        "project.yml",
+        "targets:\n  App:\n    deploymentTarget: \"16.0\"\n",
+    );
 }
