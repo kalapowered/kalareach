@@ -6,8 +6,9 @@
 //! Which display server that is depends on the machine, so this shows the distinction travelling
 //! rather than any particular one being told apart. KR-REQ-03.27, in part: a fresh host reports
 //! the setting off and holds nothing, a stored choice reaches a device with the reason nothing is
-//! held under it, and no method the registry admits a device to writes anything in the
-//! host-and-environment group. KR-REQ-23.25, in part, for `environment.capabilities`.
+//! held under it, and the only methods the registry admits a device to that write anything in the
+//! host-and-environment group are the three machine group steps. KR-REQ-23.25, in part, for
+//! `environment.capabilities`.
 //!
 //! No worker is started here, so no session has work outstanding and nothing here observes an
 //! assertion actually held. Every one of these is a read the daemon answers itself.
@@ -268,10 +269,11 @@ async fn a_device_asking_about_another_environment_is_refused_as_the_owner_is() 
 /// KR-REQ-03.27, in part: a device reads the sleep state, and no method lets it change one.
 ///
 /// Starting a host never enables inhibition, so a host nobody has configured reports the setting
-/// off and holds nothing. What a device can do about that is nothing: the registry admits a paired
-/// device to no method that writes anything in the host-and-environment group, which is where a
-/// power setting would live. What this does not show is the setup assistant's own offer, or the
-/// separate choice between mains and battery, neither of which is a protocol method.
+/// off and holds nothing. What a device can do about that is nothing: the only methods that write
+/// anything in the host-and-environment group which the registry admits a paired device to are the
+/// three machine group steps, which write the one record that names a grouping and hold no power
+/// setting. What this does not show is the setup assistant's own offer, or the separate choice
+/// between mains and battery, neither of which is a protocol method.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
     let owner = DeviceKeys::generate().expect("owner keys");
