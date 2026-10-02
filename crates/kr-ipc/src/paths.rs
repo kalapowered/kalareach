@@ -2802,28 +2802,28 @@ fn default_runtime_root() -> Result<PathBuf> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn default_runtime_root() -> Result<PathBuf> {
-    runtime_root_in(
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        Path::new(SHARED_BETWEEN_DISTRIBUTIONS),
-        home_directory,
-    )
+    let shared: Vec<&Path> = SHARED_BETWEEN_DISTRIBUTIONS
+        .iter()
+        .map(|mount| Path::new(*mount))
+        .collect();
+    runtime_root_in(std::env::var_os("XDG_RUNTIME_DIR"), &shared, home_directory)
 }
 
-/// The mount a WSL machine's graphical service shares between every distribution that runs on it.
+/// The mounts a WSL machine shares between every distribution that runs on it: the graphical
+/// service's, where it sets `XDG_RUNTIME_DIR`, and the one the platform keeps its own files in.
 ///
-/// Where that service is installed it sets `XDG_RUNTIME_DIR` to a directory in this mount, and the
-/// mount is one directory of the virtual machine, not one of the distribution: another
-/// distribution can open what is written there.
+/// Each is one directory of the virtual machine, not one of the distribution: another distribution
+/// can open what is written there.
 #[cfg(all(unix, not(target_os = "macos")))]
-const SHARED_BETWEEN_DISTRIBUTIONS: &str = "/mnt/wslg";
+const SHARED_BETWEEN_DISTRIBUTIONS: [&str; 2] = ["/mnt/wslg", "/mnt/wsl"];
 
 /// Where this installation keeps its runtime files on Linux.
 ///
 /// The user's runtime directory, `runtime_dir`, is used when it names one and the directory is the
-/// distribution's own. A directory inside `shared` is not: the control socket and every worker's
-/// socket would be reachable from each other distribution on the machine, and a distribution is a
-/// separate environment. The home directory is the distribution's own, so the runtime files go
-/// below it, as they do where no runtime directory is named.
+/// distribution's own. A directory in one of the `shared` mounts is not: the control socket and
+/// every worker's socket would be reachable from each other distribution on the machine, and a
+/// distribution is a separate environment. The home directory is the distribution's own, so the
+/// runtime files go below it, as they do where no runtime directory is named.
 ///
 /// # Errors
 ///
@@ -2831,25 +2831,96 @@ const SHARED_BETWEEN_DISTRIBUTIONS: &str = "/mnt/wslg";
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn runtime_root_in(
     runtime_dir: Option<std::ffi::OsString>,
-    shared: &Path,
+    shared: &[&Path],
     home: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(value) = runtime_dir
-        && !is_inside(Path::new(&value), shared)
+        && !is_shared(Path::new(&value), shared)
     {
         return Ok(PathBuf::from(value).join("kalareach"));
     }
     Ok(home()?.join(".cache").join("kalareach").join("run"))
 }
 
-/// Whether `path`, where it really lies, is `shared` or inside it.
+/// Whether `path` is, or may be taken to be, in storage that every distribution of a machine shares.
 ///
-/// Both are resolved through their links where they exist. Where one does not, the name it has is
-/// all there is to compare, so a machine without the shared mount still refuses a name inside it.
+/// It is where the path really lies that decides: the deepest part of it that exists is resolved
+/// through its links, what does not exist yet is taken by name from there, and the result is in a
+/// shared mount if it is inside one by name, or if it is on the same filesystem as one that is a
+/// mount of its own, which is how a bind mount of a shared directory is told from a directory that
+/// is not. A path whose missing part holds a parent component cannot be said to lie anywhere, and
+/// is taken to be shared: the runtime files then go below the home directory, which is always
+/// safe.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-fn is_inside(path: &Path, shared: &Path) -> bool {
-    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    resolved(path).starts_with(resolved(shared))
+fn is_shared(path: &Path, shared: &[&Path]) -> bool {
+    let Some((existing, lies)) = where_it_lies(path) else {
+        return true;
+    };
+    shared.iter().any(|mount| {
+        // A mount this machine does not have is named where it would be.
+        let named = where_it_lies(mount).map_or_else(|| mount.to_path_buf(), |(_, lies)| lies);
+        lies.starts_with(&named) || on_that_mount(&existing, &named)
+    })
+}
+
+/// Where `path` really lies: the deepest part of it that exists, resolved through its links, and
+/// the whole of it with what does not exist yet taken by name from there.
+///
+/// None for a path that cannot be said to lie anywhere: one with no existing ancestor, or one whose
+/// missing part holds a parent component, which leads somewhere only once what it climbs out of is
+/// made.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn where_it_lies(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let path = std::path::absolute(path).ok()?;
+    let mut missing = Vec::new();
+    let mut existing = path.as_path();
+    let resolved = loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            break real;
+        }
+        let (name, parent) = (existing.file_name()?, existing.parent()?);
+        missing.push(name.to_owned());
+        existing = parent;
+    };
+    if !missing.is_empty()
+        && path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut lies = resolved.clone();
+    lies.extend(missing.iter().rev());
+    Some((resolved, lies))
+}
+
+/// Whether `directory` is on the filesystem that `mount` is a mount of its own of.
+#[cfg(all(unix, any(all(unix, not(target_os = "macos")), test)))]
+fn on_that_mount(directory: &Path, mount: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = |path: &Path| std::fs::metadata(path).ok().map(|found| found.dev());
+    let (Some(held), Some(of_the_mount), Some(above)) = (
+        device(directory),
+        device(mount),
+        mount.parent().and_then(device),
+    ) else {
+        return false;
+    };
+    is_that_mount(held, of_the_mount, above)
+}
+
+/// Whether a path on device `held` is on the mount whose own device is `of_the_mount`, which has to
+/// differ from the device of the directory it is mounted in, `above`: a directory that is no mount
+/// shares its device with all that lies beside it.
+#[cfg(all(unix, any(all(unix, not(target_os = "macos")), test)))]
+const fn is_that_mount(held: u64, of_the_mount: u64, above: u64) -> bool {
+    of_the_mount != above && held == of_the_mount
+}
+
+#[cfg(all(not(unix), test))]
+fn on_that_mount(_directory: &Path, _mount: &Path) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -3039,6 +3110,13 @@ mod tests {
         )
     }
 
+    /// The root a runtime directory named `named` gives, with the shared mounts `shared`.
+    fn root_for(named: &Path, shared: &[&Path]) -> PathBuf {
+        runtime_root_in(Some(named.into()), shared, home).expect("a root")
+    }
+
+    const BELOW_HOME: &str = "/home/kala/.cache/kalareach/run";
+
     /// A WSL machine's graphical service sets the runtime directory inside a mount that every
     /// distribution on the machine shares, so the runtime files go below the home directory
     /// instead: one environment's sockets are never reachable from another.
@@ -3047,11 +3125,10 @@ mod tests {
         let root = temporary_root("shared-runtime");
         let shared = root.join("wslg");
         std::fs::create_dir_all(shared.join("runtime-dir")).expect("the shared mount");
-        let private = PathBuf::from("/home/kala/.cache/kalareach/run");
         for named in [shared.join("runtime-dir"), shared.clone()] {
             assert_eq!(
-                runtime_root_in(Some(named.clone().into()), &shared, home).expect("a root"),
-                private,
+                root_for(&named, &[&shared]),
+                PathBuf::from(BELOW_HOME),
                 "{} is shared",
                 named.display()
             );
@@ -3059,8 +3136,30 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Both of the platform's shared mounts are refused, and a name that only begins like one is
+    /// not.
+    #[test]
+    fn each_of_the_shared_mounts_is_refused_and_a_name_like_one_is_not() {
+        let root = temporary_root("two-mounts");
+        let (graphical, platform) = (root.join("wslg"), root.join("wsl"));
+        let alike = root.join("wslx");
+        for directory in [&graphical, &platform, &alike] {
+            std::fs::create_dir_all(directory.join("run")).expect("a directory");
+        }
+        let shared = [graphical.as_path(), platform.as_path()];
+        for refused in [graphical.join("run"), platform.join("run")] {
+            assert_eq!(root_for(&refused, &shared), PathBuf::from(BELOW_HOME));
+        }
+        assert_eq!(
+            root_for(&alike.join("run"), &shared),
+            alike.join("run").join("kalareach")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A directory that is not named inside the shared mount but resolves into it is as shared as
-    /// the one that is: `/run/user/<uid>` is a link to it where the service puts it there.
+    /// the one that is: a link to it, including one that leads a directory that does not exist yet
+    /// into it, because the directory the product makes there is made in the shared mount.
     #[cfg(unix)]
     #[test]
     fn a_runtime_directory_that_resolves_into_the_shared_mount_is_not_the_runtime_root() {
@@ -3069,9 +3168,48 @@ mod tests {
         std::fs::create_dir_all(shared.join("runtime-dir")).expect("the shared mount");
         let linked = root.join("user-1000");
         std::os::unix::fs::symlink(shared.join("runtime-dir"), &linked).expect("a link");
+        assert_eq!(root_for(&linked, &[&shared]), PathBuf::from(BELOW_HOME));
+        // The directory is not there yet, and the link it would be made through is.
         assert_eq!(
-            runtime_root_in(Some(linked.into()), &shared, home).expect("a root"),
-            PathBuf::from("/home/kala/.cache/kalareach/run")
+            root_for(&linked.join("not-yet"), &[&shared]),
+            PathBuf::from(BELOW_HOME),
+            "a directory below a link into the shared mount, not made yet"
+        );
+        assert_eq!(
+            root_for(&linked.join("not").join("yet"), &[&shared]),
+            PathBuf::from(BELOW_HOME),
+            "and one several levels below it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path whose part that does not exist holds a parent component lies nowhere that can be said
+    /// before it is made, so it is not used: the runtime files go below the home directory.
+    #[test]
+    fn a_missing_directory_that_climbs_out_again_is_not_taken_for_the_distributions_own() {
+        let root = temporary_root("climbing-runtime");
+        let shared = root.join("wslg");
+        std::fs::create_dir_all(&shared).expect("the shared mount");
+        let climbing = root.join("missing").join("..").join("wslg").join("run");
+        assert_eq!(root_for(&climbing, &[&shared]), PathBuf::from(BELOW_HOME));
+        // The control: the same path through directories that exist is the shared mount's, found by
+        // where it lies, and an ordinary one beside it is not.
+        std::fs::create_dir_all(shared.join("run")).expect("a directory");
+        std::fs::create_dir_all(root.join("beside").join("..")).expect("a directory");
+        assert_eq!(
+            root_for(
+                &root.join("beside").join("..").join("wslg").join("run"),
+                &[&shared]
+            ),
+            PathBuf::from(BELOW_HOME)
+        );
+        assert_eq!(
+            root_for(
+                &root.join("beside").join("..").join("elsewhere"),
+                &[&shared]
+            ),
+            PathBuf::from(BELOW_HOME),
+            "a missing directory with a parent component is not taken for an ordinary one"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3083,16 +3221,40 @@ mod tests {
         let root = temporary_root("absent-shared");
         let shared = root.join("wslg");
         assert_eq!(
-            runtime_root_in(Some(shared.join("runtime-dir").into()), &shared, home)
-                .expect("a root"),
-            PathBuf::from("/home/kala/.cache/kalareach/run")
+            root_for(&shared.join("runtime-dir"), &[&shared]),
+            PathBuf::from(BELOW_HOME)
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory that is on the storage a shared mount is a mount of its own of is shared, however
+    /// it is reached: a bind mount of the shared directory elsewhere has the shared mount's device.
+    /// A directory that is no mount shares its device with its neighbours, and that is no evidence.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_on_the_shared_mounts_own_storage_is_shared_and_one_beside_a_plain_directory_is_not()
+     {
+        // Device numbers: the mount's own, the directory it is mounted in, and what a path has.
+        assert!(is_that_mount(7, 7, 3), "on the mount's own storage");
+        assert!(!is_that_mount(3, 7, 3), "on the storage the mount is in");
+        assert!(
+            !is_that_mount(3, 3, 3),
+            "a directory that is no mount of its own shares the device of the one it is in"
+        );
+        // And as the machine reads it: no directory of this test is a mount of its own.
+        let root = temporary_root("not-a-mount");
+        let plain = root.join("plain");
+        std::fs::create_dir_all(plain.join("run")).expect("a directory");
+        assert!(!on_that_mount(&plain.join("run"), &plain));
+        assert_eq!(
+            root_for(&root.join("run"), &[&plain]),
+            root.join("run").join("kalareach")
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
     /// The controls: a runtime directory of the distribution's own is the root as it always was,
-    /// including one whose name only begins like the shared mount's; and with none named the root
-    /// is below the home directory.
+    /// and with none named the root is below the home directory.
     #[test]
     fn a_runtime_directory_of_the_distributions_own_is_the_runtime_root() {
         let root = temporary_root("own-runtime");
@@ -3106,13 +3268,13 @@ mod tests {
             root.join("elsewhere"),
         ] {
             assert_eq!(
-                runtime_root_in(Some(own.clone().into()), &shared, no_home).expect("a root"),
+                runtime_root_in(Some(own.clone().into()), &[&shared], no_home).expect("a root"),
                 own.join("kalareach")
             );
         }
         assert_eq!(
-            runtime_root_in(None, &shared, home).expect("a root"),
-            PathBuf::from("/home/kala/.cache/kalareach/run")
+            runtime_root_in(None, &[&shared], home).expect("a root"),
+            PathBuf::from(BELOW_HOME)
         );
         std::fs::remove_dir_all(&root).ok();
     }
