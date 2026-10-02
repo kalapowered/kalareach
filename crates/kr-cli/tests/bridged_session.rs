@@ -439,6 +439,22 @@ impl World {
         while self.destination_answers() && started.elapsed() < Duration::from_secs(30) {
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Nothing answering is not the daemon gone: it gives up its endpoint before it ends, and
+        // a command that starts the next one in between is told another daemon owns the
+        // environment. The environment's lock is the operating system's word that the process has
+        // ended, and it is the one the next daemon takes.
+        let lock = self.destination.environment().singleton_lock();
+        while started.elapsed() < Duration::from_secs(60) {
+            if kr_controller::singleton::SingletonLock::hold(
+                &lock,
+                self.destination.environment_id(),
+            )
+            .is_ok()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Closes `session` where it lives, through the destination's own daemon, and waits until that
