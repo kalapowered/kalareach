@@ -2852,14 +2852,15 @@ reported yet is one this host has not reached, and it holds turning privacy mode
 worker answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the
 next generation is recorded first, the backup fence is released under it, the delivery fence is
 lifted, and each live session is told until it answers. If a launch never handed a worker its launch
-specification, it never ran a shell, so nothing was retained. The registry and the daemon's own
-creates show this in three cases: the launch failed or was fenced before any worker claimed it, its
-launcher exited without claiming it, or its create stopped waiting without recording a launcher,
-after which a claim is refused. The obligation for such a launch is deleted from the record, but the
-session is not reported as ended. All other launches are still owed and hold privacy mode on until
-either they come into one of those cases or the worker that claimed their reservation says its
-cleanup is complete. In particular, a reservation that never made it to the `spawned` state (because
-writing to the registry failed) will stay owed until the next time the daemon starts and fails it.
+specification, it never ran a shell, so nothing was retained. The registry, the daemon's own creates
+and the kernel show this in three cases: the launch failed or was fenced before any worker claimed
+it, its launcher exited without claiming it, or its create stopped waiting without recording a
+launcher, after which a claim is refused. The obligation for such a launch is deleted from the
+record, but the session is not reported as ended. All other launches are still owed and hold privacy
+mode on until they come into one of those cases, until the registry shows, after a claim, that their
+launch is over, or until the worker that claimed their reservation says its cleanup is complete. In
+particular, a reservation that never made it to the `spawned` state (because writing to the registry
+failed) will stay owed until the next time the daemon starts and fails it.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
 about an earlier one, is admitted under the privacy state the record publishes: only while privacy
