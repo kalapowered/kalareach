@@ -3225,6 +3225,139 @@ mod tests {
         );
     }
 
+    /// A decision quiet hours hold back while privacy mode is on, over an approval the feed has not
+    /// taken yet, is the decision the release hands over when the hours end after privacy mode has,
+    /// and it was made while the mode was on: the take that settles the approval before it, and a
+    /// restart of the store, leave that, and it is never sent. The control: the same flow with no
+    /// private period sends it.
+    #[test]
+    fn a_held_decision_made_in_privacy_mode_is_dropped_after_the_approval_before_it_is_taken_and_a_restart()
+     {
+        use kr_attention::PrivacyStamp;
+        use kr_protocol::attention::QuietHours;
+        use kr_protocol::scalars::{Nullable, U64};
+
+        const HOUR: u64 = 3_600_000;
+        for private_period in [true, false] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("attention.db");
+            let claimant = || {
+                Claimant::new(
+                    ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+                    &unknown,
+                )
+            };
+            let mut producer = producer();
+            let phones = two_phones(&mut producer);
+            let mut attention =
+                Attention::open(&path, reading(0, NOON), &claimant()).expect("a store");
+            let normal = PrivacyStamp {
+                generation: 0,
+                private: false,
+            };
+            // The approval is decided and nobody takes it yet.
+            raise_approval_under(&mut attention, 1, NOON + 1_000, "req-1", normal);
+            attention
+                .set_quiet_hours(Some(QuietHours {
+                    start_minute: U64::new(11 * 60),
+                    end_minute: U64::new(13 * 60),
+                    zone: Nullable::null(),
+                }))
+                .expect("the store records the window");
+            // Its repeat falls due inside the hours and is held, over the approval not yet taken. The
+            // repeat is decided under the state in force then: privacy mode on, or not.
+            let repeat = 1_000 + kr_attention::rule::REMINDER_INTERVAL_MS;
+            let during = if private_period {
+                PrivacyStamp {
+                    generation: 1,
+                    private: true,
+                }
+            } else {
+                normal
+            };
+            let held = attention
+                .tick(reading(repeat, NOON + repeat).under(during), &|_| {
+                    Some(u64::MAX)
+                })
+                .expect("the store holds the repeat");
+            assert!(
+                held.iter().any(|outcome| matches!(
+                    outcome,
+                    kr_attention::engine::Outcome::Deferred { .. }
+                )),
+                "the repeat is held: {held:?}"
+            );
+            let mut view = NORMAL;
+            if private_period {
+                producer.journal_mut().fence(1).expect("a fence");
+                view = PrivacyView {
+                    generation: 1,
+                    private: true,
+                };
+                // The take settles the approval the held repeat was decided over.
+                let taken = take(
+                    &mut producer,
+                    &mut attention,
+                    &Everything(BTreeSet::new()),
+                    view,
+                );
+                assert_eq!(
+                    taken.taken, 1,
+                    "the approval before it is taken and settled"
+                );
+                assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+            }
+            drop(attention);
+            let mut attention =
+                Attention::open(&path, reading(2 * HOUR, NOON + 2 * HOUR), &claimant())
+                    .expect("the store reopens");
+            if private_period {
+                producer.journal_mut().lift_fence(2).expect("a lift");
+                view = PrivacyView {
+                    generation: 2,
+                    private: false,
+                };
+            }
+            let after = reading(3 * HOUR, NOON + 3 * HOUR).under(PrivacyStamp {
+                generation: view.generation,
+                private: false,
+            });
+            let released = attention
+                .tick(after, &|_| Some(u64::MAX))
+                .expect("the store records the release");
+            assert!(
+                released.iter().any(|outcome| matches!(
+                    outcome,
+                    kr_attention::engine::Outcome::Released { .. }
+                )),
+                "the hours ended: {released:?}"
+            );
+            let taken = take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                view,
+            );
+            assert_eq!(
+                taken.taken, 1,
+                "the release is taken, private period {private_period}"
+            );
+            assert_eq!(
+                taken.dropped,
+                usize::from(private_period),
+                "private period {private_period}"
+            );
+            let produced = producer
+                .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+                .expect("production");
+            assert_eq!(
+                produced.admitted,
+                if private_period { 0 } else { 2 },
+                "private period {private_period}"
+            );
+        }
+    }
+
     /// What was decided while privacy mode was on is never sent once it is off, and what was
     /// decided after is, whatever either clock says: the store's stamp of the privacy state a
     /// decision was made under is what decides, not the time. The wall clock here is set back across
