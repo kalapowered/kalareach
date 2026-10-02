@@ -292,26 +292,41 @@ pickers. The device checks cover those. They are a debug build of the applicatio
 that drives the installed application by its identifier, and `scripts/device-ios.sh`, which builds
 both, runs one session at a time and removes everything afterwards.
 
-The debug build of the application contains a few hooks for the device tests to interact with, such
-as the keychain count and sweep feature, running the push and audio tests, and dumping the app's
-windows to files. These are not present in the release build of the app. To verify that, run
-`pnpm -C apps/companion debug-code <KalaReach.app>`, which reads every executable in the bundle and
-reports any it finds. The Firebase configuration belongs to the account that owns the project and is
-not in the repository. A build copies it from the file that `KR_GOOGLE_SERVICE_INFO` names, so a
-debug build without the variable leaves Firebase alone and a release build without it fails.
+The debug build holds a few hooks for the tests: a count and a sweep of the keychain, the push and
+audio checks, and a picture that the application draws of its own windows. None of it is in a
+release build, which `pnpm -C apps/companion debug-code <KalaReach.app>` shows by reading every
+executable in the bundle and reporting any of it that it finds. The Firebase configuration belongs
+to the account that owns the project and is not in the repository. A build copies it from the file
+that the build setting `KR_GOOGLE_SERVICE_INFO` names, so a debug build without it leaves Firebase
+alone and a release build without it fails.
 
-What a build is signed with is the signer's choice. `Build.xcconfig` reads `Local.xcconfig`, which
-the repository ignores, so `KR_SIGN_STYLE`, `KR_SIGN_IDENTITY`, `KR_SIGN_FLAGS`, `KR_APP_PROFILE`,
-`KR_EXTENSION_PROFILE` and `KR_RUNNER_PROFILE` go there, with paths written out in full because a
-build setting does not expand `~`. `tauri ios build` starts `xcodebuild` itself, so an environment
-variable does not reach it. A device build without these values signs automatically, as before.
+Xcode finds a signing identity only in the keychains on the user's search list, so the script signs
+by hand and an identity kept in a keychain of its own never has to stay on that list. To that effect
+the script will first build the app with signing off, then generate a `Local.xcconfig` file (ignored
+by the repo, loaded by `Build.xcconfig`) with the team prefix and the path to the Firebase
+configuration, and finally sign the libraries, the app extension, and the app itself by calling
+`scripts/sign-ios.mjs` with the corresponding provisioning profile and entitlements (from the
+corresponding source file). The signing identity is referenced by its SHA-1, and not by name,
+because the name can be ambiguous (when there are multiple keychains). The keychain goes on the end
+of the search list only while the signing commands run, and the script puts the list back as it was
+and locks the keychain afterwards. The script will then verify the signature of the result (using
+`codesign --verify --strict`), as well as the entitlements (against the profile) and IDs. If Xcode
+is to be used for signing, set the values of `KR_SIGN_STYLE`, `KR_SIGN_IDENTITY`, `KR_SIGN_FLAGS`,
+`KR_APP_PROFILE`, `KR_EXTENSION_PROFILE`, and `KR_RUNNER_PROFILE` in the file `Local.xcconfig` (note
+that the paths must be full, because Xcode build settings do not expand `~`). Note that the
+environment variables cannot be used to set Xcode build settings, because the call to `xcodebuild`
+is done by `tauri ios build`.
+
+The script takes its choices from the environment, and its header lists them: the phone's UDID, the
+device lease, the SHA-1 of the signing certificate, the UUIDs of the three provisioning profiles,
+the signing keychain and the file that holds its password, and the Firebase configuration.
 
 ```sh
-# The applications and the test runner, signed with what Local.xcconfig names. The script's own
+# The applications and the test runner, built with signing off and signed by hand. The script's own
 # header lists the variables it needs, among them KR_DEVICE and KR_DEVICE_LEASE.
 apps/companion/scripts/device-ios.sh build-app                           # for s0 and s1
 apps/companion/scripts/device-ios.sh build-app --no-firebase             # for s3a, s3b and s4
-apps/companion/scripts/device-ios.sh build-app --harness --no-firebase   # for s2
+apps/companion/scripts/device-ios.sh build-app --harness --no-firebase   # for s2a and s2b
 apps/companion/scripts/device-ios.sh build-tests
 
 # One session, then the clean-up for a session that was stopped before its own.
@@ -319,27 +334,33 @@ apps/companion/scripts/device-ios.sh session s1
 apps/companion/scripts/device-ios.sh cleanup
 ```
 
-A session runs under the device lease of whoever starts it. The general flow is to install both apps
-on the device, check if the app's keychain groups are empty and fail if not, run the tests, delete
-any items the app may have put in its keychain groups, and finally uninstall both apps. The sessions
-are:
+A session runs under the device lease of whoever starts it. It installs the application and the
+runner, counts what the application's two keychain groups hold and stops if they are not empty, runs
+the tests, deletes anything the application put in those groups, and uninstalls both. If a session
+is killed, `cleanup` does the same from the record the session left. The sessions are:
 
-- `s0` shows that the tests report while they run and that Home presses keep the phone awake, and
-  checks the keychain boundary.
-- `s1` sends a Firebase notification to the app's registration token while it's terminated and again
-  when it's in the background.
-- `s2` uses the harness build, whose page is the phone shell on a scripted host, to check recovery
-  after a suspension and a restart, the keyboard, rotation and safe areas, accessibility, and the
-  file pickers and camera, with a person at the phone.
-- `s3a` and `s3b` run the audio check with the microphone refused and then allowed, and count a
-  change of route.
-- `s4` runs the audio check and asks the person to lock and unlock the device's screen.
+- `s0` proves what the other sessions rely on: that the lines the tests say reach the script while
+  they run, that a failing test leaves no picture or recording in its result, and that the
+  application's own picture of itself comes out of its container. It also checks the keychain
+  boundary, brings up the notification prompt with Firebase started, and sends the application to
+  the background and back.
+- `s1` : send a Firebase notification to the app's registration token, when the app is terminated,
+  and again when the app is suspended in the background
+- `s2a` uses the harness build, whose page is the phone shell on a scripted host, with a person at
+  the phone, to check recovery after a suspension and a restart, the keyboard, rotation and safe
+  areas, and the file pickers and camera.
+- `s2b` : test, with the same build, accessibility audit (target sizes and text size)
+- `s3a` and `s3b` : audio check (first with denied microphone permission, then with allowed
+  permission and routing and counting the changes)
+- `s4` : audio check (with human assistance to lock and unlock the phone)
 
-The runner reads nothing of the phone except the application's own screens and the answer button of
-a prompt that names the application. It takes no screenshot: the application draws its own windows,
-which cannot hold anything else, into its container, and the script copies the files out. Dynamic
-Type comes from a launch argument, the colour mode from the debug build's own switch and the turn of
-the phone from the test, so no setting of the phone is touched.
+The runner reads nothing of the phone except the application's own screens, the title of an alert
+that interrupts a test, to tell whether the alert is the application's, the answer button of a
+prompt whose title names the application, and the Cancel button of a system picker, found by its
+identifier. It takes no screenshot: the application draws its own windows, which cannot hold
+anything else, into its container, and the script copies the files out. Dynamic Type comes from a
+launch argument, the colour mode from the debug build's own switch and the turn of the phone from
+the test, so no setting of the phone is touched.
 
 ## The boundary on a phone
 
