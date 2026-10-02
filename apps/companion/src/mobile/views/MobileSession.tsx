@@ -30,6 +30,7 @@ import { useSessionAgent } from '../../app/agent'
 import { useConnectionRights } from '../../app/rights'
 import { composerOffers, subjectOf, withheldTotal } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
+import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { failureCode, failureMessage } from '../../host/port'
 import {
@@ -112,7 +113,10 @@ const SETTLE_MS = 150
 /** One node as the phone holds it. */
 interface ReadNode {
   readonly id: string
+  /** What the node is called, in words. */
   readonly role: string
+  /** The kind's identifier, which is data on the node and never a word on the screen. */
+  readonly kind: string
   readonly text: string
   /** True when the text is Markdown the allowlisted renderer draws. */
   readonly markdown?: boolean
@@ -805,7 +809,7 @@ export function MobileSession({
               </p>
             ) : (
               nodes.map((node) => (
-                <div key={node.id} className="m-node">
+                <div key={node.id} className="m-node" data-kind={node.kind}>
                   <p className="m-node-role">{node.role}</p>
                   {node.markdown ? (
                     // The same allowlisted renderer the desktop window uses: an element tree from
@@ -1545,14 +1549,8 @@ function readNode(item: ConversationItem, index: number): ReadNode {
     const { entry } = item
     return {
       id: item.id,
-      role:
-        entry.kind === 'message'
-          ? 'agent'
-          : entry.kind === 'tool.finished'
-            ? 'tool finished'
-            : entry.kind === 'tool.failed'
-              ? 'tool failed'
-              : entry.kind,
+      role: entryLabel(entry.kind),
+      kind: entry.kind,
       text: entry.text,
       markdown: entry.kind === 'message'
     }
@@ -1564,34 +1562,38 @@ function readNode(item: ConversationItem, index: number): ReadNode {
   const text = (name: string): string => (typeof body[name] === 'string' ? body[name] : '')
   const kind = text('kind') || 'node'
   const id = outer.id ?? String(index)
+  const read = (role: string, shown: string, markdown?: true): ReadNode => ({
+    id,
+    role,
+    kind,
+    text: shown,
+    markdown
+  })
   switch (kind) {
     case 'message':
-      return { id, role: text('author') || 'message', text: text('text') }
+      return read(text('author') || nodeKindLabel(kind), text('text'))
     case 'markdown':
-      return { id, role: 'assistant', text: text('source'), markdown: true }
+      return read(nodeKindLabel(kind), text('source'), true)
     case 'tool': {
       const summary = text('summary')
-      return {
-        id,
-        role: `tool · ${text('name')}`,
-        text: summary ? `${text('outcome')} · ${summary}` : text('outcome')
-      }
+      return read(
+        `${nodeKindLabel(kind)} · ${text('name')}`,
+        summary ? `${text('outcome')} · ${summary}` : text('outcome')
+      )
     }
     case 'diff': {
       const files = (body['files'] as { path?: string; added?: number; removed?: number }[]) ?? []
-      return {
-        id,
-        role: 'change',
-        text: files
-          .map((file) => `${file.path ?? ''} +${file.added ?? 0} −${file.removed ?? 0}`)
-          .join(', ')
-      }
+      return read(
+        nodeKindLabel(kind),
+        files.map((file) => `${file.path ?? ''} +${file.added ?? 0} −${file.removed ?? 0}`).join(', ')
+      )
     }
     case 'approval_ref':
-      return { id, role: 'decision', text: 'A decision is waiting in the inbox.' }
+      return read(nodeKindLabel(kind), 'A decision is waiting in the inbox.')
     case 'action_group':
-      return { id, role: 'actions', text: text('label') }
+      return read(nodeKindLabel(kind), text('label'))
     default:
-      return { id, role: kind, text: '' }
+      // A kind this build does not draw fully is still named, in words: its identifier is data.
+      return read(nodeKindLabel(kind), '')
   }
 }

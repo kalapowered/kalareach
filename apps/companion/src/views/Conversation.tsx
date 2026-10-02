@@ -74,6 +74,7 @@ import {
   type Control,
   type ControlState
 } from '../model/controls'
+import { entryLabel } from '../model/entry-label'
 import {
   adoptFirstTarget,
   againstCurrent,
@@ -918,20 +919,6 @@ const Document = memo(function Document({
     </>
   )
 })
-
-/** What each kind of history entry is called beside it. */
-function entryLabel(kind: string): string {
-  switch (kind) {
-    case 'tool.finished':
-      return 'Tool finished'
-    case 'tool.failed':
-      return 'Tool failed'
-    case 'notification':
-      return 'Notice'
-    default:
-      return kind
-  }
-}
 
 /**
  * One entry of the agent's history.
