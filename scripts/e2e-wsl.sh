@@ -131,6 +131,17 @@ inherited_reset='
         /*) ;;
         *) refuse "$name holds $value, which is not an absolute path" ;;
       esac
+      # A runtime directory inside what WSLg shares between every distribution of the machine is
+      # not one the product uses: its runtime root is then below the home directory. So the helper
+      # is asked as the product runs, with none, and the root it names is the one it has.
+      if [ "$name" = XDG_RUNTIME_DIR ]; then
+        case "$(readlink -m "$value")/" in
+          /mnt/wslg/*)
+            unset XDG_RUNTIME_DIR
+            continue
+            ;;
+        esac
+      fi
       index=$((index + 1))
       mkdir -m 0700 "$probe/$index"
       eval "configured_$index=\$value"
@@ -285,6 +296,23 @@ inherited_reset='
       say "  removed the inherited $real"
     done
 '
+
+# The path of every Unix socket a process holds open, one to a line, with the process identifier as
+# its argument: each descriptor that names a socket is looked up by its number in the kernel's table
+# of them, which also holds the path the socket was bound to. A socket with no path is not listed.
+# shellcheck disable=SC2016  # read by the shell inside the distribution, which is the point
+open_socket_paths='for fd in /proc/$1/fd/*; do
+    target="$(readlink "$fd")" || continue
+    case "$target" in
+      "socket:["*"]")
+        inode="${target#socket:[}"
+        inode="${inode%]}"
+        while read -r _ _ _ _ _ _ number path; do
+          [ "$number" = "$inode" ] && [ -n "$path" ] && echo "$path"
+        done </proc/net/unix
+        ;;
+    esac
+  done'
 
 # One session's row in a compacted `kr --json list --include-closed` document, when that row says
 # the session is closed and how, and nothing, with a failure, otherwise. A document is canonical,
@@ -743,6 +771,41 @@ self_test_mount_inside() {
     [ -f "$state/registry" ]
 }
 
+# The sockets a process holds are listed by their paths: one bound to a path is named, and the
+# listing of a process that holds none is empty.
+self_test_open_sockets() {
+  local d="$self_test_work/${FUNCNAME[0]}" holder listed
+  command -v python3 >/dev/null 2>&1 || {
+    echo "  this host has no python3 to hold a socket open with"
+    return 77
+  }
+  mkdir -p "$d" || return 1
+  python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen()
+time.sleep(60)' "$d/held.sock" >"$d/said" 2>&1 &
+  holder=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -S "$d/held.sock" ] && break
+    sleep 0.25
+  done
+  listed="$(/bin/sh -c "$open_socket_paths" sh "$holder" 2>>"$d/said")"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$listed" = "$d/held.sock" ] || {
+    echo "  the listing was: $listed" >>"$d/said"
+    return 1
+  }
+  # A process that holds no socket lists none.
+  sleep 30 &
+  holder=$!
+  listed="$(/bin/sh -c "$open_socket_paths" sh "$holder" 2>>"$d/said")"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ -z "$listed" ]
+}
+
 # A compacted listing of five sessions: one live, one closed with a closure whose process name holds
 # braces, one that is closing and has no closure yet, one marked closed that says nothing of how, and
 # one that carries a closure and is not marked closed.
@@ -925,6 +988,8 @@ STAND_IN
     "a root on storage the image does not carry is refused, and nothing is removed"
   self_test_case self_test_mount_inside \
     "a directory mounted inside a root is refused before anything is removed"
+  self_test_case self_test_open_sockets \
+    "the sockets a process holds are listed by the paths they were bound to"
   self_test_case self_test_closed_row \
     "a session that closed has its own closed row found in a listing"
   self_test_case self_test_open_row \
@@ -1325,6 +1390,16 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its daemon $daemon_pid has for a root"
   [ "$daemon_root" = "/" ] ||
     fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
+  # The sockets it listens on are the distribution's own: none is in the directory WSLg shares
+  # between every distribution of the machine, where another distribution could open it.
+  daemon_sockets="$(inside "$distribution" "/bin/sh -c '$open_socket_paths' sh $daemon_pid")" ||
+    fail "$distribution could not be asked what its daemon $daemon_pid listens on"
+  [ -n "$daemon_sockets" ] ||
+    fail "$distribution's daemon $daemon_pid holds no socket with a path, so its runtime root is not known"
+  shared_sockets="$(printf '%s\n' "$daemon_sockets" | grep -c '^/mnt/wslg/')" || [ "$shared_sockets" = "0" ]
+  if [ "$shared_sockets" != "0" ]; then
+    fail "$distribution's daemon holds sockets in the directory WSLg shares between distributions: $(printf '%s' "$daemon_sockets" | tr '\n' ';')"
+  fi
   # A session of the distribution's own, named by the identifier the create answered with.
   session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)" ||
     fail "$distribution could not be asked to create a session of its own"
@@ -1368,10 +1443,10 @@ for distribution in "$first" "$second"; do
   # What the worker has open that lives on the Windows side: a file under one of the drive mounts
   # (`/mnt/c`, `/mnt/d`), or on a 9p filesystem, which is how WSL2 serves them. The listing is made
   # first and counted afterwards, so a listing that could not be made is a failure here rather than
-  # a partial one counted as no crossings. Other files below /mnt are the distribution's own: WSLg,
-  # where it is installed, puts the runtime directory in /mnt/wslg/runtime-dir, a memory-backed
-  # directory of the virtual machine that every distribution in it shares and that holds each
-  # environment's files under a directory of that environment's own.
+  # a partial one counted as no crossings. Other files below /mnt are not Windows files: WSLg,
+  # where it is installed, keeps what it serves to every distribution in /mnt/wslg, a memory-backed
+  # directory of the virtual machine. The product keeps nothing of its own there, which the
+  # daemon's sockets above are checked for.
   # shellcheck disable=SC2016  # read by the shell inside the distribution, which is the point
   crossings_script='for fd in /proc/$1/fd/*; do
     target="$(readlink "$fd")" || continue
