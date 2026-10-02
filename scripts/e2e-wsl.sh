@@ -1326,7 +1326,7 @@ for distribution in "$first" "$second"; do
 
   # The worker serving it: this distribution's own Linux process, running the binary installed
   # here, as the same Linux user, with this distribution's filesystem as its root. Nothing on the
-  # Windows side takes part in it, and nothing it opens comes through /mnt.
+  # Windows side takes part in it, and nothing it opens is on the Windows side of /mnt.
   #
   # This run created one session in this distribution and closes it below, so one worker is
   # running here and it is that session's. More than one would leave these checks unable to say
@@ -1350,15 +1350,27 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its worker $worker_pid has for a root"
   [ "$worker_root" = "/" ] ||
     fail "$distribution's worker has root $worker_root rather than this distribution's own"
-  # The listing is made first and counted afterwards, so a listing that could not be made is a
-  # failure here rather than a partial one counted as no crossings.
-  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd >/tmp/kr-acc-worker-fds && awk '/ \\/mnt\\// { crossing++ } END { print crossing + 0 }' /tmp/kr-acc-worker-fds")" ||
+  # What the worker has open that lives on the Windows side: a file under one of the drive mounts
+  # (`/mnt/c`, `/mnt/d`), or on a 9p filesystem, which is how WSL2 serves them. The listing is made
+  # first and counted afterwards, so a listing that could not be made is a failure here rather than
+  # a partial one counted as no crossings. Other files below /mnt are the distribution's own: WSLg,
+  # where it is installed, puts the runtime directory in /mnt/wslg/runtime-dir, a memory-backed
+  # directory of the virtual machine that every distribution in it shares and that holds each
+  # environment's files under a directory of that environment's own.
+  # shellcheck disable=SC2016  # read by the shell inside the distribution, which is the point
+  crossings_script='for fd in /proc/$1/fd/*; do
+    target="$(readlink "$fd")" || continue
+    case "$target" in
+      /mnt/[a-z] | /mnt/[a-z]/*) echo "$target on a drive mount" ;;
+      /*) case "$(stat -L -f -c %T "$fd" 2>/dev/null)" in v9fs | 9p) echo "$target on a 9p filesystem" ;; esac ;;
+    esac
+  done'
+  crossing_list="$(inside "$distribution" "/bin/sh -c '$crossings_script' sh $worker_pid")" ||
     fail "$distribution could not be asked what its worker $worker_pid has open"
+  crossing="$(printf '%s\n' "$crossing_list" | grep -c .)" || [ "$crossing" = "0" ]
   if [ "$crossing" != "0" ]; then
-    opened="$(inside "$distribution" "grep ' /mnt/' /tmp/kr-acc-worker-fds; echo cwd: \$(readlink /proc/$worker_pid/cwd)" 2>&1 | head -n 5 | tr '\n' ';')"
-    fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution: $opened"
+    fail "$distribution's worker has $crossing open files on the Windows side, so it reaches out of the distribution: $(printf '%s' "$crossing_list" | tr '\n' ';')"
   fi
-
   inside "$distribution" "'$helper_path' close $created" >/dev/null ||
     fail "$distribution could not close session $created"
 done
