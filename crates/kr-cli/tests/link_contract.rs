@@ -434,6 +434,10 @@ const HALF_A_FRAME: Duration = Duration::from_millis(300);
 /// The partial-frame contract: a peer that has written the first half of a frame and not the rest,
 /// a receive that is given up on many times while it waits, and then the rest. The frame is
 /// delivered whole, once, and nothing was delivered before it.
+///
+/// For a socket this is what cancel-safety means: a receive cut inside a frame must not lose what it
+/// read. For a bridge it is reassembly, because a task of its own reads the helper's output and a
+/// receive that is given up on cannot cut a read.
 async fn a_frame_in_two_parts_is_delivered_whole(
     link: &mut impl Link,
     release_the_rest: impl Fn(),
@@ -510,7 +514,7 @@ async fn a_local_frame_that_arrives_in_two_parts_is_not_lost_to_a_receive_given_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bridged_frame_that_arrives_in_two_parts_is_not_lost_to_a_receive_given_up_on() {
+async fn a_bridged_frame_that_arrives_in_two_parts_is_delivered_whole() {
     let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
     let directory = tempfile::tempdir().expect("a temporary directory");
     let first = directory.path().join("first");
