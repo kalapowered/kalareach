@@ -573,7 +573,9 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,
    so a private fork is not the answer.
 
-Both are recorded for the external cryptographic review that section 10 makes a release gate.
+Both are recorded here with the versions pinned below, because no external cryptographic review has
+examined them. The release's statement of that exception is in
+[the release evidence gates](../releases/evidence-gates.md).
 
 ## Release manifest
 
