@@ -38,7 +38,7 @@ ELF alignment verification: `PT_LOAD` segments in `jni/arm64-v8a/libjingle_peerc
 | **`opus` `=0.4.0`** + **`opusic-sys` `=0.7.5`** | MIT OR Apache-2.0 / BSD-3-Clause | crates.io exact lockfile | **Chosen for macOS**: 48 kHz mono Opus encoding and decoding with native packet-loss concealment (PLC). |
 | `cpal` (`0.17.x` / `0.18.x`) | Apache-2.0 | crates.io | **Rejected**: Unconditionally references macOS 14.2 symbols (`AudioHardwareCreateProcessTap`), violating project floor of macOS 13.0. |
 | `webrtc-audio-processing` `=2.1.0` | BSD-3-Clause + Apache-2.0 | crates.io | **Rejected**: Downloads external unpinned Abseil if not on system; requires meson/ninja; unneeded on macOS due to native VoiceProcessingIO. |
-| Linux / Windows native audio backends | none | none | **Unimplemented in this branch**: Stubs return `CommandError::unavailable`, matching `verify.rs`. Future work: WASAPI capture/render with AEC on Windows; PipeWire/ALSA on Linux. |
+| Linux / Windows native audio backends | none | none | **Not used**: the desktop build has native audio only on macOS. On Linux and Windows the device functions return an `UNAVAILABLE` error, as `verify.rs` does. |
 
 ## 2. Jitter buffer and receive pipeline design
 
