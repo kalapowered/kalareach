@@ -1,0 +1,196 @@
+name: wsl-acceptance
+
+# Runs the WSL2 acceptance (`scripts/e2e-wsl.sh`) on a GitHub-hosted Windows runner, which can run a
+# WSL2 distribution (`docs/releases/platforms.md`).
+#
+# The script is an acceptance run: a prerequisite it cannot meet is a failure rather than a skip.
+# It needs a Windows host with WSL2, the three Windows programs built from the commit under test
+# (`kr.exe`, `kr-controller.exe`, `kr-worker.exe`), and a Linux distribution that carries the matching
+# Linux set (`kr`, `kr-controller`, `kr-worker` and the bridge suite) with the manifest that names
+# the commit and the hash of every installed file. Building the Linux set inside a distribution would
+# need a Rust toolchain there, so it is built on a Linux runner from the same commit and carried in.
+#
+# Two jobs:
+#
+#   linux-set    builds the Linux set and its manifest on ubuntu-24.04, the release whose C library the
+#                distribution below carries, so the programs run there unchanged.
+#   acceptance   builds the Windows set, installs WSL, imports a pinned Ubuntu root file system as
+#                the first distribution, installs the Linux set in it, and runs the script, which
+#                makes the second distribution itself.
+#
+# It is not part of the landing workflow: the run takes the better part of an hour.
+
+on:
+  push:
+    branches: ["task/T-025b-phase2"]
+    paths: [".github/workflows/wsl-acceptance.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The runner has one build cache and no reason to keep incremental artefacts between steps.
+  CARGO_INCREMENTAL: "0"
+  # A root file system pinned by its digest, so the run asks about the commit and never about what a
+  # mirror served.
+  ROOTFS_URL: https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-amd64.tar.gz
+  ROOTFS_SHA256: e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86
+
+jobs:
+  linux-set:
+    name: the Linux set
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: wsl-linux-set-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # The helper, the daemon and the worker, and the bridge suite as the test executable cargo
+      # builds for it, which the acceptance installs beside them and runs inside the distribution.
+      - name: Build the set
+        run: |
+          set -eu
+          cargo build --locked -p kr-cli --bin kr -p kr-controller --bin kr-controller -p kr-worker --bin kr-worker
+          suite="$(cargo test --locked -p kr-cli --test bridge --no-run --message-format=json |
+            sed -n 's/.*"kind":\["test"\].*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          test -n "$suite"
+          echo "the bridge suite is $suite"
+          root="$RUNNER_TEMP/set"
+          mkdir -p "$root/usr/local/bin" "$root/usr/local/lib"
+          install -m 0755 target/debug/kr target/debug/kr-controller target/debug/kr-worker "$root/usr/local/bin/"
+          install -m 0755 "$suite" "$root/usr/local/lib/kalareach-acc-bridge-suite"
+          # The commit on the first line and then the hash of every installed file, by its path
+          # below the root: what the acceptance reads before it trusts a set it did not build.
+          {
+            echo "$GITHUB_SHA"
+            cd "$root"
+            sha256sum usr/local/bin/kr usr/local/bin/kr-controller usr/local/bin/kr-worker usr/local/lib/kalareach-acc-bridge-suite
+          } >"$RUNNER_TEMP/commit-manifest"
+          mv "$RUNNER_TEMP/commit-manifest" "$root/usr/local/lib/kalareach-acc-commit"
+          tar -C "$root" -czf "$RUNNER_TEMP/linux-set.tar.gz" .
+          tar -tzvf "$RUNNER_TEMP/linux-set.tar.gz"
+
+      - name: Keep the set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wsl-linux-set
+          path: ${{ runner.temp }}/linux-set.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  acceptance:
+    name: the acceptance on windows-2025
+    needs: linux-set
+    runs-on: windows-2025
+    # Installing the platform on a machine that cannot virtualise can wait for a long time before it
+    # says so, and the acceptance itself restarts the platform to change the networking mode.
+    timeout-minutes: 150
+    env:
+      KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: wsl-windows-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # What the acceptance reaches the distributions with. The script looks for them in
+      # `target/debug` of the checkout.
+      - name: Build the Windows set
+        run: cargo build --locked -p kr-cli --bin kr -p kr-controller --bin kr-controller -p kr-worker --bin kr-worker
+
+      - name: Install WSL
+        run: |
+          wsl.exe --install --no-distribution
+          if ($LASTEXITCODE -ne 0) { throw "wsl.exe --install exited $LASTEXITCODE" }
+          wsl.exe --set-default-version 2
+          if ($LASTEXITCODE -ne 0) { throw "wsl.exe --set-default-version exited $LASTEXITCODE" }
+          wsl.exe --status
+
+      - name: Import the first distribution
+        run: |
+          $rootfs = Join-Path $env:RUNNER_TEMP 'rootfs.tar.gz'
+          Invoke-WebRequest -Uri $env:ROOTFS_URL -OutFile $rootfs
+          $digest = (Get-FileHash -Algorithm SHA256 $rootfs).Hash.ToLowerInvariant()
+          if ($digest -ne $env:ROOTFS_SHA256) { throw "the root file system's digest is $digest" }
+          New-Item -ItemType Directory -Force C:\wsl\first | Out-Null
+          wsl.exe --import kr-acc-first C:\wsl\first $rootfs --version 2
+          if ($LASTEXITCODE -ne 0) { throw "wsl.exe --import exited $LASTEXITCODE" }
+          wsl.exe --list --verbose
+
+      # The programs the acceptance runs inside a distribution that a minimal root file system does
+      # not carry. A tool still missing after the install is named, rather than left to fail a check
+      # somewhere in the run.
+      - name: Make the distribution able to run the acceptance
+        run: |
+          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends procps"
+          if ($LASTEXITCODE -ne 0) { throw "installing the tools exited $LASTEXITCODE" }
+          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c 'missing=; for tool in pgrep awk find sha256sum stat readlink unshare nohup head tail sort; do command -v $tool >/dev/null 2>&1 || missing="$missing $tool"; done; test -z "$missing" || { echo "missing from the distribution:$missing" >&2; exit 1; }'
+          if ($LASTEXITCODE -ne 0) { throw "the distribution lacks a tool the acceptance runs" }
+
+      - name: Fetch the Linux set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wsl-linux-set
+          path: C:\kala-set
+
+      - name: Install the Linux set in the first distribution
+        run: |
+          Get-ChildItem C:\kala-set
+          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c "tar -xzf /mnt/c/kala-set/linux-set.tar.gz -C / && head -n 1 /usr/local/lib/kalareach-acc-commit"
+          if ($LASTEXITCODE -ne 0) { throw "installing the set exited $LASTEXITCODE" }
+
+      - name: Run the acceptance
+        shell: bash
+        env:
+          KR_WSL_USER: root
+          KR_WSL_ROOT: /c/wsl-images
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          export KR_TEST_ARTIFACTS_DIR=/c/kr-test-artifacts
+          bash scripts/e2e-wsl.sh /c/wsl-acceptance.log
+
+      - name: Keep the acceptance's own record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wsl-acceptance
+          path: |
+            C:\wsl-acceptance.log
+            C:\kr-test-artifacts
+          if-no-files-found: warn
+
+      # The first distribution is this job's own, by the name it gave it.
+      - name: Remove what the job made
+        if: always()
+        run: wsl.exe --unregister kr-acc-first
