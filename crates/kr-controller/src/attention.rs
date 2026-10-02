@@ -506,6 +506,22 @@ impl std::fmt::Debug for AttentionModule {
     }
 }
 
+/// The session a pending question or approval names, when it is not the one it was raised from.
+///
+/// A session's ending ends these by the session they name as well as by the origin they came
+/// from, so an announcement about one waits for both to be read to their end.
+fn named_by(item: &kr_attention::engine::Item) -> Option<SessionId> {
+    use kr_protocol::attention::AttentionRule;
+    matches!(
+        item.rule,
+        AttentionRule::PendingApproval
+            | AttentionRule::PendingInput
+            | AttentionRule::InputIdleReminder
+    )
+    .then_some(item.session_id)
+    .flatten()
+}
+
 impl AttentionModule {
     /// Opens the environment's attention store in the daemon's state directory.
     ///
@@ -872,7 +888,7 @@ impl AttentionModule {
             let origins = self.origins();
             engine
                 .items()
-                .filter_map(|item| item.origin.session())
+                .flat_map(|item| item.origin.session().into_iter().chain(named_by(item)))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .filter(|session_id| {
@@ -887,7 +903,9 @@ impl AttentionModule {
         let offer = |item: &kr_attention::engine::Item| {
             item.origin
                 .session()
-                .is_none_or(|session_id| !held.contains(&session_id))
+                .into_iter()
+                .chain(named_by(item))
+                .all(|session_id| !held.contains(&session_id))
         };
         Ok(consume(&mut store, &offer))
     }
@@ -4882,5 +4900,28 @@ mod tests {
             ))])
             .expect("the store records the failure");
         offered_for(&module, "an item of the environment", true);
+
+        // A pending approval an environment record raises about a session ends with the session
+        // as one of the session's own does, so it is held with it, and offered once the session
+        // is read. The control: the same session's failed command, which the session's ending does
+        // not end, is offered whatever the session's state.
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let named = SessionId::new(kr_ipc::new_uuid());
+        module
+            .observe(&[SourceEvent::new(
+                kr_attention::EventCursor::new(AttentionSource::Receipts, 1),
+                TimestampMs::new(kr_ipc::now_ms().get()),
+                EventKind::ApprovalRequested {
+                    request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                        .expect("an identifier"),
+                    session_id: named,
+                    summary: String::new(),
+                },
+            )])
+            .expect("the store records the approval");
+        offered_for(&module, "an approval naming a session not read", false);
+        let _worker = linked(&temp, 2, &module, named).await;
+        offered_for(&module, "an approval naming a session read", true);
     }
 }
