@@ -502,10 +502,12 @@ lock are each refused, and nothing is seeded from it.
 
 ### Seeding
 
-The daemon seeds the catalogue from the bundle once, right after it starts and before it binds any
-endpoint a client could reach, so nothing is served from a catalogue the seed is still making. A
-seed that fails, or does nothing, does not stop the daemon. The doctor's catalogue check says what
-it did, what it skipped and why, and where the generation came from.
+The daemon seeds the catalogue from the bundle at every start, right after it starts and before it
+binds the local endpoints a client reaches. A request that arrives sooner on the network endpoint
+waits for the catalogue until the seed ends. A seed that fails, or does nothing, does not stop the
+daemon. The doctor's catalogue check says what it skipped and why, and where the generation in use
+came from; a pin, a removed repository or a repository of the owner's that holds the same root are
+the owner's choices and raise no warning.
 
 A build decides whether it trusts the bundle's highest root from that root's key identifiers alone,
 and never from anything the root says about itself. A shipped build trusts only the production root
@@ -527,7 +529,10 @@ back. Every root the client reaches along a chain of rotations is one the build 
 kept.
 
 Last, the seed installs each bundled package once: enabled, with an empty grant, under an authority
-of its own, from the bundle's own bytes. It grants nothing, so nothing was confirmed by an owner and
+of its own, from the bundle's own bytes. A later start finishes the packages an earlier one did not
+reach, installs the packages a newer bundle adds, and activates a newer bundled generation after the
+host is updated; a release that generation revokes loses the native bridge it had applied, as it
+would after any synchronisation. It grants nothing, so nothing was confirmed by an owner and
 no prompt was shown. Every capability past the repository's default ceiling stays
 permission-required, and no native bridge is applied for a package whose grant lacks
 `native_bridge.install`.
@@ -544,9 +549,11 @@ package is skipped, reported and tried again at the next start.
 
 A payload the bundle carries is served from the bundle's bytes whenever a repository's accepted
 generation pins it by digest, and the bytes are checked against the digest and length that
-generation signed. Reclamation therefore cannot strand an offline install of a bundled package. A
-host that cannot reach its repository is told so before it has made room for a package it could not
-fetch, so nothing is evicted for a package that cannot arrive.
+generation signed. Reclamation therefore cannot strand an offline install of a bundled package. Where the host decides
+that a payload cannot be had, it says so before it makes room for it: a seeded installation is
+refused for a payload the bundle does not carry, and a host with no transport for its repository's
+address is refused for one that is neither cached nor in the bundle, so nothing is evicted for a
+package that cannot arrive. A cached file counts only when its bytes are the ones its name says.
 
 ### Granting a seeded bridge
 
@@ -567,7 +574,7 @@ from narrowing afterwards, and adding one capability back takes all of them agai
 
 It is one generation, frozen at the commit it was copied from. It is not a catalogue: nothing about
 it searches, fetches, updates or decides that a newer generation exists, and the repository it
-enrols is fetched from its own address once the network is there. A signature under the development
+enrols is fetched from its own address when an owner or a client asks it to synchronise. A signature under the development
 lineage's root says the bytes are the ones that root's keys signed, and says nothing about who may
 run them: that is why only a build with debug assertions trusts it, and why a release trusts a root
 only once the production root exists. The package's capability requests, its grants and its
