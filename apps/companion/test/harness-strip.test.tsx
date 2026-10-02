@@ -197,4 +197,29 @@ describe('the harness control strip', () => {
     fireEvent.pointerUp(screen.getByText('Some text'))
     expect(field).not.toHaveFocus()
   })
+
+  it('leaves the keyboard alone after a drag and while text is selected', () => {
+    render(
+      <div>
+        <TapAwayPutsTheKeyboardAway />
+        <textarea aria-label="Field" />
+        <p>Some text</p>
+      </div>
+    )
+    const field = screen.getByLabelText('Field')
+    const text = screen.getByText('Some text')
+    field.focus()
+    fireEvent.pointerDown(text, { clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(text, { clientX: 60, clientY: 10 })
+    expect(field).toHaveFocus()
+
+    const range = document.createRange()
+    range.selectNodeContents(text)
+    window.getSelection()?.removeAllRanges()
+    window.getSelection()?.addRange(range)
+    fireEvent.pointerDown(text, { clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(text, { clientX: 10, clientY: 10 })
+    expect(field).toHaveFocus()
+    window.getSelection()?.removeAllRanges()
+  })
 })
