@@ -18,7 +18,7 @@ mod common;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use common::{LIVENESS, Placed, run_holding_input, run_with_input};
+use common::{LIVENESS, Placed, StandIn, read_line, run_holding_input, run_with_input};
 
 /// The members a hook's output decides with, in the three applications' output types.
 const DECIDING: [&str; 3] = ["decision", "continue", "hookSpecificOutput"];
@@ -249,32 +249,24 @@ fn kr_req_12_27_input_that_never_closes_cannot_hold_a_hook() {
 /// for and `hook`, and a worker that reads the hello and never answers cannot hold it: it answers
 /// `{}` at its own deadline, inside the shortest timeout any registration names, and never waits for
 /// a person.
-#[test]
-fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
     let placed = Placed::new();
     let files = placed.host.root().join("files");
-    std::fs::create_dir_all(&files).expect("a directory");
+    kr_ipc::paths::create_private_directory(&files).expect("a private directory");
     let credential_file = files.join("credential");
-    std::fs::write(&credential_file, "5e".repeat(32)).expect("the credential is written");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600))
-            .expect("owner-only");
-    }
+    kr_ipc::paths::create_new_owner_only_file(&credential_file, "5e".repeat(32).as_bytes())
+        .expect("the credential is written");
     for hooks in every_application() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        listener
-            .set_nonblocking(true)
-            .expect("the listener is polled");
-        let port = listener.local_addr().expect("its address").port();
+        let stand_in = StandIn::bind(&files, hooks.application);
         let registration = files.join(format!("registration.{}", hooks.application));
         std::fs::write(
             &registration,
             format!(
-                "endpoint=127.0.0.1:{port}\nprofile=lp-1\n\
+                "endpoint={}\nprofile=lp-1\n\
                  instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
                  credential={}\nframing=json_lines\n",
+                stand_in.address,
                 credential_file.display()
             ),
         )
@@ -283,39 +275,22 @@ fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
         let mut command = placed.command(&[hooks.application, "hook"]);
         command.env("KR_REGISTRATION", &registration);
         let input = payload.to_string();
-        let running = std::thread::spawn(move || run_with_input(command, input.as_bytes()));
+        let mut running =
+            tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()));
         let case = format!("{} {event}", hooks.application);
 
-        let deadline = Instant::now() + LIVENESS;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if running.is_finished() {
-                        let ran = running.join().expect("the hook ran");
-                        panic!(
-                            "{case}: the hook ended without connecting, with {:?}: {}",
-                            ran.code, ran.stderr
-                        );
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "{case}: the hook did not connect"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("{case}: the listener failed: {error}"),
+        let (mut stream, _) = tokio::select! {
+            accepted = stand_in.listener.accept() => accepted.expect("the hook connects"),
+            ran = &mut running => {
+                let ran = ran.expect("the hook ran");
+                panic!(
+                    "{case}: the hook ended without connecting, with {:?}: {}",
+                    ran.code, ran.stderr
+                );
             }
+            () = tokio::time::sleep(LIVENESS) => panic!("{case}: the hook did not connect"),
         };
-        stream.set_nonblocking(false).expect("a blocking stream");
-        stream
-            .set_read_timeout(Some(LIVENESS))
-            .expect("a bounded read");
-        let mut hello = Vec::new();
-        let mut byte = [0_u8; 1];
-        while stream.read(&mut byte).expect("the hello is read") == 1 && byte[0] != b'\n' {
-            hello.push(byte[0]);
-        }
+        let hello = read_line(&mut stream).await;
         let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
         assert_eq!(
             hello["kr_hello"]["bridge"],
@@ -323,7 +298,7 @@ fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
             "the hook declares the application it was invoked for"
         );
         // The worker never answers; the stream stays open until the hook has gone.
-        let ran = running.join().expect("the hook ran");
+        let ran = running.await.expect("the hook ran");
         drop(stream);
         assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
         assert_eq!(ran.stdout, b"{}\n", "{case}");

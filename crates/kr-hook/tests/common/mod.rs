@@ -84,6 +84,73 @@ impl Placed {
     }
 }
 
+/// A listener standing in for the worker's own, on the private endpoint this platform gives a
+/// launch: a socket inside an owner-only directory on Unix, a named pipe on Windows.
+///
+/// It is the worker's own listener type, so the forwarder connects to it as it connects to the
+/// worker's, and the process the system names on an accepted connection is the forwarder.
+pub struct StandIn {
+    /// The bound listener.
+    pub listener: kr_ipc::endpoint::Listener,
+    /// What a registration's `endpoint=` line says: the socket's path, or the pipe's full name.
+    pub address: String,
+}
+
+impl StandIn {
+    /// Binds a listener, with its socket in `directory` on Unix and a pipe name that carries `name` on
+    /// Windows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint cannot be made or bound.
+    #[must_use]
+    pub fn bind(directory: &Path, name: &str) -> Self {
+        let fresh: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .collect();
+        let (address, endpoint) = if cfg!(windows) {
+            let pipe = format!("kr-hook-{name}-{fresh}");
+            (
+                format!(r"\\.\pipe\{pipe}"),
+                kr_ipc::paths::Endpoint::from_name(pipe),
+            )
+        } else {
+            let path = directory.join(format!("{}.sock", &fresh[..12]));
+            (
+                path.to_string_lossy().into_owned(),
+                kr_ipc::paths::Endpoint::from_path(path),
+            )
+        };
+        let endpoint = endpoint.expect("a usable endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("the listener binds");
+        Self { listener, address }
+    }
+}
+
+/// Reads one line from a connection, without its newline, and the end of the stream as its end.
+///
+/// # Panics
+///
+/// Panics when the read fails or takes longer than [`LIVENESS`].
+pub async fn read_line(stream: &mut kr_ipc::endpoint::Connection) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::time::timeout(LIVENESS, stream.read(&mut byte))
+            .await
+            .expect("a bounded read")
+            .expect("the line is read");
+        if read == 0 || byte[0] == b'\n' {
+            return line;
+        }
+        line.push(byte[0]);
+    }
+}
+
 /// What one run of the forwarder produced.
 #[derive(Debug)]
 pub struct Ran {
