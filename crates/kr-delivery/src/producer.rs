@@ -2047,6 +2047,117 @@ mod tests {
         assert_eq!(deliveries[0].state, DeliveryState::Refused);
     }
 
+    /// A recipient that is not the owner is told a generic alert its audience admits, however its
+    /// history or rights are cut: a history cursor, no retained history and no `session.view` do
+    /// not turn the alert away, because it holds no line of any session. The control: the same
+    /// recipients are not told of a notice whose audience they are outside of.
+    #[test]
+    fn an_external_destination_is_told_a_generic_alert_by_a_recipient_whose_scope_is_narrow() {
+        use kr_protocol::grant::HistoryScope;
+        use kr_protocol::scalars::{CanonicalSet, Nullable};
+
+        #[derive(Debug)]
+        struct Narrow(RecipientScope);
+
+        impl RecipientAuthority for Narrow {
+            fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+                Some(self.0.clone())
+            }
+
+            fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+                Some(self.0.clone())
+            }
+        }
+
+        let no_history = HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        };
+        let workflow_grant = GrantId::new(Uuid::from_bytes([9; 16]));
+        let scope = |rights: &[ActionRight], viewer: ViewerScope, from: u64| RecipientScope {
+            viewer,
+            sessions: SessionSelector::Any,
+            rights: rights.iter().copied().collect(),
+            grant_id: workflow_grant,
+            recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+            history_from_ms: from,
+        };
+        let cases = [
+            (
+                "a history cursor",
+                scope(
+                    &[ActionRight::AutomationManage],
+                    ViewerScope::forwarded(500),
+                    500,
+                ),
+            ),
+            (
+                "no retained history and no session.view",
+                scope(
+                    &[ActionRight::AutomationManage],
+                    ViewerScope::from_history(&no_history, false),
+                    0,
+                ),
+            ),
+        ];
+        for (name, narrow) in cases {
+            let mut producer = producer();
+            let destination = webhook("hook");
+            producer
+                .journal_mut()
+                .configure_destination(&destination)
+                .expect("a destination");
+            let mut notice = notice(1_000);
+            notice.audience = Audience::Automation {
+                grant: Some(workflow_grant),
+                at_ms: 900,
+            };
+            take_the_event(&mut producer, &notice);
+            let produced = producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &Narrow(narrow.clone()),
+                    &[],
+                    1_000,
+                )
+                .expect("a decision");
+            assert_eq!(produced.admitted, 1, "{name}: told of the workflow's pause");
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            let body = String::from_utf8(record.content.expect("the built body")).expect("text");
+            assert!(body.contains("does not make it private"), "{name}");
+
+            // The control: a workflow under another grant is not this recipient's to be told of.
+            let mut other = notice.clone();
+            other.event = EventKey::announcement(Some(session(1)), "attention.other/x", 2);
+            other.audience = Audience::Automation {
+                grant: Some(GrantId::new(Uuid::from_bytes([11; 16]))),
+                at_ms: 900,
+            };
+            producer
+                .take(
+                    EventSource::Attention,
+                    SCOPE,
+                    &[other.taken(8).expect("an event record")],
+                    8,
+                    1_000,
+                )
+                .expect("a page");
+            let produced = producer
+                .produce(
+                    &other,
+                    std::slice::from_ref(&destination),
+                    &Narrow(narrow),
+                    &[],
+                    1_000,
+                )
+                .expect("a decision");
+            assert_eq!(produced.admitted, 0, "{name}: not told of another's");
+        }
+    }
+
     #[test]
     fn an_external_message_carries_the_notice_that_its_recipients_can_read_it() {
         let mut producer = producer();
