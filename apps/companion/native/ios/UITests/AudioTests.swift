@@ -115,6 +115,11 @@ final class AudioTests: DeviceTestCase {
         XCTAssertGreaterThanOrEqual(Int(result["locked.ticks"] ?? "0") ?? 0, 30, "the phone was not locked for thirty seconds")
         XCTAssertLessThanOrEqual(Int(result["gap.input.locked.max"] ?? "99999") ?? 99999, 2000, "input stopped while the phone was locked")
         XCTAssertLessThanOrEqual(Int(result["gap.output.locked.max"] ?? "99999") ?? 99999, 2000, "output stopped while the phone was locked")
+        // A stop in the first seconds of the lock falls on ticks that still read the phone as unlocked,
+        // and one that suspended the application shows only on the first tick after the unlock; the
+        // longest gap of the whole run catches both.
+        XCTAssertLessThanOrEqual(Int(result["gap.input.max"] ?? "99999") ?? 99999, 2000, "input stopped at some time in the run")
+        XCTAssertLessThanOrEqual(Int(result["gap.output.max"] ?? "99999") ?? 99999, 2000, "output stopped at some time in the run")
         post("to.kala.reach.probe.audio-stop")
     }
 }
