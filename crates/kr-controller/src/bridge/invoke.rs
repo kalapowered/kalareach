@@ -904,9 +904,12 @@ impl Shared {
 ///
 /// * **The reader never waits for its caller.** What has arrived and not been taken is held up to
 ///   [`kr_protocol::limits::MAX_SEND_QUEUE_BYTES`], the most the destination would queue for a peer
-///   that stopped reading, and a stream past it ends with [`Refusal::Backlog`]. A reader that
-///   waited for a full queue to drain, while its caller waited to write to a helper that was
-///   waiting to write to the reader, would hold all three for good.
+///   that stopped reading. Past it the output and screen frames held are replaced by one
+///   `session.resync` marker, which is what a worker on this host does to a client that falls
+///   behind, and the caller takes the screen again; a stream that holds nothing it could drop ends
+///   with [`Refusal::Backlog`]. A reader that waited for a full queue to drain, while its caller
+///   waited to write to a helper that was waiting to write to the reader, would hold all three for
+///   good.
 /// * **Reading is cancellable.** [`Self::recv`] waits on that queue and nothing else, so a caller
 ///   that drops it in a `select!` loses nothing.
 /// * **The connection's own traffic is not the caller's.** A renewed action window replaces the
@@ -973,6 +976,73 @@ impl Invocation {
     }
 }
 
+/// Whether a notification is part of what a terminal draws: the session's output and the canonical
+/// screen's rendering. These are the deliveries a worker charges to a subscriber's queue, and the
+/// ones it replaces with a marker when the subscriber falls behind. The rest, the answers and the
+/// events that carry no bytes, are never dropped.
+fn is_a_view(event_type: &str) -> bool {
+    event_type == "session.output"
+        || event_type == "session.gap"
+        || event_type.starts_with("session.projection.")
+}
+
+/// Drops what the caller holds of the view, and leaves a marker that says to take it again.
+///
+/// A client of a worker on this host that stops reading backs the socket up, and the worker replaces
+/// what it would have queued with `session.resync`. A bridge's reader never waits for its caller,
+/// because a caller waiting to write to a helper that waits to write to the reader would hold all
+/// three for good, so it is here that the same thing is done: past the bound, the output and screen
+/// frames held are dropped, one marker takes their place, and the caller asks for the screen
+/// again. Answers and the events that carry no bytes stay. Where nothing can be dropped the
+/// caller gets nothing to recover from and the stream ends.
+fn shed_a_view(pending: &mut Pending) {
+    let mut last: Option<(kr_protocol::ids::StreamId, u64)> = None;
+    let mut marked = false;
+    let mut kept = VecDeque::with_capacity(pending.frames.len());
+    let mut bytes = 0;
+    for (frame, charged) in std::mem::take(&mut pending.frames) {
+        if let ControlFrame::Notification(notification) = &frame {
+            if notification.event_type.as_str() == "session.resync" {
+                marked = true;
+            } else if is_a_view(notification.event_type.as_str()) {
+                last = Some((notification.stream_id.clone(), notification.sequence.get()));
+                continue;
+            }
+        }
+        bytes += charged;
+        kept.push_back((frame, charged));
+    }
+    pending.frames = kept;
+    pending.bytes = bytes;
+    let (Some((stream_id, sequence)), false) = (last, marked) else {
+        return;
+    };
+    let marker = kr_protocol::recovery::ResyncRequired {
+        reason: kr_protocol::recovery::ResyncReason::SendQueueFull,
+        cursor: kr_protocol::scalars::U64::new(0),
+        oldest_retained_cursor: kr_protocol::scalars::U64::new(0),
+    };
+    let (Ok(event_type), Ok(payload)) = (
+        kr_protocol::ids::EventType::new("session.resync"),
+        kr_protocol::envelope::ParamsValue::from_typed(&marker),
+    ) else {
+        return;
+    };
+    let frame = ControlFrame::Notification(kr_protocol::envelope::Notification {
+        stream_id,
+        // Not the first of a stream, which a client reads as a new subscription beginning.
+        sequence: kr_protocol::ids::EventSequence::new(sequence.max(1)),
+        event_type,
+        payload,
+    });
+    // What a frame read from the helper is charged: its length prefix and its payload.
+    let charged = FrameCodec::new(StreamKind::Control)
+        .encode_message(&BridgeFrame::Control(Box::new(frame.clone())))
+        .map_or(0, |bytes| bytes.len());
+    pending.bytes += charged;
+    pending.frames.push_back((frame, charged));
+}
+
 /// Takes frames off the helper's standard output until it ends, keeping each for the stream's
 /// caller.
 async fn read_stream(mut stdout: tokio::process::ChildStdout, shared: Arc<Shared>, ceiling: usize) {
@@ -987,7 +1057,23 @@ async fn read_stream(mut stdout: tokio::process::ChildStdout, shared: Arc<Shared
                 }
                 ControlFrame::Event(ControlEvent::Keepalive) => {}
                 other => {
+                    // A caller that cannot keep up is told to take the view again, as a client of a
+                    // worker on this host is when its socket backs up. What it held of the view is
+                    // dropped, and a marker stands where it was.
                     if pending.bytes.saturating_add(charged) > ceiling {
+                        shed_a_view(&mut pending);
+                    }
+                    if pending.bytes.saturating_add(charged) > ceiling {
+                        // A view frame that still does not fit is covered by the marker that
+                        // stands in its place. Anything else is something the caller is owed.
+                        if matches!(
+                            &other,
+                            ControlFrame::Notification(held) if is_a_view(held.event_type.as_str())
+                        ) {
+                            drop(pending);
+                            shared.arrived.notify_waiters();
+                            continue;
+                        }
                         pending.ended = Some(Refusal::Backlog { limit: ceiling });
                         drop(pending);
                         shared.arrived.notify_waiters();
@@ -2149,33 +2235,95 @@ mod tests {
             .await;
     }
 
+    /// The size one frame is charged: its length prefix and its payload.
+    #[cfg(unix)]
+    fn charged(frame: &BridgeFrame) -> usize {
+        FrameCodec::new(StreamKind::Control)
+            .encode_message(frame)
+            .expect("encodes")
+            .len()
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_destination_that_sends_more_than_the_bound_ends_the_stream_rather_than_filling_memory()
-     {
+    async fn a_caller_that_falls_behind_is_told_to_take_the_view_again_rather_than_ended() {
+        // Four output frames and an answer between them. Room for the answer and two of them.
+        let answer = answer_to(5);
         let (_directory, opening) = writing(
             &[
                 BridgeFrame::HelloAck(Box::new(acknowledgement())),
                 notification(1),
+                answer.clone(),
                 notification(2),
                 notification(3),
+                notification(4),
             ],
             "exec sleep 600",
         );
-        // Room for two of the three, which are the same size.
-        let one = FRAME_LENGTH_PREFIX_LEN
-            + FrameCodec::new(StreamKind::Control)
-                .encode_message(&notification(1))
-                .expect("encodes")
-                .len()
-            - FRAME_LENGTH_PREFIX_LEN;
+        let ceiling = charged(&notification(1)) * 2 + charged(&answer) + 1;
         let mut stream = opening
             .launch()
             .await
             .expect("the helper answered as the enrolled environment")
-            .into_stream_within(SILENCE_LIMIT, one * 2 + 1);
-        // Nobody reads, so the third is the one that does not fit. What is held is still there to
-        // be taken, and then the stream says why it ended.
+            .into_stream_within(SILENCE_LIMIT, ceiling);
+        // Nobody reads while they arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            stream.shared.lock().bytes <= ceiling,
+            "what is held stays within the bound"
+        );
+        // The answer is what the caller is owed, whatever else was dropped.
+        let response = stream
+            .response(RequestId::new(5), std::time::Duration::from_secs(5))
+            .await
+            .expect("an answer is never dropped");
+        assert_eq!(response.request_id, RequestId::new(5));
+        // The view is replaced by one marker, and what arrived after it is still there.
+        let mut types = Vec::new();
+        while let Ok(Ok(ControlFrame::Notification(held))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
+        {
+            types.push((held.event_type.as_str().to_owned(), held.sequence.get()));
+        }
+        let resyncs = types
+            .iter()
+            .filter(|(event, _)| event == "session.resync")
+            .count();
+        assert_eq!(
+            resyncs, 1,
+            "one marker takes the place of what was dropped: {types:?}"
+        );
+        assert!(
+            types.iter().all(|(_, sequence)| *sequence >= 1),
+            "a marker is never the first of a stream: {types:?}"
+        );
+        assert_eq!(
+            types.first().map(|(event, _)| event.as_str()),
+            Some("session.resync"),
+            "the marker is what the caller reads first of the view: {types:?}"
+        );
+        // And the stream is alive: the caller was told to recover, not ended.
+        assert!(stream.shared.lock().ended.is_none());
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_destination_that_sends_more_than_the_bound_of_what_cannot_be_dropped_ends_the_stream()
+     {
+        // Answers and events that carry no bytes are not a view, so nothing here can be dropped to
+        // make room, and the stream ends instead of filling memory.
+        let answers: Vec<BridgeFrame> = (1..=3).map(answer_to).collect();
+        let mut frames = vec![BridgeFrame::HelloAck(Box::new(acknowledgement()))];
+        frames.extend(answers.clone());
+        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
         let mut taken = 0;
         let ended = loop {
             match stream.recv().await {

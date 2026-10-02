@@ -1031,6 +1031,10 @@ async fn a_helper_that_dies_during_an_attachment_ends_it_as_a_lost_connection_an
         "the attachment said the connection was lost",
     );
     terminal.expect_within(
+        "the bridge to the environment failed",
+        "and, once the terminal was given back, why the bridge stopped",
+    );
+    terminal.expect_within(
         "attach-finished-3",
         "with the code of a host that was not reached",
     );
