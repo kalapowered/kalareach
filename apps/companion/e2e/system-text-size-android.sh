@@ -32,7 +32,7 @@ emulator=$sdk/emulator/emulator
 command -v timeout >/dev/null || { echo "the timeout command is needed (coreutils)"; exit 3; }
 avd=${KR_ANDROID_AVD:-$("$emulator" -list-avds | head -n 1)}
 [ -n "$avd" ] || { echo "no Android virtual device"; exit 3; }
-if timeout 60 "$adb" devices | grep -q '^emulator-'; then
+if timeout --foreground -k 10 60 "$adb" devices | grep -q '^emulator-'; then
   echo "an emulator is already running: its font scale is not this script's to change"
   exit 3
 fi
@@ -41,13 +41,14 @@ fi
 # command below names it.
 port=${KR_ANDROID_EMULATOR_PORT:-5580}
 serial=emulator-$port
-if timeout 60 "$adb" devices | grep -q "^$serial"; then
+if timeout --foreground -k 10 60 "$adb" devices | grep -q "^$serial"; then
   echo "$serial is already in use"
   exit 3
 fi
 # Every command to the device has a limit, so one that is never answered stops and does not hold the
 # run, or the clean-up that stops the emulator, for ever.
-dev() { timeout 60 "$adb" -s "$serial" "$@"; }
+# `--foreground` keeps the command in the terminal's own process group, so an interruption reaches it.
+dev() { timeout --foreground -k 10 60 "$adb" -s "$serial" "$@"; }
 
 "$emulator" -avd "$avd" -port "$port" -read-only -no-window -no-audio -no-snapshot-save -no-boot-anim \
   >"${TMPDIR:-/tmp}/kr-text-size-emulator.log" 2>&1 &
@@ -55,6 +56,9 @@ emulator_pid=$!
 scale_before=""
 checks_pid=""
 cleanup() {
+  # A second interruption does not cut the clean-up short: it runs to its end, and every step in it
+  # has a limit of its own.
+  trap '' INT TERM HUP
   # The checks stop first, then what they changed is put back, then the emulator is stopped. Only a
   # device this script has seen answer as its own emulator is written to.
   [ -n "$checks_pid" ] && kill "$checks_pid" 2>/dev/null
@@ -81,7 +85,9 @@ until [ "$(dev shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]
   if [ $(( $(date +%s) - started )) -gt 300 ]; then echo "the emulator did not finish starting"; exit 3; fi
   sleep 2
 done
-# It is this script's emulator: the serial is the one asked for, and the process is the one started.
+# It is this script's emulator: the process it started is still running, the serial is the one asked
+# for, and it answers as the virtual device that was started.
+kill -0 "$emulator_pid" 2>/dev/null || { echo "the emulator stopped before it started"; exit 3; }
 [ "$(dev emu avd name 2>/dev/null | head -n 1 | tr -d '\r')" = "$avd" ] || { echo "$serial is not the emulator that was started"; exit 3; }
 scale_before=$(dev shell settings get system font_scale | tr -d '\r')
 [ "$scale_before" = null ] && scale_before=1.0
@@ -89,7 +95,7 @@ echo "emulator: $(dev shell getprop ro.product.model | tr -d '\r'), API $(dev sh
 dev shell "settings put system font_scale 1.0; settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0"
 dev uninstall to.kala.reach >/dev/null 2>&1
 # The package is large, so the install has a limit of its own.
-timeout 600 "$adb" -s "$serial" install -r "$apk" >/dev/null
+timeout --foreground -k 10 600 "$adb" -s "$serial" install -r "$apk" >/dev/null
 case $? in
   0) ;;
   124) echo "the application did not install within ten minutes"; exit 1 ;;
