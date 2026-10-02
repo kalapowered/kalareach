@@ -45,9 +45,9 @@ class DeviceTestCase: XCTestCase {
     /// what was on the screen. A device test never does: nothing of a real phone is kept.
     override func record(_ issue: XCTIssue) {
         let name = name.replacingOccurrences(of: " ", with: "-").filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        try? FileManager.default.createDirectory(atPath: "/tmp/T-DEVICE-IOS", withIntermediateDirectories: true)
-        try? app.debugDescription.write(toFile: "/tmp/T-DEVICE-IOS/failure-\(name).txt", atomically: true, encoding: .utf8)
-        try? app.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/T-DEVICE-IOS/failure-\(name).png"))
+        try? FileManager.default.createDirectory(atPath: "/tmp/kalareach-ui-failures", withIntermediateDirectories: true)
+        try? app.debugDescription.write(toFile: "/tmp/kalareach-ui-failures/failure-\(name).txt", atomically: true, encoding: .utf8)
+        try? app.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/kalareach-ui-failures/failure-\(name).png"))
         super.record(issue)
     }
     #endif
@@ -137,25 +137,24 @@ class DeviceTestCase: XCTestCase {
 
     // MARK: The application's own picture of itself
 
-    private var shotsTaken = 0
-
     /// Has the application render its own windows to a file, which a script copies out afterwards.
     ///
     /// The request is a notification the application listens for, so this test takes no screenshot
-    /// of its own, and nothing but the application's own windows can be in the picture.
+    /// of its own, and nothing but the application's own windows can be in the picture. The
+    /// application numbers its pictures after those it already holds, so the test waits for the
+    /// number to change rather than for a number it counted itself.
     func shot(_ step: String) {
+        let element = probeElement("shots")
+        let before = element.value as? String
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
             CFNotificationName("to.kala.reach.probe.shot" as CFString),
             nil, nil, true
         )
-        shotsTaken += 1
-        let wanted = String(shotsTaken)
-        let element = probeElement("shots")
         let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
-            if (element.value as? String) == wanted {
-                say("SHOT \(String(format: "%02d", shotsTaken)) \(step)")
+            if let now = element.value as? String, now != before, !now.isEmpty {
+                say("SHOT \(now) \(step)")
                 return
             }
             Thread.sleep(forTimeInterval: 0.25)

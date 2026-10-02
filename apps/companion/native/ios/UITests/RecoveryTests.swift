@@ -89,6 +89,10 @@ final class RecoveryTests: HarnessTestCase {
         XCTAssertEqual(draftText, "draft one", "the draft came back")
         XCTAssertFalse(shows(exactly: "Applied"), "no success is shown")
         XCTAssertTrue(shows("no confirmed outcome yet"), "the hint is shown")
+        // Once the host has said where the conversation stands the draft is bound again, and the guard
+        // against a second send holds with nothing in flight: Send stays disabled.
+        eventually("the draft bound again") { !shows("kept") }
+        XCTAssertFalse(send.isEnabled, "sending again could run the action twice")
         XCTAssertEqual(sendsReceived(), 0, "the new host has received nothing")
     }
 }

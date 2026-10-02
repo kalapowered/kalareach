@@ -27,24 +27,24 @@ final class PickerTests: HarnessTestCase {
     /// which belongs to this application's window, and a tap on its entry raises the picker or the
     /// camera. The Cancel button is looked for by identifier only; a system Cancel that has none leaves
     /// the leg open and the person at the phone cancels it by hand.
-    private func openAndCancel(_ control: String, entry: String) throws {
+    private func openAndCancel(_ control: String, entry: String?) throws {
         let label = app.staticTexts[control].firstMatch
         XCTAssertTrue(label.waitForExistence(timeout: 10), "no \(control) control")
         label.tap()
-        let item = app.buttons[entry]
-        guard item.waitForExistence(timeout: 10) else {
-            #if targetEnvironment(simulator)
-            throw XCTSkip("the simulator has no \(entry): it has no camera")
-            #else
-            XCTFail("the menu of sources has no \(entry)")
-            return
-            #endif
+        // The camera control opens the camera at once on a phone that has one; the others raise the
+        // menu of sources first.
+        if let entry {
+            let item = app.buttons[entry]
+            XCTAssertTrue(item.waitForExistence(timeout: 10), "the menu of sources has no \(entry)")
+            item.tap()
         }
-        item.tap()
         // The camera asks first, the first time.
         answerPrompt(["Allow", "OK"], timeout: 5)
         let cancel = app.buttons.matching(NSPredicate(format: "identifier == %@", "Cancel")).firstMatch
         guard cancel.waitForExistence(timeout: 20) else {
+            #if targetEnvironment(simulator)
+            if entry == nil { throw XCTSkip("the simulator has no camera") }
+            #endif
             say("PICKER \(control) opened, and its Cancel has no identifier: the person at the phone cancels it by hand")
             throw XCTSkip("\(control) has no Cancel that can be told by identifier")
         }
@@ -59,7 +59,7 @@ final class PickerTests: HarnessTestCase {
 
     func testThePhotoLibraryOpensAndIsCancelled() throws { try openAndCancel("Photo library", entry: "Photo Library") }
     func testTheFilePickerOpensAndIsCancelled() throws { try openAndCancel("Files", entry: "Choose Files") }
-    func testTheCameraOpensAndIsCancelled() throws { try openAndCancel("Take a photo", entry: "Take Photo or Video") }
+    func testTheCameraOpensAndIsCancelled() throws { try openAndCancel("Take a photo", entry: nil) }
 
     /// A modifier on the accessory row says which of its states it is in, and a tap changes it.
     func testAModifierKeySaysWhichStateItIsIn() throws {

@@ -17,9 +17,10 @@ final class LifecycleTests: DeviceTestCase {
         answerPrompt(["Allow", "OK"], timeout: 20)
         let facts = try XCTUnwrap(probeFacts("push", timeout: 90), "the push check did not report")
         sayFacts("push", facts)
-        if facts["firebase"] == "skipped" {
-            throw XCTSkip("this build starts no Firebase, so there is nothing of the launch hook to survive")
-        }
+        // This session's build holds Firebase's configuration: a build that does not start Firebase
+        // is not the build under test, whatever its reason.
+        XCTAssertNotEqual(facts["firebase"], "skipped", "Firebase was left alone: \(facts["firebase.reason"] ?? "no reason given")")
+        if facts["firebase"] == "skipped" { return }
         let methods = try XCTUnwrap(probeElement("tokenmethods").value as? String, "the launch did not say whether it gave the delegate its methods")
         XCTAssertEqual(methods, "added", "the delegate was not given the APNs token methods")
 
