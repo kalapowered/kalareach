@@ -1061,29 +1061,35 @@ fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<Strin
     // the file is no longer the one that was there, and the line break stays.
     let mut rebuilt = existing.to_owned();
     let mut found = false;
-    let mut owner_at: Option<usize> = None;
+    let mut owners: Vec<usize> = Vec::new();
     for (begin, end) in [
         (MARKER_BEGIN, MARKER_END),
         (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
     ] {
         if let Some((before, block, after)) = strip(&rebuilt, begin, end) {
             let at = before.len();
-            // An owner that stood after this entry now stands that much nearer the start.
-            owner_at = owner_at.map(|owner| {
-                if at < owner {
-                    owner - block.len()
-                } else {
-                    owner
-                }
-            });
+            // An owner that stood after this entry now stands that much nearer the start, and one
+            // this entry's own lines held in the middle of them is gone with them.
+            owners = owners
+                .into_iter()
+                .filter_map(|owner| {
+                    if owner <= at {
+                        Some(owner)
+                    } else {
+                        owner.checked_sub(block.len()).filter(|moved| *moved >= at)
+                    }
+                })
+                .collect();
             if owns_separator(&block) {
-                owner_at = Some(at);
+                owners.push(at);
             }
             rebuilt = format!("{before}{after}");
             found = true;
         }
     }
-    if owner_at == Some(rebuilt.len()) && rebuilt.ends_with('\n') {
+    // The line break an owner added is a bare line feed: one that follows a carriage return is the
+    // person's own line end, and is not taken.
+    if owners.contains(&rebuilt.len()) && rebuilt.ends_with('\n') && !rebuilt.ends_with("\r\n") {
         rebuilt.pop();
     }
     if !found {
@@ -3335,6 +3341,23 @@ mod tests {
         }
     }
 
+    /// KR-REQ-26.05: a removal whose second entry's lines hold the first one's owner does not
+    /// panic or take anything it should not.
+    ///
+    /// A person's own text can repeat an entry's begin line above the entry. The span from it to the
+    /// entry's end line then holds the line break the other entry owned, which goes with the span.
+    #[test]
+    fn a_removal_whose_entries_overlap_is_not_confused_by_where_an_owner_stood() {
+        let load = with_separator_note(
+            &format!("{MARKER_BEGIN}\nImport-Module x\n{MARKER_END}\n"),
+            MARKER_BEGIN,
+        );
+        let text =
+            format!("{CHECK_MARKER_BEGIN}\nthe person's own line\n{load}{CHECK_MARKER_END}\n");
+        let rebuilt = removed_from(&text, ShellKind::Zsh).expect("reads");
+        assert_eq!(rebuilt.as_deref(), Some(""));
+    }
+
     /// KR-REQ-07.23: removal never changes a signed profile either, and says what to do.
     ///
     /// Taking the entries out of a profile that was signed after they were written changes the text
@@ -3690,6 +3713,36 @@ mod tests {
                 "{name}: a line end of the person's was taken"
             );
         }
+
+        // Two breaks, each owned by its own entry, and the entries standing the other way round
+        // from where an install puts them: the one at the end of the person's text gives its break
+        // back, and the other, which has the person's text after it, does not.
+        let both = format!(
+            "using namespace System\n{}$x = 1\n{}",
+            with_separator_note(&check, CHECK_MARKER_BEGIN),
+            with_separator_note(&load, MARKER_BEGIN)
+        );
+        std::fs::write(&path, &both).expect("writes");
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "using namespace System\n$x = 1",
+            "the owner at the end of the person's text did not give its break back"
+        );
+        // A line the person wrote directly in front of an entry that owns a break is theirs, with
+        // either line end: a removal never leaves half of a CRLF.
+        std::fs::write(&path, "$x = 1").expect("writes");
+        install(&path, &check, &last.placement).expect("installs");
+        let installed = std::fs::read_to_string(&path).expect("reads");
+        let at = installed.find(CHECK_MARKER_BEGIN).expect("the entry");
+        let written = format!("{}$y = 1\r\n{}", &installed[..at], &installed[at..]);
+        std::fs::write(&path, written).expect("writes");
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "$x = 1\n$y = 1\r\n",
+            "a line end of the person's was taken"
+        );
 
         // The reader check was installed first and owns the break; the bridge's entry is put in
         // between the person's text and it, and the other order of both installs and removal gives
