@@ -32,8 +32,9 @@ enum DeviceProbe {
         case .pushRead: pushRead()
         case .shots: Shots.start()
         case .audio:
-            // Not part of this build of the checks.
-            finish(mode, ["error": "audio is not built"])
+            AudioProbe.start { facts in
+                finish(.audio, facts)
+            }
         }
     }
 
@@ -54,6 +55,14 @@ enum DeviceProbe {
         DispatchQueue.main.async { apply(tries: 0) }
     }
 
+    /// Says which text size the system gave the application, so a test that asked for one by launch
+    /// argument can tell a size that was not applied from a page that does not follow it.
+    static func reportTextSize() {
+        DispatchQueue.main.async {
+            ProbeSurface.shared.show("textsize", UIApplication.shared.preferredContentSizeCategory.rawValue)
+        }
+    }
+
     // MARK: Where results go
 
     private static func container() -> URL {
@@ -61,7 +70,7 @@ enum DeviceProbe {
     }
 
     /// Writes a mode's result to its file and shows it.
-    private static func finish(_ mode: ProbeMode, _ facts: [String: String]) {
+    static func finish(_ mode: ProbeMode, _ facts: [String: String]) {
         var report = ProbeReport()
         facts.forEach { report.set($0.key, $0.value) }
         let text = report.text
@@ -111,6 +120,8 @@ enum DeviceProbe {
         facts["total"] = String(counts.total)
         facts["groups"] = named.joined(separator: ",")
         facts["ok"] = counts.failures.isEmpty ? "1" : "0"
+        // Whether the phone is unlocked, which a test that held it awake for a while looks at.
+        facts["protected"] = UIApplication.shared.isProtectedDataAvailable ? "1" : "0"
         if !counts.failures.isEmpty { facts["failed"] = counts.failures.joined(separator: ",") }
         finish(.count, facts)
     }
@@ -353,6 +364,10 @@ enum Shots {
         taken += 1
         let file = directory.appendingPathComponent(String(format: "shot-%02d.png", taken))
         try? image.pngData()?.write(to: file)
+        // The safe-area insets as the application has them now, which a test cannot see from outside
+        // and compares its controls against after a turn of the phone.
+        let insets = first.safeAreaInsets
+        ProbeSurface.shared.show("insets", "top=\(Int(insets.top.rounded()));left=\(Int(insets.left.rounded()));bottom=\(Int(insets.bottom.rounded()));right=\(Int(insets.right.rounded()))")
         ProbeSurface.shared.show("shots", String(taken))
     }
 }

@@ -20,6 +20,7 @@ final class KRNativeLaunch: NSObject {
         #if DEBUG
         debugMode = ProbeArguments.mode(from: CommandLine.arguments)?.rawValue
         DeviceProbe.applyColourMode()
+        DeviceProbe.reportTextSize()
         #endif
         let configured = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil
 
