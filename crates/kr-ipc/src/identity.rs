@@ -135,24 +135,31 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// collected, and each one it adopted as the child subreaper when that one's own parent exited.
 ///
 /// What it costs follows the one process, not the host: the kernel keeps the list with each of the
-/// process's threads, and nothing else is read. A process that has gone is the parent of nothing.
-/// A kernel that is built without those lists, and a reading that failed for any other reason, is
-/// an error here rather than an empty answer, so a caller never reads "no children" into it. So is
-/// a process whose threads keep leaving while they are read: a pass in which the listing of them
-/// ended early, or a listed thread had gone, is made again, since the children of such a thread are
-/// in a list the pass may have read already or never reached.
+/// process's threads, and a reading is at least two passes, each of which, when it reads, lists the
+/// threads twice, reads every thread's list and reads the standing of the threads from the first to
+/// the first live one, usually one, and of that one again. A process that has gone is the parent of
+/// nothing. A kernel that is built without those
+/// lists, and a reading that failed for any other reason, is an error here rather than an empty
+/// answer, so a caller never reads "no children" into it. So is a process whose threads keep
+/// leaving while they are read: a pass in which the listing of them ended early, a listed thread
+/// had gone, the thread that takes children began to end, one ahead of it was ending, or the threads
+/// were not the same after the pass, is made again, since the children of such a thread are in a
+/// list the pass may have read already or never reached.
 ///
 /// What the kernel lists is not a promise: its list of a thread's children can skip one that was
-/// there throughout when children ahead of it exit while it is read, and a thread that ends or
-/// calls `exec` moves children between lists. So a process is read again until two readings agree,
-/// and a process whose threads or children keep changing is an error here, not a guess. A process
-/// that calls `exec` while it is read can still be read wrong when the next reading that reads
-/// any children misses the same ones.
+/// there throughout when children ahead of it are collected while it is read. So a process is read
+/// again until two passes agree, and a process whose threads or children keep changing is an error
+/// here, not a guess. Two passes can still agree on a wrong answer when a thread of the process
+/// calls `exec` while it is read, since that thread takes the identifier of the one it replaces, or
+/// when the kernel gives a thread's identifier to a new thread, and nothing a pass reads tells the
+/// two apart, and the next pass that reads any children misses the same ones, by the same again or
+/// by a skip of the kernel's list as another child is collected.
 ///
 /// # Errors
 ///
 /// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, when the kernel
-/// keeps no list of children, or when its threads or children never hold still long enough to be read.
+/// keeps no list of children, or when its threads or children never hold still long enough to be
+/// read, which includes a thread ahead of the one that takes children that stays ending.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn children_of(pid: u32) -> Result<Vec<u32>> {
     platform::children_of(pid)
@@ -482,6 +489,11 @@ mod platform {
 
     /// The number of threads the thread group still has, field 20 of the line.
     const STAT_THREADS: usize = 17;
+    /// The kernel's flags of a thread, field 9 of the line.
+    const STAT_FLAGS: usize = 6;
+    /// The flag a thread carries from the moment it begins to end, which is before it hands its
+    /// children on, and from when the kernel hands it no more.
+    const FLAG_ENDING: u32 = 0x4;
 
     /// Returns whether a process whose identity still matches is running or waiting to be collected.
     ///
@@ -705,20 +717,22 @@ mod platform {
     }
 
     /// What one pass over a process's threads and their children came to.
-    enum Pass {
+    pub(super) enum Pass {
         /// The process has gone.
         Gone,
         /// Every child its threads held.
         Read(Vec<u32>),
-        /// A thread left, or the listing of them was short, so the pass says nothing.
+        /// A thread left or began to, or the listing of them was short, so the pass says nothing.
         Changed,
     }
 
-    /// Where one thread of a process stands.
-    #[derive(PartialEq)]
-    enum ThreadState {
-        /// It is running or waiting.
-        Alive,
+    /// Where one thread of a process stands, as far as the handing on of children goes.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum ThreadLife {
+        /// The kernel hands the children of a thread that ends to it, or may.
+        Live,
+        /// It is ending, and its own children are being handed on.
+        Leaving,
         /// It has ended and handed its children on, and the kernel keeps it for now: the process's
         /// first thread until the rest has gone, and a thread whose end a tracer has yet to collect.
         Ended,
@@ -726,26 +740,67 @@ mod platform {
         Gone,
     }
 
+    /// Reads where a thread stands from its own `stat` line: the state character, and whether the
+    /// flags carry the one a thread has from the moment it begins to end.
+    pub(super) fn life_from_stat(text: &str) -> Option<ThreadLife> {
+        let state = state_character(text)?;
+        let flags = stat_field(text, STAT_FLAGS)?;
+        Some(match state {
+            'Z' => ThreadLife::Ended,
+            'X' | 'x' => ThreadLife::Gone,
+            _ if flags & FLAG_ENDING != 0 => ThreadLife::Leaving,
+            _ => ThreadLife::Live,
+        })
+    }
+
     /// Reads where a thread stands from its own `stat`.
-    ///
-    /// A thread that ends hands its children on and marks itself ended in one step under the
-    /// kernel's lock on the process tree, which a read of its children takes too: a thread that is
-    /// running when its state is read after its children were had them when they were read. One
-    /// that has ended by then has already handed them on, and the pass sees whether they went to a
-    /// thread it has not listed.
-    fn thread_state(pid: u32, tid: u32) -> Result<ThreadState> {
+    fn thread_life(pid: u32, tid: u32) -> Result<ThreadLife> {
         match read_process_file(pid, &format!("task/{tid}/stat")) {
-            Ok(text) => Ok(match state_character(&text) {
-                Some('Z') => ThreadState::Ended,
-                Some('X' | 'x') => ThreadState::Gone,
-                _ => ThreadState::Alive,
+            Ok(text) => life_from_stat(&text).ok_or_else(|| {
+                unavailable(
+                    "children of a process",
+                    format!("/proc/{pid}/task/{tid}/stat has no state or no flags"),
+                )
             }),
-            Err(error) if gone(&error) => Ok(ThreadState::Gone),
+            Err(error) if gone(&error) => Ok(ThreadLife::Gone),
             Err(error) => Err(unavailable(
                 "children of a process",
                 format!("/proc/{pid}/task/{tid}/stat: {error}"),
             )),
         }
+    }
+
+    /// The thread the kernel hands the children of an ending thread to.
+    #[derive(Debug, PartialEq)]
+    pub(super) enum Heir {
+        /// The first live thread of the process in the order the kernel lists them, which is the
+        /// order they were made in.
+        Thread(u32),
+        /// Every listed thread has ended, so none that is listed takes children: a thread made
+        /// after the listing may.
+        Nobody,
+        /// A thread is ending or gone, ahead of the first live one or with no live one after it, so
+        /// the children it is handing on are in no list that can be relied on.
+        Unsettled,
+    }
+
+    /// Finds the heir among the threads in the order the kernel lists them, reading the standing of
+    /// one thread at a time and no more than it takes: a thread that has ended and handed its
+    /// children on is passed over, and the first live one is the heir. A thread that is ending or
+    /// gone before one is found leaves the pass [`Heir::Unsettled`]; threads that have all ended
+    /// leave [`Heir::Nobody`].
+    pub(super) fn heir_among(
+        threads: &[u32],
+        mut life: impl FnMut(u32) -> Result<ThreadLife>,
+    ) -> Result<Heir> {
+        for &tid in threads {
+            match life(tid)? {
+                ThreadLife::Live => return Ok(Heir::Thread(tid)),
+                ThreadLife::Ended => {}
+                ThreadLife::Leaving | ThreadLife::Gone => return Ok(Heir::Unsettled),
+            }
+        }
+        Ok(Heir::Nobody)
     }
 
     /// Whether a read failed because what it read about has gone: its entry is not there, or the
@@ -764,60 +819,94 @@ mod platform {
 
     /// Reads the children of every thread of a process once.
     ///
-    /// A thread that ends hands its children to a thread that is left, and a thread that has ended
-    /// before its children are read has none. A pass in which a thread that was running when it
-    /// began has ended by its end is made again, since its children may have gone to a thread whose
-    /// list was read already; and so is a pass whose threads, listed again at its end, are not the
-    /// ones it began with, since they may have gone to a thread made after it began. A thread that
-    /// ended before the pass began is as it was throughout: the first thread of a process that left
-    /// while the rest run stays in the list with no children, and so does a thread whose end a
-    /// tracer has not yet collected.
-    fn children_in_one_pass(pid: u32) -> Result<Pass> {
-        let threads = match list_threads(pid, None)? {
+    /// A thread that ends hands its children to the first thread in the order the kernel lists them
+    /// that is not ending, which is the oldest live one and the only one that takes any, so a child
+    /// only ever moves to that thread, the heir. The pass reads the threads youngest first, so the
+    /// heir is the last live thread it reads: a child that moves to it before it is read is in its
+    /// list, and one that moves after the thread it left was read was in that thread's list, which
+    /// the pass has. What can still hide a child is the heir itself ending, which hands its children
+    /// to a younger thread already read: its standing is read before the pass and again after it,
+    /// and a pass in which it began to end is made again. A thread ahead of the heir that is ending
+    /// or gone when its standing is read is handing children on, and the pass is made again. The
+    /// threads are listed again after the pass, and a pass in which they are not the same is made
+    /// again: a heir that had ended, and been kept, before its standing was read leaves nobody to
+    /// look at, and the thread made after the listing that took its children is in no list the pass
+    /// read, as is one that took the first thread's identifier by `exec`. Nothing else is read
+    /// about a thread. A pass that read lists the threads twice, reads every thread's list, and
+    /// reads the standing of the threads from the first to the heir, usually one, and the heir's
+    /// again, which a pass with no heir does not: a pass that is made again may stop short of all
+    /// of it.
+    pub(super) fn children_in_one_pass(pid: u32) -> Result<Pass> {
+        pass_over(&mut Process(pid))
+    }
+
+    /// What a pass asks the kernel about one process, so that a test can answer from a model of the
+    /// kernel's handing on of children and run every order the model's events can fall in.
+    pub(super) trait ThreadFacts {
+        /// The process's threads, listed once.
+        fn list(&mut self) -> Result<ThreadListing>;
+        /// Where one thread stands.
+        fn life(&mut self, tid: u32) -> Result<ThreadLife>;
+        /// One thread's list of children, or none when its list is gone and the kernel does keep
+        /// one for a thread that is there.
+        fn children(&mut self, tid: u32) -> Result<Option<Vec<u32>>>;
+    }
+
+    /// The kernel's own answers about one process, from its `/proc` entries.
+    struct Process(u32);
+
+    impl ThreadFacts for Process {
+        fn list(&mut self) -> Result<ThreadListing> {
+            list_threads(self.0, None)
+        }
+
+        fn life(&mut self, tid: u32) -> Result<ThreadLife> {
+            thread_life(self.0, tid)
+        }
+
+        fn children(&mut self, tid: u32) -> Result<Option<Vec<u32>>> {
+            let pid = self.0;
+            match read_process_file(pid, &format!("task/{tid}/children")) {
+                Ok(list) => Ok(Some(
+                    list.split_whitespace()
+                        .filter_map(|child| child.parse::<u32>().ok())
+                        .collect(),
+                )),
+                // A thread whose list is not there: one that is going, which another pass sees as
+                // changed, or a kernel that keeps no lists, which no pass will change.
+                Err(error) if gone(&error) && kernel_keeps_children_lists() => Ok(None),
+                Err(error) => Err(unavailable(
+                    "children of a process",
+                    format!("/proc/{pid}/task/{tid}/children: {error}"),
+                )),
+            }
+        }
+    }
+
+    /// One pass, over whatever answers the process's facts.
+    pub(super) fn pass_over(process: &mut impl ThreadFacts) -> Result<Pass> {
+        let threads = match process.list()? {
             ThreadListing::Gone => return Ok(Pass::Gone),
             ThreadListing::Whole(threads) => threads,
             ThreadListing::Partial => return Ok(Pass::Changed),
         };
-        let mut running = Vec::new();
-        for &tid in &threads {
-            match thread_state(pid, tid)? {
-                ThreadState::Alive => running.push(tid),
-                ThreadState::Ended => {}
-                ThreadState::Gone => return Ok(Pass::Changed),
-            }
-        }
+        let heir = match heir_among(&threads, |tid| process.life(tid))? {
+            Heir::Unsettled => return Ok(Pass::Changed),
+            heir => heir,
+        };
         let mut children = Vec::new();
-        for &tid in &threads {
-            match read_process_file(pid, &format!("task/{tid}/children")) {
-                Ok(list) => children.extend(
-                    list.split_whitespace()
-                        .filter_map(|child| child.parse::<u32>().ok()),
-                ),
-                // A thread whose list is not there: one that is going, which another pass sees as
-                // changed, or a kernel that keeps no lists, which no pass will change.
-                Err(error) if gone(&error) => {
-                    if kernel_keeps_children_lists() {
-                        return Ok(Pass::Changed);
-                    }
-                    return Err(unavailable(
-                        "children of a process",
-                        format!("/proc/{pid}/task/{tid}/children: {error}"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(unavailable(
-                        "children of a process",
-                        format!("/proc/{pid}/task/{tid}/children: {error}"),
-                    ));
-                }
+        for &tid in threads.iter().rev() {
+            match process.children(tid)? {
+                Some(list) => children.extend(list),
+                None => return Ok(Pass::Changed),
             }
         }
-        for tid in running {
-            if thread_state(pid, tid)? != ThreadState::Alive {
-                return Ok(Pass::Changed);
-            }
+        if let Heir::Thread(heir) = heir
+            && process.life(heir)? != ThreadLife::Live
+        {
+            return Ok(Pass::Changed);
         }
-        match list_threads(pid, None)? {
+        match process.list()? {
             ThreadListing::Gone => return Ok(Pass::Gone),
             ThreadListing::Whole(mut later) => {
                 let mut first = threads;
@@ -839,13 +928,13 @@ mod platform {
         // A pass in which the kernel's list of a thread's children skipped a child printed one that
         // was collected while it read, and no later pass prints that identifier again, so such a
         // pass never agrees with the next: two passes that agree hold every child that was there
-        // throughout both. The same holds of a thread that ended and handed its children to a list
-        // already read, and of one that called `exec` and took the first thread's identifier after
-        // that thread's list was read, which no comparison of identifiers sees: the next pass reads
-        // the children where they are. What is not closed is a process that calls `exec` while it
-        // is read and whose next pass that reads any misses the same children, by another `exec`
-        // or by a skip of the kernel's list as another child is collected: no count of passes or
-        // time bounds that, and nothing short of freezing the process closes it.
+        // throughout both. What is not closed is a process whose passes go wrong the same way
+        // twice: a thread that calls `exec` takes the identifier of the one it replaces, which no
+        // comparison of identifiers sees, so a pass that read the replaced thread's list as empty
+        // can be followed by another that does the same by another `exec`, or by a skip as
+        // another child is collected; the kernel makes no promise about a list it prints while the
+        // process runs, no count of passes or time bounds that, and nothing short of freezing the
+        // process closes it.
         let mut earlier: Option<Vec<u32>> = None;
         for _ in 0..PASSES {
             match children_in_one_pass(pid)? {
@@ -2203,58 +2292,819 @@ mod tests {
         );
     }
 
-    /// A thread that leaves hands its children to the first thread of the process. A reading that
-    /// has read that thread's list by then, and finds the leaving thread gone, has the child in
-    /// neither, so it reads again.
+    /// A thread that ends hands its children to another thread of the process, and its own list is
+    /// gone with it. A thread younger than the one that holds the child is read first, and when the
+    /// holder ends after that, its list is gone when it is read and the pass is made again: the
+    /// child is in the list of the thread that took it, which the next pass reads.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn a_child_whose_thread_leaves_mid_reading_is_still_listed() {
-        use std::sync::{Arc, Mutex, mpsc};
+    fn a_child_whose_thread_ends_while_its_list_is_unread_is_still_listed() {
+        use std::sync::mpsc;
 
         let me = std::process::id();
-        let (started, child) = mpsc::channel();
+        let (started, started_child) = mpsc::channel();
         let (leave, leaving) = mpsc::channel::<()>();
         let owner = std::thread::spawn(move || {
+            let own = std::fs::read_link("/proc/thread-self").expect("this thread");
+            let tid: u32 = own
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse().ok())
+                .expect("a thread identifier");
             let child = std::process::Command::new("sleep")
                 .arg("30")
                 .spawn()
                 .expect("a child");
-            started.send(child.id()).expect("the test is waiting");
+            started
+                .send((child.id(), tid))
+                .expect("the test is waiting");
             let _ = leaving.recv();
-            // The thread ends with the child running, and the process's first thread has it from
-            // there.
+            // The thread ends with the child running, and another thread has it from there.
             child
         });
-        let child_id = child.recv().expect("the owner started a child");
-        let held = Arc::new(Mutex::new(None));
-        let mut owner = Some((owner, leave));
-        let first = format!("task/{me}/children");
+        let (child_id, owner_tid) = started_child.recv().expect("the owner started a child");
+        // A thread younger than the owner, which a reading reads before the owner's list.
+        let (release, parked) = mpsc::channel::<()>();
+        let younger = std::thread::spawn(move || {
+            let _ = parked.recv();
+        });
+        let owners_task = format!("/proc/{me}/task/{owner_tid}");
+        let owners_list = format!("task/{owner_tid}/children");
+        let mut leave = Some(leave);
         let children = super::after_each_read(
-            {
-                let held = Arc::clone(&held);
-                move |_, file| {
-                    // Once the first thread's list has been read, the owner leaves.
-                    if file == first
-                        && let Some((owner, leave)) = owner.take()
-                    {
-                        leave.send(()).expect("the owner is waiting");
-                        *held.lock().expect("the child") = Some(owner.join().expect("it ends"));
+            move |_, file| {
+                // Once the list of a thread other than the owner's has been read, the owner ends,
+                // with its own list still to read.
+                if file.ends_with("/children")
+                    && file != owners_list
+                    && let Some(leave) = leave.take()
+                {
+                    leave.send(()).expect("the owner is waiting");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while std::path::Path::new(&owners_task).exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the owner ended within a minute"
+                        );
+                        std::thread::yield_now();
                     }
                 }
             },
             || super::children_of(me),
-        )
-        .expect("the kernel lists this process's children");
-        let mut child = held
-            .lock()
-            .expect("the child")
-            .take()
-            .expect("the owner's child");
+        );
+        release.send(()).expect("the younger thread is waiting");
+        younger.join().expect("it ends");
+        let mut child = owner.join().expect("the owner ended");
         let _ = child.kill();
         let _ = child.wait();
+        let children = children.expect("the kernel lists this process's children");
         assert!(
             children.contains(&child_id),
-            "the child is listed after its thread left: {children:?}"
+            "the child is listed after its thread ended: {children:?}"
+        );
+    }
+
+    /// What a pass costs follows the process's threads: a worker reads its own children on each
+    /// observation of the session, and has a thread for each processor. A pass reads every thread's
+    /// list of children, youngest thread first, and the standing of the threads from the first to
+    /// the one that takes children, not of each one: reading each thread's standing before and after
+    /// made a reading about ten times dearer than the one it replaced, and an idle host is allowed
+    /// less than a hundredth of a processor for twenty sessions. Other tests' threads come and go
+    /// beside this one, so the pass that is held to this is one that read, within a thousand tries.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_pass_reads_every_thread_s_children_youngest_first_and_the_standing_of_only_a_few() {
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        use super::platform::{Pass, ThreadListing, children_in_one_pass, list_threads};
+
+        const THREADS: usize = 48;
+        let parked = Arc::new((Mutex::new(false), Condvar::new()));
+        let (told, tids) = mpsc::channel();
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let parked = Arc::clone(&parked);
+                let told = told.clone();
+                std::thread::spawn(move || {
+                    let own = std::fs::read_link("/proc/thread-self").expect("this thread");
+                    let tid: u32 = own
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.parse().ok())
+                        .expect("a thread identifier");
+                    told.send(tid).expect("the test is listening");
+                    let (done, ended) = &*parked;
+                    drop(
+                        ended
+                            .wait_while(done.lock().expect("the end"), |done| !*done)
+                            .expect("the end"),
+                    );
+                })
+            })
+            .collect();
+        drop(told);
+        let ours: Vec<u32> = (0..THREADS)
+            .map(|_| tids.recv().expect("a thread said its identifier"))
+            .collect();
+        let me = std::process::id();
+        let mut held = None;
+        for _ in 0..1_000 {
+            let read: Arc<Mutex<Vec<String>>> = Arc::default();
+            let pass = super::after_each_read(
+                {
+                    let read = Arc::clone(&read);
+                    move |_, file| read.lock().expect("the record").push(file.to_owned())
+                },
+                || children_in_one_pass(me),
+            )
+            .expect("the kernel lists this process's children");
+            if matches!(pass, Pass::Read(_)) {
+                held = Some(read.lock().expect("the record").clone());
+                break;
+            }
+        }
+        // The order the kernel lists this test's threads in, which is the order they were made in:
+        // another test's thread that ends while the threads are listed makes a listing short, which
+        // is listed again.
+        let listed = (0..1_000).find_map(|_| match list_threads(me, None).expect("lists") {
+            ThreadListing::Whole(listed) => Some(listed),
+            ThreadListing::Partial => None,
+            ThreadListing::Gone => panic!("this process has gone"),
+        });
+        let (done, ended) = &*parked;
+        *done.lock().expect("the end") = true;
+        ended.notify_all();
+        for thread in threads {
+            thread.join().expect("a thread ends");
+        }
+        let read = held.expect("a pass read within a thousand tries");
+        let listed = listed.expect("a listing made whole within a thousand tries");
+        let youngest_first: Vec<String> = listed
+            .iter()
+            .rev()
+            .filter(|tid| ours.contains(tid))
+            .map(|tid| format!("task/{tid}/children"))
+            .collect();
+        let in_order: Vec<String> = read
+            .iter()
+            .filter(|file| youngest_first.contains(file))
+            .cloned()
+            .collect();
+        assert_eq!(
+            in_order, youngest_first,
+            "every thread's children were read, youngest thread first: {read:?}"
+        );
+        let standings = read
+            .iter()
+            .filter(|file| file.starts_with("task/") && file.ends_with("/stat"))
+            .count();
+        assert!(
+            standings < THREADS,
+            "the standing of {standings} threads was read for {THREADS} threads and the rest: {read:?}"
+        );
+    }
+
+    /// The thread an ending thread hands its children to is the first live one in the order the
+    /// kernel lists the threads, found by reading as few as it takes; a thread that is ending ahead
+    /// of it, or gone, leaves the pass unsettled, and one that has ended is passed over.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_heir_is_the_first_live_thread_and_one_ending_ahead_of_it_unsettles_the_pass() {
+        use super::platform::{Heir, ThreadLife, heir_among};
+
+        let case = |lives: &[ThreadLife]| {
+            let threads: Vec<u32> = (0..u32::try_from(lives.len()).expect("a few")).collect();
+            let mut asked = 0;
+            let heir = heir_among(&threads, |tid| {
+                asked += 1;
+                Ok(lives[usize::try_from(tid).expect("an index")])
+            })
+            .expect("a standing for each");
+            (heir, asked)
+        };
+        use ThreadLife::{Ended, Gone, Leaving, Live};
+        assert_eq!(case(&[Live, Live, Live]), (Heir::Thread(0), 1));
+        assert_eq!(case(&[Live, Leaving]), (Heir::Thread(0), 1));
+        assert_eq!(case(&[Ended, Live, Live]), (Heir::Thread(1), 2));
+        assert_eq!(case(&[Ended, Ended, Live]), (Heir::Thread(2), 3));
+        assert_eq!(case(&[Ended, Ended]), (Heir::Nobody, 2));
+        assert_eq!(case(&[Leaving, Live]), (Heir::Unsettled, 1));
+        assert_eq!(case(&[Ended, Gone, Live]), (Heir::Unsettled, 2));
+        let refused = heir_among(&[7], |_| {
+            Err(super::unavailable(
+                "children of a process",
+                "no answer".to_owned(),
+            ))
+        });
+        assert!(refused.is_err(), "a refused reading is not a settled one");
+    }
+
+    /// What a thread's `stat` line says of where it stands: a zombie has ended, a dead one is going,
+    /// and one that carries the flag a thread has from the moment it begins to end, in any state
+    /// that is not either, is leaving. The lines are the kernel's own, with the state and the flags
+    /// where it prints them.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_thread_s_standing_is_read_from_its_state_and_its_ending_flag() {
+        use super::platform::{ThreadLife, life_from_stat};
+
+        let line = |state: &str, flags: u32| {
+            format!(
+                "42 (od d) ne) {state} 1 42 42 0 -1 {flags} 1 0 0 0 0 0 0 0 20 0 3 0 100 0 0 0 0 0"
+            )
+        };
+        assert_eq!(
+            life_from_stat(&line("S", 0x40_0040)),
+            Some(ThreadLife::Live)
+        );
+        assert_eq!(
+            life_from_stat(&line("R", 0x40_0000)),
+            Some(ThreadLife::Live)
+        );
+        assert_eq!(
+            life_from_stat(&line("S", 0x40_0044)),
+            Some(ThreadLife::Leaving)
+        );
+        assert_eq!(life_from_stat(&line("D", 0x4)), Some(ThreadLife::Leaving));
+        assert_eq!(
+            life_from_stat(&line("Z", 0x40_000c)),
+            Some(ThreadLife::Ended)
+        );
+        assert_eq!(life_from_stat(&line("X", 0x4)), Some(ThreadLife::Gone));
+        assert_eq!(life_from_stat("42 (od d) ne) S 1"), None);
+    }
+
+    /// A model of how the kernel keeps a process's threads and their lists of children, for the
+    /// pass to be run against every order its events can fall in.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod kernel_model {
+        use super::super::platform::{Pass, ThreadFacts, ThreadLife, ThreadListing};
+        use crate::error::Result;
+
+        /// One thread of the modelled process.
+        struct Thread {
+            tid: u32,
+            life: ThreadLife,
+            /// Kept listed after it ends, empty, as a thread whose end a tracer has not collected
+            /// is. The process's first thread is kept whenever it ends.
+            retained: bool,
+            children: Vec<u32>,
+        }
+
+        /// What happens to the process between two of the pass's questions.
+        #[derive(Clone, Copy, Debug)]
+        pub enum Event {
+            /// The thread begins to end: the kernel hands it no more children.
+            Begin(u32),
+            /// The thread has ended: its children go to the first thread, in the order they are
+            /// listed in, that is not ending, and it leaves the list, or stays in it empty.
+            End(u32),
+            /// A thread is made.
+            Make,
+        }
+
+        /// The process, with its events and the number of questions answered so far.
+        pub struct Kernel {
+            threads: Vec<Thread>,
+            events: Vec<(usize, Event)>,
+            applied: usize,
+            asked: usize,
+            next: u32,
+        }
+
+        impl Kernel {
+            /// A process of the given threads, in the order they were made in, each with its
+            /// standing, whether it is kept when it ends, and the children it holds.
+            pub fn of(threads: &[(ThreadLife, bool, &[u32])], events: Vec<(usize, Event)>) -> Self {
+                Self {
+                    threads: threads
+                        .iter()
+                        .zip(1_u32..)
+                        .map(|((life, retained, children), tid)| Thread {
+                            tid,
+                            life: *life,
+                            retained: *retained,
+                            children: children.to_vec(),
+                        })
+                        .collect(),
+                    events,
+                    applied: 0,
+                    asked: 0,
+                    next: 100,
+                }
+            }
+
+            fn apply(&mut self, event: Event) {
+                match event {
+                    Event::Begin(tid) => {
+                        if let Some(thread) = self.threads.iter_mut().find(|t| t.tid == tid)
+                            && thread.life == ThreadLife::Live
+                        {
+                            thread.life = ThreadLife::Leaving;
+                        }
+                    }
+                    Event::End(tid) => {
+                        let Some(at) = self.threads.iter().position(|t| t.tid == tid) else {
+                            return;
+                        };
+                        if self.threads[at].life != ThreadLife::Leaving {
+                            return;
+                        }
+                        // The last thread that could take children is not made to end: the
+                        // children would go to another process, and nothing here follows them.
+                        let Some(heir) = self
+                            .threads
+                            .iter()
+                            .position(|t| t.tid != tid && t.life == ThreadLife::Live)
+                        else {
+                            return;
+                        };
+                        let handed = std::mem::take(&mut self.threads[at].children);
+                        self.threads[heir].children.extend(handed);
+                        if at == 0 || self.threads[at].retained {
+                            self.threads[at].life = ThreadLife::Ended;
+                        } else {
+                            self.threads.remove(at);
+                        }
+                    }
+                    Event::Make => {
+                        let tid = self.next;
+                        self.next += 1;
+                        self.threads.push(Thread {
+                            tid,
+                            life: ThreadLife::Live,
+                            retained: false,
+                            children: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            /// Answers a question: first what happened before it.
+            fn ask(&mut self) {
+                while self.applied < self.events.len() && self.events[self.applied].0 <= self.asked
+                {
+                    let event = self.events[self.applied].1;
+                    self.applied += 1;
+                    self.apply(event);
+                }
+                self.asked += 1;
+            }
+
+            /// Every child the modelled process holds, in whichever thread.
+            pub fn all_children(&self) -> Vec<u32> {
+                let mut all: Vec<u32> = self
+                    .threads
+                    .iter()
+                    .flat_map(|thread| thread.children.iter().copied())
+                    .collect();
+                all.sort_unstable();
+                all
+            }
+        }
+
+        impl ThreadFacts for Kernel {
+            fn list(&mut self) -> Result<ThreadListing> {
+                self.ask();
+                Ok(ThreadListing::Whole(
+                    self.threads.iter().map(|thread| thread.tid).collect(),
+                ))
+            }
+
+            fn life(&mut self, tid: u32) -> Result<ThreadLife> {
+                self.ask();
+                Ok(self
+                    .threads
+                    .iter()
+                    .find(|thread| thread.tid == tid)
+                    .map_or(ThreadLife::Gone, |thread| thread.life))
+            }
+
+            fn children(&mut self, tid: u32) -> Result<Option<Vec<u32>>> {
+                self.ask();
+                Ok(self
+                    .threads
+                    .iter()
+                    .find(|thread| thread.tid == tid)
+                    .map(|thread| thread.children.clone()))
+            }
+        }
+
+        /// Runs a pass over the model with its events, and says whether what it read is wrong: a
+        /// pass that read must hold every child the process held throughout, which here is every
+        /// child it ever held, since none ends.
+        pub fn wrong_read(
+            pass: impl Fn(&mut Kernel) -> Result<Pass>,
+            mut kernel: Kernel,
+        ) -> Option<Vec<u32>> {
+            let held = kernel.all_children();
+            match pass(&mut kernel).expect("the model answers") {
+                Pass::Read(read) if read != held => Some(read),
+                _ => None,
+            }
+        }
+
+        /// Every way `events` can fall among the first `questions` questions of a pass, with the
+        /// order of the events among themselves any in which each thread begins to end before it
+        /// has ended, and each way handed to `visit`.
+        pub fn for_each_schedule(
+            events: &[Event],
+            questions: usize,
+            visit: &mut impl FnMut(&[(usize, Event)]),
+        ) {
+            fn orders(events: &[Event]) -> Vec<Vec<Event>> {
+                if events.len() <= 1 {
+                    return vec![events.to_vec()];
+                }
+                let mut all = Vec::new();
+                for (at, first) in events.iter().enumerate() {
+                    // An end waits for its beginning.
+                    if let Event::End(tid) = first
+                        && events
+                            .iter()
+                            .any(|other| matches!(other, Event::Begin(t) if t == tid))
+                    {
+                        continue;
+                    }
+                    let mut rest = events.to_vec();
+                    rest.remove(at);
+                    for mut order in orders(&rest) {
+                        order.insert(0, *first);
+                        all.push(order);
+                    }
+                }
+                all
+            }
+            fn place(
+                order: &[Event],
+                from: usize,
+                questions: usize,
+                chosen: &mut Vec<(usize, Event)>,
+                visit: &mut impl FnMut(&[(usize, Event)]),
+            ) {
+                let Some((first, rest)) = order.split_first() else {
+                    visit(chosen);
+                    return;
+                };
+                for at in from..=questions {
+                    chosen.push((at, *first));
+                    place(rest, at, questions, chosen, visit);
+                    chosen.pop();
+                }
+            }
+            for order in orders(events) {
+                place(&order, 0, questions, &mut Vec::new(), visit);
+            }
+        }
+    }
+
+    /// The pass as the model sees it, with each of its rules to be left out in turn, for the checks
+    /// that each rule matters. All of them in is the pass itself.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[derive(Clone, Copy)]
+    struct Rules {
+        youngest_first: bool,
+        heir_after: bool,
+        relist: bool,
+        leaving_first: bool,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn pass_with(
+        rules: Rules,
+        kernel: &mut kernel_model::Kernel,
+    ) -> crate::error::Result<super::platform::Pass> {
+        use super::platform::{Heir, Pass, ThreadFacts, ThreadLife, ThreadListing, heir_among};
+
+        let ThreadListing::Whole(threads) = kernel.list()? else {
+            return Ok(Pass::Changed);
+        };
+        let heir = if rules.leaving_first || rules.heir_after {
+            heir_among(&threads, |tid| kernel.life(tid))?
+        } else {
+            Heir::Nobody
+        };
+        if rules.leaving_first && heir == Heir::Unsettled {
+            return Ok(Pass::Changed);
+        }
+        let mut children = Vec::new();
+        let order: Vec<u32> = if rules.youngest_first {
+            threads.iter().rev().copied().collect()
+        } else {
+            threads.clone()
+        };
+        for tid in order {
+            match kernel.children(tid)? {
+                Some(list) => children.extend(list),
+                None => return Ok(Pass::Changed),
+            }
+        }
+        if rules.heir_after
+            && let Heir::Thread(heir) = heir
+            && kernel.life(heir)? != ThreadLife::Live
+        {
+            return Ok(Pass::Changed);
+        }
+        if rules.relist {
+            match kernel.list()? {
+                ThreadListing::Whole(mut later) => {
+                    let mut first = threads;
+                    first.sort_unstable();
+                    later.sort_unstable();
+                    if first != later {
+                        return Ok(Pass::Changed);
+                    }
+                }
+                _ => return Ok(Pass::Changed),
+            }
+        }
+        children.sort_unstable();
+        children.dedup();
+        Ok(Pass::Read(children))
+    }
+
+    /// Every process of three threads the model starts from, with the one child it holds and
+    /// whether its threads are kept listed when they end, as a thread a tracer holds is: the first
+    /// thread may have ended already, which it can whether kept or not, or the first two, which
+    /// only kept threads can have, and the child is in any thread that has not.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn model_processes() -> Vec<Vec<(super::platform::ThreadLife, bool, Vec<u32>)>> {
+        use super::platform::ThreadLife::{Ended, Live};
+
+        let mut all = Vec::new();
+        for ended in 0..3 {
+            for holder in ended..3 {
+                for retained in [false, true] {
+                    // A thread that is not the first stays listed after it ends only if it is kept.
+                    if ended >= 2 && !retained {
+                        continue;
+                    }
+                    let process = (0..3)
+                        .map(|at| {
+                            (
+                                if at < ended { Ended } else { Live },
+                                retained,
+                                if at == holder {
+                                    vec![9_000]
+                                } else {
+                                    Vec::new()
+                                },
+                            )
+                        })
+                        .collect();
+                    all.push(process);
+                }
+            }
+        }
+        all
+    }
+
+    /// The events the model's searches place among the pass's questions: each way up to two of the
+    /// three threads can end, with a thread made or not.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn model_event_sets() -> Vec<Vec<kernel_model::Event>> {
+        use kernel_model::Event;
+
+        let mut event_sets = Vec::new();
+        for ending in [
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![1, 2],
+            vec![1, 3],
+            vec![2, 3],
+        ] {
+            for make in [false, true] {
+                let mut events = Vec::new();
+                for tid in ending.iter().copied() {
+                    events.push(Event::Begin(tid));
+                    events.push(Event::End(tid));
+                }
+                if make {
+                    events.push(Event::Make);
+                }
+                event_sets.push(events);
+            }
+        }
+        event_sets
+    }
+
+    /// The first process the given pass reads wrongly under any order of up to two threads ending
+    /// and a thread being made, among the questions of the pass, or none.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn first_wrong_read(
+        pass: impl Fn(&mut kernel_model::Kernel) -> crate::error::Result<super::platform::Pass> + Sync,
+    ) -> Option<String> {
+        use kernel_model::{Kernel, for_each_schedule, wrong_read};
+
+        const QUESTIONS: usize = 9;
+        let event_sets = model_event_sets();
+        let (event_sets, pass) = (&event_sets, &pass);
+        // One process to a thread: the orders are many, and each answer is independent.
+        std::thread::scope(|scope| {
+            let searches: Vec<_> = model_processes()
+                .into_iter()
+                .map(|process| {
+                    scope.spawn(move || {
+                        let threads: Vec<_> = process
+                            .iter()
+                            .map(|(life, retained, children)| {
+                                (*life, *retained, children.as_slice())
+                            })
+                            .collect();
+                        for events in event_sets {
+                            let mut found = None;
+                            for_each_schedule(events, QUESTIONS, &mut |schedule| {
+                                if found.is_some() {
+                                    return;
+                                }
+                                let kernel = Kernel::of(&threads, schedule.to_vec());
+                                if let Some(read) = wrong_read(pass, kernel) {
+                                    found = Some(format!(
+                                        "{process:?} with {schedule:?} read {read:?}"
+                                    ));
+                                }
+                            });
+                            if found.is_some() {
+                                return found;
+                            }
+                        }
+                        None
+                    })
+                })
+                .collect();
+            searches
+                .into_iter()
+                .filter_map(|search| search.join().expect("a search ends"))
+                .next()
+        })
+    }
+
+    /// The rule that makes a hand-over of children between threads impossible to miss: a child
+    /// only ever moves to the first live thread, the pass reads that thread last, looks at it before
+    /// and after, and lists the threads again. Over every order in which up to two threads of a
+    /// process of three end, with one made, among the pass's questions, a pass that read has every
+    /// child there is; and each rule left out lets one through, so none is idle.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_pass_that_reads_has_every_child_whatever_threads_end_or_are_made_while_it_runs() {
+        use super::platform::pass_over;
+
+        let all = Rules {
+            youngest_first: true,
+            heir_after: true,
+            relist: true,
+            leaving_first: true,
+        };
+        assert_eq!(first_wrong_read(pass_over), None, "the pass the code makes");
+        for (what, rules) in [
+            (
+                "reading oldest thread first",
+                Rules {
+                    youngest_first: false,
+                    ..all
+                },
+            ),
+            (
+                "looking at the first live thread after the pass",
+                Rules {
+                    heir_after: false,
+                    ..all
+                },
+            ),
+            (
+                "listing the threads again",
+                Rules {
+                    relist: false,
+                    ..all
+                },
+            ),
+            (
+                "a thread ending ahead of the first live one",
+                Rules {
+                    leaving_first: false,
+                    ..all
+                },
+            ),
+        ] {
+            assert!(
+                first_wrong_read(|kernel| pass_with(rules, kernel)).is_some(),
+                "a pass without {what} reads wrong somewhere in the model"
+            );
+        }
+    }
+
+    /// The model's pass with every rule is the pass the code makes, which is what the variants that
+    /// leave a rule out are compared with: over every order in which the first two threads end and
+    /// a thread is made, among the pass's questions, they give the same answers.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_model_s_pass_with_every_rule_is_the_pass_the_code_makes() {
+        use kernel_model::{Event, Kernel, for_each_schedule};
+
+        use super::platform::{Pass, pass_over};
+
+        let all = Rules {
+            youngest_first: true,
+            heir_after: true,
+            relist: true,
+            leaving_first: true,
+        };
+        let shown = |pass: crate::error::Result<Pass>| match pass.expect("the model answers") {
+            Pass::Read(read) => format!("read {read:?}"),
+            Pass::Changed => "changed".to_owned(),
+            Pass::Gone => "gone".to_owned(),
+        };
+        let mut compared = 0;
+        for process in model_processes() {
+            let threads: Vec<_> = process
+                .iter()
+                .map(|(life, retained, children)| (*life, *retained, children.as_slice()))
+                .collect();
+            let events = [
+                Event::Begin(1),
+                Event::End(1),
+                Event::Begin(2),
+                Event::End(2),
+                Event::Make,
+            ];
+            for_each_schedule(&events, 9, &mut |schedule| {
+                let mut real = Kernel::of(&threads, schedule.to_vec());
+                let mut model = Kernel::of(&threads, schedule.to_vec());
+                assert_eq!(
+                    shown(pass_over(&mut real)),
+                    shown(pass_with(all, &mut model)),
+                    "{process:?} with {schedule:?}"
+                );
+                compared += 1;
+            });
+        }
+        assert!(compared > 100_000, "{compared} orders compared");
+    }
+
+    /// A thread made while a pass runs can be handed children by the oldest thread ending, and its
+    /// list is in no pass that listed the threads before it: a pass whose threads, listed again,
+    /// are not the ones it began with is made again. Other tests' threads come and go beside this
+    /// one, so the control is that a pass can read when nothing is made, within a thousand tries,
+    /// and the check is that none of twenty passes in which a thread was made, and that read a
+    /// list, reads.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_thread_made_during_a_pass_makes_it_a_pass_to_make_again() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        use super::platform::{Pass, children_in_one_pass};
+
+        let me = std::process::id();
+        let reads = (0..1_000).any(|_| {
+            matches!(
+                children_in_one_pass(me).expect("the kernel lists this process's children"),
+                Pass::Read(_)
+            )
+        });
+        assert!(reads, "a pass in which nothing was made reads the children");
+
+        let mut made_during = 0;
+        for _ in 0..1_000 {
+            let (release, parked) = mpsc::channel::<()>();
+            let made: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+            let mut parked = Some(parked);
+            let during = super::after_each_read(
+                {
+                    let made = Arc::clone(&made);
+                    move |_, file| {
+                        // Once the first thread's list has been read, a thread is made.
+                        if file.ends_with("/children")
+                            && let Some(parked) = parked.take()
+                        {
+                            *made.lock().expect("the thread") =
+                                Some(std::thread::spawn(move || {
+                                    let _ = parked.recv();
+                                }));
+                        }
+                    }
+                },
+                || children_in_one_pass(me),
+            )
+            .expect("the kernel lists this process's children");
+            // A pass that was made again before it read any list made no thread, and says nothing.
+            let Some(thread) = made.lock().expect("the thread").take() else {
+                continue;
+            };
+            release.send(()).expect("the made thread is waiting");
+            thread.join().expect("it ends");
+            assert!(
+                matches!(during, Pass::Changed),
+                "a pass in which a thread was made is made again"
+            );
+            made_during += 1;
+            if made_during == 20 {
+                break;
+            }
+        }
+        assert_eq!(
+            made_during, 20,
+            "twenty passes read a list and had a thread made"
         );
     }
 
@@ -2294,21 +3144,20 @@ mod tests {
             .collect();
         // Room for four entries of the sixty-four threads and more.
         // Made again while other tests' threads come and go makes a listing short of its count.
-        let listed = (0..1_000)
-            .find_map(|_| {
-                match super::platform::list_threads(std::process::id(), Some(4)).expect("lists") {
-                    super::platform::ThreadListing::Whole(listed) => Some(listed),
-                    super::platform::ThreadListing::Partial => None,
-                    super::platform::ThreadListing::Gone => panic!("this process has gone"),
-                }
-            })
-            .expect("a listing made whole within a thousand tries");
+        let listed = (0..1_000).find_map(|_| {
+            match super::platform::list_threads(std::process::id(), Some(4)).expect("lists") {
+                super::platform::ThreadListing::Whole(listed) => Some(listed),
+                super::platform::ThreadListing::Partial => None,
+                super::platform::ThreadListing::Gone => panic!("this process has gone"),
+            }
+        });
         let (done, ended) = &*parked;
         *done.lock().expect("the end") = true;
         ended.notify_all();
         for thread in threads {
             thread.join().expect("a thread ends");
         }
+        let listed = listed.expect("a listing made whole within a thousand tries");
         for tid in &wanted {
             assert!(listed.contains(tid), "thread {tid} is listed: {listed:?}");
         }
