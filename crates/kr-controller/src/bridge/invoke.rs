@@ -75,6 +75,13 @@ pub const STREAM_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_
 /// How much of a helper's standard error is kept, from the end.
 const DIAGNOSTIC_TAIL: usize = 4096;
 
+/// How long a closing waits, after the helper has gone, for what it wrote last to be read.
+///
+/// The end of a pipe follows the end of its writer at once, so this is spent only when something
+/// else that the helper started still holds the pipe open, and then the reader is ended rather than
+/// waited for.
+const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How long this host waits for a helper to go once it has killed it.
 ///
 /// Ending a process is ordinarily immediate. One that outlives its kill (a Windows process whose
@@ -352,6 +359,8 @@ pub struct Invocation {
     acknowledgement: BridgeHelloAck,
     /// What the helper wrote to its standard error, from the end.
     diagnostics: Diagnostics,
+    /// The task that reads it, which ends with this invocation.
+    stderr: Reader,
 }
 
 /// The end of what a helper wrote to its standard error.
@@ -389,10 +398,32 @@ impl Diagnostics {
     }
 }
 
+/// A task that reads one of a helper's pipes, and ends with whoever owns it.
+///
+/// Dropping a task's handle detaches the task, which then lives until what it reads closes, and a
+/// process the helper started and left running holds a pipe open for as long as it lives. So the
+/// handle is owned here, and what drops it ends the task, whichever way the bridge ended: closed
+/// in order, given up on, or never opened.
+#[derive(Debug)]
+struct Reader(tokio::task::JoinHandle<()>);
+
+impl Reader {
+    /// Waits for the task to end by itself, no longer than `limit`.
+    async fn ended_within(&mut self, limit: std::time::Duration) {
+        let _ = tokio::time::timeout(limit, &mut self.0).await;
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Reads a helper's standard error until it ends, so a helper that writes a great deal never
 /// blocks on a full pipe.
-fn drain(stderr: tokio::process::ChildStderr, into: Diagnostics) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn drain(stderr: tokio::process::ChildStderr, into: Diagnostics) -> Reader {
+    Reader(tokio::spawn(async move {
         let mut stderr = stderr;
         let mut buffer = [0_u8; 1024];
         loop {
@@ -401,7 +432,7 @@ fn drain(stderr: tokio::process::ChildStderr, into: Diagnostics) -> tokio::task:
                 Ok(read) => into.keep(&buffer[..read]),
             }
         }
-    })
+    }))
 }
 
 impl Opening {
@@ -417,8 +448,14 @@ impl Opening {
     /// failing, a frame this host cannot read, a protocol major, a role, an identity that is not
     /// the enrolled one, or the destination's own refusal, including a closed session.
     pub async fn launch(self) -> Result<Invocation, Refusal> {
-        let (child, stdin, stdout, acknowledgement, diagnostics) =
-            start_and_acknowledge(&self.command, &self.hello).await?;
+        let Started {
+            child,
+            stdin,
+            stdout,
+            acknowledgement,
+            diagnostics,
+            stderr,
+        } = start_and_acknowledge(&self.command, &self.hello).await?;
         // The enrolment is a record of one installation. An environment that answers with another
         // identity is another installation, whatever name it was reached by: a distribution
         // registered again under the name it had, or a container recreated under a reused one.
@@ -435,6 +472,7 @@ impl Opening {
             stdout,
             acknowledgement,
             diagnostics,
+            stderr,
         })
     }
 }
@@ -515,8 +553,16 @@ pub async fn discover(
     command: &BridgeCommand,
     hello: &BridgeHello,
 ) -> Result<BridgeHelloAck, Refusal> {
-    let (child, stdin, stdout, acknowledgement, _diagnostics) =
-        start_and_acknowledge(command, hello).await?;
+    let Started {
+        child,
+        stdin,
+        stdout,
+        acknowledgement,
+        // Nothing here reads what the helper wrote to standard error, and its reader ends with
+        // this function.
+        stderr: _stderr,
+        ..
+    } = start_and_acknowledge(command, hello).await?;
     drop(stdin);
     drop(stdout);
     // Discovery carries no request, so the helper is ended as soon as it has answered, and waited
@@ -567,20 +613,21 @@ where
     }
 }
 
+/// A helper that has started and acknowledged the opening, and what this host holds of it.
+struct Started {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    acknowledgement: BridgeHelloAck,
+    diagnostics: Diagnostics,
+    stderr: Reader,
+}
+
 /// Starts the helper, exchanges the opening frames, and checks the version and the role.
 async fn start_and_acknowledge(
     command: &BridgeCommand,
     hello: &BridgeHello,
-) -> Result<
-    (
-        tokio::process::Child,
-        tokio::process::ChildStdin,
-        tokio::process::ChildStdout,
-        BridgeHelloAck,
-        Diagnostics,
-    ),
-    Refusal,
-> {
+) -> Result<Started, Refusal> {
     let mut process = tokio::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -613,10 +660,15 @@ async fn start_and_acknowledge(
         detail: "its standard output is not a pipe".to_owned(),
     })?;
     let diagnostics = Diagnostics::default();
-    if let Some(stderr) = child.stderr.take() {
-        // The reader ends with the helper's standard error, which closes when the helper does.
-        drop(drain(stderr, diagnostics.clone()));
-    }
+    // Held until the helper is, so a handshake that fails below ends the reader with it.
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| drain(stderr, diagnostics.clone()))
+        .ok_or_else(|| Refusal::NotStarted {
+            program: command.program.clone(),
+            detail: "its standard error is not a pipe".to_owned(),
+        })?;
 
     write_frame(&mut stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
     // A helper that was asked to start what it needs is waited for as long as that takes.
@@ -687,7 +739,14 @@ async fn start_and_acknowledge(
             answered: acknowledgement.role,
         });
     }
-    Ok((child, stdin, stdout, acknowledgement, diagnostics))
+    Ok(Started {
+        child,
+        stdin,
+        stdout,
+        acknowledgement,
+        diagnostics,
+        stderr,
+    })
 }
 
 impl Invocation {
@@ -750,7 +809,11 @@ impl Invocation {
     ) -> Result<(), Refusal> {
         drop(self.stdin);
         match tokio::time::timeout(silence, self.child.wait()).await {
-            Ok(Ok(_status)) => Ok(()),
+            Ok(Ok(_status)) => {
+                // What the helper wrote last is read before this says it has ended.
+                self.stderr.ended_within(DRAIN_LIMIT).await;
+                Ok(())
+            }
             Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
             }),
@@ -853,10 +916,13 @@ pub struct BridgeStream {
     program: String,
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
-    reader: tokio::task::JoinHandle<()>,
+    /// The task that reads the helper's standard output, which ends with this stream.
+    reader: Reader,
     shared: Arc<Shared>,
     acknowledgement: BridgeHelloAck,
     diagnostics: Diagnostics,
+    /// The task that reads the helper's standard error, which ends with this stream.
+    stderr: Reader,
 }
 
 impl Invocation {
@@ -885,7 +951,11 @@ impl Invocation {
             arrived: tokio::sync::Notify::new(),
             silence,
         });
-        let reader = tokio::spawn(read_stream(self.stdout, Arc::clone(&shared), ceiling));
+        let reader = Reader(tokio::spawn(read_stream(
+            self.stdout,
+            Arc::clone(&shared),
+            ceiling,
+        )));
         BridgeStream {
             program: self.program,
             child: self.child,
@@ -894,6 +964,7 @@ impl Invocation {
             shared,
             acknowledgement: self.acknowledgement,
             diagnostics: self.diagnostics,
+            stderr: self.stderr,
         }
     }
 }
@@ -1087,9 +1158,15 @@ impl BridgeStream {
     ) -> Result<(), Refusal> {
         drop(self.stdin);
         let waited = tokio::time::timeout(silence, self.child.wait()).await;
-        self.reader.abort();
+        // Nothing more is wanted of the frames, and a closing that is given up on from here ends
+        // the readers with the stream rather than leaving them to their pipes.
+        drop(self.reader);
         match waited {
-            Ok(Ok(_status)) => Ok(()),
+            Ok(Ok(_status)) => {
+                // What the helper wrote last is read before this says it has ended.
+                self.stderr.ended_within(DRAIN_LIMIT).await;
+                Ok(())
+            }
             Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
             }),
@@ -2133,6 +2210,129 @@ mod tests {
         let _ = invocation
             .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
             .await;
+    }
+
+    /// Whether every task this test's runtime started has ended within `within`.
+    ///
+    /// The tests that use it start a helper whose descendant keeps the helper's pipes open for a
+    /// few seconds after the helper itself is gone. A reader that ends when its pipe does is still
+    /// alive then, and one that ends with its owner is not.
+    #[cfg(unix)]
+    async fn readers_end_within(within: std::time::Duration) -> bool {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let started = std::time::Instant::now();
+        while metrics.num_alive_tasks() > 0 {
+            if started.elapsed() > within {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// The descendant a helper leaves behind, which keeps its standard streams open for a while.
+    #[cfg(unix)]
+    const HOLDING_THE_PIPES: &str = "sleep 4 &";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_readers_of_a_bridge_that_failed_its_opening_end_with_it_not_with_its_pipes() {
+        // The helper writes what is not a frame, so the opening fails after its readers started.
+        let (_directory, opening) = writing(
+            &[],
+            &format!("printf 'zzzzzzzz'; {HOLDING_THE_PIPES} exec sleep 600"),
+        );
+        let refusal = opening.launch().await.expect_err("what is not a frame is refused");
+        assert!(matches!(refusal, Refusal::Unreadable { .. }), "{refusal}");
+        assert!(
+            readers_end_within(std::time::Duration::from_secs(2)).await,
+            "a reader outlived the opening that failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_readers_of_a_stream_that_is_dropped_end_with_it_not_with_its_pipes() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            &format!("{HOLDING_THE_PIPES} exec sleep 600"),
+        );
+        let stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        drop(stream);
+        assert!(
+            readers_end_within(std::time::Duration::from_secs(2)).await,
+            "a reader outlived the stream that owned it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_readers_of_a_stream_whose_closing_is_given_up_on_end_with_it() {
+        // The helper does not end at its closed input, so the closing is still waiting for it when
+        // its caller stops waiting for the closing.
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            &format!("{HOLDING_THE_PIPES} exec sleep 600"),
+        );
+        let stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        let closing = stream.close_within(std::time::Duration::from_secs(30), KILL_LIMIT);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), closing)
+                .await
+                .is_err(),
+            "the helper was still being waited for"
+        );
+        assert!(
+            readers_end_within(std::time::Duration::from_secs(2)).await,
+            "a reader outlived the closing that was cancelled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_readers_of_an_invocation_that_is_dropped_end_with_it_not_with_its_pipes() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            &format!("{HOLDING_THE_PIPES} exec sleep 600"),
+        );
+        let invocation = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment");
+        drop(invocation);
+        assert!(
+            readers_end_within(std::time::Duration::from_secs(2)).await,
+            "a reader outlived the invocation that owned it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_a_helper_wrote_to_standard_error_before_it_ended_is_kept_when_it_is_closed() {
+        // Ending the readers with the stream must not cut the diagnostic a helper wrote last.
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "echo a last line >&2; exit 0",
+        );
+        let stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        let diagnostics = stream.diagnostics().clone();
+        stream
+            .close_within(std::time::Duration::from_secs(10), KILL_LIMIT)
+            .await
+            .expect("a helper that ended at its closed input is closed");
+        assert_eq!(diagnostics.written(), "a last line\n".len() as u64);
     }
 
     #[cfg(unix)]
