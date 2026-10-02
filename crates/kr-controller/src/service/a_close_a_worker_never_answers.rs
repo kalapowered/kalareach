@@ -422,7 +422,7 @@ pub(super) async fn fake_world(
 
 /// Records that this worker has acknowledged the revision in force, so its leases renew.
 pub(super) fn acknowledged(controller: &Controller, session_id: SessionId) {
-    let binding = controller.leases.binding(session_id);
+    let binding = controller.leases.binding_or_bind(session_id);
     controller.leases.acknowledge(
         session_id,
         binding,

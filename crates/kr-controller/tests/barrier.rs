@@ -340,6 +340,7 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
     );
     assert!(
         barrier
+            .begin_round()
             .report(AuthorityRevision::new(3), [worker.session_id])
             .holds()
     );
@@ -369,7 +370,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
         !announcing.is_finished(),
         "the isolated worker cannot acknowledge the revision"
     );
-    let pending = barrier.report(AuthorityRevision::new(4), [worker.session_id]);
+    let pending = barrier
+        .begin_round()
+        .report(AuthorityRevision::new(4), [worker.session_id]);
     assert!(!pending.holds());
     assert_eq!(pending.pending(), vec![worker.session_id]);
     assert_eq!(pending.workers[0].state, BarrierState::Pending);
@@ -415,7 +418,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
     );
 
     barrier.acknowledge(worker.session_id, binding, ack.revision, ack.fence.clone());
-    let complete = barrier.report(AuthorityRevision::new(4), [worker.session_id]);
+    let complete = barrier
+        .begin_round()
+        .report(AuthorityRevision::new(4), [worker.session_id]);
     assert!(complete.holds(), "{complete:?}");
     assert_eq!(complete.workers[0].state, BarrierState::Acknowledged);
     assert_eq!(
@@ -574,7 +579,9 @@ async fn cutting_the_path_is_not_completion_and_only_an_ending_resolves_a_silent
     barrier.stop_renewal(worker.session_id, binding);
     drop(client);
     assert!(barrier.is_fenced(worker.session_id));
-    let pending = barrier.report(AuthorityRevision::new(4), [worker.session_id]);
+    let pending = barrier
+        .begin_round()
+        .report(AuthorityRevision::new(4), [worker.session_id]);
     assert!(
         !pending.holds(),
         "cutting the path stops renewal and completes nothing"
@@ -595,11 +602,12 @@ async fn cutting_the_path_is_not_completion_and_only_an_ending_resolves_a_silent
     // The worker is confirmed ended, which answers the question the other way section 9 permits.
     // What confirms it is not in this type: section 9 requires the daemon to *verify* that the
     // execution has ended, which is the reconciliation the daemon performs against the recorded
-    // process identities. This records the verdict; `Controller::announce_authority_revision` is
-    // where the verdict is reached, and it calls this only after `reconcile` has established that
-    // the worker is gone.
+    // process identities. This records the verdict; the closure that records the worker's end is
+    // where the verdict is reached, and it calls this in the section that records it. A round
+    // that began while the worker ran still reports it, ended, whatever it was forgotten for.
+    let round = barrier.begin_round();
     barrier.worker_ended(worker.session_id);
-    let complete = barrier.report(AuthorityRevision::new(4), [worker.session_id]);
+    let complete = round.report(AuthorityRevision::new(4), [worker.session_id]);
     assert!(complete.holds());
     assert_eq!(complete.workers[0].state, BarrierState::Ended);
 }

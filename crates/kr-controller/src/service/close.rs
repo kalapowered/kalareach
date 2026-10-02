@@ -571,7 +571,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
-    async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
+    pub(super) async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
         // The barrier is told in the section that records the closure, under the registry's lock

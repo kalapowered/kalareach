@@ -1613,6 +1613,9 @@ impl Controller {
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
     ) -> Result<()> {
+        // A worker that ends while this exchange is on the wire is held until it is over, so the
+        // names its acknowledgement carries still have a record to go to.
+        let _exchange = self.leases.begin_round();
         let revision = self.registry.lock().await.authority_revision()?;
         let worker = self
             .directory
@@ -1624,8 +1627,13 @@ impl Controller {
                 session: session_id.to_string(),
             })?;
         // The binding is taken before the announcement travels, so an acknowledgement that arrives
-        // over a control path this daemon has already given up on lifts nothing.
-        let binding = self.leases.binding(session_id);
+        // over a control path this daemon has already given up on lifts nothing. A worker nothing
+        // is held of yet is bound here, which a closed session is not: its worker has ended.
+        let binding = self.binding_or_bind(session_id).await?.ok_or_else(|| {
+            ControllerError::UnknownSession {
+                session: session_id.to_string(),
+            }
+        })?;
         // The bound covers the whole exchange, including waiting for this worker's connection:
         // another operation may be holding it, and a wait that only started once it was free would
         // not be a bound at all.
@@ -1687,10 +1695,9 @@ impl Controller {
             }
             _ => {
                 // A worker that is confirmed gone answers the question a different way: it can no
-                // longer act under anything.
-                if self.reconcile(session_id).await?.is_some() {
-                    self.leases.worker_ended(session_id);
-                }
+                // longer act under anything. A closure this records tells the barrier in the
+                // section that records it.
+                self.reconcile(session_id).await?;
                 Err(ControllerError::supervision(
                     "this session's worker has not installed the environment's authority revision",
                 ))
