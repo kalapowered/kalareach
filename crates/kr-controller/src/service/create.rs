@@ -302,6 +302,7 @@ impl Controller {
             .map_err(|error| ControllerError::supervision(error.to_string()))
             .and_then(|noted| noted)
         {
+            hold.end_wait().await;
             self.resolve_failed(reservation.reservation_id).await?;
             return Err(error);
         }
