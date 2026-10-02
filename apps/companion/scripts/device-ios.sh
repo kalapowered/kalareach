@@ -854,6 +854,14 @@ cleanup() {
   require_target
   mkdir -p "$work/checks" "$raw"
   [ -f "$record" ] || { say "no session left a record, so there is nothing of ours to clean up"; return 0; }
+  # A record with no target is no session's: only a test run that began after its session had ended wrote
+  # into it. Nothing was installed for it, so after any driver it names is stopped there is nothing to clean up.
+  if ! grep -q '^target=' "$record"; then
+    stop_recorded_driver
+    say "the record names no session, only a test run that began too late: removed"
+    rm -rf "$record" "$record.gate"
+    return 0
+  fi
   # Only what the record names: the same kind of target and the same phone.
   [ "$(sed -n 's/^target=//p' "$record")" = "$target" ] && [ "$(sed -n 's/^device=//p' "$record")" = "$KR_DEVICE" ] \
     || die "the record at $record is of another target or phone: nothing is touched"
