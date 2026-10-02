@@ -83,6 +83,10 @@ pub struct Approval {
     /// it, where [`Approval::deny`] would not in every one of them; [`Approval::deny`] otherwise.
     #[serde(default)]
     pub refuse: Option<String>,
+    /// Whether the command stands in a box of its own: the rows just above and below it hold nothing
+    /// but the box's border, so a command that goes on in the same box, above or below, is refused.
+    #[serde(default)]
+    pub boxed: bool,
     /// Whether the part's command names its log relative to the folder the agent works in, since
     /// the folder's absolute path does not fit one line of the dialog; the part then answers only
     /// when the agent's own record of the request names the command and the run's folder.
@@ -110,7 +114,7 @@ pub struct RequestRecord {
 }
 
 /// The characters an agent draws the sides of a dialog with: not text of the dialog's rows.
-const FRAME: [char; 3] = ['│', '┃', '║'];
+const FRAME: [char; 8] = ['│', '┃', '║', '╭', '╮', '╰', '╯', '─'];
 
 /// A row of a dialog without the frame an agent draws around it, and without the spaces beside it:
 /// `│ │ echo a │ │` is `echo a`.
@@ -146,6 +150,16 @@ impl Approval {
                 at.len()
             ));
         };
+        if self.boxed {
+            let blank = |index: Option<usize>| {
+                index
+                    .and_then(|index| rows.get(index))
+                    .is_some_and(|row| unframed(row).is_empty())
+            };
+            if !blank(line.checked_sub(1)) || !blank(Some(line + 1)) {
+                return Err("the command is not alone in its box".to_owned());
+            }
+        }
         if let Some(prefix) = &self.command_line {
             let others = rows
                 .iter()
@@ -1270,6 +1284,7 @@ mod tests {
             options_start: Some("Yes, proceed".to_owned()),
             others: Vec::new(),
             refuse: Some("\u{1b}".to_owned()),
+            boxed: false,
             relative_log: false,
             request: None,
         };
@@ -1350,6 +1365,7 @@ mod tests {
             options_start: Some("Allow once".to_owned()),
             others: Vec::new(),
             refuse: None,
+            boxed: false,
             relative_log: false,
             request: None,
         };
@@ -1372,7 +1388,8 @@ mod tests {
         assert!(opencode.names_only(&more, command).is_err());
         let gemini = Approval {
             command_line: None,
-            options_start: None,
+            options_start: Some("Allow execution of".to_owned()),
+            boxed: true,
             ..opencode
         };
         let boxed = owned(&[
@@ -1386,6 +1403,28 @@ mod tests {
         let other =
             owned(&["│ │ echo kr0123 >> /tmp/run/b                                     │ │"]);
         assert!(gemini.names_only(&other, command).is_err());
+        // A second command in the same box, above or below the part's, is not the part's alone.
+        for extra in [
+            [
+                "│ ╭───────╮ │",
+                "│ │ echo EXTRA >> /tmp/other │ │",
+                "│ │ echo kr0123 >> /tmp/run/a │ │",
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ],
+            [
+                "│ ╭───────╮ │",
+                "│ │ echo kr0123 >> /tmp/run/a │ │",
+                "│ │ echo EXTRA >> /tmp/other │ │",
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ],
+        ] {
+            assert!(
+                gemini.names_only(&owned(&extra), command).is_err(),
+                "{extra:?}"
+            );
+        }
     }
 
     #[test]

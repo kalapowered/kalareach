@@ -91,7 +91,11 @@ pub fn export(database: &Path, query: &str, directory: &Path) -> Result<usize, S
         if std::fs::read(&path).is_ok_and(|bytes| bytes == text.as_bytes()) {
             continue;
         }
-        let temporary = directory.join(format!(".{session}.jsonl.tmp"));
+        // Beside the directory, not in it: a reader that lists the directory never sees it.
+        let temporary = directory
+            .parent()
+            .unwrap_or(directory)
+            .join(format!(".mirror-{session}.tmp"));
         std::fs::write(&temporary, text)
             .and_then(|()| std::fs::rename(&temporary, &path))
             .map_err(|error| format!("{}: {error}", path.display()))?;

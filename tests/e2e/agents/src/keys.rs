@@ -69,8 +69,7 @@ pub const SCAN_DESCRIPTOR_VARIABLE: &str = "KR_AGENTS_SCAN_FD";
 pub const SHORTEST: usize = crate::confine::SECRET_LENGTH;
 
 /// Reads the values [`SCAN_DESCRIPTOR_VARIABLE`] names a descriptor for, one on each line, to its
-/// end. The pipe is empty afterwards. A value that is too short, or that a result could not be
-/// kept clear of ([`crate::confine::searchable`]), is not returned.
+/// end. The pipe is empty afterwards. A value shorter than [`SHORTEST`] is not returned.
 ///
 /// # Errors
 ///
@@ -88,13 +87,15 @@ pub fn scan_values_from_descriptor() -> Result<Vec<String>, String> {
     Ok(searchable_values(&text))
 }
 
-/// The lines of `text` that can be searched for: at least [`SHORTEST`] characters and nothing a
-/// result is made of.
+/// The lines of `text` that are long enough to be a key: at least [`SHORTEST`] characters. Every one
+/// is searched for in the run's directory; a result is held out of only those that
+/// [`crate::confine::searchable`] accepts, since the others cannot be told from the result's own
+/// syntax, and the harness searches the evidence for all of them.
 #[must_use]
 pub fn searchable_values(text: &str) -> Vec<String> {
     text.lines()
         .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| line.chars().count() >= SHORTEST && crate::confine::searchable(line))
+        .filter(|line| line.chars().count() >= SHORTEST)
         .map(str::to_owned)
         .collect()
 }
@@ -132,6 +133,9 @@ mod tests {
             "AWS_*",
             "AZURE_*",
             "CLOUDFLARE_*",
+            "*_KEY",
+            "*_PAT",
+            "*_APIKEY",
             "*_API_KEY",
             "*_API_TOKEN",
             "*_ACCESS_TOKEN",
@@ -290,14 +294,15 @@ mod tests {
         assert!(taken.iter().all(|name| !name.contains("value")));
     }
 
-    /// Values to search for are the lines that are long enough and hold nothing a result is made of.
+    /// Values to search for are the lines that are long enough.
     #[test]
-    fn only_a_long_value_with_nothing_a_result_is_made_of_is_searched_for() {
+    fn every_long_value_is_searched_for_in_the_runs_directory() {
         let text = "short\nabcdefghijklmnop\nhas\"quote-and-more-text\r\nhas space but long enough\n\nabcdefghijklmnopq\n";
         assert_eq!(
             searchable_values(text),
             [
                 "abcdefghijklmnop",
+                "has\"quote-and-more-text",
                 "has space but long enough",
                 "abcdefghijklmnopq"
             ]

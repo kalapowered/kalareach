@@ -2248,13 +2248,18 @@ fn staged(
         .unwrap_or_default()
         .into_iter()
         .chain(login.iter().flat_map(|login| {
-            login.others.iter().cloned().chain(
-                login
-                    .key
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .filter(|value| confine::searchable(value)),
-            )
+            login
+                .others
+                .iter()
+                .filter(|value| confine::searchable(value))
+                .cloned()
+                .chain(
+                    login
+                        .key
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .filter(|value| confine::searchable(value)),
+                )
         }))
         .collect();
     let removable: Vec<PathBuf> = login
@@ -4434,17 +4439,42 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
         .unwrap_or_else(|| {
             panic!("{ISOLATION_UNPROVEN} the account name the system has cannot be read")
         });
+    // `{ancestors}` stands for the working folder and each folder above it, as given and as the system
+    // resolves it, for a file an agent searches for up the tree.
+    let folders: Vec<String> = {
+        let mut seen = Vec::new();
+        for start in [stage.run.work(), folder_of(stage.run)] {
+            for folder in start.ancestors() {
+                let text = folder.display().to_string();
+                let text = if text == "/" { String::new() } else { text };
+                if !seen.contains(&text) {
+                    seen.push(text);
+                }
+            }
+        }
+        seen
+    };
     account
         .absent
         .iter()
-        .map(|path| {
-            PathBuf::from(
-                path.replace("{config}", &config)
-                    .replace("{work}", &work)
-                    .replace("{home}", &home)
-                    .replace("{person}", &person)
-                    .replace("{user}", &user),
-            )
+        .flat_map(|path| {
+            let expand = |path: &str| {
+                PathBuf::from(
+                    path.replace("{config}", &config)
+                        .replace("{work}", &work)
+                        .replace("{home}", &home)
+                        .replace("{person}", &person)
+                        .replace("{user}", &user),
+                )
+            };
+            if path.contains("{ancestors}") {
+                folders
+                    .iter()
+                    .map(|folder| expand(&path.replace("{ancestors}", folder)))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![expand(path)]
+            }
         })
         .collect()
 }
@@ -7592,7 +7622,12 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
         logged.screen = Watch::open(stage, &logged.agent.session);
-        let redrawn = logged.answered(stage, &end, "the new connection is drawn the reply");
+        let _ = logged.answered(stage, &end, "the new connection is drawn the reply");
+        // A model's displayed reasoning can quote the code before the reply: the part goes on once the
+        // turn has ended and the agent's record holds the reply that closes it.
+        let _ = logged.wait_idle(stage, "the agent is back at its composer after the redraw");
+        settled_line(stage, &conversation, &[&end, &account.reply_line]);
+        let redrawn = logged.screen.view.rows().to_vec();
         let (prompts, replies) = count(&conversation);
         once(prompts, replies)
             .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
