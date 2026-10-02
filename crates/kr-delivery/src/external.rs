@@ -211,6 +211,19 @@ pub fn compose(
             "a push destination is not an external destination".to_owned(),
         ));
     }
+    // A message with no line of any session in it is this host's own generic alert, and nothing in
+    // it was derived from an interval of anyone's history. Who may be told of it is decided where
+    // the notice is placed in an audience, by what it is about; there is nothing here for the
+    // history filter to narrow.
+    if lines.is_empty() {
+        return Ok(assemble(
+            alert,
+            Vec::new(),
+            Provenance::over(SourceInterval::at(0)),
+            Vec::new(),
+            delivery_id,
+        ));
+    }
     let mut withheld: Vec<(Withheld, u64)> = Vec::new();
     let mut count = |reason: Withheld, by: u64| {
         if by == 0 {
@@ -624,6 +637,73 @@ mod tests {
             message.body.contains("left out of this message"),
             "a partial message says it is partial"
         );
+    }
+
+    /// A message with no line in it is the host's generic alert and is composed for any viewer the
+    /// notice's audience admitted, whatever the viewer's history or rights: a history cursor, no
+    /// retained history and no `session.view` do not refuse it, since nothing in it was read from
+    /// anyone's history. The control: the same viewers are still refused a line from before their
+    /// bound, so the filter has not been switched off.
+    #[test]
+    fn a_generic_alert_with_no_line_is_composed_for_a_viewer_whatever_their_history() {
+        use kr_protocol::grant::HistoryScope;
+        use kr_protocol::scalars::{CanonicalSet, Nullable};
+        let no_history = HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        };
+        let viewers = [
+            ("owner", ViewerScope::owner()),
+            ("a history cursor", ViewerScope::forwarded(5_000)),
+            (
+                "no retained history",
+                ViewerScope::from_history(&no_history, true),
+            ),
+            (
+                "no retained history and no session.view",
+                ViewerScope::from_history(&no_history, false),
+            ),
+        ];
+        for (name, viewer) in viewers {
+            let filter = HistoryFilter::new(viewer);
+            let message = compose(
+                DestinationKind::Slack,
+                PushAlert::ApprovalWaiting,
+                Vec::new(),
+                &filter,
+                &granted(&[]),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                message
+                    .body
+                    .starts_with(PushAlert::ApprovalWaiting.generic_text())
+            );
+            assert!(message.body.ends_with(RECIPIENTS_CAN_READ));
+            assert!(message.withheld.is_empty(), "{name}: nothing was left out");
+
+            // The control: a line from before the bound is still not carried, or the whole
+            // message is refused, for a viewer whose history does not reach it.
+            let lined = compose(
+                DestinationKind::Slack,
+                PushAlert::ApprovalWaiting,
+                vec![line(Some(session(1)), Some(1_000), "an old line")],
+                &filter,
+                &granted(&[session(1)]),
+                None,
+            );
+            if name == "owner" {
+                assert!(lined.expect("a message").body.contains("an old line"));
+            } else {
+                assert!(
+                    lined.map_or(true, |message| !message.body.contains("an old line")),
+                    "{name}: a line from before the bound is not carried"
+                );
+            }
+        }
     }
 
     #[test]
