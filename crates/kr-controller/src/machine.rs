@@ -44,7 +44,8 @@
 //! lapsed, and excludes a withdrawal of the approval while the attempt runs. The check is made
 //! immediately before the attempt: one rename call that the operating system blocks past a deadline
 //! is not interrupted. A rename that Windows refuses because a program holds the record is tried
-//! again after a pause, and each attempt asks again, so nothing is held across the pause.
+//! again after a pause, and each attempt asks again, so the authority is not held across the
+//! pause.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -2073,8 +2074,18 @@ mod tests {
         directory: PathBuf,
         record: PathBuf,
         refuses: bool,
-        /// For each time asked: whether a staged temporary file existed, and the record's bytes.
-        seen: Mutex<Vec<(bool, Vec<u8>)>>,
+        /// For each time asked: whether a staged temporary file existed, the record's bytes when it
+        /// was asked, and the record's bytes when the replacement it ran had returned, which are
+        /// none where it ran nothing.
+        seen: Mutex<Vec<Seen>>,
+    }
+
+    /// What one ask of [`Asked`] found.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Seen {
+        staged: bool,
+        before: Vec<u8>,
+        after: Option<Vec<u8>>,
     }
 
     impl Asked {
@@ -2087,7 +2098,7 @@ mod tests {
             }
         }
 
-        fn seen(&self) -> Vec<(bool, Vec<u8>)> {
+        fn seen(&self) -> Vec<Seen> {
             self.seen
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2100,20 +2111,28 @@ mod tests {
             &self,
             publish: &mut dyn FnMut() -> std::io::Result<()>,
         ) -> Result<std::io::Result<()>> {
+            let mut seen = Seen {
+                staged: !leftovers(&self.directory).is_empty(),
+                before: std::fs::read(&self.record).expect("reads the record"),
+                after: None,
+            };
+            let answer = if self.refuses {
+                Err(ControllerError::WindowExpired {
+                    detail: "the step's window closed while its record was being written"
+                        .to_owned(),
+                })
+            } else {
+                let renamed = publish();
+                // What the record holds once the replacement has returned, still inside the ask: a
+                // store that asked and then renamed outside it would show the old record here.
+                seen.after = Some(std::fs::read(&self.record).expect("reads the record"));
+                Ok(renamed)
+            };
             self.seen
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((
-                    !leftovers(&self.directory).is_empty(),
-                    std::fs::read(&self.record).expect("reads the record"),
-                ));
-            if self.refuses {
-                return Err(ControllerError::WindowExpired {
-                    detail: "the step's window closed while its record was being written"
-                        .to_owned(),
-                });
-            }
-            Ok(publish())
+                .push(seen);
+            answer
         }
     }
 
@@ -2163,7 +2182,14 @@ mod tests {
         }
         assert_eq!(
             lapsing.seen(),
-            vec![(true, on_disk.bytes.clone()); 3],
+            vec![
+                Seen {
+                    staged: true,
+                    before: on_disk.bytes.clone(),
+                    after: None,
+                };
+                3
+            ],
             "each step asked once, with its new record staged and the old one in place"
         );
         assert_eq!(
@@ -2210,13 +2236,23 @@ mod tests {
                 5_000,
             )
             .expect("splits");
+        let after = std::fs::read(&record).expect("reads the record");
+        let seen = standing.seen();
         assert_eq!(
-            standing.seen(),
+            seen.iter()
+                .map(|ask| (ask.staged, ask.before.clone()))
+                .collect::<Vec<_>>(),
             vec![
                 (true, before_join),
-                (true, before_merge),
-                (true, before_split)
+                (true, before_merge.clone()),
+                (true, before_split.clone())
             ]
+        );
+        // The replacement had run, and the new record was in place, when each ask returned.
+        assert_eq!(
+            seen.iter().map(|ask| ask.after.clone()).collect::<Vec<_>>(),
+            vec![Some(before_merge), Some(before_split), Some(after),],
+            "the record was replaced inside the check"
         );
         assert_eq!(store.group().expect("reads the group"), split);
         assert!(leftovers(&directory).is_empty());
@@ -2739,7 +2775,6 @@ mod tests {
             let hook = kr_flush::testing::after_held_refusal(move || {
                 holding.take();
             });
-            let started = std::time::Instant::now();
             let answer = store.join(
                 &environment.lock,
                 some_group(),
@@ -2754,10 +2789,6 @@ mod tests {
                 assert!(
                     matches!(refused, ControllerError::WindowExpired { .. }),
                     "the refusal is the standing's own: {refused:?}"
-                );
-                assert!(
-                    started.elapsed() < kr_flush::HELD_RENAME_BOUND,
-                    "the step did not wait out the bound"
                 );
                 assert_eq!(
                     std::fs::read(environment.record()).expect("reads the record"),

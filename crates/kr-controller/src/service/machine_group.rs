@@ -211,6 +211,13 @@ const NOT_CONFIRMED: &str = "this environment's machine group record was changed
                              could not be flushed, so whether the change survives a crash is not \
                              known; asking again under the same action says what the record shows";
 
+/// What a retry of an unfinished step is answered with while what the record shows for it cannot be
+/// confirmed to survive a crash: the change may be there, and asking again says what it is.
+const NOT_CONFIRMED_NOW: &str = "an earlier attempt at this action ended without recording what it \
+                                 did, and what this environment's machine group record shows of it \
+                                 cannot be confirmed to survive a crash now; ask again under the \
+                                 same action";
+
 /// What a step that wrote nothing is answered with.
 const NOT_WRITTEN: &str = "this environment's machine group record could not be written, and it \
                            is as it was";
@@ -559,16 +566,26 @@ impl Controller {
         digest: &kr_protocol::scalars::Digest256,
     ) -> Result<ParamsValue> {
         let _serial = self.machine.steps.lock().await;
-        if let Err(error) = self.settle_machine_record().await {
+        let settled = self.settle_machine_record().await;
+        if let Err(error) = &settled {
             eprintln!(
                 "kr-controller: an unfinished machine group step could not be settled: {error}"
             );
         }
+        // What the claim holds now is the answer, whether this settle or an earlier one put it
+        // there. Where it holds none, and the settle failed, the record may show the step and
+        // cannot be confirmed to survive a crash; where the settle worked, the record does not
+        // show it.
         match self
             .sharing
             .grants()
             .recorded_action(actor_id, action_id, digest)?
         {
+            Some(crate::grants::ActionRecord::Unfinished) | None if settled.is_err() => {
+                Err(ControllerError::Uncertain {
+                    detail: NOT_CONFIRMED_NOW.to_owned(),
+                })
+            }
             Some(crate::grants::ActionRecord::Unfinished) | None => Err(unfinished_and_unknown()),
             Some(record) => self.machine_recorded(record),
         }
@@ -610,7 +627,15 @@ impl Controller {
                 detail: UNCONFIRMED.to_owned(),
             }
         };
-        let record = store.group().map_err(|error| unconfirmed(&error))?;
+        // A record that cannot be read is not an earlier change that cannot be confirmed: the
+        // doctor says what is wrong with it.
+        let record = store.group().map_err(|error| {
+            eprintln!("kr-controller: the machine group record cannot be read: {error}");
+            ControllerError::Storage {
+                operation: "change the machine group record",
+                detail: NO_RECORD.to_owned(),
+            }
+        })?;
         let step = match &record.change {
             Change::Created { .. } => return Ok(()),
             Change::Joined(step) | Change::Merged(step) | Change::Split(step) => step,
