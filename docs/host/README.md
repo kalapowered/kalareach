@@ -1245,14 +1245,14 @@ is whatever the owned console chose to send, and what this host records is that.
 *client's* console to the modes it had before an attachment is the attach client's own saved mode
 words, and that is what a detach writes back.
 
-**What is not here yet.** The console reader and the encoder exist and are tested, and the worker
-selects the ConPTY backend so that a mode request from its own console is recorded rather than
-ignored. What does not exist is the transport between them: the session protocol carries input as
-bytes, so a local attach client on Windows still sends bytes rather than typed key records, and the
-worker does not yet choose the encoding per client. A session therefore runs on the legacy VT path
-today. Nothing reports that at runtime: the engine tracks which fidelity the backend asked for and
-the reader knows which one it is reading, but no receipt, diagnostic or client message carries
-either answer yet, so this page is where the limit is stated.
+**What the console path does not do.** The console reader and the encoder exist and are tested, and
+the worker selects the ConPTY backend so that a mode request from its own console is recorded rather
+than ignored. There is no transport between them: the session protocol carries input as bytes, so a
+local attach client on Windows sends bytes rather than typed key records, and the worker does not
+choose the encoding per client. A session therefore runs on the legacy VT path. Nothing reports that
+at runtime: the engine tracks which fidelity the backend asked for and the reader knows which one it
+is reading, but no receipt, diagnostic or client message carries either answer, so this page is where
+the limit is stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
@@ -2345,8 +2345,7 @@ One actor holds at most eight admitted, unsettled mutations at once, lowered by 
 connection negotiated. That is section 9's figure, and what it bounds is durable admissions this
 host still owes a decision on. A connection that offers to hold none is refused at the handshake
 rather than read as one, and a connection that offers more than eight does not get more. Eight is
-this build's ceiling: there is no host configuration that raises or lowers it, and when one arrives
-it replaces the constant rather than being compared against it.
+this build's ceiling: there is no host configuration that raises or lowers it.
 
 The concurrent-attachment limit is kept per session in this build, while section 23 states it per
 host. One session is the whole of what a worker serves, so the two are the same figure for a
@@ -2554,9 +2553,8 @@ on disk.
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
 describes, because a worker this daemon failed to verify at startup is absent from its directory
-and not absent from the machine. What ownership does not yet have is a token the read methods
-require or a lock that spans one recovery, so it is a rule this daemon keeps rather than one the
-store enforces, and two reconciliations of one session inside one daemon are not kept apart.
+and not absent from the machine. Ownership has no token that the read methods require and no lock
+that spans one recovery, so it is a rule this daemon keeps rather than one the store enforces, and two reconciliations of one session inside one daemon are not kept apart.
 Removing the endpoint is also best effort: a descriptor or a socket this host could not unlink
 leaves the fence reported as taken with one of its two halves undone.
 
@@ -2769,9 +2767,8 @@ checkpoints come back; reusable endpoint and control-signing private keys, the n
 extension's preview key, the recovery seed, this host's own grant and revocation authority and any
 revoked grant do not, each with the reason rather than as a silent omission. The table classifies
 material a caller names rather than inspecting an object's bytes, so it is the decision and the
-caller's export and import paths are the gate. **This build has no such path**: nothing here reads
-an archive back into a host, so what is here is the check a future import will make, not an import
-that makes it.
+caller's export and import paths are the gate. **No path reads an archive back into a host**: the
+table is the check an import would make, and no import makes it.
 
 ### The uploader
 
@@ -2846,7 +2843,7 @@ storage is off, and a pass with no work asks the service nothing.
 ### What it does not do
 
 It serves no method. `storage.*` and `backup.manifest` are *service* methods, which this host calls
-rather than answers. The daemon does not start the uploader in this build, and it holds no source
+rather than answers. The daemon does not start the uploader, and it holds no source
 for the account token that spends an account's storage beside the host's signature, so a running
 host still carries nothing to a service.
 
@@ -3285,8 +3282,8 @@ binds them again.
 
 The service cannot know which sessions this host still retains, so the daemon answers for them: a
 session the registry has a reservation for, in any launch phase, keeps what was submitted to it.
-That preserves files rather than losing them, and it is not yet the archive's retention policy; when
-the archive owns that state, the answer to this one question changes and the sweep does not. An hourly sweep expires
+That preserves files rather than losing them, and it is the daemon's own answer rather than the
+archive's retention policy. An hourly sweep expires
 unfinished uploads after twenty-four hours, unused attachments after seven days, and download
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
