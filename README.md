@@ -47,10 +47,10 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `apps/companion` | The Tauri companion application for desktops and phones: the React interface, its native backend in `src-tauri`, the native platform services in `native/platform`, and the iOS and Android sources beside them |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
-| `bundled-plugins/` | The plugin package that ships with the host, and the lock that names every byte of it |
+| `bundled-plugins/` | The signed catalogue generation that ships with the host, with its packages, and the lock that names every byte of it |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
 | `tests/` | Suites that span crates: the cross-boundary checkpoint in `tests/e2e/m1b`, the legs against a deployment in `tests/integration`, and the shell qualification corpus in `tests/shells` |
-| `scripts/` | Builds and checks that span crates: the test components, the shell packages, the bundled package, the end-to-end, performance and device runs, the package release and the clean-checkout check |
+| `scripts/` | Builds and checks that span crates: the test components, the shell packages, the bundled generation, the end-to-end, performance and device runs, the package release and the clean-checkout check |
 | `docs/` | The documentation; [docs/README.md](docs/README.md) lists every document |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`

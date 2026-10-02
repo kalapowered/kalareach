@@ -389,6 +389,17 @@ it, and a new confirmation is needed. An installation that widens nothing needs 
 is given is spent all the same. `plugin.grant` takes the same confirmation for every widening of an
 installed package, so removing a package and installing it again is not a way around it.
 
+`plugin.grant` does not widen an installation whose release asks for `native_bridge.install`. It
+refuses with `PLUGIN_GRANT_REQUIRED`, names `plugin.install`, and spends no confirmation, because
+`plugin.install` is where the owner is shown the publisher's statement of what the bridge does and
+the host's notice that it runs outside the plugin sandbox. Narrowing such a grant stays allowed.
+
+This matters most for the packages the host seeds from its bundle, which are installed with an empty
+grant. The first grant of a seeded bridge is `plugin.install` of the installed release, with the
+owner's confirmation, and it has a cost: an installation has to be granted every capability its
+release asks for beyond the repository's ceiling, all at once. A partial grant comes only from
+narrowing afterwards, and adding a capability back takes `plugin.install` again with all of them.
+
 The owner device shows the installation itself, not a summary of it. For an installation that grants
 `native_bridge.install`, the host reads the publisher's description of what the bridge does from the
 verified manifest of the exact package hash. The manifest of a release that is installed already is

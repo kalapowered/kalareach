@@ -470,85 +470,155 @@ handle safe to drop anywhere. Dropping one a caller holds stops nothing on its o
 holds a handle of its own until the binding is unbound or its owner goes, and only the last one to
 go signals the thread.
 
-## The package that ships with the host
+## The generation that ships with the host
 
-A fresh installation has no repository. It still has to recognise an application, present it and
-activate a package, so one package travels with the host: `bundled-plugins/fixture`, which is
-`kalareach/example-declarative` 0.1.0, and `bundled-plugins.lock`, which names it.
+A fresh installation has no repository and may have no network. It still has to recognise an
+application, present it and activate a package. So the host carries a signed catalogue generation:
+its metadata, its index and the packages the script lists at its top, nine of them. They live in
+`bundled-plugins/`, and `bundled-plugins.lock` names every file in it.
 
-The lock is the evidence beside the bytes. It carries the package identifier, the version, the SDK
-and WIT ranges the manifest declares, the digest and exact length of the manifest and of every
-payload, the total the package adds up to, the trust root the chain was verified against, and the
-repository, commit, generation and tree address the copy was made from.
+The lock is the evidence beside the bytes. It carries the digest and exact length of every metadata
+file, of the index and of every manifest and payload, the SDK and WIT ranges each manifest declares,
+the highest trust root the generation ships, and the repository, commit, generation and tree address
+the copy was made from. The bundle holds every root from version 1 to the highest, and
+`metadata/root.json` is the same bytes as the highest, so a host that adopted an earlier root can
+follow the chain. Targets keep their plain names, because the root says the generation does not name
+them by digest.
 
-The two checks happen at different times, on purpose.
+The host compiles the bundle in. `crates/kr-plugin-catalogue/src/bundled_files.rs` lists each file
+with `include_bytes!`, and `seed_trust.rs` holds the root key identifiers a build trusts and the
+official repository's addresses. The script writes both, and `--verify` fails when either differs
+from what it would write.
 
-| When | What is checked | By what |
-| --- | --- | --- |
-| Making the copy | The whole TUF chain: root, timestamp, snapshot, targets, every target's digest and length, expiry enforced | `scripts/sync-bundled-plugins.sh`, through the catalogue tool the plugin repository publishes |
-| Using the copy | Every byte against the digest and length the lock names | `kr_plugin_sdk::bundle`, on every activation |
+The two checks happen at different times, on purpose. Making the copy checks the whole TUF chain,
+with expiry enforced, through the catalogue tool the plugin repository publishes: root, timestamp,
+snapshot, targets, and every target's digest and length. Using the copy checks every byte against
+the digest and length the lock names, in `SeedBundle`, when the host reads the bundle in. A host
+with no repository cannot re-run a chain against a network it has not got, so what it can do is
+recompute the digest of every byte it is about to use and refuse anything that is not what the lock
+names. A bundle whose files do not match its lock is not a bundle: a byte changed after the lock, a
+file the lock does not name, a root missing from the chain and a manifest that disagrees with its
+lock are each refused, and nothing is seeded from it.
 
-A host reading a bundled package has no repository to re-run a chain against: the metadata, the
-mirror and the delegations are all behind the network it has not got. What it can do is recompute
-the digest of every byte it is about to use, and refuse anything that is not what the lock names. That is what `BundleLock::activate` does: it opens
-the package directory relative to a `cap_std::fs::Dir` handle the caller supplies, reads and
-verifies every file, and only then parses anything. A package whose files do not all verify does
-not activate at all, so nothing half-read reaches a caller, and a payload the lock does not name
-answers `PACKAGE_UNAVAILABLE_OFFLINE` rather than a capability nobody could perform.
+### Seeding
 
-Absence and tampering are answered apart. A file that is simply not there is
-`PACKAGE_UNAVAILABLE_OFFLINE`, because there is nowhere to fetch it from. A file that is there and
-is not what the lock names, including a link in place of one, is `REPOSITORY_UNTRUSTED`: a host that
-reported that as "try again when you are online" would retry for ever.
+The daemon seeds the catalogue from the bundle once, right after it starts and before it binds any
+endpoint a client could reach, so nothing is served from a catalogue the seed is still making. A
+seed that fails, or does nothing, does not stop the daemon. The doctor's catalogue check says what
+it did, what it skipped and why, and where the generation came from.
+
+A build decides whether it trusts the bundle's highest root from that root's key identifiers alone,
+and never from anything the root says about itself. A shipped build trusts only the production root
+keys it commits. None exist yet, so a shipped build refuses the bundle, writes nothing for it and
+says so at every start. A build with debug assertions also trusts the development lineage's root
+keys, which anybody can derive; the daemon built that way seeds only when it is started with
+`--seed`, so a test that starts it and expects an empty catalogue is not changed by it.
+
+Where the build trusts the root, the seed enrols the official repository against it, at
+`https://plugins.reach.kala.to/metadata/` and `https://plugins.reach.kala.to/targets/`, with the
+budgets the configuration allows and no capability beyond the default ceiling, and with no full
+offline mirror. It leaves alone an enrolment of the owner's own: where a repository already trusts a
+root of the bundled lineage, or one named `official` is enrolled with other keys, the seed enrols
+nothing and records that it declined. It then activates the generation through the ordinary update
+client over a transport made of the bundle's own bytes, so no network is asked. Expiry is waived for
+that one generation, which the host reports as expired when it is; a later sync enforces expiry as
+it does for any repository, and the client's own trust checkpoint still refuses a clock that went
+back. Every root the client reaches along a chain of rotations is one the build trusts before it is
+kept.
+
+Last, the seed installs each bundled package once: enabled, with an empty grant, under an authority
+of its own, from the bundle's own bytes. It grants nothing, so nothing was confirmed by an owner and
+no prompt was shown. Every capability past the repository's default ceiling stays
+permission-required, and no native bridge is applied for a package whose grant lacks
+`native_bridge.install`.
+
+What the seed leaves alone is as much of its work. It never replaces an installation that is already
+there, whatever repository it came from and in whatever state, and it records that it left it. An
+owner's uninstall or disable is never undone: once the seed has made its enrolment, an uninstall
+settles that plugin in its own commit, so a seed that stopped part way cannot bring back what the
+owner took out. Removing the repository the seed made keeps the record that it made it, so the seed
+never enrols again. A pin on the repository stops the sync and not the installs. A store a network
+sync has moved past the bundle gets any package it lacks from the active index and the bundle's
+bytes; where that index no longer lists the package at the bundle's digest, or lists it revoked, the
+package is skipped, reported and tried again at the next start.
+
+A payload the bundle carries is served from the bundle's bytes whenever a repository's accepted
+generation pins it by digest, and the bytes are checked against the digest and length that
+generation signed. Reclamation therefore cannot strand an offline install of a bundled package. A
+host that cannot reach its repository is told so before it has made room for a package it could not
+fetch, so nothing is evicted for a package that cannot arrive.
+
+### Granting a seeded bridge
+
+The first grant of a capability to a package that asks for a native bridge goes through
+`plugin.install` of the installed release, with the owner's confirmation. That is where the owner is
+shown the publisher's own statement of what the bridge does and the host's notice that it runs
+outside the plugin sandbox. `plugin.grant` does not widen an installation whose release asks for
+`native_bridge.install`: it refuses, names `plugin.install`, and spends no confirmation. Narrowing
+stays allowed.
+
+This has a cost, and it is stated here. An installation of a package that asks for capabilities past
+the repository's ceiling has to be granted all of them at once, so a seeded bridge package gets
+every capability it asks for beyond the ceiling in one confirmed install. A partial grant comes only
+from narrowing afterwards, and adding one capability back takes all of them again through
+`plugin.install`.
 
 ### What the bundle does not promise
 
-It is one package of one generation, frozen at the commit it was copied from. It is not a
-catalogue: nothing about it searches, fetches, updates or decides that a newer generation exists,
-and the generation it names does not become the host's enrolled repository. Its trust root is the
-development root the plugin repository publishes for exactly this purpose: a signature under that
-root says the bytes are the ones that root's keys signed, and says nothing about who may run them.
-The package's capability requests, its grants and its repository ceiling are applied to it exactly
-as they are to anything installed.
-
-Reading it needs no current metadata and no trusted clock, which is the point: a pinned package
-stays usable offline under the grants it already has, whatever has expired elsewhere. A new
-generation is a different matter and needs metadata that has not expired, which is the catalogue's
-concern rather than the bundle's.
+It is one generation, frozen at the commit it was copied from. It is not a catalogue: nothing about
+it searches, fetches, updates or decides that a newer generation exists, and the repository it
+enrols is fetched from its own address once the network is there. A signature under the development
+lineage's root says the bytes are the ones that root's keys signed, and says nothing about who may
+run them: that is why only a build with debug assertions trusts it, and why a release trusts a root
+only once the production root exists. The package's capability requests, its grants and its
+repository ceiling are applied to it exactly as they are to anything installed.
 
 ### Changing what is bundled
 
 `scripts/sync-bundled-plugins.sh` makes the copy. It takes the plugin repository checkout and the
 commit to pin (the lock's own commit by default), exports that commit into a private directory of
 its own, verifies the chain there, resolves each payload by the digest the verified metadata pins,
-and stages the package beside the published entry. It refuses a checkout that is not at the pin, a
-link anywhere in the exported generation, an unsafe path, two names that are one file, a payload
-that is not the exact length the metadata pinned, and an entry already published that the lock on
-disk does not describe. It executes nothing out of the package, and it holds a directory lock so two
-runs cannot publish at once.
+and stages the whole bundle beside the published one. The packages it bundles are listed at the top
+of the script. It refuses a checkout that is not at the pin, a link anywhere in the exported
+generation, an unsafe path, two names that are one file, a payload that is not the exact length the
+metadata pinned, roots that do not run from version 1 without a gap, and a bundle already published
+that the lock on disk does not describe. It executes nothing out of a package, and it holds a
+directory lock so two runs cannot publish at once. The trust a build commits (the production root
+key identifiers, which stay empty until the production root exists, and the development lineage's)
+is written at the top of the script too.
 
-Publishing is three renames: the published entry moves aside, the staged package takes its name, and
-the new lock replaces the old one. Each is a rename, so the published name holds a whole package
+Publishing is three renames: the published bundle moves aside, the staged bundle takes its name, and
+the new lock replaces the old one. Each is a rename, so the published name holds a whole bundle
 before and after every step and never a mixture of two. It is not a single atomic replacement: POSIX
-has no directory swap, so between the first two renames the name is absent.
+has no directory swap, so between the first two renames the name is absent. The two generated Rust
+files follow, each written by a rename of a file beside it.
 
 What an interruption leaves depends on what kind it was. A failure, a `SIGINT` or a `SIGTERM` runs
-the script's own cleanup. If nothing was published, it puts the previous package back and drops the
-new lock. If the package was published and the lock was not, it leaves the new package, the previous
+the script's own cleanup. If nothing was published, it puts the previous bundle back and drops the
+new lock. If the bundle was published and the lock was not, it leaves the new bundle, the previous
 one and the new lock all on disk and prints where each is, because guessing which a person wanted
-would be worse than telling them. Once the lock is installed the previous package is no longer
+would be worse than telling them. Once the lock is installed the previous bundle is no longer
 anything, and cleanup removes it.
 
 A `SIGKILL` or a power cut runs nothing, and cleanup can itself fail on a full disk. What is on disk
-then is whichever renames had happened, under names that say what they are: a `.retiring.` directory
-is the package that was published before, and a dotted pending lock beside `bundled-plugins.lock` is
-the one that was about to replace it. `--verify` says whether the package and the lock agree, which
-is the question worth answering; it does not replay what the run was doing.
+then is whichever renames had happened, under names that say what they are: a
+`.bundled-plugins.retiring.` directory beside the bundle is the bundle that was published before,
+and a dotted pending lock beside `bundled-plugins.lock` is the one that was about to replace it.
+`--verify` says whether the bundle and the lock agree, which is the question worth answering; it
+does not replay what the run was doing.
 
-`scripts/sync-bundled-plugins.sh --verify` is the offline half: it recomputes every digest under
+`scripts/sync-bundled-plugins.sh --verify` is the offline half. It recomputes every digest under
 `bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole
-package that is there and is not in the lock. It reaches no network, builds nothing and needs no
-plugin repository, which is why it runs in continuous integration.
+package that is there and is not in the lock. It checks that the roots run from version 1, that the
+highest is the one `root.json` holds and the lock names, that the highest root's keys are ones this
+build commits, that the index is within the default metadata budget, and the rules a release scan
+applies to what a file is: a binary file of 32 or 64 bytes, a file made only of hexadecimal digits
+or of base64, and a private-key header. It regenerates the two Rust files and reports any
+difference. `--verify --release` also requires a root a release trusts, which none is yet, so it
+fails for the committed bundle until the production root exists; no workflow runs it yet.
+`--generate` writes the two Rust files from the bundle on disk. None of them reaches a network,
+builds anything or needs the plugin repository, which is why `--verify` runs in continuous
+integration.
 
 ## Capability ceiling and installation grants
 
