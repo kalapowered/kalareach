@@ -1354,8 +1354,10 @@ for distribution in "$first" "$second"; do
   # failure here rather than a partial one counted as no crossings.
   crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd >/tmp/kr-acc-worker-fds && awk '/ \\/mnt\\// { crossing++ } END { print crossing + 0 }' /tmp/kr-acc-worker-fds")" ||
     fail "$distribution could not be asked what its worker $worker_pid has open"
-  [ "$crossing" = "0" ] ||
-    fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution"
+  if [ "$crossing" != "0" ]; then
+    opened="$(inside "$distribution" "grep ' /mnt/' /tmp/kr-acc-worker-fds; echo cwd: \$(readlink /proc/$worker_pid/cwd)" 2>&1 | head -n 5 | tr '\n' ';')"
+    fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution: $opened"
+  fi
 
   inside "$distribution" "'$helper_path' close $created" >/dev/null ||
     fail "$distribution could not close session $created"
