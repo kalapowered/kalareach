@@ -11,7 +11,6 @@
 //  mute, a phone call, Bluetooth and the end of the process under a call are not covered and stay open.
 //
 
-import CoreFoundation
 import XCTest
 
 final class AudioTests: DeviceTestCase {
@@ -19,14 +18,6 @@ final class AudioTests: DeviceTestCase {
         // Whatever ended a test, the check gives the session back and the microphone is not left open.
         post("to.kala.reach.probe.audio-stop")
         super.tearDown()
-    }
-
-    private func post(_ name: String) {
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName(name as CFString),
-            nil, nil, true
-        )
     }
 
     /// Waits for the check to report a fact the way a test waits for anything: it answers when it can.
@@ -72,20 +63,27 @@ final class AudioTests: DeviceTestCase {
         XCTAssertEqual(running["activated"], "1")
         XCTAssertEqual(running["engine"], "running")
         XCTAssertNotEqual(running["capture"], "unavailable", "the microphone is not available to a session that was allowed it")
+        // Input and output both ran, and not merely the timer that watches them.
+        XCTAssertGreaterThan(Int(running["callbacks.input"] ?? "0") ?? 0, 0, "the input never ran")
+        XCTAssertGreaterThan(Int(running["callbacks.output"] ?? "0") ?? 0, 0, "the output never ran")
         let before = Int(running["route.notifications"] ?? "0") ?? 0
 
-        // The output to nowhere in particular and then the speaker: two overrides, and the system
-        // reports each.
+        // The output is moved to the receiver, the speaker and back, and the system reports each move.
         post("to.kala.reach.probe.route")
-        let routed = try XCTUnwrap(facts(until: {
-            (Int($0["route.overrides"] ?? "0") ?? 0) >= 2 && (Int($0["route.notifications"] ?? "0") ?? 0) > before
-        }, timeout: 30))
+        let routed = try XCTUnwrap(facts(until: { (Int($0["route.moves"] ?? "0") ?? 0) >= 4 }, timeout: 30))
         sayFacts("audio", routed)
+        XCTAssertNil(routed["route.error"], "the check could not move the route: \(routed["route.error"] ?? "")")
+        XCTAssertEqual(routed["route.moves"], "4", "all four moves were made")
+        // The reports arrive on the main queue a moment after the moves.
+        let reported = facts(until: { (Int($0["route.notifications"] ?? "0") ?? 0) >= before + 2 }, timeout: 10) ?? routed
+        sayFacts("audio", reported)
         #if targetEnvironment(simulator)
         // A simulator has one output and moves nothing, so the system has nothing to report.
-        if (Int(routed["route.notifications"] ?? "0") ?? 0) == before { throw XCTSkip("a simulator reports no change of route") }
+        if (Int(reported["route.notifications"] ?? "0") ?? 0) == before { throw XCTSkip("a simulator reports no change of route") }
         #endif
-        XCTAssertGreaterThanOrEqual(Int(routed["route.notifications"] ?? "0") ?? 0, before + 1, "the system reported no change of route")
+        XCTAssertGreaterThanOrEqual(Int(reported["route.notifications"] ?? "0") ?? 0, before + 2, "the system reported fewer than two changes of route for four moves")
+        XCTAssertGreaterThan(Set((reported["route.trail"] ?? "").split(separator: ",")).count, 1, "the output never changed port")
+        XCTAssertGreaterThan(Int(reported["route.product.events"] ?? "0") ?? 0, 0, "the product's own session was told of no change of route")
 
         post("to.kala.reach.probe.audio-stop")
         let ended = try XCTUnwrap(facts(until: { $0["stopped"] == "1" }, timeout: 30))
@@ -99,9 +97,10 @@ final class AudioTests: DeviceTestCase {
         launch(probe: "audio")
         answerPrompt(["Allow", "OK"])
         _ = try XCTUnwrap(facts(until: { $0["engine"] == "running" && (Int($0["ticks"] ?? "0") ?? 0) >= 5 }, timeout: 60))
-        say("STEP lock the phone for at least thirty seconds, then unlock it")
-        // The person has three minutes. The check's own file is what the script reads afterwards, so
-        // a runner that cannot look at the screen while the phone is locked loses nothing.
+        say("STEP lock the phone with the side button, leave it locked for one minute, then unlock it")
+        // The person has three minutes. The runner cannot read the application while the phone is
+        // locked, so it looks again every five seconds, and decides from what the check reports once
+        // the phone is unlocked and the application is in front.
         let end = Date().addingTimeInterval(180)
         var seen: [String: String]?
         while Date() < end {

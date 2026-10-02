@@ -55,18 +55,24 @@ private final class ProbeCall: AudioSessionEvents {
     }
 }
 
-/// When the check's input and output last ran, written on the audio threads and read on the main one.
+/// When the check's input and output ran, written on the audio threads and read on the main one.
 private final class RunClock {
     private let lock = NSLock()
-    private var input: TimeInterval?
-    private var output: TimeInterval?
+    private var input = CallbackClock()
+    private var output = CallbackClock()
 
-    func inputRan() { lock.lock(); input = ProcessInfo.processInfo.systemUptime; lock.unlock() }
-    func outputRan() { lock.lock(); output = ProcessInfo.processInfo.systemUptime; lock.unlock() }
+    func inputRan() { lock.lock(); input.ran(at: ProcessInfo.processInfo.systemUptime); lock.unlock() }
+    func outputRan() { lock.lock(); output.ran(at: ProcessInfo.processInfo.systemUptime); lock.unlock() }
 
-    var last: (input: TimeInterval?, output: TimeInterval?) {
+    /// What each stream did since the last reading.
+    func reading() -> (lastInput: TimeInterval?, lastOutput: TimeInterval?, longestInput: TimeInterval?, longestOutput: TimeInterval?, inputCount: Int, outputCount: Int) {
         lock.lock(); defer { lock.unlock() }
-        return (input, output)
+        return (input.last, output.last, input.longestIntervalSinceLastReading(), output.longestIntervalSinceLastReading(), input.count, output.count)
+    }
+
+    var counts: (input: Int, output: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (input.count, output.count)
     }
 }
 
@@ -78,7 +84,8 @@ enum AudioProbe {
     private static var log = AudioTickLog(start: 0)
     private static var facts: [String: String] = [:]
     private static var routeNotifications = 0
-    private static var overrides = 0
+    private static var moves = 0
+    private static var trail: [String] = []
     private static var stopped = false
 
     /// Starts the check, which runs until the test stops it or the process ends.
@@ -159,11 +166,13 @@ enum AudioProbe {
         source1.schedule(deadline: .now() + 1, repeating: 1)
         source1.setEventHandler {
             guard !stopped else { return }
-            let last = clock.last
+            let seen = clock.reading()
             log.tick(
                 now: ProcessInfo.processInfo.systemUptime,
-                lastInput: last.input,
-                lastOutput: last.output,
+                lastInput: seen.lastInput,
+                lastOutput: seen.lastOutput,
+                longestInputInterval: seen.longestInput,
+                longestOutputInterval: seen.longestOutput,
                 protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable
             )
             report(show: show)
@@ -173,12 +182,12 @@ enum AudioProbe {
         report(show: show)
     }
 
-    /// The two requests a test can make while the check runs, as notifications it posts: a turn of
+    /// The two requests a test can make while the check runs, as notifications it posts: a move of
     /// the route, and the end of the check.
     private static func observeRequests(show: @escaping ([String: String]) -> Void) {
         let centre = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterAddObserver(centre, nil, { _, _, _, _, _ in
-            DispatchQueue.main.async { AudioProbe.overrideRoute() }
+            DispatchQueue.main.async { AudioProbe.moveRoute() }
         }, "to.kala.reach.probe.route" as CFString, nil, .deliverImmediately)
         CFNotificationCenterAddObserver(centre, nil, { _, _, _, _, _ in
             DispatchQueue.main.async { AudioProbe.stop() }
@@ -188,17 +197,27 @@ enum AudioProbe {
 
     private static var stopHandler: (() -> Void)?
 
-    /// Sends the output to nowhere in particular and then to the speaker, which the system reports as
-    /// route changes.
-    private static func overrideRoute() {
+    /// Moves the output the way a person's phone does without any accessory: the session without its
+    /// speaker default sends it to the receiver, an override sends it to the speaker, taking the
+    /// override away sends it back, and then the session's own options are set again. The system
+    /// reports each move as a change of route, and the ports it named are kept in order.
+    private static func moveRoute() {
         let session = AVAudioSession.sharedInstance()
-        for port in [AVAudioSession.PortOverride.none, .speaker] {
+        let own: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+        let steps: [() throws -> Void] = [
+            { try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP]) },
+            { try session.overrideOutputAudioPort(.speaker) },
+            { try session.overrideOutputAudioPort(.none) },
+            { try session.setCategory(.playAndRecord, mode: .voiceChat, options: own) },
+        ]
+        for step in steps {
             do {
-                try session.overrideOutputAudioPort(port)
-                overrides += 1
+                try step()
+                moves += 1
             } catch {
                 facts["route.error"] = "\(error)"
             }
+            trail.append(session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: "+"))
         }
     }
 
@@ -226,8 +245,11 @@ enum AudioProbe {
         all.merge(log.facts) { _, new in new }
         all.merge(call.facts) { _, new in new }
         all["capture"] = "\(AudioSession.shared.capture)"
+        all["callbacks.input"] = String(clock.counts.input)
+        all["callbacks.output"] = String(clock.counts.output)
         all["route.notifications"] = String(routeNotifications)
-        all["route.overrides"] = String(overrides)
+        all["route.moves"] = String(moves)
+        all["route.trail"] = trail.joined(separator: ",")
         all["route.input"] = AVAudioSession.sharedInstance().currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
         all["route.output"] = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
         all["protected"] = UIApplication.shared.isProtectedDataAvailable ? "1" : "0"
