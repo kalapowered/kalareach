@@ -81,13 +81,16 @@ has to be the device's own. A rule that names another device's grant admits noth
 does a device that is no longer paired. The grant is found in the grant store and then in the
 device's own record, where its revocation and its expiry are written. It is decided the way one of
 the device's own requests is: on the continuous clock and on UTC, under the host's policy and under
-the rights ceiling its configuration holds.
+the rights ceiling its configuration holds. A grant in the grant store that was issued to a device
+is only as good as the device's own pairing. That pairing has to be in force too, on both clocks,
+and it is read again once the policy's lock is held.
 
 The grant is asked three times: when the notification is produced, when it is claimed, and once more
 after the credential has been renewed, which can wait on the gateway. That last asking comes before
-the send is admitted under privacy mode, which can wait for an exchange already under way, so a
-bound that ends in that wait is not caught. What the grant reaches is digested with the
-notification, so a change to it settles the notification as revoked rather than sending it.
+the send is admitted under privacy mode, which can wait for an exchange already under way. A bound
+that ends in that wait is not caught, and neither is a revocation, an unpairing or a narrower rights
+ceiling: the notification is presented. What the grant reaches is digested with the notification, so
+a change to it settles the notification as revoked rather than sending it.
 
 ## Two sizes, measured rather than estimated
 
