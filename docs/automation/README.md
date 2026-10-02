@@ -175,7 +175,9 @@ Install-time validation enforces:
   apply to a shared working tree that has not acknowledged each of that destination's
   limitations, or an atomic snapshot of a policy that includes uncommitted work is refused when
   it is installed. What the method checks against the host's live state, such as whether a
-  version exists or a path is in it, is checked when the node runs.
+  version exists or a path is in it, is checked when the node runs. A `create_session` node
+  carries no environment variables: its session takes this host's environment, and a stored
+  definition would keep them. A journal an earlier build wrote comes forward without any it held.
 * **Typed outputs.** Each kind produces one output type, named by the kind, and a receipt holds
   that output and nothing else: identifiers and states the host observed, never text a node, a
   terminal or a model produced.
