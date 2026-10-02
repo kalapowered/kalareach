@@ -72,9 +72,23 @@ pub fn repositories(catalogue: &Catalogue) -> CatalogueResult<Vec<RepositoryEvid
                     .unwrap_or("its repository"),
                 provenance["commit"]
                     .as_str()
-                    .map_or("", |commit| &commit[..commit.len().min(12)]),
+                    .map_or("", |commit| commit.get(..12).unwrap_or(commit)),
             ),
             None => detail,
+        };
+        // A repository the host seeded is moved only under a root this build trusts. One that was
+        // seeded by another kind of build (a development build's, read by a release) is left as it
+        // is, and the doctor says so.
+        let detail = if catalogue.seed_provenance(&view.enrolment.id)?.is_some()
+            && kr_plugin_catalogue::SeedTrust::compiled()
+                .permit(&view.enrolment.root)
+                .is_err()
+        {
+            format!(
+                "{detail}; its root is not one this build trusts, so this build does not move it"
+            )
+        } else {
+            detail
         };
         records.push(RepositoryEvidence {
             name,
