@@ -2875,7 +2875,8 @@ fn refuse_shared_root(root: &Path, shared: &[&Path]) -> Result<()> {
 
 /// Whether `path` is, or may be taken to be, in storage that every distribution of a machine shares.
 ///
-/// It is where the path really lies that decides: the deepest part of it that exists is resolved
+/// A path that goes through a shared mount by its own name is shared. Otherwise it is where the path
+/// really lies that decides: the deepest part of it that exists is resolved
 /// through its links, what does not exist yet is taken by name from there, and the result is in a
 /// shared mount if it is inside one by name, or if it is on the same filesystem as one that is a
 /// mount of its own, which is how a bind mount of a shared directory is told from a directory that
@@ -2884,6 +2885,14 @@ fn refuse_shared_root(root: &Path, shared: &[&Path]) -> Result<()> {
 /// safe.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn is_shared(path: &Path, shared: &[&Path]) -> bool {
+    // The path as it was given is what is bound and connected to. Where it goes through a shared
+    // mount it is shared, even if a link there leads out of it now: another distribution can point
+    // that link elsewhere later, and clients follow it again each time they connect.
+    if let Ok(given) = std::path::absolute(path)
+        && shared.iter().any(|mount| given.starts_with(mount))
+    {
+        return true;
+    }
     let Some((existing, lies)) = where_it_lies(path) else {
         return true;
     };
@@ -3211,6 +3220,32 @@ mod tests {
             PathBuf::from(BELOW_HOME),
             "and one several levels below it"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The path as it was given is what is bound and connected to, so a path that goes through the
+    /// shared mount is shared even where a link there leads out of it: another distribution can
+    /// point that link elsewhere after the path was judged, and this one's clients follow it again
+    /// each time they connect.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_a_link_in_the_shared_mount_is_shared_though_the_link_leads_out_of_it() {
+        let root = temporary_root("link-in-shared");
+        let shared = root.join("wslg");
+        let own = root.join("own");
+        std::fs::create_dir_all(&shared).expect("the shared mount");
+        std::fs::create_dir_all(&own).expect("the distribution's own directory");
+        std::os::unix::fs::symlink(&own, shared.join("user-1000")).expect("a link");
+        let given = shared.join("user-1000");
+        assert_eq!(root_for(&given, &[&shared]), PathBuf::from(BELOW_HOME));
+        let made = given.join("kalareach");
+        std::fs::create_dir_all(&made).expect("the root, made through the link");
+        assert!(
+            refuse_shared_root(&made, &[&shared]).is_err(),
+            "the root as given is in the shared mount"
+        );
+        // The control: the same directory reached by its own name is the distribution's.
+        assert_eq!(root_for(&own, &[&shared]), own.join("kalareach"));
         std::fs::remove_dir_all(&root).ok();
     }
 
