@@ -376,3 +376,266 @@ async fn an_effect_for_a_projected_holder_is_delivered_to_it_and_to_nobody_else(
     );
     assert!(fixture.host_events().is_empty());
 }
+
+/// What a stream was sent as clipboard writes: the effects that carry `CLIPBOARD_WRITE` bytes.
+fn clipboard_writes(stream: &mut OutputStream) -> usize {
+    drained(stream)
+        .iter()
+        .filter(|seen| seen.starts_with("effect") && seen.contains("[27, 93, 53, 50"))
+        .count()
+}
+
+impl Fixture {
+    /// The host events the journal holds, as (kind, detail).
+    fn host_event_details(&self) -> Vec<(String, String)> {
+        self.session
+            .journal()
+            .expect("the session keeps a journal")
+            .host_events()
+            .expect("reads the host events")
+            .into_iter()
+            .map(|event| (event.kind, event.detail))
+            .collect()
+    }
+}
+
+/// KR-REQ-18.11, KR-REQ-08.38: a clipboard write the application asks for while the lease is held
+/// by an attachment whose terminal takes none is sent to nobody, whoever else is watching, and is a
+/// durable host event of its own kind. The control: the same write for a holder whose terminal takes
+/// clipboard writes is delivered to it and recorded nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clipboard_write_for_a_holder_whose_terminal_takes_none_is_a_host_event() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    let watcher = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(holder);
+    fixture.take_the_keys(holder);
+    let mut holding = fixture.subscribe(holder);
+    let mut watching = fixture.subscribe(watcher);
+    let _ = drained(&mut holding);
+    let _ = drained(&mut watching);
+
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(
+        clipboard_writes(&mut holding),
+        0,
+        "the holder's terminal takes none"
+    );
+    assert_eq!(
+        clipboard_writes(&mut watching),
+        0,
+        "and nobody else is given what it declined"
+    );
+    assert_eq!(
+        fixture.host_event_details(),
+        vec![(
+            "clipboard_write_declined".to_owned(),
+            "Clipboard, 6 bytes".to_owned()
+        )],
+        "the host event says what was asked and how much, and keeps none of it"
+    );
+
+    // The control.
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    fixture.take_the_keys(holder);
+    let mut holding = fixture.subscribe(holder);
+    let _ = drained(&mut holding);
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(clipboard_writes(&mut holding), 1);
+    assert!(fixture.host_events().is_empty());
+}
+
+/// KR-REQ-18.11: what a terminal declines is the clipboard write and nothing else: a bell, a
+/// notification and the rest of what the application asks of a terminal still reach it, and a clipboard
+/// read still gets its empty answer from the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_whose_terminal_takes_no_clipboard_writes_is_still_sent_everything_else() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(holder);
+    fixture.take_the_keys(holder);
+    let mut stream = fixture.subscribe(holder);
+    let _ = drained(&mut stream);
+
+    fixture.output(b"ab\x07");
+    let seen = drained(&mut stream);
+    assert!(seen.contains(&effect(2, BELL)), "{seen:?}");
+    assert!(
+        fixture.host_events().is_empty(),
+        "{:?}",
+        fixture.host_events()
+    );
+}
+
+/// KR-REQ-18.11: a clipboard write goes to whoever holds the lease when the application caused it,
+/// and a terminal that takes none does not become one that does by taking the lease, nor the other
+/// way about: one write for each side of a takeover is decided by the holder it was caused under.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_taken_between_two_clipboard_writes_sends_the_second_to_the_new_holder() {
+    // A declines and holds; B takes clipboard writes and takes the lease after the first write.
+    let mut fixture = Fixture::new();
+    let first = fixture.attach("xterm-256color");
+    let second = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(first);
+    fixture.take_the_keys(first);
+    let mut first_stream = fixture.subscribe(first);
+    let mut second_stream = fixture.subscribe(second);
+    let _ = drained(&mut first_stream);
+    let _ = drained(&mut second_stream);
+
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(clipboard_writes(&mut first_stream), 0);
+    assert_eq!(clipboard_writes(&mut second_stream), 0);
+    fixture.take_the_keys(second);
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(
+        clipboard_writes(&mut second_stream),
+        1,
+        "the new holder takes it"
+    );
+    assert_eq!(
+        clipboard_writes(&mut first_stream),
+        0,
+        "the old one is sent nothing"
+    );
+    assert_eq!(
+        fixture.host_events(),
+        vec![("clipboard_write_declined".to_owned(), 0)],
+        "only the write the first holder declined is a host event"
+    );
+
+    // The other way: A takes them and holds; B declines and takes the lease.
+    let mut fixture = Fixture::new();
+    let first = fixture.attach("xterm-256color");
+    let second = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(second);
+    fixture.take_the_keys(first);
+    let mut first_stream = fixture.subscribe(first);
+    let mut second_stream = fixture.subscribe(second);
+    let _ = drained(&mut first_stream);
+    let _ = drained(&mut second_stream);
+
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(clipboard_writes(&mut first_stream), 1);
+    fixture.take_the_keys(second);
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(
+        clipboard_writes(&mut second_stream),
+        0,
+        "the new holder takes none"
+    );
+    assert_eq!(
+        clipboard_writes(&mut first_stream),
+        0,
+        "and the old one is not sent it"
+    );
+    assert_eq!(
+        fixture.host_events(),
+        vec![(
+            "clipboard_write_declined".to_owned(),
+            CLIPBOARD_WRITE.len() as u64
+        )]
+    );
+}
+
+/// KR-REQ-18.11, KR-REQ-08.38: a clipboard write whose sequence is split across a takeover is
+/// decided where the sequence completes, as every effect is: by the holder at that moment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clipboard_write_split_across_a_takeover_is_decided_where_it_completes() {
+    let mut fixture = Fixture::new();
+    let first = fixture.attach("xterm-256color");
+    let second = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(first);
+    fixture.take_the_keys(first);
+    let mut first_stream = fixture.subscribe(first);
+    let mut second_stream = fixture.subscribe(second);
+    let _ = drained(&mut first_stream);
+    let _ = drained(&mut second_stream);
+
+    fixture.output(b"\x1b]52;c;c2Vj");
+    fixture.take_the_keys(second);
+    fixture.output(b"cmV0\x1b\\");
+    assert_eq!(
+        clipboard_writes(&mut second_stream),
+        1,
+        "it completed under the second holder, whose terminal takes it"
+    );
+    assert_eq!(clipboard_writes(&mut first_stream), 0);
+    assert!(
+        fixture.host_events().is_empty(),
+        "{:?}",
+        fixture.host_events()
+    );
+
+    // And the converse: begun under a holder that takes writes, completed under one that does not.
+    let mut fixture = Fixture::new();
+    let first = fixture.attach("xterm-256color");
+    let second = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(second);
+    fixture.take_the_keys(first);
+    let mut first_stream = fixture.subscribe(first);
+    let mut second_stream = fixture.subscribe(second);
+    let _ = drained(&mut first_stream);
+    let _ = drained(&mut second_stream);
+
+    fixture.output(b"\x1b]52;c;c2Vj");
+    fixture.take_the_keys(second);
+    fixture.output(b"cmV0\x1b\\");
+    assert_eq!(clipboard_writes(&mut first_stream), 0);
+    assert_eq!(clipboard_writes(&mut second_stream), 0);
+    assert_eq!(
+        fixture.host_events(),
+        vec![("clipboard_write_declined".to_owned(), 0)]
+    );
+}
+
+/// KR-REQ-18.11: nobody holding the lease is still the content-free host event it always was, whether
+/// or not the attachments there are decline clipboard writes: a write with no holder is not declined
+/// by anybody.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clipboard_write_with_no_lease_holder_is_the_host_event_it_always_was() {
+    let mut fixture = Fixture::new();
+    let watcher = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(watcher);
+    let mut watching = fixture.subscribe(watcher);
+    let _ = drained(&mut watching);
+
+    fixture.output(CLIPBOARD_WRITE);
+    assert_eq!(clipboard_writes(&mut watching), 0);
+    assert_eq!(
+        fixture.host_events(),
+        vec![("clipboard_write".to_owned(), 0)]
+    );
+}
+
+/// KR-REQ-08.38: every clipboard write a holder's terminal declined in one read is recorded, in the
+/// order the application caused them, in one transaction, as the bells a holder cannot take are.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_clipboard_writes_of_one_read_a_terminal_declines_are_all_recorded_in_order() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    fixture.session.decline_clipboard_writes(holder);
+    fixture.take_the_keys(holder);
+    let mut stream = fixture.subscribe(holder);
+    let _ = drained(&mut stream);
+
+    let output: Vec<u8> = (0..50)
+        .flat_map(|_| CLIPBOARD_WRITE.iter().copied().chain(*b"x"))
+        .collect();
+    fixture.output(&output);
+    let recorded = fixture.host_events();
+    assert_eq!(recorded.len(), 50, "{recorded:?}");
+    assert!(
+        recorded
+            .iter()
+            .all(|(kind, _)| kind == "clipboard_write_declined")
+    );
+    let step = CLIPBOARD_WRITE.len() as u64 + 1;
+    let cursors: Vec<u64> = recorded.iter().map(|(_, cursor)| *cursor).collect();
+    assert_eq!(
+        cursors,
+        (0..50).map(|write| write * step).collect::<Vec<_>>()
+    );
+    assert_eq!(clipboard_writes(&mut stream), 0);
+}

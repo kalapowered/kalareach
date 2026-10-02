@@ -94,6 +94,15 @@ pub struct BridgeOrigin {
     pub environment_id: EnvironmentId,
     /// The ingress the request originally arrived on.
     pub ingress: ActorIngress,
+    /// Whether the terminal the invoker attaches from takes the clipboard writes the session it
+    /// attaches to asks for.
+    ///
+    /// A restriction only. A worker that is told no sends no clipboard write to this connection's
+    /// attachments and records what it would have sent, and one that is told yes sends what it
+    /// sends every attachment that holds the input lease: the one writer a write is owed to. An
+    /// invoker that declared yes where it should have said no could only be sent what a local
+    /// attachment is sent.
+    pub clipboard_writes: bool,
 }
 
 impl BridgeOrigin {
@@ -1082,6 +1091,7 @@ mod tests {
         let bridged = a_hello(Some(BridgeOrigin {
             environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
             ingress: ActorIngress::LocalIpc,
+            clipboard_writes: false,
         }));
         let frame = ControlFrame::Hello(bridged.clone());
         let bytes = kr_cbor::to_canonical_vec(&frame).expect("encodes");
@@ -1134,6 +1144,7 @@ mod tests {
         let bridged = kr_cbor::to_canonical_vec(&a_hello(Some(BridgeOrigin {
             environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
             ingress: ActorIngress::LocalIpc,
+            clipboard_writes: false,
         })))
         .expect("encodes");
         assert!(
@@ -1150,6 +1161,7 @@ mod tests {
             let origin = BridgeOrigin {
                 environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
                 ingress,
+                clipboard_writes: true,
             };
             assert_eq!(
                 origin.is_admissible(),

@@ -794,7 +794,9 @@ pub struct BridgeEnrolArguments {
     /// The absolute path of the helper installed in the target.
     #[arg(long)]
     pub helper: String,
-    /// Where this environment's clipboard writes go.
+    /// Where this environment's clipboard writes go. `terminal` is the one destination there is:
+    /// the terminal an attachment is made from, which writes it. Without it, a clipboard write
+    /// from a session in this environment reaches nobody.
     #[arg(long)]
     pub clipboard: Option<String>,
     /// The environment identity this record names, when it is already known.

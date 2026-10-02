@@ -317,6 +317,7 @@ fn bridge_opening(script: String, files: &[&std::path::Path]) -> Opening {
             start: false,
             target: BridgeTarget::Session {
                 session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16])),
+                clipboard_writes: true,
             },
         },
     }

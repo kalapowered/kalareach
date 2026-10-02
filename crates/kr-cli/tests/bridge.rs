@@ -904,6 +904,7 @@ async fn a_closed_session_target_returns_session_closed_when_targeted_by_bridge(
         start: false,
         target: BridgeTarget::Session {
             session_id: closed_session_id,
+            clipboard_writes: true,
         },
     };
     helper.write(&BridgeFrame::Hello(Box::new(opening)));
@@ -951,7 +952,10 @@ async fn a_journal_left_behind_by_a_live_session_is_not_read_as_a_closure() {
         origin_ingress: ActorIngress::LocalIpc,
         already_bridged: false,
         start: false,
-        target: BridgeTarget::Session { session_id },
+        target: BridgeTarget::Session {
+            session_id,
+            clipboard_writes: true,
+        },
     })));
     let (code, diagnostics) = helper.finish();
     assert_ne!(code, Some(0), "the helper ends rather than serving");
@@ -1192,6 +1196,7 @@ fn a_destination_with_no_daemon_says_so_in_a_frame_when_nothing_may_be_started()
         BridgeTarget::Controller,
         BridgeTarget::Session {
             session_id: SessionId::new(kr_ipc::new_uuid()),
+            clipboard_writes: true,
         },
     ] {
         let mut helper = Helper::start(&tree);
@@ -1241,6 +1246,7 @@ async fn the_helper_tells_the_destination_where_the_invocation_began() {
         Some(kr_protocol::local::BridgeOrigin {
             environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
             ingress: ActorIngress::LocalIpc,
+            clipboard_writes: false,
         }),
         "the destination hears the origin the invoker declared"
     );
@@ -1411,7 +1417,10 @@ async fn a_worker_of_an_earlier_build_is_named_and_not_reported_absent() {
     helper.write(&hello_to(
         ActorIngress::LocalIpc,
         false,
-        BridgeTarget::Session { session_id },
+        BridgeTarget::Session {
+            session_id,
+            clipboard_writes: true,
+        },
     ));
     let BridgeFrame::Refused(error) = helper.read() else {
         panic!("a worker that takes no bridge is a refusal, not an acknowledgement");

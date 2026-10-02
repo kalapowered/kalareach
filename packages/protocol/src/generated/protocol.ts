@@ -6142,6 +6142,18 @@ export interface BridgeHello {
     | {
         session: {
           /**
+           * Whether the terminal the invoker attaches from takes the clipboard writes the session
+           * asks for.
+           *
+           * The invoker says it from the enrolment it holds for the destination: yes where the owner
+           * named the terminal as the environment's clipboard destination
+           * ([`EnvironmentEnrolment::takes_clipboard_writes`]), and no otherwise. It only narrows: a
+           * session's clipboard write reaches the attachment holding the input lease and nobody else
+           * whatever this says, and a terminal that says no is sent none. The destination's worker
+           * enforces it; nothing between filters the bytes.
+           */
+          clipboard_writes: boolean
+          /**
            * One KalaReach terminal session.
            */
           session_id: string
@@ -6392,6 +6404,17 @@ export interface ProtocolVersion2 {
  * helper alone.
  */
 export interface BridgeOrigin {
+  /**
+   * Whether the terminal the invoker attaches from takes the clipboard writes the session it
+   * attaches to asks for.
+   *
+   * A restriction only. A worker that is told no sends no clipboard write to this connection's
+   * attachments and records what it would have sent, and one that is told yes sends what it
+   * sends every attachment that holds the input lease: the one writer a write is owed to. An
+   * invoker that declared yes where it should have said no could only be sent what a local
+   * attachment is sent.
+   */
+  clipboard_writes: boolean
   /**
    * The environment the invoker ran in.
    */
@@ -12859,7 +12882,10 @@ export interface EnvironmentEnrolment {
    * Where this environment's clipboard writes go, when the owner named a destination.
    *
    * Section 18 asks for explicit clipboard destinations. Absent means this environment has
-   * none, not that it inherits this host's.
+   * none, not that it inherits this host's. The one destination there is to name is
+   * [`CLIPBOARD_DESTINATION_TERMINAL`]: the terminal the attaching `kr` is running in, which
+   * writes it. Any other text names no destination, and a record that holds one is read as
+   * having none.
    */
   clipboard_destination: string | null
   /**
@@ -12925,7 +12951,10 @@ export interface EnvironmentEnrolment1 {
    * Where this environment's clipboard writes go, when the owner named a destination.
    *
    * Section 18 asks for explicit clipboard destinations. Absent means this environment has
-   * none, not that it inherits this host's.
+   * none, not that it inherits this host's. The one destination there is to name is
+   * [`CLIPBOARD_DESTINATION_TERMINAL`]: the terminal the attaching `kr` is running in, which
+   * writes it. Any other text names no destination, and a record that holds one is read as
+   * having none.
    */
   clipboard_destination: string | null
   /**
@@ -12989,7 +13018,10 @@ export interface EnvironmentEnrolment2 {
    * Where this environment's clipboard writes go, when the owner named a destination.
    *
    * Section 18 asks for explicit clipboard destinations. Absent means this environment has
-   * none, not that it inherits this host's.
+   * none, not that it inherits this host's. The one destination there is to name is
+   * [`CLIPBOARD_DESTINATION_TERMINAL`]: the terminal the attaching `kr` is running in, which
+   * writes it. Any other text names no destination, and a record that holds one is read as
+   * having none.
    */
   clipboard_destination: string | null
   /**

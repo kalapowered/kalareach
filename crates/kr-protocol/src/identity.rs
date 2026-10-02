@@ -259,15 +259,23 @@ pub struct EnvironmentEnrolment {
     /// Where this environment's clipboard writes go, when the owner named a destination.
     ///
     /// Section 18 asks for explicit clipboard destinations. Absent means this environment has
-    /// none, not that it inherits this host's.
+    /// none, not that it inherits this host's. The one destination there is to name is
+    /// [`CLIPBOARD_DESTINATION_TERMINAL`]: the terminal the attaching `kr` is running in, which
+    /// writes it. Any other text names no destination, and a record that holds one is read as
+    /// having none.
     pub clipboard_destination: Nullable<String>,
     /// When the owner approved this record.
     pub approved_at_ms: TimestampMs,
 }
 
+/// The clipboard destination that is the terminal an attachment is made from.
+pub const CLIPBOARD_DESTINATION_TERMINAL: &str = "terminal";
+
 /// Why an enrolment is not a well-formed record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnrolmentError {
+    /// The clipboard destination is not one this host delivers to.
+    ClipboardDestinationUnknown,
     /// The label is empty.
     EmptyLabel,
     /// The platform identity is empty.
@@ -289,6 +297,10 @@ pub enum EnrolmentError {
 impl core::fmt::Display for EnrolmentError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ClipboardDestinationUnknown => formatter.write_str(
+                "the only clipboard destination an enrolment can name is the terminal an \
+                 attachment is made from: terminal",
+            ),
             Self::EmptyLabel => formatter.write_str("an enrolment carries the label people use"),
             Self::EmptyTarget => {
                 formatter.write_str("an enrolment carries the identity the platform issued")
@@ -347,6 +359,35 @@ impl EnvironmentEnrolment {
             return Err(EnrolmentError::EmptyLabel);
         }
         validate_destination(self.access, &self.target, &self.os_user, &self.helper_path)
+    }
+
+    /// Checks that a record about to be made names a clipboard destination this host delivers to,
+    /// or none.
+    ///
+    /// This is a check of a record being made and not of one being read: a record that names
+    /// another destination is still a record of an environment this host reaches, and is read as
+    /// having no destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnrolmentError::ClipboardDestinationUnknown`] for any other name.
+    pub fn validate_clipboard_destination(&self) -> Result<(), EnrolmentError> {
+        match self.clipboard_destination.as_ref() {
+            None => Ok(()),
+            Some(name) if name == CLIPBOARD_DESTINATION_TERMINAL => Ok(()),
+            Some(_) => Err(EnrolmentError::ClipboardDestinationUnknown),
+        }
+    }
+
+    /// Whether the terminal an attachment to this environment is made from takes the clipboard
+    /// writes its sessions ask for: only where the owner named the terminal as the destination.
+    ///
+    /// A record that names nothing, or names text this host does not deliver to, takes none.
+    #[must_use]
+    pub fn takes_clipboard_writes(&self) -> bool {
+        self.clipboard_destination
+            .as_ref()
+            .is_some_and(|name| name == CLIPBOARD_DESTINATION_TERMINAL)
     }
 
     /// Returns true when `selector` selects this record.
@@ -545,6 +586,16 @@ pub enum BridgeTarget {
     Session {
         /// The session.
         session_id: SessionId,
+        /// Whether the terminal the invoker attaches from takes the clipboard writes the session
+        /// asks for.
+        ///
+        /// The invoker says it from the enrolment it holds for the destination: yes where the owner
+        /// named the terminal as the environment's clipboard destination
+        /// ([`EnvironmentEnrolment::takes_clipboard_writes`]), and no otherwise. It only narrows: a
+        /// session's clipboard write reaches the attachment holding the input lease and nobody else
+        /// whatever this says, and a terminal that says no is sent none. The destination's worker
+        /// enforces it; nothing between filters the bytes.
+        clipboard_writes: bool,
     },
 }
 
@@ -1136,6 +1187,44 @@ mod tests {
                 channel_scoped: true,
                 detail: String::new(),
             },
+        }
+    }
+
+    /// KR-REQ-18.11: the one clipboard destination a record being made can name is the terminal an
+    /// attachment is made from, or none; any other name is refused. A record that already names
+    /// another is not refused as a record of an environment this host reaches, and takes no
+    /// clipboard writes, which is what keeps it from delivering anywhere it was not told to.
+    #[test]
+    fn a_clipboard_destination_is_the_terminal_or_none() {
+        let mut enrolment = wsl_enrolment();
+        enrolment
+            .validate_clipboard_destination()
+            .expect("none is a destination");
+        assert!(!enrolment.takes_clipboard_writes(), "none takes no write");
+
+        enrolment.clipboard_destination = Nullable::some(CLIPBOARD_DESTINATION_TERMINAL.to_owned());
+        enrolment
+            .validate_clipboard_destination()
+            .expect("the terminal is one");
+        assert!(enrolment.takes_clipboard_writes());
+
+        for other in [
+            "Terminal",
+            "terminal ",
+            "clipboard-sync",
+            "ssh://elsewhere",
+            "",
+        ] {
+            enrolment.clipboard_destination = Nullable::some(other.to_owned());
+            assert_eq!(
+                enrolment.validate_clipboard_destination(),
+                Err(EnrolmentError::ClipboardDestinationUnknown),
+                "{other:?}"
+            );
+            assert!(!enrolment.takes_clipboard_writes(), "{other:?}");
+            enrolment.validate().expect(
+                "a record that names it is still a record of an environment this host reaches",
+            );
         }
     }
 

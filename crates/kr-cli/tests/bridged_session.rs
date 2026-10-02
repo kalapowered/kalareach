@@ -298,9 +298,20 @@ impl World {
 
     /// Records the destination in the source host's own inventory, as a WSL distribution.
     fn enrol_destination(&self) {
+        let enrolled = self.enrolling(None);
+        assert!(
+            enrolled.status.success(),
+            "enrolling: {}",
+            String::from_utf8_lossy(&enrolled.stderr)
+        );
+    }
+
+    /// Records the destination in the source host's own inventory, naming `clipboard` as where its
+    /// clipboard writes go, and returns what `kr` said.
+    fn enrolling(&self, clipboard: Option<&str>) -> std::process::Output {
         let environment = self.destination.environment_id().to_string();
         let helper = support::kr().display().to_string();
-        let enrolled = self.run(&[
+        let mut arguments = vec![
             "bridge",
             "enrol",
             "--access",
@@ -315,12 +326,11 @@ impl World {
             &helper,
             "--environment-id",
             &environment,
-        ]);
-        assert!(
-            enrolled.status.success(),
-            "enrolling: {}",
-            String::from_utf8_lossy(&enrolled.stderr)
-        );
+        ];
+        if let Some(clipboard) = clipboard {
+            arguments.extend(["--clipboard", clipboard]);
+        }
+        self.run(&arguments)
     }
 
     /// How many times the stand-in was run.
@@ -1414,6 +1424,165 @@ impl World {
     fn export_path(&self, name: &str) -> PathBuf {
         self.source.root().join(format!("{name}.json"))
     }
+}
+
+/// What a terminal is shown of a clipboard write: the escape that begins one, then the selection and
+/// the content the shell wrote. The shell's own echo of what was typed holds these characters as
+/// text, so only a write that reached the terminal as the escape itself matches.
+const CLIPBOARD_WRITE_SEEN: &str = "\x1b]52;c;c2VjcmV0";
+
+/// What is typed to a shell to write the clipboard, and then to say it has finished.
+const TYPED_CLIPBOARD_WRITE: &str =
+    "printf '\\033]52;c;c2VjcmV0\\007'; printf 'written-%s\\n' marker\r";
+
+/// Attaches a terminal to a new session in the destination, has the shell there write the clipboard,
+/// and returns what the terminal was shown, once the shell has said it finished and the session has
+/// ended. The session's identifier is returned with it.
+fn clipboard_write_through_a_bridge(world: &World) -> (String, String) {
+    let created = world.create_in_destination();
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+    let display = created["display_number"].to_string();
+    let terminal = world.attach_on_a_terminal(&display);
+    terminal.types(TYPED_CLIPBOARD_WRITE);
+    terminal.expect_within("written-marker", "the shell finished writing the clipboard");
+    terminal.types("exit\r");
+    terminal.expect_within("attach-finished-", "the attachment ended with the session");
+    let shown = terminal.text();
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+    world.wait_until_closed_in_destination(&session);
+    (session, shown)
+}
+
+/// The host events the destination's journal holds for a closed session, as (kind, detail).
+fn host_events_in_destination(world: &World, session: &str) -> Vec<(String, String)> {
+    let session_id: kr_protocol::ids::SessionId = session.parse().expect("an identifier");
+    let journal = kr_worker::journal::Journal::open_read_only(
+        world.destination.environment().journal_database(session_id),
+    )
+    .expect("the closed session's journal opens");
+    journal
+        .host_events()
+        .expect("reads the host events")
+        .into_iter()
+        .map(|event| (event.kind, event.detail))
+        .collect()
+}
+
+/// KR-REQ-18.11: a clipboard write from a session in an enrolled environment reaches the attaching
+/// terminal only where the owner named the terminal as that environment's clipboard destination. The
+/// control: the write is written to the terminal when the environment names it, and the same write
+/// where it names nothing is sent to nobody and is a host event in the destination's own journal that
+/// says what was asked and how much and keeps none of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clipboard_write_from_a_bridged_session_reaches_only_a_terminal_the_owner_named() {
+    let named = World::start().await;
+    let enrolled = named.enrolling(Some("terminal"));
+    assert!(
+        enrolled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let (_, shown) = clipboard_write_through_a_bridge(&named);
+    assert!(
+        shown.contains(CLIPBOARD_WRITE_SEEN),
+        "the terminal the owner named is written to: {}",
+        shown.escape_debug()
+    );
+
+    let unnamed = World::start().await;
+    unnamed.enrol_destination();
+    let (session, shown) = clipboard_write_through_a_bridge(&unnamed);
+    assert!(
+        !shown.contains(CLIPBOARD_WRITE_SEEN),
+        "no destination is named, so the terminal is not written to: {}",
+        shown.escape_debug()
+    );
+    assert_eq!(
+        host_events_in_destination(&unnamed, &session),
+        vec![(
+            "clipboard_write_declined".to_owned(),
+            "Clipboard, 6 bytes".to_owned()
+        )],
+        "what was asked is recorded where the session lives, and none of its content"
+    );
+}
+
+/// KR-REQ-18.11: the same write in a session on this host's own environment is written to the
+/// attaching terminal, with no destination recorded anywhere: a local terminal is the destination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clipboard_write_from_a_session_on_this_host_reaches_its_terminal() {
+    let world = World::start().await;
+    let created = world.run(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--shell",
+        "/bin/sh",
+        "--startup",
+        "interactive",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("kr printed JSON");
+    let display = created["display_number"].to_string();
+    let terminal = world.attach_here_on_a_terminal(&display);
+    terminal.types(TYPED_CLIPBOARD_WRITE);
+    terminal.expect_within("written-marker", "the shell finished writing the clipboard");
+    terminal.types("exit\r");
+    terminal.expect_within("attach-finished-", "the attachment ended with the session");
+    let shown = terminal.text();
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+    assert!(
+        shown.contains(CLIPBOARD_WRITE_SEEN),
+        "{}",
+        shown.escape_debug()
+    );
+}
+
+/// KR-REQ-18.11: the one clipboard destination an enrolment can name is the terminal; any other
+/// name is refused when the record is made and nothing is recorded, and `terminal` is recorded as
+/// named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrolment_can_name_only_the_terminal_as_its_clipboard_destination() {
+    let world = World::start().await;
+    for other in ["clipboard-sync", "ssh://elsewhere", "Terminal", ""] {
+        let refused = world.enrolling(Some(other));
+        assert!(!refused.status.success(), "{other:?} is refused");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("only clipboard destination"),
+            "{other:?}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+    let listed = world.run(&["--json", "bridge", "list"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        listed["rows"].as_array().map_or(0, Vec::len),
+        0,
+        "nothing was recorded: {listed}"
+    );
+
+    let accepted = world.enrolling(Some("terminal"));
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let listed = world.run(&["--json", "bridge", "list"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        listed["rows"][0]["enrolment"]["clipboard_destination"], "terminal",
+        "{listed}"
+    );
 }
 
 /// KR-REQ-18.11, KR-REQ-25.25: `kr export` of a closed session in an enrolled environment reads the

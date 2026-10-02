@@ -330,12 +330,7 @@ async fn reach(
 ) -> std::result::Result<(kr_ipc::client::LocalClient, kr_protocol::local::LocalRole), Unreached> {
     let paths = HostPaths::discover().map_err(CliError::from)?;
     let known = resolve::select(&paths, environment)?;
-    // What the destination is told of where this invocation began: the invoker's own declaration,
-    // which the destination checks again for itself and never takes for authority.
-    let origin = kr_protocol::local::BridgeOrigin {
-        environment_id: hello.origin_environment_id,
-        ingress: hello.origin_ingress,
-    };
+    let origin = origin_of(hello);
     let (client, role) = match hello.target {
         BridgeTarget::Controller => (
             match controller(&paths, &known, hello.start, origin).await {
@@ -347,7 +342,7 @@ async fn reach(
             },
             kr_protocol::local::LocalRole::Controller,
         ),
-        BridgeTarget::Session { session_id } => {
+        BridgeTarget::Session { session_id, .. } => {
             match resolve::find(
                 &paths,
                 &resolve::SessionSelector::Identifier(session_id),
@@ -404,6 +399,24 @@ async fn reach(
         )));
     }
     Ok((client, role))
+}
+
+/// What the destination is told of where this invocation began: the invoker's own declaration,
+/// which the destination checks again for itself and never takes for authority.
+///
+/// What the invoker said of the terminal it attaches from is carried as it said it, and for a
+/// connection to the daemon, which attaches nothing, it is that there is no terminal to write to.
+fn origin_of(hello: &BridgeHello) -> kr_protocol::local::BridgeOrigin {
+    kr_protocol::local::BridgeOrigin {
+        environment_id: hello.origin_environment_id,
+        ingress: hello.origin_ingress,
+        clipboard_writes: match hello.target {
+            BridgeTarget::Session {
+                clipboard_writes, ..
+            } => clipboard_writes,
+            BridgeTarget::Controller => false,
+        },
+    }
 }
 
 /// What a bridge's helper reaches inside its environment.
@@ -827,6 +840,32 @@ mod tests {
                 && worker.contains("a build that does not state its build")
                 && worker.contains("attach to the session from a shell inside this environment"),
             "{worker}"
+        );
+    }
+
+    /// KR-REQ-18.11: the helper tells the destination's worker what the invoker said of the terminal
+    /// it attaches from, as it said it, and tells the daemon, which attaches nothing, that there is
+    /// none to write to.
+    #[test]
+    fn the_origin_carries_what_the_invoker_said_of_its_terminals_clipboard() {
+        let session_id = kr_protocol::ids::SessionId::new(Uuid::from_bytes([5; 16]));
+        for said in [true, false] {
+            let mut attaching = hello(ActorIngress::LocalIpc);
+            attaching.target = BridgeTarget::Session {
+                session_id,
+                clipboard_writes: said,
+            };
+            let origin = origin_of(&attaching);
+            assert_eq!(origin.clipboard_writes, said);
+            assert_eq!(origin.ingress, ActorIngress::LocalIpc);
+            assert_eq!(
+                origin.environment_id,
+                EnvironmentId::new(Uuid::from_bytes([4; 16]))
+            );
+        }
+        assert!(
+            !origin_of(&hello(ActorIngress::LocalIpc)).clipboard_writes,
+            "a connection to the daemon has no terminal"
         );
     }
 
