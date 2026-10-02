@@ -27,7 +27,8 @@ use kr_e2e_agents::account::{
     reported_rewrites, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
-    Account, AccountHome, Action, Build, Confinement, Inputs, Launch, quote, read_build, with_dates,
+    Account, AccountHome, Action, Build, Confinement, Inputs, InstallSwitch, Launch, quote,
+    read_build, with_dates,
 };
 use kr_e2e_agents::confine::{self, Layout, Setup};
 use kr_e2e_agents::conversation::answers;
@@ -38,6 +39,7 @@ use kr_e2e_agents::detect::{
 };
 use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::keys;
+use kr_e2e_agents::mirror::{self, Mirroring};
 use kr_e2e_agents::network::{Policy, Proxy};
 use kr_e2e_agents::observe::{
     AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
@@ -1582,6 +1584,206 @@ static NEW_SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// own: those of the part's first launch, which showed the same profile, cover them.
 static RESUMED_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What the part records of a dialog it refused: why, which dialog, with which key, and the rows the
+/// screen showed then, without its blank rows.
+///
+/// The screen is left out where it holds a piece of a key the part holds (`secrets`: see
+/// [`holds_a_key`]): what a part's log keeps is searched for exact values, which a key cut in two
+/// would escape.
+fn refusal_note(why: &str, shown: &str, key: &str, rows: &[String], secrets: &[&str]) -> String {
+    let screen: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    let said = if holds_a_key(&screen, secrets) {
+        "the screen holds a key, so it is not noted".to_owned()
+    } else {
+        format!("the screen:\n{}", screen.join("\n"))
+    };
+    format!("{why}: a dialog showing {shown:?}, refused with {key:?}; {said}")
+}
+
+/// One element of a text read for a key: a character a key is made of, or a run that may be a
+/// colour code (`ESC [`, digits and semicolons, `m`) or may be characters of the key itself, which
+/// the reading takes either way, whole.
+enum Item {
+    Char(char),
+    Colour(Vec<char>),
+}
+
+/// `text` as the characters a key is made of (letters, digits, `-` and `_`) in order, the rest taken
+/// out: whitespace, the frame and block characters an agent draws around its rows, the escape
+/// character and what else sits between them. A whole colour-looking sequence is one [`Item::Colour`]
+/// holding its digits and its `m`, so that a key is found whichever of such sequences are colour and
+/// whichever are key characters.
+fn items_of(text: &str) -> Vec<Item> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut items = Vec::new();
+    let mut at = 0;
+    while at < characters.len() {
+        let character = characters[at];
+        if character == '\u{1b}' {
+            if characters.get(at + 1) == Some(&'[') {
+                let mut end = at + 2;
+                while end < characters.len()
+                    && (characters[end].is_ascii_digit() || characters[end] == ';')
+                {
+                    end += 1;
+                }
+                if characters.get(end) == Some(&'m') {
+                    let inner: Vec<char> = characters[at + 2..=end]
+                        .iter()
+                        .copied()
+                        .filter(|inner| *inner != ';')
+                        .collect();
+                    items.push(Item::Colour(inner));
+                    at = end + 1;
+                    continue;
+                }
+            }
+        } else if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            items.push(Item::Char(character));
+        }
+        at += 1;
+    }
+    items
+}
+
+/// Whether `piece` is found in `items`, from some start, taking each [`Item::Colour`] whole or not
+/// at all (a start can fall inside one, which then is key characters). The search is a walk over
+/// states (item, offset inside a colour-looking run, characters of the piece matched), each taken
+/// once, with a stack of its own: its time and memory grow with the length of the text, not with
+/// the number of ways its colour codes can be read.
+fn piece_in(items: &[Item], piece: &[char]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
+    for (item, element) in items.iter().enumerate() {
+        match element {
+            Item::Char(_) => stack.push((item, 0, 0)),
+            Item::Colour(inner) => stack.extend((0..inner.len()).map(|offset| (item, offset, 0))),
+        }
+    }
+    while let Some(state) = stack.pop() {
+        let (item, offset, matched) = state;
+        if matched == piece.len() {
+            return true;
+        }
+        if item >= items.len() || !seen.insert(state) {
+            continue;
+        }
+        match &items[item] {
+            Item::Char(character) => {
+                if *character == piece[matched] {
+                    stack.push((item + 1, 0, matched + 1));
+                }
+            }
+            Item::Colour(inner) => {
+                let rest = &inner[offset..];
+                let take = rest.len().min(piece.len() - matched);
+                if rest[..take] == piece[matched..matched + take] {
+                    stack.push((item + 1, 0, matched + take));
+                }
+                if offset == 0 {
+                    stack.push((item + 1, 0, matched));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The length of the pieces of a held key that no note may carry: a note holding eight characters
+/// of a random key in a row holds more of it than is safe, whole, wrapped over rows, clipped at a
+/// screen edge or between colour codes. (A key's fixed vendor prefix is as long and also stops a
+/// note, which costs a diagnostic and nothing else, since a failure is classed before its text is
+/// held to this.)
+const KEY_PIECE: usize = 8;
+
+/// Whether `rows`, read as one run, hold a piece of eight characters of one of `secrets`, whichever
+/// of the colour-looking sequences in them are colour and whichever are characters of the key. A
+/// value of fewer than eight characters has no piece. An encoding of the key that changes its
+/// characters (base64, hex, a `\u` escape of each) is not covered; nor are pieces of fewer than
+/// eight characters kept apart by other letters or digits, or an escape sequence that is not a
+/// colour code and a terminal would draw nothing for, between pieces of seven.
+fn holds_a_key(rows: &[&str], secrets: &[&str]) -> bool {
+    let items: Vec<Item> = rows.iter().flat_map(|row| items_of(row)).collect();
+    secrets.iter().any(|secret| {
+        let secret: Vec<char> = items_of(secret)
+            .into_iter()
+            .flat_map(|item| match item {
+                Item::Char(character) => vec![character],
+                Item::Colour(inner) => inner,
+            })
+            .collect();
+        secret
+            .windows(KEY_PIECE)
+            .any(|piece| piece_in(&items, piece))
+    })
+}
+
+/// `text` as it is, or a line that says it is not kept where it holds a piece of a held key
+/// (`secrets`; see [`holds_a_key`]): the one place a text goes through before the part prints or
+/// keeps it.
+fn kept_clear(text: &str, secrets: &[&str]) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if holds_a_key(&lines, secrets) {
+        "(the text holds a key, so it is not kept)".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// The values of the keys the part holds, for the panic hook: set when a part with a login is made.
+static HELD_FOR_PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Makes every panic of the part's threads go through [`kept_clear`] before it is printed, once for
+/// the process: a failure's message, which can hold a screen or an agent's output, never carries a
+/// piece of a held key into the part's log. The values are those of the part made last.
+fn gate_panics(secrets: &[String]) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    *HELD_FOR_PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = secrets.to_vec();
+    INSTALLED.call_once(|| {
+        let printed = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = panic_text(info.payload());
+            let held = HELD_FOR_PANICS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let held: Vec<&str> = held.iter().map(String::as_str).collect();
+            if holds_a_key(&message.lines().collect::<Vec<_>>(), &held) {
+                let place = info
+                    .location()
+                    .map_or_else(String::new, |place| format!(" at {place}"));
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!(
+                        "\nthread panicked{place}: the message holds a key, so it is not printed\n"
+                    ),
+                );
+            } else {
+                printed(info);
+            }
+        }));
+    });
+}
+
+/// The values of the keys the part holds: its login's own and the other keys the harness's shell
+/// holds, which a text the part keeps must not carry.
+fn held_keys(stage: &Stage<'_, '_>) -> Vec<String> {
+    stage.login.map_or_else(Vec::new, |login| {
+        login
+            .others
+            .iter()
+            .cloned()
+            .chain(login.key.iter().map(|(_, value)| value.clone()))
+            .collect()
+    })
+}
+
 /// The digits a line of the agent's screen shows after `prefix`, as a status: `kr-zt-3-1007` after
 /// `kr-zt-3-` is 7. The typed line itself shows `$((1000+$?))` there, never digits.
 fn status_after(rows: &[String], prefix: &str) -> Option<i64> {
@@ -1923,13 +2125,40 @@ fn stop_failures(stop: &[(&'static str, String)]) -> Vec<Failure> {
     failures
 }
 
-/// What a panic said, where it said anything.
+/// What a panic said, where it said anything, as it said it: the text a failure is classed by.
 fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<String>()
         .cloned()
         .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
         .unwrap_or_else(|| "the part stopped without saying why".to_owned())
+}
+
+/// `text` as the part records or prints it: as it is, or, where it holds a piece of a held key
+/// (`secrets`), only its first words (up to the colon that ends the class a failure begins with)
+/// and a line that says the rest is not kept.
+fn recorded_text(text: &str, secrets: &[&str]) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if !holds_a_key(&lines, secrets) {
+        return text.to_owned();
+    }
+    let head = text
+        .match_indices([':', '\n'])
+        .find(|(at, _)| *at > 0 && !holds_a_key(&[&text[..*at]], secrets))
+        .map_or("", |(at, _)| &text[..=at.min(text.len() - 1)]);
+    let head = head.trim_end_matches('\n');
+    format!("{head} (the rest holds a key, so it is not kept)")
+}
+
+/// [`recorded_text`] with the values of the keys the part holds, which a part with a login sets at
+/// its start.
+fn kept_panic_text(text: &str) -> String {
+    let held = HELD_FOR_PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let held: Vec<&str> = held.iter().map(String::as_str).collect();
+    recorded_text(text, &held)
 }
 
 /// Runs one part on a stage of its own, closes the stage, and appends the part's outcome once the
@@ -1977,6 +2206,23 @@ fn staged(
             .into_iter()
             .filter(|value| key.as_ref().is_none_or(|(_, own)| own != value))
             .collect();
+        // A value a result's own syntax could hide, because JSON writes it differently from the
+        // bytes the searches look for, cannot be held out or found in one: the part does not start.
+        // From here every panic's message goes through the held-key rule before it is printed.
+        gate_panics(
+            &others
+                .iter()
+                .cloned()
+                .chain(key.iter().map(|(_, value)| value.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let unsearchable = unsearchable_count(key.as_ref().map(|(_, own)| own.as_str()), &others);
+        assert!(
+            unsearchable == 0,
+            "{ISOLATION_UNPROVEN} {unsearchable} key value(s), the login's own among them or the \
+             person's shell's other keys, have a quote, bracket, backslash or control character, so \
+             a result could not be searched for them: have them unset for the run, or use another key"
+        );
         let person_home =
             PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
         let mut account = account;
@@ -2093,6 +2339,18 @@ fn staged(
     });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
+    // An agent that keeps its conversations in a database: the files the part reads are exported from
+    // it while the part runs and once more, whole, when everything the part started has ended.
+    let mirroring = login
+        .as_ref()
+        .and_then(|login| login.account.mirror.as_ref())
+        .map(|mirror| {
+            Mirroring::start(
+                run.home().join(&mirror.database),
+                mirror.query.clone(),
+                root.join(mirror::DIRECTORY),
+            )
+        });
     // The person's list of workspaces before anything starts: it may only gain the run's folder. A
     // copy of its bytes goes to the part's private evidence, for the one case that restores it.
     let workspaces = login.as_ref().and_then(|login| {
@@ -2217,6 +2475,11 @@ fn staged(
     } else {
         Ok(())
     };
+    // The mirror's last export, once nothing the part started can write the agent's database.
+    let mirror_failure = mirroring
+        .map(Mirroring::finish)
+        .and_then(Result::err)
+        .map(|why| format!("the agent's conversations could not be mirrored: {why}"));
     // The search for the login's strings and for a subagent's start comes before anything is
     // cleaned up, so what the cleanup removes was searched.
     let searched = login
@@ -2230,13 +2493,18 @@ fn staged(
         .unwrap_or_default()
         .into_iter()
         .chain(login.iter().flat_map(|login| {
-            login.others.iter().cloned().chain(
-                login
-                    .key
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .filter(|value| confine::searchable(value)),
-            )
+            login
+                .others
+                .iter()
+                .filter(|value| confine::searchable(value))
+                .cloned()
+                .chain(
+                    login
+                        .key
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .filter(|value| confine::searchable(value)),
+                )
         }))
         .collect();
     let removable: Vec<PathBuf> = login
@@ -2565,19 +2833,26 @@ fn staged(
     let mut outcome = match result {
         Ok(outcome) => outcome,
         Err(panic) => {
+            // A part that refused a dialog before it failed says so where its failure is read.
+            if let Ok(declined) = declined.lock() {
+                for note in declined.iter() {
+                    eprintln!("a request the part refused before it failed: {note}");
+                }
+            }
             // A part with a login that stopped part way still says what it left, the process
             // numbers its sessions ran, and whether its agent stops, before its failure goes on.
             if needs_login {
-                let said = panic_text(&*panic);
-                let class = if said.starts_with(LOGIN_UNPROVEN) {
+                let raw = panic_text(&*panic);
+                let class = if raw.starts_with(LOGIN_UNPROVEN) {
                     Some("login_not_established")
-                } else if said.starts_with(ISOLATION_UNPROVEN) {
+                } else if raw.starts_with(ISOLATION_UNPROVEN) {
                     Some("isolation_not_established")
-                } else if said.starts_with(GUARD_CHANGED) && guard_change.is_none() {
-                    Some(guard_class(&said))
+                } else if raw.starts_with(GUARD_CHANGED) && guard_change.is_none() {
+                    Some(guard_class(&raw))
                 } else {
                     None
                 };
+                let said = kept_panic_text(&raw);
                 if let Some(class) = class {
                     stop.push((class, said.clone()));
                 }
@@ -2621,15 +2896,17 @@ fn staged(
                 // The session ran something other than the build, held a variable the build list
                 // clears, or its names could not be read, so the part did not test it: not run,
                 // as the harness records such a part.
-                let not_run = said
+                // The class is read from what the failure said, and the text kept of it is held to
+                // the key rule: where it holds a piece of a key, only its first words are kept.
+                let not_run = raw
                     .find(NOT_PINNED)
                     .map(|at| (at, Failure::NotPinned))
                     .or_else(|| {
-                        said.starts_with(ENVIRONMENT_NOT_CLEAR)
+                        raw.starts_with(ENVIRONMENT_NOT_CLEAR)
                             .then_some((0, Failure::EnvironmentNotClear))
                     })
                     .or_else(|| {
-                        said.starts_with(ENVIRONMENT_NOT_READ)
+                        raw.starts_with(ENVIRONMENT_NOT_READ)
                             .then_some((0, Failure::EnvironmentNotRead))
                     });
                 // The part's own code goes with the classes of what stopped the agent.
@@ -2641,8 +2918,8 @@ fn staged(
                 failures.extend(stop_failures(&stop));
                 let outcome = match not_run {
                     Some((at, failure)) if stop.is_empty() => {
-                        Outcome::not_run(part, test, &said[at..], evidence)
-                            .with_failures(&[failure])
+                        let said = kept_panic_text(&raw[at..]);
+                        Outcome::not_run(part, test, &said, evidence).with_failures(&[failure])
                     }
                     _ if stop.is_empty() => {
                         Outcome::failed(part, test, &said, evidence).with_failures(&failures)
@@ -2681,10 +2958,16 @@ fn staged(
         if let Some(evidence) = outcome.evidence.as_object_mut() {
             evidence.insert("stop_agent".to_owned(), json!(true));
         }
+        // What the part itself found wrong stays in the reason, in front of the stop.
+        let own = (outcome.outcome == "failed")
+            .then(|| outcome.reason.clone())
+            .flatten()
+            .map(|reason| format!("{reason}; and "))
+            .unwrap_or_default();
         outcome = Outcome::failed(
             part,
             test,
-            &format!("the agent stops here: {}", stop_text(&stop)),
+            &format!("{own}the agent stops here: {}", stop_text(&stop)),
             outcome.evidence.clone(),
         )
         .with_failures(&stop_failures(&stop));
@@ -2692,6 +2975,10 @@ fn staged(
     if let Some(why) = key_failure {
         outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
             .with_failures(&[Failure::KeyScanIncomplete]);
+    }
+    if let Some(why) = mirror_failure {
+        outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
+            .with_failures(&[Failure::PartFailed]);
     }
     // The result is held against every string searched for before it is written, and the message
     // of the failure is the one that is kept.
@@ -3393,6 +3680,10 @@ fn conversation_roots(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
 
 /// Where the agent keeps its conversations for a part with `login` in `run`, on `dates`.
 fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<PathBuf> {
+    // An agent that keeps its conversations in a database has them read from the mirror's files.
+    if login.account.mirror.is_some() {
+        return vec![run.root().join(mirror::DIRECTORY)];
+    }
     let base = if login.account.config_directory.is_some() {
         run.root().join(CONFIG_DIRECTORY)
     } else {
@@ -3412,6 +3703,20 @@ fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<Pat
             None => base.join(relative),
         })
         .collect()
+}
+
+/// The identifier of the conversation `file` holds: the member of its first line the build list names,
+/// where it names one, else what its name and place say.
+fn conversation_id_of(account: &Account, file: &Path) -> String {
+    account
+        .conversation_id_member
+        .as_deref()
+        .and_then(|member| {
+            let text = std::fs::read_to_string(file).ok()?;
+            let first: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+            first[member].as_str().map(str::to_owned)
+        })
+        .unwrap_or_else(|| conversation_id(file))
 }
 
 /// The files under a part's conversation roots, each with its length, modification time and
@@ -3534,7 +3839,10 @@ impl Logged {
             {
                 std::panic::resume_unwind(panic);
             }
-            panic!("{LOGIN_UNPROVEN} the agent did not reach its composer with it: {said}")
+            panic!(
+                "{LOGIN_UNPROVEN} the agent did not reach its composer with it: {}",
+                kept_panic_text(&said)
+            )
         });
         // The composer's own screen says so where the agent found no login, before any turn.
         let account = stage.login.expect("a part with a login").account();
@@ -3698,8 +4006,18 @@ impl Logged {
         stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         self.turns += 1;
         self.type_text(stage, text);
-        // Keys that arrive together can be read as one paste, whose line end is text and not a
-        // submission, so the submission follows on its own.
+        // An agent that is busy drawing a reply can take what was typed late, and the line end
+        // typed after it then arrives with it, as one paste whose line end is text and not a
+        // submission: the submission waits until the screen shows what was typed (ten seconds at
+        // most, after which the part goes on and its own checks say what happened), and then for
+        // a moment, so that it arrives on its own.
+        let shown_by = std::time::Instant::now() + Duration::from_secs(10);
+        while !typed_text_shows(&self.screen.view.rows(), text)
+            && std::time::Instant::now() < shown_by
+        {
+            guards_hold_while_waiting(stage);
+            self.screen.pump(stage, Duration::from_millis(200));
+        }
         std::thread::sleep(Duration::from_millis(300));
         self.no_dialog_now(stage, "where the part was about to submit");
         self.type_text(stage, key);
@@ -3776,11 +4094,12 @@ impl Logged {
         } else {
             account.approval.refusal().to_owned()
         };
+        let rows = self.screen.view.rows();
         self.type_text(stage, &key);
         if let Ok(mut declined) = stage.declined.lock() {
-            declined.push(format!(
-                "{why}: a dialog showing {shown:?}, refused with {key:?}"
-            ));
+            let held = held_keys(stage);
+            let held: Vec<&str> = held.iter().map(String::as_str).collect();
+            declined.push(refusal_note(why, shown, &key, &rows, &held));
         }
         let started = std::time::Instant::now();
         while started.elapsed() < Duration::from_secs(10)
@@ -3941,7 +4260,7 @@ impl Logged {
             {
                 panic!(
                     "{LOGIN_UNPROVEN} the agent shows {shown:?}: {}",
-                    panic_text(&*panic)
+                    kept_panic_text(&panic_text(&*panic))
                 );
             }
             std::panic::resume_unwind(panic)
@@ -4071,22 +4390,27 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
                 None => argument.clone(),
             })
             .collect();
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("exec \"$0\" \"$@\"")
-            .arg(&stage.build.command)
-            .args(&arguments)
-            .args(&switches)
-            .env_clear()
-            .envs(
-                variables
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_str())),
-            )
-            .current_dir(stage.run.work())
-            .stdin(std::process::Stdio::null());
-        let output = probe_output(stage, command)?;
+        // An agent's first start in a fresh home can find its own database still locked by the start
+        // before it: a probe whose whole answer is that is started again, a few times, through the
+        // same guards each time.
+        let output = started_again(3, Duration::from_secs(3), || {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("exec \"$0\" \"$@\"")
+                .arg(&stage.build.command)
+                .args(&arguments)
+                .args(&switches)
+                .env_clear()
+                .envs(
+                    variables
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                )
+                .current_dir(stage.run.work())
+                .stdin(std::process::Stdio::null());
+            probe_output(stage, command)
+        })?;
         let accepted = match &probe.accepted {
             Some(block) => Some(
                 std::fs::read_to_string(login.person_home.join(&block.file))
@@ -4137,7 +4461,14 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             }
             None => {
                 if !output.status.success() {
-                    return Err(format!("it exited {}", output.status));
+                    let held = held_keys(stage);
+                    let held: Vec<&str> = held.iter().map(String::as_str).collect();
+                    return Err(probe_failed(
+                        &output.status.to_string(),
+                        &output.stderr,
+                        account.home == AccountHome::Run,
+                        &held,
+                    ));
                 }
                 let text = String::from_utf8_lossy(&output.stdout).into_owned()
                     + &String::from_utf8_lossy(&output.stderr);
@@ -4146,6 +4477,16 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         }
     };
     guards_hold(stage);
+    // The files an agent searches for up the tree come before any program of it runs, the probes
+    // included: one that was there would load into them.
+    for path in absent_paths(stage, Absent::Ancestors) {
+        assert!(
+            !path.exists(),
+            "{ISOLATION_UNPROVEN} {} exists, which an agent searches for up the tree and would load \
+             into its environment",
+            path.display()
+        );
+    }
     if let Some(status) = &account.status {
         answered(status).unwrap_or_else(|why| {
             panic!(
@@ -4166,7 +4507,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         });
     }
     confine_holds(stage);
-    for path in absent_paths(stage) {
+    for path in absent_paths(stage, Absent::All) {
         assert!(
             !path.exists(),
             "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks or \
@@ -4361,7 +4702,20 @@ fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
 /// The files the build list says must not exist before the agent starts, with `{config}` and
 /// `{work}` made the run's configuration and working directories, `{home}` the home the agent runs
 /// with, and `{user}` the account name the system has for the person, as `id -un` says it.
-fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
+/// Which of an entry's `absent` paths [`absent_paths`] gives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Absent {
+    /// Every path, each `{ancestors}` entry expanded for every folder above the working folder.
+    All,
+    /// Only the `{ancestors}` entries, expanded: the files an agent searches for up the tree, which
+    /// must be known absent before any program of the agent runs.
+    Ancestors,
+    /// Every path, with an `{ancestors}` entry as its template, for the record.
+    Published,
+}
+
+/// The paths of the entry's `absent` list that `which` selects, with each template filled in.
+fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
     let home = login_home(stage).display().to_string();
     let config = stage
@@ -4388,17 +4742,45 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
         .unwrap_or_else(|| {
             panic!("{ISOLATION_UNPROVEN} the account name the system has cannot be read")
         });
+    // `{ancestors}` stands for the working folder and each folder above it, as given and as the system
+    // resolves it, for a file an agent searches for up the tree.
+    let folders: Vec<String> = {
+        let mut seen = Vec::new();
+        for start in [stage.run.work(), folder_of(stage.run)] {
+            for folder in start.ancestors() {
+                let text = folder.display().to_string();
+                let text = if text == "/" { String::new() } else { text };
+                if !seen.contains(&text) {
+                    seen.push(text);
+                }
+            }
+        }
+        seen
+    };
     account
         .absent
         .iter()
-        .map(|path| {
-            PathBuf::from(
-                path.replace("{config}", &config)
-                    .replace("{work}", &work)
-                    .replace("{home}", &home)
-                    .replace("{person}", &person)
-                    .replace("{user}", &user),
-            )
+        .filter(|path| which != Absent::Ancestors || path.contains("{ancestors}"))
+        .flat_map(|path| {
+            let expand = |path: &str| {
+                PathBuf::from(
+                    path.replace("{config}", &config)
+                        .replace("{work}", &work)
+                        .replace("{home}", &home)
+                        .replace("{person}", &person)
+                        .replace("{user}", &user),
+                )
+            };
+            if path.contains("{ancestors}") && which == Absent::Published {
+                vec![PathBuf::from(path)]
+            } else if path.contains("{ancestors}") {
+                folders
+                    .iter()
+                    .map(|folder| expand(&path.replace("{ancestors}", folder)))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![expand(path)]
+            }
         })
         .collect()
 }
@@ -4527,6 +4909,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "stored": login.account.stored,
         "home": login.account.home,
         "variable": login.account.variable,
+        "mirror": login.account.mirror.is_some(),
         "arguments": login.account.arguments,
         "variables_absent": login.account.cleared,
         "turns": turns,
@@ -4538,7 +4921,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
             "tools_offered": stage.offered.lock().map(|offered| offered.clone()).unwrap_or_default(),
             "switches": switches_of(stage),
             "servers_switched_off": server_names(stage),
-            "absent_before_start": absent_paths(stage),
+            "absent_before_start": absent_paths(stage, Absent::Published),
         },
     })
 }
@@ -6024,7 +6407,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             ),
             "an image and its question",
         );
-        let answered_rows = logged.answered(stage, &upper, "the agent answers from the image");
+        let mut answered_rows = logged.answered(stage, &upper, "the agent answers from the image");
         let named = |rows: &[String]| {
             rows.iter().any(|row| {
                 row.contains(&upper)
@@ -6033,6 +6416,14 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
                         .any(|word| word == COLOUR)
             })
         };
+        // A model's displayed reasoning can quote the code before its answer: the wait goes on until
+        // a row holds the code beside the colour, which only the answer does, or the time is up.
+        let waited = std::time::Instant::now();
+        while !named(&answered_rows) && waited.elapsed() < LIVENESS {
+            guards_hold_while_waiting(stage);
+            logged.screen.pump(stage, Duration::from_millis(300));
+            answered_rows = logged.screen.view.rows().to_vec();
+        }
         assert!(
             named(&answered_rows),
             "the answer names the image's colour, {COLOUR}, beside the code:\n{}",
@@ -6233,16 +6624,37 @@ fn turn_runs(
     prompt: Option<usize>,
     done: &str,
 ) -> Running {
+    turn_runs_within(stage, logged, conversation, prompt, done, Duration::ZERO)
+}
+
+/// [`turn_runs`], where the screen is read again for up to `within` while it does not yet show the
+/// agent busy: an agent drawing its reply redraws its whole screen, and a read that lands between
+/// two draws shows neither its busy text nor its composer.
+fn turn_runs_within(
+    stage: &Stage<'_, '_>,
+    logged: &mut Logged,
+    conversation: &Path,
+    prompt: Option<usize>,
+    done: &str,
+    within: Duration,
+) -> Running {
     let account = stage.login.expect("a part with a login").account();
-    logged.screen.pump(stage, Duration::from_millis(50));
-    Running {
-        busy: logged
+    let until = std::time::Instant::now() + within;
+    loop {
+        logged.screen.pump(stage, Duration::from_millis(50));
+        let busy = logged
             .screen
             .view
             .rows()
             .iter()
-            .any(|row| row.contains(&account.busy)),
-        unfinished: first_line_with(conversation, prompt, &[done, &account.reply_line]).is_none(),
+            .any(|row| row.contains(&account.busy));
+        if busy || std::time::Instant::now() >= until {
+            return Running {
+                busy,
+                unfinished: first_line_with(conversation, prompt, &[done, &account.reply_line])
+                    .is_none(),
+            };
+        }
     }
 }
 
@@ -6390,6 +6802,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         );
         if !account.dismiss.is_empty() {
             logged.type_text(stage, &account.dismiss);
+            // Keys typed while the slash command's screen is still closing would go to it.
+            logged.dialog_goes(
+                stage,
+                &account.slash.shows,
+                "the slash command's screen closes",
+            );
         }
         let _ = logged.wait_idle(stage, "the composer is back after the slash command");
         // An interrupt of a long turn.
@@ -6398,27 +6816,17 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         // Interrupted before its reply begins, a turn can be withdrawn whole rather than stopped:
         // the key goes once the reply is on the screen, by the agent's own mark at a reply's start
         // or, where it has none, by the code the reply is asked to begin with.
-        let (long_turn, reply_begins) = match &account.reply_mark {
-            Some(reply_mark) => (
-                format!(
-                    "Without using any tool or file, count from 1 to 400 in your reply, one number \
-                     per line, and write nothing else. ({mark}-i)"
-                ),
-                reply_mark.clone(),
-            ),
-            None => (
-                format!(
-                    "Without using any tool or file, write the code {mark} in upper case on the \
-                     first line of your reply, then count from 1 to 400, one number per line, and \
-                     write nothing else. ({mark}-i)"
-                ),
-                upper.clone(),
-            ),
-        };
+        let (long_turn, reply_begins) = long_turn(&mark, account.reply_mark.as_deref());
         logged.submit(stage, &long_turn, "a long turn to interrupt");
         let _ = logged.wait_for(stage, &account.busy, "the turn runs");
         let _ = logged.wait_for(stage, &reply_begins, "the turn's reply begins");
-        logged.type_text(stage, &account.interrupt.input);
+        // An agent whose first press only arms the interrupt wants the key again, as a separate press.
+        for press in 0..account.interrupt_presses.max(1) {
+            if press > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            logged.type_text(stage, &account.interrupt.input);
+        }
         let interrupted = logged.wait_for(
             stage,
             &account.interrupt.shows,
@@ -6459,7 +6867,14 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "a prompt entered during the turn",
             &queue_key,
         );
-        let after_queue = turn_runs(stage, &mut logged, &conversation, None, &queued_done);
+        let after_queue = turn_runs_within(
+            stage,
+            &mut logged,
+            &conversation,
+            None,
+            &queued_done,
+            Duration::from_secs(2),
+        );
         assert_eq!(
             recorded(
                 stage,
@@ -6933,6 +7348,153 @@ fn local_idle(stage: &Stage<'_, '_>, window: &Window, why: &str) -> Vec<String> 
     }
 }
 
+/// How many of the values a part searches for cannot be held out of a result or found in one, the
+/// login's own value (`own`) and the other keys the person's shell holds (`others`), each counted
+/// once.
+fn unsearchable_count(own: Option<&str>, others: &[String]) -> usize {
+    let mut values: Vec<&str> = others.iter().map(String::as_str).collect();
+    values.extend(own);
+    values.sort_unstable();
+    values.dedup();
+    values
+        .into_iter()
+        .filter(|value| !confine::searchable(value))
+        .count()
+}
+
+/// The longest whitespace-separated word of `text`, without the punctuation at its ends (an agent
+/// can drop a question mark or redraw a bracket), the first of them where several are as long.
+fn longest_word(text: &str) -> &str {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .fold("", |longest, word| {
+            if word.len() > longest.len() {
+                word
+            } else {
+                longest
+            }
+        })
+}
+
+/// Whether the screen `rows` shows the prompt `text` typed into a composer: its longest word is on
+/// some row. A prompt with no words is shown.
+fn typed_text_shows(rows: &[String], text: &str) -> bool {
+    let word = longest_word(text);
+    word.is_empty() || rows.iter().any(|row| row.contains(word))
+}
+
+/// The markers of the part's two commands, the approved one and the control's, each `kr` and six
+/// hexadecimal digits of the part's mark: the last six and the first six after its `kr`. They are
+/// as long as each other, so the control's command fits the agent's dialog where the first does.
+///
+/// # Panics
+///
+/// Panics when the two are the same, which would let one command's marker stand for the other's.
+fn approval_markers(mark: &str) -> (String, String) {
+    let first = format!("kr{}", &mark[mark.len() - 6..]);
+    let second = format!("kr{}", &mark[2..8]);
+    assert_ne!(first, second, "the part's two markers are the same");
+    (first, second)
+}
+
+/// The question session B asks of the conversation it resumed, and its words before the question
+/// mark, by which the conversation is searched for it.
+const RESUMED_QUESTION: &str =
+    "What code did I ask you to remember? Reply with only the code, in upper case.";
+const RESUMED_QUESTION_WORDS: &str = "What code did I ask you to remember";
+
+/// Whether what a failed probe wrote to its error output is the agent's database being locked at its
+/// start and nothing else: its lines, without colour codes, are the agent's "Unexpected error" line
+/// and the lock's own, and the lock's is there.
+fn lock_failure(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr);
+    let mut plain = String::new();
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            plain.push(character);
+            continue;
+        }
+        // Only a whole colour sequence is skipped: `ESC [`, digits and semicolons, `m`. Any other
+        // escape, or one that does not end, is not the agent's colouring and refuses the output.
+        if characters.next() != Some('[') {
+            return false;
+        }
+        loop {
+            match characters.next() {
+                Some(next) if next.is_ascii_digit() || next == ';' => {}
+                Some('m') => break,
+                _ => return false,
+            }
+        }
+    }
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.contains(&"database is locked")
+        && lines
+            .iter()
+            .all(|line| matches!(*line, "database is locked" | "Error: Unexpected error"))
+}
+
+/// Starts a probe with `start` and, while it ends in a failure that is the agent's database being
+/// locked and nothing else (no output, an error output that is the lock alone), starts it again, up
+/// to `times` starts in all, `wait` apart; returns the last start's output. Any other end is
+/// returned at once.
+fn started_again(
+    times: usize,
+    wait: Duration,
+    mut start: impl FnMut() -> Result<std::process::Output, String>,
+) -> Result<std::process::Output, String> {
+    let mut output = start()?;
+    for _ in 1..times {
+        // Only a start that said nothing but the lock: what a failed start wrote to its output is
+        // evidence a later, clean start must not replace.
+        if output.status.success() || !output.stdout.is_empty() || !lock_failure(&output.stderr) {
+            break;
+        }
+        eprintln!("a probe is started again: the agent's database was locked at its start");
+        std::thread::sleep(wait);
+        output = start()?;
+    }
+    Ok(output)
+}
+
+/// The prompt of the long turn an interrupt stops and what the screen shows while the reply runs: the
+/// agent's own reply mark where it has one, else the part's code in upper case, which the reply is
+/// asked to write at the start of every line.
+fn long_turn(mark: &str, reply_mark: Option<&str>) -> (String, String) {
+    match reply_mark {
+        Some(reply_mark) => (
+            format!(
+                "Without using any tool or file, count from 1 to 400 in your reply, one number per \
+                 line, and write nothing else. ({mark}-i)"
+            ),
+            reply_mark.to_owned(),
+        ),
+        None => (
+            format!(
+                "Without using any tool or file, write the code {mark} in upper case at the start \
+                 of every line of your reply, then a space and the number, count from 1 to 400, one \
+                 number per line, and write nothing else. ({mark}-i)"
+            ),
+            mark.to_uppercase(),
+        ),
+    }
+}
+
+/// The answers among `answers` that a screen shows when they are typed: the ones with no control
+/// character in them, and not empty.
+fn visible_answers<'a>(answers: &[&'a str]) -> Vec<&'a str> {
+    answers
+        .iter()
+        .copied()
+        .filter(|answer| !answer.is_empty() && !answer.chars().any(char::is_control))
+        .collect()
+}
+
 /// Whether the composer shows either answer typed again before `probe`, which was typed into an
 /// empty composer: an answer the host replayed after a reconnection lands there first.
 fn replayed(rows: &[String], probe: &str, answers: &[&str]) -> Result<(), String> {
@@ -6977,7 +7539,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         // part's mark cut to its last six characters, and the prompt carries the whole mark beside
         // it.
         let log = stage.run.work().join("a");
-        let tag = format!("kr{}", &mark[mark.len() - 6..]);
+        let (tag, second) = approval_markers(&mark);
         // Where the folder's absolute path does not fit a line of the dialog, the log is named
         // relative to the folder the agent works in, and the agent's own record of the request must
         // name that folder before the command is answered.
@@ -7161,16 +7723,21 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             account.approval.allow.as_str(),
             account.approval.deny.as_str(),
         ];
-        replayed(&probed, &probe, &answers)
-            .unwrap_or_else(|why| panic!("nothing is typed again after reconnecting: {why}"));
+        // An answer that is a control key shows nowhere on the screen, so the screen can say only
+        // that no answer that shows was typed again. For a control key the counts of executions and
+        // of recorded answers above are the evidence, and they establish outcomes, not every key
+        // delivered: a key typed again while a dialog stayed open changes neither count if the
+        // agent ignores it, and one typed into an idle composer changes neither. The record says
+        // `screen_checked` and does not claim to have excluded either.
+        let visible = visible_answers(&answers);
+        let replay_control = visible.first().map(|answer| {
+            replayed(&probed, &probe, &visible)
+                .unwrap_or_else(|why| panic!("nothing is typed again after reconnecting: {why}"));
+            replayed(&[format!("> {answer}{probe}")], &probe, &visible)
+        });
         logged.type_text(stage, &account.clear);
-        let replay_control = replayed(
-            &[format!("> {}{probe}", account.approval.allow)],
-            &probe,
-            &answers,
-        );
         assert!(
-            replay_control.is_err(),
+            replay_control.as_ref().is_none_or(Result::is_err),
             "the replay check rejects an answer typed again before the probe"
         );
         // The control: the local terminal attaches again and holds the lease; a second approval,
@@ -7186,8 +7753,13 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         answered(&local, local.answer_capability_queries(0));
         std::thread::sleep(Duration::from_millis(500));
-        let second = format!("{tag}-2");
         let second_command = format!("echo {second} >> {logs_at}");
+        assert!(
+            account.approval.command_line.as_deref().unwrap_or("").len() + second_command.len() + 8
+                <= usize::from(kr_e2e_m1b::window::COLUMNS),
+            "the control's command, {} characters, would not fit on one line of the agent's dialog",
+            second_command.len()
+        );
         guards_hold(stage);
         let _ = stage
             .login
@@ -7272,6 +7844,23 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
              {device_refused:?}, and the conversation records the denial as one more answer \
              ({decided_control} after {decided})"
         );
+        // Where the agent records the calls of its shell tool, that record, and not the screen, says
+        // what was approved: it holds the part's two commands, each whole as the tool received it,
+        // and no other, which the dialog's rows cannot show (a character the screen trims or never
+        // draws).
+        if let Some(recorded) = &account.approval.recorded {
+            let text = std::fs::read_to_string(&conversation).unwrap_or_default();
+            let commands =
+                kr_e2e_agents::conversation::recorded_commands(&text, prompt_at, recorded)
+                    .unwrap_or_else(|why| panic!("the agent's record of its calls: {why}"));
+            let wanted: std::collections::BTreeSet<String> =
+                [command.clone(), second_command.clone()].into();
+            assert_eq!(
+                commands, wanted,
+                "the agent's record of its shell calls holds the part's two commands, each whole, \
+                 and no other"
+            );
+        }
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
@@ -7280,8 +7869,8 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": { "shows": "input lease", "seen": shown_in_log(stage, "the local terminal's receipt", &receipt, "input lease") }, "exit_status": local_status },
             "command": command,
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
-            "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
-            "replay": { "probe": probe, "typed_again": false, "checker_control_rejected": replay_control.is_err() },
+            "decisions": { "conversation": conversation_id_of(account, &conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
+            "replay": { "probe": probe, "typed_again": false, "screen_checked": replay_control.is_some(), "checker_control_rejected": replay_control.as_ref().is_some_and(Result::is_err) },
             "resources": snapshot.agent_resources.resources.len(),
             "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "command": second_command, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
         });
@@ -7486,7 +8075,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             }
             let evidence = json!({
                 "account": account_evidence(stage, logged.turns),
-                "conversation": conversation_id(&conversation),
+                "conversation": conversation_id_of(account, &conversation),
                 "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, the device was sent or asked for a fresh screen in that time, or its reader was not seen to stop once it disconnected",
                 "code_seen": code_seen,
                 "reader_stopped": reader_stopped,
@@ -7525,7 +8114,12 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
         logged.screen = Watch::open(stage, &logged.agent.session);
-        let redrawn = logged.answered(stage, &end, "the new connection is drawn the reply");
+        let _ = logged.answered(stage, &end, "the new connection is drawn the reply");
+        // A model's displayed reasoning can quote the code before the reply: the part goes on once the
+        // turn has ended and the agent's record holds the reply that closes it.
+        let _ = logged.wait_idle(stage, "the agent is back at its composer after the redraw");
+        settled_line(stage, &conversation, &[&end, &account.reply_line]);
+        let redrawn = logged.screen.view.rows().to_vec();
         let (prompts, replies) = count(&conversation);
         once(prompts, replies)
             .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
@@ -7561,7 +8155,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
-            "conversation": conversation_id(&conversation),
+            "conversation": conversation_id_of(account, &conversation),
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
@@ -7607,7 +8201,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &account.prompt_line,
             stage.conversations_before,
         )
-        .map(|file| conversation_id(&file))
+        .map(|file| conversation_id_of(account, &file))
         .unwrap_or_else(|| {
             panic!(
                 "one conversation under {} holds the code",
@@ -7630,7 +8224,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         let shown_second = detect(stage, &second.agent.session);
         second.submit(
             stage,
-            "What code did I ask you to remember? Reply with only the code, in upper case.",
+            RESUMED_QUESTION,
             "the resumed conversation's question",
         );
         let upper = mark.to_uppercase();
@@ -7652,14 +8246,10 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
                 settled_line(
                     stage,
                     &file,
-                    &["What code did I ask you to remember?", &account.prompt_line],
+                    &[RESUMED_QUESTION_WORDS, &account.prompt_line],
                 );
-                first_line_with(
-                    &file,
-                    None,
-                    &["What code did I ask you to remember?", &account.prompt_line],
-                )
-                .is_some()
+                first_line_with(&file, None, &[RESUMED_QUESTION_WORDS, &account.prompt_line])
+                    .is_some()
             })
         });
         // Two executions, each detected on its own, kept apart.
@@ -7693,11 +8283,22 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         );
         // The control: B's marker typed into A's session, and the check fails on it.
         first.type_text(stage, &format!(" {mark_b}"));
-        let control_rows = fresh_rows(stage, &first.agent.session);
+        // The agent draws what was typed a moment after it takes it: session A's screen is read
+        // again, fresh each time, until it shows the marker that was typed into it (ten seconds at
+        // most, after which what it shows is the answer).
+        let shown_by = std::time::Instant::now() + Duration::from_secs(10);
+        let mut control_rows = fresh_rows(stage, &first.agent.session);
+        while !control_rows.iter().any(|row| row.contains(&mark_b))
+            && std::time::Instant::now() < shown_by
+        {
+            std::thread::sleep(Duration::from_millis(500));
+            control_rows = fresh_rows(stage, &first.agent.session);
+        }
         let control = isolated(&control_rows, &rows_b);
         assert!(
-            !control,
-            "the isolation check fails once B's marker is in A's session"
+            !control && control_rows.iter().any(|row| row.contains(&mark_b)),
+            "the isolation check fails once B's marker is in A's session; session A's screen then:\n{}",
+            control_rows.join("\n")
         );
         first.type_text(stage, &account.clear);
         second.type_text(stage, &account.clear);
@@ -7862,7 +8463,7 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
 
 /// The variables a person's own shell can hold that would give an agent another model account,
 /// with the harmless one a control passes alongside them: each with a value that is no key.
-const PROVIDER_KEYS_HELD: [&str; 32] = [
+const PROVIDER_KEYS_HELD: [&str; 35] = [
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "CODEX_API_KEY",
@@ -7892,6 +8493,9 @@ const PROVIDER_KEYS_HELD: [&str; 32] = [
     "AZURE_API_KEY",
     "CLOUDFLARE_API_TOKEN",
     "SOME_PROVIDER_BASE_URL",
+    "CLARIFAI_PAT",
+    "WATSONX_AI_APIKEY",
+    "PRIVATEMODE_ENDPOINT",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "KR_SESSION_TOKEN",
@@ -7925,6 +8529,29 @@ fn a_session_exports_no_provider_key_but_those_the_build_list_sets_and_a_harmles
         eprintln!("skipping: the provider-key check: the build list names no login for this agent");
         return;
     };
+    // The entry switches the agent's updates and installs off in what its parts give the agent; the same entry
+    // with a switch it does not give is refused, and so is one that names none.
+    build
+        .installs_are_off()
+        .unwrap_or_else(|why| panic!("the installs check: {why}"));
+    let mut unswitched = build.clone();
+    if let Some(account) = unswitched.account.as_mut() {
+        account.installs_off.push(InstallSwitch::Variable {
+            name: "KR_NO_SUCH_SWITCH".to_owned(),
+            value: "1".to_owned(),
+        });
+    }
+    let refused = unswitched
+        .installs_are_off()
+        .expect_err("a switch the entry does not give");
+    assert!(refused.contains("KR_NO_SUCH_SWITCH"), "{refused}");
+    if let Some(account) = unswitched.account.as_mut() {
+        account.installs_off.clear();
+    }
+    let refused = unswitched
+        .installs_are_off()
+        .expect_err("an entry that names no switch");
+    assert!(refused.contains("names no switch"), "{refused}");
     let shell = match shells::managed_zsh() {
         Ok(shell) => shell,
         Err(why) if shells::required() => panic!("the provider-key check's managed shell: {why}"),
@@ -7990,13 +8617,7 @@ fn a_session_exports_no_provider_key_but_those_the_build_list_sets_and_a_harmles
             "{name} reached the session"
         );
     }
-    for name in [
-        "HARMLESS_CONTROL",
-        "KR_SESSION_TOKEN",
-        "PATH",
-        "HOME",
-        "ZDOTDIR",
-    ] {
+    for name in ["HARMLESS_CONTROL", "PATH", "HOME", "ZDOTDIR"] {
         assert!(
             names.contains(&name),
             "{name} is exported: a harmless variable passes"
@@ -8195,6 +8816,478 @@ fn a_process_of_the_agent_is_found_by_either_name_and_is_the_parts_own_by_its_pa
     assert!(view_of("", &names).named.is_empty());
     assert!(view_of("not a listing\n", &names).named.is_empty());
     assert!(agent_processes(&["no-such-program-kr".to_owned()]).is_ok_and(|pids| pids.is_empty()));
+}
+
+/// The values a part's searches cannot be sure of finding in a result are counted whoever's they
+/// are: the login's own value as much as the other keys the person's shell holds.
+#[test]
+fn a_value_a_result_could_hide_is_counted_whether_it_is_the_logins_own_or_another_key() {
+    let plain = "sk-or-v1-0123456789abcdef".to_owned();
+    let quoted = "sk-or-v1-0123\"456789abcdef".to_owned();
+    let lined = "sk-or-v1-0123\n456789abcdef".to_owned();
+    assert_eq!(
+        unsearchable_count(Some(&plain), std::slice::from_ref(&plain)),
+        0
+    );
+    assert_eq!(unsearchable_count(None, &[]), 0);
+    assert_eq!(
+        unsearchable_count(Some(&quoted), &[]),
+        1,
+        "the login's own value"
+    );
+    assert_eq!(
+        unsearchable_count(Some(&lined), &[]),
+        1,
+        "the login's own value"
+    );
+    assert_eq!(
+        unsearchable_count(
+            Some(&plain),
+            &[quoted.clone(), "a\\b-0123456789".to_owned()]
+        ),
+        2,
+        "the other keys"
+    );
+    assert_eq!(
+        unsearchable_count(Some(&quoted), &[quoted.clone(), lined]),
+        2,
+        "the login's own value is counted once, whether or not another key is the same"
+    );
+}
+
+/// A probe that ends with a failure says how it ended, and what it wrote to its error output where
+/// that is safe to say: the run's own home holds nothing of the person's, and the part's log is
+/// searched for every key it was given.
+#[test]
+fn a_probe_that_failed_says_what_it_wrote_only_where_the_run_holds_nothing_of_the_persons() {
+    let written = b"error: cannot open the database\nat start (file.ts:1)\n".as_slice();
+    assert_eq!(
+        probe_failed("exit status: 1", written, false, &[]),
+        "it exited exit status: 1"
+    );
+    assert_eq!(
+        probe_failed("exit status: 1", written, true, &[]),
+        "it exited exit status: 1 and wrote: error: cannot open the database / at start (file.ts:1)"
+    );
+    assert_eq!(
+        probe_failed("exit status: 1", b"  \n", true, &[]),
+        "it exited exit status: 1"
+    );
+    let long = "x".repeat(900).into_bytes();
+    assert!(
+        probe_failed("exit status: 1", &long, true, &[])
+            .chars()
+            .count()
+            < 520
+    );
+    // A key the probe was given, at the place the text is cut or past it, is no part of the note.
+    let key = "sk-or-v1-0123456789abcdef0123456789abcdef";
+    let mut leaking = "y".repeat(380).into_bytes();
+    leaking.extend_from_slice(format!(" key {key} end").as_bytes());
+    let said = probe_failed("exit status: 1", &leaking, true, &[key]);
+    assert_eq!(said, "it exited exit status: 1", "{said}");
+    // Whatever the held values are to one another, and however the output wrapped or clipped one,
+    // a piece of eight characters of a held key anywhere in it stops the whole note.
+    let long_key = "sk-synthetic-1234567890abcdef";
+    for written in [
+        format!("a {long_key} b"),
+        "token sk-synthetic-1234\n567890abcdef end".to_owned(),
+        "token ...567890abcdef end".to_owned(),
+        "abcabcabcabc sk-synthetic-1234 567890abcdef".to_owned(),
+    ] {
+        for held in [
+            vec![long_key],
+            vec!["sk-synthetic-1234", long_key],
+            vec![long_key, "sk-synthetic-1234"],
+        ] {
+            let said = probe_failed("exit status: 1", written.as_bytes(), true, &held);
+            assert_eq!(
+                said, "it exited exit status: 1",
+                "{written:?} {held:?}: {said}"
+            );
+        }
+    }
+    let said = probe_failed("exit status: 1", b"database is locked\n", true, &[long_key]);
+    assert!(said.ends_with("wrote: database is locked"), "{said}");
+}
+
+/// A prompt's own text is shown on a screen once the agent has taken it into its composer; the
+/// longest word of it, which no other row of the part holds unless the part typed it, is what is
+/// looked for, and the same word on a row that wraps is still one word.
+#[test]
+fn a_typed_prompt_is_shown_once_its_longest_word_is_on_the_screen() {
+    let text = "What is 741 plus 830 Reply with only the number. (kr370dcc681495-r)";
+    let rows = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(longest_word(text), "kr370dcc681495-r");
+    // A question mark an agent drops is not part of the word the wait looks for.
+    assert_eq!(
+        longest_word("What code did I ask you to remember? Reply with only the code."),
+        "remember"
+    );
+    assert!(typed_text_shows(
+        &rows(&[
+            " > What is 741 plus 830 Reply with only the number.",
+            " (kr370dcc681495-r)"
+        ]),
+        text
+    ));
+    assert!(typed_text_shows(
+        &rows(&["> [Image colour.png] (kr370dcc681495-r)"]),
+        text
+    ));
+    // The composer still empty while the agent draws its reply: nothing is shown yet.
+    assert!(!typed_text_shows(
+        &rows(&[" >   Type your message or @path/to/file", "  123", "  124"]),
+        text
+    ));
+    assert!(
+        typed_text_shows(&rows(&["anything"]), ""),
+        "an empty prompt has nothing to wait for"
+    );
+}
+
+/// The part's two commands, the one it approves and the one its control denies, are the same length,
+/// so that the second fits the agent's dialog wherever the first does, and neither marker holds the
+/// other.
+#[test]
+fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
+    let (first, second) = approval_markers("kr0123456789ab");
+    assert_eq!((first.as_str(), second.as_str()), ("kr6789ab", "kr012345"));
+    assert_eq!(first.len(), second.len());
+    // Two markers that would be the same stop the part before it types anything.
+    let same = std::panic::catch_unwind(|| approval_markers("kr123456123456"));
+    assert!(same.is_err());
+}
+
+/// The question session B asks of the resumed conversation is looked for in the conversation by its
+/// words before the question mark, which an agent can drop from what a person types.
+#[test]
+fn the_resumed_question_is_found_by_its_words_and_not_by_its_question_mark() {
+    assert!(RESUMED_QUESTION.starts_with(RESUMED_QUESTION_WORDS));
+    assert!(!RESUMED_QUESTION_WORDS.contains('?'));
+    assert!(RESUMED_QUESTION_WORDS.split_whitespace().count() >= 6);
+}
+
+/// An agent's first start in a fresh home can fail because its own database is still locked by the
+/// start before it. A probe whose whole account of itself is that lock is started again, a few
+/// times; one that says anything else besides it, or ends otherwise, is not, and its answer is the
+/// last start's own.
+#[test]
+fn a_probe_is_started_again_only_when_the_lock_is_all_it_said() {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = |code: i32, stderr: &str| std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    let locked = "\u{1b}[91m\u{1b}[1mError: \u{1b}[0mUnexpected error\ndatabase is locked\n";
+    assert!(lock_failure(locked.as_bytes()));
+    assert!(lock_failure(b"database is locked"));
+    assert!(!lock_failure(b""));
+    assert!(!lock_failure(b"Error: Unexpected error\n"));
+    assert!(!lock_failure(
+        b"Error: Unexpected error\ndatabase is locked\nconfig is not valid\n"
+    ));
+    assert!(!lock_failure(b"the config says database is locked"));
+    // An escape that is not a whole colour sequence is not skipped over, and cannot hide text.
+    assert!(!lock_failure(b"database is locked\n\x1b[1~403\n"));
+    assert!(!lock_failure(
+        b"database is locked\n\x1b[91m403 forbidden\n"
+    ));
+    assert!(!lock_failure(b"database is locked\n\x1bX\n"));
+    assert!(!lock_failure(b"database is locked\x1b"));
+
+    let mut starts = 0;
+    let result = started_again(3, Duration::ZERO, || {
+        starts += 1;
+        Ok(if starts < 3 {
+            ended(1, locked)
+        } else {
+            ended(0, "")
+        })
+    });
+    assert!(result.expect("an output").status.success());
+    assert_eq!(starts, 3);
+
+    let mut starts = 0;
+    let result = started_again(3, Duration::ZERO, || {
+        starts += 1;
+        Ok(ended(1, locked))
+    });
+    assert!(!result.expect("an output").status.success());
+    assert_eq!(
+        starts, 3,
+        "the last start's answer is returned after the bound"
+    );
+
+    // A failed start that wrote to its output besides the lock is not started again: a later
+    // start's clean output must not stand in for what the first one said.
+    let mut starts = 0;
+    let with_output = || {
+        starts += 1;
+        let mut output = ended(1, locked);
+        output.stdout = b"loaded ~/.config/opencode/opencode.json".to_vec();
+        Ok(output)
+    };
+    let result = started_again(3, Duration::ZERO, with_output);
+    assert!(result.is_ok());
+    assert_eq!(starts, 1);
+
+    for (stderr, code) in [
+        (
+            "Error: Unexpected error\ndatabase is locked\nconfig is not valid\n",
+            1,
+        ),
+        ("Error: config is not valid\n", 1),
+        ("", 0),
+    ] {
+        let mut starts = 0;
+        let result = started_again(3, Duration::ZERO, || {
+            starts += 1;
+            Ok(ended(code, stderr))
+        });
+        assert!(result.is_ok());
+        assert_eq!(starts, 1, "{stderr:?} is not started again");
+    }
+    // A start that cannot be made at all is not tried again either.
+    let mut starts = 0;
+    let result = started_again(3, Duration::ZERO, || {
+        starts += 1;
+        Err("the probe did not start".to_owned())
+    });
+    assert_eq!(
+        (result.err().as_deref(), starts),
+        (Some("the probe did not start"), 1)
+    );
+}
+
+/// The long turn an interrupt stops asks for a reply the screen shows the key's cue in throughout:
+/// the agent's own mark where it has one at each reply's start, and where it has none the part's code
+/// at the start of every line, so that a fast model, whose reply scrolls the first line off the
+/// screen within a second, still shows the code while the turn runs.
+#[test]
+fn the_long_turn_shows_its_cue_on_every_line_where_the_agent_has_no_reply_mark() {
+    let (text, cue) = long_turn("kr0123456789ab", Some("✦"));
+    assert_eq!(cue, "✦");
+    assert!(
+        text.contains("count from 1 to 400") && text.ends_with("(kr0123456789ab-i)"),
+        "{text}"
+    );
+    let (text, cue) = long_turn("kr0123456789ab", None);
+    assert_eq!(cue, "KR0123456789AB");
+    assert!(
+        text.contains("KR0123456789AB at the start of every line")
+            || text.contains("kr0123456789ab in upper case at the start of every line"),
+        "{text}"
+    );
+    assert!(
+        text.contains("count from 1 to 400") && text.ends_with("(kr0123456789ab-i)"),
+        "{text}"
+    );
+}
+
+/// A text the part keeps or prints, a panic's message and a note, holds no piece of a key the part
+/// holds, in any way the output can show it: whole, wrapped, clipped, between colour codes, behind
+/// an escape that is not a colour code, or after one. A text that holds one is replaced.
+#[test]
+fn a_text_the_part_keeps_carries_no_piece_of_a_held_key_whatever_escapes_surround_it() {
+    let key = "sk-synthetic-1234567890abcdef";
+    for text in [
+        // an escape that is not a colour code, and the key digits after it
+        "token \u{1b}[1~1234567890abcdef".to_owned(),
+        // a sequence of key digits that ends in a letter, where a colour code would end in `m`
+        "\u{1b}[1234567890abcdef".to_owned(),
+        // a cursor save, then a piece of the key
+        "x \u{1b}7567890abcdef y".to_owned(),
+        // a colour code between the pieces of the key
+        "sk-synthetic-\u{1b}[31m1234567890abcdef".to_owned(),
+        // the key digits written as if they were a colour code's parameters
+        "sk-synthetic-\u{1b}[1234567890m abcdef".to_owned(),
+        // framed and wrapped
+        "┃ sk-synthetic-1234\n┃ 567890abcdef".to_owned(),
+    ] {
+        let kept = kept_clear(&text, &[key]);
+        assert!(kept.contains("holds a key"), "{text:?} -> {kept:?}");
+    }
+    assert_eq!(
+        kept_clear("Error: database is locked", &[key]),
+        "Error: database is locked"
+    );
+    assert_eq!(
+        kept_clear("\u{1b}[91mError: \u{1b}[0mUnexpected", &[key]),
+        "\u{1b}[91mError: \u{1b}[0mUnexpected"
+    );
+}
+
+/// A failure is classed by what it said, and what is recorded or printed of it is held to the key
+/// rule: a message that holds a piece of a held key is still of its class, and only its text is
+/// replaced.
+#[test]
+fn a_failure_that_holds_a_piece_of_a_key_keeps_its_class_and_loses_only_its_text() {
+    let key = "sk-or-v1-0123456789abcdef0123456789abcdef";
+    let message = format!("{LOGIN_UNPROVEN} the screen shows an error for {key}");
+    let kept = kept_clear(&message, &[key]);
+    assert!(!kept.contains("sk-or-v1"), "{kept}");
+    // The class is read from the message as it was written, and recorded as the harness's own words.
+    assert!(message.starts_with(LOGIN_UNPROVEN));
+    assert_eq!(
+        recorded_text(&message, &[key]),
+        format!("{LOGIN_UNPROVEN} (the rest holds a key, so it is not kept)")
+    );
+    assert_eq!(recorded_text("fine", &[key]), "fine");
+    let wrapped =
+        format!("{ISOLATION_UNPROVEN} a probe wrote sk-or-\nv1-0123456789abcdef0123456789abcdef");
+    assert!(recorded_text(&wrapped, &[key]).starts_with(ISOLATION_UNPROVEN));
+}
+
+/// A colour code that is also a run of key characters, beside another that is not: each is read
+/// either way, so a key is found however the codes are told apart.
+#[test]
+fn a_key_is_found_whichever_of_its_colour_looking_runs_are_colour() {
+    let key = "sk-synthetic-1234mabcdefg";
+    assert!(holds_a_key(&["\u{1b}[1234ma\u{1b}[0mbcdefg"], &[key]));
+    assert!(holds_a_key(&["\u{1b}[1234mabcdefg"], &[key]));
+    assert!(
+        !holds_a_key(&["\u{1b}[1234ma"], &[key]),
+        "six characters of the key are no piece"
+    );
+    assert!(holds_a_key(&["x1234m\u{1b}[0mabcdefg"], &[key]));
+    assert!(!holds_a_key(
+        &["\u{1b}[91mError\u{1b}[0m: nothing here"],
+        &[key]
+    ));
+    // A long screen full of colour codes is searched in time and stack of its own length.
+    let long = "\u{1b}[0m".repeat(100_000);
+    assert!(!holds_a_key(&[long.as_str()], &[key]));
+    let with_key = format!("{long}sk-synthetic-1234mabcdefg{long}");
+    assert!(holds_a_key(&[with_key.as_str()], &[key]));
+}
+
+/// An answer that is a control key, such as Enter or Escape, shows nowhere on the screen, so the
+/// composer cannot show it typed again; only the answers a person would see are looked for there.
+#[test]
+fn only_an_answer_that_shows_on_the_screen_is_looked_for_in_the_composer() {
+    assert_eq!(visible_answers(&["\r", "\u{1b}"]), Vec::<&str>::new());
+    assert_eq!(visible_answers(&["1", "\u{1b}"]), vec!["1"]);
+    assert_eq!(visible_answers(&["y", "n", ""]), vec!["y", "n"]);
+    // The check itself still finds a visible answer before the probe and not a control key, which
+    // the row trims away as a space.
+    assert!(replayed(&["> 1zq0123".to_owned()], "zq0123", &["1"]).is_err());
+    assert!(replayed(&["> \rzq0123".to_owned()], "zq0123", &["\r"]).is_ok());
+}
+
+/// How a probe that did not succeed is said to have ended: its status and, where `say` is set, the
+/// first 400 characters of what it wrote to its error output, its lines joined by ` / `, and
+/// nothing of it where it holds a piece of a key the part holds (`secrets`: see [`holds_a_key`]).
+fn probe_failed(status: &str, written: &[u8], say: bool, secrets: &[&str]) -> String {
+    let text = String::from_utf8_lossy(written).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    // Nothing is said of what was written when a piece of a held key is in it.
+    if !say || lines.is_empty() || holds_a_key(&lines, secrets) {
+        return format!("it exited {status}");
+    }
+    let joined: String = lines.join(" / ").chars().take(400).collect();
+    format!("it exited {status} and wrote: {joined}")
+}
+
+/// A dialog the part refuses is noted with the screen it was refused on, so that a part that then
+/// fails for want of a dialog says what became of the one that was there.
+#[test]
+fn a_refused_dialog_is_noted_with_the_rows_the_part_refused_it_on() {
+    let rows = vec![
+        "  ┃  △ Permission required".to_owned(),
+        String::new(),
+        "  ┃  $ echo kr0123 >> a".to_owned(),
+    ];
+    let note = refusal_note(
+        "a command other than the part's",
+        "Permission required",
+        "\u{1b}",
+        &rows,
+        &[],
+    );
+    assert!(
+        note.starts_with(
+            "a command other than the part's: a dialog showing \"Permission required\", refused \
+             with \"\\u{1b}\""
+        ),
+        "{note}"
+    );
+    assert!(
+        note.contains("  ┃  △ Permission required\n  ┃  $ echo kr0123 >> a"),
+        "the rows are in the note without the blank one: {note}"
+    );
+    // No piece of a held key is noted, whole or wrapped, clipped at a screen edge or cut by a
+    // colour code: a piece of eight characters or more of a value, in any row.
+    let key8 = "sk-synthetic-1234567890abcdef";
+    for piece in ["567890abcdef end", "x 1234567890 x", "synthetic"] {
+        let rows = vec![format!("  ┃  $ {piece}")];
+        let note = refusal_note("why", "Permission required", "\u{1b}", &rows, &[key8]);
+        assert!(note.contains("holds a key"), "{piece}: {note}");
+    }
+    let coloured = vec!["  ┃  $ sk-synth\u{1b}[31metic-1234567890".to_owned()];
+    let note = refusal_note("why", "Permission required", "\u{1b}", &coloured, &[key8]);
+    assert!(note.contains("holds a key"), "{note}");
+    // Seven characters of a value are an ordinary word.
+    let rows = vec!["  ┃  $ abcdefg".to_owned()];
+    let note = refusal_note(
+        "why",
+        "Permission required",
+        "\u{1b}",
+        &rows,
+        &["abcdefghij"],
+    );
+    assert!(!note.contains("holds a key"), "{note}");
+    // A key that wraps inside a frame, or between boxes, is still one key.
+    let framed = vec![
+        "  ┃  $ echo sk-synthetic-1234".to_owned(),
+        "  ┃  567890abcdef".to_owned(),
+    ];
+    let note = refusal_note(
+        "why",
+        "Permission required",
+        "\u{1b}",
+        &framed,
+        &["sk-synthetic-1234567890abcdef"],
+    );
+    assert!(
+        !note.contains("sk-synthetic") && !note.contains("567890"),
+        "{note}"
+    );
+    let boxed = vec![
+        "│ │ sk-synthetic-1234 │ │".to_owned(),
+        "│ │ 567890abcdef      │ │".to_owned(),
+    ];
+    let note = refusal_note(
+        "why",
+        "Allow",
+        "1",
+        &boxed,
+        &["sk-synthetic-1234567890abcdef"],
+    );
+    assert!(!note.contains("567890"), "{note}");
+    // A screen that shows a key the part holds, whole in a row or across two rows, is not noted.
+    let key = "sk-or-v1-0123456789abcdef0123456789abcdef";
+    for held in [
+        vec![format!("  ┃  $ echo {key}")],
+        vec![
+            "  ┃  $ echo sk-or-v1-0123456789ab".to_owned(),
+            "cdef0123456789abcdef".to_owned(),
+        ],
+    ] {
+        let note = refusal_note("why", "Permission required", "\u{1b}", &held, &[key]);
+        assert!(!note.contains("sk-or"), "{note}");
+        assert!(note.contains("holds a key"), "{note}");
+    }
 }
 
 /// A default keychain is said by its kind, compared as a path: a name that only begins like the
