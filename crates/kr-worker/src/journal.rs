@@ -748,6 +748,28 @@ impl Journal {
         effects: impl IntoIterator<Item = &'a kr_term::sideeffect::SideEffect>,
         now_ms: TimestampMs,
     ) -> Result<()> {
+        self.record_kept_host_events(
+            effects
+                .into_iter()
+                .map(|effect| (effect, Kept::Undelivered)),
+            now_ms,
+        )
+    }
+
+    /// Records side effects that were not delivered, each with why, in one transaction.
+    ///
+    /// The same as [`Self::record_host_events`], for a batch whose effects were kept for different
+    /// reasons: an effect with no destination, and one whose destination declined it, are told
+    /// apart by their kind, and are kept in the order they were given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails; none of them is recorded.
+    pub fn record_kept_host_events<'a>(
+        &mut self,
+        effects: impl IntoIterator<Item = (&'a kr_term::sideeffect::SideEffect, Kept)>,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
         let mut effects = effects.into_iter().peekable();
         if effects.peek().is_none() {
             return Ok(());
@@ -756,8 +778,8 @@ impl Journal {
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
-        for effect in effects {
-            let (kind, detail) = describe_effect(&effect.kind);
+        for (effect, kept) in effects {
+            let (kind, detail) = describe_effect(&effect.kind, kept);
             transaction
                 .execute(
                     "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
@@ -4093,8 +4115,37 @@ pub struct HostEvent {
     pub recorded_at_ms: TimestampMs,
 }
 
+/// Why a side effect is kept as a host event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// It had no destination, or its destination could not take it.
+    Undelivered,
+    /// Its destination is an attachment whose terminal takes no clipboard writes, so the write was
+    /// sent to nobody. Only a clipboard write is ever kept for this reason.
+    Declined,
+}
+
+/// The kind a clipboard write is recorded under when the terminal it was owed to takes none.
+pub const CLIPBOARD_WRITE_DECLINED: &str = "clipboard_write_declined";
+
 /// Returns the kind and the description one side effect is recorded under.
-fn describe_effect(kind: &kr_term::sideeffect::SideEffectKind) -> (&'static str, String) {
+fn describe_effect(
+    kind: &kr_term::sideeffect::SideEffectKind,
+    kept: Kept,
+) -> (&'static str, String) {
+    use kr_term::sideeffect::SideEffectKind;
+    match (kind, kept) {
+        // What the write asked for, and not what it carried: the same description as one with no
+        // destination, under a kind that says why it has none.
+        (SideEffectKind::ClipboardWrite { selection, content }, Kept::Declined) => (
+            CLIPBOARD_WRITE_DECLINED,
+            format!("{selection:?}, {} bytes", content.len()),
+        ),
+        _ => describe_undelivered(kind),
+    }
+}
+
+fn describe_undelivered(kind: &kr_term::sideeffect::SideEffectKind) -> (&'static str, String) {
     use kr_term::sideeffect::SideEffectKind;
     match kind {
         SideEffectKind::Bell => ("bell", String::new()),
