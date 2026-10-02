@@ -4070,12 +4070,12 @@ so a credential replaced under a configured destination never carries a notifica
 under the old one, and removing the destination deletes the credential with it.
 
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
-queued content, and does not report complete while a send is still on the wire. A pending question
-or approval still alerts a paired device, with no preview and none of its words, and nothing else
-decided while privacy mode is on is ever sent. Notifications that already reached a provider are
-shown as retained artifacts, each saying that this host holds no way to recall it: there is no
-deletion action for a copy that is on somebody else's device or in somebody else's service, and the
-listing says so rather than offering one that would do nothing.
+queued content, and does not report complete while a send of content from before the boundary is
+still on the wire. A pending question or approval still alerts a paired device, with no preview and
+none of its words, and nothing else decided while privacy mode is on is ever sent. Notifications
+that already reached a provider are shown as retained artifacts, each saying that this host holds no
+way to recall it: there is no deletion action for a copy that is on somebody else's device or in
+somebody else's service, and the listing says so rather than offering one that would do nothing.
 
 `docs/delivery/README.md` is the whole of it.
 
