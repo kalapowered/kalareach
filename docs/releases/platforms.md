@@ -21,7 +21,9 @@ The companion's desktop build declares macOS 14.0 as well, in the same configura
 
 A WSL2 distribution uses the Linux build, inside the distribution, like any other Linux host. The
 hosted `windows-2025` runner starts WSL2 distributions: `wsl-probe.yml` imports a root file system
-as WSL 2 and runs a command in it, and is run again when the runner image changes. WSL1
+as WSL 2 and runs a command in it, and can be run again by hand when the runner image changes. That
+runner is a Windows Server, which does not offer mirrored networking, so `wsl-acceptance.yml`
+measures NAT there and says that it did. WSL1
 and Windows 10 are not release targets: nothing is built for them and nothing is tested on them.
 Windows 10 reports the same NT 10.0 as Windows 11, so a Windows executable may well start there, but
 that is not a configuration a release is checked against.
