@@ -723,6 +723,46 @@ impl Records<'_> {
             .transpose()
     }
 
+    /// Returns one named setting, where it is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the setting cannot be read.
+    pub fn setting(&self, name: &str) -> CatalogueResult<Option<String>> {
+        self.transaction
+            .query_row(
+                "SELECT value FROM settings WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.failure(&source))
+    }
+
+    /// Returns every setting whose name starts with `prefix`, by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a setting cannot be read.
+    pub fn settings_with_prefix(&self, prefix: &str) -> CatalogueResult<Vec<(String, String)>> {
+        let mut statement = self
+            .transaction
+            .prepare(
+                "SELECT name, value FROM settings WHERE substr(name, 1, ?2) = ?1 ORDER BY name",
+            )
+            .map_err(|source| self.failure(&source))?;
+        let rows = statement
+            .query_map(params![prefix, number(prefix.len() as u64)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| self.failure(&source))?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row.map_err(|source| self.failure(&source))?);
+        }
+        Ok(found)
+    }
+
     /// Returns the administrator's disable policy.
     ///
     /// # Errors
@@ -1271,6 +1311,30 @@ impl Changes<'_> {
                 &row.origin,
             )?;
         }
+        Ok(())
+    }
+
+    /// Sets one named setting, replacing what it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub fn put_setting(&self, name: &str, value: &str) -> CatalogueResult<()> {
+        self.execute(
+            "INSERT INTO settings (name, value) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            params![name, value],
+        )?;
+        Ok(())
+    }
+
+    /// Removes one named setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub fn delete_setting(&self, name: &str) -> CatalogueResult<()> {
+        self.execute("DELETE FROM settings WHERE name = ?1", params![name])?;
         Ok(())
     }
 

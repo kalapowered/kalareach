@@ -1,0 +1,425 @@
+{
+  "fixture_version": 1,
+  "visibility": [
+    {
+      "name": "a bound session can be sent a message",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh"
+      ]
+    },
+    {
+      "name": "an actor who can only view cannot send",
+      "context": {
+        "rights": [
+          "session.view"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "volatile-native operation stops the message path",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "native_only_volatile",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "no qualified evidence for acting upstream leaves the control unusable",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "temporarily_unavailable"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "an upload in progress does not stop a message",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "bound",
+        "flags": [
+          "transfer_in_progress"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "send"
+      ]
+    },
+    {
+      "name": "repeated faults hide every control",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "disabled",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [],
+      "enabled_controls": []
+    },
+    {
+      "name": "a waiting approval offers the answer to an actor who may give it",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt",
+          "agent.approval.respond"
+        ],
+        "binding_state": "bound",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh",
+        "allow",
+        "deny"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh",
+        "allow",
+        "deny"
+      ]
+    },
+    {
+      "name": "an actor without the answer right is not offered it",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt"
+        ],
+        "binding_state": "bound",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh"
+      ]
+    },
+    {
+      "name": "with no approval waiting there is nothing to answer",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt",
+          "agent.approval.respond"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh"
+      ]
+    },
+    {
+      "name": "volatile-native operation stops the answer and the message path",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt",
+          "agent.approval.respond"
+        ],
+        "binding_state": "native_only_volatile",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh",
+        "allow",
+        "deny"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "no evidence that approvals reach the channel leaves the answer unusable",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt",
+          "agent.approval.respond"
+        ],
+        "binding_state": "bound",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "temporarily_unavailable"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh",
+        "allow",
+        "deny"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh"
+      ]
+    },
+    {
+      "name": "a permission prompt read from the terminal or a notification is not an approval",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.prompt",
+          "agent.approval.respond"
+        ],
+        "binding_state": "awaiting_person",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ],
+          [
+            "approval.respond",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "approval",
+          "compose",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "send",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "send",
+        "refresh"
+      ]
+    }
+  ]
+}

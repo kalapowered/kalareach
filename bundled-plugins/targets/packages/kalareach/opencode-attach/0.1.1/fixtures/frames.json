@@ -1,0 +1,240 @@
+{
+  "corpus_version": 1,
+  "protocol": "opencode-server-events",
+  "tested_version": "1.18.31",
+  "source": "Frames written from the event schemas in the OpenAPI document the installed build serves and checked against each variant's schema. They are not a capture of a live session, and every one of them says so.",
+  "frames": [
+    {
+      "situation": "a running turn's text",
+      "note": "The envelope of this family carries the payload under properties",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR2",
+        "type": "message.part.delta",
+        "properties": {
+          "sessionID": "ses_0a1b2c",
+          "messageID": "msg_7f3d",
+          "partID": "prt_1",
+          "field": "text",
+          "delta": "Reading the manifest"
+        }
+      },
+      "expect": {
+        "wire_name": "message.part.delta",
+        "method": "message.part.delta",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBR2",
+        "members": {
+          "properties.sessionID": "ses_0a1b2c",
+          "properties.delta": "Reading the manifest"
+        }
+      }
+    },
+    {
+      "situation": "a permission the session is waiting on",
+      "note": "The pending resource is named at properties.id; answering it is an operation this table does not carry",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR3",
+        "type": "permission.asked",
+        "properties": {
+          "id": "per_5c8e",
+          "sessionID": "ses_0a1b2c",
+          "permission": "bash",
+          "patterns": [
+            "rm -rf build"
+          ],
+          "metadata": {},
+          "always": []
+        }
+      },
+      "expect": {
+        "wire_name": "permission.asked",
+        "method": "permission.asked",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBR3",
+        "members": {
+          "properties.id": "per_5c8e",
+          "properties.permission": "bash"
+        }
+      }
+    },
+    {
+      "situation": "the answer that resolved it",
+      "note": "The answer names the request it resolved at properties.requestID, which is the identifier the ask carried at properties.id",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR4",
+        "type": "permission.replied",
+        "properties": {
+          "sessionID": "ses_0a1b2c",
+          "requestID": "per_5c8e",
+          "reply": "once"
+        }
+      },
+      "expect": {
+        "wire_name": "permission.replied",
+        "method": "permission.replied",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBR4",
+        "members": {
+          "properties.requestID": "per_5c8e"
+        }
+      }
+    },
+    {
+      "situation": "composer insertion this connector refuses",
+      "note": "Writing into the native composer is what section 12 forbids claiming without a qualified bridge, so the table states it is outside what it proxies",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR5",
+        "type": "tui.prompt.append",
+        "properties": {
+          "text": "ship it"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.prompt.append",
+        "method": "tui.prompt.append",
+        "direction": "upstream_to_host",
+        "class": "unsupported",
+        "request_id": "evt_01JBR5",
+        "members": {
+          "properties.text": "ship it"
+        }
+      }
+    },
+    {
+      "situation": "a terminal command this connector refuses",
+      "note": "The command vocabulary includes prompt.submit, so forwarding one would submit a turn from a control nobody qualified",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR6",
+        "type": "tui.command.execute",
+        "properties": {
+          "command": "prompt.submit"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.command.execute",
+        "method": "tui.command.execute",
+        "direction": "upstream_to_host",
+        "class": "unsupported",
+        "request_id": "evt_01JBR6",
+        "members": {
+          "properties.command": "prompt.submit"
+        }
+      }
+    },
+    {
+      "situation": "the terminal moving to another session",
+      "note": "The selected conversation changes without the process changing, which is what advances a binding revision",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR7",
+        "type": "tui.session.select",
+        "properties": {
+          "sessionID": "ses_9f8e7d"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.session.select",
+        "method": "tui.session.select",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": "evt_01JBR7",
+        "members": {
+          "properties.sessionID": "ses_9f8e7d"
+        }
+      }
+    },
+    {
+      "situation": "the server's global scope disposed",
+      "note": "The document carries no payload with this event, so it reports the disposal and nothing about what survived it",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR8",
+        "type": "global.disposed",
+        "properties": {}
+      },
+      "expect": {
+        "wire_name": "global.disposed",
+        "method": "global.disposed",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBR8"
+      }
+    },
+    {
+      "situation": "an envelope from the shared-server API family",
+      "note": "The same type name, and the payload under data rather than properties. A name identifies no family, so this frame routes by name and carries nothing under the member this table reads; which family a connection belongs to is settled from the installed version and schema before it opens",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBR9",
+        "type": "permission.v2.asked",
+        "data": {
+          "id": "per_3d2a",
+          "sessionID": "ses_0a1b2c",
+          "action": "bash",
+          "resources": [
+            "rm *"
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "permission.v2.asked",
+        "method": "permission.v2.asked",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBR9",
+        "members": {
+          "data.id": "per_3d2a",
+          "data.action": "bash"
+        }
+      }
+    },
+    {
+      "situation": "an event only this API family publishes",
+      "note": "This name is in this family's event union and not in the shared-server family's, so seeing it is evidence of the family this table was qualified against. The table reads it as the observation it is",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBRA",
+        "type": "server.instance.disposed",
+        "properties": {
+          "directory": "/workspace"
+        }
+      },
+      "expect": {
+        "wire_name": "server.instance.disposed",
+        "method": "server.instance.disposed",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBRA",
+        "members": {
+          "properties.directory": "/workspace"
+        }
+      }
+    }
+  ],
+  "evidence": {
+    "executable": {
+      "path": "node_modules/opencode-darwin-arm64/bin/opencode",
+      "platform": "macos-aarch64",
+      "version": "1.18.31",
+      "sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+    },
+    "schema": {
+      "source": "the OpenAPI document this build serves at /doc",
+      "sha256": "46db986090aae41846cd6dbe16225a1d883f0bbcb4c48814008d3f6ce140aa5c",
+      "families": {
+        "this_table": "GET /event, schema Event, payload at properties",
+        "the_other": "GET /api/event, schema V2Event, payload at data"
+      }
+    },
+    "attach": "This build lists opencode serve, which starts a headless server, and opencode attach <url>, which attaches the terminal to a running server, in its own help",
+    "read_on": "2026-09-24"
+  }
+}

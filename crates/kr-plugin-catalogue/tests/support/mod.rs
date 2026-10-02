@@ -407,6 +407,20 @@ impl Generation {
         new_keys: &KeySet,
         index_generation: u64,
     ) -> Vec<u8> {
+        self.rotate_root_to(2, &self.keys, new_keys, index_generation)
+            .await
+    }
+
+    /// Rotates the root to `version` using `new_keys`, signed by the root of `previous` as well,
+    /// writing `<version>.root.json` and signing every role's metadata at `version`, with the
+    /// index published as `index_generation`.
+    pub async fn rotate_root_to(
+        &self,
+        version: u64,
+        previous: &KeySet,
+        new_keys: &KeySet,
+        index_generation: u64,
+    ) -> Vec<u8> {
         let metadata = self.directory.join("metadata");
         let targets = self.directory.join("targets");
         let root_expires: jiff::Timestamp =
@@ -415,16 +429,16 @@ impl Generation {
 
         let consistent_snapshot = self.spec.consistent_snapshot;
         let root_v2 = new_keys.root_document_with_version(
-            NonZeroU64::new(2).expect("two is not zero"),
+            NonZeroU64::new(version).expect("a root version starts at one"),
             root_expires,
             consistent_snapshot,
         );
 
-        let old_root_doc = self.keys.root_document(root_expires, consistent_snapshot);
+        let old_root_doc = previous.root_document(root_expires, consistent_snapshot);
         let old_signed = SignedRole::new(
             root_v2.clone(),
             &KeyHolder::Root(old_root_doc),
-            &self.keys.sources(),
+            &previous.sources(),
             &SystemRandom::new(),
         )
         .await
@@ -447,10 +461,14 @@ impl Generation {
 
         std::fs::write(self.directory.join("root.json"), &root_v2_bytes).expect("writable");
         std::fs::write(metadata.join("root.json"), &root_v2_bytes).expect("writable");
-        std::fs::write(metadata.join("2.root.json"), &root_v2_bytes).expect("writable");
+        std::fs::write(
+            metadata.join(format!("{version}.root.json")),
+            &root_v2_bytes,
+        )
+        .expect("writable");
 
-        // Now resign the repository metadata using new_keys at version 2
-        let version = NonZeroU64::new(2).expect("two is not zero");
+        // Now resign the repository metadata using new_keys at the new version
+        let version = NonZeroU64::new(version).expect("a root version starts at one");
         let mut editor = RepositoryEditor::new(self.directory.join("root.json"))
             .await
             .expect("editor");
@@ -1135,4 +1153,174 @@ fn read_tree(directory: &Path) -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+/// The bundle a host compiles in, made from one generation of this suite: its metadata, its index
+/// and the one package it publishes, with a lock that names each file, trusting the root keys the
+/// generation's highest root names (a test's own trust, which only a test constructor takes).
+pub fn seed_bundle(generation: &Generation) -> kr_plugin_catalogue::SeedBundle {
+    let trust = seed_trust_of(&generation.root_bytes_highest());
+    seed_bundle_trusting(generation, trust)
+}
+
+/// [`seed_bundle`], trusting `trust` instead.
+pub fn seed_bundle_trusting(
+    generation: &Generation,
+    trust: kr_plugin_catalogue::SeedTrust,
+) -> kr_plugin_catalogue::SeedBundle {
+    let (lock, files) = seed_files(generation);
+    kr_plugin_catalogue::SeedBundle::from_files(lock.as_bytes(), files, trust)
+        .expect("a bundle that matches its lock")
+}
+
+/// The files of a generation as a bundle holds them, and the lock that names them.
+pub fn seed_files(
+    generation: &Generation,
+) -> (String, std::collections::BTreeMap<String, Vec<u8>>) {
+    let directory = generation.directory();
+    let mut files = std::collections::BTreeMap::new();
+    for area in ["metadata", "targets"] {
+        for path in read_tree(&directory.join(area)) {
+            let relative = path
+                .strip_prefix(&directory)
+                .expect("inside the generation")
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(relative, std::fs::read(&path).expect("readable"));
+        }
+    }
+    // Consistent snapshots publish each target a second time under its digest; a bundle names
+    // targets plain.
+    files.retain(|path, _| !path.starts_with("targets/") || !is_digest_named(path));
+    let highest = files
+        .keys()
+        .filter_map(|path| {
+            path.strip_prefix("metadata/")?
+                .strip_suffix(".root.json")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("a numbered root");
+    let index: CatalogueIndex =
+        serde_json::from_slice(&files["targets/index.json"]).expect("a readable index");
+    let entry = index.entries.first().expect("an entry");
+    let prefix = format!(
+        "targets/packages/{}/{}/{}",
+        entry.publisher_id, entry.plugin_name, entry.version
+    );
+    let describe = |path: &str| {
+        let bytes = &files[path];
+        serde_json::json!({
+            "path": path,
+            "digest": PayloadDigest::of(bytes).to_string(),
+            "size_bytes": bytes.len().to_string(),
+        })
+    };
+    let root_bytes = &files[&format!("metadata/{highest}.root.json")];
+    let root: serde_json::Value = serde_json::from_slice(root_bytes).expect("a root");
+    let mut metadata: Vec<serde_json::Value> = files
+        .keys()
+        .filter(|path| path.starts_with("metadata/") || path.as_str() == "targets/index.json")
+        .map(|path| describe(path))
+        .collect();
+    metadata.sort_by_key(|entry| entry["path"].as_str().map(str::to_owned));
+    let payloads: Vec<serde_json::Value> = entry
+        .payloads
+        .iter()
+        .map(|payload| {
+            serde_json::json!({
+                "role": serde_json::to_value(payload.role).expect("a role"),
+                "path": payload.path.as_str(),
+                "digest": payload.digest.to_string(),
+                "size_bytes": payload.size_bytes.get().to_string(),
+            })
+        })
+        .collect();
+    let lock = serde_json::json!({
+        "lock_version": 2,
+        "source": {
+            "repository": "https://example.invalid/plugins",
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "generation_path": "snapshots/test",
+            "tree_url": "https://example.invalid/tree",
+            "generation": index.generation.get().to_string(),
+            "produced_at": "1760000000000",
+        },
+        "trust_root": {
+            "digest": PayloadDigest::of(root_bytes).to_string(),
+            "version": highest,
+            "expires": root["signed"]["expires"],
+            "key_ids": root["signed"]["roles"]["root"]["keyids"],
+        },
+        "metadata": metadata,
+        "packages": [{
+            "directory": prefix,
+            "plugin_id": entry.plugin_id.to_string(),
+            "publisher_id": entry.publisher_id.to_string(),
+            "plugin_name": entry.plugin_name.to_string(),
+            "version": entry.version.to_string(),
+            "sdk_range": entry.sdk_range.to_string(),
+            "wit_range": entry.wit_range.to_string(),
+            "manifest": {
+                "path": "plugin.json",
+                "digest": entry.manifest_digest.to_string(),
+                "size_bytes": entry.manifest_size_bytes.get().to_string(),
+            },
+            "payloads": payloads,
+            "total_size_bytes": entry.total_size_bytes.get().to_string(),
+        }],
+    });
+    // The package's files go into the bundle under the package's directory.
+    let mut package_files: Vec<String> = vec!["plugin.json".to_owned()];
+    package_files.extend(
+        entry
+            .payloads
+            .iter()
+            .map(|payload| payload.path.to_string()),
+    );
+    let kept: std::collections::BTreeMap<String, Vec<u8>> = files
+        .into_iter()
+        .filter(|(path, _)| {
+            path.starts_with("metadata/")
+                || path == "targets/index.json"
+                || package_files
+                    .iter()
+                    .any(|name| *path == format!("{prefix}/{name}"))
+        })
+        .collect();
+    (serde_json::to_string_pretty(&lock).expect("a lock"), kept)
+}
+
+fn is_digest_named(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.split_once('.'))
+        .is_some_and(|(head, _)| {
+            head.len() == 64 && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// What a test trusts for a root: its root keys as the development lineage.
+pub fn seed_trust_of(root: &[u8]) -> kr_plugin_catalogue::SeedTrust {
+    let enrolment = kr_plugin_catalogue::Enrolment::new(
+        kr_plugin_catalogue::RepositoryId::new("trusted").expect("an identifier"),
+        kr_plugin_catalogue::RepositoryKind::Official,
+        url::Url::parse("https://example.invalid/metadata/").expect("an address"),
+        url::Url::parse("https://example.invalid/targets/").expect("an address"),
+        root.to_vec(),
+        kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+        kr_plugin_catalogue::CapabilityCeiling::default_ceiling(),
+    )
+    .expect("an enrolment");
+    let keys = enrolment.root_key_ids().expect("root keys");
+    kr_plugin_catalogue::SeedTrust::named(Vec::new(), 1, Some(keys))
+}
+
+impl Generation {
+    /// The highest root this generation ships: `root.json`.
+    #[must_use]
+    pub fn root_bytes_highest(&self) -> Vec<u8> {
+        std::fs::read(self.directory().join("metadata").join("root.json")).expect("a root")
+    }
 }

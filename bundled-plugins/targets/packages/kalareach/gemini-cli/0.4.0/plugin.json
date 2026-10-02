@@ -1,0 +1,218 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "gemini-cli",
+  "version": "0.4.0",
+  "display_name": "Gemini CLI",
+  "description": "Recognises Gemini CLI, observes its sessions through hooks, reads its agent protocol through a declarative table and stops the turn it is running, with the stock terminal untouched.",
+  "sdk_range": ">=0.1.2, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "3efd5eed04308e54e6a55c19f7483c55d8b3e515"
+  },
+  "match_rules": [
+    {
+      "id": "gemini-cli-npm",
+      "executable": {
+        "file_stem": "gemini",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@google/gemini-cli"
+      },
+      "confidence": "exact"
+    },
+    {
+      "id": "gemini-cli-executable",
+      "executable": {
+        "file_stem": "gemini",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "a7bcda7cced8487adb022022cfbc73b635424314d8e111208f5c53646d00f83f",
+      "size_bytes": "10439"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/gemini-extension-install.json",
+      "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
+      "size_bytes": "57"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/gemini-extension.json",
+      "digest": "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7",
+      "size_bytes": "204"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/hooks.json",
+      "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba",
+      "size_bytes": "738"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "b0d3a7cb428dced8f41762a93b67d5a42aabc912af449ad3eb1cb352ae95dbe3",
+      "size_bytes": "7204"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "5777b8b689e3bcda61cec0f8b118a77aee37440dd7f7856e17b516a4d6dff56d",
+      "size_bytes": "5668"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "f9c7c197726962a80f3e65e6afa77b172b4b909ae3b9fa819f15ab94f2125262",
+      "size_bytes": "9554"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "f64bc2273fc628047e511f466d185f091a25855035ec38d60f60ba8cf54d67a6",
+      "size_bytes": "4056"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Gemini CLI from its published package and its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show what the Gemini CLI session is doing and the controls for its turn"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read the turn and tool updates the selected agent-protocol execution reports"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Ask Gemini CLI to stop the turn it is running when you press Stop"
+    },
+    {
+      "capability": "native_bridge.install",
+      "reason": "Register the forwarder Gemini CLI starts for its session and notification hooks"
+    },
+    {
+      "capability": "command_integration.launch",
+      "reason": "Keep Gemini CLI's session in the process KalaReach launched, so its hooks can select the session's thread"
+    }
+  ],
+  "actions": [
+    {
+      "id": "turn.cancel",
+      "label": "Stop the turn",
+      "effect": "upstream.cancel",
+      "implementation": {
+        "type": "upstream_cancel"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Cancel the turn the bound Gemini CLI execution is running, which ends it as interrupted",
+      "confirmation_required": false
+    },
+    {
+      "id": "session.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the session state the host already holds",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": {
+    "application": "Gemini CLI",
+    "application_range": "=0.60.0",
+    "install": [
+      {
+        "type": "install_file",
+        "source": "bridge/gemini-extension-install.json",
+        "destination": "extensions/kalareach/.gemini-extension-install.json",
+        "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb"
+      },
+      {
+        "type": "install_file",
+        "source": "bridge/gemini-extension.json",
+        "destination": "extensions/kalareach/gemini-extension.json",
+        "digest": "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7"
+      },
+      {
+        "type": "install_file",
+        "source": "bridge/hooks.json",
+        "destination": "extensions/kalareach/hooks/hooks.json",
+        "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba"
+      }
+    ],
+    "remove": [
+      {
+        "type": "remove_file",
+        "destination": "extensions/kalareach/hooks/hooks.json",
+        "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba"
+      },
+      {
+        "type": "remove_file",
+        "destination": "extensions/kalareach/gemini-extension.json",
+        "digest": "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7"
+      },
+      {
+        "type": "remove_file",
+        "destination": "extensions/kalareach/.gemini-extension-install.json",
+        "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb"
+      }
+    ],
+    "grant_statement": "Installs three files under your own Gemini CLI directory: the manifest of an extension named kalareach, its hooks, and the record of where it is installed. Gemini CLI loads the extension for every project and every later session, whether or not you trust the folder, beside your own hooks; where your settings allow only listed extensions, it loads it only when one of your patterns matches the source that record names. Gemini CLI then starts the KalaReach forwarder itself, through bash, so the forwarder runs under Gemini CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees each session's SessionStart, SessionEnd and Notification events and no tool events, because Gemini CLI reads a failing hook's error text as a refusal of a finished tool's result. Removal deletes exactly those three files, each only while it still holds the bytes that were installed, and the record last, only once nothing else is left beside it."
+  },
+  "command_integration": {
+    "command": "gemini",
+    "flags": [],
+    "variables": [
+      {
+        "name": "GEMINI_CLI_NO_RELAUNCH",
+        "value": "true"
+      }
+    ],
+    "grant_statement": "When you run gemini in a KalaReach session with this integration on, KalaReach sets GEMINI_CLI_NO_RELAUNCH to true for it, so the process KalaReach launched runs the session itself instead of starting a second copy of Gemini CLI to run it, and the hooks this package's bridge registers can select the session's thread. You give up what that second copy was for. Gemini CLI no longer raises the session's memory limit to half of this machine's memory, which it otherwise does where that is more than Node's default, so a very large session runs out of memory sooner. When Gemini CLI restarts after an update, or for a restart it asks for, the session ends instead and you run gemini again."
+  }
+}

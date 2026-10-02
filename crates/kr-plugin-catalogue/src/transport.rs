@@ -17,6 +17,8 @@
 //! read, must fail the synchronisation, not end the search for a newer root as though there were
 //! none. Only a stream that ends with the file's absence ends that search.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -144,5 +146,83 @@ async fn answer(client: &reqwest::Client, url: Url) -> Result<TransportStream, T
         tokio::time::sleep(wait).await;
         wait = wait.mul_f32(1.5).min(LONGEST_WAIT);
         tried += 1;
+    }
+}
+
+/// Serves the generation compiled into the host at the addresses of the repository it was
+/// published at.
+///
+/// The update client asks for each file by the address it would have on the network, and this
+/// answers from the bundle's bytes: a metadata file at the enrolment's metadata address, a target
+/// at its targets address. Nothing is fetched and no socket is opened. A file the bundle does not
+/// carry is reported as absent in the stream, as the network transport reports a 404, so the search
+/// for the next root ends where the bundle's roots do.
+#[derive(Clone, Debug)]
+pub struct EmbeddedTransport {
+    files: Arc<BTreeMap<String, Vec<u8>>>,
+    metadata_url: Url,
+    targets_url: Url,
+}
+
+impl EmbeddedTransport {
+    /// A transport over `bundle`, answering at `enrolment`'s own addresses.
+    #[must_use]
+    pub fn new(bundle: &crate::SeedBundle, enrolment: &crate::Enrolment) -> Self {
+        Self {
+            files: bundle.shared_files(),
+            metadata_url: directory_of(&enrolment.metadata_url),
+            targets_url: directory_of(&enrolment.targets_url),
+        }
+    }
+
+    /// The bundle's path for an address, where the address is one of its own.
+    fn path_of(&self, url: &Url) -> Option<String> {
+        let text = url.as_str();
+        let (area, rest) = match text.strip_prefix(self.metadata_url.as_str()) {
+            Some(rest) => ("metadata", rest),
+            None => ("targets", text.strip_prefix(self.targets_url.as_str())?),
+        };
+        // A name that leaves the directory it was asked under is not one of the bundle's.
+        let decoded = percent_encoding::percent_decode_str(rest)
+            .decode_utf8()
+            .ok()?;
+        if decoded.is_empty()
+            || decoded.contains('?')
+            || decoded
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+        {
+            return None;
+        }
+        Some(format!("{area}/{decoded}"))
+    }
+}
+
+/// An address with a trailing slash, as a directory.
+fn directory_of(url: &Url) -> Url {
+    if url.as_str().ends_with('/') {
+        url.clone()
+    } else {
+        Url::parse(&format!("{url}/")).unwrap_or_else(|_| url.clone())
+    }
+}
+
+#[tough::async_trait]
+impl Transport for EmbeddedTransport {
+    async fn fetch(&self, url: Url) -> Result<TransportStream, TransportError> {
+        let found = self
+            .path_of(&url)
+            .and_then(|path| self.files.get(&path))
+            .cloned();
+        Ok(match found {
+            Some(bytes) => Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(bytes))])),
+            None => Box::pin(futures::stream::iter([Err(
+                TransportError::new_with_cause(
+                    TransportErrorKind::FileNotFound,
+                    url,
+                    "the bundle does not carry it",
+                ),
+            )])),
+        })
     }
 }

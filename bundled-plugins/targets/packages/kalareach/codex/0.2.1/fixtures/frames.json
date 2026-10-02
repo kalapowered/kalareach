@@ -1,0 +1,376 @@
+{
+  "corpus_version": 1,
+  "protocol": "codex-app-server",
+  "tested_version": "0.155.1",
+  "source": "Frames written from the published App Server documentation's own examples, completed against the required members of the schema codex-cli 0.155.1 generates. They are not a capture of a live session.",
+  "frames": [
+    {
+      "situation": "thread subscriptions",
+      "note": "Starting a thread subscribes this connection to its turn and item events",
+      "frame": {
+        "method": "thread/start",
+        "id": 1,
+        "params": {
+          "model": "gpt-5.6-terra"
+        }
+      },
+      "expect": {
+        "wire_name": "thread/start",
+        "method": "thread.start",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 1
+      }
+    },
+    {
+      "situation": "thread subscriptions",
+      "note": "The thread the subscription belongs to",
+      "frame": {
+        "method": "thread/started",
+        "params": {
+          "thread": {
+            "cliVersion": "0.155.1",
+            "createdAt": 1760000000,
+            "cwd": "/Users/me/project",
+            "ephemeral": false,
+            "id": "thr_123",
+            "modelProvider": "openai",
+            "preview": "Run tests",
+            "projectId": "prj_1",
+            "sessionId": "ses_1",
+            "source": "cli",
+            "status": {
+              "type": "idle"
+            },
+            "turns": [],
+            "updatedAt": 1760000005
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "thread/started",
+        "method": "thread.started",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null
+      }
+    },
+    {
+      "situation": "thread subscriptions",
+      "note": "An event the subscription delivers",
+      "frame": {
+        "method": "item/started",
+        "params": {
+          "threadId": "thr_123",
+          "turnId": "turn_456",
+          "startedAtMs": 1760000000000,
+          "item": {
+            "type": "userMessage",
+            "id": "item_1",
+            "content": [
+              {
+                "type": "text",
+                "text": "Run tests"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "item/started",
+        "method": "item.started",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null,
+        "members": {
+          "params.turnId": "turn_456",
+          "params.startedAtMs": 1760000000000
+        }
+      }
+    },
+    {
+      "situation": "thread subscriptions",
+      "note": "Dropping the subscription is a mutation, not a read",
+      "frame": {
+        "method": "thread/unsubscribe",
+        "id": 22,
+        "params": {
+          "threadId": "thr_123"
+        }
+      },
+      "expect": {
+        "wire_name": "thread/unsubscribe",
+        "method": "thread.unsubscribe",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 22
+      }
+    },
+    {
+      "situation": "turn/steer and its expectedTurnId",
+      "note": "The turn the steer names travels in the request body; the table reads only the identifier and the method",
+      "frame": {
+        "method": "turn/steer",
+        "id": 32,
+        "params": {
+          "threadId": "thr_123",
+          "input": [
+            {
+              "type": "text",
+              "text": "Actually focus on failing tests first."
+            }
+          ],
+          "expectedTurnId": "turn_456"
+        }
+      },
+      "expect": {
+        "wire_name": "turn/steer",
+        "method": "turn.steer",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 32,
+        "members": {
+          "params.expectedTurnId": "turn_456"
+        }
+      }
+    },
+    {
+      "situation": "an uncertain turn/start result",
+      "note": "The request whose result may never arrive; the identifier is what the host has to keep",
+      "frame": {
+        "method": "turn/start",
+        "id": 30,
+        "params": {
+          "threadId": "thr_123",
+          "input": [
+            {
+              "type": "text",
+              "text": "Run tests"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "turn/start",
+        "method": "turn.start",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 30
+      }
+    },
+    {
+      "situation": "an uncertain turn/start result",
+      "note": "The notification that would confirm a turn began",
+      "frame": {
+        "method": "turn/started",
+        "params": {
+          "threadId": "thr_123",
+          "turn": {
+            "id": "turn_456",
+            "items": [],
+            "status": "inProgress"
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "turn/started",
+        "method": "turn.started",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null
+      }
+    },
+    {
+      "situation": "competing approvals",
+      "note": "A reverse request, with a string identifier; the string one is not the number one",
+      "frame": {
+        "method": "item/commandExecution/requestApproval",
+        "id": "srv-1",
+        "params": {
+          "itemId": "item_9",
+          "threadId": "thr_123",
+          "turnId": "turn_456",
+          "startedAtMs": 1760000000001,
+          "command": "rm -rf build"
+        }
+      },
+      "expect": {
+        "wire_name": "item/commandExecution/requestApproval",
+        "method": "item.command-execution.request-approval",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": "srv-1",
+        "members": {
+          "params.startedAtMs": 1760000000001,
+          "params.command": "rm -rf build"
+        }
+      }
+    },
+    {
+      "situation": "competing approvals",
+      "note": "A second reverse request pending at the same time",
+      "frame": {
+        "method": "item/fileChange/requestApproval",
+        "id": "srv-2",
+        "params": {
+          "itemId": "item_10",
+          "threadId": "thr_123",
+          "turnId": "turn_456",
+          "startedAtMs": 1760000000002
+        }
+      },
+      "expect": {
+        "wire_name": "item/fileChange/requestApproval",
+        "method": "item.file-change.request-approval",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": "srv-2",
+        "members": {
+          "params.startedAtMs": 1760000000002
+        }
+      }
+    },
+    {
+      "situation": "serverRequest/resolved",
+      "note": "The notification carries the resolved request in its body, not in a frame identifier",
+      "frame": {
+        "method": "serverRequest/resolved",
+        "params": {
+          "threadId": "thr_123",
+          "requestId": "srv-1"
+        }
+      },
+      "expect": {
+        "wire_name": "serverRequest/resolved",
+        "method": "server-request.resolved",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null,
+        "members": {
+          "params.requestId": "srv-1"
+        }
+      }
+    },
+    {
+      "situation": "reconnect",
+      "note": "A reconnected connection negotiates its capabilities again",
+      "frame": {
+        "method": "initialize",
+        "id": 0,
+        "params": {
+          "clientInfo": {
+            "name": "kalareach",
+            "title": "KalaReach",
+            "version": "0.2.0"
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "initialize",
+        "method": "initialize",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 0
+      }
+    },
+    {
+      "situation": "reconnect",
+      "note": "Interrupting after a reconnect names the turn it means",
+      "frame": {
+        "method": "turn/interrupt",
+        "id": 31,
+        "params": {
+          "threadId": "thr_123",
+          "turnId": "turn_456"
+        }
+      },
+      "expect": {
+        "wire_name": "turn/interrupt",
+        "method": "turn.interrupt",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 31,
+        "members": {
+          "params.turnId": "turn_456"
+        }
+      }
+    },
+    {
+      "situation": "methods this table refuses",
+      "note": "Running a command outside the sandbox",
+      "frame": {
+        "method": "thread/shellCommand",
+        "id": 40,
+        "params": {
+          "threadId": "thr_123",
+          "command": "ls"
+        }
+      },
+      "expect": {
+        "wire_name": "thread/shellCommand",
+        "method": "thread.shell-command",
+        "direction": "host_to_upstream",
+        "class": "unsupported",
+        "request_id": 40
+      }
+    },
+    {
+      "situation": "methods this table refuses",
+      "note": "A reverse request for refreshed tokens",
+      "frame": {
+        "method": "account/chatgptAuthTokens/refresh",
+        "id": "auth-1",
+        "params": {
+          "reason": "unauthorized"
+        }
+      },
+      "expect": {
+        "wire_name": "account/chatgptAuthTokens/refresh",
+        "method": "account.chatgpt-auth-tokens.refresh",
+        "direction": "upstream_to_host",
+        "class": "credential",
+        "request_id": "auth-1",
+        "members": {
+          "params.reason": "unauthorized"
+        }
+      }
+    },
+    {
+      "situation": "a method the table does not list",
+      "note": "Renaming a thread is not in this table, so it is a mutation by default",
+      "frame": {
+        "method": "thread/name/set",
+        "id": 50,
+        "params": {
+          "threadId": "thr_123",
+          "name": "Tests"
+        }
+      },
+      "expect": {
+        "wire_name": "thread/name/set",
+        "method": null,
+        "direction": null,
+        "class": "mutation",
+        "request_id": 50
+      }
+    }
+  ],
+  "evidence": {
+    "executable": {
+      "path": "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+      "platform": "macos-aarch64",
+      "sha256": "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e"
+    },
+    "schemas": [
+      {
+        "name": "codex_app_server_protocol.schemas.json",
+        "sha256": "f1f3591667d8dcf77352c04be5d0667153e492d1a378e4205d69e9af6f31c0c3"
+      },
+      {
+        "name": "codex_app_server_protocol.v2.schemas.json",
+        "sha256": "f0402dc8ce8d278108f1e68e9d46ec7e59ddd9d153f5e70668d84d56f258dda3"
+      }
+    ],
+    "read_on": "2026-09-20"
+  }
+}

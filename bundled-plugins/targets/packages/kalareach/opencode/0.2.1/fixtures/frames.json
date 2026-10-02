@@ -1,0 +1,244 @@
+{
+  "corpus_version": 1,
+  "protocol": "opencode-server-v2-events",
+  "tested_version": "1.18.31",
+  "source": "Frames written from the event schemas in the OpenAPI document the installed build serves and checked against each variant's required members. They are not a capture of a live session, and every one of them says so.",
+  "frames": [
+    {
+      "situation": "a running turn's text",
+      "note": "The envelope of this family carries the payload under data",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ2",
+        "type": "session.next.text.delta",
+        "durable": {
+          "aggregateID": "ses_0a1b2c",
+          "seq": 41,
+          "version": 1
+        },
+        "data": {
+          "timestamp": 1758400000000,
+          "sessionID": "ses_0a1b2c",
+          "assistantMessageID": "msg_7f3d",
+          "textID": "txt_1",
+          "delta": "Reading the manifest"
+        }
+      },
+      "expect": {
+        "wire_name": "session.next.text.delta",
+        "method": "session.next.text.delta",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBQ2",
+        "members": {
+          "data.sessionID": "ses_0a1b2c",
+          "data.delta": "Reading the manifest"
+        }
+      }
+    },
+    {
+      "situation": "a permission the session is waiting on",
+      "note": "The pending resource is named at data.id; answering it is an operation this table does not carry",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ3",
+        "type": "permission.v2.asked",
+        "data": {
+          "id": "per_5c8e",
+          "sessionID": "ses_0a1b2c",
+          "action": "bash",
+          "resources": [
+            "rm -rf build"
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "permission.v2.asked",
+        "method": "permission.v2.asked",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBQ3",
+        "members": {
+          "data.id": "per_5c8e",
+          "data.action": "bash"
+        }
+      }
+    },
+    {
+      "situation": "the answer that resolved it",
+      "note": "The answer names the request it resolved at data.requestID, which is the identifier the ask carried at data.id",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ4",
+        "type": "permission.v2.replied",
+        "data": {
+          "sessionID": "ses_0a1b2c",
+          "requestID": "per_5c8e",
+          "reply": "once"
+        }
+      },
+      "expect": {
+        "wire_name": "permission.v2.replied",
+        "method": "permission.v2.replied",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBQ4",
+        "members": {
+          "data.requestID": "per_5c8e"
+        }
+      }
+    },
+    {
+      "situation": "composer insertion this connector refuses",
+      "note": "Writing into the native composer is what section 12 forbids claiming without a qualified bridge, so the table states it is outside what it proxies",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ5",
+        "type": "tui.prompt.append",
+        "data": {
+          "text": "ship it"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.prompt.append",
+        "method": "tui.prompt.append",
+        "direction": "upstream_to_host",
+        "class": "unsupported",
+        "request_id": "evt_01JBQ5",
+        "members": {
+          "data.text": "ship it"
+        }
+      }
+    },
+    {
+      "situation": "a terminal command this connector refuses",
+      "note": "The command vocabulary includes prompt.submit, so forwarding one would submit a turn from a control nobody qualified",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ6",
+        "type": "tui.command.execute",
+        "data": {
+          "command": "prompt.submit"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.command.execute",
+        "method": "tui.command.execute",
+        "direction": "upstream_to_host",
+        "class": "unsupported",
+        "request_id": "evt_01JBQ6",
+        "members": {
+          "data.command": "prompt.submit"
+        }
+      }
+    },
+    {
+      "situation": "the terminal moving to another session",
+      "note": "The selected conversation changes without the process changing, which is what advances a binding revision",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ7",
+        "type": "tui.session.select",
+        "data": {
+          "sessionID": "ses_9f8e7d"
+        }
+      },
+      "expect": {
+        "wire_name": "tui.session.select",
+        "method": "tui.session.select",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": "evt_01JBQ7",
+        "members": {
+          "data.sessionID": "ses_9f8e7d"
+        }
+      }
+    },
+    {
+      "situation": "the shared per-user scope disposed",
+      "note": "The document carries no payload with this event, so it reports the disposal and nothing about what survived it",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ8",
+        "type": "global.disposed",
+        "data": {}
+      },
+      "expect": {
+        "wire_name": "global.disposed",
+        "method": "global.disposed",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBQ8"
+      }
+    },
+    {
+      "situation": "an envelope from the other API family",
+      "note": "The same type name, and the payload under properties rather than data. A name identifies no family, so this frame routes by name and carries nothing under the member this table reads; which family a connection belongs to is settled from the installed version and schema before it opens",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQ9",
+        "type": "permission.asked",
+        "properties": {
+          "id": "per_3d2a",
+          "sessionID": "ses_0a1b2c",
+          "permission": "bash",
+          "patterns": [
+            "rm *"
+          ],
+          "metadata": {},
+          "always": []
+        }
+      },
+      "expect": {
+        "wire_name": "permission.asked",
+        "method": "permission.asked",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": "evt_01JBQ9",
+        "members": {
+          "properties.id": "per_3d2a",
+          "properties.permission": "bash"
+        }
+      }
+    },
+    {
+      "situation": "an event only the other API family publishes",
+      "note": "This name is in the earlier family's event union and not in this one's. The table lists it as unsupported, so seeing it says the connection is not the family this table was qualified against",
+      "provenance": "written",
+      "frame": {
+        "id": "evt_01JBQA",
+        "type": "server.instance.disposed",
+        "properties": {
+          "directory": "/workspace"
+        }
+      },
+      "expect": {
+        "wire_name": "server.instance.disposed",
+        "method": "server.instance.disposed",
+        "direction": "upstream_to_host",
+        "class": "unsupported",
+        "request_id": "evt_01JBQA",
+        "members": {
+          "properties.directory": "/workspace"
+        }
+      }
+    }
+  ],
+  "evidence": {
+    "executable": {
+      "path": "node_modules/opencode-darwin-arm64/bin/opencode",
+      "platform": "macos-aarch64",
+      "version": "1.18.31",
+      "sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+    },
+    "schema": {
+      "source": "the OpenAPI document this build serves at /doc",
+      "sha256": "46db986090aae41846cd6dbe16225a1d883f0bbcb4c48814008d3f6ce140aa5c",
+      "families": {
+        "this_table": "GET /api/event, schema V2Event, payload at data",
+        "the_other": "GET /event, schema Event, payload at properties"
+      }
+    },
+    "read_on": "2026-09-20"
+  }
+}

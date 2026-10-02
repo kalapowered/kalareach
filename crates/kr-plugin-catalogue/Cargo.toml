@@ -10,7 +10,14 @@ publish.workspace = true
 
 # Verification, storage and network code, and no component engine: the control daemon links this
 # crate, and neither the daemon nor a worker may link a Wasm engine.
+[features]
+# Lets a test build the seed's bundle from files of its own and name what it trusts. A shipped
+# build has one bundle, the one compiled in.
+testing = []
+
 [dependencies]
+# The byte buffers the update client's transport streams carry.
+bytes.workspace = true
 # The store's directories are held open, each opened without following a link, and everything the
 # store writes, renames or removes goes through those handles rather than through a name again.
 cap-fs-ext.workspace = true
@@ -45,6 +52,8 @@ url.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+# The seed's test constructors, which a shipped build does not have.
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 aws-lc-rs.workspace = true
 # Identifiers a test makes for environments of its own.
 kr-ipc.workspace = true

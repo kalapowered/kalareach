@@ -4724,6 +4724,7 @@ name = "kr-plugin-catalogue"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "bytes",
  "cap-fs-ext",
  "cap-std",
  "futures",
@@ -4731,6 +4732,7 @@ dependencies = [
  "kr-crypto",
  "kr-flush",
  "kr-ipc",
+ "kr-plugin-catalogue",
  "kr-plugin-sdk",
  "kr-protocol",
  "percent-encoding",
@@ -4776,6 +4778,7 @@ dependencies = [
  "kr-cbor",
  "kr-crypto",
  "kr-ipc",
+ "kr-plugin-catalogue",
  "kr-plugin-runtime",
  "kr-plugin-sdk",
  "kr-plugin-service",

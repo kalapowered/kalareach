@@ -1,0 +1,938 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/opencode-attach",
+  "protocol": {
+    "name": "opencode-server-events",
+    "qualified_range": "=1.18.31",
+    "tested_version": "1.18.31"
+  },
+  "transport": "server_sent_events",
+  "framing": {
+    "type": "server_sent_events",
+    "max_message_bytes": "8388608"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "type"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "id"
+        }
+      ]
+    }
+  },
+  "routes": [
+    {
+      "method": "catalog.updated",
+      "wire_name": "catalog.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "command.executed",
+      "wire_name": "command.executed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "file.edited",
+      "wire_name": "file.edited",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "file.watcher.updated",
+      "wire_name": "file.watcher.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "global.disposed",
+      "wire_name": "global.disposed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "installation.update-available",
+      "wire_name": "installation.update-available",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "installation.updated",
+      "wire_name": "installation.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "integration.connection.updated",
+      "wire_name": "integration.connection.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "integration.updated",
+      "wire_name": "integration.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "lsp.updated",
+      "wire_name": "lsp.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp.browser.open.failed",
+      "wire_name": "mcp.browser.open.failed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp.tools.changed",
+      "wire_name": "mcp.tools.changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "message.part.delta",
+      "wire_name": "message.part.delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "message.part.removed",
+      "wire_name": "message.part.removed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "message.part.updated",
+      "wire_name": "message.part.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "message.removed",
+      "wire_name": "message.removed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "message.updated",
+      "wire_name": "message.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "models-dev.refreshed",
+      "wire_name": "models-dev.refreshed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "permission.asked",
+      "wire_name": "permission.asked",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "permission.replied",
+      "wire_name": "permission.replied",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "permission.v2.asked",
+      "wire_name": "permission.v2.asked",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "permission.v2.replied",
+      "wire_name": "permission.v2.replied",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "plugin.added",
+      "wire_name": "plugin.added",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "project.directories.updated",
+      "wire_name": "project.directories.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "project.updated",
+      "wire_name": "project.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "pty.created",
+      "wire_name": "pty.created",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "pty.deleted",
+      "wire_name": "pty.deleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "pty.exited",
+      "wire_name": "pty.exited",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "pty.updated",
+      "wire_name": "pty.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.asked",
+      "wire_name": "question.asked",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.rejected",
+      "wire_name": "question.rejected",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.replied",
+      "wire_name": "question.replied",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.v2.asked",
+      "wire_name": "question.v2.asked",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.v2.rejected",
+      "wire_name": "question.v2.rejected",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "question.v2.replied",
+      "wire_name": "question.v2.replied",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "reference.updated",
+      "wire_name": "reference.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "server.connected",
+      "wire_name": "server.connected",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "server.instance.disposed",
+      "wire_name": "server.instance.disposed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.compacted",
+      "wire_name": "session.compacted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.created",
+      "wire_name": "session.created",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.deleted",
+      "wire_name": "session.deleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.diff",
+      "wire_name": "session.diff",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.error",
+      "wire_name": "session.error",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.idle",
+      "wire_name": "session.idle",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.agent.switched",
+      "wire_name": "session.next.agent.switched",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.compaction.delta",
+      "wire_name": "session.next.compaction.delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.compaction.ended",
+      "wire_name": "session.next.compaction.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.compaction.started",
+      "wire_name": "session.next.compaction.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.context.updated",
+      "wire_name": "session.next.context.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.model.switched",
+      "wire_name": "session.next.model.switched",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.moved",
+      "wire_name": "session.next.moved",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.prompt.admitted",
+      "wire_name": "session.next.prompt.admitted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.prompted",
+      "wire_name": "session.next.prompted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.reasoning.delta",
+      "wire_name": "session.next.reasoning.delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.reasoning.ended",
+      "wire_name": "session.next.reasoning.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.reasoning.started",
+      "wire_name": "session.next.reasoning.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.retried",
+      "wire_name": "session.next.retried",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.revert.cleared",
+      "wire_name": "session.next.revert.cleared",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.revert.committed",
+      "wire_name": "session.next.revert.committed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.revert.staged",
+      "wire_name": "session.next.revert.staged",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.shell.ended",
+      "wire_name": "session.next.shell.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.shell.started",
+      "wire_name": "session.next.shell.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.step.ended",
+      "wire_name": "session.next.step.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.step.failed",
+      "wire_name": "session.next.step.failed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.step.started",
+      "wire_name": "session.next.step.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.synthetic",
+      "wire_name": "session.next.synthetic",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.text.delta",
+      "wire_name": "session.next.text.delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.text.ended",
+      "wire_name": "session.next.text.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.text.started",
+      "wire_name": "session.next.text.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.called",
+      "wire_name": "session.next.tool.called",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.failed",
+      "wire_name": "session.next.tool.failed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.input.delta",
+      "wire_name": "session.next.tool.input.delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.input.ended",
+      "wire_name": "session.next.tool.input.ended",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.input.started",
+      "wire_name": "session.next.tool.input.started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.progress",
+      "wire_name": "session.next.tool.progress",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.next.tool.success",
+      "wire_name": "session.next.tool.success",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.status",
+      "wire_name": "session.status",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.updated",
+      "wire_name": "session.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "todo.updated",
+      "wire_name": "todo.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "tui.command.execute",
+      "wire_name": "tui.command.execute",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "tui.prompt.append",
+      "wire_name": "tui.prompt.append",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "tui.session.select",
+      "wire_name": "tui.session.select",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "tui.toast.show",
+      "wire_name": "tui.toast.show",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "vcs.branch.updated",
+      "wire_name": "vcs.branch.updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "workspace.failed",
+      "wire_name": "workspace.failed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "workspace.ready",
+      "wire_name": "workspace.ready",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "workspace.status",
+      "wire_name": "workspace.status",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "worktree.failed",
+      "wire_name": "worktree.failed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "worktree.ready",
+      "wire_name": "worktree.ready",
+      "direction": "upstream_to_host"
+    }
+  ],
+  "methods": [
+    {
+      "method": "catalog.updated",
+      "class": "observation",
+      "evidence": "Reports that the model catalogue this server reads has changed"
+    },
+    {
+      "method": "command.executed",
+      "class": "observation",
+      "evidence": "Reports that a command ran; the run happened before the event"
+    },
+    {
+      "method": "file.edited",
+      "class": "observation",
+      "evidence": "Names a file the session edited; the edit happened before the event"
+    },
+    {
+      "method": "file.watcher.updated",
+      "class": "observation",
+      "evidence": "Reports that the watched file set changed"
+    },
+    {
+      "method": "global.disposed",
+      "class": "observation",
+      "evidence": "Reports that the server's global scope was disposed; the document carries no payload with it, so it says nothing further about what survives"
+    },
+    {
+      "method": "installation.update-available",
+      "class": "observation",
+      "evidence": "Reports that a newer release exists; it installs nothing"
+    },
+    {
+      "method": "installation.updated",
+      "class": "observation",
+      "evidence": "Reports the installed version this server is running"
+    },
+    {
+      "method": "integration.connection.updated",
+      "class": "observation",
+      "evidence": "Names an integration whose connection state changed; it carries the identifier only, never the credential"
+    },
+    {
+      "method": "integration.updated",
+      "class": "observation",
+      "evidence": "Reports that the installed integration list has changed"
+    },
+    {
+      "method": "lsp.updated",
+      "class": "observation",
+      "evidence": "Reports the language server state this session sees"
+    },
+    {
+      "method": "mcp.browser.open.failed",
+      "class": "observation",
+      "evidence": "Reports that an MCP authorisation page could not be opened"
+    },
+    {
+      "method": "mcp.tools.changed",
+      "class": "observation",
+      "evidence": "Reports that a connected MCP server's tool list changed"
+    },
+    {
+      "method": "message.part.delta",
+      "class": "observation",
+      "evidence": "Carries an incremental change to a message part already reported"
+    },
+    {
+      "method": "message.part.removed",
+      "class": "observation",
+      "evidence": "Reports that a stored message part was removed"
+    },
+    {
+      "method": "message.part.updated",
+      "class": "observation",
+      "evidence": "Reports a stored message part's new state"
+    },
+    {
+      "method": "message.removed",
+      "class": "observation",
+      "evidence": "Reports that a stored message was removed"
+    },
+    {
+      "method": "message.updated",
+      "class": "observation",
+      "evidence": "Reports a stored message's new state"
+    },
+    {
+      "method": "models-dev.refreshed",
+      "class": "observation",
+      "evidence": "Reports that the shared model catalogue was refreshed"
+    },
+    {
+      "method": "permission.asked",
+      "class": "observation",
+      "evidence": "Reports that a permission is pending, with its identifier, session, permission name and patterns; answering it is a separate operation this table does not carry"
+    },
+    {
+      "method": "permission.replied",
+      "class": "observation",
+      "evidence": "Reports the answer that resolved a pending permission; the resolution happened before the event"
+    },
+    {
+      "method": "permission.v2.asked",
+      "class": "observation",
+      "evidence": "Reports a pending permission on the same stream under the newer name"
+    },
+    {
+      "method": "permission.v2.replied",
+      "class": "observation",
+      "evidence": "Reports a pending permission's resolution under the newer name"
+    },
+    {
+      "method": "plugin.added",
+      "class": "observation",
+      "evidence": "Reports that a plugin was loaded into this server"
+    },
+    {
+      "method": "project.directories.updated",
+      "class": "observation",
+      "evidence": "Reports the directory set a project covers"
+    },
+    {
+      "method": "project.updated",
+      "class": "observation",
+      "evidence": "Reports a project record's new state"
+    },
+    {
+      "method": "pty.created",
+      "class": "observation",
+      "evidence": "Reports that a terminal was created; its bytes travel on a separate connection outside this table"
+    },
+    {
+      "method": "pty.deleted",
+      "class": "observation",
+      "evidence": "Reports that a terminal record was removed"
+    },
+    {
+      "method": "pty.exited",
+      "class": "observation",
+      "evidence": "Reports that a terminal's process exited"
+    },
+    {
+      "method": "pty.updated",
+      "class": "observation",
+      "evidence": "Reports a terminal's new state"
+    },
+    {
+      "method": "question.asked",
+      "class": "observation",
+      "evidence": "Reports a question the session is waiting on, with its identifier"
+    },
+    {
+      "method": "question.rejected",
+      "class": "observation",
+      "evidence": "Reports that a pending question was rejected"
+    },
+    {
+      "method": "question.replied",
+      "class": "observation",
+      "evidence": "Reports the answer that resolved a pending question"
+    },
+    {
+      "method": "question.v2.asked",
+      "class": "observation",
+      "evidence": "Reports a pending question under the newer name"
+    },
+    {
+      "method": "question.v2.rejected",
+      "class": "observation",
+      "evidence": "Reports a pending question's rejection under the newer name"
+    },
+    {
+      "method": "question.v2.replied",
+      "class": "observation",
+      "evidence": "Reports a pending question's answer under the newer name"
+    },
+    {
+      "method": "reference.updated",
+      "class": "observation",
+      "evidence": "Reports that the reference index changed"
+    },
+    {
+      "method": "server.connected",
+      "class": "observation",
+      "evidence": "Reports that this subscription is established"
+    },
+    {
+      "method": "server.instance.disposed",
+      "class": "observation",
+      "evidence": "Reports that the server instance for the named directory was disposed. Only this API family publishes it, so seeing it is evidence of the family this table was qualified against"
+    },
+    {
+      "method": "session.compacted",
+      "class": "observation",
+      "evidence": "Reports that the session history was compacted"
+    },
+    {
+      "method": "session.created",
+      "class": "observation",
+      "evidence": "Reports that a session exists, with the record the server already stored"
+    },
+    {
+      "method": "session.deleted",
+      "class": "observation",
+      "evidence": "Reports that a stored session was deleted; the deletion happened before the event"
+    },
+    {
+      "method": "session.diff",
+      "class": "observation",
+      "evidence": "Reports the session's changed-file state"
+    },
+    {
+      "method": "session.error",
+      "class": "observation",
+      "evidence": "Reports an error the session raised"
+    },
+    {
+      "method": "session.idle",
+      "class": "observation",
+      "evidence": "Reports that the named session has no turn in flight"
+    },
+    {
+      "method": "session.next.agent.switched",
+      "class": "observation",
+      "evidence": "Reports that the session's agent selection changed, which advances the binding revision"
+    },
+    {
+      "method": "session.next.compaction.delta",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.compaction.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.compaction.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.context.updated",
+      "class": "observation",
+      "evidence": "Reports the turn's context window accounting"
+    },
+    {
+      "method": "session.next.model.switched",
+      "class": "observation",
+      "evidence": "Reports that the session's model selection changed"
+    },
+    {
+      "method": "session.next.moved",
+      "class": "observation",
+      "evidence": "Reports that the session moved to another execution location"
+    },
+    {
+      "method": "session.next.prompt.admitted",
+      "class": "observation",
+      "evidence": "Reports that an accepted prompt entered the running turn, which is admission and not a result"
+    },
+    {
+      "method": "session.next.prompted",
+      "class": "observation",
+      "evidence": "Reports that a prompt was accepted into the session"
+    },
+    {
+      "method": "session.next.reasoning.delta",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.reasoning.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.reasoning.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.retried",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.revert.cleared",
+      "class": "observation",
+      "evidence": "Reports that a staged revert was cleared"
+    },
+    {
+      "method": "session.next.revert.committed",
+      "class": "observation",
+      "evidence": "Reports that a staged revert was committed to the working tree"
+    },
+    {
+      "method": "session.next.revert.staged",
+      "class": "observation",
+      "evidence": "Reports that a revert was staged; staging happened before the event"
+    },
+    {
+      "method": "session.next.shell.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.shell.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.step.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.step.failed",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.step.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.synthetic",
+      "class": "observation",
+      "evidence": "Reports a message the server added itself rather than one a person wrote"
+    },
+    {
+      "method": "session.next.text.delta",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.text.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.text.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.tool.called",
+      "class": "observation",
+      "evidence": "Reports the tool the turn called and the input it called it with"
+    },
+    {
+      "method": "session.next.tool.failed",
+      "class": "observation",
+      "evidence": "Reports a tool call's failure; the call ran before the event"
+    },
+    {
+      "method": "session.next.tool.input.delta",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.tool.input.ended",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.tool.input.started",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.tool.progress",
+      "class": "observation",
+      "evidence": "Reports one step of a running turn on the subscribed session and changes nothing upstream"
+    },
+    {
+      "method": "session.next.tool.success",
+      "class": "observation",
+      "evidence": "Reports a tool call's result; the call ran before the event"
+    },
+    {
+      "method": "session.status",
+      "class": "observation",
+      "evidence": "Reports which sessions are running and which are idle"
+    },
+    {
+      "method": "session.updated",
+      "class": "observation",
+      "evidence": "Reports a stored session record's new state"
+    },
+    {
+      "method": "todo.updated",
+      "class": "observation",
+      "evidence": "Reports the session's task list"
+    },
+    {
+      "method": "tui.command.execute",
+      "class": "unsupported",
+      "evidence": "Runs a named terminal command, including prompt.submit and session.interrupt; the table cannot say what one does, so the connector states it is outside what it proxies"
+    },
+    {
+      "method": "tui.prompt.append",
+      "class": "unsupported",
+      "evidence": "Writes text into the native composer of whichever terminal is attached; this package qualifies no composer insertion, so the connector states it is outside what it proxies"
+    },
+    {
+      "method": "tui.session.select",
+      "class": "mutation",
+      "evidence": "Moves the attached terminal to another session, which changes the execution owner a binding is observing"
+    },
+    {
+      "method": "tui.toast.show",
+      "class": "mutation",
+      "evidence": "Puts a message on the attached terminal's screen, so it changes what a person reads rather than reporting state"
+    },
+    {
+      "method": "vcs.branch.updated",
+      "class": "observation",
+      "evidence": "Reports the working tree's branch"
+    },
+    {
+      "method": "workspace.failed",
+      "class": "observation",
+      "evidence": "Reports that a workspace failed to prepare"
+    },
+    {
+      "method": "workspace.ready",
+      "class": "observation",
+      "evidence": "Reports that a workspace finished preparing"
+    },
+    {
+      "method": "workspace.status",
+      "class": "observation",
+      "evidence": "Reports a workspace's preparation state"
+    },
+    {
+      "method": "worktree.failed",
+      "class": "observation",
+      "evidence": "Reports that a worktree failed to prepare"
+    },
+    {
+      "method": "worktree.ready",
+      "class": "observation",
+      "evidence": "Reports that a worktree finished preparing"
+    }
+  ],
+  "decision_destination": null,
+  "volatile_forwarding": false,
+  "qualification_note": "Qualified against OpenCode 1.18.31 (npm opencode-ai), executable sha256 16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198, from the OpenAPI document that build serves at /doc (sha256 46db986090aae41846cd6dbe16225a1d883f0bbcb4c48814008d3f6ce140aa5c), read 2026-09-24. It covers the event stream of the unprefixed API that opencode serve and opencode attach use, GET /event, whose envelope carries id, type and properties. The shared-server family publishes 88 of these 89 names at GET /api/event with the payload under data, so a name identifies no family; this table applies where the installed version and schema match these pins, and otherwise the capability is incompatible and the terminal remains. Nothing travels host to upstream: id is the durable event identifier, and the correlation repeats it because this leg answers no request. The request leg is HTTP, so no table can name it. max_message_bytes is this host's bound. Volatile forwarding is untested."
+}
