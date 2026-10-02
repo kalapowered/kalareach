@@ -348,10 +348,17 @@ async fn a_link_that_cannot_be_opened_stops_the_lease() {
     // The endpoint goes: nothing accepts there any more.
     silent.serving.abort();
     let _ = silent.serving.await;
-    until("the worker's endpoint refuses", || {
-        std::os::unix::net::UnixStream::connect(silent.worker.endpoint.as_path()).is_err()
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while kr_ipc::endpoint::Connection::connect(&silent.worker.endpoint)
+        .await
+        .is_ok()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker's endpoint still accepts after {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let refused = silent
         .controller
@@ -431,6 +438,123 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
     assert!(
         slot_holds_a_link(controller, silent.session_id).await,
         "the link is kept for the next caller"
+    );
+    silent.serving.abort();
+}
+
+/// An endpoint that proves itself as a worker and answers the handshake, and ends its side of every
+/// connection once `close` is raised, counting each it ended.
+fn closing(
+    close: Arc<tokio::sync::Notify>,
+    ended: Arc<AtomicUsize>,
+) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
+    move |listener, identity, endpoint_text| {
+        tokio::spawn(async move {
+            loop {
+                let Ok((connection, peer)) = listener.accept().await else {
+                    return;
+                };
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                let close = Arc::clone(&close);
+                let ended = Arc::clone(&ended);
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    loop {
+                        tokio::select! {
+                            () = close.notified() => break,
+                            read = reader.read_message::<ControlFrame>() => {
+                                let Ok(frame) = read else { break };
+                                let answers = world::handshake(
+                                    &frame,
+                                    &identity,
+                                    &endpoint_text,
+                                    connection_id,
+                                    &peer,
+                                    &kr_protocol::scalars::CanonicalSet::new(),
+                                );
+                                for answer in answers.into_iter().flatten() {
+                                    if writer.write_message(&answer).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop((reader, writer));
+                    ended.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        })
+    }
+}
+
+/// KR-REQ-09.12: the notice that a caller has its acceptance is written over the link the daemon
+/// holds, and a link that takes it whole is kept with the lease. A worker with no link is not
+/// opened one for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_confirmed_over_a_link_that_takes_it_keeps_the_link_and_the_lease() {
+    let (silent, heard) = stalled().await;
+    let controller = &silent.controller;
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+
+    controller.confirm_delivery(action_id).await;
+    assert_eq!(heard.connections(), 0, "no link is opened to be told");
+    assert_eq!(heard.frames(), 0);
+
+    let mut link = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("the daemon opens its link to the worker");
+    link.give_back();
+    drop(link);
+    controller.confirm_delivery(action_id).await;
+    until("the worker was told", || heard.frames() >= 1).await;
+    assert!(
+        !controller.leases.is_fenced(silent.session_id),
+        "a notice that was taken gave nothing up"
+    );
+    assert!(leases(controller, silent.session_id));
+    assert!(slot_holds_a_link(controller, silent.session_id).await);
+    assert_eq!(heard.connections(), 1, "over the link it had");
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a link the notice cannot be written to is given up with the lease, and the next
+/// caller opens a link of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
+    let close = Arc::new(tokio::sync::Notify::new());
+    let ended = Arc::new(AtomicUsize::new(0));
+    let silent = world::fake_world(closing(Arc::clone(&close), Arc::clone(&ended))).await;
+    world::acknowledged(&silent.controller, silent.session_id);
+    let controller = &silent.controller;
+    let mut link = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("the daemon opens its link to the worker");
+    link.give_back();
+    drop(link);
+    assert!(leases(controller, silent.session_id));
+
+    // The worker ends its side of the connection; the daemon holds a link to nothing.
+    close.notify_waiters();
+    until("the worker ended its side", || {
+        ended.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    controller
+        .confirm_delivery(kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()))
+        .await;
+    assert!(
+        controller.leases.is_fenced(silent.session_id),
+        "the lease stops renewing"
+    );
+    assert!(!leases(controller, silent.session_id));
+    assert!(
+        !slot_holds_a_link(controller, silent.session_id).await,
+        "the link was closed and not put back"
     );
     silent.serving.abort();
 }

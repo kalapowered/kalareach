@@ -109,16 +109,6 @@ impl std::fmt::Debug for WorkerLink {
 }
 
 impl Controller {
-    /// Records that a worker's control path was lost, wherever the loss was noticed.
-    ///
-    /// Renewal stops with the path. Section 9 ties renewal to the live binding rather than to a
-    /// revision number, so every place that gives up on a worker's client says so here rather than
-    /// leaving a lease renewable over a socket that has gone.
-    pub(super) fn lost_control_path(&self, session_id: SessionId) {
-        let binding = self.leases.binding(session_id);
-        self.leases.stop_renewal(session_id, binding);
-    }
-
     /// Returns what a worker needs to accept this daemon's authority.
     pub(super) fn reconnect(&self) -> Reconnect<'_> {
         Reconnect {
@@ -245,6 +235,27 @@ impl Controller {
             link.client = Some(self.open_worker(worker).await?);
         }
         Ok(link)
+    }
+
+    /// Returns this daemon's connection to a worker as it stands in `slot`, for a caller that
+    /// writes over a link that exists and would not open one: nothing when the slot holds none.
+    ///
+    /// The slot is the one `slot` holds, taken by the caller, and the link carries the binding the
+    /// worker's control path is on now, so what is given up with it is that path.
+    pub(super) fn link_in(
+        &self,
+        session_id: SessionId,
+        mut slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+    ) -> Option<WorkerLink> {
+        let client = slot.take()?;
+        Some(WorkerLink {
+            daemon: self.me.clone(),
+            session_id,
+            binding: self.leases.binding(session_id),
+            client: Some(client),
+            returned: false,
+            slot,
+        })
     }
 
     /// Returns this daemon's one connection to the worker of one session.
