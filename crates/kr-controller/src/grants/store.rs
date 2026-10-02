@@ -2250,20 +2250,28 @@ fn migrate_revocation_answers(connection: &Connection) -> Result<()> {
     // text is not one. What holds it is decided by the decode below, which accepts only the earlier
     // shape: an answer in this build's shape carries a field the earlier one did not, and is left as
     // it is.
-    let candidates: Vec<(String, Vec<u8>, Vec<u8>)> = transaction
+    // The keys only: each result is read when its turn comes, so no more than one is held at once.
+    let candidates: Vec<(String, Vec<u8>)> = transaction
         .prepare(
-            "SELECT actor_id, action_id, result FROM authority_receipts
+            "SELECT actor_id, action_id FROM authority_receipts
               WHERE result IS NOT NULL
                 AND instr(result, CAST('revoked_grants' AS BLOB)) > 0",
         )
         .and_then(|mut statement| {
             statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(ControllerError::registry)?;
     let mut rewritten = 0_usize;
-    for (actor_id, action_id, stored) in candidates {
+    for (actor_id, action_id) in candidates {
+        let stored: Vec<u8> = transaction
+            .query_row(
+                "SELECT result FROM authority_receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
         // Bounded by the row's own length: an answer an earlier build wrote may be larger than a
         // message's limits, and is read whole here to be cut.
         let limits = kr_cbor::Limits {
