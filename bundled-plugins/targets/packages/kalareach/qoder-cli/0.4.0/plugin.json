@@ -1,0 +1,177 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "qoder-cli",
+  "version": "0.4.0",
+  "display_name": "Qoder CLI",
+  "description": "Recognises Qoder CLI, reads its agent protocol through a declarative table and stops the turn it is running, with the terminal as the default route.",
+  "sdk_range": ">=0.1.2, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "3efd5eed04308e54e6a55c19f7483c55d8b3e515"
+  },
+  "match_rules": [
+    {
+      "id": "qoder-cli-entry",
+      "executable": {
+        "file_stem": "qoder",
+        "path_suffix": [
+          ".qoder",
+          "entry"
+        ],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    },
+    {
+      "id": "qoder-cli-command",
+      "executable": {
+        "file_stem": "qodercli",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    },
+    {
+      "id": "qoder-cli-executable",
+      "executable": {
+        "file_stem": "qoder",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    },
+    {
+      "id": "qoder-cli-qualified-release",
+      "executable": {
+        "file_stem": "qodercli-1.1.63",
+        "path_suffix": [
+          ".qoder",
+          "bin",
+          "qodercli"
+        ],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "0c3c912ac90dbb0a9dc810cea46338634a8ac98e54e959d88181a1a57022fada",
+      "size_bytes": "7918"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "327094ff38d8c62bb93010eaf7dfc6255c915b84e570a8bfa586d0ad27b0cbbe",
+      "size_bytes": "8672"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "8240295fd5e8f51aac6091c00c5cf85a85d95689efd140facfd8c84db2538083",
+      "size_bytes": "4896"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "8d62c2877ee81d152b2390845aca2a46041c36f9b1de9c6268cbdaca30b8ea36",
+      "size_bytes": "7883"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "7efcadea1c8c941e45be6e9112ff6c5244a4f7512c653759160176779ca73cc1",
+      "size_bytes": "4058"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Qoder CLI from its own installation directory, and from the executable names it installs, as a guess"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show what the Qoder CLI session is doing and the controls for its turn"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read the turn and tool updates the selected agent-protocol execution reports"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Ask Qoder CLI to stop the turn it is running when you press Stop"
+    },
+    {
+      "capability": "command_integration.launch",
+      "reason": "Start Qoder CLI in KalaReach sessions with the settings that register the KalaReach forwarder as its hooks"
+    }
+  ],
+  "actions": [
+    {
+      "id": "turn.cancel",
+      "label": "Stop the turn",
+      "effect": "upstream.cancel",
+      "implementation": {
+        "type": "upstream_cancel"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Cancel the turn the bound Qoder CLI execution is running, which ends it as interrupted",
+      "confirmation_required": false
+    },
+    {
+      "id": "session.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the session state the host already holds",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null,
+  "command_integration": {
+    "command": "qodercli",
+    "flags": [
+      "--settings",
+      "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":1}]}],\"PostToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"PostToolUseFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"Notification\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}]}}"
+    ],
+    "variables": [],
+    "grant_statement": "When you run qodercli in a KalaReach session with this integration on, KalaReach adds --settings with inline settings that register the KalaReach forwarder, kr-hook qoder-cli hook, for SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification, with a timeout of one second for SessionEnd and five for the others. Qoder CLI runs these hooks beside your own, and nothing is written to your Qoder CLI settings. Qoder CLI starts the forwarder itself, so the forwarder runs under Qoder CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees those five events of that session."
+  }
+}

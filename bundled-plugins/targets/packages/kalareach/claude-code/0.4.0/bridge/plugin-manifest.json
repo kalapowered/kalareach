@@ -1,0 +1,12 @@
+{
+  "name": "kalareach-channels",
+  "displayName": "KalaReach",
+  "version": "0.2.0",
+  "description": "Carries this session's lifecycle and tool events, and its Channels tool approvals, to the KalaReach worker that owns the terminal.",
+  "channels": [
+    {
+      "server": "kalareach"
+    }
+  ],
+  "defaultEnabled": false
+}

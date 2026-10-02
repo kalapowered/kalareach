@@ -17,7 +17,7 @@
 //! An active binding is not torn down under a request that is already running: it warns, and it
 //! follows the administrator's explicit disable policy at the point that policy names.
 
-use kr_plugin_sdk::capability::CapabilityRequest;
+use kr_plugin_sdk::capability::{CapabilityRequest, PluginCapability};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::{PluginId, PluginName, PublisherId};
 use kr_plugin_sdk::version::PackageVersion;
@@ -152,6 +152,26 @@ impl Installation {
                 .collect(),
             ceiling,
         }
+    }
+
+    /// Returns the first capability a grant of `proposed` would add to this installation, where
+    /// this release asks for a native bridge.
+    ///
+    /// A bridge runs under the application's own permissions, outside the plugin sandbox, and the
+    /// owner is shown the publisher's statement of what it does and the host's notice of that when
+    /// the release is installed with a grant. A grant that only changes an installation later
+    /// shows neither, so for such a release it only narrows: adding to what it holds is the
+    /// install's.
+    #[must_use]
+    pub fn widening_for_a_bridge(&self, proposed: &InstallationGrant) -> Option<PluginCapability> {
+        if !self
+            .requested
+            .iter()
+            .any(|request| request.capability == PluginCapability::NativeBridgeInstall)
+        {
+            return None;
+        }
+        self.grant.increase_over(proposed).first().copied()
     }
 
     /// Returns whether the installation is pinned once a pin naming `package_digest` is applied.

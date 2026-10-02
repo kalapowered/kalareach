@@ -1,0 +1,123 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/claude-code",
+  "protocol": {
+    "name": "claude-code-channels",
+    "qualified_range": "=2.1.278",
+    "tested_version": "2.1.278"
+  },
+  "transport": "private_socket",
+  "framing": {
+    "type": "line_delimited_json",
+    "max_message_bytes": "1048576"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "params"
+      },
+      {
+        "type": "member",
+        "name": "request_id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "method"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "params"
+        },
+        {
+          "type": "member",
+          "name": "request_id"
+        }
+      ]
+    }
+  },
+  "routes": [
+    {
+      "method": "channel.event",
+      "wire_name": "notifications/claude/channel",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "channel.permission-request",
+      "wire_name": "notifications/claude/channel/permission_request",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "channel.permission",
+      "wire_name": "notifications/claude/channel/permission",
+      "direction": "host_to_upstream"
+    }
+  ],
+  "methods": [
+    {
+      "method": "channel.event",
+      "class": "mutation",
+      "evidence": "Delivers a message into the session, which Claude reads on its next turn and acts on; the write to the transport is the only acknowledgement, so delivery is not steering and not processing"
+    },
+    {
+      "method": "channel.permission-request",
+      "class": "mutation",
+      "evidence": "A reverse request carrying request_id, tool_name, description and input_preview for a tool call the session is waiting on; answering it runs or refuses that call"
+    },
+    {
+      "method": "channel.permission",
+      "class": "mutation",
+      "evidence": "Answers the pending request named by request_id with allow or deny, which runs or refuses the tool call"
+    }
+  ],
+  "decision_destination": {
+    "answers": "channel.permission-request",
+    "method": "channel.permission",
+    "request_id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "params"
+        },
+        {
+          "type": "member",
+          "name": "request_id"
+        }
+      ]
+    },
+    "decision_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "params"
+        },
+        {
+          "type": "member",
+          "name": "behavior"
+        }
+      ]
+    },
+    "decisions": [
+      {
+        "decision": "allow",
+        "value": "allow"
+      },
+      {
+        "decision": "deny",
+        "value": "deny"
+      }
+    ]
+  },
+  "volatile_forwarding": false,
+  "qualification_note": "Qualified against Claude Code 2.1.278 (npm @anthropic-ai/claude-code), whose macOS arm64 executable is sha256 bd245662fb8a0e321b3bf133e930371d6563c387527885f30b2613aef3ba14d6, and the Channels reference at code.claude.com/docs/en/channels-reference, read 2026-09-20; all three notification names are in that executable. Every message on this surface is a notification with no id member, so the correlation identifier is params.request_id. The decision destination answers channel.permission-request with channel.permission, which repeats the request's own params.request_id and carries a params.behavior of allow or deny. The table sends nothing; where no host carries the answer, the approval is answered in the terminal. The bridge's host contract is core's kr-hook forwarder at core e2f867b3, verified by core's tests against a stand-in application, not a live Claude Code. Volatile forwarding is untested. fixtures/frames.json pins the evidence; docs/qualification-notes.md records each check."
+}

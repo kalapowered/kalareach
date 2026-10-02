@@ -67,9 +67,19 @@ pub mod install;
 pub mod platform;
 pub mod repository;
 pub mod search;
+pub mod seed;
 pub mod store;
 pub mod transport;
 pub mod trust;
+
+// Both are written by `scripts/sync-bundled-plugins.sh`, which `--verify` checks them against, so
+// the formatter leaves them as the script wrote them.
+/// The generation compiled into the host.
+#[rustfmt::skip]
+mod bundled_files;
+/// The trust a build commits.
+#[rustfmt::skip]
+mod seed_trust;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -106,6 +116,11 @@ pub use crate::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
 pub use crate::search::{MatchIndex, Observation};
+#[cfg(any(test, feature = "testing"))]
+pub use crate::seed::SeedPoint;
+pub use crate::seed::{
+    Permitted, Refusal, SeedBundle, SeedOutcome, SeedTrust, permitted as permitted_root,
+};
 pub use crate::store::{HeldPackage, PackageCheck, ReadyPackage, Store};
 pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 
@@ -157,6 +172,36 @@ impl FetchReason {
             Self::ExplicitEnable => "explicit_enable",
             Self::AuthorisedActivation => "authorised_activation",
             Self::FullOfflineMirror => "full_offline_mirror",
+        }
+    }
+}
+
+/// Where a sync reads a generation from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Via<'a> {
+    /// The repository, over the transport its host built: expiry is enforced and an address that
+    /// cannot be reached is a refusal.
+    Repository,
+    /// The generation compiled into the host, over a transport made of its bytes: no network is
+    /// asked, the metadata's expiry is waived (the host reports it by its own reading), and only
+    /// the enrolment the seed made is synchronised.
+    Bundle(&'a SeedBundle),
+}
+
+/// Why a payload is being fetched: one of the reasons section 11 names, or the seed's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Why<'a> {
+    /// One of the three reasons section 11 names, and the mirror.
+    Reason(FetchReason),
+    /// The seed installs a package it carries, from the bytes it carries.
+    Seed(&'a SeedBundle),
+}
+
+impl Why<'_> {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reason(reason) => reason.as_str(),
+            Self::Seed(_) => "bundled_seed",
         }
     }
 }
@@ -237,6 +282,8 @@ pub enum Transition {
     },
     /// The administrator's disable policy changed.
     PolicyChanged(DisablePolicy),
+    /// The seed recorded a decision of its own and changed nothing a binding can see.
+    SeedRecorded,
 }
 
 impl Transition {
@@ -248,7 +295,7 @@ impl Transition {
     #[must_use]
     pub const fn alters_admissions(&self) -> bool {
         match self {
-            Self::Enrolled(_) | Self::Updated(_) => false,
+            Self::Enrolled(_) | Self::Updated(_) | Self::SeedRecorded => false,
             Self::Synced { .. }
             | Self::Pinned(_)
             | Self::Removed { .. }
@@ -328,6 +375,12 @@ pub struct Catalogue {
     /// qualifies where none does. It is not kept in the records: the host that holds the policy
     /// puts it in force again when it starts, before the first admission round.
     allowed_adapters: Option<BTreeSet<PluginId>>,
+    /// The generation compiled into the host, where the host has given it: payloads an accepted
+    /// generation pins by digest are served from its bytes when they are not cached.
+    embedded: Option<SeedBundle>,
+    /// Where a test stops the next seed.
+    #[cfg(any(test, feature = "testing"))]
+    seed_stop: Option<seed::SeedPoint>,
 }
 
 impl Catalogue {
@@ -377,6 +430,9 @@ impl Catalogue {
             transport,
             limits: LimitsInForce::default(),
             allowed_adapters: None,
+            embedded: None,
+            #[cfg(any(test, feature = "testing"))]
+            seed_stop: None,
         })
     }
 
@@ -428,6 +484,19 @@ impl Catalogue {
                 enrolment.id, enrolment.metadata_url
             ),
         })
+    }
+
+    /// Refuses a read of the bundled generation for an enrolment the seed did not make.
+    fn require_seeded(&self, key: &EnrolmentKey) -> CatalogueResult<()> {
+        let name = format!("{}{key}", seed::SEEDED);
+        match self.db.read(|records| records.setting(&name))? {
+            Some(_) => Ok(()),
+            None => Err(CatalogueError::Untrusted {
+                detail: "the bundled generation is read only for the repository the seed \
+                         enrolled"
+                    .to_owned(),
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1157,6 +1226,15 @@ impl Catalogue {
                 .map(|installation| installation.plugin_id)
                 .collect();
             changes.remove_enrolment(&current.key)?;
+            // The record that the seed made this enrolment stays, so the seed never enrols again
+            // here; what is written beside it says the owner removed it, and its provenance goes.
+            if changes
+                .setting(&format!("{}{}", seed::SEEDED, current.key))?
+                .is_some()
+            {
+                changes.put_setting(&format!("{}{}", seed::REMOVED, current.key), "1")?;
+                changes.delete_setting(&format!("{}{}", seed::PROVENANCE, current.key))?;
+            }
             Ok((
                 (current.enrolment.clone(), installed.clone()),
                 Transition::Removed {
@@ -1209,6 +1287,20 @@ impl Catalogue {
         id: &RepositoryId,
         change: &mut Change<'_>,
     ) -> CatalogueResult<SyncOutcome> {
+        self.sync_from(id, change, Via::Repository).await
+    }
+
+    /// Synchronises one repository's snapshot from where `via` says.
+    ///
+    /// Reading the bundle is the seed's, and only for the enrolment the seed made: every commit
+    /// this makes under it is for that enrolment, whose record is permanent, and each root the
+    /// client reaches along the way is one this build trusts before it is kept.
+    pub(crate) async fn sync_from(
+        &mut self,
+        id: &RepositoryId,
+        change: &mut Change<'_>,
+        via: Via<'_>,
+    ) -> CatalogueResult<SyncOutcome> {
         let authority = change.authority;
         authority.check()?;
         let enrolled = self.enrolled(id)?;
@@ -1218,13 +1310,29 @@ impl Catalogue {
         // the repository on a newer root and generation than it read before the wait, and trust
         // that a newer root withdrew is not where a load starts.
         let (store, _lock, enrolled) = self.locked(&enrolled)?;
-        self.check_reachable(&enrolled.enrolment)?;
+        let seeded = matches!(via, Via::Bundle(_));
+        if seeded {
+            self.require_seeded(&enrolled.key)?;
+        } else {
+            self.check_reachable(&enrolled.enrolment)?;
+        }
         // The limits in force are read once, so every check this synchronisation makes is held to
         // the same ones.
         let limits = self.limits.get();
         let ledger = ledger_of(&store, &enrolled, limits.package)?;
 
-        let transport = Arc::clone(&self.transport);
+        let transport: Arc<dyn tough::Transport + Send + Sync> = match via {
+            Via::Repository => Arc::clone(&self.transport),
+            Via::Bundle(bundle) => Arc::new(transport::EmbeddedTransport::new(
+                bundle,
+                &enrolled.enrolment,
+            )),
+        };
+        let expiry = if seeded {
+            trust::Expiry::Waived
+        } else {
+            trust::Expiry::Enforced
+        };
         // The client works in a private copy of the accepted trust checkpoint, never in the
         // checkpoint itself: a load that fails, is interrupted or is refused at its commit leaves
         // the accepted checkpoint exactly as it was. A reset a kept root advance still owes is
@@ -1243,16 +1351,29 @@ impl Catalogue {
                 &ledger,
                 limits.transfer_bytes,
                 &transport,
+                expiry,
                 &mut |new_root| {
                     // A rotation is kept the moment verification arrives at it, before anything
                     // that follows can fail: a host that went back to the old root could have old
                     // trust restored by a repository that withheld the new one. Whether it resets
                     // the timestamp and snapshot floors is kept with it, so the next load applies
                     // the reset even though it starts from the new root.
+                    //
+                    // Under the bundle every root the client arrives at is one this build trusts
+                    // before it is kept, an intermediate one included: the client hands one over
+                    // after a load that failed part way along a chain.
+                    if let Via::Bundle(bundle) = via {
+                        bundle.trust().permit(&new_root)?;
+                    }
                     let reset = trust::resets_floors(accepted_root, &new_root)?;
                     let pending = db.begin()?;
                     committed(authority, &rotated, move |permit| {
-                        pending.run(permit, |changes| changes.set_root(key, &new_root, reset))
+                        pending.run(permit, |changes| {
+                            if seeded {
+                                require_seeded_in(changes, key)?;
+                            }
+                            changes.set_root(key, &new_root, reset)
+                        })
                     })
                 },
             )
@@ -1292,6 +1413,9 @@ impl Catalogue {
                                 detail: "the reset was made not to settle".to_owned(),
                             });
                         }
+                        if seeded {
+                            require_seeded_in(changes, key)?;
+                        }
                         changes.clear_trust_reset(key)
                     })
                     .map_err(|error| match error {
@@ -1317,7 +1441,8 @@ impl Catalogue {
         // generation inside the approved budget, so a mirror that cannot be completed leaves the
         // previous generation in place rather than activating a new index it has no payloads for.
         let mut mirrored = 0usize;
-        if enrolled.enrolment.budgets.full_offline_mirror {
+        // The bundle carries the packages of the adapters and nothing a mirror would read.
+        if enrolled.enrolment.budgets.full_offline_mirror && !seeded {
             let fetched = self
                 .mirror(&enrolled, &store, &verified, limits.package, authority)
                 .await;
@@ -1376,6 +1501,9 @@ impl Catalogue {
                 entries,
                 versions,
             };
+            if seeded {
+                require_seeded_in(changes, &key)?;
+            }
             changes.activate(&key, &active, &accepted_targets)?;
             // The generations it no longer keeps go in the same commit that moves it on, the
             // oldest first, decided from the records and the budgets as they are now.
@@ -1699,7 +1827,7 @@ impl Catalogue {
             plugin_id,
             version,
             package_hash,
-            reason,
+            Why::Reason(reason),
             authority,
         )
         .await
@@ -1707,7 +1835,7 @@ impl Catalogue {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn activate_locked(
+    pub(crate) async fn activate_locked(
         &mut self,
         enrolled: &Enrolled,
         store: &Store,
@@ -1715,20 +1843,21 @@ impl Catalogue {
         plugin_id: &PluginId,
         version: &PackageVersion,
         package_hash: Option<PayloadDigest>,
-        reason: FetchReason,
+        why: Why<'_>,
         authority: &dyn Authority,
     ) -> CatalogueResult<ReadyPackage> {
         authority.check()?;
         // Which of the three reasons section 11 names this is, and whether it holds. A package is
         // not fetched because something matched; it is fetched because somebody installed it,
-        // enabled it, or already did both and an application it recognises started.
+        // enabled it, or already did both and an application it recognises started. The seed's
+        // own reason holds only for the enrolment the seed made.
         self.check_reason(
             enrolled,
             environment_id,
             plugin_id,
             version,
             package_hash,
-            reason,
+            why,
         )?;
         // The limits in force are read once, so every check this activation makes is held to the
         // same ones.
@@ -1804,6 +1933,42 @@ impl Catalogue {
                 fetched = fetched.saturating_add(size.get());
             }
         }
+        // Where each payload still to be fetched comes from is decided before anything is made room
+        // for. The seed fetches nothing from the network: a digest that is not in the bundle stops
+        // it here, with nothing evicted, and never reaches an address.
+        let mut needs_the_network = false;
+        for digest in &fetching {
+            let size = if *digest == entry.manifest_digest {
+                entry.manifest_size_bytes.get()
+            } else {
+                entry
+                    .payloads
+                    .iter()
+                    .find(|payload| payload.digest == *digest)
+                    .map_or(0, |payload| payload.size_bytes.get())
+            };
+            let carried = match why {
+                Why::Seed(bundle) => Some(bundle),
+                Why::Reason(_) => self.embedded.as_ref(),
+            }
+            .is_some_and(|bundle| bundle.payload(*digest, size).is_some());
+            if !carried {
+                if matches!(why, Why::Seed(_)) {
+                    return Err(CatalogueError::UnavailableOffline {
+                        detail: format!(
+                            "{digest} of {subject} is not in the bundle, and a seeded installation \
+                             fetches nothing else"
+                        ),
+                    });
+                }
+                needs_the_network = true;
+            }
+        }
+        // A host that cannot reach the repository is told so before it has made room for what it
+        // could not fetch: nothing is evicted for a package that cannot arrive.
+        if needs_the_network {
+            self.check_reachable(&enrolled.enrolment)?;
+        }
         reclaim(
             &mut self.db,
             authority,
@@ -1830,7 +1995,7 @@ impl Catalogue {
                 entry.manifest_digest,
                 entry.manifest_size_bytes.get(),
                 &package,
-                reason,
+                why,
                 authority,
             )
             .await?;
@@ -1852,7 +2017,7 @@ impl Catalogue {
                     payload.digest,
                     payload.size_bytes.get(),
                     &package,
-                    reason,
+                    why,
                     authority,
                 )
                 .await?;
@@ -1902,7 +2067,7 @@ impl Catalogue {
         digest: PayloadDigest,
         length: u64,
         package: &BTreeSet<PayloadDigest>,
-        reason: FetchReason,
+        why: Why<'_>,
         authority: &dyn Authority,
     ) -> CatalogueResult<Vec<u8>> {
         // A cached object that is not cached, or is not the length declared for it, or whose bytes
@@ -1922,10 +2087,9 @@ impl Catalogue {
                 detail: format!(
                     "{target} is not cached here and {id} has no activated generation to fetch it \
                      from for an {}",
-                    reason.as_str()
+                    why.as_str()
                 ),
             })?;
-        self.check_reachable(&enrolled.enrolment)?;
 
         // The payload is fetched as the accepted generation named it, from where that generation
         // said it is, and nothing the repository has published since is read. A generation this
@@ -1946,6 +2110,28 @@ impl Catalogue {
                 ),
             });
         }
+        // A payload the host carries is served from the bytes it carries, whatever generation
+        // pins it, once the bytes are checked against the digest and length that generation
+        // signed: the host's own copy is what an offline install is made from, and nothing is
+        // asked of the network. The seed fetches from nowhere else, and a digest it does not carry
+        // is a refusal and not an address.
+        let embedded = match why {
+            Why::Seed(bundle) => Some(bundle),
+            Why::Reason(_) => self.embedded.as_ref(),
+        }
+        .and_then(|bundle| bundle.payload(digest, accepted_target.record.length))
+        .map(<[u8]>::to_vec);
+        if embedded.is_none() {
+            if matches!(why, Why::Seed(_)) {
+                return Err(CatalogueError::UnavailableOffline {
+                    detail: format!(
+                        "{target} is not in the bundle, and a seeded installation fetches nothing \
+                         else"
+                    ),
+                });
+            }
+            self.check_reachable(&enrolled.enrolment)?;
+        }
         reclaim(
             &mut self.db,
             authority,
@@ -1956,12 +2142,14 @@ impl Catalogue {
             target,
             package,
         )?;
-        let bytes = trust::fetch_accepted(
-            &self.transport,
-            &accepted_target,
-            &ledger_of(store, enrolled, self.limits.get().package)?,
-        )
-        .await?;
+        let ledger = ledger_of(store, enrolled, self.limits.get().package)?;
+        let bytes = if let Some(bytes) = embedded {
+            ledger.check_payload_bytes(bytes.len() as u64, Stage::Declared, target)?;
+            ledger.check_payload_bytes(bytes.len() as u64, Stage::Actual, target)?;
+            bytes
+        } else {
+            trust::fetch_accepted(&self.transport, &accepted_target, &ledger).await?
+        };
         committed(authority, &Effect::Payload(digest), |permit| {
             store.cache_payload(permit, digest, &bytes)
         })?;
@@ -1976,9 +2164,14 @@ impl Catalogue {
         plugin_id: &PluginId,
         version: &PackageVersion,
         package_hash: Option<PayloadDigest>,
-        reason: FetchReason,
+        why: Why<'_>,
     ) -> CatalogueResult<()> {
         let id = &enrolled.enrolment.id;
+        let reason = match why {
+            Why::Reason(reason) => reason,
+            // The seed's own reason holds only for the enrolment the seed made.
+            Why::Seed(_) => return self.require_seeded(&enrolled.key),
+        };
         match reason {
             // The owner asked for it. Whether they may is the ceiling's and the grant's decision,
             // which `install` makes before it gets here.
@@ -2104,7 +2297,7 @@ impl Catalogue {
                     entry.manifest_digest,
                     length,
                     &package,
-                    FetchReason::ExplicitInstall,
+                    Why::Reason(FetchReason::ExplicitInstall),
                     &Owner::acting(),
                 )
                 .await?
@@ -2239,7 +2432,7 @@ impl Catalogue {
                 plugin_id,
                 version,
                 Some(entry.manifest_digest),
-                FetchReason::ExplicitInstall,
+                Why::Reason(FetchReason::ExplicitInstall),
                 authority,
             )
             .await?;
@@ -2365,7 +2558,7 @@ impl Catalogue {
                         plugin_id,
                         &installation.version,
                         Some(installation.package_digest),
-                        FetchReason::ExplicitEnable,
+                        Why::Reason(FetchReason::ExplicitEnable),
                         authority,
                     )
                     .await?;
@@ -2500,6 +2693,19 @@ impl Catalogue {
                     });
                 }
             }
+            if let Some(added) = current.widening_for_a_bridge(&grant) {
+                return Err(CatalogueError::GrantRequired {
+                    capability: added,
+                    requirement: format!(
+                        "plugin.install of the installed release: {plugin_id} asks for \
+                         {}, so a grant that adds to what it holds is made when the owner \
+                         confirms the release, which shows the publisher's own statement of what \
+                         the bridge does and the host's notice that it runs outside the plugin \
+                         sandbox",
+                        PluginCapability::NativeBridgeInstall.as_str()
+                    ),
+                });
+            }
             if let Some(added) = current.grant.increase_over(&grant).first().copied()
                 && !confirmed
             {
@@ -2575,6 +2781,15 @@ impl Catalogue {
                 .map(|(_, count)| count);
             changes.retire_release(&retired_from(&current))?;
             changes.uninstall(environment_id, plugin_id)?;
+            // Once the seed has made its enrolment here, an owner's uninstall of a plugin the seed
+            // has not yet settled settles it, in the same commit: a seed that stopped part way, or
+            // a package it has not reached, never installs what the owner took out.
+            let record = format!("{}{plugin_id}", seed::SEED_INSTALLED);
+            if !changes.settings_with_prefix(seed::SEEDED)?.is_empty()
+                && changes.setting(&record)?.is_none()
+            {
+                changes.put_setting(&record, "left")?;
+            }
             Ok((
                 affected_bindings,
                 Transition::Uninstalled {
@@ -2629,6 +2844,17 @@ impl Catalogue {
             let view = installation_view(&root, changes, current)?;
             Ok((view.clone(), Transition::Changed(view)))
         })
+    }
+}
+
+/// Refuses a change under the bundle for an enrolment the seed did not make.
+fn require_seeded_in(changes: &Changes<'_>, key: &EnrolmentKey) -> CatalogueResult<()> {
+    match changes.setting(&format!("{}{key}", seed::SEEDED))? {
+        Some(_) => Ok(()),
+        None => Err(CatalogueError::Untrusted {
+            detail: "the bundled generation is read only for the repository the seed enrolled"
+                .to_owned(),
+        }),
     }
 }
 
@@ -2785,6 +3011,35 @@ fn check_installation(
     previous: Option<&Installation>,
     confirmed: bool,
 ) -> CatalogueResult<()> {
+    check_installation_rules(entry, repository_ceiling, grant, previous, confirmed, true)
+}
+
+/// What the seed holds an installation to: every rule of [`check_installation`] for a package
+/// with an empty grant and nothing to replace, except that every capability past the repository's
+/// ceiling has to be granted. The seed grants nothing, so those stay permission-required and
+/// effective to no one until the owner grants them.
+pub(crate) fn check_seeded_installation(
+    entry: &IndexEntry,
+    repository_ceiling: &CapabilityCeiling,
+) -> CatalogueResult<()> {
+    check_installation_rules(
+        entry,
+        repository_ceiling,
+        &InstallationGrant::none(),
+        None,
+        false,
+        false,
+    )
+}
+
+fn check_installation_rules(
+    entry: &IndexEntry,
+    repository_ceiling: &CapabilityCeiling,
+    grant: &InstallationGrant,
+    previous: Option<&Installation>,
+    confirmed: bool,
+    every_capability_granted: bool,
+) -> CatalogueResult<()> {
     // A grant names only what the package asks for. A grant for anything else would be authority
     // an installation holds with nothing in the package to use it, waiting for a later release to
     // ask for it without anybody deciding again.
@@ -2803,7 +3058,9 @@ fn check_installation(
             });
         }
     }
-    ceiling::check_installable(&entry.capabilities, repository_ceiling, grant)?;
+    if every_capability_granted {
+        ceiling::check_installable(&entry.capabilities, repository_ceiling, grant)?;
+    }
     // A pin holds an installation at the hash it names. Installing something else over it is the
     // pin's decision to make, not the install's.
     if let Some(previous) = previous

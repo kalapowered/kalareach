@@ -396,6 +396,20 @@ pub async fn fetch_accepted(
     Ok(bytes)
 }
 
+/// Whether a generation's metadata has to be unexpired to verify.
+///
+/// Expiry is enforced for every generation a repository serves. It is waived for the one
+/// generation compiled into the host, which the host verifies against the root it adopted and
+/// reports as expired by its own reading of the dates; the trust checkpoint still refuses a clock
+/// that went back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// Metadata that has expired is refused.
+    Enforced,
+    /// Metadata that has expired is read.
+    Waived,
+}
+
 /// Verifies one generation of a repository.
 ///
 /// `datastore` is a directory the client keeps its trusted metadata in. It belongs to this
@@ -415,6 +429,7 @@ pub async fn verify(
     ledger: &BudgetLedger,
     transfer_limit: u64,
     transport: &std::sync::Arc<dyn tough::Transport + Send + Sync>,
+    expiry: Expiry,
     on_root_rotated: &mut (dyn FnMut(Vec<u8>) -> CatalogueResult<()> + Send),
 ) -> CatalogueResult<VerifiedGeneration> {
     std::fs::create_dir_all(datastore)
@@ -442,7 +457,10 @@ pub async fn verify(
         enrolment.targets_url.clone(),
     )
     .datastore(datastore.to_path_buf())
-    .expiration_enforcement(ExpirationEnforcement::Safe)
+    .expiration_enforcement(match expiry {
+        Expiry::Enforced => ExpirationEnforcement::Safe,
+        Expiry::Waived => ExpirationEnforcement::Unsafe,
+    })
     .transport(sync.clone())
     .limits(tough::Limits {
         max_root_size: enrolment.budgets.metadata_bytes.get(),
@@ -937,6 +955,11 @@ pub(crate) fn classify(error: &tough::error::Error) -> CatalogueError {
             expired_at: "the time the metadata states".to_owned(),
         },
         tough::error::Error::Transport { source, .. } => classify_transport(source),
+        // The clock is behind a time this host kept at an earlier load, which is a clock that went
+        // back and not metadata that cannot be trusted: say so under the client's own name for it.
+        tough::error::Error::SystemTimeSteppedBackward { .. } => CatalogueError::Untrusted {
+            detail: format!("the clock is behind the last load: {error}"),
+        },
         tough::error::Error::HashMismatch {
             context,
             calculated,

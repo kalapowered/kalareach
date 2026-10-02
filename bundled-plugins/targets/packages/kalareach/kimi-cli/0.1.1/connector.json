@@ -1,0 +1,248 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/kimi-cli",
+  "protocol": {
+    "name": "kimi-cli-acp",
+    "qualified_range": "=1.51.0",
+    "tested_version": "1.51.0"
+  },
+  "transport": "stdio",
+  "framing": {
+    "type": "line_delimited_json",
+    "max_message_bytes": "8388608"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "method"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "id"
+        }
+      ]
+    }
+  },
+  "routes": [
+    {
+      "method": "initialize",
+      "wire_name": "initialize",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "authenticate",
+      "wire_name": "authenticate",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.new",
+      "wire_name": "session/new",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.load",
+      "wire_name": "session/load",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.prompt",
+      "wire_name": "session/prompt",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.set-mode",
+      "wire_name": "session/set_mode",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.set-model",
+      "wire_name": "session/set_model",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.cancel",
+      "wire_name": "session/cancel",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.list",
+      "wire_name": "session/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.resume",
+      "wire_name": "session/resume",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.fork",
+      "wire_name": "session/fork",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "session.update",
+      "wire_name": "session/update",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "session.request-permission",
+      "wire_name": "session/request_permission",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "fs.read-text-file",
+      "wire_name": "fs/read_text_file",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "fs.write-text-file",
+      "wire_name": "fs/write_text_file",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "terminal.create",
+      "wire_name": "terminal/create",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "terminal.output",
+      "wire_name": "terminal/output",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "terminal.wait-for-exit",
+      "wire_name": "terminal/wait_for_exit",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "terminal.kill",
+      "wire_name": "terminal/kill",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "terminal.release",
+      "wire_name": "terminal/release",
+      "direction": "upstream_to_host"
+    }
+  ],
+  "methods": [
+    {
+      "method": "initialize",
+      "class": "mutation",
+      "evidence": "Negotiates this connection's protocol version and client capabilities, so it decides what the connection may afterwards be asked to do"
+    },
+    {
+      "method": "authenticate",
+      "class": "credential",
+      "evidence": "Checks the login this build keeps for its own Kimi account; the credential stays with the agent and never reaches a component. Without a usable login the build could not encode its own error, so the request reached the method and got no answer"
+    },
+    {
+      "method": "session.new",
+      "class": "mutation",
+      "evidence": "Creates an execution the agent owns, after checking its login; this build answered authentication required, so nothing was created"
+    },
+    {
+      "method": "session.load",
+      "class": "mutation",
+      "evidence": "Loads a stored conversation into this connection and replays its history; stored history is not evidence that this process owns the live execution"
+    },
+    {
+      "method": "session.prompt",
+      "class": "mutation",
+      "evidence": "Submits a turn with its content blocks, which is what makes the agent act"
+    },
+    {
+      "method": "session.set-mode",
+      "class": "mutation",
+      "evidence": "Changes the session's mode; this build offers the one mode default and answers any other with an internal error"
+    },
+    {
+      "method": "session.set-model",
+      "class": "mutation",
+      "evidence": "Changes the model the session's next turn uses and saves it as the default in the agent's own configuration file"
+    },
+    {
+      "method": "session.cancel",
+      "class": "mutation",
+      "evidence": "Ends the turn in flight. The installed protocol library routes it as a notification: sent as one it reached this build's handler, and sent as a request it answered method not found"
+    },
+    {
+      "method": "session.list",
+      "class": "observation",
+      "evidence": "Lists the stored sessions for a working directory without loading or resuming one"
+    },
+    {
+      "method": "session.resume",
+      "class": "mutation",
+      "evidence": "Resumes a stored session so later turns append to it"
+    },
+    {
+      "method": "session.fork",
+      "class": "unsupported",
+      "evidence": "This build accepts the name and cannot fork: a well-formed request answered an internal error because its handler is not implemented, and the handshake does not advertise forking, so the connector states it is outside what it proxies"
+    },
+    {
+      "method": "session.update",
+      "class": "observation",
+      "evidence": "Carries the agent's own stream of turn updates: message and reasoning chunks, tool calls and their results, plans and the available command list"
+    },
+    {
+      "method": "session.request-permission",
+      "class": "mutation",
+      "evidence": "A reverse request naming the tool call the agent is waiting on and the options it offers; answering it runs or refuses that call, so it is not a report"
+    },
+    {
+      "method": "fs.read-text-file",
+      "class": "observation",
+      "evidence": "Reads a file and returns its text. It changes nothing, and it must run in the selected host environment under that environment's own identity rather than wherever a client happens to be"
+    },
+    {
+      "method": "fs.write-text-file",
+      "class": "mutation",
+      "evidence": "Writes a file in the selected host environment under that environment's own identity"
+    },
+    {
+      "method": "terminal.create",
+      "class": "mutation",
+      "evidence": "Starts a process in the selected host environment with the broker's scoped resources; it is not a read"
+    },
+    {
+      "method": "terminal.output",
+      "class": "observation",
+      "evidence": "Reads what a terminal the agent created has produced so far"
+    },
+    {
+      "method": "terminal.wait-for-exit",
+      "class": "observation",
+      "evidence": "Waits for a terminal the agent created and reports how it ended"
+    },
+    {
+      "method": "terminal.kill",
+      "class": "mutation",
+      "evidence": "Ends a terminal's process"
+    },
+    {
+      "method": "terminal.release",
+      "class": "mutation",
+      "evidence": "Releases a terminal and the resources the broker scoped to it"
+    }
+  ],
+  "decision_destination": null,
+  "volatile_forwarding": false,
+  "qualification_note": "Qualified against MoonshotAI's kimi-cli 1.51.0 (PyPI kimi-cli, wheel sha256 ffb9d0d4725844d36d6c78e8d3914a96b2d6a17678c217f3abe7336fb7e02d0e), installed into an environment of its own on 2026-09-24 and started with the acp subcommand under a home directory of its own: ACP protocol version 1, agentInfo Kimi Code CLI 1.51.0, session capabilities list and resume. Each host-to-upstream method here was sent to that build and answered, or reached a handler its log records; one answered method not found is not routed; each upstream-to-host method is one the installed package calls. The kimi.com distribution reports the same agent name, so a name identifies no distribution: this table applies where the installed version and evidence match these pins, and otherwise the capability is incompatible and the terminal path is what remains. Release 1.52.0 carries no agent protocol. max_message_bytes is this host's bound. Volatile forwarding is untested."
+}
