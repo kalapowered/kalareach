@@ -612,7 +612,7 @@ fn windows() -> Vec<Step> {
             reading: Reading::Build,
             ..Step::cargo(
                 Group::Rust,
-                "the control daemon and the worker the suites start",
+                "the control daemon, the worker and the forwarder the suites start",
                 &[
                     "build",
                     "--locked",
@@ -620,6 +620,8 @@ fn windows() -> Vec<Step> {
                     "kr-controller",
                     "-p",
                     "kr-worker",
+                    "-p",
+                    "kr-hook",
                 ],
             )
         },
@@ -641,6 +643,41 @@ fn windows() -> Vec<Step> {
             Group::Rust,
             "the worker's library",
             &["test", "--locked", "-p", "kr-worker", "--lib"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the forwarder's library",
+            &["test", "--locked", "-p", "kr-hook", "--lib"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the launch endpoint, the registration and the credential",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "windows_endpoint",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the listener, the transport and the broker over the launch endpoint",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "listener",
+                "--test",
+                "transport",
+                "--test",
+                "broker",
+                "--test",
+                "gateway",
+            ],
         ),
         Step::cargo(
             Group::Rust,
