@@ -59,11 +59,9 @@ impl Observer for PlatformObserver {
                 registered,
                 running,
             } => {
-                // One observation has one bound, however many commands it takes.
-                let deadline = std::time::Instant::now() + PLATFORM_LIMIT;
-                let within = || deadline.saturating_duration_since(std::time::Instant::now());
-                let registered = run_within(&registered.program, &registered.arguments, within())?;
-                let running = run_within(&running.program, &running.arguments, within())?;
+                let registered =
+                    run_within(&registered.program, &registered.arguments, LISTING_LIMIT)?;
+                let running = run_within(&running.program, &running.arguments, LISTING_LIMIT)?;
                 Ok(wsl_state(&registered, &running, &enrolment.target))
             }
             Observation::Inspection(command) => {
@@ -125,6 +123,11 @@ pub fn decode_output(bytes: &[u8]) -> String {
 /// listing as well as the refresh that started it. Starting a distribution is the slowest of them
 /// and takes seconds, not minutes.
 pub const PLATFORM_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long each of the two listings that make one observation of a distribution is given, which
+/// is half of [`PLATFORM_LIMIT`]: the observation as a whole is held to that bound, and each
+/// listing has the time the bound allows it whatever the other took.
+const LISTING_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The most output one platform command's answer may take up, in bytes.
 ///
@@ -534,6 +537,11 @@ mod tests {
             printed("Ubuntu-24.04\r\nDebian\r\nMy Distro\r\n"),
             printed("Ubuntu-24.04\r\n"),
         )
+    }
+
+    #[test]
+    fn two_listings_together_are_held_to_the_bound_of_one_platform_command() {
+        assert!(LISTING_LIMIT * 2 <= PLATFORM_LIMIT);
     }
 
     #[test]
