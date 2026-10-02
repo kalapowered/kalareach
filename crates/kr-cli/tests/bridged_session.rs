@@ -1232,10 +1232,13 @@ async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel(
 // ---------------------------------------------------------------------------------------------
 // A real container with a Linux `kr` in it.
 
-/// The runtime these use, and the image it starts. The image carries a shell and the C library the
-/// binaries are linked against, and nothing of KalaReach.
+/// The runtime these use, and the image it starts. The base image carries a shell and the C library
+/// the binaries are linked against, and nothing of KalaReach. The image a container is started from
+/// adds Git, which the daemon needs wherever it runs: a daemon on a host without it says so and
+/// does not start.
 const RUNTIME: &str = "podman";
 const CONTAINER_IMAGE: &str = "docker.io/library/debian:stable-slim";
+const INSTALLED_IMAGE: &str = "localhost/kalareach-bridge-test:git-1";
 
 /// Where the directory holding the Linux programs is mounted inside the container.
 const MOUNTED: &str = "/kr";
@@ -1262,21 +1265,56 @@ fn podman(arguments: &[&str]) -> std::process::Output {
         .expect("the runtime runs")
 }
 
-/// Puts the image in the runtime's store, once per run of this suite, before any container starts.
+/// Puts the images in the runtime's store, once per run of this suite, before any container starts:
+/// the base image, and the one that adds Git to it.
 fn image_present() {
     static PULLED: std::sync::Once = std::sync::Once::new();
     PULLED.call_once(|| {
-        if podman(&["image", "exists", CONTAINER_IMAGE])
+        if !podman(&["image", "exists", CONTAINER_IMAGE])
+            .status
+            .success()
+        {
+            let pulled = podman(&["pull", "--quiet", CONTAINER_IMAGE]);
+            assert!(
+                pulled.status.success(),
+                "the image is pulled: {}",
+                String::from_utf8_lossy(&pulled.stderr)
+            );
+        }
+        if podman(&["image", "exists", INSTALLED_IMAGE])
             .status
             .success()
         {
             return;
         }
-        let pulled = podman(&["pull", "--quiet", CONTAINER_IMAGE]);
+        let context = tempfile::tempdir().expect("an empty build context");
+        let mut build = std::process::Command::new(RUNTIME)
+            .args(["build", "--quiet", "--pull=never", "--tag", INSTALLED_IMAGE])
+            .args(["--file", "-"])
+            .arg(context.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the runtime builds");
+        build
+            .stdin
+            .take()
+            .expect("the build reads its file from standard input")
+            .write_all(
+                format!(
+                    "FROM {CONTAINER_IMAGE}\nRUN apt-get update -qq && \\\n    \
+                     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                     git && rm -rf /var/lib/apt/lists/*\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the file");
+        let built = build.wait_with_output().expect("the build ends");
         assert!(
-            pulled.status.success(),
-            "the image is pulled: {}",
-            String::from_utf8_lossy(&pulled.stderr)
+            built.status.success(),
+            "the image that adds Git is built: {}",
+            String::from_utf8_lossy(&built.stderr)
         );
     });
 }
@@ -1331,7 +1369,7 @@ impl Container {
             "--volume",
             &mount,
             "--",
-            CONTAINER_IMAGE,
+            INSTALLED_IMAGE,
             "sleep",
             "900",
         ]);
