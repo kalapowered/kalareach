@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment, EnvironmentPresence};
 
-use crate::bridge::launch::{self, CONTAINER_RUNTIME};
+use crate::bridge::launch::{self, CONTAINER_RUNTIME, Observation};
 use crate::bridge::store::Observer;
 use crate::error::{ControllerError, Result};
 
@@ -52,17 +52,20 @@ pub fn destination_state(
 
 impl Observer for PlatformObserver {
     fn observe(&self, enrolment: &EnvironmentEnrolment) -> Result<EnvironmentPresence> {
-        let command = launch::observe(enrolment)
+        let observation = launch::observe(enrolment)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let output = run(&command.program, &command.arguments)?;
-        match enrolment.access {
-            EnvironmentAccess::WslDistribution => Ok(wsl_state(&output.text, &enrolment.target)),
-            EnvironmentAccess::Container => Ok(container_state(&output)),
-            EnvironmentAccess::SshHost | EnvironmentAccess::PairedHost => {
-                Err(ControllerError::InvalidArgument(
-                    "an SSH or paired environment is not observed through a process bridge"
-                        .to_owned(),
-                ))
+        match observation {
+            Observation::Listings {
+                registered,
+                running,
+            } => {
+                let registered = run(&registered.program, &registered.arguments)?;
+                let running = run(&running.program, &running.arguments)?;
+                Ok(wsl_state(&registered, &running, &enrolment.target))
+            }
+            Observation::Inspection(command) => {
+                let output = run(&command.program, &command.arguments)?;
+                Ok(container_state(&output))
             }
         }
     }
@@ -91,20 +94,27 @@ pub struct CommandOutput {
     pub text: String,
 }
 
-/// Decodes process output bytes, correctly handling UTF-16LE (with or without BOM) and UTF-8.
+/// Decodes process output bytes, reading UTF-16LE (with or without a byte order mark) and UTF-8.
+///
+/// `wsl.exe` writes UTF-16LE with no byte order mark when its output is not a console. What tells
+/// that from UTF-8 is where the zero bytes are: a UTF-16LE text of any script has its line endings'
+/// zero bytes in the odd places, and a text that is UTF-8 has none. The first two letters are not
+/// asked to be Latin, because a distribution is named by the person who made it.
 #[must_use]
 pub fn decode_output(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe {
-        let u16s: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        return char::decode_utf16(u16s)
-            .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect();
-    }
-    if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
-        let u16s: Vec<u16> = bytes
+    // The zero bytes at every second place, counting from `first`.
+    let zeros_from = |first: usize| {
+        bytes
+            .iter()
+            .skip(first)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count()
+    };
+    let bom = bytes.starts_with(&[0xff, 0xfe]);
+    if bom || zeros_from(1) > zeros_from(0) {
+        let wide = if bom { &bytes[2..] } else { bytes };
+        let u16s: Vec<u16> = wide
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
@@ -340,60 +350,40 @@ pub fn container_runtime_present() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Reads one distribution's state out of `wsl.exe --list --verbose`.
+/// Reads one distribution's state out of the two listings of names `wsl.exe` prints.
 ///
-/// The listing is one distribution per line: an optional `*` for the default, the name (which may
-/// contain spaces), the state and the version. A name that is not in the listing is not
-/// registered, which is reported as stale rather than as stopped: this host has not observed it at
-/// all.
-fn wsl_state(listing: &str, target: &str) -> EnvironmentPresence {
-    for line in listing.lines() {
-        let trimmed = line.trim_start().trim_start_matches('*').trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.len() < 2 {
-            continue;
-        }
-        // When version is present (standard wsl.exe -l -v), the second-to-last token is state.
-        if tokens.len() >= 3 {
-            let candidate_state = tokens[tokens.len() - 2];
-            if matches!(
-                candidate_state,
-                "Running" | "Stopped" | "Installing" | "Converting" | "Paused"
-            ) {
-                let name = tokens[..tokens.len() - 2].join(" ");
-                if name.eq_ignore_ascii_case(target) || name == target {
-                    return match candidate_state {
-                        "Running" => EnvironmentPresence::Running,
-                        "Stopped" | "Installing" | "Converting" | "Paused" => {
-                            EnvironmentPresence::EnvironmentStopped
-                        }
-                        _ => EnvironmentPresence::Stale,
-                    };
-                }
-            }
-        }
-        // If version is absent, the last token is candidate state.
-        let candidate_state = tokens[tokens.len() - 1];
-        if matches!(
-            candidate_state,
-            "Running" | "Stopped" | "Installing" | "Converting" | "Paused"
-        ) {
-            let name = tokens[..tokens.len() - 1].join(" ");
-            if name.eq_ignore_ascii_case(target) || name == target {
-                return match candidate_state {
-                    "Running" => EnvironmentPresence::Running,
-                    "Stopped" | "Installing" | "Converting" | "Paused" => {
-                        EnvironmentPresence::EnvironmentStopped
-                    }
-                    _ => EnvironmentPresence::Stale,
-                };
-            }
-        }
+/// Each listing is one name to a line and nothing else, so the answer does not depend on the
+/// language the host's Windows prints in, which `wsl.exe --list --verbose` does: its state is a
+/// word of that language. A name that is not in the registered listing is not registered, which is
+/// reported as stale rather than as stopped: this host has not observed it at all. A listing that
+/// failed has observed nothing either, whatever text it printed.
+fn wsl_state(
+    registered: &CommandOutput,
+    running: &CommandOutput,
+    target: &str,
+) -> EnvironmentPresence {
+    if !lists(registered, target) || running.code != Some(0) {
+        return EnvironmentPresence::Stale;
     }
-    EnvironmentPresence::Stale
+    if lists(running, target) {
+        EnvironmentPresence::Running
+    } else {
+        EnvironmentPresence::EnvironmentStopped
+    }
+}
+
+/// Returns whether a listing of names, which exited cleanly, names `target` on a line of its own.
+///
+/// The whole line is the name, so a name that is the start of another is not matched and a name
+/// with spaces in it is read as it is written. The platform compares names without regard to
+/// ASCII case, and so does this.
+fn lists(listing: &CommandOutput, target: &str) -> bool {
+    listing.code == Some(0)
+        && listing
+            .text
+            .lines()
+            .map(str::trim)
+            .any(|name| !name.is_empty() && (name == target || name.eq_ignore_ascii_case(target)))
 }
 
 /// Reads a container's state out of `podman container inspect --format {{.State.Running}}`.
@@ -524,22 +514,42 @@ mod tests {
 
     use super::*;
 
-    const LISTING: &str = "  NAME            STATE           VERSION\n\
-                           * Ubuntu-24.04    Running         2\n\
-                             Debian          Stopped         2\n";
+    /// A listing `wsl.exe` printed and exited cleanly after.
+    fn printed(text: &str) -> CommandOutput {
+        CommandOutput {
+            code: Some(0),
+            text: text.to_owned(),
+        }
+    }
+
+    /// What `wsl.exe --list --quiet` prints on a host with three distributions, and what
+    /// `--list --running --quiet` prints when the first of them is the only one running.
+    fn the_host() -> (CommandOutput, CommandOutput) {
+        (
+            printed("Ubuntu-24.04\r\nDebian\r\nMy Distro\r\n"),
+            printed("Ubuntu-24.04\r\n"),
+        )
+    }
 
     #[test]
-    fn a_running_distribution_is_read_from_the_listing() {
+    fn a_running_distribution_is_read_from_the_listings() {
+        let (registered, running) = the_host();
         assert_eq!(
-            wsl_state(LISTING, "Ubuntu-24.04"),
+            wsl_state(&registered, &running, "Ubuntu-24.04"),
             EnvironmentPresence::Running
         );
     }
 
     #[test]
     fn a_stopped_distribution_is_reported_as_stopped_rather_than_absent() {
+        let (registered, running) = the_host();
         assert_eq!(
-            wsl_state(LISTING, "Debian"),
+            wsl_state(&registered, &running, "Debian"),
+            EnvironmentPresence::EnvironmentStopped
+        );
+        // Nothing running prints nothing at all, and exits cleanly.
+        assert_eq!(
+            wsl_state(&registered, &printed(""), "Ubuntu-24.04"),
             EnvironmentPresence::EnvironmentStopped
         );
     }
@@ -548,53 +558,124 @@ mod tests {
     fn a_distribution_that_is_not_registered_is_stale_rather_than_stopped() {
         // This host has observed nothing about it. Reporting it stopped would claim an
         // observation that was never made.
-        assert_eq!(wsl_state(LISTING, "Fedora"), EnvironmentPresence::Stale);
+        let (registered, running) = the_host();
+        assert_eq!(
+            wsl_state(&registered, &running, "Fedora"),
+            EnvironmentPresence::Stale
+        );
     }
 
     #[test]
     fn a_name_that_is_a_prefix_of_another_is_not_matched() {
-        assert_eq!(wsl_state(LISTING, "Ubuntu"), EnvironmentPresence::Stale);
+        let (registered, running) = the_host();
+        assert_eq!(
+            wsl_state(&registered, &running, "Ubuntu"),
+            EnvironmentPresence::Stale
+        );
     }
 
     #[test]
-    fn a_distribution_with_spaces_in_its_name_is_read_correctly() {
-        let listing = "  NAME            STATE           VERSION\n\
-                       * Ubuntu-24.04    Running         2\n\
-                         My Distro       Running         2\n\
-                         Debian Work     Stopped         2\n";
+    fn a_distribution_with_spaces_in_its_name_is_read_as_it_is_written() {
+        let registered = printed("Ubuntu-24.04\r\nMy  Distro\r\nDebian Work\r\n");
+        let running = printed("My  Distro\r\n");
         assert_eq!(
-            wsl_state(listing, "My Distro"),
+            wsl_state(&registered, &running, "My  Distro"),
             EnvironmentPresence::Running
         );
         assert_eq!(
-            wsl_state(listing, "Debian Work"),
+            wsl_state(&registered, &running, "My Distro"),
+            EnvironmentPresence::Stale,
+            "one space is not two"
+        );
+        assert_eq!(
+            wsl_state(&registered, &running, "Debian Work"),
             EnvironmentPresence::EnvironmentStopped
         );
     }
 
     #[test]
-    fn utf16_output_with_bom_is_decoded_faithfully() {
-        let text =
-            "  NAME            STATE           VERSION\n* My Distro       Running         2\n";
-        let mut bytes = vec![0xff, 0xfe]; // UTF-16LE BOM
-        for c in text.encode_utf16() {
-            bytes.extend_from_slice(&c.to_le_bytes());
-        }
-        let decoded = decode_output(&bytes);
-        assert_eq!(decoded, text);
+    fn the_platform_compares_names_without_regard_to_case_and_so_does_this() {
+        let (registered, running) = the_host();
         assert_eq!(
-            wsl_state(&decoded, "My Distro"),
+            wsl_state(&registered, &running, "ubuntu-24.04"),
             EnvironmentPresence::Running
         );
     }
 
     #[test]
-    fn a_listing_written_as_utf16_reads_the_same_once_its_nulls_are_dropped() {
-        let wide: String = LISTING.chars().flat_map(|c| [c, '\0']).collect();
-        let cleaned: String = wide.chars().filter(|c| *c != '\0').collect();
+    fn a_listing_that_failed_has_observed_nothing_whatever_it_printed() {
+        let (registered, running) = the_host();
+        let failed = |text: &str| CommandOutput {
+            code: Some(1),
+            text: text.to_owned(),
+        };
+        // The text of a failure is in the host's language and may be anything, including a name.
         assert_eq!(
-            wsl_state(&cleaned, "Ubuntu-24.04"),
+            wsl_state(&failed("Ubuntu-24.04\r\n"), &running, "Ubuntu-24.04"),
+            EnvironmentPresence::Stale
+        );
+        assert_eq!(
+            wsl_state(&registered, &failed("Ubuntu-24.04\r\n"), "Ubuntu-24.04"),
+            EnvironmentPresence::Stale
+        );
+        // A host with no distribution says so in its own words and exits with a failure.
+        assert_eq!(
+            wsl_state(
+                &failed(
+                    "Das Windows-Subsystem f\u{fc}r Linux hat keine installierten Distributionen."
+                ),
+                &failed(""),
+                "Ubuntu-24.04"
+            ),
+            EnvironmentPresence::Stale
+        );
+    }
+
+    #[test]
+    fn what_wsl_writes_is_read_whatever_script_the_name_is_in() {
+        // The encoding `wsl.exe` uses when it is not writing to a console: UTF-16LE, with no byte
+        // order mark. The first letters are not Latin in the second and third names.
+        let wide =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        for names in [
+            "Ubuntu-24.04\r\nDebian\r\n",
+            "\u{420}\u{430}\u{431}\u{43e}\u{447}\u{430}\u{44f}\r\nDebian\r\n",
+            "\u{6d4b}\u{8bd5}\r\nDebian\r\n",
+            "\u{6d4b}\u{8bd5}\r\n",
+        ] {
+            assert_eq!(decode_output(&wide(names)), names, "{names:?}");
+            let mut with_mark = vec![0xff, 0xfe];
+            with_mark.extend(wide(names));
+            assert_eq!(
+                decode_output(&with_mark),
+                names,
+                "{names:?} with a byte order mark"
+            );
+        }
+        // Text that is UTF-8 stays UTF-8, accents and all.
+        assert_eq!(
+            decode_output("Ubuntu-24.04 \u{e9}\u{e8}\r\n".as_bytes()),
+            "Ubuntu-24.04 \u{e9}\u{e8}\r\n"
+        );
+        assert_eq!(decode_output(b""), "");
+    }
+
+    #[test]
+    fn a_distribution_named_in_another_script_is_read_from_what_wsl_wrote() {
+        let wide =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let name = "\u{420}\u{430}\u{431}\u{43e}\u{447}\u{430}\u{44f}";
+        let registered = printed(&decode_output(&wide(&format!(
+            "Ubuntu-24.04\r\n{name}\r\n"
+        ))));
+        let running = printed(&decode_output(&wide(&format!("{name}\r\n"))));
+        assert_eq!(
+            wsl_state(&registered, &running, name),
             EnvironmentPresence::Running
+        );
+        assert_eq!(
+            wsl_state(&registered, &running, "Ubuntu-24.04"),
+            EnvironmentPresence::EnvironmentStopped
         );
     }
 
