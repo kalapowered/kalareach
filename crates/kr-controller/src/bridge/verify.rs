@@ -17,6 +17,7 @@
 //! acknowledgement carries the destination daemon's own connection and boot identity, taken inside
 //! the environment the helper runs in.
 
+use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{Outcome, ParamsValue, Request};
 use kr_protocol::identity::{BridgeTarget, BridgeVerification, EnvironmentEnrolment};
@@ -83,6 +84,27 @@ pub async fn through_bridge(
     }
 }
 
+/// Every environment this installation holds, the one `own` names included.
+///
+/// A socket forwarded from here is answered by whichever of them its endpoint belongs to, so an
+/// answer that is any of them is this host's and says nothing about a destination. An environment
+/// is a directory this installation made and left a complete identity in; one whose marker cannot
+/// be read is not counted, which is how every listing of them reads.
+#[must_use]
+pub fn installed_environments(own: &EnvironmentPaths) -> Vec<EnvironmentId> {
+    let mut found = vec![own.environment_id()];
+    if let Ok(entries) = std::fs::read_dir(own.state_root().join("environments")) {
+        for entry in entries.flatten() {
+            if let Ok(environment_id) = kr_ipc::paths::read_environment_marker(&entry.path())
+                && !found.contains(&environment_id)
+            {
+                found.push(environment_id);
+            }
+        }
+    }
+    found
+}
+
 /// Registers an SSH host's identity: its helper says which environment and which user it is, and
 /// nothing else crosses.
 ///
@@ -96,14 +118,16 @@ pub async fn through_identity_probe(
     actor: &ActorEnvelope,
     already_bridged: bool,
     enrolment: &EnvironmentEnrolment,
-    origin_environment_id: EnvironmentId,
+    local_environments: &EnvironmentPaths,
     build_id: BuildId,
 ) -> Result<BridgeVerification, Refusal> {
+    let own = local_environments.environment_id();
     let acknowledgement = invoke::identify(
         actor,
         already_bridged,
         enrolment,
-        origin_environment_id,
+        own,
+        &installed_environments(local_environments),
         build_id,
     )
     .await?;
