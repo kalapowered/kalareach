@@ -41,9 +41,10 @@
 //!   whose outcome the environment does not know, or could not confirm, or could not write, is not
 //!   given a result it was not given: it stays sent. An environment that reports no record takes no
 //!   step, and what it refuses a step for says nothing of an earlier action of that step, which it
-//!   may have taken: the first action sent for a step is refused for what the environment refuses
-//!   it for, and a step sent before stays sent, under any action, until the environment can read
-//!   its record. An environment that cannot be reached stays pending.
+//!   may have taken: the first action sent for a step that the environment refuses is refused with
+//!   `STORAGE_UNAVAILABLE`, and a step sent before stays sent, under any action, until the
+//!   environment can read its record. A step saved before it was sent counts as sent. An
+//!   environment that cannot be reached stays pending.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
 //!   never sent is given up. One that may or may not have been taken has to be finished first,
@@ -1186,8 +1187,11 @@ fn taken(
 /// Which attempt at a step an environment's refusal answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sent {
-    /// The step's first action, composed on the connection that sent it: no action was sent for the
-    /// step before, so nothing an environment holds for it can be an earlier attempt's.
+    /// The step's first action, composed on the connection that sent it: as far as the plan knows,
+    /// no action was sent for the step before, so nothing an environment holds for it can be an
+    /// earlier attempt's. A step the plan saved before it was sent is not this: a crash between the
+    /// save and the send cannot be told from a send whose answer was lost, so the next `finish`
+    /// treats it as sent again, and keeps it sent where no record can be read.
     First,
     /// An action sent again as it was composed on an earlier connection: its window is not this
     /// connection's, and the environment may hold what the earlier send did.
