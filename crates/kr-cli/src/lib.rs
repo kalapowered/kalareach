@@ -28,6 +28,7 @@
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
 //! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
 //! | [`bridge`] | `kr bridge`: the process-bridge helper and this host's enrolled environments |
+//! | [`export`] | `kr export`: a closed session's retained output, written to a file the person names |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
 //! | [`render`] | Drawing a projected session into this terminal, at canonical cell positions |
@@ -54,6 +55,7 @@ pub mod device;
 pub mod diff;
 pub mod doctor;
 pub mod error;
+pub mod export;
 pub mod import;
 pub mod machine;
 pub mod output;

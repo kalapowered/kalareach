@@ -111,6 +111,13 @@ fn stand_in(tools: &Path, destination: &Path, home: &Path, login: Login) -> Stri
     format!(
         r##"#!/bin/sh
 printf '%s\n' "$*" >>'{tools}/invocations'
+# What the platform says of the distribution, which a test sets to say it is stopped. Asking runs
+# nothing in the distribution, as the real command does not.
+if [ "$1" = "--list" ]; then
+  printf '  NAME          STATE      VERSION\n  Test-Distro   %s   2\n' \
+    "$(cat '{tools}/distribution-state' 2>/dev/null || echo Running)"
+  exit 0
+fi
 # The helper is this process, which becomes it, so a test can name the one it means to end.
 printf '%s\n' "$$" >'{tools}/last-bridge.pid'
 # A test that wants the destination unreachable from some run onward says from which.
@@ -434,6 +441,50 @@ impl World {
         }
     }
 
+    /// Closes `session` where it lives, through the destination's own daemon, and waits until that
+    /// daemon says it is closed.
+    ///
+    /// Closing is asynchronous: a daemon stopped before the destination records the closure would
+    /// leave nothing to be asked about it.
+    fn close_in_destination(&self, session: &str) {
+        let mut close = std::process::Command::new(support::kr());
+        close
+            .args(["--json", "close", session])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                self.destination.paths().runtime_root(),
+            )
+            .env(
+                kr_ipc::paths::STATE_DIR_VARIABLE,
+                self.destination.paths().state_root(),
+            )
+            .current_dir("/");
+        assert!(close.output().expect("runs kr").status.success());
+        let started = Instant::now();
+        loop {
+            let listed: kr_protocol::session::SessionListResult = self.ask(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: kr_protocol::scalars::Nullable::null(),
+                    include_closed: true,
+                },
+            );
+            if listed.sessions.iter().any(|summary| {
+                summary.session_id.to_string() == session
+                    && summary.state == kr_protocol::session::SessionState::Closed
+            }) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the session did not close: {listed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// What the destination's daemon wrote to its log, from the end, for a failure to say.
     fn destination_daemon_log(&self) -> String {
         let log = self
@@ -619,44 +670,7 @@ async fn an_attach_to_a_closed_session_in_a_stopped_environment_says_how_it_ende
 
     // Close it where it lives, through the destination's own daemon, and stop that daemon, as
     // stopping a distribution does.
-    let mut close = std::process::Command::new(support::kr());
-    close
-        .args(["--json", "close", &session])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env(
-            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
-            world.destination.paths().runtime_root(),
-        )
-        .env(
-            kr_ipc::paths::STATE_DIR_VARIABLE,
-            world.destination.paths().state_root(),
-        )
-        .current_dir("/");
-    assert!(close.output().expect("runs kr").status.success());
-    // Closing is asynchronous: the daemon stops once the destination records the closure, and a
-    // distribution that stopped in the middle of one would leave nothing to be asked about it.
-    let started = Instant::now();
-    loop {
-        let listed: kr_protocol::session::SessionListResult = world.ask(
-            Method::SessionList,
-            &kr_protocol::session::SessionListParams {
-                environment_id: kr_protocol::scalars::Nullable::null(),
-                include_closed: true,
-            },
-        );
-        if listed.sessions.iter().any(|summary| {
-            summary.session_id.to_string() == session
-                && summary.state == kr_protocol::session::SessionState::Closed
-        }) {
-            break;
-        }
-        assert!(
-            started.elapsed() < LIVENESS_DEADLINE,
-            "the session did not close: {listed:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    world.close_in_destination(&session);
     world.stop_destination_daemon();
     assert!(!world.destination_answers());
 
@@ -858,6 +872,18 @@ impl World {
         ));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
+        terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
+        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        terminal
+    }
+
+    /// Runs `kr attach` for a display number of the source host's own environment, on a terminal
+    /// that answers the command's questions about what it is.
+    fn attach_here_on_a_terminal(&self, display: &str) -> Terminal {
+        let terminal = self.terminal_running(&format!(
+            "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ));
         terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
         terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
         terminal
@@ -1294,6 +1320,384 @@ const INSTALLED_IMAGE: &str = "localhost/kalareach-bridge-test:git-1";
 
 /// Where the directory holding the Linux programs is mounted inside the container.
 const MOUNTED: &str = "/kr";
+
+/// What a shell is typed, in which it writes a line of ordinary output, then asks its terminal to
+/// write the clipboard, ring the bell and say what it is: what an export must keep out of its file.
+const TYPED_WITH_SIDE_EFFECTS: &str = "printf 'out-%s\\n' marker; \
+     printf '\\033]52;c;c2VjcmV0LXRva2Vu\\007\\007\\033[c'; printf 'after-%s\\n' marker\r";
+
+/// The output an export file carries, joined from its chunks.
+fn exported_output(document: &Value) -> Vec<u8> {
+    document["output"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .flat_map(|chunk| {
+            kr_protocol::scalars::from_base64url(chunk["base64url"].as_str().expect("base64url"))
+                .expect("decodes")
+        })
+        .collect()
+}
+
+fn holds(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+/// Runs a session in the destination through a bridge that prints `TYPED_WITH_SIDE_EFFECTS`, ends it
+/// by exiting its shell, and returns its identifier once the destination says it is closed.
+fn a_closed_session_in_the_destination(world: &World) -> String {
+    let created = world.create_in_destination();
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+    let display = created["display_number"].to_string();
+    let terminal = world.attach_on_a_terminal(&display);
+    terminal.types(TYPED_WITH_SIDE_EFFECTS);
+    terminal.expect_within("after-marker", "the shell printed past its side effects");
+    // The engine answered the shell's question about the terminal, as a terminal would, and the
+    // answer reached the shell as typing: the line discipline's kill character clears it.
+    terminal.types("\x15exit\r");
+    terminal.expect_within("attach-finished-", "the attachment ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+    world.wait_until_closed_in_destination(&session);
+    session
+}
+
+impl World {
+    /// Waits until the destination's daemon says `session` is closed, which its shell ending brings
+    /// about.
+    fn wait_until_closed_in_destination(&self, session: &str) {
+        let started = Instant::now();
+        loop {
+            let listed: kr_protocol::session::SessionListResult = self.ask(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: kr_protocol::scalars::Nullable::null(),
+                    include_closed: true,
+                },
+            );
+            if listed.sessions.iter().any(|summary| {
+                summary.session_id.to_string() == session
+                    && summary.state == kr_protocol::session::SessionState::Closed
+            }) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the session did not close: {listed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Where an export file goes: a name that is not there yet.
+    fn export_path(&self, name: &str) -> PathBuf {
+        self.source.root().join(format!("{name}.json"))
+    }
+}
+
+/// KR-REQ-18.11, KR-REQ-25.25: `kr export` of a closed session in an enrolled environment reads the
+/// destination's archive through a bridge and writes one file, owner-only, that carries what the
+/// session printed and none of what it asked the terminal to do, with the clipboard write, the
+/// bell and the question counted as omissions. It opens a bridge that starts nothing, so a
+/// destination that was running is still the one that was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_through_a_bridge_carries_the_output_and_none_of_its_side_effects() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let world = World::start().await;
+    world.enrol_destination();
+    let session = a_closed_session_in_the_destination(&world);
+    assert!(
+        world.destination_answers(),
+        "the destination is running, as it was left"
+    );
+
+    let file = world.export_path("through-a-bridge");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    assert!(
+        exported.status.success(),
+        "kr export: {}; it said {}; the destination's daemon logged {}",
+        String::from_utf8_lossy(&exported.stdout),
+        String::from_utf8_lossy(&exported.stderr),
+        world.destination_daemon_log()
+    );
+    let said: Value = serde_json::from_slice(&exported.stdout).expect("kr printed JSON");
+    assert_eq!(said["ok"], true, "{said}");
+    assert_eq!(said["session_id"], session.as_str(), "{said}");
+
+    let bytes = std::fs::read(&file).expect("the file was written");
+    let document: Value = serde_json::from_slice(&bytes).expect("the file is JSON");
+    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert_eq!(document["session"]["session_id"], session.as_str());
+    assert_eq!(document["closure"]["reason"], "root_exit", "{document}");
+    let output = exported_output(&document);
+    assert!(
+        holds(&output, "out-marker"),
+        "{}",
+        String::from_utf8_lossy(&output).escape_debug()
+    );
+    assert!(holds(&output, "after-marker"));
+    // The shell's own echo of what was typed holds the escape sequences as text, and what it printed
+    // holds them as bytes: neither is in the file as a clipboard write, a bell or a question.
+    for gone in ["\x1b]52", "\x07", "\x1b[c"] {
+        assert!(
+            !holds(&output, gone),
+            "{} is not carried: {}",
+            gone.escape_debug(),
+            String::from_utf8_lossy(&output).escape_debug()
+        );
+    }
+    let whole = String::from_utf8_lossy(&bytes);
+    assert!(!whole.contains("c2VjcmV0LXRva2Vu"), "{whole}");
+    for kind in [
+        "clipboard_write",
+        "bell",
+        "terminal_query",
+        "output_timestamps",
+    ] {
+        assert!(
+            document["omissions"]
+                .as_array()
+                .expect("omissions")
+                .iter()
+                .any(|omission| omission["kind"] == kind),
+            "{kind} is declared: {}",
+            document["omissions"]
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(
+        world.destination_answers(),
+        "an export leaves the destination's daemon running"
+    );
+
+    // The file is never replaced.
+    let again = world.run(&[
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("reads"),
+        bytes,
+        "and is left as it was"
+    );
+}
+
+/// KR-REQ-18.11: an export of a session in a stopped environment is refused and starts nothing, where
+/// a create or an attach would start it: no bridge is run in the distribution, the platform is only
+/// asked, and no file is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_from_a_stopped_environment_starts_nothing() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let session = a_closed_session_in_the_destination(&world);
+    world.stop_destination_daemon();
+    std::fs::write(world.tools.join("distribution-state"), "Stopped")
+        .expect("the platform's answer");
+    let before = world.invocations();
+
+    let file = world.export_path("stopped");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    let said: Value = serde_json::from_slice(&exported.stdout).unwrap_or_else(|error| {
+        panic!(
+            "kr export printed no document ({error}): {}; it said {}",
+            String::from_utf8_lossy(&exported.stdout),
+            String::from_utf8_lossy(&exported.stderr)
+        )
+    });
+    assert!(!exported.status.success(), "{said}");
+    assert_eq!(said["code"], "ENVIRONMENT_UNAVAILABLE", "{said}");
+    assert!(!file.exists(), "no file was made");
+    let asked = std::fs::read_to_string(world.tools.join("invocations")).expect("the record");
+    let since: Vec<&str> = asked.lines().skip(before).collect();
+    assert!(
+        since.iter().all(|line| line.starts_with("--list")),
+        "the platform was asked and nothing was run in the distribution: {since:?}"
+    );
+    assert!(
+        !world.destination_answers(),
+        "nothing started the destination's daemon"
+    );
+}
+
+/// KR-REQ-18.11: where the destination's privacy mode is on, no session is exported, closed ones
+/// included, and the refusal names privacy mode and writes nothing. The control is the first test:
+/// the same session with the mode off is exported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_from_an_environment_in_privacy_mode_writes_nothing() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let session = a_closed_session_in_the_destination(&world);
+    let mut privacy = std::process::Command::new(support::kr());
+    privacy
+        .args(["--json", "privacy", "on"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            world.destination.paths().runtime_root(),
+        )
+        .env(
+            kr_ipc::paths::STATE_DIR_VARIABLE,
+            world.destination.paths().state_root(),
+        )
+        .current_dir("/");
+    let turned_on = privacy.output().expect("runs kr");
+    assert!(
+        String::from_utf8_lossy(&turned_on.stdout).contains("\"enabled\": true"),
+        "{}; {}",
+        String::from_utf8_lossy(&turned_on.stdout),
+        String::from_utf8_lossy(&turned_on.stderr)
+    );
+
+    let file = world.export_path("private");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    let said: Value = serde_json::from_slice(&exported.stdout).unwrap_or_else(|error| {
+        panic!(
+            "kr export printed no document ({error}): {}; it said {}",
+            String::from_utf8_lossy(&exported.stdout),
+            String::from_utf8_lossy(&exported.stderr)
+        )
+    });
+    assert!(!exported.status.success(), "{said}");
+    assert_eq!(said["code"], "PERMISSION_DENIED", "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("privacy mode is on")),
+        "{said}"
+    );
+    assert!(!file.exists(), "nothing was written");
+}
+
+/// KR-REQ-18.11, KR-REQ-25.25: the same command exports a session of this host's own environment,
+/// through its daemon and not through a bridge, with the same file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_of_a_session_on_this_host_is_the_same_file() {
+    let world = World::start().await;
+    let created = world.run(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--shell",
+        "/bin/sh",
+        "--startup",
+        "interactive",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("kr printed JSON");
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+    let display = created["display_number"].to_string();
+    let terminal = world.attach_here_on_a_terminal(&display);
+    terminal.types(TYPED_WITH_SIDE_EFFECTS);
+    terminal.expect_within("after-marker", "the shell printed past its side effects");
+    // The engine answered the shell's question about the terminal, as a terminal would, and the
+    // answer reached the shell as typing: the line discipline's kill character clears it.
+    terminal.types("\x15exit\r");
+    terminal.expect_within("attach-finished-", "the attachment ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+    let started = Instant::now();
+    loop {
+        let listed = world.run(&["--json", "list", "--include-closed"]);
+        let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr list printed JSON");
+        if listed["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.iter().any(|row| row["state"] == "closed"))
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the session did not close: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let file = world.export_path("here");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &display,
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    assert!(
+        exported.status.success(),
+        "kr export: {}; it said {}",
+        String::from_utf8_lossy(&exported.stdout),
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("written")).expect("JSON");
+    assert_eq!(document["session"]["session_id"], session.as_str());
+    let output = exported_output(&document);
+    assert!(
+        holds(&output, "out-marker"),
+        "{}",
+        String::from_utf8_lossy(&output).escape_debug()
+    );
+    assert!(!holds(&output, "\x1b]52"));
+    assert_eq!(
+        world.invocations(),
+        0,
+        "no bridge was opened for a session of this host's own"
+    );
+}
 
 fn runtime_available() -> bool {
     let present = std::process::Command::new(RUNTIME)
