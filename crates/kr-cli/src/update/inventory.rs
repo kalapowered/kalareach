@@ -20,6 +20,7 @@ use kr_protocol::local::{LocalBuild, LocalClientKind};
 use kr_protocol::session::DisplayNumber;
 use kr_protocol::update::ReleaseManifest;
 
+use super::Unreached;
 use crate::error::{CliError, Result};
 
 /// How long one worker is given to answer its connection and its challenge.
@@ -35,22 +36,78 @@ pub struct Environment {
     pub host: HostPaths,
 }
 
+/// What looking for the environments a store's daemons have served found.
+pub struct Surveyed {
+    /// Every environment whose state is still there, in the order of their identities: the order
+    /// their locks are taken in.
+    pub environments: Vec<Environment>,
+    /// The roots the store records whose environment could not be looked at.
+    pub unreached: Vec<Unreached>,
+    /// The state root of every pair the store records through which an environment was found, and
+    /// the environment: several pairs, spelled differently, can name one.
+    pub reached: Vec<(std::path::PathBuf, EnvironmentId)>,
+}
+
+/// What a failure to look at an environment's identity says, when it says that what holds the
+/// identity is gone: a directory above it is not a directory, the file system behind it is stale,
+/// or its device or address is not there. Any other failure says nothing of the kind, and an
+/// environment whose daemon may be running is never passed over for it.
+fn what_holds_it_is_gone(error: &kr_ipc::IpcError) -> Option<&std::io::Error> {
+    let kr_ipc::IpcError::Io { source, .. } = error else {
+        return None;
+    };
+    let gone = source.kind() == std::io::ErrorKind::NotFound
+        || source.raw_os_error().is_some_and(|code| {
+            [libc::ENOTDIR, libc::ESTALE, libc::ENODEV, libc::ENXIO].contains(&code)
+        });
+    gone.then_some(source)
+}
+
 /// Every environment the store's daemons have served whose state is still there, in the order of
-/// their identities: the order their locks are taken in.
+/// their identities: the order their locks are taken in, and the roots of those whose state is
+/// not: a stopped distribution, a removed container, a mount that is gone.
+///
+/// An environment is passed over only when what holds its identity is gone, which is also what a
+/// removed environment looks like. An identity that is there and cannot be trusted, or cannot be
+/// looked at for any other reason, stops the update: that environment may have a daemon running.
 ///
 /// # Errors
 ///
 /// Returns the failure to read the store's record of roots or an environment's identity.
-pub fn environments(store: &Store) -> Result<Vec<Environment>> {
+pub fn environments(store: &Store) -> Result<Surveyed> {
     let mut environments: Vec<Environment> = Vec::new();
+    let mut unreached = Vec::new();
+    let mut reached = Vec::new();
     for roots in store
         .recorded_roots()
         .map_err(|error| CliError::Other(super::said(&error)))?
     {
         let host = HostPaths::new(&roots.runtime_root, &roots.state_root)?;
-        let Some(environment_id) = host.recorded_environment_id()? else {
-            continue;
+        let not_reached = |reason: Shown| Unreached {
+            runtime_root: roots.runtime_root.clone(),
+            state_root: roots.state_root.clone(),
+            reason,
         };
+        let environment_id = match host.recorded_environment_id() {
+            Ok(Some(environment_id)) => environment_id,
+            Ok(None) => {
+                unreached.push(not_reached(Shown::said(
+                    "no environment identity is recorded there",
+                )));
+                continue;
+            }
+            Err(error) => match what_holds_it_is_gone(&error) {
+                Some(source) => {
+                    unreached.push(not_reached(shown!(
+                        "its environment identity could not be looked at: {}",
+                        Shown::io(source)
+                    )));
+                    continue;
+                }
+                None => return Err(error.into()),
+            },
+        };
+        reached.push((roots.state_root.clone(), environment_id));
         if environments
             .iter()
             .any(|known| known.environment_id == environment_id)
@@ -64,7 +121,11 @@ pub fn environments(store: &Store) -> Result<Vec<Environment>> {
         });
     }
     environments.sort_by_key(|environment| environment.environment_id.to_string());
-    Ok(environments)
+    Ok(Surveyed {
+        environments,
+        unreached,
+        reached,
+    })
 }
 
 /// What one live worker says it is.
@@ -154,6 +215,38 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
         }
     }
     stated
+}
+
+/// Brings the registry of an environment whose daemon has not run since an earlier schema step
+/// forward to the schema this release reads, which is the schema [`classify`] reads one by, and says
+/// what it did. The environment's daemon has stopped and its lock, and the store's install lock,
+/// are held, so no daemon writes the registry or starts meanwhile.
+///
+/// It is the registry's own migration, the one a daemon's start runs, and nothing else: a registry
+/// at the schema this release reads is not migrated, and one this cannot bring forward, because it
+/// records a later schema, no schema or several, or is not a file, is left for [`classify`]'s
+/// reader to refuse in its own words. A registry that lost a table its records are read from is
+/// refused here, by the table's name.
+///
+/// # Errors
+///
+/// Returns the failure to read the registry or to bring it forward, naming the environment, which
+/// holds the update.
+pub fn carry_forward(
+    environment: &Environment,
+) -> Result<Option<kr_controller::registry::Carried>> {
+    Registry::bring_forward(
+        environment.paths.registry_database(),
+        environment.environment_id,
+    )
+    .map_err(|error| {
+        CliError::Other(shown!(
+            "environment {}'s registry could not be read or brought forward: {}. The update \
+             switched nothing; run kr host update again once the cause is dealt with",
+            environment.environment_id,
+            Shown::protocol(&error.to_protocol_error())
+        ))
+    })
 }
 
 /// Classes every record of an environment's registry for an update to `target`, and returns what
@@ -366,5 +459,61 @@ mod tests {
             !read(registry, environment.environment_id),
             "a registry of its own is read"
         );
+    }
+
+    /// An environment is passed over, and named, only when its identity cannot be looked at because
+    /// what holds it is gone. Every other failure may be an environment whose daemon runs, and stops
+    /// the update.
+    #[test]
+    fn only_a_failure_that_says_what_holds_an_identity_is_gone_passes_an_environment_over() {
+        let path = std::path::Path::new("/state/environment-id");
+        let failed =
+            |code: i32| kr_ipc::IpcError::io("open", path, std::io::Error::from_raw_os_error(code));
+        for gone in [libc::ENOTDIR, libc::ESTALE, libc::ENODEV, libc::ENXIO] {
+            assert!(
+                what_holds_it_is_gone(&failed(gone)).is_some(),
+                "error {gone} says what holds it is gone"
+            );
+        }
+        assert!(
+            what_holds_it_is_gone(&kr_ipc::IpcError::io(
+                "open",
+                path,
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+            .is_some(),
+            "a name that is not there"
+        );
+        for other in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EIO,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EINTR,
+            libc::ELOOP,
+            libc::ETIMEDOUT,
+        ] {
+            assert!(
+                what_holds_it_is_gone(&failed(other)).is_none(),
+                "error {other} says nothing of the kind"
+            );
+        }
+        for untrusted in [
+            kr_ipc::IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "this file must not be a symbolic link",
+            },
+            kr_ipc::IpcError::IdentityUnavailable {
+                what: "environment identity",
+                detail: "the file is not text".to_owned(),
+            },
+        ] {
+            assert!(
+                what_holds_it_is_gone(&untrusted).is_none(),
+                "{untrusted} is not an environment that is gone"
+            );
+        }
     }
 }

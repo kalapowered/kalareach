@@ -45,6 +45,8 @@ mod inventory;
 #[cfg(unix)]
 pub mod release;
 
+use std::path::PathBuf;
+
 use kr_client::shown;
 #[cfg(unix)]
 use kr_client::shown::Said as _;
@@ -335,8 +337,90 @@ pub struct Updated {
     pub restarted: Vec<EnvironmentId>,
     /// The releases removed because nothing needs them.
     pub removed: Vec<ReleaseName>,
+    /// The environments no daemon served, whose registries the update brought forward.
+    pub carried: Vec<CarriedRegistry>,
+    /// The environments the store records that the update could not reach.
+    pub unreached: Vec<Unreached>,
     /// Whether this was a check only, which changed nothing.
     pub checked_only: bool,
+}
+
+/// An environment's registry an update brought forward to the schema its release reads, because no
+/// daemon of the environment has run since an earlier schema step.
+pub struct CarriedRegistry {
+    /// Its environment.
+    pub environment: EnvironmentId,
+    /// The schema version the registry recorded.
+    pub from: i64,
+    /// The schema version the migration brought it to.
+    pub to: i64,
+}
+
+impl CarriedRegistry {
+    /// What `--json` says of it.
+    fn document(&self) -> Document {
+        Document::new()
+            .with("environment", crate::output::said(&self.environment))
+            .with("from", self.from)
+            .with("to", self.to)
+    }
+
+    /// What is said to a person.
+    fn said(&self) -> Shown {
+        shown!(
+            "environment {}'s registry was at schema version {} and was brought forward to {}, the \
+             schema this release reads; a control daemon of the new release brings it on from \
+             there when it starts",
+            self.environment,
+            self.from,
+            self.to
+        )
+    }
+
+    /// What an update that did not finish says it had already done to this registry.
+    #[cfg(unix)]
+    fn brought(&self) -> Shown {
+        shown!(
+            "the registry of environment {} from schema version {} to {}",
+            self.environment,
+            self.from,
+            self.to
+        )
+    }
+}
+
+/// A pair of roots the store records a control daemon served, whose environment the update could
+/// not look at, because what holds its identity is gone: a stopped distribution, a removed
+/// container, a mount that is not there.
+pub struct Unreached {
+    /// The runtime root the daemon was started with.
+    pub runtime_root: PathBuf,
+    /// The state root the daemon was started with.
+    pub state_root: PathBuf,
+    /// Why it could not be looked at.
+    pub reason: Shown,
+}
+
+impl Unreached {
+    /// What `--json` says of it.
+    fn document(&self) -> Document {
+        Document::new()
+            .with("runtime_root", Shown::root(&self.runtime_root))
+            .with("state_root", Shown::root(&self.state_root))
+            .with("reason", self.reason.clone())
+    }
+
+    /// What is said to a person: for a check, which hands nothing over, what an update would do.
+    fn said(&self, check: bool) -> Shown {
+        shown!(
+            "the environment recorded with runtime root {} and state root {} could not be reached: \
+             {}; a control daemon there, if one runs, {} handed over and keeps the release it runs",
+            Shown::root(&self.runtime_root),
+            Shown::root(&self.state_root),
+            self.reason,
+            if check { "would not be" } else { "was not" }
+        )
+    }
 }
 
 impl Updated {
@@ -362,19 +446,35 @@ impl Updated {
                     .map(crate::shown::release)
                     .collect::<Vec<_>>(),
             )
+            .with(
+                "carried",
+                self.carried
+                    .iter()
+                    .map(CarriedRegistry::document)
+                    .collect::<Vec<_>>(),
+            )
+            .with(
+                "not_reached",
+                self.unreached
+                    .iter()
+                    .map(Unreached::document)
+                    .collect::<Vec<_>>(),
+            )
     }
 
     /// What is said to a person.
     #[must_use]
     pub fn lines(&self) -> Vec<Shown> {
         if self.checked_only {
-            return vec![shown!(
+            let mut lines = vec![shown!(
                 "release {} checks as a release for this host, and no live session that answered \
                  runs at a level it does not retain; kr host update --archive installs it in \
                  place of {}",
                 crate::shown::release(&self.target),
                 crate::shown::release(&self.source)
             )];
+            lines.extend(self.unreached.iter().map(|unreached| unreached.said(true)));
+            return lines;
         }
         if self.source == self.target {
             return vec![shown!(
@@ -394,6 +494,8 @@ impl Updated {
                 crate::shown::release(&self.target)
             ));
         }
+        lines.extend(self.carried.iter().map(CarriedRegistry::said));
+        lines.extend(self.unreached.iter().map(|unreached| unreached.said(false)));
         lines.push(Shown::said(
             "every live session goes on running the release it started from until it closes",
         ));
@@ -765,6 +867,8 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             source,
             restarted: Vec::new(),
             removed: Vec::new(),
+            carried: Vec::new(),
+            unreached: Vec::new(),
             checked_only: check,
         });
     }
@@ -774,10 +878,120 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         record.staged = Some(target.release.clone());
         record.write(&store)?;
     }
-    let environments = inventory::environments(&store)?;
+    let inventory::Surveyed {
+        environments,
+        unreached,
+        reached,
+    } = inventory::environments(&store)?;
+    // What the rest of the run learns that a person is told, whether it finishes or not.
+    let mut report = Report {
+        carried: Vec::new(),
+        unreached,
+        check,
+    };
+    let restarted = match proceed(
+        &store,
+        &update_lock,
+        &mut record,
+        (&environments, &reached),
+        (&source, &target),
+        &mut report,
+    )
+    .await
+    {
+        Ok(restarted) => restarted,
+        Err(error) => return Err(report.annotate(error)),
+    };
+    let removed = if check {
+        Vec::new()
+    } else {
+        collect(&store, &record, &update_lock)
+    };
+    Ok(Updated {
+        source,
+        target: target.release,
+        restarted,
+        removed,
+        carried: report.carried,
+        unreached: report.unreached,
+        checked_only: check,
+    })
+}
+
+/// What an update that has surveyed the store's environments learns, which every outcome says: the
+/// registries it brought forward and the recorded environments it could not reach.
+///
+/// An error that leaves an update after its survey goes through [`Report::annotate`] once, in
+/// [`update`], so that no exit, a failed record write among them, can leave out what the update had
+/// already done.
+#[cfg(unix)]
+struct Report {
+    carried: Vec<CarriedRegistry>,
+    unreached: Vec<Unreached>,
+    check: bool,
+}
+
+#[cfg(unix)]
+impl Report {
+    /// The error with what the update had done and found said after it, of the same kind and with
+    /// the same exit code: a local IPC failure becomes [`CliError::HostUnavailable`], which exits
+    /// with 3 and carries the same stable code. An error of any other kind, which no step of an
+    /// update returns, is left as it is.
+    fn annotate(&self, error: CliError) -> CliError {
+        let mut notes = Vec::new();
+        if let Some((first, rest)) = self.carried.split_first() {
+            let mut list = first.brought();
+            for next in rest {
+                list = shown!("{}, {}", list, next.brought());
+            }
+            notes.push(shown!(
+                "The update had already brought forward {}; a control daemon of a newer release \
+                 brings one on when it starts there",
+                list
+            ));
+        }
+        for unreached in &self.unreached {
+            notes.push(shown!(
+                "The update found that {}",
+                unreached.said(self.check)
+            ));
+        }
+        let mut said = match &error {
+            CliError::UpdateDeferred(said)
+            | CliError::Other(said)
+            | CliError::HostUnavailable(said) => said.clone(),
+            CliError::Ipc(failed) => Shown::ipc(failed),
+            _ => return error,
+        };
+        if notes.is_empty() {
+            return error;
+        }
+        for note in notes {
+            said = shown!("{}. {}", said, note);
+        }
+        match error {
+            CliError::UpdateDeferred(_) => CliError::UpdateDeferred(said),
+            CliError::Other(_) => CliError::Other(said),
+            _ => CliError::HostUnavailable(said),
+        }
+    }
+}
+
+/// Everything an update does after it has surveyed the environments: the first look at the live
+/// workers, the end of a check there, and otherwise the record of the update under way and the
+/// handover. Returns the environments whose daemons it started again.
+#[cfg(unix)]
+async fn proceed(
+    store: &Store,
+    update_lock: &kr_ipc::install::StoreLock,
+    record: &mut Record,
+    (environments, reached): (&[inventory::Environment], &[(PathBuf, EnvironmentId)]),
+    (source, target): (&ReleaseName, &kr_protocol::update::ReleaseManifest),
+    report: &mut Report,
+) -> Result<Vec<EnvironmentId>> {
     // Nothing is stopped for the first look: a worker at a level the new release does not retain
     // holds the update here, before any daemon is asked anything.
-    for environment in &environments {
+    for environment in environments {
         for stated in inventory::described(&environment.paths).await {
             let retained = stated
                 .build
@@ -785,20 +999,14 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
                 .is_some_and(|build| target.retains(build.protocol_version));
             if !retained {
                 return Err(deferred(
-                    &target,
-                    inventory::Holding::Unretained(stated).said(&target),
+                    target,
+                    inventory::Holding::Unretained(stated).said(target),
                 ));
             }
         }
     }
-    if check {
-        return Ok(Updated {
-            source,
-            target: target.release,
-            restarted: Vec::new(),
-            removed: Vec::new(),
-            checked_only: true,
-        });
+    if report.check {
+        return Ok(Vec::new());
     }
     record.update = Some(Transaction {
         source: source.clone(),
@@ -806,16 +1014,16 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         state: TransactionState::Prepared,
         restarts: Vec::new(),
     });
-    record.write(&store)?;
-    let restarted = hand_over(&store, &update_lock, &mut record, &environments, &target).await?;
-    let removed = collect(&store, &record, &update_lock);
-    Ok(Updated {
-        source,
-        target: target.release,
-        restarted,
-        removed,
-        checked_only: false,
-    })
+    record.write(store)?;
+    hand_over(
+        store,
+        update_lock,
+        record,
+        (environments, reached),
+        target,
+        report,
+    )
+    .await
 }
 
 /// The manifest of a release already in the store.
@@ -888,15 +1096,18 @@ fn deferred(target: &kr_protocol::update::ReleaseManifest, held: Shown) -> CliEr
     ))
 }
 
-/// Hands every daemon over, classes every registry, switches `current` and starts each daemon of
-/// the target; or, when anything holds the update, starts again what it stopped and waits.
+/// Hands every daemon over, brings the registry of each environment no daemon has run in forward,
+/// classes every registry, switches `current` and starts each daemon of the target; or, when
+/// anything holds the update, starts again what it stopped and waits. What it carries and finds
+/// unreachable is put in `report`, from where every outcome says it.
 #[cfg(unix)]
 async fn hand_over(
     store: &Store,
     update_lock: &kr_ipc::install::StoreLock,
     record: &mut Record,
-    environments: &[inventory::Environment],
+    (environments, reached): (&[inventory::Environment], &[(PathBuf, EnvironmentId)]),
     target: &kr_protocol::update::ReleaseManifest,
+    report: &mut Report,
 ) -> Result<Vec<EnvironmentId>> {
     // Every daemon prepares before any stops, so a daemon that will not make way costs the others
     // only a closed gate, which reopens.
@@ -960,7 +1171,11 @@ async fn hand_over(
     // held, so a daemon holding an environment that nobody prepared started after the first look,
     // or was not listening then, and was never asked to make way. It holds the update while
     // nothing has been stopped, and each daemon prepared resumes.
-    let again = match inventory::environments(store) {
+    let inventory::Surveyed {
+        environments: again,
+        unreached: unreached_again,
+        reached: reached_again,
+    } = match inventory::environments(store) {
         Ok(again) => again,
         Err(error) => {
             drop(install);
@@ -972,6 +1187,18 @@ async fn hand_over(
         }
     };
     let every = every_environment(environments, &again);
+    // From here the reading under the install lock is the one a person is told of. A pair of roots
+    // through which an environment held below was found, at either reading, is not also one the
+    // update could not reach.
+    let held: Vec<EnvironmentId> = every
+        .iter()
+        .map(|environment| environment.environment_id)
+        .collect();
+    report.unreached = still_unreached(
+        unreached_again,
+        &[reached, reached_again.as_slice()].concat(),
+        &held,
+    );
     for environment in &every {
         if stopped.contains(&environment.environment_id) {
             continue;
@@ -1049,6 +1276,22 @@ async fn hand_over(
     }
     if holding.is_none() {
         for environment in &every {
+            // Every daemon has stopped and every environment's lock and the install lock are held:
+            // an environment whose daemon did not run since an earlier schema step is brought to the
+            // schema this release reads, which is the schema its registry is classed by.
+            match inventory::carry_forward(environment) {
+                Ok(Some(done)) => report.carried.push(CarriedRegistry {
+                    environment: environment.environment_id,
+                    from: done.from,
+                    to: done.to,
+                }),
+                Ok(None) => {}
+                Err(error) => {
+                    drop(held);
+                    drop(install);
+                    return Err(undo(store, record, error).await);
+                }
+            }
             match inventory::classify(environment, target).await {
                 Ok(found) => {
                     if let Some(first) = found.first() {
@@ -1095,6 +1338,26 @@ async fn hand_over(
     written?;
     settle(store, record)?;
     Ok(restarted)
+}
+
+/// The recorded roots the reading under the install lock could not reach, less each pair of roots
+/// through which an environment the update holds was found at either reading: such an environment
+/// is held and classed, and is no environment the update could not reach, whatever way one of its
+/// pairs of roots is spelled.
+#[cfg(unix)]
+fn still_unreached(
+    unreached: Vec<Unreached>,
+    reached: &[(PathBuf, EnvironmentId)],
+    held: &[EnvironmentId],
+) -> Vec<Unreached> {
+    unreached
+        .into_iter()
+        .filter(|unreached| {
+            !reached
+                .iter()
+                .any(|(state_root, id)| *state_root == unreached.state_root && held.contains(id))
+        })
+        .collect()
 }
 
 /// Every environment an update holds and classes once no daemon can start: those read again under
@@ -1722,5 +1985,193 @@ mod tests {
         handover::install_lock(&store, bound, "update")
             .await
             .expect("the lock is free");
+    }
+
+    /// What an update says to a person of what it carried and could not reach: a check says what an
+    /// update would do, and a finished one says what it did.
+    #[test]
+    fn the_lines_of_an_outcome_say_what_was_carried_and_what_was_not_reached() {
+        let release = |name: &str| ReleaseName::new(name).expect("a release name");
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let updated = |checked_only: bool| Updated {
+            source: release("0.1.0+aaaaaaaaaaaa"),
+            target: release("0.2.0+bbbbbbbbbbbb"),
+            restarted: Vec::new(),
+            removed: Vec::new(),
+            carried: vec![CarriedRegistry {
+                environment,
+                from: 4,
+                to: 6,
+            }],
+            unreached: vec![Unreached {
+                runtime_root: PathBuf::from("/runtime/gone"),
+                state_root: PathBuf::from("/state/gone"),
+                reason: Shown::said("its environment identity could not be looked at"),
+            }],
+            checked_only,
+        };
+        let said = |lines: Vec<Shown>| {
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let done = said(updated(false).lines());
+        assert!(
+            done.contains(&format!(
+                "environment {environment}'s registry was at schema version 4 and was brought \
+                 forward to 6"
+            )) && done.contains("could not be reached")
+                && done.contains("was not handed over"),
+            "{done}"
+        );
+        let checked = said(updated(true).lines());
+        assert!(
+            checked.contains("could not be reached")
+                && checked.contains("would not be handed over")
+                && !checked.contains("brought forward"),
+            "a check carries nothing and names what an update would not reach: {checked}"
+        );
+    }
+
+    /// Whatever ends an update after its survey says what it had carried and could not reach, in the
+    /// kind of error it was and with its exit code: a wait stays a wait, a failure a failure, and a
+    /// local IPC failure, which exits with 3 as a host that is not available does, says it too.
+    #[test]
+    fn an_error_that_ends_an_update_says_what_it_had_carried_and_could_not_reach() {
+        let environment =
+            |byte: u8| EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]));
+        let unreached = |name: &str| Unreached {
+            runtime_root: PathBuf::from(format!("/runtime/{name}")),
+            state_root: PathBuf::from(format!("/state/{name}")),
+            reason: Shown::said("its environment identity could not be looked at"),
+        };
+        let report = |check: bool| Report {
+            carried: vec![
+                CarriedRegistry {
+                    environment: environment(1),
+                    from: 4,
+                    to: 6,
+                },
+                CarriedRegistry {
+                    environment: environment(2),
+                    from: 5,
+                    to: 6,
+                },
+            ],
+            unreached: vec![unreached("one"), unreached("two")],
+            check,
+        };
+        let said = |error: &CliError| error.said().to_string();
+
+        let waits = report(false).annotate(CliError::UpdateDeferred(Shown::said("it waits")));
+        assert_eq!(waits.exit_code(), 9);
+        let text = said(&waits);
+        assert!(
+            text.starts_with("it waits. The update had already brought forward the registry of "),
+            "{text}"
+        );
+        for expected in [
+            "from schema version 4 to 6, the registry of environment",
+            "from schema version 5 to 6; a control daemon of a newer release brings one on",
+            "/state/one",
+            "/state/two",
+            "was not handed over",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+
+        let failed = report(false).annotate(CliError::Other(Shown::said("it failed")));
+        assert_eq!(
+            (failed.exit_code(), failed.code()),
+            (1, kr_protocol::error::ErrorCode::ResourceUnavailable)
+        );
+        let text = said(&failed);
+        for expected in [
+            "it failed. The update had already brought forward the registry of environment",
+            "from schema version 4 to 6",
+            "from schema version 5 to 6",
+            "/state/one",
+            "/state/two",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+
+        // A local IPC failure keeps its exit code and its stable code.
+        let ipc = || {
+            kr_ipc::IpcError::io(
+                "write",
+                std::path::Path::new("/store/install.json"),
+                std::io::Error::from_raw_os_error(libc::ENOSPC),
+            )
+        };
+        let was = (
+            CliError::Ipc(ipc()).exit_code(),
+            kr_protocol::error::ErrorCode::HostNotConfigured,
+        );
+        let recorded = report(false).annotate(CliError::Ipc(ipc()));
+        assert_eq!((recorded.exit_code(), recorded.code()), was);
+        assert!(said(&recorded).contains("The update had already brought forward"));
+
+        // A check names what an update would not reach, and carries nothing.
+        let checked = Report {
+            carried: Vec::new(),
+            unreached: vec![unreached("one")],
+            check: true,
+        }
+        .annotate(CliError::UpdateDeferred(Shown::said("it waits")));
+        let text = said(&checked);
+        assert!(
+            text.contains("would not be handed over") && !text.contains("brought forward"),
+            "{text}"
+        );
+
+        // Nothing carried and nothing unreached: the error is as it was.
+        let plain = Report {
+            carried: Vec::new(),
+            unreached: Vec::new(),
+            check: false,
+        }
+        .annotate(CliError::Other(Shown::said("it failed")));
+        assert_eq!(said(&plain), "it failed");
+    }
+
+    /// A pair of roots the second reading could not reach is not one the update could not reach when
+    /// an environment it holds was found through it at either reading, in whatever spelling of the
+    /// path: `/tmp` and `/private/tmp` name one directory on macOS, and both are recorded.
+    #[test]
+    fn a_pair_of_roots_an_environment_the_update_holds_was_found_through_is_not_unreached() {
+        let environment =
+            |byte: u8| EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]));
+        let unreached = |state: &str| Unreached {
+            runtime_root: PathBuf::from("/runtime"),
+            state_root: PathBuf::from(state),
+            reason: Shown::said("gone"),
+        };
+        let found = vec![
+            (PathBuf::from("/tmp/state"), environment(1)),
+            (PathBuf::from("/private/tmp/state"), environment(1)),
+            (PathBuf::from("/state/other"), environment(2)),
+        ];
+        let left = still_unreached(
+            vec![
+                unreached("/tmp/state"),
+                unreached("/private/tmp/state"),
+                unreached("/state/other"),
+                unreached("/state/removed"),
+            ],
+            &found,
+            &[environment(1)],
+        );
+        let states: Vec<_> = left
+            .iter()
+            .map(|unreached| unreached.state_root.display().to_string())
+            .collect();
+        assert_eq!(
+            states,
+            vec!["/state/other", "/state/removed"],
+            "an environment that is not held keeps its roots named, and so does a pair nothing was found through"
+        );
     }
 }
