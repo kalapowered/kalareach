@@ -424,13 +424,30 @@ impl RecipientAuthority for GrantedRecipients {
     /// that fails stays owed, and the host's next decision or its record task writes it.
     fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
         let standing = self.standing(rule.grant_id?)?;
-        self.scope_of(&standing, None)
+        // A grant of the grant store issued to a device this host has paired is only as good as the
+        // device's own pairing, as it is for the device's own requests: once that pairing has
+        // ended, a destination under the grant is told nothing. A grant issued to a recipient this
+        // host never paired has no pairing to end.
+        let device = match &standing {
+            Standing::Stored(record) => match self
+                .lifetimes
+                .devices()
+                .record_for_device(record.grant.recipient_device_id)
+            {
+                Ok(Some(device)) if device.is_paired() => Some(device),
+                Ok(Some(_)) | Err(_) => return None,
+                Ok(None) => None,
+            },
+            Standing::Paired(_) => None,
+        };
+        self.scope_of(&standing, device.as_ref())
     }
 
     /// The device is the one its destination is named by, and the grant its rule names is the
     /// device's own, by the device it was issued to; a grant in the grant store that was issued to
     /// a device is still only as good as that device's own pairing, so the device has to be
-    /// paired.
+    /// paired. [`Self::scope_for`] asks the same of a destination under such a grant, which has no
+    /// device of its own to name; here the device has to be there to be paired at all.
     fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
         let device_id: DeviceId = destination.id.as_str().parse().ok()?;
         let standing = self.standing(destination.rule.as_ref()?.grant_id?)?;
@@ -1328,6 +1345,63 @@ mod tests {
             scope.viewer,
             ViewerScope::from_grant(&grant(45, SessionSelector::Any, &held_rights)),
             "and not through the ones the grant held"
+        );
+    }
+
+    /// A destination under a grant of the grant store issued to a paired device is told nothing once
+    /// the device is unpaired, as the device's own request would not be served: its pairing is
+    /// decided as `device_scope` decides it. The control: while the device is paired the same rule
+    /// is admitted, and so is a rule under a grant issued to a recipient this host never paired,
+    /// which has no pairing to end.
+    #[test]
+    fn a_rule_under_a_grant_issued_to_a_device_admits_nothing_once_the_device_is_unpaired() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        let recipients = recipients(&sharing);
+        issued(
+            &sharing,
+            Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                ..grant(48, SessionSelector::Any, &[ActionRight::SessionView])
+            },
+            true,
+        );
+        issued(
+            &sharing,
+            Grant {
+                recipient_device_id: DeviceId::new(uuid(9)),
+                ..grant(49, SessionSelector::Any, &[ActionRight::SessionView])
+            },
+            true,
+        );
+        let devices = recipients.lifetimes().devices();
+        devices
+            .commit(&device(
+                DeviceId::new(uuid(2)),
+                grant(50, SessionSelector::Any, &[ActionRight::SessionView]),
+            ))
+            .expect("a device");
+        assert!(
+            recipients.scope_for(&rule(Some(48))).is_some(),
+            "told while the device is paired"
+        );
+        assert!(
+            recipients.scope_for(&rule(Some(49))).is_some(),
+            "a recipient this host never paired has no pairing to end"
+        );
+        devices
+            .revoke(
+                DeviceId::new(uuid(2)),
+                kr_protocol::scalars::TimestampMs::new(NOW),
+            )
+            .expect("an unpairing");
+        assert_eq!(
+            recipients.scope_for(&rule(Some(48))),
+            None,
+            "told nothing once the device is unpaired"
+        );
+        assert!(
+            recipients.scope_for(&rule(Some(49))).is_some(),
+            "and the other recipient is told still"
         );
     }
 
