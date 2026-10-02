@@ -272,8 +272,8 @@ fn agent_runs_a_helper() {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let _helper = command.spawn().expect("the helper starts");
-        std::thread::sleep(Duration::from_secs(600));
+        let mut helper = command.spawn().expect("the helper starts");
+        let _ = helper.wait();
     } else {
         std::thread::sleep(Duration::from_secs(600));
     }
@@ -327,13 +327,10 @@ fn a_bridge_helper() {
     let me = kr_ipc::identity::current_process_start_identity().expect("this process");
     // Another real process's identity, which the operating system reads back as it presents it.
     let presented = match mode.as_str() {
-        "other_identity" => {
-            let parent = kr_ipc::identity::process_start_identity(
-                u32::try_from(field("pid").parse::<u64>().expect("a number")).expect("a pid"),
-            )
-            .expect("the launched agent");
-            parent
-        }
+        "other_identity" => kr_ipc::identity::process_start_identity(
+            u32::try_from(field("pid").parse::<u64>().expect("a number")).expect("a pid"),
+        )
+        .expect("the launched agent"),
         _ => me,
     };
     let headers = if mode == "browser" {
@@ -653,7 +650,7 @@ async fn kr_req_11_43_a_process_outside_every_job_is_refused() {
         .await
         .expect("the process reaches the endpoint")
         .err()
-        .expect("a process outside the job is refused");
+        .unwrap_or_else(|| panic!("a process outside the job is refused"));
     assert_eq!(
         refused.code(),
         kr_protocol::error::ErrorCode::PermissionDenied,
@@ -683,7 +680,7 @@ async fn kr_req_11_43_a_process_in_another_launchs_job_is_refused() {
         .await
         .expect("the process reaches the endpoint")
         .err()
-        .expect("a process in another launch's job is refused");
+        .unwrap_or_else(|| panic!("a process in another launch's job is refused"));
     assert_eq!(
         refused.code(),
         kr_protocol::error::ErrorCode::PermissionDenied,
