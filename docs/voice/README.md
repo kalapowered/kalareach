@@ -5,10 +5,14 @@ asks for, and it decides each action against the grants the host already keeps. 
 an explicit data-access boundary, separate from the encryption of terminal transport, and this
 document is that boundary written down.
 
-This daemon starts no managed call. It attaches no managed voice broker, so `voice.prepare` reports
-no managed terms and `voice.start` answers that the host has no voice service configured. The
-sections on the rate and the account token describe what the coordinator does when a broker is
-attached, which its code and tests establish, and every other section holds on this daemon as it is.
+This daemon attaches no voice provider, managed or of a person's own, so no call starts:
+`voice.start` answers that the host has no voice service configured, and `voice.prepare` reports no
+managed terms. `voice.grant` and `voice.prepare` act as this document describes. With no call there
+is no voice session, so `voice.context` and `voice.delegate` are refused as naming no such session.
+The sections on what a call may read and send, where it goes, the managed operator, what is never
+authority, the session-bound grant, the rate and the account token describe what the coordinator
+does once a provider is attached, which its code and its tests establish. The section on what this
+daemon performs and supplies says which of that this daemon carries out itself.
 
 ## What the parts are
 
@@ -42,7 +46,8 @@ voice-context surface, under a viewer scope built from the **requesting device's
 
 ## What the coordinator may send back
 
-The bounded selection the specification states, and nothing else:
+The bounded selection the specification states, and nothing else. It is an upper limit, and this
+daemon supplies less of it, as the section on what this daemon performs and supplies says:
 
 - the session description, the current working directory, the active application, the summaries of
   decisions waiting on a person, and the last twenty semantic messages;
@@ -79,8 +84,8 @@ rather than to a policy page. The preparation a person reads before a call carri
 carries them when it starts, and every context selection for that call carries them too. The host
 keeps no wording of its own for this.
 
-Using a provider credential of your own changes who can read it, and nothing else about how the
-host decides what a call may do.
+Using a provider credential of your own would change who can read it, and nothing else about how
+the host decides what a call may do. This daemon attaches none.
 
 ## What an append acknowledgement does not mean
 
@@ -120,11 +125,12 @@ become authority by arriving over a channel the host trusts for something else.
 
 A voice grant is an ordinary grant in the host's one authority store. There is no second store.
 
-Two exist per device. The **standing** grant says which voice actions the person chose to permit and
-survives calls. The **session-bound** grant is delegated from it when a call starts, narrows to the
-sessions that call may reach and to the call's own deadline, and is revoked the moment the call
-stops — immediately, and independently of the service's billing finalisation. Revoking the standing
-grant revokes its descendants, so withdrawing it ends any call running under it.
+Two kinds exist per device. The **standing** grant says which voice actions the person chose to
+permit and survives calls. The **session-bound** grant is delegated from it when a call starts,
+narrows to the sessions that call may reach and to the call's own deadline, and is revoked the
+moment the call stops, immediately and independently of the service's billing finalisation. This
+daemon starts no call, so none exists on it. Revoking the standing grant revokes its descendants, so
+withdrawing it ends any call running under it.
 
 The default grant permits session navigation, status queries, briefing and prompt composition, and
 nothing else. Broadening it is a choice a person makes, and the change states which actions it
@@ -151,14 +157,18 @@ two requests can never each decide about the authority the other is writing.
 ## What this daemon performs and supplies
 
 The daemon performs one kind of voice action itself, the reading of a session, which covers
-navigating, status queries, briefing and composing a prompt. For every other action it admits the
-proposal and reports it as admitted and not done, because the daemon does not dispatch to a
-session's worker, and a receipt stands for what was done. A decision on an approval is refused: the
+navigating, status queries, briefing and composing a prompt. For every other action that has a
+method it admits the proposal and reports it as admitted and not done, because the daemon does not
+dispatch to a session's worker, and a receipt stands for what was done. Delivering something
+externally has no method, so a proposal for it is refused. A decision on an approval is refused: the
 daemon holds no approval's details to check a spoken decision against.
 
-The context the daemon supplies is the session's description and its working directory, each with
-the moment it was produced. It supplies no active application, no pending-decision summaries and no
-messages, because it holds no semantic history, and the selection says so as withheld.
+The context the daemon supplies is the session's description and the directory the session started
+in, each with the moment the session was created. It supplies no active application, because it
+cannot say when the foreground last changed, and no pending-decision summaries or messages, because
+it does not hold the worker's semantic history; the selection carries those two reasons as
+withheld. It supplies no file contents, environment variables, scrollback or attachment bytes, since
+nothing has been selected.
 
 ## A voice session is not a terminal session
 
@@ -187,7 +197,7 @@ is the authorisation header of the request it authorises. The token lasts as lon
 said when it issued it, ten minutes for the managed service, and the host does not refresh it; a
 token issued without the `voice` scope is refused before any request carries it.
 
-A host with no token and a host with no broker configured are both complete hosts. They start no
+A host with no token and a host with no provider attached are both complete hosts. They start no
 managed call, and nothing else on them depends on one: sessions, agents and their questions work as
 they do without voice. The coordinator takes its provider through a seam, so a provider of a
-person's own can stand where the managed one does, and this host ships none.
+person's own can stand where the managed one does, and this daemon attaches none.
