@@ -23,7 +23,7 @@ name: wsl-acceptance
 on:
   push:
     branches: ["task/T-025b-phase2"]
-    paths: [".github/workflows/wsl-acceptance.yml"]
+    paths: [".github/workflows/wsl-acceptance.yml", "scripts/e2e-wsl.sh"]
   workflow_dispatch:
 
 permissions:
