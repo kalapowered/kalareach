@@ -169,8 +169,9 @@ async fn an_enrolment_is_performed_once_per_action_and_a_retry_is_answered_from_
     assert_eq!(enrolled.row.enrolment.environment_id, record.environment_id);
     assert_eq!(enrolled.row.enrolment.label, "ubuntu");
 
-    // The record is forgotten by another action. Sending the enrolment again as it was sent
-    // answers from its receipt, and does not enrol the record again.
+    // The record is forgotten by another action. Sending the enrolment again as it was sent, over a
+    // connection of its own whose window is not the one it quotes, answers from its receipt and
+    // does not enrol the record again.
     let forgotten = client
         .mutate(
             Method::EnvironmentForget,
@@ -189,6 +190,8 @@ async fn an_enrolment_is_performed_once_per_action_and_a_retry_is_answered_from_
             .expect("a result")
             .forgotten
     );
+    drop(client);
+    let mut client = host.client().await;
     let again: EnvironmentEnrolResult = client
         .repeat(&first)
         .await
@@ -249,6 +252,8 @@ async fn a_forget_is_performed_once_per_action_and_a_retry_is_answered_from_its_
     assert!(forgotten.forgotten);
 
     enrol(&mut client, &host, record.clone()).await;
+    drop(client);
+    let mut client = host.client().await;
     let again: EnvironmentForgetResult = client
         .repeat(&first)
         .await
@@ -316,6 +321,8 @@ async fn a_refresh_is_performed_once_per_action_and_a_retry_is_answered_from_its
         ..record.clone()
     };
     enrol(&mut client, &host, renamed).await;
+    drop(client);
+    let mut client = host.client().await;
     let again: EnvironmentRefreshResult = client
         .repeat(&first)
         .await
