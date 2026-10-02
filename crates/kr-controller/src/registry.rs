@@ -19,6 +19,16 @@
 //!   starts again on another login still knows which desktop each worker belongs to. A worker
 //!   bound to none is recorded with none.
 //!
+//! # Who runs a migration
+//!
+//! A daemon's start opens the registry ([`Registry::open`]) and brings it to the schema this build
+//! reads, one step per version, each of which commits whole or leaves the registry at the version it
+//! began from, so that it can run again. An update does the same for an
+//! environment whose daemon is not running ([`Registry::bring_forward`]), with the daemon stopped
+//! and the environment's lock held, so that every registry it classes is at the one schema its
+//! reader reads. A step therefore runs outside the daemon's start as well, and must not depend on
+//! anything else the start does.
+//!
 //! # Process identities in whole seconds
 //!
 //! The previous build recorded a Windows process's start in whole seconds, and a worker it started
@@ -211,6 +221,77 @@ fn immutable_uri(path: &std::path::Path) -> Option<String> {
     Some(uri)
 }
 
+/// Opens a registry file to read it alone: no lock, no log, no shared memory, and nothing made
+/// beside it.
+fn open_immutable(path: &std::path::Path) -> Result<Connection> {
+    let uri = immutable_uri(path).ok_or_else(|| ControllerError::RegistryUnavailable {
+        detail: format!(
+            "{} is not a path this build can name to SQLite as a file to read alone",
+            path.display()
+        ),
+    })?;
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(ControllerError::registry)
+}
+
+/// Every schema version a registry records: one row, in every registry this host wrote.
+fn recorded_versions(connection: &Connection) -> Result<Vec<i64>> {
+    let mut statement = connection
+        .prepare("SELECT version FROM schema_version")
+        .map_err(ControllerError::registry)?;
+    statement
+        .query_map([], |row| row.get(0))
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(ControllerError::registry)
+}
+
+/// Whether a registry has a table.
+fn has_table(connection: &Connection, table: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(ControllerError::registry)
+}
+
+/// The tables whose rows say what a registry's sessions are. Every schema version has had them, and
+/// a registry that has lost one is never brought forward, because opening it would make the table
+/// again, empty, and a registry that records no worker is the one answer a question about who may
+/// still hold a session's stores must never get by accident.
+const EVIDENCE_TABLES: [&str; 4] = ["environment", "reservations", "workers", "tombstones"];
+
+/// What tells one regular file from another at the same name, where the platform names one.
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// What [`Registry::bring_forward`] did to a registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Carried {
+    /// The schema version the registry recorded.
+    pub from: i64,
+    /// The schema version it records now, the one this build reads.
+    pub to: i64,
+}
+
 /// The environment registry.
 #[derive(Debug)]
 pub struct Registry {
@@ -325,6 +406,161 @@ impl Registry {
         Ok(true)
     }
 
+    /// Brings a registry that is behind this build's schema forward, as a daemon's start would,
+    /// and says what it did; `None` when there was nothing to bring.
+    ///
+    /// For an update, which carries the registry of an environment whose daemon has not run since
+    /// an earlier schema step to the schema its own release reads, so that it can be classed by
+    /// [`Registry::open_to_read`], which reads exactly one. The caller holds the environment's
+    /// singleton lock, so no daemon writes meanwhile and none can start. It is the one migration
+    /// chain of [`Registry::open`]: nothing here migrates by itself.
+    ///
+    /// What is beside the registry is looked at before anything opens it, and what a daemon that
+    /// ended by a signal left in its log is taken in ([`Registry::take_in_its_log`], which opens a
+    /// registry whose log or journal holds writes, and no other), so the version is read from what
+    /// the registry holds. Only a regular file with exactly one version row, from 1 up to below
+    /// this build's, and every table in `EVIDENCE_TABLES`, is migrated. A registry already at this
+    /// build's version is not migrated, and neither is one at a later version, one with no version
+    /// or several, an empty file, a link or what is not a file: they are left, `None`, for
+    /// [`Registry::open_to_read`] to refuse in its own words. A registry that lost an evidence table
+    /// is refused here, by the table's name, because opening it would make that table again,
+    /// empty. The file is opened for writing without being created, and the name is checked to
+    /// still name the file that was looked at and to record the same version on that connection, so
+    /// a file replaced by another regular file between the look and the open is refused, and never
+    /// made new. A file replaced by another kind of file in that window is the owner's race, as it
+    /// is for [`Registry::open_to_read`], which looks at the name and then opens it: the caller
+    /// holds the environment's lock, and nothing here closes that window. The log is taken in once
+    /// more at the end, so the file alone holds what was written.
+    ///
+    /// A step commits whole, or leaves the registry at the version it began from with whatever it
+    /// did that it can run again over (the step to version 7 rewrites the recorded create requests,
+    /// compacts the file and takes the log in before it moves the version), so a failure leaves the
+    /// registry at the version of the last step that completed, which this release's own
+    /// [`Registry::open`] continues from. This is a step a migration must stay fit for: it also runs
+    /// outside the daemon's start, so a step may not depend on anything else the start does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the registry's log or journal cannot be
+    /// taken in or is not a regular file, when its `-shm` file is not a regular file, when an
+    /// evidence table is missing, when the registry changed while it was opened, and when a step of
+    /// the chain or the final log intake fails, naming the schema version it started from.
+    pub fn bring_forward(
+        path: impl AsRef<std::path::Path>,
+        environment_id: EnvironmentId,
+    ) -> Result<Option<Carried>> {
+        let path = path.as_ref();
+        let looked_at = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!("this registry could not be looked at: {error}"),
+                });
+            }
+        };
+        let mut shared_memory = path.as_os_str().to_owned();
+        shared_memory.push("-shm");
+        match std::fs::symlink_metadata(&shared_memory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!(
+                        "what is beside this registry under the name {} is not a regular file",
+                        shared_memory.to_string_lossy()
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!("what is beside this registry could not be looked at: {error}"),
+                });
+            }
+        }
+        Self::take_in_its_log(path)?;
+        // What an immutable read cannot tell is left for the reader to refuse by its own words.
+        let Ok(peek) = open_immutable(path) else {
+            return Ok(None);
+        };
+        let Ok(versions) = recorded_versions(&peek) else {
+            return Ok(None);
+        };
+        let [from] = versions[..] else {
+            return Ok(None);
+        };
+        if !(1..SCHEMA_VERSION).contains(&from) {
+            return Ok(None);
+        }
+        Self::refuse_a_lost_table(&peek, from)?;
+        drop(peek);
+        // Without the flag that creates a file: a registry removed meanwhile is not made again.
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ControllerError::registry)?;
+        let changed = || ControllerError::RegistryUnavailable {
+            detail: format!(
+                "this registry changed while it was brought forward from schema version {from}"
+            ),
+        };
+        // The name still names the file that was looked at, and it records what it did.
+        match std::fs::symlink_metadata(path) {
+            Ok(now) if now.is_file() && file_identity(&now) == file_identity(&looked_at) => {}
+            _ => return Err(changed()),
+        }
+        if recorded_versions(&connection)? != [from] {
+            return Err(changed());
+        }
+        Self::refuse_a_lost_table(&connection, from)?;
+        let registry = Self::prepare(connection, environment_id).map_err(|error| {
+            let cause = match error {
+                ControllerError::RegistryUnavailable { detail } => detail,
+                other => other.to_string(),
+            };
+            ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "this registry recorded schema version {from} when it was opened and could not \
+                     be brought to schema version {SCHEMA_VERSION}: {cause}"
+                ),
+            }
+        })?;
+        let blocked: i64 = registry
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(ControllerError::registry)?;
+        if blocked != 0 {
+            return Err(ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "this registry was brought forward from schema version {from}, but its \
+                     write-ahead log could not be taken in while another connection uses it"
+                ),
+            });
+        }
+        drop(registry);
+        Ok(Some(Carried {
+            from,
+            to: SCHEMA_VERSION,
+        }))
+    }
+
+    /// Refuses a registry that recorded schema version `from` and has lost an evidence table.
+    fn refuse_a_lost_table(connection: &Connection, from: i64) -> Result<()> {
+        for table in EVIDENCE_TABLES {
+            if !has_table(connection, table)? {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!(
+                        "this registry recorded schema version {from} and has no {table} table, so \
+                         it cannot be brought forward without losing what it held"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Opens a registry that already exists, to read what it records and nothing else.
     ///
     /// Nothing is created, brought forward, repaired or settled, and nothing is written, not even
@@ -398,29 +634,8 @@ impl Registry {
                 }
             }
         }
-        let uri = immutable_uri(path).ok_or_else(|| ControllerError::RegistryUnavailable {
-            detail: format!(
-                "{} is not a path this build can name to SQLite as a file to read alone",
-                path.display()
-            ),
-        })?;
-        let connection = Connection::open_with_flags(
-            uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(ControllerError::registry)?;
-        let versions: Vec<i64> = {
-            let mut statement = connection
-                .prepare("SELECT version FROM schema_version")
-                .map_err(ControllerError::registry)?;
-            statement
-                .query_map([], |row| row.get(0))
-                .map_err(ControllerError::registry)?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(ControllerError::registry)?
-        };
+        let connection = open_immutable(path)?;
+        let versions = recorded_versions(&connection)?;
         if versions != [SCHEMA_VERSION] {
             let recorded = match versions.as_slice() {
                 [] => "no schema version".to_owned(),
@@ -435,14 +650,7 @@ impl Registry {
             });
         }
         for table in ["workers", "tombstones"] {
-            let present: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .map_err(ControllerError::registry)?;
-            if present == 0 {
+            if !has_table(&connection, table)? {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!("this registry has no {table} table"),
                 });
@@ -3480,5 +3688,351 @@ mod tests {
             let refused = Registry::open_to_read(&link, environment()).expect_err("a link");
             assert!(refused.to_string().contains("link"), "{refused}");
         }
+    }
+
+    /// A registry in the shape the previous build left (version 3's), with the version it records
+    /// set to `version`, the worker of session 1 and a spawned reservation for session 5. A test
+    /// that brings it forward needs `version` to be 3; one that only reads it may say any.
+    fn behind_registry(path: &std::path::Path, version: i64) {
+        let elsewhere = ProcessStartIdentity::new(1004, ProcessStartSource::MacosProcBsdInfo, 9);
+        previous_build_registry(path, &[(1, elsewhere.clone())], &[(5, elsewhere)]);
+        Connection::open(path)
+            .expect("opens")
+            .execute(
+                &format!("UPDATE schema_version SET version = {version}"),
+                [],
+            )
+            .expect("a version");
+    }
+
+    /// The schema version a registry file records, read as the file alone.
+    fn recorded(path: &std::path::Path) -> Vec<i64> {
+        let connection = open_immutable(path).expect("reads");
+        recorded_versions(&connection).expect("reads the versions")
+    }
+
+    /// An update carries the registry of an environment whose daemon did not run forward through the
+    /// one chain a daemon's start runs: it reads at this build's schema, every row it held is the
+    /// row it holds, and nothing is left beside the file.
+    #[test]
+    fn a_registry_behind_this_build_is_brought_forward_with_its_rows_and_nothing_beside_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        behind_registry(&path, 3);
+        let before: Vec<i64> = {
+            let connection = Connection::open(&path).expect("opens");
+            let mut statement = connection
+                .prepare("SELECT process_pid FROM workers ORDER BY session_id")
+                .expect("prepares");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        assert_eq!(before, vec![1004]);
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 3,
+                to: SCHEMA_VERSION
+            })
+        );
+        assert_eq!(
+            files_in(directory.path())
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["registry.sqlite3".to_owned()],
+            "a closed registry is one file"
+        );
+        let read = Registry::open_to_read(&path, environment()).expect("reads at this version");
+        let workers = read.workers().expect("reads the workers");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].session_id, session(1));
+        assert_eq!(
+            workers[0].process_identity,
+            ProcessStartIdentity::new(1004, ProcessStartSource::MacosProcBsdInfo, 9)
+        );
+        assert_eq!(
+            read.reservations_in(LaunchPhase::Spawned)
+                .expect("reads")
+                .len(),
+            1,
+            "the launch that came to nothing is still recorded"
+        );
+        drop(read);
+        // Once at this version a second call finds nothing to bring.
+        assert_eq!(
+            Registry::bring_forward(&path, environment()).expect("nothing to do"),
+            None
+        );
+    }
+
+    /// A registry that is at this build's schema is not migrated, and one with no log to take in is
+    /// not opened for writing, so it is not changed, and a registry that cannot be brought forward
+    /// by this build is left as it is, for the reader to refuse in its own words.
+    #[test]
+    fn a_registry_that_is_not_behind_this_build_is_left_exactly_as_it_is() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let environment_id = environment();
+        let left = |path: &std::path::Path| {
+            let before = files_in(path.parent().expect("a directory"));
+            assert_eq!(
+                Registry::bring_forward(path, environment_id).expect("is left"),
+                None
+            );
+            assert_eq!(files_in(path.parent().expect("a directory")), before);
+        };
+        // At this version.
+        drop(Registry::open(&path, environment_id).expect("a registry"));
+        left(&path);
+        // At a later one.
+        let change = |sql: &str| {
+            Connection::open(&path)
+                .expect("a second connection")
+                .execute_batch(sql)
+                .expect("changes the registry");
+        };
+        change(&format!(
+            "UPDATE schema_version SET version = {};",
+            SCHEMA_VERSION + 1
+        ));
+        left(&path);
+        assert_eq!(recorded(&path), vec![SCHEMA_VERSION + 1]);
+        // With no version, and with two.
+        change("DELETE FROM schema_version;");
+        left(&path);
+        change("INSERT INTO schema_version (version) VALUES (3), (4);");
+        left(&path);
+        // With a version of 0, below the first.
+        change("DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (0);");
+        left(&path);
+        // An empty file, which SQLite reads as a database with no tables.
+        let empty = directory.path().join("empty.sqlite3");
+        std::fs::write(&empty, b"").expect("an empty file");
+        left(&empty);
+        assert!(std::fs::read(&empty).expect("reads").is_empty());
+        // A file that is not a database at all.
+        let text = directory.path().join("text.sqlite3");
+        std::fs::write(&text, b"this is not a database").expect("a file");
+        left(&text);
+        // None.
+        assert_eq!(
+            Registry::bring_forward(directory.path().join("none.sqlite3"), environment_id)
+                .expect("nothing there"),
+            None
+        );
+        assert!(!directory.path().join("none.sqlite3").exists());
+    }
+
+    /// An older registry that lost a table its rows are read from is refused by the table's name and
+    /// left as it was: opening it would make the table again, empty, and a registry that records no
+    /// worker is the answer a question about who may still hold a session's stores must never get
+    /// by accident.
+    #[test]
+    fn an_older_registry_that_lost_an_evidence_table_is_refused_and_left() {
+        for table in EVIDENCE_TABLES {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            behind_registry(&path, 4);
+            Connection::open(&path)
+                .expect("opens")
+                .execute_batch(&format!("DROP TABLE {table};"))
+                .expect("loses the table");
+            let before = files_in(directory.path());
+            let refused = Registry::bring_forward(&path, environment())
+                .expect_err("a registry that lost a table is not brought forward");
+            assert!(
+                refused.to_string().contains(&format!("no {table} table")),
+                "{refused}"
+            );
+            assert_eq!(files_in(directory.path()), before, "{table}");
+            assert_eq!(recorded(&path), vec![4]);
+        }
+    }
+
+    /// A step that fails leaves the registry at the version of the last step that committed, whole:
+    /// the release that is current continues the chain from it. Labelled version 2 with the columns
+    /// of version 3 gone and the column of version 4 already there, its first step commits and its
+    /// second adds a column that is already there.
+    #[test]
+    fn a_step_that_fails_leaves_the_registry_at_the_version_of_the_last_step_that_committed() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        behind_registry(&path, 2);
+        Connection::open(&path)
+            .expect("opens")
+            .execute_batch(
+                "ALTER TABLE environment DROP COLUMN fence_owed_revision;
+                 ALTER TABLE environment DROP COLUMN accepted_revision;
+                 ALTER TABLE environment DROP COLUMN accepted_document;
+                 ALTER TABLE workers ADD COLUMN stated_source TEXT NOT NULL DEFAULT '';",
+            )
+            .expect("the shape");
+        let refused = Registry::bring_forward(&path, environment())
+            .expect_err("the second step adds a column that is there");
+        let said = refused.to_string();
+        assert!(
+            said.contains("schema version 2")
+                && said.contains(&format!("schema version {SCHEMA_VERSION}"))
+                && said.contains("stated_source"),
+            "{said}"
+        );
+        assert_eq!(recorded(&path), vec![3], "the first step committed whole");
+        let columns: i64 = open_immutable(&path)
+            .expect("reads")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('environment')
+                 WHERE name = 'fence_owed_revision'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reads the columns");
+        assert_eq!(columns, 1, "and what it did stays");
+        // Once the cause is gone the chain goes on from where it stopped, and the rows are carried.
+        Connection::open(&path)
+            .expect("opens")
+            .execute_batch("ALTER TABLE workers DROP COLUMN stated_source;")
+            .expect("the cause is removed");
+        let carried = Registry::bring_forward(&path, environment()).expect("goes on from there");
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 3,
+                to: SCHEMA_VERSION
+            })
+        );
+        assert_eq!(
+            Registry::open_to_read(&path, environment())
+                .expect("reads at this version")
+                .workers()
+                .expect("reads the workers")
+                .len(),
+            1
+        );
+        assert!(
+            files_in(directory.path()).len() == 1,
+            "nothing is left beside the file: {:?}",
+            files_in(directory.path())
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// What a daemon that ended by a signal left in its log is taken into the file before the
+    /// version is read, so an older registry carries what the daemon last wrote.
+    #[test]
+    fn an_older_registry_with_a_log_a_daemon_left_is_carried_with_what_the_log_holds() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        behind_registry(&path, 3);
+        let daemon = Connection::open(&path).expect("a daemon's connection");
+        daemon
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("write-ahead logging");
+        daemon
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        daemon
+            .execute("UPDATE workers SET endpoint = 'left in the log'", [])
+            .expect("a write the log holds");
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(carried.map(|carried| carried.from), Some(3));
+        let endpoint: String = open_immutable(&path)
+            .expect("reads")
+            .query_row("SELECT endpoint FROM workers", [], |row| row.get(0))
+            .expect("reads the worker");
+        assert_eq!(endpoint, "left in the log");
+        std::mem::forget(daemon);
+    }
+
+    /// What is beside an older registry is looked at, never opened, before anything is: a pipe at
+    /// the log, the journal or the shared-memory name, a link at the registry and a pipe in its
+    /// place hold nothing up, and nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_a_link_where_a_registry_or_its_files_are_is_refused_without_being_opened() {
+        let make_pipe = |path: &std::path::Path| {
+            let made = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "a pipe is made");
+        };
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            behind_registry(&path, 4);
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(suffix);
+            make_pipe(std::path::Path::new(&beside));
+            // On a thread of its own, so that a wait for a writer fails the test and does not hang
+            // it.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let at = path.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(Registry::bring_forward(&at, environment()));
+            });
+            let refused = receiver
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("was not held up by a pipe")
+                .expect_err("a pipe beside the registry is refused");
+            assert!(
+                refused.to_string().contains("not a regular file"),
+                "{suffix}: {refused}"
+            );
+            assert_eq!(recorded(&path), vec![4], "{suffix}");
+        }
+        // A link where the log, the journal or the shared-memory file is named is refused the same
+        // way, and nothing is opened.
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            behind_registry(&path, 4);
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(suffix);
+            std::os::unix::fs::symlink(directory.path().join("elsewhere"), &beside)
+                .expect("a link");
+            let refused = Registry::bring_forward(&path, environment())
+                .expect_err("a link beside the registry is refused");
+            assert!(
+                refused.to_string().contains("not a regular file"),
+                "{suffix}: {refused}"
+            );
+            assert_eq!(recorded(&path), vec![4], "{suffix}");
+        }
+        // A link at the registry, and a pipe in its place, are left for the reader.
+        let directory = tempfile::tempdir().expect("a directory");
+        let actual = directory.path().join("actual.sqlite3");
+        behind_registry(&actual, 4);
+        let link = directory.path().join("registry.sqlite3");
+        std::os::unix::fs::symlink(&actual, &link).expect("a link");
+        assert_eq!(
+            Registry::bring_forward(&link, environment()).expect("left"),
+            None
+        );
+        assert_eq!(recorded(&actual), vec![4], "what the link reaches is left");
+        let pipe = directory.path().join("pipe.sqlite3");
+        make_pipe(&pipe);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let at = pipe.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(Registry::bring_forward(&at, environment()));
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("was not held up by a pipe")
+                .expect("left"),
+            None
+        );
+        let refused =
+            Registry::open_to_read(&link, environment()).expect_err("the reader refuses a link");
+        assert!(refused.to_string().contains("link"), "{refused}");
     }
 }
