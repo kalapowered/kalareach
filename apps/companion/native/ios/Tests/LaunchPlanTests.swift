@@ -17,7 +17,7 @@ final class LaunchPlanTests: XCTestCase {
         for permission in everyPermission {
             let plan = LaunchPlan.decide(
                 debugMode: nil,
-                hasFirebaseConfiguration: true,
+                firebase: .usable,
                 permission: permission
             )
             XCTAssertEqual(
@@ -36,7 +36,7 @@ final class LaunchPlanTests: XCTestCase {
     func testRegistrationForRemoteNotificationsNeedsNoPermission() {
         // Registering shows no prompt, so it happens at every launch whatever the person answered.
         for permission in everyPermission {
-            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: permission)
+            let plan = LaunchPlan.decide(debugMode: nil, firebase: .usable, permission: permission)
             XCTAssertTrue(plan.contains(.registerForRemoteNotifications), "permission \(permission)")
         }
     }
@@ -44,26 +44,33 @@ final class LaunchPlanTests: XCTestCase {
     func testAutoInitFollowsTheCurrentPermissionEveryLaunch() {
         // The setting persists across launches, so a launch that stays silent on it would keep an
         // answer the person has since taken back.
-        let granted = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: .granted)
-        let revoked = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: .refused)
+        let granted = LaunchPlan.decide(debugMode: nil, firebase: .usable, permission: .granted)
+        let revoked = LaunchPlan.decide(debugMode: nil, firebase: .usable, permission: .refused)
         XCTAssertTrue(granted.contains(.setAutoInit(true)))
         XCTAssertTrue(revoked.contains(.setAutoInit(false)))
     }
 
+    func testAConfigurationFirebaseCannotStartFromLeavesFirebaseAloneAndSaysWhy() {
+        for reason in ["API_KEY is not 39 characters", "this build holds no GoogleService-Info.plist"] {
+            let plan = LaunchPlan.decide(debugMode: nil, firebase: .unusable(reason), permission: .granted)
+            XCTAssertEqual(plan, [.skipFirebase(reason)])
+        }
+    }
+
     func testABuildWithoutConfigurationLeavesFirebaseAlone() {
         for permission in everyPermission {
-            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: false, permission: permission)
-            XCTAssertEqual(plan, [.skipFirebase], "permission \(permission)")
+            let plan = LaunchPlan.decide(debugMode: nil, firebase: .unusable("no file"), permission: permission)
+            XCTAssertEqual(plan, [.skipFirebase("no file")], "permission \(permission)")
         }
     }
 
     func testTheCountAndSweepModesRunBeforeAnythingCanWriteAndNothingElseRuns() {
         for mode in ["count", "sweep"] {
-            for configured in [true, false] {
+            for configured in [FirebaseConfiguration.usable, .unusable("no file")] {
                 for permission in everyPermission {
                     let plan = LaunchPlan.decide(
                         debugMode: mode,
-                        hasFirebaseConfiguration: configured,
+                        firebase: configured,
                         permission: permission
                     )
                     XCTAssertEqual(plan, [.runDebugMode(mode)], "\(mode) \(configured) \(permission)")
@@ -73,20 +80,20 @@ final class LaunchPlanTests: XCTestCase {
     }
 
     func testAnotherModeRunsAfterPushHasStarted() {
-        let configured = LaunchPlan.decide(debugMode: "push", hasFirebaseConfiguration: true, permission: .refused)
+        let configured = LaunchPlan.decide(debugMode: "push", firebase: .usable, permission: .refused)
         XCTAssertEqual(configured.last, .runDebugMode("push"))
         XCTAssertEqual(configured.first, .configureFirebase)
-        let bare = LaunchPlan.decide(debugMode: "keychain", hasFirebaseConfiguration: false, permission: .refused)
-        XCTAssertEqual(bare, [.skipFirebase, .runDebugMode("keychain")])
+        let bare = LaunchPlan.decide(debugMode: "keychain", firebase: .unusable("no file"), permission: .refused)
+        XCTAssertEqual(bare, [.skipFirebase("no file"), .runDebugMode("keychain")])
     }
 
     func testNoPlanEverAsksForAPermission() {
         // The actions have no case that does, so this holds by construction; this keeps it so.
         let modes: [String?] = [nil, "count", "sweep", "keychain", "push", "push-read", "audio", "shots"]
         for mode in modes {
-            for configured in [true, false] {
+            for configured in [FirebaseConfiguration.usable, .unusable("no file")] {
                 for permission in everyPermission {
-                    let plan = LaunchPlan.decide(debugMode: mode, hasFirebaseConfiguration: configured, permission: permission)
+                    let plan = LaunchPlan.decide(debugMode: mode, firebase: configured, permission: permission)
                     for action in plan {
                         XCTAssertFalse("\(action)".lowercased().contains("authoris") && !"\(action)".contains("setAutoInit"), "\(action)")
                     }

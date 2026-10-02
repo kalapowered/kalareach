@@ -3,7 +3,7 @@
 //
 //  `LaunchHook.m` calls `didFinishLaunching` when the system says the application has launched. What
 //  happens next is `LaunchPlan`'s decision, made from three facts: which device check a debug build
-//  was started for, whether the build holds Firebase configuration, and where the person's answer to
+//  was started for, whether the build holds Firebase configuration that Firebase can start from, and where the person's answer to
 //  the notification permission stands. This file reads the facts and carries the plan out. It reads
 //  the permission and never asks for it.
 //
@@ -22,18 +22,21 @@ final class KRNativeLaunch: NSObject {
         DeviceProbe.applyColourMode()
         DeviceProbe.reportTextSize()
         #endif
-        let configured = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil
+        let configured = FirebaseConfigurationCheck.read(
+            fileAt: Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? ""
+        )
 
         // The modes that look at the keychain before anything writes to it need no answer about
         // the permission, and wait for none.
-        let early = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, permission: .unknown)
+        let early = LaunchPlan.decide(debugMode: debugMode, firebase: configured, permission: .unknown)
         if let mode = debugMode, early == [.runDebugMode(mode)] {
             PushStartup.carryOut(early)
             return
         }
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             let permission = PushPermission(status: settings.authorizationStatus)
-            let plan = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, permission: permission)
+            let plan = LaunchPlan.decide(debugMode: debugMode, firebase: configured, permission: permission)
             DispatchQueue.main.async {
                 PushRegistration.shared.permissionKnown(permission)
                 PushStartup.carryOut(plan)
