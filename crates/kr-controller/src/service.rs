@@ -777,6 +777,10 @@ mod a_peer_that_stops_reading;
 #[cfg(test)]
 mod a_link_that_is_not_given_back;
 
+/// A dispatch lease that runs out while its action waits at a real worker.
+#[cfg(test)]
+mod a_lease_that_runs_out_at_a_worker;
+
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
 #[cfg(test)]
