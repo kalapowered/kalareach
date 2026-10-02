@@ -23,7 +23,7 @@
 //! worker that will not answer is the worker ending of its own accord or being confirmed gone,
 //! and both arrive through [`AuthorityBarrier::worker_ended`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use kr_protocol::action::{BarrierState, PossiblyExecutedAction, RevocationBarrier, WorkerBarrier};
@@ -204,6 +204,16 @@ impl FenceReport {
         self.omitted = self.omitted.max(evidence.omitted.get());
     }
 
+    /// Returns whether a report of this revocation would name anything of this worker's: an action
+    /// its fence rejected or could not take back, or names that are still on their way or were
+    /// never kept.
+    fn names(&self) -> bool {
+        !self.rejected.is_empty()
+            || !self.possibly_executed.is_empty()
+            || self.remaining > 0
+            || self.omitted > 0
+    }
+
     /// Returns how many names this report holds, which is where the next page starts.
     fn named(&self) -> u64 {
         let held = self
@@ -276,6 +286,124 @@ impl WorkerFences {
             .iter()
             .any(|report| report.revision >= revision && report.reported)
     }
+
+    /// Returns the revisions at or above `floor` at which this worker holds names.
+    fn named_from(&self, floor: AuthorityRevision) -> Vec<AuthorityRevision> {
+        self.reports
+            .iter()
+            .filter(|report| report.revision >= floor && report.names())
+            .map(|report| report.revision)
+            .collect()
+    }
+}
+
+/// How many workers that ended a barrier keeps only for the names they hold.
+///
+/// An ended worker that named actions stays until no report can ask for those names again, so a
+/// retry of a revocation whose answer was not kept lists them as the first attempt did. Names are
+/// kept at most for this many workers at once, which is a limit of policy and not a measure of
+/// memory: a session limit the owner raises, or a revision that does not advance while sessions
+/// come and go, would otherwise let them accumulate for ever. Past it the oldest worker's record is
+/// let go whole, and the barrier says so: the answer's total counts it ([`Round::report`]).
+pub const MAX_RETAINED_ENDED_WORKERS: usize = 1024;
+
+/// What the barrier holds of the workers that ended and of the work that may still ask about them.
+#[derive(Debug, Default)]
+struct Roster {
+    /// The ticket the next round or exchange takes.
+    next_ticket: u64,
+    /// The sequence number the next ended worker is retired under.
+    next_seq: u64,
+    /// The rounds and exchanges running, by ticket, with the revision a round announces once it
+    /// has said which ([`Round::at`]).
+    running: BTreeMap<u64, Option<AuthorityRevision>>,
+    /// The workers whose execution has ended and whose record is still held ([`Retired`]).
+    ///
+    /// Kept here rather than read back out of the lease issuer, because the issuer counts an ended
+    /// worker and an acknowledging one as the same thing - both satisfy a lease - and the barrier
+    /// has to tell them apart. A worker that installed a revision without reporting what its fence
+    /// did is pending; the same worker, once it is gone, can no longer dispatch anything, and that
+    /// answers the question a different way.
+    retired: HashMap<SessionId, Retired>,
+    /// How many ended workers that held names at a revision were let go for want of room, by that
+    /// revision ([`MAX_RETAINED_ENDED_WORKERS`]).
+    lost: BTreeMap<AuthorityRevision, u64>,
+}
+
+/// One worker that ended, and what keeps its record.
+#[derive(Clone, Copy, Debug)]
+struct Retired {
+    /// The first ticket that was taken after the worker ended. A round or exchange with a ticket
+    /// below it began while the worker ran, and may still report it or still be sent its names.
+    after: u64,
+    /// The order the workers ended in, which is the order the oldest is let go in.
+    seq: u64,
+}
+
+/// One announcement of an authority revision, or one exchange with a single worker about it, as
+/// the barrier counts it.
+///
+/// A worker whose execution ends while a round or exchange that began before it is running is held
+/// until that round or exchange is over: the round may still report it with the names it
+/// collected, and the exchange may still be sent the names the worker had not yet given. A round
+/// that begins after the end holds nothing back by itself. Taken before the revision is read, and
+/// dropped when the work is over or abandoned, wherever it stops.
+#[must_use = "a round holds ended workers back only while it lives"]
+pub struct Round<'a> {
+    barrier: &'a AuthorityBarrier,
+    ticket: u64,
+}
+
+impl Round<'_> {
+    /// Records the revision this round announces.
+    ///
+    /// Taken inside the section that reads the revision from the registry, which is also where the
+    /// barrier adopts a revision, so the revision this records is the one the barrier is at. The
+    /// names a worker holds at this revision are kept for as long as the round runs.
+    pub fn at(&self, revision: AuthorityRevision) {
+        self.barrier
+            .ordered()
+            .running
+            .insert(self.ticket, Some(revision));
+    }
+
+    /// Reports the barrier across `workers`, which are the workers this daemon has recorded and
+    /// not closed, and across every worker the barrier still holds a record of.
+    ///
+    /// A worker that has never answered is `pending` rather than absent, because a revocation is
+    /// not complete for a worker this daemon cannot account for. Each pending entry says what is
+    /// missing, so a person reading `pending` learns which worker and why. A worker that ended is
+    /// reported when it names something, and otherwise states nothing, as it can no longer
+    /// dispatch.
+    ///
+    /// The answer's total counts the workers the barrier let go of while they held names at this
+    /// revision ([`MAX_RETAINED_ENDED_WORKERS`]) as well as the ones it lists, so a reader sees a
+    /// list that is shorter than the whole. Every worker counted so is one that ended, so what it
+    /// leaves out cannot change whether the barrier holds.
+    pub fn report(
+        &self,
+        revision: AuthorityRevision,
+        workers: impl IntoIterator<Item = SessionId>,
+    ) -> RevocationBarrier {
+        self.barrier.report(revision, workers)
+    }
+}
+
+impl Drop for Round<'_> {
+    fn drop(&mut self) {
+        let mut roster = self.barrier.ordered();
+        roster.running.remove(&self.ticket);
+        self.barrier.sweep(&mut roster);
+    }
+}
+
+impl std::fmt::Debug for Round<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Round")
+            .field("ticket", &self.ticket)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The daemon's half of the dispatch lease and the revocation barrier.
@@ -283,20 +411,19 @@ impl WorkerFences {
 /// Every operation that changes more than one thing takes `order` first. The lease issuer has its
 /// own lock and the fence reports have theirs, so without it an acknowledgement could check the
 /// binding, have the path replaced underneath it, and then write its report against the
-/// replacement: two locks make two moments, and this is what makes them one.
+/// replacement: two locks make two moments, and this is what makes them one. The rounds running
+/// and the workers that ended are held under it too, so that the check that an ended worker is no
+/// longer needed, its retirement and the sweep that forgets it are one step.
+///
+/// A worker is made a record of only by [`Self::bind`], and only a caller that holds the registry
+/// and has seen the session is not closed makes that call. [`Self::worker_ended`] is called in the
+/// section that records the closure, so a creation either comes first and is ended by the closure,
+/// or comes after and creates nothing.
 #[derive(Debug)]
 pub struct AuthorityBarrier {
     leases: LeaseIssuer,
-    order: Mutex<()>,
+    order: Mutex<Roster>,
     fences: Mutex<HashMap<SessionId, WorkerFences>>,
-    /// The workers whose execution this daemon has established has ended.
-    ///
-    /// Kept here rather than read back out of the lease issuer, because the issuer counts an ended
-    /// worker and an acknowledging one as the same thing - both satisfy a lease - and the barrier
-    /// has to tell them apart. A worker that installed a revision without reporting what its fence
-    /// did is pending; the same worker, once it is gone, can no longer dispatch anything, and that
-    /// answers the question a different way.
-    ended: Mutex<Vec<SessionId>>,
 }
 
 impl AuthorityBarrier {
@@ -307,9 +434,8 @@ impl AuthorityBarrier {
     pub fn new(generation: ControllerGeneration, authority_revision: AuthorityRevision) -> Self {
         Self {
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
-            order: Mutex::new(()),
+            order: Mutex::new(Roster::default()),
             fences: Mutex::new(HashMap::new()),
-            ended: Mutex::new(Vec::new()),
         }
     }
 
@@ -325,7 +451,23 @@ impl AuthorityBarrier {
         self.leases.authority_revision()
     }
 
+    /// Takes the next ticket for a round or an exchange that is about to run.
+    pub fn begin_round(&self) -> Round<'_> {
+        let mut roster = self.ordered();
+        let ticket = roster.next_ticket;
+        roster.next_ticket = roster.next_ticket.saturating_add(1);
+        roster.running.insert(ticket, None);
+        Round {
+            barrier: self,
+            ticket,
+        }
+    }
+
     /// Records that a worker's control path was established, returning its binding.
+    ///
+    /// The one call that makes a record of a worker. The caller holds the registry and has seen
+    /// that the worker's session has no closure, which is what keeps a closed session from being
+    /// made a record of again.
     pub fn bind(&self, session_id: SessionId) -> WorkerBinding {
         let _order = self.ordered();
         // A new control path owes a fresh acknowledgement. What the previous path reported about
@@ -336,7 +478,16 @@ impl AuthorityBarrier {
         self.leases.bind(session_id)
     }
 
-    /// Returns the binding in force for a worker.
+    /// Returns the binding in force for a worker, making one only for a worker nothing is held of.
+    ///
+    /// For a caller that needs a binding without starting the worker's control path over, under the
+    /// same condition as [`Self::bind`].
+    pub fn binding_or_bind(&self, session_id: SessionId) -> WorkerBinding {
+        let _order = self.ordered();
+        self.leases.binding_or_bind(session_id)
+    }
+
+    /// Returns the binding in force for a worker, which is nought for one nothing is held of.
     #[must_use]
     pub fn binding(&self, session_id: SessionId) -> WorkerBinding {
         self.leases.binding(session_id)
@@ -351,7 +502,8 @@ impl AuthorityBarrier {
     ///
     /// A caller that records the acknowledgement anywhere else waits for this answer: the binding
     /// check is here, and a store updated before it had been made would hold an acknowledgement
-    /// this barrier refused.
+    /// this barrier refused. A worker nothing is held of cannot acknowledge, so a late message
+    /// about one that was forgotten makes no record of it.
     pub fn acknowledge(
         &self,
         session_id: SessionId,
@@ -360,10 +512,11 @@ impl AuthorityBarrier {
         evidence: Option<kr_protocol::action::FenceEvidence>,
     ) -> bool {
         let _order = self.ordered();
-        if binding != self.leases.binding(session_id) {
-            // The acknowledgement was made over a control path this daemon has given up on. The
-            // lease issuer refuses it for the same reason, and its fence lists are no more
-            // evidence about the path in force than the acknowledgement itself is.
+        if binding == WorkerBinding::default() || binding != self.leases.binding(session_id) {
+            // The acknowledgement was made over a control path this daemon has given up on, or
+            // about a worker it holds no record of. The lease issuer refuses it for the same
+            // reason, and its fence lists are no more evidence about the path in force than the
+            // acknowledgement itself is.
             return false;
         }
         {
@@ -380,8 +533,7 @@ impl AuthorityBarrier {
                 .or_default()
                 .record(revision, evidence);
         }
-        self.leases.acknowledge(session_id, binding, revision);
-        true
+        self.leases.acknowledge(session_id, binding, revision)
     }
 
     /// Returns where the next page of a worker's fence evidence starts, when one is owed.
@@ -429,17 +581,82 @@ impl AuthorityBarrier {
     /// A worker that can no longer dispatch satisfies the barrier as surely as one that
     /// acknowledged. This is how a worker that will not answer is resolved, and it is the only
     /// way: nothing in this module ends a process to make a revocation complete.
+    ///
+    /// The worker is retired here and forgotten once nothing can ask about it any more: no round or
+    /// exchange that began while it ran is still going, and no report at a revision that can still
+    /// be asked for would name anything of it. A worker nothing is held of has nothing to retire,
+    /// and ending it again changes nothing.
     pub fn worker_ended(&self, session_id: SessionId) {
-        let _order = self.ordered();
-        let mut ended = self
-            .ended
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !ended.contains(&session_id) {
-            ended.push(session_id);
+        let mut roster = self.ordered();
+        if !self.leases.worker_ended(session_id) {
+            return;
         }
-        drop(ended);
-        self.leases.worker_ended(session_id);
+        if !roster.retired.contains_key(&session_id) {
+            let seq = roster.next_seq;
+            roster.next_seq = roster.next_seq.saturating_add(1);
+            let after = roster.next_ticket;
+            roster.retired.insert(session_id, Retired { after, seq });
+        }
+        self.sweep(&mut roster);
+    }
+
+    /// Forgets every ended worker nothing can ask about any more, and keeps the rest.
+    ///
+    /// A retired worker is held while a round or exchange that began before it ended is running,
+    /// because that work may still report it or be sent its names; and while it holds names at a
+    /// revision a report can still be taken for: the one in force, which a retry is a round at, or
+    /// one a running round announces. A report names only its own revision, so names below the
+    /// lowest of those can never be asked for again. Nothing moves the first condition once the
+    /// worker has ended, so a later round cannot hold it back.
+    ///
+    /// At most [`MAX_RETAINED_ENDED_WORKERS`] workers are held only for their names; past that the
+    /// oldest are let go and counted ([`Roster::lost`]).
+    fn sweep(&self, roster: &mut Roster) {
+        let current = self.leases.authority_revision();
+        let floor = roster
+            .running
+            .values()
+            .flatten()
+            .fold(current, |floor, revision| floor.min(*revision));
+        roster.lost.retain(|revision, _| *revision >= floor);
+        if roster.retired.is_empty() {
+            return;
+        }
+        let earliest = roster.running.keys().next().copied();
+        let mut fences = self.lock();
+        let mut forgotten: Vec<SessionId> = Vec::new();
+        let mut named: Vec<(u64, SessionId)> = Vec::new();
+        for (session_id, retired) in &roster.retired {
+            if earliest.is_some_and(|ticket| ticket < retired.after) {
+                continue;
+            }
+            if fences
+                .get(session_id)
+                .is_some_and(|held| !held.named_from(floor).is_empty())
+            {
+                named.push((retired.seq, *session_id));
+            } else {
+                forgotten.push(*session_id);
+            }
+        }
+        if named.len() > MAX_RETAINED_ENDED_WORKERS {
+            named.sort_unstable();
+            let over = named.len() - MAX_RETAINED_ENDED_WORKERS;
+            for (_, session_id) in named.into_iter().take(over) {
+                if let Some(held) = fences.get(&session_id) {
+                    for revision in held.named_from(floor) {
+                        let lost = roster.lost.entry(revision).or_default();
+                        *lost = lost.saturating_add(1);
+                    }
+                }
+                forgotten.push(session_id);
+            }
+        }
+        for session_id in forgotten {
+            roster.retired.remove(&session_id);
+            fences.remove(&session_id);
+            self.leases.forget(session_id);
+        }
     }
 
     /// Stops renewal for one worker, which is what losing the control path does.
@@ -480,29 +697,37 @@ impl AuthorityBarrier {
     ///
     /// Every outstanding lease becomes invalid at once, because a lease carries the revision it was
     /// issued at. Nothing is complete yet: the barrier is what completes a revocation, and this is
-    /// only the moment the revision changed.
+    /// only the moment the revision changed. Names held at the revision that has just been
+    /// replaced are let go as soon as no round announcing it is running.
     pub fn revoke(&self, revision: AuthorityRevision) {
-        let _order = self.ordered();
+        let mut roster = self.ordered();
         self.leases.revoke(revision);
+        self.sweep(&mut roster);
     }
 
-    /// Reports the barrier across the workers this daemon knows about.
+    /// Returns how many workers this barrier holds a record of, in the lease issuer.
     ///
-    /// A worker that has never answered is `pending` rather than absent, because a revocation is
-    /// not complete for a worker this daemon cannot account for. Each pending entry says what is
-    /// missing, so a person reading `pending` learns which worker and why.
-    pub fn report(
+    /// A worker nothing can ask about any more is not one of them.
+    #[must_use]
+    pub fn workers_held(&self) -> usize {
+        self.leases.workers_held()
+    }
+
+    /// Returns how many workers have fence reports held, and how many ended workers are retired.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        let retired = self.ordered().retired.len();
+        (self.lock().len(), retired)
+    }
+
+    /// Reports the barrier across the workers this daemon knows about ([`Round::report`]).
+    fn report(
         &self,
         revision: AuthorityRevision,
         workers: impl IntoIterator<Item = SessionId>,
     ) -> RevocationBarrier {
-        let _order = self.ordered();
+        let roster = self.ordered();
         let status = self.leases.status(revision);
-        let ended = self
-            .ended
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let fences = self.lock();
         let mut reported: Vec<WorkerBarrier> = Vec::new();
         let mut seen = Vec::new();
@@ -512,7 +737,11 @@ impl AuthorityBarrier {
             }
             seen.push(session_id);
             reported.push(Self::describe(
-                &status, &ended, &fences, session_id, revision,
+                &status,
+                &roster.retired,
+                &fences,
+                session_id,
+                revision,
             ));
         }
         // A worker the directory no longer lists but the lease issuer still holds a record of is
@@ -524,7 +753,8 @@ impl AuthorityBarrier {
                 continue;
             }
             seen.push(*session_id);
-            let described = Self::describe(&status, &ended, &fences, *session_id, revision);
+            let described =
+                Self::describe(&status, &roster.retired, &fences, *session_id, revision);
             // A worker this daemon no longer lists and has confirmed ended, whose fence named
             // nothing under this revision, states nothing: it can no longer dispatch, and there is
             // no action to name. Listing it would only make every revocation's answer longer by
@@ -541,12 +771,16 @@ impl AuthorityBarrier {
             reported.push(described);
         }
         reported.sort_by_key(|worker| worker.session_id);
-        RevocationBarrier::new(revision, reported)
+        let mut report = RevocationBarrier::new(revision, reported);
+        let lost = roster.lost.get(&revision).copied().unwrap_or(0);
+        report.workers_total =
+            kr_protocol::scalars::U64::new(report.workers_total.get().saturating_add(lost));
+        report
     }
 
     fn describe(
         status: &kr_transport::lease::RevocationStatus,
-        ended: &[SessionId],
+        ended: &HashMap<SessionId, Retired>,
         fences: &HashMap<SessionId, WorkerFences>,
         session_id: SessionId,
         revision: AuthorityRevision,
@@ -562,7 +796,7 @@ impl AuthorityBarrier {
         // An ending is checked before an acknowledgement, because it is the stronger answer: a
         // worker that has ended can no longer dispatch anything, whatever it did or did not say
         // about its fence while it was running.
-        let state = if ended.contains(&session_id) {
+        let state = if ended.contains_key(&session_id) {
             BarrierState::Ended
         } else if acknowledged.is_some() && reported {
             BarrierState::Acknowledged
@@ -660,8 +894,9 @@ impl AuthorityBarrier {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Serialises the operations that change more than one of this type's two stores.
-    fn ordered(&self) -> std::sync::MutexGuard<'_, ()> {
+    /// Serialises the operations that change more than one of this type's stores, and holds the
+    /// rounds running and the workers that ended.
+    fn ordered(&self) -> std::sync::MutexGuard<'_, Roster> {
         self.order
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -738,8 +973,10 @@ mod tests {
                 .report(AuthorityRevision::new(4), [session(1)])
                 .holds()
         );
+        // A round that began while the worker ran reports it ended once it has.
+        let round = barrier.begin_round();
         barrier.worker_ended(session(1));
-        let report = barrier.report(AuthorityRevision::new(4), [session(1)]);
+        let report = round.report(AuthorityRevision::new(4), [session(1)]);
         assert!(report.holds(), "{report:?}");
         assert_eq!(report.workers[0].state, BarrierState::Ended);
         assert!(report.workers[0].detail.is_empty());
@@ -1118,8 +1355,9 @@ mod tests {
         let binding = barrier.bind(session(1));
         assert!(barrier.acknowledge(session(1), binding, AuthorityRevision::new(4), None));
         assert!(barrier.acknowledge(session(1), binding, AuthorityRevision::new(5), None));
+        let round = barrier.begin_round();
         barrier.worker_ended(session(1));
-        let report = barrier.report(AuthorityRevision::new(4), [session(1)]);
+        let report = round.report(AuthorityRevision::new(4), [session(1)]);
         assert!(report.holds(), "{report:?}");
         assert_eq!(report.workers[0].state, BarrierState::Ended);
         assert!(
@@ -1144,6 +1382,8 @@ mod tests {
     fn an_ended_worker_the_directory_no_longer_lists_is_reported_only_when_it_states_something() {
         let barrier = barrier();
         let rev = AuthorityRevision::new(4);
+        // The round the workers end during: it reports every one it had begun before.
+        let round = barrier.begin_round();
         // Bound and ended, never having answered anything.
         barrier.bind(session(1));
         barrier.worker_ended(session(1));
@@ -1166,7 +1406,7 @@ mod tests {
         barrier.bind(session(5));
         barrier.worker_ended(session(5));
 
-        let report = barrier.report(rev, [session(5)]);
+        let report = round.report(rev, [session(5)]);
         let listed: Vec<SessionId> = report
             .workers
             .iter()
@@ -1184,6 +1424,291 @@ mod tests {
         assert_eq!(report.workers[0].possibly_executed_total.get(), 1);
         assert_eq!(report.workers[1].state, BarrierState::Pending);
         assert_eq!(report.pending(), vec![session(4)]);
+
+        // Once the round is over, the workers that ended and named nothing are forgotten, and the
+        // one that named actions is kept for a retry; the lost one is a worker like any other.
+        drop(round);
+        assert_eq!(barrier.workers_held(), 2);
+        let retry = barrier.begin_round().report(rev, []);
+        let listed: Vec<SessionId> = retry
+            .workers
+            .iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        assert_eq!(listed, vec![session(2), session(4)], "{retry:?}");
+    }
+
+    /// One of many sessions, by number.
+    fn numbered(n: u32) -> SessionId {
+        let mut bytes = [0xAB; 16];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        SessionId::new(Uuid::from_bytes(bytes))
+    }
+
+    /// What a fence names when it rejected one action and one had already been dispatched.
+    fn naming() -> Option<kr_protocol::action::FenceEvidence> {
+        evidence(vec![action(10)], vec![possibly_executed(11)])
+    }
+
+    /// KR-REQ-09.12: a daemon that has closed a thousand sessions holds a record of none of them,
+    /// however far each had come: acknowledged and naming nothing, bound and never answering,
+    /// installing the revision without a report of its fence, or never bound at all. A late message
+    /// about one makes no record of it. The control, a worker still running, is held and pending.
+    #[test]
+    fn a_thousand_closed_sessions_leave_no_record_of_any_of_them() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let live = numbered(5_000);
+        barrier.bind(live);
+        for n in 0..1_000 {
+            let id = numbered(n);
+            match n % 4 {
+                0 => {
+                    let binding = barrier.bind(id);
+                    assert!(barrier.acknowledge(
+                        id,
+                        binding,
+                        rev,
+                        evidence(Vec::new(), Vec::new())
+                    ));
+                }
+                1 => {
+                    barrier.bind(id);
+                }
+                2 => {}
+                _ => {
+                    let binding = barrier.binding_or_bind(id);
+                    assert!(barrier.acknowledge(id, binding, rev, None));
+                }
+            }
+            barrier.worker_ended(id);
+        }
+        for n in 0..1_000 {
+            let id = numbered(n);
+            assert!(!barrier.acknowledge(id, WorkerBinding::default(), rev, naming()));
+            assert!(!barrier.acknowledge(id, barrier.binding(id), rev, naming()));
+            barrier.stop_renewal(id, WorkerBinding::default());
+            barrier.worker_ended(id);
+        }
+        assert_eq!(barrier.workers_held(), 1, "only the worker still running");
+        assert_eq!(barrier.held(), (0, 0), "no fence report, no retired worker");
+        let report = barrier.begin_round().report(rev, []);
+        assert_eq!(report.workers_total.get(), 1);
+        assert_eq!(report.pending(), vec![live]);
+    }
+
+    /// A worker that ends while a round is running is reported by that round with the names it had
+    /// given, and is held for a retry at the same revision, which a round whose answer was not kept
+    /// would otherwise lose. It goes when the revision advances and no round announcing the old one
+    /// is left.
+    #[test]
+    fn a_worker_that_ends_during_a_round_is_reported_by_it_and_kept_for_a_retry() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let round = barrier.begin_round();
+        round.at(rev);
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(session(1), binding, rev, naming()));
+        barrier.worker_ended(session(1));
+        let report = round.report(rev, []);
+        assert_eq!(report.workers.len(), 1, "{report:?}");
+        assert_eq!(report.workers[0].state, BarrierState::Ended);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+        assert_eq!(report.possibly_executed().len(), 1);
+        drop(round);
+
+        // The first answer was not kept, and the retry is a round at the same revision.
+        assert_eq!(barrier.workers_held(), 1);
+        let retry = barrier.begin_round();
+        retry.at(rev);
+        let again = retry.report(rev, []);
+        assert_eq!(again.workers, report.workers);
+        drop(retry);
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "names at the revision in force stay"
+        );
+
+        // The revision advances, and nothing can ask for names at the one before it.
+        barrier.revoke(AuthorityRevision::new(4));
+        assert_eq!(barrier.workers_held(), 0);
+        assert_eq!(barrier.held(), (0, 0));
+        assert!(
+            barrier
+                .begin_round()
+                .report(AuthorityRevision::new(4), [])
+                .workers
+                .is_empty()
+        );
+    }
+
+    /// Names a worker gave outside any round, as an acknowledgement to the one worker does, are
+    /// kept for the round that reports that revision next, and go with the revision.
+    #[test]
+    fn names_given_outside_any_round_are_kept_for_the_next_report_and_go_with_the_revision() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(session(1), binding, rev, naming()));
+        barrier.worker_ended(session(1));
+        assert_eq!(barrier.workers_held(), 1);
+        let report = barrier.begin_round().report(rev, []);
+        assert_eq!(report.workers.len(), 1);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+        barrier.revoke(AuthorityRevision::new(4));
+        assert_eq!(barrier.workers_held(), 0);
+    }
+
+    /// A round announcing an older revision keeps that revision's names until it is over, and
+    /// reports them, though the revision has advanced.
+    #[test]
+    fn a_round_announcing_an_older_revision_keeps_its_names_until_it_is_over() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let round = barrier.begin_round();
+        round.at(rev);
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(session(1), binding, rev, naming()));
+        barrier.worker_ended(session(1));
+        barrier.revoke(AuthorityRevision::new(4));
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "the round at the old revision runs"
+        );
+        let report = round.report(rev, []);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+        drop(round);
+        assert_eq!(barrier.workers_held(), 0);
+    }
+
+    /// Rounds that began after a worker ended hold nothing of it back for being there, whatever
+    /// the revisions do while they run: the first round ends and the worker goes though later ones
+    /// still run, and names at an old revision go once nothing announces that revision, though a
+    /// round at a newer one is running.
+    #[test]
+    fn overlapping_rounds_do_not_hold_an_ended_worker_for_ever() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+
+        // Held by the round that began before it ended, and by that one alone.
+        let first = barrier.begin_round();
+        first.at(rev);
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(session(1), binding, rev, evidence(Vec::new(), Vec::new())));
+        barrier.worker_ended(session(1));
+        let later = barrier.begin_round();
+        later.at(rev);
+        assert_eq!(barrier.workers_held(), 1);
+        drop(first);
+        assert_eq!(
+            barrier.workers_held(),
+            0,
+            "a round that began after the end holds nothing"
+        );
+        drop(later);
+
+        // Held for its names by the rounds that announce the revision it named them at.
+        let first = barrier.begin_round();
+        first.at(rev);
+        let binding = barrier.bind(session(2));
+        assert!(barrier.acknowledge(session(2), binding, rev, naming()));
+        barrier.worker_ended(session(2));
+        let second = barrier.begin_round();
+        second.at(rev);
+        barrier.revoke(AuthorityRevision::new(4));
+        drop(first);
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "the second round announces revision 3"
+        );
+        let third = barrier.begin_round();
+        third.at(AuthorityRevision::new(4));
+        barrier.revoke(AuthorityRevision::new(5));
+        drop(second);
+        assert_eq!(
+            barrier.workers_held(),
+            0,
+            "nothing announces revision 3 any more, and the third round only announces 4"
+        );
+        drop(third);
+        assert_eq!(barrier.held(), (0, 0));
+    }
+
+    /// An exchange with one worker that began while it ran still takes the names the worker gives
+    /// after it has ended, and the control, with no exchange, forgets a worker that named nothing
+    /// at once and refuses what it says later.
+    #[test]
+    fn an_exchange_that_began_before_the_end_still_takes_the_names_given_after_it() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let exchange = barrier.begin_round();
+        let binding = barrier.bind(session(1));
+        barrier.worker_ended(session(1));
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "the exchange began while the worker ran"
+        );
+        assert!(barrier.acknowledge(session(1), binding, rev, naming()));
+        drop(exchange);
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "the names it took are kept for a report"
+        );
+        let report = barrier.begin_round().report(rev, []);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+
+        // The control.
+        let binding = barrier.bind(session(2));
+        barrier.worker_ended(session(2));
+        assert_eq!(
+            barrier.workers_held(),
+            1,
+            "session 2 named nothing and no round was running"
+        );
+        assert!(!barrier.acknowledge(session(2), binding, rev, naming()));
+        assert_eq!(barrier.workers_held(), 1);
+    }
+
+    /// Past the most workers a barrier keeps for their names the oldest are let go, and the answer
+    /// says so, whether or not a report has been taken before: its total counts them, its list
+    /// does not, and the barrier still holds, because every one let go had ended. The count goes
+    /// with the revision.
+    #[test]
+    fn workers_let_go_for_want_of_room_are_counted_in_the_answers_total() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(3);
+        let over = 5_u32;
+        for n in 0..(MAX_RETAINED_ENDED_WORKERS as u32 + over) {
+            let id = numbered(n);
+            let binding = barrier.bind(id);
+            assert!(barrier.acknowledge(id, binding, rev, naming()));
+            barrier.worker_ended(id);
+        }
+        assert_eq!(barrier.workers_held(), MAX_RETAINED_ENDED_WORKERS);
+        let report = barrier.begin_round().report(rev, []);
+        assert_eq!(report.workers.len(), MAX_RETAINED_ENDED_WORKERS);
+        assert_eq!(
+            report.workers_total.get(),
+            u64::from(MAX_RETAINED_ENDED_WORKERS as u32 + over)
+        );
+        assert!(report.holds(), "every worker let go had ended");
+        let listed: Vec<SessionId> = report
+            .workers
+            .iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        assert!(!listed.contains(&numbered(0)) && !listed.contains(&numbered(over - 1)));
+        assert!(listed.contains(&numbered(over)));
+
+        barrier.revoke(AuthorityRevision::new(4));
+        let next = barrier.begin_round().report(AuthorityRevision::new(4), []);
+        assert_eq!(next.workers_total.get(), 0);
+        assert_eq!(barrier.workers_held(), 0);
     }
 
     /// The evidence one fence pass reported, complete in one page.
@@ -1370,8 +1895,9 @@ mod tests {
         assert_eq!(report.pending(), vec![session(2)]);
 
         // The second worker's execution ends, which answers the same question a different way.
+        let round = barrier.begin_round();
         barrier.worker_ended(session(2));
-        let report = barrier.report(AuthorityRevision::new(4), [session(1), session(2)]);
+        let report = round.report(AuthorityRevision::new(4), [session(1), session(2)]);
         assert!(report.holds());
         assert_eq!(report.workers[1].state, BarrierState::Ended);
         assert!(

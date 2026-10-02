@@ -1,0 +1,321 @@
+//! What this daemon makes of a session whose closure is recorded.
+//!
+//! A worker that has ended is no worker the daemon has any use to keep a record of in its barrier:
+//! nothing can ask about it once the work that began while it ran is over, and a record made after
+//! its closure would never be ended by anything. So a record is made only by a bind taken under the
+//! registry's lock, and only for a session that has no closure there; the closure tells the
+//! barrier in the section that records it, so the two cannot pass each other; a recovery that
+//! reaches a worker after its closure leaves the closure as it is; and a revocation's answer is
+//! about the workers that are recorded and not closed.
+
+use std::future::Future;
+use std::task::Poll;
+
+use kr_protocol::identity::WorkerProfile;
+use kr_protocol::ids::AuthorityRevision;
+use kr_protocol::session::SessionState;
+
+use super::a_close_a_worker_never_answers::Silent;
+use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
+use crate::error::ControllerError;
+use crate::registry::WorkerRecord;
+
+/// The registry's row for a world's worker, as an earlier build's recovery wrote it.
+fn row_of(world: &Silent) -> WorkerRecord {
+    let descriptor = &world.worker.descriptor;
+    WorkerRecord {
+        session_id: world.session_id,
+        display_number: descriptor.display_number,
+        public_key: descriptor.worker_public_key,
+        process_identity: descriptor.process_start_identity.clone(),
+        endpoint: descriptor.endpoint.clone(),
+        profile: WorkerProfile::HeadlessUser,
+        state: SessionState::Live,
+        acknowledged_revision: AuthorityRevision::new(0),
+    }
+}
+
+/// A session that has closed is not bound again, by either of the calls that bind: the worker has
+/// ended, and a record of it would be one nothing could end. The control is the same session
+/// before its closure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_with_a_closure_is_not_bound() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    assert!(
+        world
+            .controller
+            .bind_worker(world.session_id)
+            .await
+            .expect("the registry answers")
+            .is_some()
+    );
+    assert!(
+        world
+            .controller
+            .binding_or_bind(world.session_id)
+            .await
+            .expect("the registry answers")
+            .is_some()
+    );
+    assert_eq!(world.controller.leases.workers_held(), 1);
+
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    assert_eq!(
+        world.controller.leases.workers_held(),
+        0,
+        "the closure ended the worker and nothing was left to ask about it"
+    );
+    assert!(
+        world
+            .controller
+            .bind_worker(world.session_id)
+            .await
+            .expect("the registry answers")
+            .is_none()
+    );
+    assert!(
+        world
+            .controller
+            .binding_or_bind(world.session_id)
+            .await
+            .expect("the registry answers")
+            .is_none()
+    );
+    assert_eq!(world.controller.leases.workers_held(), 0);
+    world.serving.abort();
+}
+
+/// Polls a future once and says it is waiting: for a test that wants two futures queued for one lock
+/// in a known order, with nothing waited for but the lock.
+async fn parked<F: Future>(mut future: std::pin::Pin<&mut F>, what: &str) {
+    let polled = std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await;
+    assert!(polled.is_pending(), "{what} waits for the registry");
+}
+
+/// A bind and a closure that wait for the registry together leave nothing held, whichever of them
+/// the registry lets in first: a bind that comes first is ended by the closure in its own section,
+/// and one that comes after sees the closure and binds nothing. Answers whether the bind bound.
+async fn a_bind_and_a_closure_wait_together(bind_first: bool) -> bool {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let record = closure_of(world.session_id);
+    let registry = world.controller.registry.lock().await;
+    let binding = world.controller.bind_worker(world.session_id);
+    let closing = world.controller.write_closure(&record);
+    tokio::pin!(binding, closing);
+    // The lock is fair: they are let in in the order they asked.
+    if bind_first {
+        parked(binding.as_mut(), "the bind").await;
+        parked(closing.as_mut(), "the closure").await;
+    } else {
+        parked(closing.as_mut(), "the closure").await;
+        parked(binding.as_mut(), "the bind").await;
+    }
+    drop(registry);
+    let (bound, closed) = tokio::join!(binding, closing);
+    closed.expect("the closure is recorded");
+    assert!(recorded(&world).await);
+    assert_eq!(
+        world.controller.leases.workers_held(),
+        0,
+        "nothing is held of a session whose closure is recorded"
+    );
+    world.serving.abort();
+    bound.expect("the registry answers").is_some()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_that_comes_before_a_closure_is_ended_by_it() {
+    assert!(a_bind_and_a_closure_wait_together(true).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_that_comes_after_a_closure_binds_nothing() {
+    assert!(!a_bind_and_a_closure_wait_together(false).await);
+}
+
+/// An exchange with a worker whose session has closed, found in the directory because the closure's
+/// own tidying was dropped, makes no record of it, and says the session is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exchange_with_a_worker_whose_session_closed_makes_no_record() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    world.controller.leases.worker_ended(world.session_id);
+    assert_eq!(world.controller.leases.workers_held(), 0);
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the closure is recorded");
+    let refused = world
+        .controller
+        .acknowledge_worker_revision(world.session_id)
+        .await
+        .expect_err("a closed session has no worker to ask");
+    assert!(matches!(refused, ControllerError::UnknownSession { .. }));
+    assert_eq!(world.controller.leases.workers_held(), 0);
+    world.serving.abort();
+}
+
+/// A recovery that reached a worker, and found its closure recorded while it waited for the
+/// worker's answer, writes no row for it and publishes nothing. The control is the same adoption
+/// before any closure, which writes the row and puts the worker in the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let descriptor = world.worker.descriptor.clone();
+    let proof = kr_protocol::worker::WorkerVerifyProof {
+        session_id: descriptor.session_id,
+        session_epoch: descriptor.session_epoch,
+        boot_identity: descriptor.boot_identity.clone(),
+        process_start_identity: descriptor.process_start_identity.clone(),
+        protocol_version: descriptor.protocol_version,
+        endpoint: descriptor.endpoint.clone(),
+        signature: kr_protocol::scalars::Signature64::from_bytes([0; 64]),
+    };
+    let adopt = |controller: std::sync::Arc<crate::service::Controller>| {
+        let (descriptor, proof, endpoint) = (
+            descriptor.clone(),
+            proof.clone(),
+            world.worker.endpoint.clone(),
+        );
+        async move {
+            controller
+                .adopt(
+                    descriptor.display_number,
+                    &descriptor.worker_public_key,
+                    &proof,
+                    &endpoint,
+                    None,
+                )
+                .await
+        }
+    };
+
+    // The control.
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    adopt(std::sync::Arc::clone(&world.controller))
+        .await
+        .expect("a worker that is not closed is adopted");
+    assert!(
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .get(world.session_id)
+            .is_some()
+    );
+
+    // Closed while the challenge waited.
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the closure is recorded");
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    adopt(std::sync::Arc::clone(&world.controller))
+        .await
+        .expect("an adoption that finds the closure has nothing to do");
+    assert!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .workers()
+            .expect("the registry answers")
+            .is_empty(),
+        "no row is written for a session that has closed"
+    );
+    assert!(
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .get(world.session_id)
+            .is_none()
+    );
+    world.serving.abort();
+}
+
+/// A row an earlier build's recovery left beside a closure is no worker: a revocation's answer
+/// does not list it pending, so the revocation completes. The control is the same row with no
+/// closure, a worker this daemon cannot reach and has not established is gone, which is pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    // The daemon has not reached the worker: nothing in its directory, the row in its registry.
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    let control = world
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the announcement is made");
+    assert!(!control.holds(), "{control:?}");
+    assert_eq!(control.pending(), vec![world.session_id]);
+
+    // The closure, and then the row an earlier recovery wrote after it.
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &row_of(&world),
+            Some(&kr_protocol::identity::DesktopBinding::none()),
+        )
+        .expect("the stale row is written");
+    assert_eq!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .workers()
+            .expect("the registry answers")
+            .len(),
+        1
+    );
+    let report = world
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the announcement is made");
+    assert!(report.holds(), "{report:?}");
+    assert!(report.workers.is_empty(), "{report:?}");
+    assert_eq!(world.controller.leases.workers_held(), 0);
+    world.serving.abort();
+}

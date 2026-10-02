@@ -127,6 +127,10 @@ struct WorkerState {
 /// that was queued on a path the host has already given up on says nothing about the path it has
 /// now. The binding advances whenever the path is replaced or lost, and an acknowledgement carries
 /// the binding it was made under.
+///
+/// Every binding comes from one counter for the whole issuer, so no two control paths of any worker
+/// ever share a value, whatever was forgotten in between. Nought is the one value no path has: it
+/// is what a worker the issuer holds no record of is said to be bound to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkerBinding(u64);
 
@@ -135,10 +139,6 @@ impl WorkerBinding {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
-    }
-
-    fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
     }
 }
 
@@ -152,6 +152,16 @@ impl WorkerBinding {
 struct IssuerState {
     authority_revision: AuthorityRevision,
     workers: HashMap<SessionId, WorkerState>,
+    /// The last binding handed out, to any worker.
+    last_binding: u64,
+}
+
+impl IssuerState {
+    /// Hands out a binding no worker has had before.
+    fn next_binding(&mut self) -> WorkerBinding {
+        self.last_binding = self.last_binding.saturating_add(1);
+        WorkerBinding(self.last_binding)
+    }
 }
 
 /// The controller's half of the lease contract.
@@ -178,6 +188,7 @@ impl LeaseIssuer {
             state: Mutex::new(IssuerState {
                 authority_revision,
                 workers: HashMap::new(),
+                last_binding: 0,
             }),
         }
     }
@@ -203,24 +214,29 @@ impl LeaseIssuer {
         self.lock().authority_revision
     }
 
-    /// Records that a worker acknowledged an authority revision.
+    /// Records that a worker acknowledged an authority revision, and answers whether it was taken.
     ///
     /// Acknowledgement means the worker has installed the revision and fenced or rejected the
     /// undispatched actions it affects. Only then can the worker's lease carry that revision, and
     /// only then does a fence from a lost control path lift.
+    ///
+    /// Only a worker the issuer holds a record of can acknowledge: a late message about a worker
+    /// that was forgotten, or that was never bound, creates nothing and is refused.
     pub fn acknowledge(
         &self,
         session_id: SessionId,
         binding: WorkerBinding,
         revision: AuthorityRevision,
-    ) {
+    ) -> bool {
         let mut state = self.lock();
         let current = state.authority_revision;
-        let worker = state.workers.entry(session_id).or_default();
+        let Some(worker) = state.workers.get_mut(&session_id) else {
+            return false;
+        };
         if binding != worker.binding {
             // The acknowledgement was made over a control path the host has given up on. It is not
             // evidence about the path in force, so it changes nothing.
-            return;
+            return false;
         }
         if worker
             .acknowledged_revision
@@ -234,26 +250,50 @@ impl LeaseIssuer {
         if revision == current {
             worker.fenced = false;
         }
+        true
     }
 
     /// Records that a worker's control path was established, returning its binding.
     ///
     /// A host calls this when the worker's connection comes up, and passes the binding with every
-    /// acknowledgement it forwards.
+    /// acknowledgement it forwards. This is the one call that makes a record of a worker.
     pub fn bind(&self, session_id: SessionId) -> WorkerBinding {
         let mut state = self.lock();
+        let binding = state.next_binding();
         let worker = state.workers.entry(session_id).or_default();
-        worker.binding = worker.binding.next();
+        worker.binding = binding;
         // A new control path starts owing an acknowledgement. The fence belonged to the path that
         // was lost, and clearing it here changes nothing on its own: renewal still waits for an
         // acknowledgement of the revision in force, made over this binding.
         worker.fenced = false;
         worker.acknowledged_revision = None;
         worker.lease = None;
-        worker.binding
+        binding
     }
 
-    /// Returns the binding in force for a worker.
+    /// Returns the binding in force for a worker, and makes one only where the issuer holds no
+    /// record of the worker at all.
+    ///
+    /// For a caller that needs a binding and has no reason to start the worker's control path over:
+    /// a worker already bound keeps its binding, its acknowledgement and its lease.
+    pub fn binding_or_bind(&self, session_id: SessionId) -> WorkerBinding {
+        let mut state = self.lock();
+        if let Some(worker) = state.workers.get(&session_id) {
+            return worker.binding;
+        }
+        let binding = state.next_binding();
+        state.workers.insert(
+            session_id,
+            WorkerState {
+                binding,
+                ..WorkerState::default()
+            },
+        );
+        binding
+    }
+
+    /// Returns the binding in force for a worker, which is nought for one the issuer holds no
+    /// record of.
     #[must_use]
     pub fn binding(&self, session_id: SessionId) -> WorkerBinding {
         self.lock()
@@ -262,15 +302,40 @@ impl LeaseIssuer {
             .map_or(WorkerBinding::default(), |worker| worker.binding)
     }
 
-    /// Records that a worker's execution has ended.
+    /// Returns whether the issuer holds a record of this worker.
+    #[must_use]
+    pub fn holds(&self, session_id: SessionId) -> bool {
+        self.lock().workers.contains_key(&session_id)
+    }
+
+    /// Returns how many workers the issuer holds a record of.
+    #[must_use]
+    pub fn workers_held(&self) -> usize {
+        self.lock().workers.len()
+    }
+
+    /// Records that a worker's execution has ended, and answers whether the issuer held a record of
+    /// it to record that in.
     ///
     /// A worker that can no longer dispatch satisfies the barrier as surely as one that
-    /// acknowledged, which is the other half of the section 9 rule.
-    pub fn worker_ended(&self, session_id: SessionId) {
+    /// acknowledged, which is the other half of the section 9 rule. A worker the issuer never bound
+    /// has nothing to satisfy and is not made a record of by ending.
+    pub fn worker_ended(&self, session_id: SessionId) -> bool {
         let mut state = self.lock();
-        let worker = state.workers.entry(session_id).or_default();
+        let Some(worker) = state.workers.get_mut(&session_id) else {
+            return false;
+        };
         worker.ended = true;
         worker.lease = None;
+        true
+    }
+
+    /// Forgets a worker: its record, and with it its binding, its acknowledgement and its lease.
+    ///
+    /// For a worker whose end is confirmed and that nothing can ask about any more. A later message
+    /// about it finds no record and creates none.
+    pub fn forget(&self, session_id: SessionId) {
+        self.lock().workers.remove(&session_id);
     }
 
     /// Issues or renews a worker's lease.
@@ -301,7 +366,9 @@ impl LeaseIssuer {
 
         let mut state = self.lock();
         let revision = state.authority_revision;
-        let worker = state.workers.entry(session_id).or_default();
+        let Some(worker) = state.workers.get_mut(&session_id) else {
+            return Ok(Err(LeaseRefusal::RevisionNotAcknowledged));
+        };
         if worker.ended || worker.fenced || worker.acknowledged_revision != Some(revision) {
             return Ok(Err(LeaseRefusal::RevisionNotAcknowledged));
         }
@@ -350,18 +417,25 @@ impl LeaseIssuer {
     /// shell.
     pub fn stop_renewal(&self, session_id: SessionId, binding: WorkerBinding) {
         let mut state = self.lock();
-        let worker = state.workers.entry(session_id).or_default();
-        if binding != worker.binding {
-            // The loss belongs to a control path that has already been replaced. Fencing the
-            // replacement because its predecessor died would stop a worker that is perfectly
-            // healthy, and a late notification is exactly how that happens.
+        // Nothing to stop for a worker the issuer holds no record of, which cannot renew; and a
+        // loss that belongs to a control path that has already been replaced fences nothing:
+        // fencing the replacement because its predecessor died would stop a worker that is
+        // perfectly healthy, and a late notification is exactly how that happens.
+        if state
+            .workers
+            .get(&session_id)
+            .is_none_or(|worker| worker.binding != binding)
+        {
             return;
         }
-        worker.fenced = true;
-        worker.lease = None;
         // The binding advances, so an acknowledgement still travelling over the lost path arrives
         // under a binding that is no longer current and lifts nothing.
-        worker.binding = worker.binding.next();
+        let lost = state.next_binding();
+        if let Some(worker) = state.workers.get_mut(&session_id) {
+            worker.fenced = true;
+            worker.lease = None;
+            worker.binding = lost;
+        }
     }
 
     /// Returns true when renewal for this worker is fenced.
@@ -646,5 +720,99 @@ mod tests {
                 .expect("a decision"),
             Err(LeaseRefusal::RevisionNotAcknowledged)
         );
+    }
+
+    /// A message about a worker the issuer holds no record of makes none: only a bind does.
+    #[test]
+    fn a_message_about_a_worker_nothing_is_held_of_makes_no_record() {
+        let clock = ManualClock::new();
+        let issuer = issuer();
+        assert!(!issuer.acknowledge(
+            session(1),
+            WorkerBinding::default(),
+            AuthorityRevision::new(3)
+        ));
+        assert_eq!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision"),
+            Err(LeaseRefusal::RevisionNotAcknowledged)
+        );
+        issuer.stop_renewal(session(1), WorkerBinding::default());
+        assert!(!issuer.worker_ended(session(1)));
+        assert!(!issuer.is_fenced(session(1)));
+        assert_eq!(issuer.binding(session(1)), WorkerBinding::default());
+        assert!(!issuer.holds(session(1)));
+        assert_eq!(issuer.workers_held(), 0);
+        // The control: a bind is what makes one.
+        issuer.bind(session(1));
+        assert!(issuer.holds(session(1)));
+        assert_eq!(issuer.workers_held(), 1);
+    }
+
+    /// A binding is never given twice, so a message made over a control path that was forgotten
+    /// with its worker cannot be taken for one about a path the worker has since been given.
+    #[test]
+    fn a_binding_is_never_given_twice_whatever_was_forgotten_between() {
+        let issuer = issuer();
+        let first = issuer.bind(session(1));
+        let other = issuer.bind(session(2));
+        assert_ne!(first, other);
+        assert_ne!(first, WorkerBinding::default());
+        issuer.forget(session(1));
+        assert!(!issuer.holds(session(1)));
+        let second = issuer.bind(session(1));
+        assert_ne!(
+            second, first,
+            "a forgotten worker's next binding is a new one"
+        );
+        assert!(
+            !issuer.acknowledge(session(1), first, AuthorityRevision::new(3)),
+            "an acknowledgement made over the forgotten path is not about the new one"
+        );
+        assert!(issuer.acknowledge(session(1), second, AuthorityRevision::new(3)));
+        // A path lost advances the binding to a value no worker has had either.
+        issuer.stop_renewal(session(1), second);
+        let advanced = issuer.binding(session(1));
+        assert!(advanced != second && advanced != first && advanced != other);
+        assert_ne!(issuer.bind(session(3)), advanced);
+    }
+
+    /// A caller that needs a binding and has no reason to start a control path over keeps the
+    /// binding, the acknowledgement and the lease a worker already has.
+    #[test]
+    fn a_binding_asked_for_keeps_what_a_bound_worker_has() {
+        let clock = ManualClock::new();
+        let issuer = issuer();
+        let bound = issuer.binding_or_bind(session(1));
+        assert_ne!(bound, WorkerBinding::default());
+        assert!(issuer.acknowledge(session(1), bound, AuthorityRevision::new(3)));
+        let lease = issuer
+            .renew(session(1), ControllerGeneration::new(7), &clock)
+            .expect("a lease")
+            .expect("an issued lease");
+        assert_eq!(issuer.binding_or_bind(session(1)), bound);
+        assert_eq!(issuer.current_lease(session(1)), Some(lease));
+        // The control: a bind starts the path over.
+        assert_ne!(issuer.bind(session(1)), bound);
+        assert_eq!(issuer.current_lease(session(1)), None);
+    }
+
+    /// A worker forgotten keeps nothing: not its binding, not its acknowledgement, not its lease,
+    /// and a worker that ended is no longer said to satisfy a revocation.
+    #[test]
+    fn a_forgotten_worker_is_in_no_status() {
+        let issuer = issuer();
+        let binding = issuer.bind(session(1));
+        assert!(issuer.acknowledge(session(1), binding, AuthorityRevision::new(3)));
+        assert!(issuer.worker_ended(session(1)));
+        assert_eq!(
+            issuer.status(AuthorityRevision::new(3)).acknowledged,
+            vec![session(1)]
+        );
+        issuer.forget(session(1));
+        let status = issuer.status(AuthorityRevision::new(3));
+        assert!(status.acknowledged.is_empty() && status.pending.is_empty());
+        assert_eq!(issuer.binding(session(1)), WorkerBinding::default());
     }
 }
