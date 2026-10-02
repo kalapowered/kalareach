@@ -903,7 +903,8 @@ pub struct MachineArguments {
     pub command: Option<MachineCommand>,
     /// The environment to act in: one of this host's own, by identifier, or one enrolled for a
     /// process bridge, by identifier or label. Without it, this installation's own. A merge over
-    /// several environments takes the option once for each of them.
+    /// several environments takes the option once for each of them. `plan`, `finish` and `undo`
+    /// act on the plan, which names its own environments, and take none.
     #[arg(long, global = true)]
     pub environment: Vec<String>,
 }
@@ -920,10 +921,12 @@ pub enum MachineCommand {
     Split(MachineSplitArguments),
     /// Show the merge plan this client keeps, and what each step has come to.
     Plan,
-    /// Send each step of the plan that has no result again, under the action it was first sent
-    /// under, and say what each came to. An environment that cannot be reached stays pending.
+    /// Send each step of the plan that has no result, and say what each came to. A step never
+    /// sent is sent under its own action, and one already sent is sent again as it was composed. An
+    /// environment that cannot be reached, or cannot yet say what it did, stays pending.
     Finish,
-    /// Move each environment the plan moved back into the group it left, one step at a time.
+    /// Move each environment the plan moved back into the group it left, one step at a time. A
+    /// step never sent is given up, and one that may have been taken has to be finished first.
     Undo,
 }
 

@@ -46,7 +46,7 @@ impl WorkerSupervisor for NoWorkers {
 /// A host tree and its running daemon.
 struct Host {
     temp: kr_ipc::testing::TempHost,
-    _controller: Arc<Controller>,
+    controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
 }
 
@@ -88,7 +88,7 @@ impl Host {
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
         Self {
             temp,
-            _controller: controller,
+            controller,
             clients,
         }
     }
@@ -244,7 +244,7 @@ async fn the_owner_shows_the_group_and_takes_each_step_against_the_record_they_s
     assert_eq!(host.group(), joined_group);
 
     // A step against the record from before is refused, and writes nothing.
-    let stale = host.failed(
+    let (stale_status, stale) = host.kr_json(
         None,
         &[
             "host",
@@ -256,6 +256,8 @@ async fn the_owner_shows_the_group_and_takes_each_step_against_the_record_they_s
         ],
     );
     assert_eq!(stale["code"], "DRAFT_CONFLICT", "{stale}");
+    assert_eq!(stale_status, Some(8), "a refusal exits with status 8");
+    assert_eq!(stale["exit_code"], 8, "{stale}");
     assert_eq!(host.group(), joined_group);
 
     // Expectations that are not a group and a revision are a usage failure, before anything is sent.
@@ -537,12 +539,35 @@ async fn a_merge_over_independent_environments_is_a_plan_kept_until_each_step_ha
     assert_eq!(a_group.change, "merged");
     assert_eq!(pair.b.group().machine_id, shared.machine_id);
 
-    // The plan is a file only the owner reads, in this user's state directory.
+    // The plan is a file only the owner reads, in this user's state directory, and no environment's
+    // own directory holds one.
     let plan = pair.a.plan_file();
-    assert!(plan.starts_with(pair.a.temp.paths().state_root()));
+    assert!(plan.exists(), "the plan is kept");
+    assert_eq!(
+        plan.parent(),
+        Some(pair.a.temp.paths().state_root()),
+        "in this user's state root"
+    );
+    for host in [&pair.a, &pair.b] {
+        assert!(
+            !host
+                .temp
+                .environment()
+                .state_dir()
+                .join("machine-merge-plan")
+                .exists(),
+            "never in an environment's own directory"
+        );
+    }
     assert!(
-        !plan.starts_with(pair.a.temp.environment().state_dir()),
-        "never in an environment's own directory"
+        !pair
+            .b
+            .temp
+            .paths()
+            .state_root()
+            .join("machine-merge-plan")
+            .exists(),
+        "nor in the other host's"
     );
     let mode = std::fs::metadata(&plan)
         .expect("the plan is kept")
@@ -567,7 +592,11 @@ async fn a_merge_over_independent_environments_is_a_plan_kept_until_each_step_ha
 
     // `finish` while B is still stopped leaves the step pending, and the plan.
     pair.allow(0);
-    let still = pair.at_a_failing(&["host", "machine", "finish"]);
+    let (still_status, still) = pair
+        .a
+        .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert_eq!(still_status, Some(1), "a pending step exits with status 1");
+    assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
     assert_eq!(still["steps"][1]["state"], "unsent", "{still}");
     assert!(plan.exists());
 
@@ -634,8 +663,9 @@ async fn a_merge_left_half_done_is_undone_by_putting_back_each_environment_that_
 }
 
 /// KR-REQ-03.07: the environments of a merge each take their own step over their own connection,
-/// and a step changes the environment it names and no other: B's group is as it was after A took
-/// its step, and the other way round.
+/// and a step changes the environment it names and no other: A's step and B's step each leave the
+/// other's group as the owner left it, and each is a step of its own, taken under an action of its
+/// own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_environment_of_a_merge_takes_its_own_step_and_changes_no_other() {
     let pair = Pair::start().await;
@@ -669,10 +699,10 @@ async fn each_environment_of_a_merge_takes_its_own_step_and_changes_no_other() {
     assert!(!pair.a.plan_file().exists());
 }
 
-/// KR-REQ-03.07: a step the environment never saw is sent again on the next connection, whose
-/// window is not the one the step quotes, and the environment is read against what the step was
-/// approved against. Where the owner took the same step another way meanwhile, the record shows it
-/// was taken, and the step is taken as done without being taken twice.
+/// KR-REQ-03.07: a step the environment was never sent is composed on the connection that sends it,
+/// and the environment is read against what the step was approved against when it refuses it. Where
+/// the owner took the same step another way meanwhile, the record shows it was taken, and the step
+/// is taken as done without being taken twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_the_owner_took_another_way_meanwhile_is_taken_as_done_and_not_taken_twice() {
     let pair = Pair::start().await;
@@ -816,4 +846,328 @@ async fn each_environment_a_half_finished_merge_moved_is_named_with_the_command_
         )),
         "{said}"
     );
+}
+
+/// The merge started with both environments reachable and B's answer lost, and the plan that is
+/// kept: A took its step, and B's step is `sent`.
+fn merge_with_b_answer_lost(pair: &Pair, fault: impl FnOnce(&Host)) -> (Group, String, Value) {
+    let shared = pair.together();
+    let a_id = pair.a.environment_id();
+    let into = a_group();
+    fault(&pair.b);
+    let started = pair.a.failed(
+        Some(pair.bridges.path()),
+        &[
+            "host",
+            "machine",
+            "merge",
+            &into,
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            &a_id,
+            "--environment",
+            "bravo",
+        ],
+    );
+    (shared, into, started)
+}
+
+/// KR-REQ-03.07: a step is first sent on the connection that composes it, under the identity the
+/// plan has held since it was made. B is stopped when its step comes, so the plan keeps B's step
+/// unsent with its identity, and `finish` takes it under that identity and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_is_first_sent_under_the_identity_the_plan_holds_for_it() {
+    let pair = Pair::start().await;
+    let shared = pair.together();
+    let a_id = pair.a.environment_id();
+    let into = a_group();
+
+    pair.allow(1);
+    pair.a.failed(
+        Some(pair.bridges.path()),
+        &[
+            "host",
+            "machine",
+            "merge",
+            &into,
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            &a_id,
+            "--environment",
+            "bravo",
+        ],
+    );
+    let kept = pair.at_a(&["host", "machine", "plan"]);
+    assert_eq!(kept["steps"][1]["state"], "unsent", "{kept}");
+    let identity = text(&kept["steps"][1]["action_id"]);
+
+    pair.allow(10);
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(
+        text(&finished["steps"][1]["action_id"]),
+        identity,
+        "the step was taken under the identity the plan held, not under another made on the way"
+    );
+    assert_eq!(pair.b.group().machine_id, into);
+}
+
+/// KR-REQ-03.07: a step whose answer was lost after the environment wrote its record is not given a
+/// result it was not given. B's record shows the step and B cannot say it took it, so the step
+/// stays `sent`, the plan is kept, and no second identity is made for it; `undo` refuses while it is
+/// `sent`; and `finish` sends it again under its identity and is answered with its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_answer_was_lost_stays_pending_and_is_answered_by_the_next_finish() {
+    let pair = Pair::start().await;
+    let (shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.lose_the_next_machine_receipt();
+    });
+    assert_eq!(started["steps"][0]["state"], "done", "{started}");
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    assert_eq!(started["kept"], Value::Bool(true), "{started}");
+    let identity = text(&started["steps"][1]["action_id"]);
+    assert!(pair.a.plan_file().exists());
+    assert_eq!(
+        pair.b.group().machine_id,
+        into,
+        "B's record shows the step it could not answer"
+    );
+
+    // Undoing while a step may or may not have been taken is refused, and changes nothing.
+    let refused = pair.at_a_failing(&["host", "machine", "undo"]);
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    assert!(pair.a.plan_file().exists());
+    assert_eq!(pair.a.group().machine_id, into);
+
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(
+        text(&finished["steps"][1]["action_id"]),
+        identity,
+        "the step was asked again under its own identity"
+    );
+    assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
+    assert!(!pair.a.plan_file().exists());
+    assert_eq!(pair.b.group().previous, Some(shared.machine_id));
+}
+
+/// KR-REQ-03.07: the same for a step whose write the environment could not confirm to survive a
+/// crash: it is an outcome nobody knows, and the plan keeps it `sent` until the environment can say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_write_could_not_be_confirmed_is_not_called_taken_until_it_is_answered() {
+    let pair = Pair::start().await;
+    let (_shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.report_the_next_machine_write_as_unconfirmed();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    assert_eq!(started["kept"], Value::Bool(true), "{started}");
+    assert_eq!(pair.b.group().machine_id, into);
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert!(!pair.a.plan_file().exists());
+}
+
+/// KR-REQ-03.07: a step the environment could not write is not given up. B's record is as it was,
+/// the step stays `sent` and the plan is kept, and the next `finish` takes it under a new action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_that_could_not_be_written_is_taken_by_the_next_finish() {
+    let pair = Pair::start().await;
+    let (shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.fail_the_next_machine_write();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    assert_eq!(started["kept"], Value::Bool(true), "{started}");
+    assert_eq!(
+        pair.b.group().machine_id,
+        shared.machine_id,
+        "nothing was written"
+    );
+    let first = text(&started["steps"][1]["action_id"]);
+
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_ne!(
+        text(&finished["steps"][1]["action_id"]),
+        first,
+        "the refusal the first action was given is final for it, so the step is taken under a new one"
+    );
+    assert_eq!(pair.b.group().machine_id, into);
+}
+
+/// KR-REQ-03.07: one command at a time works on the plan. While another holds it, `merge --from`,
+/// `finish` and `undo` each refuse and send nothing, and `plan`, which reads a file that is always
+/// whole, is answered; once it is let go the same command goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_one_command_at_a_time_works_on_the_plan() {
+    let pair = Pair::start().await;
+    let shared = pair.together();
+    let a_id = pair.a.environment_id();
+    let into = a_group();
+    pair.allow(1);
+    pair.a.failed(
+        Some(pair.bridges.path()),
+        &[
+            "host",
+            "machine",
+            "merge",
+            &into,
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            &a_id,
+            "--environment",
+            "bravo",
+        ],
+    );
+    pair.allow(10);
+
+    let lock_path = pair.a.plan_file().with_file_name("machine-merge-plan.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("opens the lock file");
+    held.try_lock().expect("another command holds the plan");
+
+    for line in [
+        &["host", "machine", "finish"][..],
+        &["host", "machine", "undo"][..],
+        &[
+            "host",
+            "machine",
+            "merge",
+            &a_group(),
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            "bravo",
+        ][..],
+    ] {
+        let (status, refused) = pair.a.kr_json(Some(pair.bridges.path()), line);
+        assert_eq!(status, Some(1), "{line:?}: {refused}");
+        assert_eq!(refused["ok"], Value::Bool(false), "{refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|said| said.contains("another kr host machine command")),
+            "{line:?}: {refused}"
+        );
+    }
+    assert_eq!(
+        pair.b.group().machine_id,
+        shared.machine_id,
+        "nothing was sent to B"
+    );
+    let shown = pair.at_a(&["host", "machine", "plan"]);
+    assert_eq!(shown["steps"][1]["state"], "unsent", "{shown}");
+
+    held.unlock().expect("lets the plan go");
+    drop(held);
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+}
+
+/// KR-REQ-03.07: a lost plan is not rebuilt from what the environments report. With A's step taken
+/// and B's pending, the plan file goes: `plan` says none is kept, `finish` and `undo` refuse, B is
+/// not sent anything, and nothing is written in its place. A plan file that cannot be read is left
+/// as it is, and a new merge is refused until the owner moves it aside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_plan_is_not_rebuilt_and_an_unreadable_one_is_left_as_it_is() {
+    let pair = Pair::start().await;
+    let shared = pair.together();
+    let a_id = pair.a.environment_id();
+    let into = a_group();
+    pair.allow(1);
+    pair.a.failed(
+        Some(pair.bridges.path()),
+        &[
+            "host",
+            "machine",
+            "merge",
+            &into,
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            &a_id,
+            "--environment",
+            "bravo",
+        ],
+    );
+    pair.allow(10);
+    let plan = pair.a.plan_file();
+    assert!(plan.exists());
+
+    std::fs::remove_file(&plan).expect("loses the plan");
+    let none = pair.at_a(&["host", "machine", "plan"]);
+    assert_eq!(none["plan"], Value::Null, "{none}");
+    for step in ["finish", "undo"] {
+        let refused = pair.at_a_failing(&["host", "machine", step]);
+        assert_eq!(refused["code"], "INVALID_ARGUMENT", "{step}: {refused}");
+    }
+    assert!(!plan.exists(), "nothing was written in the plan's place");
+    assert_eq!(
+        pair.b.group().machine_id,
+        shared.machine_id,
+        "B was sent nothing"
+    );
+    assert_eq!(pair.a.group().machine_id, into, "A was not put back");
+
+    // A file that is not a plan: refused, and left exactly as it is.
+    kr_ipc::paths::write_owner_only_file(&plan, b"this is not a plan").expect("damages the plan");
+    let refused = pair.at_a_failing(&[
+        "host",
+        "machine",
+        "merge",
+        &a_group(),
+        "--from",
+        &into,
+        "--environment",
+        "bravo",
+    ]);
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("moved aside")),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read(&plan).expect("the file"),
+        b"this is not a plan",
+        "the file was left as it was"
+    );
+    assert_eq!(pair.b.group().machine_id, shared.machine_id);
+}
+
+/// KR-REQ-03.07: `--environment` names the environment of one step or the environments of a merge
+/// plan. `plan`, `finish` and `undo` act on the plan and take none, and a merge of a group into
+/// itself is refused, each before anything is read or kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_options_that_name_nothing_the_command_acts_on_are_refused() {
+    let pair = Pair::start().await;
+    let shared = pair.together();
+    for step in ["plan", "finish", "undo"] {
+        let (status, refused) = pair.a.kr_json(
+            Some(pair.bridges.path()),
+            &["host", "machine", step, "--environment", "bravo"],
+        );
+        assert_eq!(status, Some(2), "{step}: {refused}");
+        assert_eq!(refused["code"], "INVALID_ARGUMENT", "{step}: {refused}");
+    }
+    let itself = pair.at_a_failing(&[
+        "host",
+        "machine",
+        "merge",
+        &shared.machine_id,
+        "--from",
+        &shared.machine_id,
+        "--environment",
+        "bravo",
+    ]);
+    assert_eq!(itself["code"], "INVALID_ARGUMENT", "{itself}");
+    assert!(!pair.a.plan_file().exists(), "nothing was kept");
+    assert_eq!(pair.b.group().machine_id, shared.machine_id);
 }
