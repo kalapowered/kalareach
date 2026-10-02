@@ -5,9 +5,11 @@
 //! `catalogue.add` over its paired connection. The host then synchronises the generation and
 //! installs from it, which is what `kr plugin repo sync` and `kr plugin install` ask of it.
 //!
-//! The trust root is never fetched from the place it is meant to verify. It is the development
-//! root this repository commits, taken only when its digest is the one `bundled-plugins.lock`
-//! pins, which is the root the bundled copy was verified against.
+//! The trust root is never fetched from the place it is meant to verify. For the published release
+//! it is the highest root the bundle ships, taken only when its digest is the one
+//! `bundled-plugins.lock` pins, which is the root the bundled copy was verified against. For a
+//! generation a leg serves from the internal disk it is the root of the committed development
+//! generation fixture, taken only when its digest is the one this crate pins for that fixture.
 
 use std::path::{Path, PathBuf};
 
@@ -83,21 +85,67 @@ pub fn development_generation() -> PathBuf {
     workspace().join("fixtures/plugins/catalogue/development")
 }
 
-/// The development trust root, taken only when its digest is the one the lock pins.
+/// The digest of the root of the committed development generation fixture, which is core's own
+/// copy of an earlier generation and not the bundle's.
+pub const FIXTURE_ROOT_DIGEST: &str =
+    "874233c78ea4a6db808b3967fe6b750c6419084edf2007d2c4fc2e5486d1ed8e";
+
+/// The root the bundle ships, taken only when its digest is the one the lock pins, which is the
+/// root a published release's metadata is verified against.
 ///
 /// # Panics
 ///
-/// Panics when the committed root is not the root the lock pins.
+/// Panics when the bundle's highest root is not the root the lock pins.
 #[must_use]
-pub fn pinned_root(lock: &BundledLock) -> Vec<u8> {
-    let path = development_generation().join("root.json");
+pub fn bundled_root(lock: &BundledLock) -> Vec<u8> {
+    let path = workspace().join("bundled-plugins/metadata/root.json");
     let root = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let digest = kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string();
     assert_eq!(
         digest, lock.root_digest,
-        "the committed development root is the root the bundled lock pins"
+        "the bundle's highest root is the root the bundled lock pins"
     );
     root
+}
+
+/// The root of the committed development generation, taken only when its digest is the one this
+/// crate pins for that fixture.
+///
+/// # Panics
+///
+/// Panics when the committed root is not the root this crate pins.
+#[must_use]
+pub fn fixture_root() -> Vec<u8> {
+    let path = development_generation().join("root.json");
+    let root = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let digest = kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string();
+    assert_eq!(
+        digest, FIXTURE_ROOT_DIGEST,
+        "the committed development root is the one this crate pins for the fixture"
+    );
+    root
+}
+
+/// The release of [`PLUGIN`] the committed development generation's own index carries, and its
+/// package hash: what a leg that serves the fixture installs, read from the fixture and not from
+/// the bundle's lock.
+///
+/// # Panics
+///
+/// Panics when the fixture's index does not name [`PLUGIN`].
+#[must_use]
+pub fn fixture_release() -> (String, String) {
+    let path = development_generation().join("targets/index.json");
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+    )
+    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let entry = index["entries"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["plugin_id"] == PLUGIN))
+        .unwrap_or_else(|| panic!("the fixture's index names {PLUGIN}"));
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+    (text(&entry["version"]), text(&entry["manifest_digest"]))
 }
 
 /// Enrols a repository on the host through `remote`, with the owner device's confirmation of that
