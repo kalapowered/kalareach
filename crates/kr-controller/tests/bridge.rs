@@ -843,17 +843,31 @@ const MOVED_HELPER: &str = "/opt/kalareach/kr";
 const REFUSAL: &str = "the destination refuses this bridge";
 
 /// What `wsl.exe --list --verbose` prints on the machine the stand-in describes.
-const LISTING: &str = "  NAME              STATE           VERSION\n\
-                       * Ubuntu-Fixture    Running         2\n";
+const LISTING: &str = "  NAME              STATE           VERSION\r\n\
+                       * Ubuntu-Fixture    Running         2\r\n";
+
+/// What the same command prints on a machine whose Windows is in German: the state is a word of
+/// that language.
+const GERMAN_LISTING: &str = "  NAME              STATUS          VERSION\r\n\
+                              * Ubuntu-Fixture    Wird ausgef\u{fc}hrt   2\r\n";
+
+/// What `wsl.exe --list --quiet` and `--list --running --quiet` print on the machine the stand-in
+/// describes: the distribution's name, which no language changes.
+const NAMES: &str = "Ubuntu-Fixture\r\n";
+
+/// What `wsl.exe` writes when its output is not a console: UTF-16LE with no byte order mark.
+fn utf16le(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
 
 /// The text of the stand-in for `wsl.exe`, which keeps its control files in `fixture`.
 ///
-/// It records the argument vector of every invocation on a line of its own. It answers a listing
-/// with [`LISTING`], and a bridge with the frames the test wrote for that bridge's helper. When the
-/// test has asked for a bridge to be held, the stand-in marks it open once it has started, which is
-/// after the refresh that opened it has read its row, and waits for the test to release it before
-/// it answers. The wait has a bound of its own, longer than the silence the invoker allows, so a
-/// stand-in whose test has gone does not outlive it by much.
+/// It records the argument vector of every invocation on a line of its own. It answers each of the
+/// three listings with the file the test keeps for it, and a bridge with the frames the test wrote
+/// for that bridge's helper. When the test has asked for a bridge to be held, the stand-in marks it
+/// open once it has started, which is after the refresh that opened it has read its row, and waits
+/// for the test to release it before it answers. The wait has a bound of its own, longer than the
+/// silence the invoker allows, so a stand-in whose test has gone does not outlive it by much.
 fn stand_in(fixture: &Path) -> String {
     let fixture = fixture.to_str().expect("a temporary path is text");
     assert!(
@@ -867,7 +881,15 @@ line="$(printf '%s\t' "$@")"
 printf '%s\n' "$line" >>"$fixture/invocations"
 case "$1" in
   --list)
-    cat "$fixture/listing"
+    case "$*" in
+      "--list --verbose") cat "$fixture/listing" ;;
+      "--list --quiet") cat "$fixture/registered" ;;
+      "--list --running --quiet") cat "$fixture/running" ;;
+      *)
+        echo "the stand-in for wsl.exe has no listing for: $*" >&2
+        exit 2
+        ;;
+    esac
     exit 0
     ;;
   --distribution)
@@ -932,7 +954,9 @@ impl FixtureDaemon {
         let fixture = tree.root().join("fixture");
         let bin = fixture.join("bin");
         std::fs::create_dir_all(&bin).expect("the stand-in's directories");
-        std::fs::write(fixture.join("listing"), LISTING).expect("the listing");
+        std::fs::write(fixture.join("listing"), utf16le(LISTING)).expect("the listing");
+        std::fs::write(fixture.join("registered"), utf16le(NAMES)).expect("the registered names");
+        std::fs::write(fixture.join("running"), utf16le(NAMES)).expect("the running names");
         // The stand-in is placed rather than written in place, like every program a test starts:
         // a descriptor open for writing, handed to a child another thread was starting, would stop
         // it from starting.
@@ -1521,8 +1545,9 @@ async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_
         .await;
     }
 
-    // Every process the daemon started was the stand-in, with an argument vector it built: the
-    // listing it observes a distribution with, and the bridge, whose helper is each record's own.
+    // Every process the daemon started was the stand-in, with an argument vector it built: the two
+    // listings of names it observes a distribution with, and the bridge, whose helper is each
+    // record's own.
     let bridge = |helper: &str| {
         [
             "--distribution",
@@ -1537,11 +1562,15 @@ async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_
         .map(str::to_owned)
         .to_vec()
     };
-    let listing = ["--list", "--verbose"].map(str::to_owned).to_vec();
+    let registered = ["--list", "--quiet"].map(str::to_owned).to_vec();
+    let running = ["--list", "--running", "--quiet"]
+        .map(str::to_owned)
+        .to_vec();
     let invocations = daemon.invocations();
     for invocation in &invocations {
         assert!(
-            *invocation == listing
+            *invocation == registered
+                || *invocation == running
                 || *invocation == bridge(FIRST_HELPER)
                 || *invocation == bridge(MOVED_HELPER),
             "the daemon started the stand-in with {invocation:?}"
@@ -1555,9 +1584,53 @@ async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_
             .filter(|invocation| *invocation == wanted)
             .count()
     };
-    assert_eq!(count(&listing), 10, "{invocations:?}");
+    assert_eq!(count(&registered), 10, "{invocations:?}");
+    assert_eq!(count(&running), 10, "{invocations:?}");
     assert_eq!(count(&bridge(FIRST_HELPER)), 8, "{invocations:?}");
     assert_eq!(count(&bridge(MOVED_HELPER)), 2, "{invocations:?}");
+}
+
+/// KR-REQ-03.14: a distribution that is running is observed as running when its host prints the
+/// states of `wsl.exe --list --verbose` in another language, and one that is not registered is
+/// observed as not seen. The refresh asks for the names the host registers and the names it runs,
+/// which no language changes, and never for the listing that prints a state as a word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_reads_a_distribution_the_same_whatever_language_its_host_prints() {
+    let daemon = FixtureDaemon::start();
+    std::fs::write(daemon.fixture.join("listing"), utf16le(GERMAN_LISTING))
+        .expect("the host's listing");
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x31; 16]));
+    let approved = enrol_as(
+        &mut client,
+        host,
+        fixture_record(environment_id, FIRST_HELPER),
+    )
+    .await;
+    daemon.answer(FIRST_HELPER, &answered_as(environment_id));
+    let refreshed = refresh_as(&mut client, host, environment_id).await;
+    assert_eq!(
+        refreshed,
+        established(approved, refreshed.row.last_observed_at_ms),
+        "a running distribution on a German host is observed running"
+    );
+
+    // The same host, with the distribution removed from it: the platform answers no name.
+    std::fs::write(daemon.fixture.join("registered"), []).expect("the registered names");
+    std::fs::write(daemon.fixture.join("running"), []).expect("the running names");
+    let gone = refresh_as(&mut client, host, environment_id).await;
+    assert_eq!(gone.row.status, EnvironmentPresence::Stale, "{gone:?}");
+    assert!(!gone.started, "{gone:?}");
+
+    assert!(
+        daemon
+            .invocations()
+            .iter()
+            .all(|invocation| invocation.get(1).map(String::as_str) != Some("--verbose")),
+        "the daemon asked for a listing that prints a word of the host's language: {:?}",
+        daemon.invocations()
+    );
 }
 
 /// The origin a bridge's helper declares for an invocation that began at a person's command line.
