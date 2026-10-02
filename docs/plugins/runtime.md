@@ -617,10 +617,11 @@ does not replay what the run was doing.
 `scripts/sync-bundled-plugins.sh --verify` is the offline half. It recomputes every digest under
 `bundled-plugins/` against the lock and reports any drift, including a file, a directory or a whole
 package that is there and is not in the lock. It checks that the roots run from version 1, that the
-highest is the one `root.json` holds and the lock names, that the highest root's keys are ones this
-build commits, that the index is within the default metadata budget, and the rules a release scan
-applies to what a file is: a binary file of 32 or 64 bytes, a file made only of hexadecimal digits
-or of base64, and a private-key header. It regenerates the two Rust files and reports any
+highest is the one `root.json` holds and the lock names, that the keys of every shipped root are all
+development keys or all production keys this build commits, that the index is within the default
+metadata budget, and that the generation and production time the lock names are the index's. It
+runs the release scan's own checks over every bundled file, so a private key, a key seed or a
+credential is refused whatever the file is called. It regenerates the two Rust files and reports any
 difference. `--verify --release` also requires a root a release trusts, which none is yet, so it
 fails for the committed bundle until the production root exists; no workflow runs it yet.
 `--generate` writes the two Rust files from the bundle on disk. None of them reaches a network,
