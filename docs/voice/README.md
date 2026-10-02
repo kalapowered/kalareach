@@ -129,9 +129,8 @@ alone permits navigating, briefing and composing a prompt as well, and the perso
 rather than finding it later.
 
 A device changes its own voice grant over its own connection. The person at this machine changes any
-device's on the host's own socket. A device changing another device's needs host-management
-authority, which this host does not yet resolve for a device, so it is refused rather than guessed
-at.
+device's on the host's own socket. A device that tries to change another device's is refused: that
+needs host-management authority, and this host does not resolve that right for a device.
 
 ## How a device reaches it
 
