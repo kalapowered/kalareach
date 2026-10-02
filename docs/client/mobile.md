@@ -302,20 +302,21 @@ alone and a release build without it fails.
 
 Xcode finds a signing identity only in the keychains on the user's search list, so the script signs
 by hand and an identity kept in a keychain of its own never has to stay on that list. To that effect
-the script will first build the app with signing off, then generate a `Local.xcconfig` file (ignored
-by the repo, loaded by `Build.xcconfig`) with the team prefix and the path to the Firebase
-configuration, and finally sign the libraries, the app extension, and the app itself by calling
-`scripts/sign-ios.mjs` with the corresponding provisioning profile and entitlements (from the
-corresponding source file). The signing identity is referenced by its SHA-1, and not by name,
+the script will first generate a `Local.xcconfig` file (ignored by the repo, loaded by
+`Build.xcconfig` ) with the team prefix and the path to the Firebase configuration, then build the
+app with signing off, and finally sign the libraries, the app extension, and the app itself by
+calling `scripts/sign-ios.mjs` with the corresponding provisioning profile and entitlements (from
+the corresponding source file). The signing identity is referenced by its SHA1 , and not by name,
 because the name can be ambiguous (when there are multiple keychains). The keychain goes on the end
 of the search list only while the signing commands run, and the script puts the list back as it was
 and locks the keychain afterwards. The script will then verify the signature of the result (using
-`codesign --verify --strict`), as well as the entitlements (against the profile) and IDs. If Xcode
-is to be used for signing, set the values of `KR_SIGN_STYLE`, `KR_SIGN_IDENTITY`, `KR_SIGN_FLAGS`,
-`KR_APP_PROFILE`, `KR_EXTENSION_PROFILE`, and `KR_RUNNER_PROFILE` in the file `Local.xcconfig` (note
-that the paths must be full, because Xcode build settings do not expand `~`). Note that the
+`codesign --verify --strict` ), as well as the entitlements (against the profile) and IDs. If Xcode
+is to be used for signing instead, in a build made by hand, set the values of `KR_SIGN_STYLE` ,
+`KR_SIGN_IDENTITY` , `KR_SIGN_FLAGS` , `KR_APP_PROFILE` , `KR_EXTENSION_PROFILE` , and
+`KR_RUNNER_PROFILE` in the file `Local.xcconfig`, which every build the script makes overwrites
+(note that the paths must be full, because Xcode build settings do not expand `~` ). Note that the
 environment variables cannot be used to set Xcode build settings, because the call to `xcodebuild`
-is done by `tauri ios build`.
+is done by `tauri ios build` .
 
 The script takes its choices from the environment, and its header lists them: the phone's UDID, the
 device lease, the SHA-1 of the signing certificate, the UUIDs of the three provisioning profiles,
@@ -340,10 +341,10 @@ the tests, deletes anything the application put in those groups, and uninstalls 
 is killed, `cleanup` does the same from the record the session left. The sessions are:
 
 - `s0` proves what the other sessions rely on: that the lines the tests say reach the script while
-  they run, that a failing test leaves no picture or recording in its result, and that the
-  application's own picture of itself comes out of its container. It also checks the keychain
-  boundary, brings up the notification prompt with Firebase started, and sends the application to
-  the background and back.
+  they run, that pressing Home keeps the phone awake for as long as a push leg waits, that a failing
+  test leaves no picture or recording in its result, and that the application's own picture of
+  itself comes out of its container. It also checks the keychain boundary, brings up the
+  notification prompt with Firebase started, and sends the application to the background and back.
 - `s1` : send a Firebase notification to the app's registration token, when the app is terminated,
   and again when the app is suspended in the background
 - `s2a` uses the harness build, whose page is the phone shell on a scripted host, with a person at
