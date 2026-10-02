@@ -286,6 +286,58 @@ inherited_reset='
     done
 '
 
+# One session's row in a compacted `kr --json list --include-closed` document, when that row says
+# the session is closed and how, and nothing, with a failure, otherwise. A document is canonical,
+# so a row begins with its first key, `attachments`; the row is the one that carries the session's
+# identity, which no other row does (its own closure carries it too), and a row that is not closed
+# cannot be answered for by another that is.
+closed_row_in() {
+  local rows="${1#*\"sessions\":\[}" session="$2" row
+  [ "$rows" != "$1" ] || return 1
+  while [ -n "$rows" ]; do
+    row="${rows%%\},\{\"attachments\":*}"
+    case "$row" in
+      *'"session_id":"'"$session"'"'*)
+        case "$row" in *'"state":"closed"'*) : ;; *) return 1 ;; esac
+        case "$row" in *'"closure":{'*) : ;; *) return 1 ;; esac
+        printf '%s' "$row"
+        return 0
+        ;;
+    esac
+    [ "$row" != "$rows" ] || break
+    rows="${rows#"$row"}"
+    rows="${rows#\},\{\"attachments\":}"
+  done
+  return 1
+}
+
+# The closure record in a compacted document, whole: the object that follows `"closure":`, closed
+# where its braces close, with a brace inside a string left alone. Two documents that were given
+# the same record carry the same text here.
+closure_text() {
+  awk '
+    {
+      start = index($0, "\"closure\":{")
+      if (start == 0) { exit 1 }
+      start += 10
+      depth = 0; quoted = 0; escaped = 0
+      for (at = start; at <= length($0); at++) {
+        c = substr($0, at, 1)
+        if (quoted) {
+          if (escaped) { escaped = 0 }
+          else if (c == "\\") { escaped = 1 }
+          else if (c == "\"") { quoted = 0 }
+        } else if (c == "\"") { quoted = 1 }
+        else if (c == "{") { depth++ }
+        else if (c == "}") {
+          depth--
+          if (depth == 0) { print substr($0, start, at - start + 1); exit 0 }
+        }
+      }
+      exit 1
+    }'
+}
+
 # The self-test runs the program above on this host, against trees of its own, and checks what it
 # removed and what it left. A stand-in answers for the installed helper: it names the roots the way
 # the product names them on Linux and publishes an identity the way a first use does. Every root a
@@ -677,6 +729,57 @@ self_test_mount_inside() {
     [ -f "$state/registry" ]
 }
 
+# A compacted listing of five sessions: one live, one closed with a closure whose process name holds
+# braces, one that is closing and has no closure yet, one marked closed that says nothing of how, and
+# one that carries a closure and is not marked closed.
+self_test_listing='{"sessions":[{"attachments":0,"closure":null,"created_at_ms":1,"session_id":"live-1","state":"running"},{"attachments":0,"closure":{"closed_at_ms":99,"reason":"close_requested","session_id":"gone-2","terminated":[{"name":"a{brace}\"shell","pid":7}]},"created_at_ms":2,"session_id":"gone-2","state":"closed"},{"attachments":1,"closure":null,"created_at_ms":3,"session_id":"closing-3","state":"closing"},{"attachments":0,"closure":null,"created_at_ms":4,"session_id":"unsaid-4","state":"closed"},{"attachments":0,"closure":{"closed_at_ms":5,"session_id":"odd-5"},"created_at_ms":5,"session_id":"odd-5","state":"running"}]}'
+
+# The row of a session that closed is found, and it is that session's alone.
+self_test_closed_row() {
+  local row
+  row="$(closed_row_in "$self_test_listing" gone-2)" || return 1
+  case "$row" in
+    *'"session_id":"gone-2","state":"closed"'*) : ;;
+    *) return 1 ;;
+  esac
+  case "$row" in
+    *live-1* | *closing-3* | *unsaid-4* | *odd-5*) return 1 ;;
+  esac
+}
+
+# A session that has not been recorded as closed, and how, has no closed row, whatever else the
+# listing holds: a closed row beside it is no answer for it, and neither is a session the listing
+# does not name.
+self_test_open_row() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d" || return 1
+  if closed_row_in "$self_test_listing" closing-3 >"$d/said" 2>&1; then return 1; fi
+  if closed_row_in "$self_test_listing" live-1 >>"$d/said" 2>&1; then return 1; fi
+  if closed_row_in "$self_test_listing" unsaid-4 >>"$d/said" 2>&1; then return 1; fi
+  if closed_row_in "$self_test_listing" odd-5 >>"$d/said" 2>&1; then return 1; fi
+  if closed_row_in "$self_test_listing" absent-6 >>"$d/said" 2>&1; then return 1; fi
+  if closed_row_in '{"sessions":[]}' gone-2 >>"$d/said" 2>&1; then return 1; fi
+  if closed_row_in 'not a listing' gone-2 >>"$d/said" 2>&1; then return 1; fi
+}
+
+# The closure of a row and the closure in a refusal are the same text when they are the same record,
+# a brace inside a string does not end it, and a record made at another time is another text.
+self_test_closure_text() {
+  local row from_row refusal from_refusal other
+  row="$(closed_row_in "$self_test_listing" gone-2)" || return 1
+  from_row="$(printf '%s' "$row" | closure_text)" || return 1
+  [ "$from_row" = '{"closed_at_ms":99,"reason":"close_requested","session_id":"gone-2","terminated":[{"name":"a{brace}\"shell","pid":7}]}' ] || return 1
+  refusal='{"closure":{"closed_at_ms":99,"reason":"close_requested","session_id":"gone-2","terminated":[{"name":"a{brace}\"shell","pid":7}]},"code":"SESSION_CLOSED","ok":false}'
+  from_refusal="$(printf '%s' "$refusal" | closure_text)" || return 1
+  [ "$from_row" = "$from_refusal" ] || return 1
+  other="$(printf '%s' "${refusal/99/100}" | closure_text)" || return 1
+  [ "$other" != "$from_row" ] || return 1
+  # A document with no closure has none to compare.
+  if printf '%s' '{"closure":null,"code":"SESSION_CLOSED"}' | closure_text >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
 # Runs one case and says how it ended. A case that fails shows what the removal said.
 self_test_case() {
   local status=0
@@ -806,6 +909,12 @@ STAND_IN
     "a root on storage the image does not carry is refused, and nothing is removed"
   self_test_case self_test_mount_inside \
     "a directory mounted inside a root is refused before anything is removed"
+  self_test_case self_test_closed_row \
+    "a session that closed has its own closed row found in a listing"
+  self_test_case self_test_open_row \
+    "a session not recorded as closed has no closed row, whatever else the listing holds"
+  self_test_case self_test_closure_text \
+    "a closure is the same text in a row and in a refusal, and another record is another text"
 
   echo "self-test: $self_test_passed passed, $self_test_failed failed, $self_test_not_run not run here"
   [ "$self_test_failed" -eq 0 ]
@@ -1156,6 +1265,16 @@ json_string() {
     }'
 }
 
+# The row of `kr list --include-closed` inside a distribution for one session, once the
+# distribution's own daemon says that session is closed and how; a failure while it does not.
+# Closing is asynchronous, so a distribution stopped before the record is written would test
+# recovery from an interrupted close and not the retention of a completed one.
+closed_row_inside() {
+  local listing
+  listing="$(inside "$1" "'$helper_path' --json list --include-closed" | compact)" || return 1
+  closed_row_in "$listing" "$2"
+}
+
 build_inside "$first"
 start_daemon_inside "$first"
 build_inside "$second"
@@ -1435,6 +1554,20 @@ pass "creating a session in the stopped distribution started it and its daemon, 
 # distribution's daemon, and the answer is that the session closed.
 inside "$second" "'$helper_path' close $created_here" >/dev/null ||
   fail "$second could not close $created_here"
+# The distribution is stopped once its daemon has recorded the closure, which is what the attach
+# below asks about after it starts again.
+retained_row=""
+for _ in $(seq 1 60); do
+  if retained_row="$(closed_row_inside "$second" "$created_here")"; then
+    break
+  fi
+  retained_row=""
+  sleep 1
+done
+[ -n "$retained_row" ] ||
+  fail "$second did not record $created_here as closed within a minute of closing it"
+retained_closure="$(printf '%s' "$retained_row" | closure_text)" ||
+  fail "the closure $second recorded for $created_here could not be read: $retained_row"
 wsl.exe -t "$second" >/dev/null 2>&1 || fail "the second distribution could not be stopped again"
 sleep 2
 [ "$(state_of "$second")" = "Stopped" ] ||
@@ -1453,6 +1586,11 @@ case "$attached" in
   *'"closure":{'*) : ;;
   *) fail "the refusal did not say how the session ended: $attached" ;;
 esac
+# What the destination retained across the stop is the record it made when the session closed.
+answered_closure="$(printf '%s' "$attached" | closure_text)" ||
+  fail "the refusal's closure could not be read: $attached"
+[ "$answered_closure" = "$retained_closure" ] ||
+  fail "the closure the stopped distribution gave back is not the one it recorded: recorded $retained_closure, gave $answered_closure"
 [ "$(state_of "$second")" = "Running" ] ||
   fail "attaching did not start $second, which it needs to ask what became of the session"
 pass "attaching to a closed session in the stopped distribution said how it ended"
