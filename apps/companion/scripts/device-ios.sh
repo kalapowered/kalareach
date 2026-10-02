@@ -235,6 +235,7 @@ read_search_list() {
 
 signing_lock=""
 signing_child=""
+signing_start=""
 signing_paths=()
 signing_before=""
 signing_ended=1
@@ -260,19 +261,31 @@ end_signing() {
   return 1
 }
 
+# Whether the signing command is still the process this shell started: its number, its state and the start
+# time read right after it was started all have to agree. Bash can collect a command that has ended before
+# this shell waits for it, and its number could then belong to another process, so the number alone is
+# never signalled.
+signing_command_runs() {
+  local stat
+  [ -n "$signing_child" ] && [ -n "$signing_start" ] || return 1
+  stat=$(ps -o stat= -p "$signing_child" 2>/dev/null | tr -d ' ')
+  case $stat in '' | Z*) return 1 ;; esac
+  [ "$(process_start "$signing_child")" = "$signing_start" ]
+}
+
 # Stops the signing command, and answers once it has ended. The command starts with the signals this
 # shell ignores, and puts the default ones back as its first act, so a TERM that comes before that act
-# has no effect on it: the TERM is sent again every tenth of a second until the command has ended, and
-# the command is killed if it has not ended after five seconds. The command's number cannot be another
-# process's, since this shell has not collected it yet.
+# has no effect on it: the TERM is sent again every tenth of a second, while the command is still the
+# process that was started, until it has ended, and the command is killed if it has not ended after five
+# seconds. A command whose identity cannot be read is not signalled, and is waited for.
 stop_signing_command() {
   local turns=0
-  while kill -0 "$signing_child" 2>/dev/null && [ "$turns" -lt 50 ]; do
+  while signing_command_runs && [ "$turns" -lt 50 ]; do
     kill "$signing_child" 2>/dev/null
     sleep 0.1
     turns=$((turns + 1))
   done
-  if kill -0 "$signing_child" 2>/dev/null; then
+  if signing_command_runs; then
     say "the signing command did not stop at TERM: killing it"
     kill -9 "$signing_child" 2>/dev/null
   fi
@@ -285,6 +298,7 @@ signing_interrupted() { # <exit status>
   trap '' INT TERM HUP
   [ -n "$signing_child" ] && stop_signing_command
   signing_child=""
+  signing_start=""
   end_signing
   exit "$1"
 }
@@ -308,6 +322,7 @@ with_signing_keychain() { # <command...>
   signing_lock="$work/signing.lock"
   signing_ended=1
   signing_child=""
+  signing_start=""
   mkdir "$signing_lock" 2>/dev/null || die "another build is signing, or one ended without restoring the list: see $signing_lock"
   if ! read_search_list; then rmdir "$signing_lock"; die "the keychain search list could not be read, or it is empty"; fi
   signing_before=$listing
@@ -326,6 +341,7 @@ with_signing_keychain() { # <command...>
     # a TERM stops it; a TERM that comes before that act is sent again by the handler.
     ( trap - INT TERM HUP; exec "$@" ) &
     signing_child=$!
+    signing_start=$(process_start "$signing_child")
     trap 'signing_interrupted 130' INT
     trap 'signing_interrupted 143' TERM
     trap 'signing_interrupted 129' HUP
@@ -333,6 +349,7 @@ with_signing_keychain() { # <command...>
     status=$?
     trap '' INT TERM HUP
     signing_child=""
+    signing_start=""
   else
     status=2
   fi
@@ -493,11 +510,12 @@ process_start() { # <pid>
 # Starts the test run for the phone in the background as a new process that, before it becomes Xcode,
 # writes its own identity into the record (its number, its start time and its result bundle), checks that
 # cleanup has not closed the gate and that the record is still this session's, and only then becomes Xcode.
-# A process that cannot read its start time, finds no record (it never creates one: the session's start
-# does), cannot write its identity, finds the gate closed or finds another session's record, ends without
-# starting Xcode. Cleanup, and the end of a session, close the gate before they read the record, so a
-# driver is either in the record they read or sees the gate closed: no driver can run unseen. Sets
-# runner_pid.
+# A process that cannot read its start time, finds no record, cannot write its identity, finds the gate
+# closed or finds another session's record, ends without starting Xcode. The session's start makes the
+# record and a driver only looks for it, though one that looks just before the record is removed can still
+# write a new file, which cleanup removes. Cleanup, and the end of a session, close the gate before they
+# read the record, so a driver is either in the record they read or sees the gate closed: no driver can
+# run unseen. Sets runner_pid.
 start_driver() { # <the result bundle> <the output file> <xcodebuild arguments...>
   local result=$1 output=$2
   shift 2
@@ -526,12 +544,13 @@ retire_driver() { # <pid>
 # both of which have to agree. 1: it is not, for a number that is gone or has ended (a process that has
 # ended and is not yet collected counts as ended), or has neither the recorded start time nor the recorded
 # result bundle in its command line. 2: doubtful, a live process that has one of the two and not the other,
-# which is no process to touch and none to pass over.
+# or whose state cannot be read, which is no process to touch and none to pass over.
 driver_state() { # <pid> <start time> <result bundle>
   local stat started=0 named=0
   kill -0 "$1" 2>/dev/null || return 1
   stat=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')
-  case $stat in '' | Z*) return 1 ;; esac
+  case $stat in Z*) return 1 ;; esac
+  if [ -z "$stat" ]; then kill -0 "$1" 2>/dev/null && return 2; return 1; fi
   [ "$(process_start "$1")" = "$2" ] && started=1
   ps -ww -o command= -p "$1" 2>/dev/null | grep -qF -- "$3" && named=1
   [ $((started + named)) = 2 ] && return 0
@@ -856,7 +875,10 @@ cleanup() {
   [ -f "$record" ] || { say "no session left a record, so there is nothing of ours to clean up"; return 0; }
   # A record with no target is no session's: only a test run that began after its session had ended wrote
   # into it. Nothing was installed for it, so after any driver it names is stopped there is nothing to clean up.
-  if ! grep -q '^target=' "$record"; then
+  local has_target
+  grep -q '^target=' "$record" 2>/dev/null; has_target=$?
+  [ "$has_target" -le 1 ] || die "the record at $record cannot be read: nothing is touched"
+  if [ "$has_target" = 1 ]; then
     stop_recorded_driver
     say "the record names no session, only a test run that began too late: removed"
     rm -rf "$record" "$record.gate"
