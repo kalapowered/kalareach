@@ -116,7 +116,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The step takes about an hour. A test that waits for something that never comes would
+      # otherwise hold the runner for the job's six hours and every branch's checks behind it, so
+      # the step is given twice its length and no more.
       - name: Test
+        timeout-minutes: 110
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
