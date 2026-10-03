@@ -18,7 +18,7 @@ code under the Apache License 2.0, and the scripts keep their headers.
 
 ## Repository layout
 
-A Cargo workspace and a pnpm workspace share one tree.
+This is both a cargo and a pnpm workspace.
 
 | Path | What it holds |
 | --- | --- |
@@ -71,19 +71,18 @@ control names a registered action, are checked by the host and by `kr-plugin-san
 
 ## Build and test
 
-A build needs:
+Requirements for building the project:
 
 - the toolchain `rust-toolchain.toml` pins, which rustup installs on first use, with its
   `wasm32-wasip2` target for the plugin runtime's test components;
-- Node 22 and the pnpm release `package.json` names;
+- Node version 22 and the version of pnpm specified in `package.json`
 - a C and a C++ compiler, CMake and libclang, which the description service's model runtime is
   built with, and Git and Python 3;
 - on Linux, the headers of the system WebView the companion application's backend links: WebKitGTK
   4.1, GTK 3, libayatana-appindicator, librsvg and libsoup 3;
-- on macOS, Fish, which the worker's terminal suite starts as a root shell;
-- for the managed shell packages, curl, make, patch and tar, the ncurses headers and gettext, and
-  for the PSReadLine package PowerShell 7.4 or later with PSReadLine 2.3.4 or later and before
-  3.0.0.
+- On macOS, fish (for the root shell used in the worker's terminal suites)
+- curl, make, patch, and tar, as well as the headers for ncurses, and gettext (for the managed shell
+  packages), and PowerShell >= 7.4 with PSReadLine >= 2.3.4 < 3.0.0 (for the PSReadLine package)
 
 The lists below hold every step, in order.
 [`scripts/check-clean-checkout.sh`](scripts/check-clean-checkout.sh) runs them in a fresh clone of
@@ -202,7 +201,7 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures
 
 ## Releases
 
-Two release paths exist, and a tag starts each:
+There are two kinds of release, both initiated by creating a tag.
 
 - A tag `packages/v<version>+<commit>` releases the generated `@kalareach/protocol` and
   `@kalareach/plugin-sdk` packages as immutable archives on a GitHub release, through
@@ -215,7 +214,7 @@ Two release paths exist, and a tag starts each:
   [docs/releases/windows-signing.md](docs/releases/windows-signing.md) says what signs, what the
   release carries and how the signing identity is kept.
 
-To see what a package release would carry before tagging one:
+To see what a package release will include, without creating a tag:
 
 ```bash
 bash scripts/release-packages.sh --output /tmp/kalareach-packages
