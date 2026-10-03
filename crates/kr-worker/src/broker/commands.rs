@@ -1739,6 +1739,35 @@ fn launch_profile(
     }
 }
 
+/// The job of a program that was created suspended and has not yet been started, which ends the
+/// program with everything in the job when the launch that holds it ends for any reason before the
+/// launcher says it started it: a refusal, a failed write, a launcher that has gone, a launch
+/// dropped meanwhile.
+///
+/// Nothing the program could have started exists until it has run, so ending it costs nothing, and
+/// the launcher that created it is the one place a program left suspended would otherwise wait for
+/// the session's end.
+#[cfg(windows)]
+struct Unstarted(Option<Arc<crate::windows::job::AgentJob>>);
+
+#[cfg(windows)]
+impl Unstarted {
+    /// The launcher has started the program: it is the person's now, and this ends nothing.
+    fn started(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Unstarted {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            // Best effort: a program that cannot be ended is still in the session's job.
+            let _ = job.terminate(1);
+        }
+    }
+}
+
 /// The program a launcher created, as the worker shows it: its identity, and the job it was put in.
 #[cfg(windows)]
 struct ShownProgram {
@@ -1901,6 +1930,10 @@ async fn continue_launch(
             return Err(error);
         }
     };
+    // From here the program exists, shown to be the launcher's own child made from the held file,
+    // and is ended unless the launcher says it started it.
+    let job = Arc::new(job);
+    let mut unstarted = Unstarted(Some(Arc::clone(&job)));
     // Registered by the reservation, with the program and not the launcher.
     let managed = ManagedProcess::new(
         backend.application_instance_id,
@@ -1927,7 +1960,7 @@ async fn continue_launch(
     };
     // Kept for the broker, which places what the program starts by what its job holds. The
     // registered launch lets it go again if the launch is given back.
-    crate::windows::job::keep_agent(process.clone(), Arc::new(job), None);
+    crate::windows::job::keep_agent(process.clone(), Arc::clone(&job), None);
     let finished = finish_binding(backend, broker, identity, &process, directory).await;
     let (registered, registration) = match finished {
         Ok(finished) => (registered, finished),
@@ -1992,6 +2025,17 @@ async fn continue_launch(
             Ok(()) => BrokerError::denied("this backend was retired"),
         });
     }
+    // The hold on the file ends with the commit. It kept the file from being renamed, deleted or
+    // written between the hash and the program's creation; the program's image is the verdict from
+    // here, which never reads a path, and a program that updates itself in place while it runs
+    // must be able to.
+    drop(
+        backend
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+    );
     #[cfg(feature = "testing")]
     {
         let armed = backend
@@ -2032,11 +2076,10 @@ async fn continue_launch(
         _ => false,
     };
     if resumed {
+        unstarted.started();
         Ok(())
     } else {
-        if let Some(job) = crate::windows::job::agent_job(&process) {
-            let _ = job.terminate(1);
-        }
+        // `unstarted` ends the program and everything in its job as this returns.
         Err(BrokerError::denied(
             "the launcher did not say it started the program it was committed to",
         ))

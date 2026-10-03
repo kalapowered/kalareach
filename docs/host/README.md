@@ -4621,10 +4621,10 @@ end of the backend's standard input that this host writes is closed, which is ho
 to finish, and any write to it that is blocked is cancelled so that it cannot hold the stop up. Then
 a grace period is given to the job, after which the job is terminated if anything in it is left. The
 stop is complete only when the job lists nothing: the backend's root process may have exited while
-the helpers it started are alive, and the backend is then not yet stopped. If the job cannot be
-asked, or a termination fails and leaves something in it, the stop is reported as unresolved. If a
-caller stops a backend while another caller's stop of it is in progress, the second caller waits for
-the first and gets the same answer.
+the helpers it started are alive, and the backend is then not yet stopped. If the job could not be
+asked at any point, even when a later question was answered, or a termination fails and leaves
+something in it, the stop is reported as unresolved. If a caller stops a backend while another
+caller's stop of it is in progress, the second caller waits for the first and gets the same answer.
 
 ## The gateway
 
@@ -5037,11 +5037,14 @@ the program before it commits anything. The program has to be the launcher's own
 have started after the backend was established, it has to have been created from the file the worker
 hashed and has held open since, and it is put in a job of its own before it has run. The instance,
 the registration, the transport's record and that job all name the program and never the launcher,
-and the registration is published only at this point. When the backend says the launch is committed,
-the launcher starts the program, says that it has, and waits, and it then ends with the program's
-whole 32-bit exit code. A program that is committed and not started within four seconds is ended,
-with everything in its job. If anything goes wrong before the commit, the program never ran: the
-launcher ends it and runs the command as typed. A launcher that cannot create its program says why
+and the registration is published only at this point. The worker lets go of the hashed file when it
+commits, so a program that updates itself while it runs is not held to its old file, and the verdict
+it took stands for the process. When the backend says the launch is committed, the launcher starts
+the program, says that it has, and waits, and it then ends with the program's
+whole 32-bit exit code. A program that is committed and not started within four seconds, or whose
+launcher is gone before it can be told, is ended with everything in its job, and so is a program
+shown to the worker when the launch fails after it. If anything goes wrong before the commit, the
+program never ran: the launcher ends it and runs the command as typed. A launcher that cannot create its program says why
 in its frame, and the worker keeps the reason on the backend, because no instance exists to keep it.
 
 A program the integration did not launch is adopted, never given a gateway after the fact. Four
