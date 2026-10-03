@@ -88,15 +88,17 @@ pub(crate) trait Table {
 
 /// Checks one answer of class 88 and returns the start it carries.
 ///
-/// The answer must be of a process that is still running (the end time is zero), must say it was
-/// created some time ago and not before the clock began, and the difference must not overflow:
-/// anything else is not a reading of a start.
+/// The answer must be of a process that is still running (the end time is zero), must carry the
+/// interrupt time now (an answer the kernel did not fill in reads zero), must say the process was
+/// created no earlier than the clock began, and the difference must not overflow: anything else is
+/// not a reading of a start. A process read within the interrupt tick it was created in says it
+/// was created zero ago, which is a start like any other.
 pub(crate) fn start_in(answer: &Uptime) -> Result<Option<u64>, String> {
     if answer.end_interrupt_time != 0 {
         return Ok(None);
     }
-    if answer.time_since_creation == 0 {
-        return Err("the kernel says the process was created at this instant".to_owned());
+    if answer.query_interrupt_time == 0 {
+        return Err("the kernel gave no interrupt time with the process's age".to_owned());
     }
     answer
         .query_interrupt_time
@@ -672,12 +674,17 @@ mod tests {
         };
         assert_eq!(start_in(&answer(1_000, 400, 0)), Ok(Some(600)));
         assert_eq!(
+            start_in(&answer(1_000, 0, 0)),
+            Ok(Some(1_000)),
+            "a process read within the tick it was created in is as old as the tick"
+        );
+        assert_eq!(
             start_in(&answer(1_000, 400, 900)),
             Ok(None),
             "a process that has ended has no start to place"
         );
         for implausible in [
-            answer(1_000, 0, 0),
+            answer(0, 0, 0),
             answer(1_000, 1_000, 0),
             answer(1_000, 2_000, 0),
         ] {
