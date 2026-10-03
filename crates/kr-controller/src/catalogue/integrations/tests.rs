@@ -347,6 +347,26 @@ fn a_platform_that_says_why_its_backends_do_not_run_has_the_reason_in_the_check(
         "the reason is in the check: {}",
         shown.detail()
     );
+    // Nowhere else: where the backends run, or where no integration is on, the reason is not
+    // stated whatever the host carries.
+    for (elsewhere, enabled_names) in [
+        (
+            Host {
+                backends: true,
+                ..host.clone()
+            },
+            enabled(&["claude-code"]),
+        ),
+        (host.clone(), enabled(&[])),
+    ] {
+        let reported = report(Some(&reading), &[], &enabled_names, &elsewhere);
+        let shown = check(&reported, &enabled_names);
+        assert!(
+            !shown.detail().contains(because),
+            "no reason where it does not apply: {}",
+            shown.detail()
+        );
+    }
     let silent = Host {
         backends_failure: None,
         ..host

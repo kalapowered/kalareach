@@ -3,12 +3,12 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
-//! | [`conpty`] | The pseudo-console, its two pipes, the shell inside it and the reader that drains it |
-//! | [`file`] | A file as the kernel identifies it, and the file a process was created from |
-//! | [`job`] | The per-session job object: kill-on-close, breakaway disabled, and the processes it holds |
-//! | [`lineage`] | Which process started a process and when, on the kernel's interrupt clock |
-//! | [`launch`] | Starting an agent in its jobs with only the handles it is given |
-//! | [`pin`] | Holding the directory a command's program works in, so a grant is made of the directory it is in |
+//! | `conpty` | The pseudo-console, its two pipes, the shell inside it and the reader that drains it |
+//! | `file` | A file as the kernel identifies it, and the file a process was created from |
+//! | `job` | The per-session job object: kill-on-close, breakaway disabled, and the processes it holds |
+//! | `lineage` | Which process started a process and when, on the kernel's interrupt clock |
+//! | `launch` | Starting an agent in its jobs with only the handles it is given |
+//! | `pin` | Holding the directory a command's program works in, so a grant is made of the directory it is in |
 //!
 //! Section 7 puts the three together. The worker holds the sole owning handle for a per-session
 //! job object with kill-on-close; every process it starts joins that job **before** it runs, which
@@ -20,7 +20,7 @@
 //! What this platform does not have is a foreground process group, so there is nothing to signal.
 //! The console's own interrupt is a byte written into the pseudo-console's input, which the
 //! console host turns into a control event for whatever is attached to it: see
-//! [`conpty::Console::interrupt`].
+//! `conpty::Console::interrupt`.
 
 #[cfg(windows)]
 pub mod conpty;
