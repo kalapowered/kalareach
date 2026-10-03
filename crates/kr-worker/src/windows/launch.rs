@@ -172,7 +172,7 @@ mod platform {
     use std::os::windows::process::ExitStatusExt as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, PoisonError, RwLock};
+    use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
     use windows_sys::Win32::Foundation::{
         ERROR_OPERATION_ABORTED, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
@@ -317,7 +317,9 @@ mod platform {
     ///
     /// A write holds a shared lock for as long as it runs. Closing cancels any write that is
     /// blocked, which ends it with an error, and then takes the lock to close the handle, so no
-    /// write is ever on a handle another thread is closing.
+    /// write is ever on a handle another thread is closing. Two closes are made one after the
+    /// other: the cancel of one is never made on a handle the other has closed, whose value the
+    /// system may hand to something else.
     #[derive(Clone)]
     pub struct StdinPipe {
         shared: Arc<Shared>,
@@ -325,9 +327,12 @@ mod platform {
 
     struct Shared {
         /// The handle's value, kept for the cancel, which does not take the lock a blocked write
-        /// holds. It is read only while a writer holds the lock, so the handle is open.
+        /// holds. It is used only while `closing` is held, which nothing but a close can end the
+        /// handle's life under, so the handle is open.
         raw: AtomicUsize,
         handle: RwLock<Option<OwnedHandle>>,
+        /// Held for the whole of a close.
+        closing: Mutex<()>,
     }
 
     impl std::fmt::Debug for StdinPipe {
@@ -345,6 +350,7 @@ mod platform {
                 shared: Arc::new(Shared {
                     raw: AtomicUsize::new(handle.as_raw_handle() as usize),
                     handle: RwLock::new(Some(handle)),
+                    closing: Mutex::new(()),
                 }),
             }
         }
@@ -360,6 +366,11 @@ mod platform {
         /// Returns why a write that was cancelled did not end in time. The pipe is then still
         /// open, and whatever ends the agent ends that write with it.
         pub fn close(&self) -> Result<(), String> {
+            let _closing = self
+                .shared
+                .closing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let deadline = std::time::Instant::now() + CLOSE_PATIENCE;
             loop {
                 if let Ok(mut handle) = self.shared.handle.try_write() {
@@ -370,8 +381,8 @@ mod platform {
                 }
                 let raw = self.shared.raw.load(Ordering::SeqCst);
                 if raw != 0 {
-                    // SAFETY: a write holds the lock, so the handle is open; a null overlapped
-                    // cancels every request on the handle. A handle with nothing pending answers
+                    // SAFETY: the handle is not closed, because only a close closes it and this
+                    // is the one running; a null overlapped cancels every request on the handle. A handle with nothing pending answers
                     // with a failure that is the outcome wanted.
                     unsafe { CancelIoEx(raw as HANDLE, std::ptr::null()) };
                 }
