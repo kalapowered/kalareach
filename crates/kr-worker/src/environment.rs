@@ -52,31 +52,25 @@ pub const WORKER_ENDPOINT_VARIABLE: &str = "KR_WORKER_ENDPOINT";
 /// The prefix reserved for KalaReach's own bootstrap values.
 ///
 /// A creator's snapshot cannot set one of these. They come from the worker or not at all.
-pub const RESERVED_PREFIX: &str = "KR_";
+pub const RESERVED_PREFIX: &str = kr_protocol::hostinfo::configuration::RESERVED_VARIABLE_PREFIX;
 
 /// Physical-terminal identity variables that are removed from an inherited environment.
 ///
 /// Each one names a terminal emulator the session is not. Passing them through would let a shell
 /// plugin enable an escape-sequence feature on the strength of a false identity, and the failure
-/// would show up as corrupted output rather than as a missing feature.
-pub const TERMINAL_IDENTITY_VARIABLES: &[&str] = &[
-    "ITERM_SESSION_ID",
-    "ITERM_PROFILE",
-    "LC_TERMINAL",
-    "LC_TERMINAL_VERSION",
-    "VTE_VERSION",
-    "WT_SESSION",
-    "WT_PROFILE_ID",
-    "KONSOLE_VERSION",
-    "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
-];
+/// would show up as corrupted output rather than as a missing feature. The lists a creator's
+/// environment is filtered by are the protocol's, which is also what a configuration is refused
+/// additions by: one list of the names this host owns.
+pub const TERMINAL_IDENTITY_VARIABLES: &[&str] =
+    kr_protocol::hostinfo::configuration::TERMINAL_IDENTITY_VARIABLES;
 
 /// Prefixes of physical-terminal identity variables that are removed.
-pub const TERMINAL_IDENTITY_PREFIXES: &[&str] = &["KONSOLE_DBUS_"];
+pub const TERMINAL_IDENTITY_PREFIXES: &[&str] =
+    kr_protocol::hostinfo::configuration::TERMINAL_IDENTITY_PREFIXES;
 
 /// Variables that describe the creator's own terminal device rather than the new session's.
-pub const CREATOR_TERMINAL_VARIABLES: &[&str] = &["SSH_TTY", "TERM", "COLORTERM", "SHELL"];
+pub const CREATOR_TERMINAL_VARIABLES: &[&str] =
+    kr_protocol::hostinfo::configuration::CREATOR_TERMINAL_VARIABLES;
 
 /// What the environment of one session was built from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,16 +222,7 @@ pub struct ExecutionContext {
 /// A desktop-bound session needs the display and the session bus to reach the desktop it belongs
 /// to. A headless one has none of them, and passing a stale one through from a creator's snapshot
 /// would point the session at a desktop that is not there.
-pub const DESKTOP_VARIABLES: &[&str] = &[
-    "DBUS_SESSION_BUS_ADDRESS",
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "XAUTHORITY",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_RUNTIME_DIR",
-    "XDG_SESSION_ID",
-    "XDG_SESSION_TYPE",
-];
+pub const DESKTOP_VARIABLES: &[&str] = kr_protocol::hostinfo::configuration::DESKTOP_VARIABLES;
 
 impl ExecutionContext {
     /// Resolves the context a worker of this profile runs in.
@@ -596,6 +581,50 @@ mod tests {
             Some(":0")
         );
         assert_eq!(built.sources.path, "execution context");
+    }
+
+    /// KR-REQ-07.25: one list of the names this host owns. What the worker removes from a
+    /// creator's environment is what a configuration is refused as an addition, and no ordinary
+    /// name is either.
+    #[test]
+    fn the_names_the_worker_removes_are_the_names_a_configuration_may_not_add() {
+        use kr_protocol::hostinfo::configuration::host_owns_variable;
+
+        let owned: Vec<&str> = DESKTOP_VARIABLES
+            .iter()
+            .chain(TERMINAL_IDENTITY_VARIABLES)
+            .chain(CREATOR_TERMINAL_VARIABLES)
+            .copied()
+            .chain(["KR_SESSION", "KR_ANYTHING", "KONSOLE_DBUS_SESSION"])
+            .collect();
+        for name in owned {
+            assert!(host_owns_variable(name), "{name} is owned");
+            let built = built_with(&[(name, "from-a-creator")], &ExecutionContext::default());
+            assert!(
+                built.removed.iter().any(|removed| removed == name),
+                "{name} is removed from a creator's environment"
+            );
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "EDITOR",
+            "GOPATH",
+            "TERMINFO_X",
+        ] {
+            assert!(
+                !host_owns_variable(name),
+                "{name} is nobody's but the person's"
+            );
+            let built = built_with(&[(name, "from-a-creator")], &ExecutionContext::default());
+            assert_eq!(
+                built.variables.get(name).map(String::as_str),
+                Some("from-a-creator"),
+                "{name} is kept"
+            );
+        }
     }
 
     #[test]
