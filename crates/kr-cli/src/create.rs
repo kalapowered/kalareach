@@ -1,4 +1,4 @@
-//! Choosing the palette a new session starts with.
+//! Choosing what a new session starts with: its palette and its environment.
 //!
 //! Section 8 fixes a session's palette at creation and records where it came from. There are three
 //! honest answers: the profile's own default, one of the two presets, and the foreground and
@@ -7,7 +7,9 @@
 //! attributed to a probe nobody ran would be a provenance the session made up.
 
 use kr_client::shown::Shown;
-use kr_protocol::session::{PalettePreset, PaletteRequest, Presentation, ProbedPalette};
+use kr_protocol::session::{
+    EnvironmentVariable, PalettePreset, PaletteRequest, Presentation, ProbedPalette,
+};
 
 use crate::attach::RestorationGuard;
 use crate::error::{CliError, Result};
@@ -35,6 +37,23 @@ impl std::fmt::Debug for Chosen {
             .field("typed", &self.typed.len())
             .finish()
     }
+}
+
+/// The environment a create carries.
+///
+/// What `shown` returns for a session the person is shown, which the host filters for the
+/// terminal's identity and for reserved variables. Nothing for a session nobody is shown: the host
+/// starts it with the environment of its own execution context, and refuses a request that sends
+/// variables with it rather than ignore them. Every create, from this host's command line or over
+/// a bridge, follows this one rule.
+pub fn environment_snapshot(
+    presentation: Presentation,
+    shown: impl FnOnce() -> Vec<EnvironmentVariable>,
+) -> Vec<EnvironmentVariable> {
+    if presentation == Presentation::Invisible {
+        return Vec::new();
+    }
+    shown()
 }
 
 /// What `--palette` was given.
@@ -197,6 +216,27 @@ mod tests {
             refusal.to_string().contains("light, dark or probe"),
             "the refusal names what the option takes: {refusal}"
         );
+    }
+
+    /// KR-REQ-07.25: a create for a session nobody is shown carries no environment of the caller's:
+    /// the host starts it with its own, and a request that sent variables with it would be refused.
+    /// A create for a session the person is shown carries the caller's.
+    #[test]
+    fn an_invisible_create_carries_no_environment_and_a_visible_one_carries_the_callers() {
+        let variables = || {
+            vec![EnvironmentVariable {
+                name: "KR_EXAMPLE".to_owned(),
+                value: "kept".to_owned(),
+            }]
+        };
+        assert!(environment_snapshot(Presentation::Invisible, variables).is_empty());
+        for presentation in [Presentation::Attach, Presentation::Terminal] {
+            assert_eq!(
+                environment_snapshot(presentation, variables),
+                variables(),
+                "{presentation:?}"
+            );
+        }
     }
 
     /// KR-REQ-08.44: a preset is what a no-probe or invisible creation selects.

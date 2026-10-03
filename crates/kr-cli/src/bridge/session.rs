@@ -256,7 +256,9 @@ where
         cwd: Nullable::some(new.cwd.clone().unwrap_or(base.home)),
         dimensions: Nullable(new.dimensions),
         worker_profile: profile,
-        environment_snapshot: base.variables,
+        environment_snapshot: crate::create::environment_snapshot(new.presentation, || {
+            base.variables
+        }),
         palette: Nullable(new.palette),
         launch_profile: new.launch_profile.clone(),
         terminal: Nullable::null(),
