@@ -3280,7 +3280,11 @@ mod tests {
     }
 
     /// A path whose part that does not exist holds a parent component lies nowhere that can be said
-    /// before it is made, so it is not used: the runtime files go below the home directory.
+    /// before it is made, so it is not used: the runtime files go below the home directory. That is
+    /// a Unix path's rule, where the filesystem resolves each `..` against the directory it has
+    /// reached; Windows resolves it in the spelling before the filesystem sees the path, so there
+    /// the path lies where its spelling says.
+    #[cfg(unix)]
     #[test]
     fn a_missing_directory_that_climbs_out_again_is_not_taken_for_the_distributions_own() {
         let root = temporary_root("climbing-runtime");
