@@ -28,6 +28,11 @@ use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
@@ -132,10 +137,61 @@ pub(super) fn environment_block(
 }
 
 /// The program the launcher created, suspended.
+///
+/// A job of the launcher's own holds it from before its first instruction until it has been started,
+/// with the job set to end what it holds when its last handle closes, and this launcher holds the
+/// only one. A launcher that stops for any reason in that time, whatever the backend has or has not
+/// done, ends the program it created, which nothing could start. Once the backend has committed the
+/// launch the setting is taken off, so the launcher's own end ends nothing the program started.
 pub(super) struct Program {
     process: OwnedHandle,
     thread: OwnedHandle,
     id: u32,
+    /// The job that holds the program until it has been started.
+    holder: OwnedHandle,
+}
+
+/// Sets what ending the job's last handle does to what it holds: ends it, or nothing.
+fn ends_with_its_handle(job: &OwnedHandle, ends: bool) -> Result<(), String> {
+    // SAFETY: all zeroes is a structure of integers and pointers that the call reads only as far
+    // as the flags this sets.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    if ends {
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    }
+    // SAFETY: the handle is the job's, open for the call, and the structure is a local of the size
+    // told.
+    let set = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle().cast(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0),
+        )
+    };
+    if set == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// Makes the job a program is held by until it has been started: its own, ending what it holds
+/// when its last handle closes.
+fn holder() -> Result<OwnedHandle, String> {
+    // SAFETY: no attributes and no name are asked for; the call returns a handle or null.
+    let made = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if made.is_null() {
+        return Err(format!(
+            "no job could be made to hold the program: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the call reported a handle this process owns and nothing else holds.
+    let job = unsafe { OwnedHandle::from_raw_handle(made.cast()) };
+    ends_with_its_handle(&job, true).map_err(|failure| {
+        format!("the program's job could not be set to end with this launcher: {failure}")
+    })?;
+    Ok(job)
 }
 
 impl Program {
@@ -163,6 +219,7 @@ impl Program {
             .chain(std::iter::once(0))
             .collect();
         let environment = environment_block(std::env::vars_os(), variables);
+        let holder = holder()?;
         let mut handles: Vec<HANDLE> = Vec::new();
         let mut standard = [std::ptr::null_mut::<std::ffi::c_void>(); 3];
         for (slot, which) in
@@ -256,11 +313,29 @@ impl Program {
                 OwnedHandle::from_raw_handle(started.hThread.cast()),
             )
         };
-        Ok(Self {
+        let program = Self {
             process,
             thread,
             id: started.dwProcessId,
-        })
+            holder,
+        };
+        // SAFETY: both handles are open for the call and this value owns them.
+        let held = unsafe {
+            AssignProcessToJobObject(
+                program.holder.as_raw_handle().cast(),
+                program.process.as_raw_handle().cast(),
+            )
+        };
+        if held == 0 {
+            let failure = std::io::Error::last_os_error();
+            // Not yet held by anything of this launcher's, and not run: ended here, so that no
+            // suspended program is left for a launcher that now runs the typed command.
+            program.end();
+            return Err(format!(
+                "the program could not be held by a job of this launcher's: {failure}"
+            ));
+        }
+        Ok(program)
     }
 
     /// Ends the program, which has not run: nothing it could have started exists.
@@ -269,8 +344,16 @@ impl Program {
         unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
     }
 
-    /// Starts the program.
+    /// Lets the job that held the program until now go without ending what it holds, and starts the
+    /// program.
+    ///
+    /// Called once the backend has committed the launch, which is after it has shown the program
+    /// and taken it into a job of its own that ends it should the launcher go before it says the
+    /// program started. The job is let go of first, so a program that is running is never one that
+    /// a launcher's end would end, and a job that cannot be let go of leaves the program unstarted.
     fn resume(&self) -> Result<(), String> {
+        ends_with_its_handle(&self.holder, false)
+            .map_err(|failure| format!("the program's job could not be released: {failure}"))?;
         // SAFETY: the thread is the one the creation made, suspended, and this handle is the only
         // one for it.
         if unsafe { ResumeThread(self.thread.as_raw_handle().cast()) } == u32::MAX {
