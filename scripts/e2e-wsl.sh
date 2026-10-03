@@ -1166,11 +1166,13 @@ cleanup() {
     (separate_groups) &
     restoring=$!
     waited=0
-    while kill -0 "$restoring" 2>/dev/null && [ "$waited" -lt 300 ]; do
+    # Asked of the shell's own jobs and not of the system, which may have given the number of a
+    # job that ended to another process.
+    while jobs -rp | grep -qx "$restoring" && [ "$waited" -lt 300 ]; do
       sleep 5
       waited=$((waited + 5))
     done
-    if kill -0 "$restoring" 2>/dev/null; then
+    if jobs -rp | grep -qx "$restoring"; then
       kill "$restoring" 2>/dev/null || true
       echo "the two environments were not put back in groups of their own within five minutes"
     elif ! wait "$restoring"; then
@@ -1934,7 +1936,7 @@ pairing_case() {
 }
 
 # The JSON a case printed on a line of one kind, which is the first such line.
-pairing_line() { sed -n "s/.*KR-ACC $1 //p" "$pairing_log" | head -n 1; }
+pairing_line() { sed -n "s/.*acceptance-fact $1 //p" "$pairing_log" | head -n 1; }
 
 # What each distribution's daemon holds of devices and grants, as the suite reports it.
 first_held=""

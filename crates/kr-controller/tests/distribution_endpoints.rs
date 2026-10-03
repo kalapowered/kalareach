@@ -24,7 +24,7 @@
 //! * `report_the_devices_and_grants` prints what this installation holds of both, which the script
 //!   compares across a change of machine group.
 //!
-//! Each case prints the facts the script needs on lines that start with `KR-ACC`.
+//! Each case prints the facts the script needs on lines that start with `acceptance-fact`.
 
 #![cfg(unix)]
 
@@ -132,7 +132,7 @@ fn unhex(text: &str) -> [u8; 32] {
 
 /// One line the script reads.
 fn report(kind: &str, value: &serde_json::Value) {
-    println!("KR-ACC {kind} {value}");
+    println!("acceptance-fact {kind} {value}");
 }
 
 /// The directory this suite keeps its keys and records in: owner-only, and this account's own.

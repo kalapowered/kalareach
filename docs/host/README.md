@@ -1559,13 +1559,13 @@ host's.
 
 A distribution whose configuration selects the network has an endpoint of its own on it, and each
 installation keeps its own keys and records, so pairing a device with that distribution pairs it
-with no other. Unless the device was also paired with another distribution, that distribution holds
-no record of it and ends its connection. The networking mode does not change this. The distributions
-share one loopback in both modes, so the check is about the endpoints and not about the bridge.
-Machine groups follow the same rule. Joining, splitting or merging the groups of two distributions
-changes the record each environment keeps of its own group, and the receipt of the step, and nothing
-else. The devices each distribution lists and the grants it lists stay as they were, and each device
-still reaches only the distribution it was paired with. The acceptance checks this inside two
+with no other. Another distribution holds no record of the device, unless the device was also paired
+with it, and ends its connection. The networking mode does not change this. The distributions share
+one loopback in both modes, so the check is about the endpoints and not about the bridge. Machine
+groups follow the same rule. Joining, splitting or merging the groups of two distributions changes
+the record each environment keeps of its own group, and the receipt of the step, and nothing else.
+The devices each distribution lists and the grants it lists stay as they were, and each device still
+reaches only the distribution it was paired with. The acceptance checks this inside two
 distributions, once in each networking mode: it pairs a viewer with each one through that
 distribution's own owner, connects each viewer to both, and takes the group steps from Windows over
 the process bridge.
