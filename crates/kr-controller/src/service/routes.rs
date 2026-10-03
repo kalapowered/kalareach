@@ -768,12 +768,14 @@ impl Controller {
                         }
                         outcome
                     }
-                    Ok(crate::grants::ActionClaim::Recorded(_)) => {
+                    Ok(crate::grants::ActionClaim::Recorded(record)) => {
                         // A claim can be recorded between the retained lookup before a first
                         // admission and this one. What the action produced is given back only
                         // under authority that has not been withdrawn, and the answer is waited
                         // for first: it is the check made with the answer in hand that decides.
-                        let answered = self.retained_authority_answer(actor_id, mutation).await;
+                        let answered = self
+                            .recorded_authority_change(actor_id, mutation, record)
+                            .await;
                         #[cfg(feature = "testing")]
                         self.after_the_retained_lookup.wait().await;
                         if let Err(error) = self.check_retained_answer(connection_id, admitted) {
@@ -783,13 +785,7 @@ impl Controller {
                                 error.to_string(),
                             );
                         }
-                        return answered.unwrap_or_else(|| {
-                            error_reply(
-                                mutation.request_id,
-                                ErrorCode::ResourceUnavailable,
-                                "another attempt under this action identifier has not finished",
-                            )
-                        });
+                        return respond(mutation.request_id, answered);
                     }
                     Err(error) => Err(error),
                 }
