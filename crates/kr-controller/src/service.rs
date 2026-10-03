@@ -836,6 +836,10 @@ mod a_link_that_is_not_given_back;
 #[cfg(test)]
 mod a_lease_that_runs_out_at_a_worker;
 
+/// The voice coordinator's reads of a grant, decided on this host's clock floor.
+#[cfg(test)]
+mod a_voice_grant_on_the_floor;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;
