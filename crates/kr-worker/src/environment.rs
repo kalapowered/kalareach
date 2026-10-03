@@ -816,74 +816,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// A creator's values are the creator's text: a line break in one cannot start a line of the
-    /// worker's own.
+    /// A creator's database directories are the creator's text, and a configuration can have added
+    /// them: what the worker logs and what a debug print of the selection shows names the variables
+    /// and never what they hold.
     #[test]
-    fn a_creators_value_cannot_end_the_line_the_worker_logs() {
-        let hostile = built_with(
+    fn what_the_worker_logs_names_a_creators_database_directories_and_never_quotes_them() {
+        let built = built_with(
             &[
                 (
                     "TERMINFO",
-                    "/x\nkr-worker: session s: terminfo: private database /evil",
+                    "/home/someone/planted-first\nkr-worker: session s: terminfo: private database /evil",
                 ),
-                ("TERMINFO_DIRS", "/a\r\u{1b}[31m:/b\u{85}c"),
+                ("TERMINFO_DIRS", "/opt/planted-second:/b\u{85}c"),
             ],
             &with_private_database("/state/terminfo/ab"),
         );
-        let line = hostile.sources.terminfo.describe();
+        let selection = &built.sources.terminfo;
+        let line = selection.describe();
+        for printed in [
+            line.clone(),
+            format!("{selection:?}"),
+            format!("{:?}", built.sources),
+        ] {
+            assert!(!printed.contains("planted"), "{printed:?}");
+            assert!(!printed.contains("evil"), "{printed:?}");
+            assert!(!printed.contains("/home/someone"), "{printed:?}");
+        }
+        assert!(!line.chars().any(char::is_control), "{line:?}");
         assert!(
-            !line.chars().any(char::is_control),
-            "the line holds a control character: {line:?}"
-        );
-        let separators = built_with(
-            &[("TERMINFO", "/a\u{2028}b\u{2029}c\u{202e}d\u{200f}e")],
-            &with_private_database("/state/terminfo/ab"),
-        );
-        let marked = separators.sources.terminfo.describe();
-        assert!(
-            !marked.chars().any(|character| matches!(
-                character,
-                '\u{2028}' | '\u{2029}' | '\u{202e}' | '\u{200f}'
-            )),
-            "the line holds a separator or a direction mark: {marked:?}"
-        );
-        assert!(
-            marked.contains(r"/a\u{2028}b\u{2029}c\u{202e}d\u{200f}e"),
-            "{marked}"
-        );
-        assert!(
-            line.contains(r"TERMINFO=/x\nkr-worker: session s:"),
-            "{line}"
-        );
-        assert!(line.contains(r"\r\u{1b}[31m"), "{line}");
-        let plain = built_with(
-            &[("TERMINFO", "/home/a/\u{e9}.terminfo")],
-            &with_private_database("/state/terminfo/ab"),
-        );
-        assert!(
-            plain
-                .sources
-                .terminfo
-                .describe()
-                .contains("/home/a/\u{e9}.terminfo"),
-            "text that is not a control character is written as it is"
+            line.contains("TERMINFO, TERMINFO_DIRS"),
+            "the names are said: {line}"
         );
     }
 
-    /// Every character the Unicode standard names as a bidirectional control, and both separators,
-    /// is written as an escape, and text that only reads right to left is not.
+    /// A reason the worker has no private database is text of the host's own, and it cannot end
+    /// the line the worker logs either.
     #[test]
-    fn every_bidirectional_control_and_separator_is_written_as_an_escape() {
+    fn a_reason_cannot_end_the_line_the_worker_logs() {
+        let unavailable = |reason: &str| {
+            built_with(
+                &[],
+                &ExecutionContext {
+                    terminfo_unavailable: Some(reason.to_owned()),
+                    ..ExecutionContext::default()
+                },
+            )
+            .sources
+            .terminfo
+            .describe()
+        };
+        let hostile = unavailable(
+            "/x\nkr-worker: session s: terminfo: private database /evil\r\u{1b}[31m\u{85}",
+        );
+        assert!(
+            !hostile.chars().any(char::is_control),
+            "the line holds a control character: {hostile:?}"
+        );
+        assert!(hostile.contains(r"/x\nkr-worker: session s:"), "{hostile}");
         let controls = [
             '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
             '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{2028}', '\u{2029}',
         ];
         for control in controls {
-            let built = built_with(
-                &[("TERMINFO", &format!("/a{control}b"))],
-                &with_private_database("/state/terminfo/ab"),
-            );
-            let line = built.sources.terminfo.describe();
+            let line = unavailable(&format!("/a{control}b"));
             assert!(
                 !line.contains(control),
                 "U+{:04X} reached the line as it is: {line:?}",
@@ -895,21 +890,15 @@ mod tests {
                 u32::from(control)
             );
         }
-        let arabic = built_with(
-            &[(
-                "TERMINFO",
-                "/\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}",
-            )],
-            &with_private_database("/state/terminfo/ab"),
-        );
-        assert!(
-            arabic
-                .sources
-                .terminfo
-                .describe()
-                .contains("/\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}"),
-            "letters that read right to left are text, not controls"
-        );
+        for plain in [
+            "/home/a/\u{e9}.terminfo",
+            "/\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}",
+        ] {
+            assert!(
+                unavailable(plain).contains(plain),
+                "text that is not a control character is written as it is: {plain}"
+            );
+        }
     }
 
     #[test]
@@ -920,8 +909,8 @@ mod tests {
         );
         assert_eq!(
             private.sources.terminfo.describe(),
-            "terminfo: private database /state/terminfo/ab; the creator's \
-             TERMINFO=/home/a/.terminfo follow it"
+            "terminfo: private database /state/terminfo/ab; the creator's database \
+             directories (TERMINFO) follow it"
         );
         let failed = built_with(
             &[("TERMINFO_DIRS", "/opt/one")],
@@ -933,7 +922,7 @@ mod tests {
         assert_eq!(
             failed.sources.terminfo.describe(),
             "terminfo: no private database (the disk is full); the host's own applies; the \
-             creator's TERMINFO_DIRS=/opt/one stay as they were"
+             creator's database directories (TERMINFO_DIRS) stay as they were"
         );
         assert_eq!(
             failed.variables.get("TERMINFO_DIRS").map(String::as_str),

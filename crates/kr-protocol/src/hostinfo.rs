@@ -9006,6 +9006,15 @@ mod tests {
             vec![("COLORTERM", "truecolor")],
             vec![("SHELL", "/bin/zsh")],
             vec![("SSH_TTY", "/dev/pts/9")],
+            // The same names spelled in another case: a document means the same on every
+            // platform, and where the platform folds case the host's own copy would win.
+            vec![("kr_session", "x")],
+            vec![("Kr_Anything", "x")],
+            vec![("Iterm_Session_Id", "x")],
+            vec![("Konsole_Dbus_Session", "x")],
+            vec![("Term", "xterm")],
+            vec![("Display", ":0")],
+            vec![("shell", "/bin/zsh")],
             // Not names a variable can have.
             vec![("", "x")],
             vec![("1ST", "x")],
@@ -9021,6 +9030,22 @@ mod tests {
             for document in [at_host(&refused), in_profile(&refused)] {
                 configuration::validate(&document)
                     .expect_err(&format!("{refused:?} is not a set of additions"));
+            }
+        }
+
+        // Two names this platform holds as one are two answers for one variable, and neither is
+        // chosen for the owner. Elsewhere the two are two variables, and an owner who sets both
+        // `http_proxy` and `HTTP_PROXY` for the tools that read one each means both.
+        for pair in [
+            vec![("Path", "/a"), ("PATH", "/b")],
+            vec![("http_proxy", "http://a"), ("HTTP_PROXY", "http://a")],
+        ] {
+            for document in [at_host(&pair), in_profile(&pair)] {
+                assert_eq!(
+                    configuration::validate(&document).is_err(),
+                    cfg!(windows),
+                    "{pair:?}"
+                );
             }
         }
 
