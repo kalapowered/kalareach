@@ -505,7 +505,9 @@ pub(crate) fn executable_of(pid: u32) -> Option<String> {
 /// Linux's start value counts clock ticks since boot, so it is one. macOS keeps the host's absolute
 /// time at the fork beside the wall-clock start the identity carries, which a change of the clock
 /// can move back; it is read here, with the identifier checked to name the same process afterwards.
-/// Windows records a creation time on the wall clock only, so there is none there.
+/// Windows records a creation time on the wall clock only, and its start on the interrupt clock is
+/// read by [`crate::windows::lineage`], which is what every launch and bridge admission asks.
+#[cfg(not(windows))]
 pub(crate) fn monotonic_start(
     process: &ProcessStartIdentity,
 ) -> std::result::Result<Option<u64>, String> {
@@ -900,9 +902,10 @@ const fn is_first_process(_pid: u32) -> bool {
 ///
 /// It is one link of the walk, read the same way: the parent is read between two readings of the
 /// child that both name it, and no start times are ordered. None where the child has no parent,
-/// where its parent has ended or is the system's first process, where a reading failed or changed,
-/// and on a platform that keeps a parent's name after the parent exits, as Windows does, where a
-/// named parent proves nothing.
+/// where its parent has ended or is the system's first process, and where a reading failed or
+/// changed. Windows keeps a parent's name after the parent exits, so a named parent proves nothing
+/// there and [`crate::windows::lineage::parent_of`] answers instead, by the order of the two starts.
+#[cfg(not(windows))]
 pub(crate) fn parent_of(child: &ProcessStartIdentity) -> Option<ProcessStartIdentity> {
     match read_link(&Kernel, child, false) {
         Ok(Link::Parent(parent)) => Some(parent),

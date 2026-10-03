@@ -404,7 +404,11 @@ impl Registration {
             .and_then(crate::questions::binding::executable_of)
             .map(std::path::PathBuf::from);
         installed.validate(declared, running.as_deref())?;
-        Ok(crate::questions::binding::parent_of(connecting))
+        #[cfg(windows)]
+        let starter = crate::windows::lineage::parent_of(connecting).ok();
+        #[cfg(not(windows))]
+        let starter = crate::questions::binding::parent_of(connecting);
+        Ok(starter)
     }
 
     /// Renders the registration as the file a launched process reads.
