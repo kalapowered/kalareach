@@ -2723,3 +2723,60 @@ fn a_session_started_with_the_hosts_environment_takes_an_allowlist_of_the_daemon
             .any(|variable| variable.value.contains("secret"))
     );
 }
+
+/// KR-REQ-07.25: the environment a session started with the host's is given is the daemon's own,
+/// allowlisted, with the owner's configured additions over it by name; an addition wins over the
+/// daemon's value of the same name, and an edit of the configuration reaches the sessions started
+/// after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it() {
+    let (temp, controller, _asked) = daemon().await;
+    controller.set_host_environment(
+        [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/a"),
+            ("OPENAI_API_KEY", "sk-planted"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned())),
+    );
+    let names =
+        |variables: Vec<kr_protocol::session::EnvironmentVariable>| -> Vec<(String, String)> {
+            variables
+                .into_iter()
+                .map(|variable| (variable.name, variable.value))
+                .collect()
+        };
+    assert_eq!(
+        names(controller.host_context_environment()),
+        [
+            ("HOME".to_owned(), "/home/a".to_owned()),
+            ("PATH".to_owned(), "/usr/bin".to_owned())
+        ],
+        "with nothing configured it is the allowlisted environment, and no credential"
+    );
+
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.preferences.environment_additions = Nullable::some(
+        [("EDITOR", "hx"), ("PATH", "/opt/added/bin:/usr/bin")]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect(),
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&temp.environment()),
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the configuration document");
+    // Accepted the way a person's edit outside the daemon is: when anything asks for it.
+    let _ = controller.effective_configuration().await;
+    assert_eq!(
+        names(controller.host_context_environment()),
+        [
+            ("EDITOR".to_owned(), "hx".to_owned()),
+            ("HOME".to_owned(), "/home/a".to_owned()),
+            ("PATH".to_owned(), "/opt/added/bin:/usr/bin".to_owned())
+        ],
+        "an addition is added, and wins over the daemon's value of its name"
+    );
+}

@@ -267,3 +267,66 @@ fn command_integrations_resolve_on_the_ladder() {
         assert_eq!(resolved.source, source, "{profile}");
     }
 }
+
+/// KR-REQ-07.25: the variables added to a session started with the host's environment resolve on
+/// the ladder: a profile's set replaces the host's, an empty one adds nothing, and a profile that
+/// names none leaves the host's; with no document, none is added.
+#[test]
+fn environment_additions_resolve_on_the_ladder() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let absent = Resolver::open(&environment).environment_additions();
+    assert!(absent.value.is_empty());
+    assert_eq!(absent.source, ValueSource::Default);
+    assert_eq!(absent.preference.effect, ValueEffect::NewSessionsOnly);
+
+    let added = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    let mut document = ConfigurationDocument::empty();
+    document.preferences.environment_additions =
+        Nullable::some(added(&[("EDITOR", "vim"), ("GOPATH", "/home/a/go")]));
+    for (name, set) in [
+        ("quiet", Some(added(&[]))),
+        ("one", Some(added(&[("EDITOR", "hx")]))),
+        ("silent", None),
+    ] {
+        document.profiles.insert(
+            name.to_owned(),
+            PreferenceSet {
+                environment_additions: Nullable(set),
+                ..PreferenceSet::default()
+            },
+        );
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &document_path(&environment),
+        configuration::contents(&document).as_bytes(),
+    )
+    .expect("writes the document");
+
+    let host = Resolver::open(&environment).environment_additions();
+    assert_eq!(
+        host.value,
+        added(&[("EDITOR", "vim"), ("GOPATH", "/home/a/go")])
+    );
+    assert_eq!(host.source, ValueSource::HostConfiguration);
+    for (profile, expected, source) in [
+        ("quiet", added(&[]), ValueSource::Profile),
+        ("one", added(&[("EDITOR", "hx")]), ValueSource::Profile),
+        (
+            "silent",
+            added(&[("EDITOR", "vim"), ("GOPATH", "/home/a/go")]),
+            ValueSource::HostConfiguration,
+        ),
+    ] {
+        let resolved = Resolver::open(&environment)
+            .with_profile(Some(profile.to_owned()))
+            .environment_additions();
+        assert_eq!(resolved.value, expected, "{profile}");
+        assert_eq!(resolved.source, source, "{profile}");
+    }
+}

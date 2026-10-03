@@ -7730,6 +7730,7 @@
           "$ref": "#/$defs/PreferenceSet",
           "default": {
             "command_integrations": null,
+            "environment_additions": null,
             "sleep_inhibition": null,
             "worker_profile": null
           },
@@ -23577,6 +23578,21 @@
           ],
           "default": null,
           "description": "The installed packages, each as `publisher/plugin`, whose command integration a session\ncreated from now on applies: the command, flags and variables that package's verified\nmanifest declares, added to an interactive invocation of that command.\n\nSection 12's opt-in. Absent leaves the choice to the rung below; an empty list turns\nevery integration off at this rung; a list replaces the one below it rather than adding\nto it. A package named here that this environment has not installed, does not admit, or\nhas not granted `command_integration.launch` integrates nothing, and the doctor says why."
+        },
+        "environment_additions": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Variables a session started with this host's environment is given beside what the\nhost's own environment supplies, by name.\n\nA session no person's shell stands behind (one an app creates, one created invisibly,\none a paired device asks for) is started with this host's environment, and these are\nthe owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH` that puts a\ntool first. An addition wins over the host's own value of the same name. Absent leaves\nthe choice to the rung below; an empty set adds nothing at this rung; a set replaces\nthe one below it rather than adding to it. The values stay in this document and are\nprinted by nothing: a report names the variables and no value."
         },
         "sleep_inhibition": {
           "anyOf": [

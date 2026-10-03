@@ -1562,6 +1562,84 @@ pub mod configuration {
     /// How many packages one rung's `command_integrations` may name.
     pub const MAX_COMMAND_INTEGRATIONS: usize = 64;
 
+    /// How many variables one rung's `environment_additions` may name.
+    pub const MAX_ENVIRONMENT_ADDITIONS: usize = 64;
+
+    /// The longest value one environment addition may have, in bytes.
+    pub const MAX_ENVIRONMENT_ADDITION_BYTES: usize = 4096;
+
+    /// The prefix of the variables a session's worker owns and sets itself.
+    ///
+    /// A creator's environment cannot preload one, and neither can an addition.
+    pub const RESERVED_VARIABLE_PREFIX: &str = "KR_";
+
+    /// Variables that name the physical terminal a creator is in, which a session is not in.
+    ///
+    /// Each names a terminal emulator the session is not: passing one through would let a shell
+    /// plugin enable an escape-sequence feature on the strength of a false identity. The worker
+    /// removes them from a creator's environment and a configuration may not add them.
+    pub const TERMINAL_IDENTITY_VARIABLES: &[&str] = &[
+        "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "VTE_VERSION",
+        "WT_SESSION",
+        "WT_PROFILE_ID",
+        "KONSOLE_VERSION",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+    ];
+
+    /// Prefixes of terminal identity variables.
+    pub const TERMINAL_IDENTITY_PREFIXES: &[&str] = &["KONSOLE_DBUS_"];
+
+    /// Variables that describe the creator's own terminal device or shell rather than the new
+    /// session's.
+    pub const CREATOR_TERMINAL_VARIABLES: &[&str] = &["SSH_TTY", "TERM", "COLORTERM", "SHELL"];
+
+    /// The variables a desktop context supplies, which belong to the desktop and not to whoever
+    /// asked for the session.
+    pub const DESKTOP_VARIABLES: &[&str] = &[
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_RUNTIME_DIR",
+        "XDG_SESSION_ID",
+        "XDG_SESSION_TYPE",
+    ];
+
+    /// Whether a session's worker owns `name`, so that nothing a creator or a configuration
+    /// supplies is used for it.
+    ///
+    /// The one list the worker removes from a creator's environment by and a configuration is
+    /// refused additions by, so the two cannot disagree about which names are the host's.
+    #[must_use]
+    pub fn host_owns_variable(name: &str) -> bool {
+        name.starts_with(RESERVED_VARIABLE_PREFIX)
+            || TERMINAL_IDENTITY_VARIABLES.contains(&name)
+            || TERMINAL_IDENTITY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || CREATOR_TERMINAL_VARIABLES.contains(&name)
+            || DESKTOP_VARIABLES.contains(&name)
+    }
+
+    /// Whether `name` is a name an environment variable has: letters, digits and underscores,
+    /// not beginning with a digit.
+    fn is_variable_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        bytes.len() <= MAX_NAME_LEN
+            && bytes
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    }
+
     /// The largest session ceiling this host can record.
     ///
     /// The registry keeps the number in a signed 64-bit column, which is the limit every SQLite
@@ -1715,6 +1793,17 @@ pub mod configuration {
         /// to it. A package named here that this environment has not installed, does not admit, or
         /// has not granted `command_integration.launch` integrates nothing, and the doctor says why.
         pub command_integrations: Nullable<Vec<String>>,
+        /// Variables a session started with this host's environment is given beside what the
+        /// host's own environment supplies, by name.
+        ///
+        /// A session no person's shell stands behind (one an app creates, one created invisibly,
+        /// one a paired device asks for) is started with this host's environment, and these are
+        /// the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH` that puts a
+        /// tool first. An addition wins over the host's own value of the same name. Absent leaves
+        /// the choice to the rung below; an empty set adds nothing at this rung; a set replaces
+        /// the one below it rather than adding to it. The values stay in this document and are
+        /// printed by nothing: a report names the variables and no value.
+        pub environment_additions: Nullable<BTreeMap<String, String>>,
     }
 
     impl Default for PreferenceSet {
@@ -1724,6 +1813,7 @@ pub mod configuration {
                 sleep_inhibition: Nullable::null(),
                 worker_profile: Nullable::null(),
                 command_integrations: Nullable::null(),
+                environment_additions: Nullable::null(),
             }
         }
     }
@@ -2631,6 +2721,62 @@ pub mod configuration {
                 }
             }
         }
+        // The variables each rung adds to a session started with this host's environment: names a
+        // variable can have and this host does not own, values of a bound, and no more of them than
+        // one rung may name. A refusal says the name by its class and length and never the value.
+        for (profile, set) in std::iter::once((None, &document.preferences)).chain(
+            document
+                .profiles
+                .iter()
+                .map(|(name, set)| (Some(name.as_str()), set)),
+        ) {
+            let Some(additions) = set.environment_additions.as_ref() else {
+                continue;
+            };
+            let rung = || match profile {
+                None => Sentence::new().stated("environment_additions"),
+                Some(name) => Sentence::new()
+                    .stated("the environment_additions of the profile ")
+                    .withheld(Name, name),
+            };
+            if additions.len() > MAX_ENVIRONMENT_ADDITIONS {
+                problems.push(
+                    rung()
+                        .stated(" names ")
+                        .number(additions.len() as u64)
+                        .stated(" variables, more than the ")
+                        .number(MAX_ENVIRONMENT_ADDITIONS as u64)
+                        .stated(" one rung may name"),
+                );
+            }
+            for (name, value) in additions {
+                if !is_variable_name(name) {
+                    problems.push(
+                        rung()
+                            .stated(" names ")
+                            .withheld(Name, name)
+                            .stated(", which is not a name an environment variable has"),
+                    );
+                } else if host_owns_variable(name) {
+                    problems.push(
+                        rung()
+                            .stated(" names ")
+                            .withheld(Name, name)
+                            .stated(", which this host sets for a session itself"),
+                    );
+                }
+                if value.contains('\0') || value.len() > MAX_ENVIRONMENT_ADDITION_BYTES {
+                    problems.push(
+                        rung()
+                            .stated(" gives ")
+                            .withheld(Name, name)
+                            .stated(" a value that is longer than ")
+                            .number(MAX_ENVIRONMENT_ADDITION_BYTES as u64)
+                            .stated(" bytes or holds a NUL"),
+                    );
+                }
+            }
+        }
         if let Some(budgets) = document.ceilings.enrolment.0.as_ref() {
             // Only the budgets this document actually names. One left out is the schema's own
             // number, which validated when this build chose it.
@@ -3475,16 +3621,24 @@ pub mod configuration {
         about: "the installed packages whose command integration a new session applies",
     };
 
+    /// The variables a session started with this host's environment is given beside it.
+    pub const ENVIRONMENT_ADDITIONS: Preference = Preference {
+        key: "environment_additions",
+        effect: ValueEffect::NewSessionsOnly,
+        about: "the variables a session started with this host's environment is given beside it",
+    };
+
     /// Every preference this host resolves, in the order `kr doctor` prints them.
     ///
     /// The two directories are here because they resolve through [`resolve`] like everything else:
     /// an allowlisted variable supplies them at the request rung, and the platform default is the
     /// bottom rung. Keeping them in this table is also what makes the allowlist checkable, because
     /// every entry must name a key that appears here.
-    pub const PREFERENCES: [Preference; 5] = [
+    pub const PREFERENCES: [Preference; 6] = [
         SLEEP_INHIBITION,
         WORKER_PROFILE,
         COMMAND_INTEGRATIONS,
+        ENVIRONMENT_ADDITIONS,
         RUNTIME_DIRECTORY,
         STATE_DIRECTORY,
     ];
@@ -8777,6 +8931,144 @@ mod tests {
             .join("; ");
         assert!(!listed.contains("sk-live-abc123"), "{listed}");
         assert!(listed.contains("[name withheld, 24 bytes]"), "{listed}");
+    }
+
+    /// KR-REQ-07.25: a configured environment addition is a variable name a session may be given,
+    /// on the host's rung and on a profile's, with a value of a bound; a refused one is named by its
+    /// class and its length and its value is never in the refusal.
+    #[test]
+    fn a_configured_environment_addition_is_a_name_a_session_may_be_given() {
+        let at_host = |additions: &[(&str, &str)]| {
+            let mut document = ConfigurationDocument::empty();
+            document.preferences.environment_additions = Nullable::some(
+                additions
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            );
+            document
+        };
+        let in_profile = |additions: &[(&str, &str)]| {
+            let mut document = ConfigurationDocument::empty();
+            document.profiles.insert(
+                "review".to_owned(),
+                PreferenceSet {
+                    environment_additions: at_host(additions).preferences.environment_additions,
+                    ..PreferenceSet::default()
+                },
+            );
+            document
+        };
+        let many: Vec<(String, String)> = (0..configuration::MAX_ENVIRONMENT_ADDITIONS)
+            .map(|index| (format!("ADDED_{index}"), "x".to_owned()))
+            .collect();
+        let many: Vec<(&str, &str)> = many
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        for document in [
+            at_host(&[
+                ("EDITOR", "vim"),
+                ("GOPATH", "/home/a/go"),
+                ("_PRIVATE", ""),
+            ]),
+            in_profile(&[]),
+            at_host(&[]),
+            at_host(&many),
+            // A name a session's shell reads that the host does not own: the person's own
+            // `PATH` and `LANG` are the point of an addition.
+            at_host(&[("PATH", "/opt/a/bin:/usr/bin"), ("LANG", "en_ZA.UTF-8")]),
+        ] {
+            configuration::validate(&document).expect("additions a session may be given");
+        }
+
+        let too_long_value = "v".repeat(configuration::MAX_ENVIRONMENT_ADDITION_BYTES + 1);
+        let too_many: Vec<(String, String)> = (0..=configuration::MAX_ENVIRONMENT_ADDITIONS)
+            .map(|index| (format!("ADDED_{index}"), "x".to_owned()))
+            .collect();
+        let too_many: Vec<(&str, &str)> = too_many
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        for refused in [
+            // Names the host owns: its reserved prefix, the terminal's identity, the display and
+            // the session's desktop, the terminal device and the shell the worker launched.
+            vec![("KR_SESSION", "x")],
+            vec![("KR_ANYTHING", "x")],
+            vec![("ITERM_SESSION_ID", "x")],
+            vec![("KONSOLE_DBUS_SESSION", "x")],
+            vec![("TERM_PROGRAM", "x")],
+            vec![("DISPLAY", ":0")],
+            vec![("WAYLAND_DISPLAY", "wayland-0")],
+            vec![("XDG_RUNTIME_DIR", "/run/user/1000")],
+            vec![("TERM", "xterm")],
+            vec![("COLORTERM", "truecolor")],
+            vec![("SHELL", "/bin/zsh")],
+            vec![("SSH_TTY", "/dev/pts/9")],
+            // Not names a variable can have.
+            vec![("", "x")],
+            vec![("1ST", "x")],
+            vec![("A=B", "x")],
+            vec![("A B", "x")],
+            vec![("A-B", "x")],
+            vec![("A\u{0}B", "x")],
+            // Values a variable cannot have, and more of them than a rung may name.
+            vec![("EDITOR", "vi\u{0}m")],
+            vec![("EDITOR", too_long_value.as_str())],
+            too_many,
+        ] {
+            for document in [at_host(&refused), in_profile(&refused)] {
+                configuration::validate(&document)
+                    .expect_err(&format!("{refused:?} is not a set of additions"));
+            }
+        }
+
+        // A refusal names the name by its class and its length, and never the value.
+        let mut document = at_host(&[
+            ("sk-live-abc123", "a-credential-value"),
+            ("KR_X", "also-secret"),
+        ]);
+        document.preferences.environment_additions = document
+            .preferences
+            .environment_additions
+            .0
+            .map(|mut additions| {
+                additions.insert("DISPLAY".to_owned(), "a-display-value".to_owned());
+                additions
+            })
+            .into();
+        let problems = configuration::validate(&document).expect_err("names the host owns");
+        let said = problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        for private in [
+            "a-credential-value",
+            "also-secret",
+            "a-display-value",
+            "sk-live-abc123",
+        ] {
+            assert!(!said.contains(private), "{private} in: {said}");
+        }
+        assert!(said.contains("[name withheld, "), "{said}");
+    }
+
+    /// KR-REQ-07.25: the additions are an ordinary preference, resolved on the ladder: a profile's
+    /// replaces the host's rather than adding to it, and an empty set is a rung that adds nothing.
+    #[test]
+    fn the_environment_additions_are_a_preference_for_new_sessions() {
+        assert_eq!(
+            configuration::preference("environment_additions").map(|preference| preference.effect),
+            Some(configuration::ValueEffect::NewSessionsOnly)
+        );
+        assert!(
+            configuration::PREFERENCES
+                .iter()
+                .any(|preference| preference.key == "environment_additions")
+        );
+        // The key is a term this build prints in its own words, the values it holds are not.
+        assert!(configuration::is_known_term("environment_additions"));
     }
 
     /// KR-REQ-07.45, KR-REQ-26.44: a command integration's report leaves the host as its classes

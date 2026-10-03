@@ -301,6 +301,9 @@ pub struct InForce {
     pub worker_profile: Option<WorkerProfile>,
     /// The installed packages whose command integration a session created now applies.
     pub command_integrations: Vec<String>,
+    /// The variables a session started now with this host's environment is given beside it, by
+    /// name. The values are the owner's own and are printed by nothing.
+    pub environment_additions: std::collections::BTreeMap<String, String>,
 }
 
 impl InForce {
@@ -311,6 +314,7 @@ impl InForce {
             sleep_inhibition: resolver.sleep_inhibition(None).value,
             worker_profile: resolver.chosen_worker_profile(),
             command_integrations: resolver.command_integrations().value,
+            environment_additions: resolver.environment_additions().value,
         }
     }
 }
@@ -525,6 +529,7 @@ pub fn effective(
     let power = resolver.sleep_inhibition(None);
     let profile = resolver.worker_profile(None, platform_profile);
     let integrations = resolver.command_integrations();
+    let additions = resolver.environment_additions();
     let runtime = resolver.runtime_directory();
     let state = resolver.state_directory();
     // Each row carries what its value is made of. The two settings resolve to one of this build's
@@ -542,6 +547,16 @@ pub fn effective(
                 Declared::stated("none")
             } else {
                 Declared::names(integrations.value.iter().map(String::as_str))
+            },
+        ),
+        // The variables are names the owner chose and their values are the owner's own, written
+        // in the document and nowhere else: the row says which are added and never what to.
+        effective_value(
+            &additions,
+            &if additions.value.is_empty() {
+                Declared::stated("none")
+            } else {
+                Declared::names(additions.value.keys().map(String::as_str))
             },
         ),
         effective_value(
