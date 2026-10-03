@@ -785,13 +785,17 @@ async fn read_and_not_counted(host: &Host, gate: &std::path::Path) -> std::sync:
     release
 }
 
-/// Asks the session to close, and returns once its drain period has ended and a worker that did not
-/// wait for what it had read would have written its record.
+/// Asks the session to close, with the closure's sequence on `sequence`, and returns once its drain
+/// period has ended and a worker that did not wait for what it had read would have written its
+/// record.
 #[cfg(unix)]
-async fn close_past_the_drain(host: &Host) {
+async fn close_past_the_drain(host: &Host, sequence: &tokio::runtime::Handle) {
     let drained = host.runtime.watch_drain_end();
     let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
-    gate.release();
+    {
+        let _on_sequence = sequence.enter();
+        gate.release();
+    }
     tokio::time::timeout(LIVENESS_DEADLINE, drained)
         .await
         .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the drain to end"))
@@ -841,7 +845,7 @@ async fn output_read_before_the_drain_ends_reaches_every_attachment_before_the_c
     let mut second = watching(&host).await;
     let held = tasks.hold().await;
     drop(read_and_not_counted(&host, &gate).await);
-    close_past_the_drain(&host).await;
+    close_past_the_drain(&host, &tokio::runtime::Handle::current()).await;
     drop(held);
     each_was_sent_the_line_first(&host, [&mut first, &mut second]).await;
 }
@@ -854,17 +858,24 @@ async fn output_read_before_the_drain_ends_reaches_every_attachment_before_the_c
 /// for that read would leave the line out of the measure, write its record, and hand the line to
 /// nobody once the read loop went on.
 ///
+/// The closure's measure waits for the stopped read on the thread it runs on, which is what a
+/// worker that waits for a read does. So the session's tasks and the closure's sequence run on a
+/// runtime of their own, and the test's own timers and connections run where they cannot be held
+/// behind it: on one runtime, the thread that drives the timers can be the one that waits, and the
+/// test's own bound on the record then never ends.
+///
 /// Unix only, for the same reason as the test above.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_that_returned_before_the_drain_ended_reaches_every_attachment_before_the_closure() {
+    let tasks = SessionTasks::start();
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
     let gate = marks.path().join("gate");
-    let host = host(&prints_once(&gate)).await;
+    let host = host_on(&prints_once(&gate), tasks.handle()).await;
     let mut first = watching(&host).await;
     let mut second = watching(&host).await;
     let reading = read_and_not_counted(&host, &gate).await;
-    close_past_the_drain(&host).await;
+    close_past_the_drain(&host, tasks.handle()).await;
     drop(reading);
     each_was_sent_the_line_first(&host, [&mut first, &mut second]).await;
 }
