@@ -1521,3 +1521,73 @@ async fn an_environment_change_recorded_before_a_late_attempts_claim_is_not_give
         "once the fence is gone it is answered again: {answered:?}"
     );
 }
+
+/// KR-REQ-03.13, KR-REQ-09.09, 09.12 and 26.16: a refresh from a connection that came over a
+/// process bridge is refused before the platform is asked, and that refusal is kept under the
+/// claim like any other outcome. Its retry finds the record and is given the refusal back only
+/// while this host owes no fence, including one that lands while the answer is read. The control:
+/// with nothing owed, the retry is answered from the record, with the bridge's refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_refused_for_the_bridge_it_came_over_is_not_given_back_while_a_fence_is_owed() {
+    use kr_protocol::identity::EnvironmentRefreshParams;
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(
+        &temp,
+        Method::EnvironmentRefresh,
+        ParamsValue::from_typed(&EnvironmentRefreshParams {
+            environment_id: enrolment_of(2).environment_id,
+            start: true,
+        })
+        .expect("encodes"),
+    );
+    let origin = kr_protocol::local::BridgeOrigin {
+        environment_id: kr_protocol::ids::EnvironmentId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0x0a; 16]),
+        ),
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        clipboard_writes: false,
+    };
+    let attempt = |controller: Arc<Controller>| {
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::EnvironmentRefresh,
+                    connection_id,
+                    Some(origin),
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                )
+                .await
+        }
+    };
+    let refused_for_the_bridge = |answer: &ControlFrame| {
+        let error =
+            refusal(answer).unwrap_or_else(|| panic!("a bridged refresh is refused: {answer:?}"));
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+        assert!(error.message.contains("process bridge"), "{error:?}");
+    };
+    refused_for_the_bridge(&attempt(Arc::clone(&controller)).await);
+    refused_for_the_bridge(&attempt(Arc::clone(&controller)).await);
+
+    // The fence lands while the answer is being read, after the claim found the record: the check
+    // that decides is the one made with the answer in hand.
+    let (arrived, release) = controller.pause_retained_lookup();
+    let waiting = tokio::spawn(attempt(Arc::clone(&controller)));
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the retry reaches the place it is stopped at")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the retry goes on");
+    let refused = waiting.await.expect("the retry finishes");
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence that landed while the answer was read stops it: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    refused_for_the_bridge(&attempt(Arc::clone(&controller)).await);
+}
