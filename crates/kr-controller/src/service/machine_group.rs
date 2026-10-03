@@ -343,6 +343,14 @@ impl Controller {
         )? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
+                // An earlier attempt recorded this action between the lookup that found nothing
+                // and this claim, which waited for the step lock. What it produced goes back only
+                // under authority that has not been withdrawn, as it does from that lookup, and
+                // without the deadline a receipt outlives.
+                self.check_registration(&crate::authority::AdmittedMutation {
+                    deadline: None,
+                    ..carried
+                })?;
                 return recorded_answer(record);
             }
         };
