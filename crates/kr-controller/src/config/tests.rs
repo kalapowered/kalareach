@@ -326,10 +326,10 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        5 + configuration::SELECTIONS.len(),
-        "three preferences, two locations and every selection read at the next start"
+        6 + configuration::SELECTIONS.len(),
+        "four preferences, two locations and every selection read at the next start"
     );
-    for (row, selection) in report.values[5..].iter().zip(configuration::SELECTIONS) {
+    for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
         assert_eq!(row.effect, ValueEffect::NextStart);
         assert_eq!(
@@ -1300,4 +1300,76 @@ fn the_command_integrations_in_force_are_reported_with_their_source() {
         .find(|value| value.key == "command_integrations")
         .expect("the command integrations");
     assert_eq!(row.value(), "none");
+}
+
+/// KR-REQ-07.25, KR-REQ-26.13: the variables added to a session started with the host's
+/// environment are in force once the document is accepted, and the report names them, with their
+/// source and their effect, and never a value: not in the owner's own report, not in a debug
+/// print of it, and not in what an export carries.
+#[test]
+fn the_environment_additions_in_force_are_reported_by_name_and_never_by_value() {
+    use kr_protocol::hostinfo::export::{ContentClass, ForExport as _};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    assert!(
+        InForce::of(&open(&environment))
+            .environment_additions
+            .is_empty()
+    );
+    let row_of = |report: &EffectiveConfiguration| {
+        report
+            .values
+            .iter()
+            .find(|value| value.key == "environment_additions")
+            .cloned()
+            .expect("the environment additions")
+    };
+    assert_eq!(row_of(&reported(&environment)).value(), "none");
+
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.preferences.environment_additions = Nullable::some(
+        [
+            ("EDITOR", "vim-planted-value-1"),
+            ("GOPATH", "/home/someone/go-planted-2"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect(),
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&environment),
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("writes the document");
+
+    let in_force = InForce::of(&open(&environment)).environment_additions;
+    assert_eq!(in_force.len(), 2);
+    assert_eq!(
+        in_force.get("EDITOR").map(String::as_str),
+        Some("vim-planted-value-1"),
+        "the values are what a new session is given"
+    );
+    let report = reported(&environment);
+    let row = row_of(&report);
+    assert_eq!(row.value(), "EDITOR, GOPATH");
+    assert_eq!(row.class(), ContentClass::Name);
+    assert_eq!(
+        row.source,
+        kr_protocol::hostinfo::configuration::ValueSource::HostConfiguration
+    );
+    assert_eq!(row.effect, ValueEffect::NewSessionsOnly);
+    let printed = format!("{report:?}");
+    assert!(!printed.contains("planted"), "{printed}");
+    let owners = serde_json::to_string(&report).expect("the report serialises");
+    assert!(!owners.contains("planted"), "{owners}");
+    let exported = serde_json::to_string(
+        &kr_protocol::hostinfo::HostDoctorResult::new(Vec::new(), report.clone())
+            .for_export()
+            .get(),
+    )
+    .expect("the export serialises");
+    for private in ["planted", "EDITOR", "GOPATH", "/home/someone"] {
+        assert!(!exported.contains(private), "{private} left in: {exported}");
+    }
 }
