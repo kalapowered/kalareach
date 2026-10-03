@@ -750,8 +750,7 @@ impl Thread {
             for done in std::mem::take(&mut self.held.acks) {
                 let _ = done.send(());
             }
-            let wait = self.next_wait(now);
-            self.driver.wait(wait);
+            self.rest();
         }
         // The process goes with the host: the driver ends it when it is dropped, unless a test
         // asked for it to outlive this daemon.
@@ -763,6 +762,27 @@ impl Thread {
         let _ = self.abandon;
     }
 
+    /// Ends a turn: sleeps until something wakes the thread or something is due, unless a message
+    /// is waiting, and says how long it was ready to sleep.
+    ///
+    /// A message is posted and then its wake sent, and the turn reads the wakes when it asks the
+    /// driver for what arrived, which is after it read the messages. A message posted between the
+    /// two has its wake read by this turn and its text left for the next, and the next turn could
+    /// wait as long as the thread's longest sleep ([`IDLE_WAIT`]). So the messages are read once
+    /// more here, after everything this turn did, and when there were any the thread turns again
+    /// at once. A message posted after this read has its wake still to come, and the sleep ends at
+    /// it.
+    fn rest(&mut self) -> Duration {
+        let now = self.clock.now();
+        let wait = if self.take_messages(now) {
+            Duration::ZERO
+        } else {
+            self.next_wait(now)
+        };
+        self.driver.wait(wait);
+        wait
+    }
+
     fn conditions(&self) -> HostConditions {
         match &self.conditions {
             Some(held) => *held.lock().unwrap_or_else(PoisonError::into_inner),
@@ -770,8 +790,11 @@ impl Thread {
         }
     }
 
-    fn take_messages(&mut self, now: Reading) {
+    /// Applies every message that has arrived, and says whether there were any.
+    fn take_messages(&mut self, now: Reading) -> bool {
+        let mut took = false;
         while let Ok(message) = self.inbox.try_recv() {
+            took = true;
             match message {
                 Message::Opened {
                     session_id,
@@ -867,6 +890,7 @@ impl Thread {
                 Message::Fail => panic!("the host's thread fails, as a test asked"),
             }
         }
+        took
     }
 
     /// Raises the fence of every session that does not hold one while privacy mode is published as
@@ -1613,6 +1637,45 @@ mod tests {
         let (_directory, mut off) = thread(state(3, false));
         off.follow_privacy();
         assert!(!off.shared.handles.fence.is_fenced(&session()));
+    }
+
+    /// A message posted while a turn is under way, whose wake that turn's own look at what arrived
+    /// then took, is read before the thread sleeps, so a fetch's check is offered at once and not
+    /// when the longest sleep has passed. The control is the setting before the message, which is
+    /// still on.
+    #[test]
+    fn a_message_whose_wake_a_turn_already_took_is_read_before_the_thread_sleeps() {
+        let (_directory, mut host) = thread(state(0, false));
+        let now = host.clock.now();
+        host.take_messages(now);
+        assert!(
+            host.driver.service().setup_state().enabled,
+            "on to begin with"
+        );
+
+        host.shared
+            .inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(Message::Settings {
+                enabled: Some(false),
+                on_battery: None,
+            })
+            .expect("the message is posted");
+        host.shared.waker.wake();
+        host.driver
+            .turn(&host.conditions(), now)
+            .expect("the turn runs");
+
+        assert_eq!(
+            host.rest(),
+            Duration::ZERO,
+            "the thread turns again at once, with no sleep"
+        );
+        assert!(
+            !host.driver.service().setup_state().enabled,
+            "the message was read before the thread slept"
+        );
     }
 
     /// A page that arrives for a host that has stopped is dropped, where a page for one that runs
