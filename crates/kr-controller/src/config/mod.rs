@@ -301,9 +301,9 @@ pub struct InForce {
     pub worker_profile: Option<WorkerProfile>,
     /// The installed packages whose command integration a session created now applies.
     pub command_integrations: Vec<String>,
-    /// The variables a session started now with this host's environment is given beside it, by
-    /// name. The values are the owner's own and are printed by nothing.
-    pub environment_additions: std::collections::BTreeMap<String, String>,
+    /// The variables a session started now with this host's environment is given beside it. The
+    /// values are the owner's own and are printed by nothing.
+    pub environment_additions: configuration::EnvironmentAdditions,
 }
 
 impl InForce {

@@ -10616,15 +10616,14 @@ export interface PreferenceSet {
    *
    * A session no person's shell stands behind (one an app creates, one created invisibly,
    * one a paired device asks for) is started with this host's environment, and these are
-   * the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH` that puts a
-   * tool first. An addition wins over the host's own value of the same name. Absent leaves
-   * the choice to the rung below; an empty set adds nothing at this rung; a set replaces
-   * the one below it rather than adding to it. The values stay in this document and are
-   * printed by nothing: a report names the variables and no value.
+   * the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH`. An addition
+   * wins over the host's own value of the same name, and takes its place whole: a `PATH`
+   * given here is the session's `PATH`, and nothing in it is expanded or joined to the
+   * host's. Absent leaves the choice to the rung below; an empty set adds nothing at this
+   * rung; a set replaces the one below it rather than adding to it. The values stay in this
+   * document and are printed by nothing: a report names the variables and no value.
    */
-  environment_additions?: {
-    [k: string]: string
-  } | null
+  environment_additions?: EnvironmentAdditions | null
   /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
@@ -10634,6 +10633,16 @@ export interface PreferenceSet {
    * The execution context a session is created in when the request does not choose one.
    */
   worker_profile?: WorkerProfile | null
+}
+/**
+ * The variables an owner has configured to add to a session, each with its value.
+ *
+ * The values are the owner's own and go to a session's shell and nowhere else, so what a
+ * debug print shows of this is the names: a print of the document, of the configuration in
+ * force or of anything that holds either cannot carry a credential into a log.
+ */
+export interface EnvironmentAdditions {
+  [k: string]: string
 }
 /**
  * The ordinary preferences, each absent unless this document chooses it.
@@ -10656,15 +10665,14 @@ export interface PreferenceSet1 {
    *
    * A session no person's shell stands behind (one an app creates, one created invisibly,
    * one a paired device asks for) is started with this host's environment, and these are
-   * the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH` that puts a
-   * tool first. An addition wins over the host's own value of the same name. Absent leaves
-   * the choice to the rung below; an empty set adds nothing at this rung; a set replaces
-   * the one below it rather than adding to it. The values stay in this document and are
-   * printed by nothing: a report names the variables and no value.
+   * the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH`. An addition
+   * wins over the host's own value of the same name, and takes its place whole: a `PATH`
+   * given here is the session's `PATH`, and nothing in it is expanded or joined to the
+   * host's. Absent leaves the choice to the rung below; an empty set adds nothing at this
+   * rung; a set replaces the one below it rather than adding to it. The values stay in this
+   * document and are printed by nothing: a report names the variables and no value.
    */
-  environment_additions?: {
-    [k: string]: string
-  } | null
+  environment_additions?: EnvironmentAdditions | null
   /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
