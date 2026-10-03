@@ -646,8 +646,8 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
-            "the forwarder's library",
-            &["test", "--locked", "-p", "kr-hook", "--lib"],
+            "the forwarder",
+            &["test", "--locked", "-p", "kr-hook"],
         ),
         Step::cargo(
             Group::Rust,
@@ -705,14 +705,14 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
-            "the forwarder's launcher against the command backends",
+            "the command backends",
             &[
                 "test",
                 "--locked",
                 "-p",
-                "kr-hook",
+                "kr-worker",
                 "--test",
-                "launch_windows",
+                "command_backends",
             ],
         ),
         qualified_only(
