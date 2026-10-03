@@ -274,23 +274,26 @@ load_signing_identity() {
 }
 
 # Whether the signing command is still the process this shell started, by its number, its state and the
-# start time the command wrote about itself. 0: it is. 1: it has ended (gone, or ended and not yet collected).
-# 2: not known, because its identity, state or start time cannot be read: a read that fails is no answer, and
-# nothing is signalled on it. 3: the number is another process's, which a readable and different start time shows;
-# its process group has no member either, since the system gives a number to no other process while a group
-# of that number has one. Bash can collect a command that has ended before this shell waits for it, so the
-# number alone is never signalled.
+# start time the command wrote about itself. 0: it is. 1: it has ended (gone, or ended and not yet collected,
+# which is the same process by the same start time). 2: not known, because its identity, state or start time
+# cannot be read: a read that fails is no answer, and nothing is signalled on it. 3: the number is another
+# process's, which a readable and different start time shows, whether that process is running or not yet
+# collected; its process group has no member of ours either, since the system gives a number to no other
+# process while a group of that number has one. Bash can collect a command that has ended before this shell
+# waits for it, so the number alone is never signalled, and a process that has ended is never taken to be
+# the command before its start time has been compared.
 signing_command_state() {
   local stat now
   kill -0 "$signing_child" 2>/dev/null || return 1
   load_signing_identity
   [ -n "$signing_start" ] || return 2
   stat=$(ps -o stat= -p "$signing_child" 2>/dev/null | tr -d ' ')
-  case $stat in Z*) return 1 ;; '') return 2 ;; esac
+  [ -n "$stat" ] || return 2
   now=$(process_start "$signing_child")
   [ -n "$now" ] || return 2
-  [ "$now" = "$signing_start" ] && return 0
-  return 3
+  [ "$now" = "$signing_start" ] || return 3
+  case $stat in Z*) return 1 ;; esac
+  return 0
 }
 
 # Whether the signing command's process group still has a live member. The command is the leader of its own
