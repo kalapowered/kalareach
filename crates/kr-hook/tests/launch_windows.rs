@@ -1280,6 +1280,8 @@ fn kr_req_12_02_a_cold_copy_of_the_largest_agent_is_launched_within_the_deadline
         "the launch was committed and not run as typed: {report:?}"
     );
     eprintln!("cold 300 MB launch: the program ran {program_ran:?} after the launcher started");
+    // One placed program is held at a time, so the cold copy is let go of before the control's.
+    drop(shell);
     let small = Shell::new();
     let answer = small.establish();
     let started = Instant::now();
