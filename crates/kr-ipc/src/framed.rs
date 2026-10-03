@@ -182,10 +182,11 @@ impl Readiness {
     /// `select!` or a timeout that another arm can end. [`FrameWriter::write_frame`] and
     /// `write_message` wait with no bound of their own and are used for a control exchange whose
     /// peer reads what it is sent; a control write to a peer that has stopped reading would poll here
-    /// until the connection errs, which is why a path whose peer may stall uses the checked writes
-    /// under a deadline instead. A local connection's own control replies and hello refusals are
-    /// written that way too, and a peer that sends a request and then stops reading holds that
-    /// connection until it fails. `docs/transport/README.md` records the figure and this rule.
+    /// until the connection errs, which is why a path whose peer may stall uses the checked writes,
+    /// or the begin and resume writes under a timeout, instead. A local connection's own control
+    /// replies and hello refusals are written with `write_message` too, and a peer that sends a
+    /// request and then stops reading holds that connection until it fails.
+    /// `docs/transport/README.md` records the figure and this rule.
     async fn ready(&self) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         Ok(())
