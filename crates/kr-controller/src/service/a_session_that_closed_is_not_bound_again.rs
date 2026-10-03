@@ -92,7 +92,7 @@ async fn a_session_with_a_closure_is_not_bound() {
 
 /// Polls a future once and says it is waiting: for a test that wants two futures queued for one lock
 /// in a known order, with nothing waited for but the lock.
-async fn parked<F: Future>(mut future: std::pin::Pin<&mut F>, what: &str) {
+async fn parked<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>, what: &str) {
     let polled = std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await;
     assert!(polled.is_pending(), "{what} waits for the registry");
 }
@@ -162,6 +162,54 @@ async fn an_exchange_with_a_worker_whose_session_closed_makes_no_record() {
     assert!(matches!(refused, ControllerError::UnknownSession { .. }));
     assert_eq!(world.controller.leases.workers_held(), 0);
     world.serving.abort();
+}
+
+/// A closure lands while work that began before it waits for the registry: the worker is held for
+/// that work until it is over, and forgotten then. Answers how many workers the barrier held while
+/// the work waited and after it was done. The registry is held by the test, which records the
+/// closure in it as a closure's own section does, so the work is at its first wait with its ticket.
+async fn a_closure_lands_while_work_that_began_before_it_waits(exchange: bool) -> (usize, usize) {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let session_id = world.session_id;
+    let controller = std::sync::Arc::clone(&world.controller);
+    let mut registry = world.controller.registry.lock().await;
+    let mut work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = if exchange {
+        Box::pin(async move {
+            let _ = controller.acknowledge_worker_revision(session_id).await;
+        })
+    } else {
+        Box::pin(async move {
+            let _ = controller.announce_authority_revision().await;
+        })
+    };
+    parked(work.as_mut(), "the work").await;
+    registry
+        .record_closure(&closure_of(session_id))
+        .expect("the closure is recorded");
+    world.controller.leases.worker_ended(session_id);
+    let during = world.controller.leases.workers_held();
+    drop(registry);
+    work.await;
+    let after = world.controller.leases.workers_held();
+    world.serving.abort();
+    (during, after)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exchange_that_began_before_a_closure_holds_the_worker_until_it_is_over() {
+    assert_eq!(
+        a_closure_lands_while_work_that_began_before_it_waits(true).await,
+        (1, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announcement_that_began_before_a_closure_holds_the_worker_until_it_is_over() {
+    assert_eq!(
+        a_closure_lands_while_work_that_began_before_it_waits(false).await,
+        (1, 0)
+    );
 }
 
 /// A recovery that reached a worker, and found its closure recorded while it waited for the
