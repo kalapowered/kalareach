@@ -110,6 +110,7 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
         Parked::Presentations => Box::new(world.controller.presentations.lock().await),
     };
     let mut closing = Box::pin(world.controller.retire(&record));
+    let mut at_the_wait = false;
     for _ in 0..POLLS {
         let polled =
             std::future::poll_fn(|context| Poll::Ready(closing.as_mut().poll(context))).await;
@@ -118,10 +119,15 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
             "the closure waits at the {parked:?} lock the test holds"
         );
         if reached(parked, &world) {
+            at_the_wait = true;
             break;
         }
         tokio::task::yield_now().await;
     }
+    assert!(
+        at_the_wait,
+        "the closure did not reach the {parked:?} wait in {POLLS} polls"
+    );
     drop(closing);
     drop(held);
     let closed = recorded(&world).await;
