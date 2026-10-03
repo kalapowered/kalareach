@@ -4,7 +4,8 @@
 //! nothing. These cases hold the forwarder to its half: whatever it finds before then, an empty
 //! file or one cut short, it reads again rather than acts on, until its deadline. Each starts the
 //! relay a launched agent runs, with the registration's path in its environment and nothing else,
-//! and a real listener stands at the endpoint the registration names.
+//! and a real listener stands at the endpoint the registration names: a socket on Unix and a named
+//! pipe on Windows, bound the way the worker binds it.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -12,16 +13,12 @@
 //! | KR-REQ-12.14 | every case: the endpoint is the one the whole registration names |
 //! | KR-REQ-05.09 | the credential is the file the registration names beside it, whatever else the environment says |
 
-#![cfg(unix)]
-
 mod common;
 
-use std::io::BufRead as _;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{LIVENESS, Placed};
+use common::{LIVENESS, Placed, StandIn};
 
 /// The private exchange, as the worker writes it for a launch.
 const CREDENTIAL: &str = "0909090909090909090909090909090909090909090909090909090909090909";
@@ -37,13 +34,10 @@ struct Launch {
 
 impl Launch {
     fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
         let placed = Placed::new();
         // Short, because a socket path has a small bound on every Unix.
         let directory = placed.host.root().join("l");
-        std::fs::create_dir_all(&directory).expect("a directory");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("made private");
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory");
         kr_ipc::paths::create_new_owner_only_file(
             &directory.join("credential"),
             CREDENTIAL.as_bytes(),
@@ -62,17 +56,14 @@ impl Launch {
 
     /// A whole registration, as the worker writes it, naming `endpoint` and this launch's
     /// credential file.
-    fn whole(&self, endpoint: &Path) -> String {
+    fn whole(&self, endpoint: &str) -> String {
         whole(endpoint, &self.credential())
     }
 
-    fn listen(&self, name: &str) -> (PathBuf, UnixListener) {
-        let path = self.directory.join(name);
-        let listener = UnixListener::bind(&path).expect("the listener binds");
-        listener
-            .set_nonblocking(true)
-            .expect("the listener is polled");
-        (path, listener)
+    /// A listener at an endpoint of its own, and the address a registration names it by.
+    fn listen(&self, name: &str) -> (String, StandIn) {
+        let stand_in = StandIn::bind(&self.directory, name);
+        (stand_in.address.clone(), stand_in)
     }
 
     /// Writes the registration in place, the way a writer that is not whole-or-nothing does.
@@ -98,41 +89,34 @@ impl Launch {
 }
 
 /// A whole registration, as the worker writes it, naming `endpoint` and `credential`.
-fn whole(endpoint: &Path, credential: &Path) -> String {
+fn whole(endpoint: &str, credential: &Path) -> String {
     format!(
-        "endpoint={}\nprofile=lp-1\ninstance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+        "endpoint={endpoint}\nprofile=lp-1\ninstance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
          credential={}\nframing=json_lines\n",
-        endpoint.display(),
         credential.display()
     )
 }
 
+/// The runtime a test drives its listener with.
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+}
+
 /// The one connection that reaches `listener` within `within`, if one does.
-fn accepted(listener: &UnixListener, within: Duration) -> Option<UnixStream> {
-    let deadline = Instant::now() + within;
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return Some(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("the listener failed: {error}"),
-        }
-    }
+fn accepted(listener: &StandIn, within: Duration) -> Option<kr_ipc::endpoint::Connection> {
+    runtime()
+        .block_on(tokio::time::timeout(within, listener.listener.accept()))
+        .ok()
+        .map(|accepted| accepted.expect("the listener serves").0)
 }
 
 /// The hello the forwarder writes before anything else.
-fn hello(stream: UnixStream) -> serde_json::Value {
-    stream.set_nonblocking(false).expect("blocking");
-    stream.set_read_timeout(Some(LIVENESS)).expect("bounded");
-    let mut line = String::new();
-    std::io::BufReader::new(stream)
-        .read_line(&mut line)
-        .expect("the hello is read");
-    serde_json::from_str(&line).expect("the hello is JSON")
+fn hello(mut stream: kr_ipc::endpoint::Connection) -> serde_json::Value {
+    let line = runtime().block_on(common::read_line(&mut stream));
+    serde_json::from_slice(&line).expect("the hello is JSON")
 }
 
 fn stop(mut relay: std::process::Child) {
@@ -145,7 +129,7 @@ fn stop(mut relay: std::process::Child) {
 #[test]
 fn kr_req_12_14_an_empty_registration_is_read_again_until_it_is_whole() {
     let launch = Launch::new();
-    let (endpoint, listener) = launch.listen("e.sock");
+    let (endpoint, listener) = launch.listen("e");
     launch.write_in_place("");
     let mut relay = launch.start();
 
@@ -171,9 +155,9 @@ fn kr_req_12_14_an_empty_registration_is_read_again_until_it_is_whole() {
 #[test]
 fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
     let launch = Launch::new();
-    let (decoy, decoy_listener) = launch.listen("d.sock");
-    let (endpoint, listener) = launch.listen("e.sock");
-    launch.write_in_place(&format!("endpoint={}\nprofile=lp", decoy.display()));
+    let (decoy, decoy_listener) = launch.listen("d");
+    let (endpoint, listener) = launch.listen("e");
+    launch.write_in_place(&format!("endpoint={decoy}\nprofile=lp"));
     let mut relay = launch.start();
 
     std::thread::sleep(Duration::from_secs(1));
@@ -206,8 +190,8 @@ fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
 #[test]
 fn kr_req_12_14_a_registration_that_never_becomes_whole_ends_the_forwarder_at_its_deadline() {
     let launch = Launch::new();
-    let (endpoint, listener) = launch.listen("e.sock");
-    launch.write_in_place(&format!("endpoint={}\n", endpoint.display()));
+    let (endpoint, listener) = launch.listen("e");
+    launch.write_in_place(&format!("endpoint={endpoint}\n"));
     let started = Instant::now();
     let mut relay = launch.start();
     // Bounded, so a forwarder that acts on the partial record, and then waits on the endpoint it
@@ -244,7 +228,7 @@ fn kr_req_12_14_a_registration_that_never_becomes_whole_ends_the_forwarder_at_it
 #[test]
 fn kr_req_05_09_the_credential_is_the_one_the_registration_names() {
     let launch = Launch::new();
-    let (endpoint, listener) = launch.listen("e.sock");
+    let (endpoint, listener) = launch.listen("e");
     let decoy = launch.directory.join("decoy");
     kr_ipc::paths::create_new_owner_only_file(
         &decoy,
@@ -275,14 +259,9 @@ fn kr_req_05_09_the_credential_is_the_one_the_registration_names() {
 #[test]
 fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
     let launch = Launch::new();
-    let (endpoint, listener) = launch.listen("e.sock");
+    let (endpoint, listener) = launch.listen("e");
     let elsewhere = launch.placed.host.root().join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).expect("a directory");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700))
-            .expect("made private");
-    }
+    kr_ipc::paths::create_private_directory(&elsewhere).expect("a private directory");
     let foreign = elsewhere.join("credential");
     kr_ipc::paths::create_new_owner_only_file(&foreign, CREDENTIAL.as_bytes())
         .expect("a credential elsewhere");
@@ -330,15 +309,10 @@ fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
 fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
     for leaves_the_directory in [true, false] {
         let launch = Launch::new();
-        let (endpoint, listener) = launch.listen("e.sock");
+        let (endpoint, listener) = launch.listen("e");
         let target = if leaves_the_directory {
             let elsewhere = launch.placed.host.root().join("target");
-            std::fs::create_dir_all(&elsewhere).expect("a directory");
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700))
-                    .expect("made private");
-            }
+            kr_ipc::paths::create_private_directory(&elsewhere).expect("a private directory");
             elsewhere.join("credential")
         } else {
             launch.directory.join("credential.real")
@@ -352,7 +326,7 @@ fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
         } else {
             PathBuf::from("credential.real")
         };
-        std::os::unix::fs::symlink(&pointing_at, launch.credential()).expect("a link in its place");
+        link(&pointing_at, &launch.credential());
         launch.publish(&launch.whole(&endpoint));
 
         let mut relay = launch.start();
@@ -372,6 +346,21 @@ fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
             "{what}: nothing is reached through a linked credential"
         );
     }
+}
+
+/// Puts a link at `path` that points at `target`, which a relative target is read from the directory
+/// the link is in.
+#[cfg(unix)]
+fn link(target: &Path, path: &Path) {
+    std::os::unix::fs::symlink(target, path).expect("a link in its place");
+}
+
+/// Puts a link at `path` that points at `target`, which a relative target is read from the
+/// directory the link is in. Making one needs the privilege to, which the accounts these suites run
+/// as hold.
+#[cfg(windows)]
+fn link(target: &Path, path: &Path) {
+    std::os::windows::fs::symlink_file(target, path).expect("a link in its place");
 }
 
 /// Waits for a relay that is expected to end on its own, within its deadline.

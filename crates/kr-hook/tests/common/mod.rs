@@ -90,7 +90,7 @@ pub struct Placed {
     /// The copy of the forwarder a test starts.
     pub forwarder: PathBuf,
     /// Where a program placed and run one at a time is held to that; ended after the tree.
-    _hold: Hold,
+    _hold: Option<Hold>,
 }
 
 impl Placed {
@@ -110,7 +110,7 @@ impl Placed {
         let placed = Self {
             host,
             forwarder,
-            _hold: hold,
+            _hold: Some(hold),
         };
         // The first start of a program at a new path is the one the operating system checks, and
         // on macOS that check can take seconds. It is taken here, once, so a test that measures how
@@ -128,6 +128,17 @@ impl Placed {
             warmed.stderr
         );
         placed
+    }
+
+    /// A program placed by a case beside the one it already holds, which is the only one it runs: it
+    /// takes no hold of its own, so it never waits for itself.
+    #[must_use]
+    pub const fn beside(host: kr_ipc::testing::TempHost, forwarder: PathBuf) -> Self {
+        Self {
+            host,
+            forwarder,
+            _hold: None,
+        }
     }
 
     /// The forwarder with these arguments and a clean environment, run from the tree's root.
@@ -187,6 +198,27 @@ impl StandIn {
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("the listener binds");
         Self { listener, address }
     }
+}
+
+/// Connects to the private endpoint a launch publishes, which a registration names as `address`: the
+/// socket's path on Unix and the pipe's full name on Windows.
+///
+/// # Panics
+///
+/// Panics when the endpoint cannot be named or reached.
+pub async fn connect(address: &str) -> kr_ipc::endpoint::Connection {
+    let endpoint = if cfg!(windows) {
+        let name = address
+            .strip_prefix(r"\\.\pipe\")
+            .expect("a pipe's full name");
+        kr_ipc::paths::Endpoint::from_name(name.to_owned())
+    } else {
+        kr_ipc::paths::Endpoint::from_path(PathBuf::from(address))
+    }
+    .expect("a usable endpoint");
+    kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("the endpoint is reachable")
 }
 
 /// Reads one line from a connection, without its newline, and the end of the stream as its end.
@@ -297,4 +329,40 @@ fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran 
         stderr: diagnosing.join().expect("the diagnostics are read"),
         took,
     }
+}
+
+/// Sets whether a write to a pipe waits for room: it does, or it writes nothing and says so.
+///
+/// The calls have no safe form; the handle is the pipe's own and open for each of them.
+///
+/// # Panics
+///
+/// Panics when the system refuses the mode.
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "setting a pipe's mode is a call with no safe form"
+)]
+pub fn pipe_waits(pipe: &std::io::PipeWriter, waits: bool) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::System::Pipes::{PIPE_NOWAIT, PIPE_WAIT, SetNamedPipeHandleState};
+
+    let mode = if waits { PIPE_WAIT } else { PIPE_NOWAIT };
+    // SAFETY: the handle is the pipe's own and open; the mode is a local that outlives the call, and
+    // the two limits are not changed.
+    let set = unsafe {
+        SetNamedPipeHandleState(
+            pipe.as_raw_handle().cast(),
+            &raw const mode,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_ne!(
+        set,
+        0,
+        "the pipe's mode is set: {}",
+        std::io::Error::last_os_error()
+    );
 }
