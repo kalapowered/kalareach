@@ -1570,7 +1570,9 @@ fn upstream_rich() -> kr_protocol::gateway::RichMethodTable {
 }
 
 /// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
-/// and otherwise a loopback connection, which is what this host's own endpoint is there.
+/// and otherwise a loopback connection. This suite needs two connected streams and nothing of the
+/// endpoint they stand in for: a launched agent's endpoint on Windows is a named pipe, and the
+/// `windows_endpoint` suite runs that.
 #[cfg(unix)]
 type SocketStream = tokio::net::UnixStream;
 #[cfg(not(unix))]

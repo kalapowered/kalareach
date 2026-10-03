@@ -323,6 +323,18 @@ impl ManagedProcess {
         cfg!(any(unix, windows))
     }
 
+    /// Returns true when this platform's command backends run: an integrated invocation is given a
+    /// backend before it starts, and its launcher reaches it.
+    ///
+    /// It is a fact about the platform apart from [`Self::publishes_credential_file`]: a platform
+    /// can prove a file closed to other accounts and still have no launcher that reaches a backend.
+    /// Unix and Windows run them. The daemon's doctor reads this to say whether an enabled
+    /// integration can launch here.
+    #[must_use]
+    pub const fn runs_command_backends() -> bool {
+        cfg!(any(unix, windows))
+    }
+
     /// Writes the registration file the launched process reads its credential from.
     ///
     /// The host's own owner-only publication is what writes it: the contents are complete before
@@ -520,6 +532,12 @@ mod tests {
             true,
             TimestampMs::new(1),
         )
+    }
+
+    #[test]
+    fn unix_and_windows_run_command_backends_and_publish_a_credential_file() {
+        assert!(ManagedProcess::runs_command_backends());
+        assert!(ManagedProcess::publishes_credential_file());
     }
 
     #[test]
