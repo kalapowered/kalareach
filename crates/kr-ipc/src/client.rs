@@ -832,10 +832,16 @@ impl LocalClient {
         loop {
             match self.read_socket_frame().await? {
                 ControlFrame::Response(response) if response.request_id == request_id => {
-                    return Ok(match response.outcome {
-                        Outcome::Ok(value) => Ok(value),
-                        Outcome::Error(error) => Err(error),
-                    });
+                    return match response.outcome {
+                        Outcome::Ok(value) => Ok(Ok(value)),
+                        // A worker's refusal of this connection itself. The answer was read to its
+                        // end, but nothing more can be asked over a link that no longer speaks for
+                        // the generation that holds the worker, so it is the link's failure.
+                        Outcome::Error(error) if error.link_fenced => Err(IpcError::LinkFenced {
+                            detail: error.message,
+                        }),
+                        Outcome::Error(error) => Ok(Err(error)),
+                    };
                 }
                 // A notification that arrives while a call is outstanding is not an answer to it.
                 // It is this connection's subscription, so it is kept in the order it arrived and
