@@ -281,9 +281,9 @@ There are two things the adapters do that are easy to get wrong. An argument vec
 at a time, *including the first*, and with the enclosing single quotes: a bare word at command
 position would be a reserved word, an assignment or an alias rather than the name the caller asked
 to run, and an unquoted `$(...)` would run. Zsh's own `quotestring` escapes for the inside of single
-quotes and leaves the quotes to its caller, which is a trap worth naming. And on Zsh the text goes
-in through the editor's own string representation: `setline` unmetafies what it is handed, so raw
-bytes above 0x7f would change on the way in.
+quotes and leaves the quotes to its caller, which is a trap. And on Zsh the text goes in through the
+editor's own string representation: `setline` unmetafies what it is handed, so raw bytes above 0x7f
+would change on the way in.
 
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
@@ -370,10 +370,10 @@ There are two notes on that last field. Bash's `make tests` passes with these pa
 `make check` runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over
 `print foo >&-`, which writes to a closed descriptor and prints where the test expects silence. An
 unpatched 5.9 built from the same tarball and the same flags fails the same single script, so this
-is the release meeting the host rather than anything the patches do. The build script runs each
-suite in its own process group, ends it at a bound, records the outcome and its summary line in the
-identity, and carries on; `--require-upstream-tests` turns anything but a pass into a build failure,
-which is what continuous integration uses on Linux.
+is how the release behaves on this host rather than anything the patches do. The build script runs
+each suite in its own process group, ends it at a bound, records the outcome and its summary line in
+the identity, and carries on; `--require-upstream-tests` turns anything but a pass into a build
+failure, which is what continuous integration uses on Linux.
 
 ## The licence position
 

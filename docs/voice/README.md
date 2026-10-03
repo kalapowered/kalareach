@@ -47,9 +47,9 @@ device's** grant.
 
 ## What the coordinator may send back
 
-The coordinator sends back the bounded selection the specification states, and nothing else. It is
-an upper limit, and this daemon supplies less of it, as the section on what this daemon performs and
-supplies says:
+The coordinator may send back the bounded selection the specification states, and nothing else. It
+is an upper limit, and this daemon supplies less of it, as the section on what this daemon performs
+and supplies says:
 
 - the session description, the current working directory, the active application, the summaries of
   decisions waiting on a person, and the last twenty semantic messages;

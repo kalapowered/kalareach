@@ -362,7 +362,7 @@ while the transport stays connected, and the bounded offline-validity policy an 
 Those are rules the control daemon implements and decides with `grants::decide`; a paired device's
 session request is decided at the network boundary, against the grant its pairing recorded.
 
-Two rules cross the boundary and are stated on both sides.
+Two rules cross the boundary, so each is stated here from both sides.
 
 **Only the host issues revisions.** A revocation request carries none, and a host rejects a revision
 record that does not follow the one it last accepted. The daemon keeps the highest revision it has
