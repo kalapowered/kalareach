@@ -35,10 +35,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::{
@@ -136,13 +136,30 @@ pub(super) fn environment_block(
     block
 }
 
+/// Makes this process a member of `job`, so that every process it creates from now on is born in
+/// it as well.
+fn join(job: &OwnedHandle) -> Result<(), String> {
+    // SAFETY: the handle is the job's, open for the call; the pseudo handle for this process names
+    // it and needs no closing.
+    let joined =
+        unsafe { AssignProcessToJobObject(job.as_raw_handle().cast(), GetCurrentProcess()) };
+    if joined == 0 {
+        return Err(format!(
+            "this launcher could not join the job that holds its program: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// The program the launcher created, suspended.
 ///
-/// A job of the launcher's own holds it from before its first instruction until it has been started,
-/// with the job set to end what it holds when its last handle closes, and this launcher holds the
-/// only one. A launcher that stops for any reason in that time, whatever the backend has or has not
-/// done, ends the program it created, which nothing could start. Once the backend has committed the
-/// launch the setting is taken off, so the launcher's own end ends nothing the program started.
+/// The launcher joins a job of its own, set to end what it holds when its last handle closes, just
+/// before it creates the program, so the program is born in that job and no moment exists in which
+/// it is created and not held. The launcher holds the only handle. A launcher that stops for any
+/// reason after that, whatever the backend has or has not done, ends the program it created, which
+/// nothing could start. Once the backend has committed the launch, or the program has been ended,
+/// the setting is taken off, so the launcher's own end ends nothing the program started.
 pub(super) struct Program {
     process: OwnedHandle,
     thread: OwnedHandle,
@@ -176,7 +193,7 @@ fn ends_with_its_handle(job: &OwnedHandle, ends: bool) -> Result<(), String> {
 }
 
 /// Makes the job a program is held by until it has been started: its own, ending what it holds
-/// when its last handle closes.
+/// when its last handle closes. Nothing is in it yet.
 fn holder() -> Result<OwnedHandle, String> {
     // SAFETY: no attributes and no name are asked for; the call returns a handle or null.
     let made = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -278,6 +295,13 @@ impl Program {
         startup.StartupInfo.hStdError = standard[2];
         // SAFETY: all zeroes is a structure of integers that the call fills in.
         let mut started: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // Joined last, with everything that could fail already done: from here the program is born
+        // in the holder, and the holder is let go of again on every way out that does not start it.
+        if let Err(failure) = join(&holder) {
+            // SAFETY: the list was initialised above, nothing else holds it.
+            unsafe { DeleteProcThreadAttributeList(attributes) };
+            return Err(failure);
+        }
         // SAFETY: every pointer is to a local that outlives the call. The command line is mutable
         // because the call may write into it. The handles inherited are the ones the list names;
         // with none to name, none are inherited.
@@ -300,6 +324,8 @@ impl Program {
         // holds it.
         unsafe { DeleteProcThreadAttributeList(attributes) };
         if let Some(failure) = failure {
+            // Nothing was created in the holder, and this launcher is in it: it ends nothing.
+            let _ = ends_with_its_handle(&holder, false);
             return Err(format!(
                 "{} could not be created: {failure}",
                 executable.display()
@@ -313,39 +339,25 @@ impl Program {
                 OwnedHandle::from_raw_handle(started.hThread.cast()),
             )
         };
-        let program = Self {
+        Ok(Self {
             process,
             thread,
             id: started.dwProcessId,
             holder,
-        };
-        // SAFETY: both handles are open for the call and this value owns them.
-        let held = unsafe {
-            AssignProcessToJobObject(
-                program.holder.as_raw_handle().cast(),
-                program.process.as_raw_handle().cast(),
-            )
-        };
-        if held == 0 {
-            let failure = std::io::Error::last_os_error();
-            // Not yet held by anything of this launcher's, and not run: ended here, so that no
-            // suspended program is left for a launcher that now runs the typed command.
-            program.end();
-            return Err(format!(
-                "the program could not be held by a job of this launcher's: {failure}"
-            ));
-        }
-        Ok(program)
+        })
     }
 
-    /// Ends the program, which has not run: nothing it could have started exists.
+    /// Ends the program, which has not run: nothing it could have started exists. The holder is let
+    /// go of, since this launcher goes on to run the typed command and what that starts is not the
+    /// holder's to end.
     fn end(&self) {
         // SAFETY: the handle is this value's own and open for the call.
         unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
+        let _ = ends_with_its_handle(&self.holder, false);
     }
 
     /// Lets the job that held the program until now go without ending what it holds, and starts the
-    /// program.
+    /// program. The launcher stays a member of it, which ends nothing.
     ///
     /// Called once the backend has committed the launch, which is after it has shown the program
     /// and taken it into a job of its own that ends it should the launcher go before it says the
@@ -646,4 +658,91 @@ pub(super) fn run(
     let code = program.wait();
     // The whole 32-bit code: an exit code is not a byte on this platform.
     std::process::exit(i32::from_ne_bytes(code.to_ne_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
+
+    use super::*;
+
+    /// A program every Windows machine has, which ends at once when it is started.
+    fn quick() -> (std::path::PathBuf, Vec<OsString>) {
+        let system = std::env::var_os("SystemRoot").expect("a system directory");
+        let program = Path::new(&system).join("System32").join("cmd.exe");
+        let vector = ["cmd.exe", "/d", "/c", "exit 0"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        (program, vector)
+    }
+
+    /// Whether ending the job's last handle would end what it holds.
+    fn armed(job: &OwnedHandle) -> bool {
+        // SAFETY: all zeroes is a structure of integers and pointers that the call fills in.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut written = 0_u32;
+        // SAFETY: the handle is open for the call; the structure and the count are locals, and the
+        // size told is the structure's own.
+        let read = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle().cast(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut limits).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .unwrap_or(0),
+                &raw mut written,
+            )
+        };
+        assert_ne!(read, 0, "the job's limits are read");
+        limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0
+    }
+
+    /// Whether `process` is in `job`, directly or in a job nested in it.
+    fn holds(job: &OwnedHandle, process: &OwnedHandle) -> bool {
+        let mut inside = 0_i32;
+        // SAFETY: both handles are open for the call and the answer is a local.
+        let asked = unsafe {
+            IsProcessInJob(
+                process.as_raw_handle().cast(),
+                job.as_raw_handle().cast(),
+                &raw mut inside,
+            )
+        };
+        assert_ne!(
+            asked, 0,
+            "the system answers whether the process is in the job"
+        );
+        inside != 0
+    }
+
+    /// A program the launcher creates is in the job that ends it with the launcher from the moment
+    /// the creation returns, and is let go of by every way out of an unstarted program: ended, and
+    /// started. One case, since a launcher is a member of every holder it makes.
+    #[test]
+    fn a_program_is_born_in_the_job_that_ends_it_with_the_launcher_until_it_is_let_go() {
+        let (executable, vector) = quick();
+
+        let ended = Program::create(&executable, &vector, &[]).expect("a program is created");
+        assert!(
+            holds(&ended.holder, &ended.process),
+            "the program is in the holder as soon as it exists"
+        );
+        assert!(armed(&ended.holder), "which ends it with the launcher");
+        ended.end();
+        assert!(
+            !armed(&ended.holder),
+            "an ended program leaves the holder ending nothing, for the typed command that follows"
+        );
+
+        let started = Program::create(&executable, &vector, &[]).expect("a program is created");
+        assert!(holds(&started.holder, &started.process));
+        assert!(armed(&started.holder));
+        started.resume().expect("the program is started");
+        assert!(
+            !armed(&started.holder),
+            "a started program is never one that the launcher's end ends"
+        );
+        assert_eq!(started.wait(), 0, "and it ran");
+    }
 }
