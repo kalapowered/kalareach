@@ -331,7 +331,7 @@ struct Verdict {
     file: FileIdentity,
 }
 
-/// Shows that a process was created from the file this launch holds, once, and records the verdict.
+/// Shows that a process was created from the file this launch holds.
 ///
 /// `held` is the file that was opened for reading with sharing for readers only at the establish
 /// and hashed through that handle; nothing has been able to rename, delete or write it since, so
@@ -339,19 +339,11 @@ struct Verdict {
 /// the path the launch presented. The kernel's record of the image is opened by its device path
 /// and its object compared with the held file's.
 ///
-/// A launch has one program. A second verdict is refused, and so is a process created from
-/// another file.
-///
 /// # Errors
 ///
 /// Returns why the process's image is not shown to be the held file.
 #[cfg(windows)]
-pub fn record_image(
-    process: &ProcessStartIdentity,
-    identity: &ExecutableIdentity,
-    held: &std::fs::File,
-    verified: &VerifiedFiles,
-) -> Result<(), String> {
+pub fn show_image(process: &ProcessStartIdentity, held: &std::fs::File) -> Result<(), String> {
     let pid = u32::try_from(process.pid.get())
         .map_err(|_| format!("{} is not a process identifier", process.pid))?;
     let image = crate::windows::file::image_of(pid)?;
@@ -359,20 +351,54 @@ pub fn record_image(
         .map_err(|error| format!("the image of process {pid} cannot be identified: {error}"))?;
     let held_object = crate::windows::file::object_of(held)
         .map_err(|error| format!("the file this launch holds cannot be identified: {error}"))?;
-    if created_from != held_object {
-        return Err(format!(
+    if created_from == held_object {
+        Ok(())
+    } else {
+        Err(format!(
             "process {pid} was created from another file than the one its launch presented"
-        ));
+        ))
     }
-    // The hold is the hashed file: its identity is read from the handle that was hashed, so this
-    // is the identity the verdict is kept under.
-    let verdict = Verdict {
-        process: process.clone(),
-        file: identity.hashed.file,
-    };
-    verified.verdict.set(verdict).map_err(|_| {
-        "this launch's program was shown already, and a launch has one program".to_owned()
-    })
+}
+
+/// Records, once, that a process was shown to be created from the hashed file.
+///
+/// A launch has one program: a second verdict is refused.
+///
+/// # Errors
+///
+/// Returns that the launch's program was recorded already.
+#[cfg(windows)]
+pub fn record_verdict(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    verified: &VerifiedFiles,
+) -> Result<(), String> {
+    verified
+        .verdict
+        .set(Verdict {
+            process: process.clone(),
+            file: identity.hashed.file,
+        })
+        .map_err(|_| {
+            "this launch's program was shown already, and a launch has one program".to_owned()
+        })
+}
+
+/// Shows that a process was created from the held file and records the verdict: both of
+/// [`show_image`] and [`record_verdict`].
+///
+/// # Errors
+///
+/// Returns what either refuses.
+#[cfg(all(windows, test))]
+pub fn record_image(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    held: &std::fs::File,
+    verified: &VerifiedFiles,
+) -> Result<(), String> {
+    show_image(process, held)?;
+    record_verdict(process, identity, verified)
 }
 
 /// Checks, from the kernel's record of the process's main executable, that a registered process

@@ -952,7 +952,10 @@ async fn kr_req_12_02_a_launch_into_a_directory_open_to_another_account_starts_n
     let broker =
         Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
     let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(2))
-        .expect("the endpoint binds");
+        .expect("the endpoint binds")
+        .in_session(Arc::new(
+            kr_worker::windows::job::SessionJob::create().expect("a session job"),
+        ));
     let intent = broker
         .prepare_launch(
             agent_profile(&[
