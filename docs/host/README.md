@@ -412,6 +412,9 @@ launched without for its size is reported as `too_large`. One answer carries at 
 and 384 KiB of them, the listed packages first, and the check counts any it leaves out. A session
 whose own search path differs can find another; each launch records the one it ran.
 
+`environment_additions` is the preference that adds variables to a session started with the host's
+environment, described under *The environment a session starts with*.
+
 The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
 configuration is reported by `kr doctor` in one line and ignored.
 
@@ -933,8 +936,9 @@ qualification may not do.
    identifier and the kernel's record of its start — with what the launcher reported. Exactly one
    rendezvous per reservation succeeds; a second is refused, recorded, and fences the reservation.
 5. The daemon sends the launch specification over that private channel: the create request with the
-   creator's environment variables, taken from memory, its own public key, its generation and the
-   privacy state in force.
+   environment variables the session starts with (see *The environment a session starts with*),
+   taken from memory, whose environment they are and the names of the configured ones among them,
+   its own public key, its generation and the privacy state in force.
 6. The worker binds its endpoint, creates the pseudo-terminal, applies the privacy state, launches
    the root shell and reports itself ready. The daemon records the worker's public key inside the
    same transaction that marks the session live, then publishes the descriptor.
@@ -970,6 +974,21 @@ request that could not be served.
 
 [docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
 the phases, the launch transaction and the guarded startup entries `kr shell` writes.
+
+### The environment a session starts with
+
+Whose environment a shell starts with depends on where the create came through, what the client says it is, and whether anyone is shown the session. It never depends on whether the request happens to carry variables.
+
+A session the command line creates for a person to see starts with that command line's own environment, which the command line sends with the request. The worker filters it as [the shell host's document](../shell-integration/host.md) describes. A session an app creates, a session created invisibly (from the command line too, which then sends nothing) and a session a paired device asks for all start with the host's environment instead. A request for one of those that carries variables is refused, and the refusal repeats none of them. A connection that declared itself the control daemon or a worker creates no session. The kind a client declares decides whose environment its sessions get, and gives it no authority.
+
+The host's environment is an allowlist of the daemon's own, read once when the daemon starts: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `TZ`, `TMPDIR` and every `LC_` variable. On Windows the allowlist is `PATH`, `PATHEXT`, `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `USERNAME`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`, `LANG`, `TZ` and every `LC_` variable, and names are compared without regard to case. A credential in the environment the daemon was started from, an agent socket or a terminal's identity never reaches a session. Desktop variables come from the execution context the session runs in, as *The desktop a session runs on* describes.
+
+The owner can add to it. The `environment_additions` preference is a map from variable names to values, set in the configuration document on the host's rung or on a profile. A session started with the host's environment gets each of them over the host's own value of the same name, and a value replaces the host's whole: a `PATH` added there is the session's `PATH`, and nothing in it is expanded or joined to another. A profile's map replaces the host's rather than adding to it, and an empty map adds nothing. A session started with the command line's environment gets none of them. The configuration is read when the session is created, so an edit reaches the sessions created after the daemon accepts it.
+
+A rung holds at most 64 names. A value is at most 32,767 bytes and holds no NUL, and a rung's names and values together are at most 256 KiB. A name the host sets for a session itself is refused in any letter case: the `KR_` names, the terminal identity variables, `TERM`, `COLORTERM`, `SHELL`, `SSH_TTY` and the desktop's variables. On Windows two names that differ only in case are one variable, so a document that names both is refused. The values stay in the document. `kr doctor` names the variables a rung adds and never a value, a refusal names a name by its class and length, and the map prints only its names when something prints it, so a credential an owner keeps there does not reach a log.
+
+The worker records where three things came from, and the session's summary says so. The list of sessions, a read, the worker's ready report and the worker's journal all carry it. For `PATH` the answer is `creator_snapshot`, `host_context`, `configured_addition`, `execution_context` or `unset`. The locale takes the same words, for the first of `LC_ALL`, `LC_CTYPE` and `LANG` that is not empty, which is how a POSIX shell picks its character set. The working directory is `create_request`, or `worker_default` when the request named none and the worker started the shell in the root directory. The words describe what the shell was started with, and a startup file changes the rest as it does for any shell. A daemon that starts again lists them as before, because the worker holds them. `kr doctor` prints a line for each live session and says how many live sessions did not answer. The content export carries the three words in each session's record, and a bundle without content carries none.
+
 ## The desktop a session runs on
 
 Where a session is shown and where its processes run are different questions. `kr new --invisible`
