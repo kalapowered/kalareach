@@ -14,7 +14,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses, one a launcher declines and one that is never started leave nothing running |
+//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses or does not commit, one a launcher declines and one that is never started leave nothing running |
 //! | KR-REQ-12.07 | a refused invocation runs as typed |
 //! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
 //! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
@@ -855,6 +855,34 @@ fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
     assert!(why.contains("the job limits the desktop"), "{why}");
     assert!(!Shell::registration(&answer).exists());
     shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-12.02: a launch the backend does not commit leaves nothing of the launcher's running: the
+/// program it created was never started and it is ended before the typed command runs. Here the
+/// line ends while the launch waits at its commit, so the backend is retired and the commit is
+/// refused. Control: the same launch, committed, is the program the other tests run.
+#[test]
+fn kr_req_12_02_a_program_the_backend_does_not_commit_is_ended_and_the_typed_command_runs() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let (arrived, release) = shell.backends.pause_before_committing();
+    // The typed program ends at once, so that what the shell's job holds afterwards is what the
+    // launcher left behind.
+    let mut launcher = shell.launch(&answer, "uncommitted", &[("EXIT_WITH", "7")]);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch arrives at the commit")
+        .expect("and waits there");
+    let _ = shell.backends.close();
+    release.send(()).expect("the commit goes on");
+    let status = launcher
+        .wait()
+        .expect("the launcher ends with the typed program");
+    assert_eq!(status.code(), Some(7), "the typed command ran");
+    eventually("the program the launcher created is ended", || {
+        shell.job.process_ids().is_ok_and(|held| held.is_empty())
+    });
 }
 
 /// KR-REQ-12.02: a program that was committed and never started is ended with everything in its job
