@@ -8,27 +8,9 @@
 //! selected profile's, read from the cache `scripts/bench-descriptions.sh` fills, and never
 //! written. A host without them says so and runs nothing.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-
 use kr_describe::output::DESCRIPTION_GRAMMAR;
-use kr_describe::priority::Cancellation;
-use kr_describe::profile::catalogue::Catalogue;
-use kr_describe_model::assets::verify_file;
-use kr_describe_model::llama::LlamaRuntime;
 
-/// Where the benchmark keeps the weights on this platform, or where this run is told they are.
-fn cache_directory() -> Option<PathBuf> {
-    if let Some(given) = std::env::var_os("KR_DESCRIBE_MODEL_CACHE") {
-        return Some(PathBuf::from(given));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(if cfg!(target_os = "macos") {
-        home.join("Library/Caches/kalareach-describe")
-    } else {
-        home.join(".cache/kalareach-describe")
-    })
-}
+mod support;
 
 /// The answer the grammar describes, with the given title and activity text.
 fn answer(title: &str, activity: &str) -> String {
@@ -42,37 +24,11 @@ fn answer(title: &str, activity: &str) -> String {
 /// one that is cut short, whatever the bytes of its characters add up to.
 #[test]
 fn llama_cpp_takes_the_answers_the_grammar_describes_and_refuses_the_rest() {
-    let profile = Catalogue::builtin()
-        .expect("this build's profiles")
-        .default_profile()
-        .clone();
-    let weights = profile
-        .assets()
-        .iter()
-        .find(|asset| asset.role == "weights")
-        .expect("the profile names its weights")
-        .clone();
-    let Some(cached) = cache_directory().map(|cache| cache.join(&weights.file_name)) else {
-        eprintln!("the grammar test did not run: this host has no home directory");
+    let Some(runtime) =
+        support::runtime("llama_cpp_takes_the_answers_the_grammar_describes_and_refuses_the_rest")
+    else {
         return;
     };
-    if std::fs::metadata(&cached).map(|about| about.len()).ok() != Some(weights.bytes) {
-        eprintln!(
-            "the grammar test did not run: {} is not on this host",
-            cached.display()
-        );
-        return;
-    }
-    // The file the profile records, by its digest and not only its size: a test of how the
-    // library reads the grammar means nothing against another model's vocabulary.
-    verify_file(&weights, &cached).expect("the cached weights are the profile's");
-    let runtime = LlamaRuntime::load(
-        &profile,
-        &cached,
-        &Cancellation::new(),
-        Instant::now() + Duration::from_secs(300),
-    )
-    .expect("the real weights load");
     let takes = |text: &str| {
         runtime
             .grammar_takes(DESCRIPTION_GRAMMAR, text.as_bytes())
