@@ -467,6 +467,8 @@ fn review_states(attention: &Attention, who: &str, in_session: SessionId) -> Vec
 
 // ----- The rule set ------------------------------------------------------------------------
 
+/// KR-REQ-25.01: every rule in the set is raised by the typed event it covers, and the idle
+/// reminder, the one rule a timer raises, by the clock.
 #[test]
 fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
     let mut attention = engine();
@@ -2212,6 +2214,8 @@ fn view(id: &str, offset: u64, filter: &str) -> LogViewState {
     }
 }
 
+/// KR-REQ-25.27: a log view keeps its source offset and its filter across a reconnect: the store
+/// is opened again and the view comes back as it was, with no gap.
 #[test]
 fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -2238,6 +2242,7 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
     assert!(changed.views[0].gap.as_ref().is_none());
 }
 
+/// KR-REQ-25.27: switching to another view keeps the source offset and the filter of both.
 #[test]
 fn switching_to_another_view_loses_neither_one_s_position() {
     let mut attention = engine();
@@ -2319,6 +2324,8 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
     );
 }
 
+/// KR-REQ-25.27: a view whose range retention took is served from the oldest byte still held with
+/// its filter kept, and the evicted range is stated as a gap.
 #[test]
 fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_about_the_gap() {
     let mut attention = engine();

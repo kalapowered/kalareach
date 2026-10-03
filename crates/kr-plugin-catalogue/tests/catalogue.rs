@@ -3504,7 +3504,9 @@ fn presentation_size(generation: &Generation) -> u64 {
         .get()
 }
 
-/// A declaration that understates a payload's length is not served from the cache on its word.
+/// KR-REQ-11.10, KR-REQ-11.12: a declaration that understates a payload's length is not served
+/// from the cache on its word, and a payload whose bytes run past the length declared for it is
+/// refused, with nothing of the package activated.
 ///
 /// The first release's presentation is cached here. The next release names the same bytes, by
 /// digest, at two paths, and its index and its targets metadata agree on a length shorter than the
@@ -8882,11 +8884,11 @@ fn tree_of(
     tree
 }
 
-/// Every directory the store writes through, from the catalogue's own down to each of one
-/// repository's, is refused while it is a link to a directory elsewhere. A sync that would publish
-/// a checkpoint and an install that would activate a package both stop before anything is written
-/// through it, and the directory elsewhere, which holds a copy of what the store's held and a file
-/// of its own, is left exactly as it was. Put back, the directory serves both again.
+/// KR-REQ-11.10: every directory the store writes through, from the catalogue's own down to each
+/// of one repository's, is refused while it is a link to a directory elsewhere. A sync that would
+/// publish a checkpoint and an install that would activate a package both stop before anything is
+/// written through it, and the directory elsewhere, which holds a copy of what the store's held
+/// and a file of its own, is left exactly as it was. Put back, the directory serves both again.
 #[tokio::test]
 async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_through_it() {
     let mut written_through = Vec::new();
@@ -8975,10 +8977,10 @@ async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_
     assert!(written_through.is_empty(), "{written_through:#?}");
 }
 
-/// A catalogue directory that is a link is refused however its name is spelt: a separator or a
-/// `.` after the link's name would have the platform resolve the link before a check of the name
-/// could see it. Neither the catalogue nor a repository's store opens through it, and the
-/// directory it points at is left as it was.
+/// KR-REQ-11.10: a catalogue directory that is a link is refused however its name is spelt: a
+/// separator or a `.` after the link's name would have the platform resolve the link before a
+/// check of the name could see it. Neither the catalogue nor a repository's store opens through
+/// it, and the directory it points at is left as it was.
 #[test]
 fn a_catalogue_directory_that_is_a_link_is_refused_however_it_is_spelt() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -9117,11 +9119,11 @@ impl tough::Transport for Interrupting {
     }
 }
 
-/// A store directory replaced by a link while an operation holds the store, after the checks it
-/// made when it took the store and before it writes, is refused at its next write. A checkpoint
-/// publication, a payload kept in the cache, a staged file and a package's activation each check
-/// every directory they write through just before they write, and the directory elsewhere is
-/// left as it was.
+/// KR-REQ-11.10: a store directory replaced by a link while an operation holds the store, after
+/// the checks it made when it took the store and before it writes, is refused at its next write. A
+/// checkpoint publication, a payload kept in the cache, a staged file and a package's activation
+/// each check every directory they write through just before they write, and the directory
+/// elsewhere is left as it was.
 #[tokio::test]
 async fn a_store_directory_linked_while_the_store_is_held_is_refused_at_the_next_write() {
     let mut written_through = Vec::new();
