@@ -14,9 +14,9 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses or does not commit, one a launcher declines and one that is never started leave nothing running |
+//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses or does not commit, one a launcher declines, one whose launcher goes before it is confirmed and one that is never started leave nothing running |
 //! | KR-REQ-12.07 | a refused invocation runs as typed |
-//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
+//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; the hold on the hashed file ends with the commit; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
 //! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
 
 #![cfg(windows)]
@@ -884,6 +884,67 @@ fn kr_req_12_02_a_program_the_backend_does_not_commit_is_ended_and_the_typed_com
     eventually("the program the launcher created is ended", || {
         shell.job.process_ids().is_ok_and(|held| held.is_empty())
     });
+}
+
+/// KR-REQ-12.02: a launcher that is gone between the commit and the confirmation leaves no program
+/// suspended: the worker ends the program it was shown when the confirmation cannot be written.
+/// Control: a launcher that is not gone is confirmed, and its program runs (every other test here).
+#[test]
+fn kr_req_12_02_a_launcher_gone_before_it_is_confirmed_leaves_no_suspended_program() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut scripted = shell.admitted_launcher(&answer);
+    let program = scripted.create(&shell.executable, &shell.typed()[1..]);
+    let identity = kr_ipc::identity::process_start_identity(program).expect("an identity");
+    scripted.write(&Shell::going(program));
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch arrives at its confirmation")
+        .expect("and waits there");
+    let _ = scripted.child.kill();
+    let _ = scripted.child.wait();
+    let _ = release.send(());
+    eventually("the program nobody can start is ended", || {
+        matches!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Ended
+        )
+    });
+}
+
+/// KR-REQ-05.09: the hold on the file a launch hashed lasts to the commit and ends with it: the file
+/// cannot be renamed while the launch is being committed, and can once it is, so a program that
+/// updates itself while it runs is not held to its old file. Control: before the commit the rename
+/// is refused with a sharing violation.
+#[test]
+fn kr_req_05_09_the_hold_on_a_launchs_file_ends_with_its_commit() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let moved = shell.executable.with_extension("moved");
+    let (arrived, release) = shell.backends.pause_before_committing();
+    let mut launcher = shell.launch(&answer, "held", &[]);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch arrives at the commit")
+        .expect("and waits there");
+    let refused = std::fs::rename(&shell.executable, &moved)
+        .expect_err("the file is held until the launch is committed");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(32),
+        "by a sharing violation: {refused}"
+    );
+    release.send(()).expect("the commit goes on");
+    let report = shell.report_from("held", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the launch was committed");
+    std::fs::rename(&shell.executable, &moved).expect("the file is let go of with the commit");
+    assert!(matches!(
+        shell.state_of(Shell::instance_of(&answer)),
+        Some(BackendState::Committed(_))
+    ));
 }
 
 /// KR-REQ-12.02: a program that was committed and never started is ended with everything in its job
