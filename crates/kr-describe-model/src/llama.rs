@@ -126,7 +126,8 @@ pub struct PromptTokens {
     /// The tokens, framed as the vocabulary frames a prompt.
     pub tokens: Vec<LlamaToken>,
     /// How many structure tokens the prompt's text spelled and had written out as characters
-    /// instead. An ordinary prompt spells none.
+    /// instead. Ordinary names can spell one, as `feature/thinking` spells `/think`; a prompt whose
+    /// text spells none has none.
     pub spelled_out: usize,
 }
 
@@ -346,6 +347,11 @@ impl LlamaRuntime {
     /// tokens returned hold no control token of the vocabulary except the framing the vocabulary
     /// itself adds. See [`PromptTokens`].
     ///
+    /// The characters are the text's own for a byte-level vocabulary, which both shipped profiles
+    /// are. A vocabulary with a space prefix adds a space before each character, and one without
+    /// a byte fallback writes an unknown character as the unknown token's spelling; neither lets
+    /// a structure token through.
+    ///
     /// # Errors
     ///
     /// Returns what went wrong when the prompt could not be tokenized.
@@ -365,6 +371,9 @@ impl LlamaRuntime {
         }
         // The framing the vocabulary puts around a text is read off a text it has no opinion about.
         let probe = tokenize("a", AddBos::Never)?;
+        if probe.iter().any(|token| self.is_structure(*token)) {
+            return Err("this vocabulary reads the letter a as structure".to_owned());
+        }
         let probed = tokenize("a", AddBos::Always)?;
         let at = (!probe.is_empty())
             .then(|| {
@@ -394,8 +403,14 @@ impl LlamaRuntime {
     /// Returns whether a token is one the model reads as the structure of a prompt, which text
     /// from a project must never become: a control token, the unknown token, a token the
     /// vocabulary defines on top of its text, the ends of a sequence and the end of a turn.
+    ///
+    /// A number that is no token of this vocabulary is not text either, and counts as structure.
     #[must_use]
     pub fn is_structure(&self, token: LlamaToken) -> bool {
+        // The library looks a token up by its number and does not check it.
+        if !(0..self.model.n_vocab()).contains(&token.0) {
+            return true;
+        }
         self.model.token_attr(token).intersects(
             LlamaTokenAttr::Control | LlamaTokenAttr::UserDefined | LlamaTokenAttr::Unknown,
         ) || self.model.is_eog_token(token)
@@ -403,22 +418,41 @@ impl LlamaRuntime {
             || token == self.model.token_eos()
     }
 
+    /// Returns the bytes `tokens` spell: what the model reads when the tokens are ordinary text.
+    /// A token that is not text, such as the framing of a prompt, spells nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when a token could not be spelled.
+    pub fn spelling_of(&self, tokens: &[LlamaToken]) -> std::result::Result<Vec<u8>, String> {
+        let mut spelled = Vec::new();
+        for token in tokens {
+            spelled.extend(self.piece(*token, false)?);
+        }
+        Ok(spelled)
+    }
+
+    /// Returns the bytes of one token's piece, with `special` choosing whether a structure token
+    /// spells its own text or nothing. A token with no text of its own spells nothing.
+    fn piece(&self, token: LlamaToken, special: bool) -> std::result::Result<Vec<u8>, String> {
+        let mut size = PIECE_BYTES;
+        loop {
+            match self.model.token_to_piece_bytes(token, size, special, None) {
+                Ok(piece) => return Ok(piece),
+                Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
+                    size = usize::try_from(-needed).unwrap_or(size.saturating_mul(2));
+                }
+                Err(TokenToStringError::UnknownTokenType) => return Ok(Vec::new()),
+                Err(error) => return Err(format!("a token could not be spelled: {error}")),
+            }
+        }
+    }
+
     /// Returns the tokens that write out a structure token's spelling as the characters it is made
     /// of, each tokenized alone. A character that is itself a structure token has nothing to be
     /// written as, and is left out.
     fn spelling_tokens(&self, token: LlamaToken) -> std::result::Result<Vec<LlamaToken>, String> {
-        let mut size = PIECE_BYTES;
-        let piece = loop {
-            match self.model.token_to_piece_bytes(token, size, true, None) {
-                Ok(piece) => break piece,
-                Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
-                    size = usize::try_from(-needed).unwrap_or(size.saturating_mul(2));
-                }
-                // A token with no text of its own, which has nothing to write out.
-                Err(TokenToStringError::UnknownTokenType) => break Vec::new(),
-                Err(error) => return Err(format!("a token could not be spelled: {error}")),
-            }
-        };
+        let piece = self.piece(token, true)?;
         let mut tokens = Vec::new();
         for character in String::from_utf8_lossy(&piece).chars() {
             let mut buffer = [0_u8; 4];
