@@ -1075,7 +1075,7 @@ fn kr_req_12_02_a_cold_copy_of_the_largest_agent_is_launched_within_the_deadline
     let program_ran = started.elapsed();
     assert_eq!(
         report["relaunch"], "true",
-        "the launch was committed and not run as typed"
+        "the launch was committed and not run as typed: {report:?}"
     );
     eprintln!("cold 300 MB launch: the program ran {program_ran:?} after the launcher started");
     let small = Shell::new();
