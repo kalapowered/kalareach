@@ -7101,12 +7101,12 @@ export interface SessionSummary {
    * Where the variables its root shell was started with came from, when its worker said.
    *
    * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-   * a summary this host composes without its worker (a closure with no worker record to read, a
-   * worker whose end could not be established, or a session the registry holds whose worker did
-   * not answer) because no worker said anything about the environment, and for one a worker of
-   * an earlier release described, which wrote no such member. Only that second reason ends: it
-   * goes when no worker of a release that wrote none can still be running and no journal row of
-   * one is still read.
+   * a summary this host composes from its own records without its worker's description (a
+   * closure with no worker record to read, a worker whose end could not be established, or a
+   * session the registry lists from its rows alone) because those records do not hold it, and
+   * for one a worker of an earlier release described, which wrote no such member. Only that
+   * second reason ends: it goes when no worker of a release that wrote none can still be
+   * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
   /**
@@ -13439,12 +13439,12 @@ export interface SessionSummary1 {
    * Where the variables its root shell was started with came from, when its worker said.
    *
    * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-   * a summary this host composes without its worker (a closure with no worker record to read, a
-   * worker whose end could not be established, or a session the registry holds whose worker did
-   * not answer) because no worker said anything about the environment, and for one a worker of
-   * an earlier release described, which wrote no such member. Only that second reason ends: it
-   * goes when no worker of a release that wrote none can still be running and no journal row of
-   * one is still read.
+   * a summary this host composes from its own records without its worker's description (a
+   * closure with no worker record to read, a worker whose end could not be established, or a
+   * session the registry lists from its rows alone) because those records do not hold it, and
+   * for one a worker of an earlier release described, which wrote no such member. Only that
+   * second reason ends: it goes when no worker of a release that wrote none can still be
+   * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
   /**
@@ -24484,12 +24484,12 @@ export interface SessionSummary2 {
    * Where the variables its root shell was started with came from, when its worker said.
    *
    * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-   * a summary this host composes without its worker (a closure with no worker record to read, a
-   * worker whose end could not be established, or a session the registry holds whose worker did
-   * not answer) because no worker said anything about the environment, and for one a worker of
-   * an earlier release described, which wrote no such member. Only that second reason ends: it
-   * goes when no worker of a release that wrote none can still be running and no journal row of
-   * one is still read.
+   * a summary this host composes from its own records without its worker's description (a
+   * closure with no worker record to read, a worker whose end could not be established, or a
+   * session the registry lists from its rows alone) because those records do not hold it, and
+   * for one a worker of an earlier release described, which wrote no such member. Only that
+   * second reason ends: it goes when no worker of a release that wrote none can still be
+   * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
   /**
@@ -24636,12 +24636,12 @@ export interface SessionSummary3 {
    * Where the variables its root shell was started with came from, when its worker said.
    *
    * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-   * a summary this host composes without its worker (a closure with no worker record to read, a
-   * worker whose end could not be established, or a session the registry holds whose worker did
-   * not answer) because no worker said anything about the environment, and for one a worker of
-   * an earlier release described, which wrote no such member. Only that second reason ends: it
-   * goes when no worker of a release that wrote none can still be running and no journal row of
-   * one is still read.
+   * a summary this host composes from its own records without its worker's description (a
+   * closure with no worker record to read, a worker whose end could not be established, or a
+   * session the registry lists from its rows alone) because those records do not hold it, and
+   * for one a worker of an earlier release described, which wrote no such member. Only that
+   * second reason ends: it goes when no worker of a release that wrote none can still be
+   * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
   /**
@@ -25032,12 +25032,12 @@ export interface SessionSummary4 {
    * Where the variables its root shell was started with came from, when its worker said.
    *
    * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-   * a summary this host composes without its worker (a closure with no worker record to read, a
-   * worker whose end could not be established, or a session the registry holds whose worker did
-   * not answer) because no worker said anything about the environment, and for one a worker of
-   * an earlier release described, which wrote no such member. Only that second reason ends: it
-   * goes when no worker of a release that wrote none can still be running and no journal row of
-   * one is still read.
+   * a summary this host composes from its own records without its worker's description (a
+   * closure with no worker record to read, a worker whose end could not be established, or a
+   * session the registry lists from its rows alone) because those records do not hold it, and
+   * for one a worker of an earlier release described, which wrote no such member. Only that
+   * second reason ends: it goes when no worker of a release that wrote none can still be
+   * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
   /**

@@ -1860,8 +1860,9 @@ async fn host_read<T: kr_protocol::wire::WireMessage, P: serde::Serialize + ?Siz
 }
 
 /// How long `kr doctor` waits to read the live sessions: a worker that does not answer holds the
-/// host's list of them up, and the rest of the diagnostics are worth printing without it.
-const SESSIONS_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// host's list of them up for two exchanges of five seconds, and the rest of the diagnostics are
+/// worth printing without it.
+const SESSIONS_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The live sessions of `environment_id`, or `None` where they were not read within
 /// [`SESSIONS_READ_BOUND`].

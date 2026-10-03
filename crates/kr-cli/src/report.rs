@@ -576,10 +576,9 @@ pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> Line {
 /// the closed words the worker said them in, and what was not heard.
 ///
 /// `listed` is the live sessions the host listed, or `None` where the list was not read, and
-/// `held` is how many sessions the host says it holds, which counts one still being created, one
-/// whose launch the host stopped trusting and one whose worker did not answer as well as the live
-/// ones, and which a close between the two reads can change: those the list did not show are
-/// counted here rather than left out without a word.
+/// `held` is how many sessions the host counts, which is read before the list is and which a close
+/// between the two reads can change: sessions it counted that the list did not show are counted
+/// here rather than left out without a word.
 #[must_use]
 pub fn session_environment_lines(listed: Option<&[SessionSummary]>, held: u64) -> Vec<Shown> {
     let Some(listed) = listed else {
@@ -606,14 +605,12 @@ pub fn session_environment_lines(listed: Option<&[SessionSummary]>, held: u64) -
     match held.saturating_sub(listed.len() as u64) {
         0 => {}
         1 => lines.push(Shown::said(
-            "1 session the host holds is not in the list, which can be one still starting or \
-             ending or one whose worker did not answer, so where its environment came from is not \
-             known",
+            "1 session the host counted is not in the list, which can be one that ended between \
+             the two reads",
         )),
         unlisted => lines.push(shown!(
-            "{} sessions the host holds are not in the list, which can be sessions still starting \
-             or ending or sessions whose workers did not answer, so where their environment came \
-             from is not known",
+            "{} sessions the host counted are not in the list, which can be sessions that ended \
+             between the two reads",
             unlisted
         )),
     }
