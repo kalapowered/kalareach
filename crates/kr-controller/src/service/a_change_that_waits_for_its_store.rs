@@ -250,6 +250,7 @@ fn summary(environment_id: EnvironmentId) -> SessionSummary {
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::null(),
+        environment_sources: None,
     }
 }
 
@@ -531,7 +532,13 @@ async fn creating(
         .expect("the reservation")
         .reservation_id;
     let (ready, _answer) = tokio::sync::oneshot::channel();
-    super::create::CreateHold::open(controller, reservation_id, Vec::new(), ready).await
+    super::create::CreateHold::open(
+        controller,
+        reservation_id,
+        super::create::SessionEnvironment::of_creator(Vec::new()),
+        ready,
+    )
+    .await
 }
 
 /// Has a worker claim the reservation of an already reserved, spawned session.

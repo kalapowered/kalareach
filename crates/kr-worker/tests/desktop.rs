@@ -1135,6 +1135,15 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
         recorded.desktop.desktop_session_id, created.session.desktop.desktop_session_id,
         "and which desktop it was bound to, which is what a later daemon compares"
     );
+    assert!(
+        recorded.environment_sources.is_some(),
+        "and where its environment came from, which a daemon that reads it after the worker has \
+         gone can say"
+    );
+    assert_eq!(
+        recorded.environment_sources, created.session.environment_sources,
+        "the same as its ready report said"
+    );
     if profile_here() == WorkerProfile::DesktopBound {
         assert!(
             recorded.desktop.desktop_session_id.is_present(),
@@ -1221,6 +1230,8 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
             WorkerProfile::HeadlessUser,
         )
         .environment_snapshot,
+        kr_protocol::worker::EnvironmentOrigin::CreatorSnapshot,
+        &[],
         &context,
         &kr_worker::testing::posix_shell(),
         "0",

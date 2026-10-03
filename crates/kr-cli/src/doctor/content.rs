@@ -300,6 +300,9 @@ struct SessionRecord {
     created_at_ms: u64,
     shell: String,
     cwd: String,
+    /// Where the session's `PATH`, locale and directory came from, in closed words: nothing in them
+    /// is text a person or an owner wrote.
+    environment_sources: Option<kr_protocol::session::SessionEnvironmentSources>,
     closure: Option<ClosureOut>,
 }
 
@@ -328,6 +331,7 @@ impl SessionRecord {
             created_at_ms: summary.created_at_ms.get(),
             shell: rules.field(&summary.shell_path),
             cwd: rules.field(&summary.cwd),
+            environment_sources: summary.environment_sources,
             closure: summary.closure.as_ref().map(|closure| ClosureOut {
                 reason: closure.reason,
                 root_exit_code: closure.root_exit_code.as_ref().map(|code| code.get()),

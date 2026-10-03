@@ -265,6 +265,7 @@ mod tests {
             application_state: Nullable::some(kr_protocol::session::ApplicationState::AgentBusy),
             root_process: Nullable::null(),
             closure: Nullable::null(),
+            environment_sources: None,
         }
     }
 

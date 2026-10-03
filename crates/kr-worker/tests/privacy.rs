@@ -1023,6 +1023,11 @@ fn start_printing(
         kr_worker::testing::posix_script("printf 'printed before any notice\\n'; sleep 30");
     kr_worker::runtime::start_or_record(
         config,
+        kr_protocol::session::SessionEnvironmentSources {
+            path: kr_protocol::session::EnvironmentSource::Unset,
+            locale: kr_protocol::session::EnvironmentSource::Unset,
+            cwd: kr_protocol::session::WorkingDirectorySource::WorkerDefault,
+        },
         kr_worker::snapshot::PaletteChoice::from_request(None),
         privacy,
         std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),

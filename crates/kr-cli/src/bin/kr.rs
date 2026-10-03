@@ -687,6 +687,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 },
             )
             .await?;
+            // Where each live session's environment came from, which only the sessions' own
+            // workers can say.
+            let session_environments =
+                live_sessions(&environment.paths, environment.environment_id).await;
             // The bundle is written before anything is printed, so `--json` produces one document
             // and a bundle that could not be written is the command's failure rather than a note
             // after a result that already said everything went well.
@@ -741,6 +745,13 @@ async fn run(cli: Cli) -> Result<Completion> {
                     .with(
                         "environment",
                         report::environment_capabilities(&capabilities),
+                    )
+                    .with(
+                        "session_environments",
+                        report::session_environments(
+                            session_environments.as_deref(),
+                            info.live_sessions.get(),
+                        ),
                     );
                 if let Some(exported) = content.as_ref() {
                     // What the content export left out and why, and the digest of what was shown,
@@ -791,7 +802,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "environment {} generation {} ({} of {} sessions)",
                     info.environment_id,
                     info.generation.get(),
-                    info.live_sessions,
+                    info.live_sessions.get(),
                     info.session_limit
                 ));
                 output::say(&shown!(
@@ -804,6 +815,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                     output::say(&line);
                 }
                 output::say(&report::power_line(&info.power));
+                for line in report::session_environment_lines(
+                    session_environments.as_deref(),
+                    info.live_sessions.get(),
+                ) {
+                    output::say(&line);
+                }
                 output::lines(&kr_cli::doctor::configurable_lines(&checks.configuration));
                 output::lines(&kr_cli::doctor::doctor_lines(&checks, arguments.verbose));
                 if let Some(exported) = content.as_ref()
@@ -1839,6 +1856,38 @@ async fn host_read<T: kr_protocol::wire::WireMessage, P: serde::Serialize + ?Siz
             typed(client.request(method, params).await?)
         }
         Err(refused) => Err(CliError::Refused(refused)),
+    }
+}
+
+/// How long `kr doctor` waits to read the live sessions: a worker that does not answer holds the
+/// host's list of them up, and the rest of the diagnostics are worth printing without it.
+const SESSIONS_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The live sessions of `environment_id`, or `None` where they were not read within
+/// [`SESSIONS_READ_BOUND`].
+///
+/// Read on a connection of its own: a request given up on leaves an answer nobody reads, and the
+/// connection the other diagnostics use is not left holding it.
+async fn live_sessions(
+    paths: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> Option<Vec<kr_protocol::session::SessionSummary>> {
+    let read = async {
+        let mut own = open_controller(paths, build_id()).await?;
+        host_read::<kr_protocol::session::SessionListResult, _>(
+            &mut own,
+            paths,
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: kr_protocol::scalars::Nullable::some(environment_id),
+                include_closed: false,
+            },
+        )
+        .await
+    };
+    match tokio::time::timeout(SESSIONS_READ_BOUND, read).await {
+        Ok(Ok(listed)) => Some(listed.sessions),
+        Ok(Err(_)) | Err(_) => None,
     }
 }
 

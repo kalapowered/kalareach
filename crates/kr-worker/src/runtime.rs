@@ -1593,6 +1593,10 @@ pub struct LaunchFailure {
 
 /// Starts a session and reports a launch failure with its closure record.
 ///
+/// `environment_sources` says where the variables its shell is started with came from. It is
+/// applied before the shell starts, so that the description written when the shell starts and the
+/// one its ready report carries both hold it.
+///
 /// `palette` is where the session's colours come from, and it is applied between opening the
 /// session and launching its shell. That is the only moment it can be applied: section 8 fixes the
 /// palette at creation, and the first byte the shell writes is already a screen somebody could be
@@ -1608,6 +1612,7 @@ pub struct LaunchFailure {
 /// leaves its journal and no closure record.
 pub fn start_or_record(
     config: crate::session::SessionConfig,
+    environment_sources: kr_protocol::session::SessionEnvironmentSources,
     palette: crate::snapshot::PaletteChoice,
     privacy: kr_protocol::worker::PrivacyLaunch,
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
@@ -1621,6 +1626,9 @@ pub fn start_or_record(
             }));
         }
     };
+    // Before the shell starts, so the summary written when it does and the one its ready report
+    // carries both say where its environment came from.
+    session.set_environment_sources(environment_sources);
     if let Err(error) = session.set_initial_palette(palette) {
         return Err(Box::new(LaunchFailure {
             error,

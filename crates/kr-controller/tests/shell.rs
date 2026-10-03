@@ -24,7 +24,9 @@ use kr_protocol::ids::{ActionId, BuildId, EnvironmentId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::session::EnvironmentSource;
 use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParams, ShellMode};
+use kr_protocol::worker::EnvironmentOrigin;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
@@ -358,7 +360,15 @@ fn the_environment_is_the_creators_snapshot_filtered_and_then_the_contexts_and_t
     context
         .variables
         .insert("DISPLAY".to_owned(), ":0".to_owned());
-    let built = build_environment(&snapshot, &context, "/opt/kr/zsh", "0.4.0", session_id);
+    let built = build_environment(
+        &snapshot,
+        EnvironmentOrigin::CreatorSnapshot,
+        &[],
+        &context,
+        "/opt/kr/zsh",
+        "0.4.0",
+        session_id,
+    );
 
     // Physical-terminal identity is removed and replaced, and the removal is what diagnostics show.
     for removed in [
@@ -418,8 +428,8 @@ fn the_environment_is_the_creators_snapshot_filtered_and_then_the_contexts_and_t
         !diagnostics.contains("a-credential"),
         "a credential never appears in diagnostics: {diagnostics}"
     );
-    assert_eq!(built.sources.path, "creator snapshot");
-    assert_eq!(built.sources.locale, "creator snapshot");
+    assert_eq!(built.sources.path, EnvironmentSource::CreatorSnapshot);
+    assert_eq!(built.sources.locale, EnvironmentSource::CreatorSnapshot);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -773,10 +783,20 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
 #[cfg(unix)]
 struct Daemon {
     tree: teardown::Tree,
-    controller: Arc<Controller>,
+    controller: Option<Arc<Controller>>,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+    worker: std::path::PathBuf,
+    /// The environment the daemon runs in, which a daemon started again on the tree runs in too.
+    host_environment: Vec<(String, String)>,
+}
+
+/// A session a [`Daemon`] started and left running, and what its shell reports of its environment.
+#[cfg(unix)]
+struct Started {
+    environment: std::collections::BTreeMap<String, String>,
+    created: kr_protocol::session::SessionCreateResult,
 }
 
 #[cfg(unix)]
@@ -798,8 +818,6 @@ impl Daemon {
         let worker = tree.root().join("kr-worker");
         kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
         let paths = tree.environment();
-        let environment_id = tree.environment_id();
-        let secrets = paths.secrets_dir();
         if !additions.is_empty() {
             let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
             document.preferences.environment_additions = Nullable::some(
@@ -814,6 +832,27 @@ impl Daemon {
             )
             .expect("the host's configuration document");
         }
+        let mut daemon = Self {
+            endpoint: paths.controller_endpoint().expect("an endpoint"),
+            environment_id: tree.environment_id(),
+            tree,
+            controller: None,
+            serving: Vec::new(),
+            worker,
+            host_environment: environment
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        };
+        daemon.run().await;
+        daemon
+    }
+
+    /// Starts the daemon on the tree, serving its clients and its workers' rendezvous.
+    async fn run(&mut self) {
+        let paths = self.tree.environment();
+        let environment_id = self.environment_id;
+        let secrets = paths.secrets_dir();
         let controller = Controller::start(ControllerSetup {
             paths: paths.clone(),
             environment_id,
@@ -826,8 +865,8 @@ impl Daemon {
             }),
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: tree.supervisor(kr_controller::supervision::detect()),
-            worker_program: worker,
+            supervisor: self.tree.supervisor(kr_controller::supervision::detect()),
+            worker_program: self.worker.clone(),
             build_id: build(),
             release: "0".to_owned(),
             shell_packages: None,
@@ -837,26 +876,38 @@ impl Daemon {
         .expect("the daemon starts");
         // The environment this daemon runs in is the one it is given, and not this test's own:
         // the tests of one binary share a process, and none of them may change its environment.
-        controller.set_host_environment(
-            environment
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), value.clone())),
-        );
-        let endpoint = paths.controller_endpoint().expect("an endpoint");
-        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        controller.set_host_environment(self.host_environment.iter().cloned());
+        let listener = Listener::bind(&self.endpoint).expect("binds the endpoint");
         let rendezvous = Listener::bind(&paths.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
-        let serving = vec![
-            tokio::spawn(Arc::clone(&controller).serve_clients(listener)),
-            tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous)),
-        ];
-        Self {
-            tree,
-            controller,
-            endpoint,
-            environment_id,
-            serving,
+        self.serving.push(tokio::spawn(
+            Arc::clone(&controller).serve_clients(listener),
+        ));
+        self.serving.push(tokio::spawn(
+            Arc::clone(&controller).serve_rendezvous(rendezvous),
+        ));
+        self.controller = Some(controller);
+    }
+
+    /// Stops the daemon and starts another on the same tree, the way a restart of the host does:
+    /// every durable record stays, nothing held in memory does, and the workers go on running.
+    async fn restart(&mut self) {
+        for serving in self.serving.drain(..) {
+            serving.abort();
+            let _ = serving.await;
         }
+        let controller = self.controller.take().expect("a daemon");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&controller) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stopped daemon is still held in {} places",
+                Arc::strong_count(&controller) - 1
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(controller);
+        self.run().await;
     }
 
     /// Creates a session through a client that declares itself `kind`, and returns the
@@ -872,6 +923,24 @@ impl Daemon {
         snapshot: Vec<EnvironmentVariable>,
         scratch: &Path,
     ) -> Result<std::collections::BTreeMap<String, String>, kr_protocol::error::ProtocolError> {
+        let started = self
+            .start_session(kind, presentation, snapshot, scratch, true)
+            .await?;
+        let environment = started.environment.clone();
+        self.close_session(started).await;
+        Ok(environment)
+    }
+
+    /// As [`Self::session_environment`], and the session is left running. `named_directory` is
+    /// whether the request names `scratch` as the directory the shell starts in.
+    async fn start_session(
+        &self,
+        kind: LocalClientKind,
+        presentation: Presentation,
+        snapshot: Vec<EnvironmentVariable>,
+        scratch: &Path,
+        named_directory: bool,
+    ) -> Result<Started, kr_protocol::error::ProtocolError> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let report = scratch.join("env-report.txt");
@@ -899,7 +968,11 @@ impl Daemon {
             Some(&script.display().to_string()),
         );
         request.presentation = presentation;
-        request.cwd = Nullable::some(scratch.display().to_string());
+        request.cwd = if named_directory {
+            Nullable::some(scratch.display().to_string())
+        } else {
+            Nullable::null()
+        };
         request.environment_snapshot = snapshot;
         request.launch_profile.startup = kr_protocol::session::ShellStartup::Interactive;
         let answered = client
@@ -925,19 +998,33 @@ impl Daemon {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
-        let _: kr_protocol::session::SessionCloseResult = client
+        Ok(Started {
+            environment: text
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect(),
+            created,
+        })
+    }
+
+    /// Closes a session this daemon, or the one it replaced, started.
+    async fn close_session(&self, started: Started) {
+        let _: kr_protocol::session::SessionCloseResult = self
+            .client()
+            .await
             .mutate(
                 Method::SessionClose,
                 ActionId::new(kr_ipc::new_uuid()),
                 ActionTarget {
                     environment_id: self.environment_id,
-                    session_id: Nullable::some(created.session.session_id),
-                    session_epoch: Nullable::some(created.session.session_epoch),
+                    session_id: Nullable::some(started.created.session.session_id),
+                    session_epoch: Nullable::some(started.created.session.session_epoch),
                     application_instance_id: Nullable::null(),
                     agent_binding_revision: Nullable::null(),
                 },
                 &kr_protocol::session::SessionCloseParams {
-                    session_id: created.session.session_id,
+                    session_id: started.created.session.session_id,
                 },
             )
             .await
@@ -945,18 +1032,48 @@ impl Daemon {
             .expect("closes")
             .to_typed()
             .expect("decodes");
-        Ok(text
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-            .collect())
     }
 
-    fn stop(self) {
+    /// Where the environment of each session this daemon lists came from, as the list says it.
+    async fn listed_sources(
+        &self,
+    ) -> Vec<(
+        kr_protocol::session::DisplayNumber,
+        Option<kr_protocol::session::SessionEnvironmentSources>,
+    )> {
+        let listed: kr_protocol::session::SessionListResult = self
+            .client()
+            .await
+            .request(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::some(self.environment_id),
+                    include_closed: false,
+                },
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect("lists")
+            .to_typed()
+            .expect("decodes");
+        listed
+            .sessions
+            .into_iter()
+            .map(|session| (session.display_number, session.environment_sources))
+            .collect()
+    }
+
+    async fn client(&self) -> LocalClient {
+        LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects")
+    }
+
+    fn stop(mut self) {
         for task in &self.serving {
             task.abort();
         }
-        drop(self.controller);
+        drop(self.controller.take());
         drop(self.tree);
     }
 }
@@ -1146,6 +1263,167 @@ async fn the_owners_configured_additions_join_the_hosts_environment_and_only_the
         Some("/opt/kr-test-cli/bin")
     );
     assert!(!own.contains_key("EDITOR"), "{own:?}");
+    daemon.stop();
+}
+
+/// KR-REQ-07.25, KR-REQ-07.26: a session says where its `PATH`, its locale and its directory came
+/// from, in closed words and none of what the person or the owner typed, and the list of sessions
+/// carries them: the host's own, the owner's addition over it, the command line's, and the
+/// root directory where a request names none.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_reports_where_its_path_its_locale_and_its_directory_came_from() {
+    use kr_protocol::session::{
+        EnvironmentSource, SessionEnvironmentSources, WorkingDirectorySource,
+    };
+
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start_with_additions(
+        &[
+            ("PATH", "/opt/kr-test-host/bin:/usr/bin:/bin".to_owned()),
+            ("HOME", home.display().to_string()),
+            ("LANG", "en_ZA.UTF-8".to_owned()),
+        ],
+        &[
+            ("EDITOR", "hx-planted-value"),
+            ("PATH", "/opt/kr-test-added/bin:/usr/bin:/bin"),
+        ],
+    )
+    .await;
+
+    let app = daemon
+        .start_session(
+            LocalClientKind::App,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+            true,
+        )
+        .await
+        .expect("an app's create is served");
+    let own = daemon
+        .start_session(
+            LocalClientKind::Cli,
+            Presentation::Terminal,
+            vec![
+                variable("PATH", "/opt/kr-test-cli/bin"),
+                variable("LANG", "en_GB.UTF-8"),
+            ],
+            &a_home(&daemon, "cli"),
+            true,
+        )
+        .await
+        .expect("a visible create from the command line is served");
+    let unseen = daemon
+        .start_session(
+            LocalClientKind::Cli,
+            Presentation::Invisible,
+            Vec::new(),
+            &a_home(&daemon, "unseen"),
+            false,
+        )
+        .await
+        .expect("an invisible create from the command line is served");
+
+    let listed: std::collections::BTreeMap<_, _> =
+        daemon.listed_sources().await.into_iter().collect();
+    let sources_of = |started: &Started| {
+        listed
+            .get(&started.created.session.display_number)
+            .copied()
+            .expect("the session is listed")
+    };
+    assert_eq!(
+        sources_of(&app),
+        Some(SessionEnvironmentSources {
+            path: EnvironmentSource::ConfiguredAddition,
+            locale: EnvironmentSource::HostContext,
+            cwd: WorkingDirectorySource::CreateRequest,
+        }),
+        "the owner's PATH is over the host's, and the host's LANG is the host's"
+    );
+    assert_eq!(
+        sources_of(&own),
+        Some(SessionEnvironmentSources {
+            path: EnvironmentSource::CreatorSnapshot,
+            locale: EnvironmentSource::CreatorSnapshot,
+            cwd: WorkingDirectorySource::CreateRequest,
+        }),
+        "the command line's own environment is its own, and no addition is over it"
+    );
+    assert_eq!(
+        sources_of(&unseen),
+        Some(SessionEnvironmentSources {
+            path: EnvironmentSource::ConfiguredAddition,
+            locale: EnvironmentSource::HostContext,
+            cwd: WorkingDirectorySource::WorkerDefault,
+        }),
+        "a session nobody sees takes the host's, and a request that names no directory starts \
+         the shell in the root"
+    );
+    // The words are all there is: nothing the daemon, the command line or the owner held.
+    let said = serde_json::to_string(&listed).expect("the sources serialise");
+    for private in ["planted", "kr-test", "EDITOR", "en_ZA", "en_GB"] {
+        assert!(!said.contains(private), "{private} is in: {said}");
+    }
+    for started in [app, own, unseen] {
+        daemon.close_session(started).await;
+    }
+    daemon.stop();
+}
+
+/// KR-REQ-07.25: the sources a session reports are its worker's, so a daemon started again on the
+/// same tree, which never heard the worker's ready report, lists them as the first one did; a
+/// variable nobody supplied is said to be unset, and a locale a configured variable decides is the
+/// owner's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_started_again_lists_the_sources_its_workers_hold() {
+    use kr_protocol::session::{
+        EnvironmentSource, SessionEnvironmentSources, WorkingDirectorySource,
+    };
+
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    // No `PATH` in this daemon's environment, an empty `LC_ALL` that decides nothing, and the
+    // owner's `LC_CTYPE` that does.
+    let mut daemon = Daemon::start_with_additions(
+        &[
+            ("HOME", home.display().to_string()),
+            ("LANG", "en_ZA.UTF-8".to_owned()),
+            ("LC_ALL", String::new()),
+        ],
+        &[("LC_CTYPE", "C.UTF-8")],
+    )
+    .await;
+    let started = daemon
+        .start_session(
+            LocalClientKind::App,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+            true,
+        )
+        .await
+        .expect("an app's create is served");
+    let expected = vec![(
+        started.created.session.display_number,
+        Some(SessionEnvironmentSources {
+            path: EnvironmentSource::Unset,
+            locale: EnvironmentSource::ConfiguredAddition,
+            cwd: WorkingDirectorySource::CreateRequest,
+        }),
+    )];
+    assert_eq!(daemon.listed_sources().await, expected);
+
+    daemon.restart().await;
+    assert_eq!(
+        daemon.listed_sources().await,
+        expected,
+        "the daemon that started again lists what the worker holds"
+    );
+    daemon.close_session(started).await;
     daemon.stop();
 }
 
