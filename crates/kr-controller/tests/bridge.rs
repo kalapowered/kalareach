@@ -862,12 +862,14 @@ fn utf16le(text: &str) -> Vec<u8> {
 
 /// The text of the stand-in for `wsl.exe`, which keeps its control files in `fixture`.
 ///
-/// It records the argument vector of every invocation on a line of its own. It answers each of the
-/// three listings with the file the test keeps for it, and a bridge with the frames the test wrote
-/// for that bridge's helper. When the test has asked for a bridge to be held, the stand-in marks it
-/// open once it has started, which is after the refresh that opened it has read its row, and waits
-/// for the test to release it before it answers. The wait has a bound of its own, longer than the
-/// silence the invoker allows, so a stand-in whose test has gone does not outlive it by much.
+/// It records the argument vector of every invocation on a line of its own, except the one version
+/// query a test makes to start it once before anything is timed, which it answers and records
+/// nowhere. It answers each of the three listings with the file the test keeps for it, and a bridge
+/// with the frames the test wrote for that bridge's helper. When the test has asked for a bridge to
+/// be held, the stand-in marks it open once it has started, which is after the refresh that opened
+/// it has read its row, and waits for the test to release it before it answers. The wait has a
+/// bound of its own, longer than the silence the invoker allows, so a stand-in whose test has gone
+/// does not outlive it by much.
 fn stand_in(fixture: &Path) -> String {
     let fixture = fixture.to_str().expect("a temporary path is text");
     assert!(
@@ -877,6 +879,9 @@ fn stand_in(fixture: &Path) -> String {
     format!(
         r##"#!/bin/sh
 fixture='{fixture}'
+case "$1" in
+  --version) exit 0 ;;
+esac
 line="$(printf '%s\t' "$@")"
 printf '%s\n' "$line" >>"$fixture/invocations"
 case "$1" in
@@ -914,12 +919,16 @@ exit 2
 
 /// The text of the stand-in for `ssh`: it records the argument vector it was run with, answers with
 /// the frames the test wrote for it, and reads whatever it is sent to its end, as a login on the
-/// other side whose helper answers an opening and waits to be ended would.
+/// other side whose helper answers an opening and waits to be ended would. It answers the one
+/// version query a test makes to start it once before anything is timed, and records nothing of it.
 fn ssh_stand_in(fixture: &Path) -> String {
     let fixture = fixture.to_str().expect("a temporary path is text");
     format!(
         r##"#!/bin/sh
 fixture='{fixture}'
+case "$1" in
+  -V) exit 0 ;;
+esac
 line="$(printf '%s\t' "$@")"
 printf '%s\n' "$line" >>"$fixture/ssh-invocations"
 if [ -e "$fixture/ssh.hold" ]; then
@@ -957,17 +966,26 @@ impl FixtureDaemon {
         std::fs::write(fixture.join("listing"), utf16le(LISTING)).expect("the listing");
         std::fs::write(fixture.join("registered"), utf16le(NAMES)).expect("the registered names");
         std::fs::write(fixture.join("running"), utf16le(NAMES)).expect("the running names");
-        // The stand-in is placed rather than written in place, like every program a test starts:
-        // a descriptor open for writing, handed to a child another thread was starting, would stop
-        // it from starting.
+        // Each program is placed rather than written in place, like every program a test starts: a
+        // descriptor open for writing, handed to a child another thread was starting, would stop
+        // it from starting. And each is started once here, where nothing is timed: the operating
+        // system checks a newly written program the first time it runs, one check at a time for
+        // the whole machine, and the checks of the ten daemons this suite copies at once come
+        // before a stand-in's own. The daemon gives `wsl.exe` and `ssh` a bounded time that
+        // includes the time the system takes to start them, so a stand-in checked for the first
+        // time inside a refresh could spend the whole of it waiting for its turn.
         let text = fixture.join("wsl.exe.text");
         std::fs::write(&text, stand_in(&fixture)).expect("the stand-in's text");
-        kr_ipc::testing::place_program(&text, &bin.join("wsl.exe"));
         let ssh_text = fixture.join("ssh.text");
         std::fs::write(&ssh_text, ssh_stand_in(&fixture)).expect("the ssh stand-in's text");
-        kr_ipc::testing::place_program(&ssh_text, &bin.join("ssh"));
         let program = tree.root().join("kr-controller");
-        kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
+        kr_ipc::testing::place_and_start_once(
+            Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+            &program,
+            &["--version"],
+        );
+        kr_ipc::testing::place_and_start_once(&text, &bin.join("wsl.exe"), &["--version"]);
+        kr_ipc::testing::place_and_start_once(&ssh_text, &bin.join("ssh"), &["-V"]);
 
         let mut path = std::ffi::OsString::from(bin.as_os_str());
         if let Some(inherited) = std::env::var_os("PATH") {
