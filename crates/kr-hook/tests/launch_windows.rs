@@ -16,7 +16,7 @@
 //! | --- | --- |
 //! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses, one a launcher declines and one that is never started leave nothing running |
 //! | KR-REQ-12.07 | a refused invocation runs as typed |
-//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed |
+//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
 //! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
 
 #![cfg(windows)]
@@ -483,15 +483,35 @@ struct Scripted {
 
 impl Scripted {
     fn start(shell: &Shell) -> Self {
+        Self::started(shell, false)
+    }
+
+    /// Starts the scripted launcher as the child of a `cmd.exe` that is the shell's own child, so
+    /// that the shell is the launcher's grandparent.
+    fn start_beneath(shell: &Shell) -> Self {
+        Self::started(shell, true)
+    }
+
+    fn started(shell: &Shell, beneath: bool) -> Self {
         let agent = AgentJob::create().expect("a job for the helper's own children");
+        let this = std::env::current_exe().expect("this test's executable");
+        let mut arguments = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "scripted_launcher_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let program = if beneath {
+            let mut through = vec!["/d".to_owned(), "/c".to_owned(), this.display().to_string()];
+            through.append(&mut arguments);
+            arguments = through;
+            system_program("cmd.exe")
+        } else {
+            this
+        };
         let mut child = kr_worker::windows::launch::start(&Spec {
-            program: &std::env::current_exe().expect("this test's executable"),
-            arguments: &[
-                "--ignored".to_owned(),
-                "--exact".to_owned(),
-                "scripted_launcher_helper".to_owned(),
-                "--nocapture".to_owned(),
-            ],
+            program: &program,
+            arguments: &arguments,
             directory: shell.placed.host.root(),
             environment: &[],
             session: Some(&shell.job),
@@ -779,6 +799,40 @@ fn kr_req_05_09_a_process_the_launcher_did_not_create_is_not_committed() {
         .launch_failure_of(shell.last_generation())
         .expect("the backend says why");
     assert!(why.contains("not started by the launcher"), "{why}");
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-05.09: a launcher the root shell did not start is not admitted, whatever it presents: here
+/// the shell started a `cmd.exe` and that started the launcher. Control: the shell's own child, the
+/// same presentation, is admitted and committed.
+#[test]
+fn kr_req_05_09_a_launcher_the_root_shell_did_not_start_is_not_admitted() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut beneath = Scripted::start_beneath(&shell);
+    assert_eq!(
+        beneath.present(&answer, &shell.executable, &shell.typed()),
+        None,
+        "the connection is closed without a word"
+    );
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-05.09: a launcher that was started before the backend was established is not admitted: it
+/// cannot have been started for the invocation the backend answered. Control: one started after
+/// the establish, the same presentation, is admitted and committed.
+#[test]
+fn kr_req_05_09_a_launcher_started_before_the_backend_was_established_is_not_admitted() {
+    let shell = Shell::new();
+    let mut early = Scripted::start(&shell);
+    // Longer than a tick of the kernel's clock, so that the launcher is strictly the older.
+    std::thread::sleep(Duration::from_millis(100));
+    let answer = shell.establish();
+    assert_eq!(
+        early.present(&answer, &shell.executable, &shell.typed()),
+        None,
+        "the connection is closed without a word"
+    );
     shell.commits_after_a_refusal(&answer);
 }
 
