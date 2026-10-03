@@ -4,13 +4,12 @@
 //! invocation, from a Claude Code connector installed in the catalogue store's layout. What is
 //! checked here is what establishing creates, what it refuses before creating anything, and when a
 //! backend no launch took is retired. The launch that presents itself to a backend is proved with
-//! the real launcher in `kr-hook`'s own suite.
+//! the real launcher in `kr-hook`'s own suite. The launcher and the application a case stands in for
+//! are copies of a program the machine has: `sleep` on Unix and `cmd.exe` on Windows.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
-
-#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,13 +37,36 @@ fn private_directory(prefix: &str) -> PathBuf {
         .take(8)
         .collect();
     let directory = std::env::temp_dir().join(format!("{prefix}{name}"));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("the directory is made private");
-    }
+    kr_ipc::paths::create_private_directory(&directory).expect("a private directory");
     directory
+}
+
+/// The program a case's launcher and application are copies of: one every machine of the platform
+/// has, which is never run here.
+fn stand_in_program() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(std::env::var_os("SystemRoot").expect("a system directory"))
+            .join("System32")
+            .join("cmd.exe")
+    } else {
+        PathBuf::from("/bin/sleep")
+    }
+}
+
+/// An executable's file name on this platform.
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Whether the endpoint a launch record names exists: a socket's path on Unix, and a pipe in the
+/// system's list of them on Windows, which is read without connecting to any.
+fn endpoint_exists(endpoint: &str) -> bool {
+    match endpoint.strip_prefix(r"\\.\pipe\") {
+        Some(name) => std::fs::read_dir(r"\\.\pipe\").is_ok_and(|mut pipes| {
+            pipes.any(|pipe| pipe.is_ok_and(|pipe| pipe.file_name().to_string_lossy() == name))
+        }),
+        None => std::path::Path::new(endpoint).exists(),
+    }
 }
 
 /// Everything one case needs: a store with the connector installed, a launcher and an executable
@@ -76,14 +98,20 @@ impl Setup {
         let directory = private_directory("kcb");
         let bin = directory.join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
-        let launcher = bin.join("kr-hook");
+        let launcher = bin.join(executable_name("kr-hook"));
         let executable = executable
             .iter()
             .fold(directory.clone(), |path, part| path.join(part));
+        let executable = executable.with_file_name(executable_name(
+            &executable
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy(),
+        ));
         std::fs::create_dir_all(executable.parent().expect("a directory"))
             .expect("the executable's directory");
-        std::fs::copy("/bin/sleep", &launcher).expect("a launcher stands in");
-        std::fs::copy("/bin/sleep", &executable).expect("an executable stands in");
+        std::fs::copy(stand_in_program(), &launcher).expect("a launcher stands in");
+        std::fs::copy(stand_in_program(), &executable).expect("an executable stands in");
         let sources = Arc::new(ConnectorSources::new());
         let store = directory.join("store");
         std::fs::create_dir_all(&store).expect("a store");
@@ -234,7 +262,11 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
         .expect("a backend is established");
     assert_eq!(answer.session_id, session());
     assert_eq!(answer.prompt_generation, PromptGeneration::new(5));
-    assert!(answer.launcher.ends_with("kr-hook"), "{}", answer.launcher);
+    assert!(
+        answer.launcher.ends_with(&executable_name("kr-hook")),
+        "{}",
+        answer.launcher
+    );
     assert_eq!(
         answer.environment.len(),
         1,
@@ -257,11 +289,11 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
         !registration.exists(),
         "no registration exists before a launch presents itself"
     );
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let credential = std::fs::metadata(directory.join("credential")).expect("a credential");
-        assert_eq!(credential.mode() & 0o077, 0, "the credential is owner-only");
-    }
+    // Read as the host reads it: a file another account can read, by its mode or by its access
+    // list, is refused and not read.
+    kr_ipc::paths::read_owner_only_file(&directory.join("credential"), 4096)
+        .expect("the credential is owner-only")
+        .expect("a credential");
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("launch")).expect("a launch record"))
             .expect("the record is JSON");
@@ -276,8 +308,11 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
         serde_json::json!([]),
         "Claude Code's integration declares no variable"
     );
-    let endpoint = PathBuf::from(record["endpoint"].as_str().expect("an endpoint"));
-    assert!(endpoint.exists(), "the endpoint is bound before the answer");
+    let endpoint = record["endpoint"].as_str().expect("an endpoint");
+    assert!(
+        endpoint_exists(endpoint),
+        "the endpoint is bound before the answer"
+    );
     assert_eq!(
         PathBuf::from(record["credential"].as_str().expect("a credential path")),
         directory.join("credential")
@@ -374,7 +409,7 @@ async fn a_platform_that_cannot_publish_a_credential_file_establishes_nothing() 
             os_user: "someone".to_owned(),
             runtime_dir: setup.runtime.clone(),
             sources: Arc::clone(setup.backends.sources()),
-            launcher: Some(setup.directory.join("bin").join("kr-hook")),
+            launcher: Some(setup.directory.join("bin").join(executable_name("kr-hook"))),
         },
         tokio::runtime::Handle::current(),
     )
@@ -425,12 +460,15 @@ async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("launch")).expect("a launch record"))
             .expect("JSON");
-    let endpoint = PathBuf::from(record["endpoint"].as_str().expect("an endpoint"));
+    let endpoint = record["endpoint"].as_str().expect("an endpoint").to_owned();
     setup
         .backends
         .establish(&request(&setup, &first, &integration, 8))
         .expect("the next line's invocation gets its own backend");
-    assert!(!endpoint.exists(), "the earlier line's endpoint is gone");
+    assert!(
+        !endpoint_exists(&endpoint),
+        "the earlier line's endpoint is gone"
+    );
     assert!(!directory.join("credential").exists(), "and its credential");
     assert!(
         !directory.join("launch").exists(),
@@ -480,7 +518,7 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
             os_user: "someone".to_owned(),
             runtime_dir: setup.runtime.clone(),
             sources: Arc::clone(setup.backends.sources()),
-            launcher: Some(setup.directory.join("bin").join("kr-hook")),
+            launcher: Some(setup.directory.join("bin").join(executable_name("kr-hook"))),
         },
         tokio::runtime::Handle::current(),
     );
