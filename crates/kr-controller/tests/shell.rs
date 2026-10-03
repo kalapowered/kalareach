@@ -1041,8 +1041,17 @@ impl Daemon {
         kr_protocol::session::DisplayNumber,
         Option<kr_protocol::session::SessionEnvironmentSources>,
     )> {
-        let listed: kr_protocol::session::SessionListResult = self
-            .client()
+        self.listed()
+            .await
+            .sessions
+            .into_iter()
+            .map(|session| (session.display_number, session.environment_sources))
+            .collect()
+    }
+
+    /// The live sessions this daemon lists.
+    async fn listed(&self) -> kr_protocol::session::SessionListResult {
+        self.client()
             .await
             .request(
                 Method::SessionList,
@@ -1055,12 +1064,7 @@ impl Daemon {
             .expect("reaches the daemon")
             .expect("lists")
             .to_typed()
-            .expect("decodes");
-        listed
-            .sessions
-            .into_iter()
-            .map(|session| (session.display_number, session.environment_sources))
-            .collect()
+            .expect("decodes")
     }
 
     async fn client(&self) -> LocalClient {
@@ -1363,7 +1367,7 @@ async fn a_session_reports_where_its_path_its_locale_and_its_directory_came_from
          the shell in the root"
     );
     // The words are all there is: nothing the daemon, the command line or the owner held.
-    let said = serde_json::to_string(&listed).expect("the sources serialise");
+    let said = serde_json::to_string(&daemon.listed().await).expect("the list serialises");
     for private in ["planted", "kr-test", "EDITOR", "en_ZA", "en_GB"] {
         assert!(!said.contains(private), "{private} is in: {said}");
     }

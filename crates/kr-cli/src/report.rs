@@ -576,10 +576,11 @@ pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> Line {
 /// the closed words the worker said them in, and what was not heard.
 ///
 /// `listed` is the live sessions the host listed, or `None` where the list was not read, and
-/// `live` is how many live sessions the host says it has: a session whose worker did not answer is
-/// not in the list, and is counted here rather than left out without a word.
+/// `held` is how many sessions the host says it holds, which counts one still being created and one
+/// whose worker did not answer as well as the live ones: those the list left out are counted here
+/// rather than left out without a word.
 #[must_use]
-pub fn session_environment_lines(listed: Option<&[SessionSummary]>, live: u64) -> Vec<Shown> {
+pub fn session_environment_lines(listed: Option<&[SessionSummary]>, held: u64) -> Vec<Shown> {
     let Some(listed) = listed else {
         return vec![Shown::said(
             "the sessions were not read, so where each one's environment came from is not known",
@@ -601,19 +602,24 @@ pub fn session_environment_lines(listed: Option<&[SessionSummary]>, live: u64) -
             ),
         })
         .collect();
-    let unlisted = live.saturating_sub(listed.len() as u64);
-    if unlisted > 0 {
-        lines.push(shown!(
-            "{} live sessions did not answer, so where their environment came from is not known",
+    match held.saturating_sub(listed.len() as u64) {
+        0 => {}
+        1 => lines.push(Shown::said(
+            "1 session the host holds is not in the list, because it is still being created or its \
+             worker did not answer, so where its environment came from is not known",
+        )),
+        unlisted => lines.push(shown!(
+            "{} sessions the host holds are not in the list, because they are still being created \
+             or their workers did not answer, so where their environment came from is not known",
             unlisted
-        ));
+        )),
     }
     lines
 }
 
 /// The same as [`session_environment_lines`], for a script.
 #[must_use]
-pub fn session_environments(listed: Option<&[SessionSummary]>, live: u64) -> Document {
+pub fn session_environments(listed: Option<&[SessionSummary]>, held: u64) -> Document {
     let Some(listed) = listed else {
         return Document::new().with("read", false);
     };
@@ -636,7 +642,7 @@ pub fn session_environments(listed: Option<&[SessionSummary]>, live: u64) -> Doc
                 })
                 .collect::<Vec<_>>(),
         )
-        .with("unlisted", live.saturating_sub(listed.len() as u64))
+        .with("unlisted", held.saturating_sub(listed.len() as u64))
 }
 
 /// Renders what a logout does to each execution profile, one line each.
