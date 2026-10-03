@@ -66,6 +66,10 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 7;
 /// The version whose journals [`WorkflowStore::open`] brings forward to this build's.
 const SCHEMA_WITH_VARIABLES: u32 = 6;
 
+/// Where the environment variables are in the array form of a session's parameters: the values
+/// of its fields in the order the type declares them, `environment_snapshot` the eighth.
+const ENVIRONMENT_SNAPSHOT_POSITION: usize = 7;
+
 /// The columns [`Journal::parse_run_record`] expects, in order.
 const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, generation, depth,
             parent_run_id, parent_node_id";
@@ -772,7 +776,8 @@ impl<'c> Journal<'c> {
             Ok(Some(_)) => {
                 return Err(AutomationError::InvalidArgument(
                     "a definition that carries environment variables is not stored: a create \
-                     node's parameters hold some, and a stored definition would keep them"
+                     node's parameters hold some, or hold them where a name-keyed check does not \
+                     look, and a stored definition would keep them"
                         .to_owned(),
                 ));
             }
@@ -1885,7 +1890,7 @@ impl std::fmt::Debug for WorkflowStore {
 }
 
 /// A stored definition with the environment variables of its create nodes emptied, or `None` when
-/// it holds none.
+/// it holds none and nothing else in it needs to change.
 ///
 /// A node's parameters are a JSON document kept as text inside the definition's own document, so
 /// both are read. Nothing but the variables changes: every other field of the definition and of
@@ -1936,14 +1941,37 @@ fn without_variables(stored: &str) -> std::result::Result<Option<String>, String
         // by name. It comes forward as the object the same decoder reads as the same parameters,
         // so the check that looks for the field by name sees it.
         if params.is_array() {
-            let mut decoded: kr_protocol::session::SessionCreateParams =
-                serde_json::from_value(params).map_err(|_| {
-                    "a create node's parameters are an array that does not read as a session's"
-                        .to_owned()
-                })?;
-            decoded.environment_snapshot.clear();
-            let emptied = serde_json::to_string(&decoded)
-                .map_err(|_| "a create node's parameters cannot be written again".to_owned())?;
+            let emptied = match serde_json::from_value::<kr_protocol::session::SessionCreateParams>(
+                params.clone(),
+            ) {
+                Ok(mut decoded) => {
+                    decoded.environment_snapshot.clear();
+                    serde_json::to_string(&decoded).map_err(|_| {
+                        "a create node's parameters cannot be written again".to_owned()
+                    })?
+                }
+                // Parameters this build cannot read as a session's, for want of a field a later
+                // build declared. Its variables are in a position all the same, and the node is
+                // kept as the array it is with that position emptied: nothing can run it, and
+                // nothing can show it to hold none otherwise.
+                Err(_) => {
+                    let Some(list) = params
+                        .as_array_mut()
+                        .and_then(|fields| fields.get_mut(ENVIRONMENT_SNAPSHOT_POSITION))
+                    else {
+                        return Err(
+                            "a create node's parameters are an array with no place for variables"
+                                .to_owned(),
+                        );
+                    };
+                    // Already emptied, by an earlier pass: nothing more to take out.
+                    if list.as_array().is_some_and(Vec::is_empty) {
+                        continue;
+                    }
+                    *list = Value::Array(Vec::new());
+                    params.to_string()
+                }
+            };
             node["action_params"] = Value::String(emptied);
             changed = true;
             continue;
@@ -2106,8 +2134,8 @@ impl WorkflowStore {
             return Err(AutomationError::InvalidArgument(format!(
                 "the workflow journal at {} was written to, by something that does not refuse \
                  environment variables, while the journal was being brought forward, and a \
-                 definition came to carry some again. Stop whatever else has it open, then start \
-                 the daemon again",
+                 definition came to need the rewrite again. Stop whatever else has it open, then \
+                 start the daemon again",
                 self.path.display()
             )));
         }
