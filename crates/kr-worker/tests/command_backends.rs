@@ -58,12 +58,20 @@ fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Waits until the endpoint a launch record names is gone, within the liveness bound.
+/// Says that the endpoint a launch record names is gone.
 ///
-/// A socket's file is removed as the backend is retired. A pipe is gone when the last handle to it
-/// closes, which is when the listener's task has been dropped, and that task is dropped by the
-/// runtime and not by the caller that retired the backend.
+/// A socket's file is removed as the backend is retired, so it is gone when `establish` returns. A
+/// pipe is gone when the last handle to it closes, which is when the listener's task has been
+/// dropped, and that task is dropped by the runtime and not by the caller that retired the backend,
+/// so there it is waited for, within the liveness bound.
 async fn endpoint_goes(endpoint: &str) {
+    if cfg!(unix) {
+        assert!(
+            !endpoint_exists(endpoint),
+            "the earlier line's endpoint is gone"
+        );
+        return;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while endpoint_exists(endpoint) {
         assert!(

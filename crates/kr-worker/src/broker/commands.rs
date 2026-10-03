@@ -263,6 +263,8 @@ struct Backend {
     commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(all(feature = "testing", windows))]
     show_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(all(feature = "testing", windows))]
+    started_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// What a backend's instance was last announced as, and what may still be announced about it.
@@ -389,6 +391,10 @@ pub struct CommandBackends {
     /// host's own tests.
     #[cfg(all(feature = "testing", windows))]
     show_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// What tells a test that the next launch's launcher has said it started its program, for this
+    /// host's own tests.
+    #[cfg(all(feature = "testing", windows))]
+    started_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Where the next backend's reading stops before it opens the directory it grants, for this
     /// host's own tests.
     #[cfg(feature = "testing")]
@@ -478,6 +484,8 @@ impl CommandBackends {
             commit_pause: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "testing", windows))]
             show_pause: Arc::new(Mutex::new(None)),
+            #[cfg(all(feature = "testing", windows))]
+            started_signal: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
             directory_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -543,6 +551,22 @@ impl CommandBackends {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
+    }
+
+    /// Tells a test when the next launch's launcher has said it started its program, for this
+    /// host's own tests: the launch is then complete, and a launcher that is ended after this ends
+    /// a program that is already the host's to supervise.
+    ///
+    /// Returns the end that is sent to when the launcher's word has been read. It is compiled away
+    /// in every shipped build.
+    #[cfg(all(feature = "testing", windows))]
+    pub fn notify_when_started(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (told, watch) = tokio::sync::oneshot::channel();
+        *self
+            .started_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(told);
+        watch
     }
 
     /// Stops the next backend's reading before it opens the directory its launch is granted, for
@@ -999,6 +1023,8 @@ impl CommandBackends {
             commit_pause: Arc::clone(&self.commit_pause),
             #[cfg(all(feature = "testing", windows))]
             show_pause: Arc::clone(&self.show_pause),
+            #[cfg(all(feature = "testing", windows))]
+            started_signal: Arc::clone(&self.started_signal),
         });
         let reading = {
             let path = PathBuf::from(&backend.invocation.executable);
@@ -2123,6 +2149,15 @@ async fn continue_launch(
         _ => false,
     };
     if resumed {
+        #[cfg(feature = "testing")]
+        if let Some(told) = backend
+            .started_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = told.send(());
+        }
         Ok(())
     } else {
         if let Some(job) = crate::windows::job::agent_job(&process) {
