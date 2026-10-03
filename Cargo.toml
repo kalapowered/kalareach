@@ -257,3 +257,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The host hashes every program it launches before it admits the launch, under a deadline set for an
+# optimised hash, and a debug build hashes about seventeen times slower than that. The package that
+# does the hashing is optimised in debug and test builds too; the rest of them are not.
+[profile.dev.package.sha2]
+opt-level = 3
