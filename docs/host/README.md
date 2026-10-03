@@ -4539,6 +4539,16 @@ this host dedicated to it. The backend is asked to stop, given the grace period,
 not gone, and then waited for, so what is reported is what actually happened rather than what was
 signalled.
 
+On Windows, a dedicated backend this host started is held by a job, and the stop is of that job. The
+end of the backend's standard input that this host writes is closed, which is how an agent is told
+to finish, and any write to it that is blocked is cancelled so that it cannot hold the stop up. Then
+a grace period is given to the job, after which the job is terminated if anything in it is left. The
+stop is complete only when the job lists nothing: the backend's root process may have exited while
+the helpers it started are alive, and the backend is then not yet stopped. If the job cannot be
+asked, or a termination fails and leaves something in it, the stop is reported as unresolved. If a
+caller stops a backend while another caller's stop of it is in progress, the second caller waits for
+the first and gets the same answer.
+
 ## The gateway
 
 A native terminal reaches its upstream through a path core code alone interprets. The connector
@@ -4718,6 +4728,23 @@ whatever its path names later, and a read that would cross into another mount is
 ends with the instance, or with the session. No other launch is granted a directory, and no launch
 is granted writing.
 
+On Windows the worker holds the directory's path before it opens the directory. It opens every
+component of the path, from the root of the drive to the directory itself, without sharing deletion,
+so none of them can be renamed, replaced or deleted while the launch lasts. Only an absolute path on
+a local NTFS drive is held. A network path, a verbatim path, a relative path, a drive letter that
+names another path, a component that is a link of any kind and a file are each refused by name, and
+nothing is granted for them. The launcher reports the directory it works in, which is the string its
+program inherits. The worker holds that string the same way and grants only where it reaches the
+same directory as the shell's path did, so a launcher started in another directory grants nothing.
+The hold lasts until the backend ends. There is one thing the hold cannot stop. A principal that may
+write to the empty directory can convert it to a junction in place, whatever is shared, between the
+commit and the time the program's loader opens it, and the program then starts in another directory.
+The grant does not move: it keeps naming the held directory, and a read through it after the
+conversion is refused. The commit reads the directory's attributes again and withdraws the grant
+from a directory that has become a link. A principal with write access to the directory's contents
+can already change the files the program reads there. A principal that may write only the
+directory's attributes cannot, and for it the grant stays confined to the held directory.
+
 The request is recorded, what to do about it is decided, and the one admission to answer it is taken
 with the dispatch marker committed, all under the broker's one lock and all before the operation
 runs. No native answer and no rich answer can take that admission afterwards, so this host's answer
@@ -4842,6 +4869,20 @@ is ended and waited for before the launch returns, the credential file it wrote 
 the broker gives back the instance and the conversation the launch took, so a retry is not refused
 for a launch that never happened.
 
+On Windows the spawned programs must be `.exe` or `.com`: a batch file, a PowerShell script or a
+script that a runtime runs is refused by name, because the process that would start is the
+interpreter, whose identity is not the program's. The path to the program and its arguments are
+joined into one command line by the one quoting rule this host writes every command line with, and
+the command line is never passed to a shell. The process is created suspended and put into two jobs
+by the creation itself: the session's job, which ends it with the session, and a job of its own,
+which lists everything it starts. The worker asks the kernel whether each job holds the process
+before its first instruction runs. The process receives three handles and no others: a pipe for its
+standard input, a pipe for its standard output, and the null device for its standard error. This
+host keeps the other ends of the pipes. The pipe ends are made inheritable only for the call that
+creates the process, under a lock that every start this worker makes takes, so a process another
+part of the worker starts at the same moment holds none of them. This allows the reader of the
+backend's output to see the end of the file when the backend's last process lets go.
+
 A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
 `sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that
 guesses the address still cannot speak to it.
@@ -4911,6 +4952,20 @@ commit runs the command as typed, without the integration's flags. Every bridge 
 also checked against the running image: the process must still execute what was hashed, and one
 mismatch refuses that bridge and every later one. The launcher's contract is in the Claude Code
 bridge's documentation.
+
+Windows lacks exec, so there the launcher creates the program itself. It creates it suspended, in
+the job the launcher is in, sharing the launcher's console and given its three standard handles. It
+then says it is going, naming the program and the directory the program inherits. The worker shows
+the program before it commits anything. The program has to be the launcher's own child, it has to
+have started after the backend was established, it has to have been created from the file the worker
+hashed and has held open since, and it is put in a job of its own before it has run. The instance,
+the registration, the transport's record and that job all name the program and never the launcher,
+and the registration is published only at this point. When the backend says the launch is committed,
+the launcher starts the program, says that it has, and waits, and it then ends with the program's
+whole 32-bit exit code. A program that is committed and not started within four seconds is ended,
+with everything in its job. If anything goes wrong before the commit, the program never ran: the
+launcher ends it and runs the command as typed. A launcher that cannot create its program says why
+in its frame, and the worker keeps the reason on the backend, because no instance exists to keep it.
 
 A program the integration did not launch is adopted, never given a gateway after the fact. Four
 times a second, while a command has the terminal, the worker reads the terminal's foreground group,
