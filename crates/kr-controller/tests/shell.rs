@@ -1142,25 +1142,24 @@ async fn an_invisible_session_takes_the_hosts_environment_even_from_the_command_
     daemon.stop();
 }
 
-/// A connection that declares itself the control daemon or a worker is no source of a create.
+/// A connection that declares itself a worker is no source of a create. (One that declares itself
+/// the control daemon waits for a worker's challenge before it can send anything, so it is
+/// refused by the rule alone: see the table of origins beside the create.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_connection_that_declares_itself_a_controller_or_a_worker_is_no_source_of_a_create() {
+async fn a_connection_that_declares_itself_a_worker_is_no_source_of_a_create() {
     let scratch = tempfile::tempdir().expect("a directory");
     let home = scratch.path().to_path_buf();
     let daemon = Daemon::start(&[("HOME", home.display().to_string())]).await;
-    for kind in [LocalClientKind::Controller, LocalClientKind::Worker] {
-        let refused = daemon
-            .session_environment(kind, Presentation::Invisible, Vec::new(), &home)
-            .await
-            .expect_err("no session is created for it");
-        assert!(
-            matches!(
-                refused.code,
-                ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
-            ),
-            "{kind:?}: {refused:?}"
-        );
-    }
+    let refused = daemon
+        .session_environment(
+            LocalClientKind::Worker,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+        )
+        .await
+        .expect_err("no session is created for it");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     let listed: kr_protocol::session::SessionListResult =
         LocalClient::connect(&daemon.endpoint, LocalClientKind::Cli, build())
             .await
