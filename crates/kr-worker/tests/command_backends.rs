@@ -58,6 +58,22 @@ fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// Waits until the endpoint a launch record names is gone, within the liveness bound.
+///
+/// A socket's file is removed as the backend is retired. A pipe is gone when the last handle to it
+/// closes, which is when the listener's task has been dropped, and that task is dropped by the
+/// runtime and not by the caller that retired the backend.
+async fn endpoint_goes(endpoint: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while endpoint_exists(endpoint) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the earlier line's endpoint is gone"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Whether the endpoint a launch record names exists: a socket's path on Unix, and a pipe in the
 /// system's list of them on Windows, which is read without connecting to any.
 fn endpoint_exists(endpoint: &str) -> bool {
@@ -465,10 +481,7 @@ async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
         .backends
         .establish(&request(&setup, &first, &integration, 8))
         .expect("the next line's invocation gets its own backend");
-    assert!(
-        !endpoint_exists(&endpoint),
-        "the earlier line's endpoint is gone"
-    );
+    endpoint_goes(&endpoint).await;
     assert!(!directory.join("credential").exists(), "and its credential");
     assert!(
         !directory.join("launch").exists(),
