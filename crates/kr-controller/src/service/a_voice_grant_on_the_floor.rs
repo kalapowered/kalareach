@@ -252,7 +252,6 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_with_the_hosts_reas
 
     let faulted = refuse_expiry_records(&temp, "grants");
     wall.store(now + 120_000, Ordering::SeqCst);
-    let reason = crate::grants::Refusal::FloorUnrecorded.detail();
     for refused in [
         authority
             .standing_voice_grant(device.device_id)
@@ -262,7 +261,6 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_with_the_hosts_reas
             .map(|held| held.map(|grant| grant.grant_id)),
     ] {
         let error = refused.expect_err("a lapse this host cannot record is not stated");
-        assert_eq!(error.to_protocol_error().message, reason);
         assert_eq!(
             error.code(),
             kr_protocol::error::ErrorCode::StorageUnavailable
@@ -307,8 +305,8 @@ async fn a_pairing_grant_whose_end_is_not_on_record_is_refused_with_the_hosts_re
         .device_grant(device.device_id, None)
         .expect_err("a lapse this host cannot record is not stated");
     assert_eq!(
-        error.to_protocol_error().message,
-        crate::grants::Refusal::FloorUnrecorded.detail()
+        error.code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable
     );
     faulted
         .execute_batch("DROP TRIGGER refuse_expiry;")

@@ -58,8 +58,8 @@ async fn admitted(controller: &Controller) -> (ConnectionId, ActorId) {
     (connection_id, actor_id)
 }
 
-/// A mutation that sets privacy mode, under a fresh action identifier.
-fn privacy_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+/// A mutation that sets privacy mode to `enabled`, under a fresh action identifier.
+fn privacy_request(temp: &kr_ipc::testing::TempHost, enabled: bool) -> MutationRequest {
     MutationRequest {
         request_id: RequestId::new(1),
         method: Method::PrivacySet.into(),
@@ -70,7 +70,7 @@ fn privacy_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
         expected: ParamsValue::empty(),
         action_window_id: ActionWindowId::new("local:test").expect("a window"),
         requested_ttl_ms: DurationMs::new(30_000),
-        params: ParamsValue::from_typed(&PrivacySetParams { enabled: true }).expect("encodes"),
+        params: ParamsValue::from_typed(&PrivacySetParams { enabled }).expect("encodes"),
     }
 }
 
@@ -94,7 +94,7 @@ async fn performed_once(
     controller: &Arc<Controller>,
 ) -> (ConnectionId, ActorId, MutationRequest) {
     let (connection_id, actor_id) = admitted(controller).await;
-    let mutation = privacy_request(temp);
+    let mutation = privacy_request(temp, true);
     let revision = controller
         .admitted_revision(connection_id)
         .expect("the connection is registered");
@@ -1011,6 +1011,33 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
     late()
         .await
         .expect("once the fence is gone it is answered again");
+
+    // The fence lands while the answer is being read, after the claim found the record: the check
+    // that decides is the one made with the answer in hand.
+    let (arrived, release) = controller.pause_retained_lookup();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        let carried = carried(&controller, connection_id);
+        async move {
+            controller
+                .authority_change(&actor_id, &mutation, Method::GrantRevoke, carried)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the late attempt reaches the place it is stopped at")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting
+        .await
+        .expect("the late attempt finishes")
+        .expect_err("a fence that landed while the answer was read stops it");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    controller.hold_fence(false);
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: the same for a privacy change, whose claim another attempt may
@@ -1047,19 +1074,51 @@ async fn a_privacy_change_recorded_before_a_late_attempts_claim_is_not_given_bac
         refusal(&answered).is_none(),
         "once the fence is gone it is answered again: {answered:?}"
     );
+
+    // The fence lands while the answer is being read, after the claim found the record: the check
+    // that decides is the one made with the answer in hand.
+    let (arrived, release) = controller.pause_retained_lookup();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            let admitted = controller.admitted_revision(connection_id).ok();
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::PrivacySet,
+                    connection_id,
+                    Some(accepted(&controller)),
+                    admitted,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the late attempt reaches the place it is stopped at")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence that landed while the answer was read stops it: {refused:?}")
+    }));
+    controller.hold_fence(false);
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: a privacy change that was applied is answered as applied when what
-/// it came to cannot be kept. The retry is told the action is unfinished and is not performed
-/// again, which is what the claim left behind. The control: with the receipt kept, the answer is
-/// the same.
+/// it came to cannot be kept. A retry of it is told its outcome is not known and is not performed
+/// again, which is what the claim left behind. The control: with the receipt kept, the change is
+/// answered and applied the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_receipt_cannot_be_kept()
  {
     let (temp, controller, _clock) = daemon().await;
     let (connection_id, actor_id) = admitted(&controller).await;
-    let kept_mutation = privacy_request(&temp);
-    let unkept_mutation = privacy_request(&temp);
+    let enabled = || controller.privacy.status(kr_ipc::now_ms()).enabled;
     let write = |mutation: &'_ MutationRequest| {
         let controller = Arc::clone(&controller);
         let actor_id = actor_id.clone();
@@ -1077,8 +1136,10 @@ async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_re
                 .await
         }
     };
-    let kept = write(&kept_mutation).await;
+    assert!(!enabled(), "privacy mode starts off");
+    let kept = write(&privacy_request(&temp, true)).await;
     assert!(refusal(&kept).is_none(), "the control: {kept:?}");
+    assert!(enabled(), "the control: the change was applied");
 
     // The store takes no write of a receipt, as on a full disk.
     let registry = rusqlite::Connection::open(temp.environment().registry_database())
@@ -1089,14 +1150,32 @@ async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_re
              BEGIN SELECT RAISE(ABORT, 'no room'); END;",
         )
         .expect("the fault is in place");
-    let unkept = write(&unkept_mutation).await;
+    let turned_off = privacy_request(&temp, false);
+    let unkept = write(&turned_off).await;
     assert!(
         refusal(&unkept).is_none(),
         "the change was applied, and that is what the caller is told: {unkept:?}"
     );
+    assert!(!enabled(), "the change was applied");
     registry
         .execute_batch("DROP TRIGGER refuse_receipts;")
         .expect("the fault is cleared");
+
+    // A later action turns it on again. A retry of the one whose receipt was lost is told its
+    // outcome is not known, and does not turn it off a second time.
+    let on_again = write(&privacy_request(&temp, true)).await;
+    assert!(refusal(&on_again).is_none(), "{on_again:?}");
+    assert!(enabled());
+    let retried = write(&turned_off).await;
+    assert_eq!(
+        refusal(&retried)
+            .unwrap_or_else(|| panic!(
+                "a retry of an unfinished action is not answered: {retried:?}"
+            ))
+            .code,
+        ErrorCode::OutcomeUnknown
+    );
+    assert!(enabled(), "the retry was not performed again");
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: the four methods that take no admission into a service are
@@ -1147,4 +1226,152 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
                 .unwrap_or_else(|| panic!("{method:?} while a fence is owed: {answered:?}")),
         );
     }
+}
+
+/// An enrolment of an environment, for the record this host keeps of them.
+fn enrolment_of(byte: u8) -> kr_protocol::identity::EnvironmentEnrolment {
+    use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment};
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+    EnvironmentEnrolment {
+        environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([byte; 16])),
+        access: EnvironmentAccess::WslDistribution,
+        label: "ubuntu".to_owned(),
+        target: "ubuntu-target".to_owned(),
+        os_user: "kala".to_owned(),
+        helper_path: "/usr/local/bin/kr".to_owned(),
+        clipboard_destination: Nullable::null(),
+        approved_at_ms: TimestampMs::new(0),
+    }
+}
+
+/// Runs `call` while something else holds this host's record of its environments, and lets that go
+/// once `meanwhile` has run: the call waits for the record, and what lands while it waits is what
+/// the call is asked about when it gets it.
+async fn while_the_environment_record_is_held<T: Send + 'static>(
+    controller: &Controller,
+    call: impl std::future::Future<Output = T> + Send + 'static,
+    meanwhile: impl FnOnce(),
+) -> T {
+    let state_dir = controller.paths.state_dir().to_path_buf();
+    let (held, holding) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = tokio::task::spawn_blocking(move || {
+        crate::bridge::store::Store::with_locked(&state_dir, |_| {
+            let _ = held.send(());
+            let _ = released.recv();
+            Ok(())
+        })
+    });
+    holding.await.expect("the record is held");
+    let waiting = tokio::spawn(call);
+    meanwhile();
+    release.send(()).expect("the holder lets go");
+    holder
+        .await
+        .expect("the holder finishes")
+        .expect("the record opens");
+    waiting.await.expect("the call finishes")
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: a fence this host owes that lands while an environment record
+/// change waits for the record stops it, so the record is not changed. The control: with nothing
+/// owed, the same changes are made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_an_environment_change_waits_for_the_record_stops_it() {
+    use kr_protocol::identity::{
+        EnvironmentEnrolParams, EnvironmentForgetParams, EnvironmentRefreshParams,
+    };
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: None,
+    };
+    let change = |method: Method, params: ParamsValue| {
+        let controller = Arc::clone(&controller);
+        let mutation = mutation_of(&temp, method, params);
+        let actor =
+            super::routes::local_actor(actor_id.clone(), connection_id, controller.generation);
+        async move {
+            controller
+                .environment_record(&actor, &mutation, method, carried)
+                .await
+        }
+    };
+    let enrol = |byte: u8| {
+        change(
+            Method::EnvironmentEnrol,
+            ParamsValue::from_typed(&EnvironmentEnrolParams {
+                enrolment: enrolment_of(byte),
+            })
+            .expect("encodes"),
+        )
+    };
+    let forget = |byte: u8| {
+        change(
+            Method::EnvironmentForget,
+            ParamsValue::from_typed(&EnvironmentForgetParams {
+                environment_id: enrolment_of(byte).environment_id,
+            })
+            .expect("encodes"),
+        )
+    };
+    let refresh = |byte: u8| {
+        change(
+            Method::EnvironmentRefresh,
+            ParamsValue::from_typed(&EnvironmentRefreshParams {
+                environment_id: enrolment_of(byte).environment_id,
+                start: false,
+            })
+            .expect("encodes"),
+        )
+    };
+    let recorded = |byte: u8| {
+        let state_dir = controller.paths.state_dir().to_path_buf();
+        let environment_id = enrolment_of(byte).environment_id;
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store.enrolment(environment_id).is_some())
+        })
+        .expect("the record opens")
+    };
+
+    // The control: nothing owed, so the changes are made. A refresh asks the platform, which this
+    // machine may not have, and what it must not be is a refusal for a fence.
+    enrol(1).await.expect("enrolled");
+    assert!(recorded(1));
+    if let Err(error) = refresh(1).await {
+        assert!(!error.to_string().contains("fence"), "{error}");
+    }
+
+    // The fence lands while each change waits for the record.
+    let fence_lands = || controller.hold_fence(true);
+    let refused = while_the_environment_record_is_held(&controller, enrol(2), fence_lands).await;
+    controller.hold_fence(false);
+    refused_for_a_fence(
+        &refused
+            .expect_err("an enrolment is stopped")
+            .to_protocol_error(),
+    );
+    assert!(!recorded(2), "the enrolment was not made");
+    let refused = while_the_environment_record_is_held(&controller, forget(1), fence_lands).await;
+    controller.hold_fence(false);
+    refused_for_a_fence(
+        &refused
+            .expect_err("a forgetting is stopped")
+            .to_protocol_error(),
+    );
+    assert!(recorded(1), "the record was not forgotten");
+    let refused = while_the_environment_record_is_held(&controller, refresh(1), fence_lands).await;
+    controller.hold_fence(false);
+    refused_for_a_fence(
+        &refused
+            .expect_err("a refresh is stopped")
+            .to_protocol_error(),
+    );
+
+    forget(1).await.expect("forgotten once nothing is owed");
+    assert!(!recorded(1));
 }
