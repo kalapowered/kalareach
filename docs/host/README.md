@@ -2514,8 +2514,13 @@ whose write-ahead log still holds writes or that is reached through a link), and
 descriptor; a source it cannot read, the registry included, refuses the journal. It checks the
 version and every object against the statement one of those builds ran to make it, reads every row
 as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
-it was; a failure after it has begun changing the journal goes back with its transaction. Code reads
-one current schema after migration or import, and there is no branch anywhere that reads two.
+it was; a failure after it has begun changing the journal goes back with its transaction.
+After a migration or an import, the code that reads the worker journal reads one current schema, and
+no branch of it reads two. Not every store works that way. The project, delivery, transfer and
+grants stores each bring a store that an earlier build wrote forward when they open it, and the
+project store also adds any nullable column that a store at its current version lacks. The contact
+skill's installation records are still found under the name an earlier build gave a user record. A
+comment at each of these paths says what it serves and when it can be removed.
 
 Similarly, the registry will take its own set of steps to move through schema versions one-by-one. In this case, version 7 will rewrite all create request records to remove environment variables that the creator had sent (and which earlier versions of the registry recorded as part of the reservation). After it has done this, the registry will `VACUUM` and perform a truncating checkpoint to remove the old bytes (which are still in free pages and in the WAL). Only then will it move to the next version. A run that stops before then is made again from the start. If `VACUUM` cannot finish, the daemon does not start. The error says why, and when the disk is full it asks for free space in the registry's directory and in SQLite's temporary directory, then a new start. Any record that is not in the expected format for either version will be cleared as it cannot be proven that the record does not contain environment variables.
 
