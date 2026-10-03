@@ -10,6 +10,9 @@
 //! property of the machine, so a latency with no hardware beside it cannot be compared with the
 //! next one.
 
+#[path = "kr-describe-bench/outputs.rs"]
+mod outputs;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -89,9 +92,33 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "--outputs" => {
+            let rounds = match flag(&arguments, "--rounds") {
+                None if arguments.iter().any(|argument| argument == "--rounds") => {
+                    eprintln!("--rounds takes a whole number of at least one");
+                    return ExitCode::FAILURE;
+                }
+                None => 1,
+                Some(given) => match given.parse::<u32>() {
+                    Ok(rounds) if rounds > 0 => rounds,
+                    _ => {
+                        eprintln!("--rounds takes a whole number of at least one, not {given}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            match run_outputs(&profile, &cache_directory(&arguments), rounds) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(message) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         other => {
             eprintln!(
-                "usage: kr-describe-bench [--manifest|--run] [--profile <id>] [--cache <dir>]"
+                "usage: kr-describe-bench [--manifest|--run|--outputs [--rounds <n>]] [--profile <id>] [--cache <dir>]"
             );
             eprintln!("unknown mode {other}");
             ExitCode::FAILURE
@@ -226,6 +253,86 @@ fn report_ceiling(
             "the {ceiling} byte process ceiling was not measured during {phase}"
         )),
     }
+}
+
+/// Describes the fixed sessions of [`outputs::fixtures`] with the real weights and counts what
+/// comes back: each answer through llama.cpp's grammar and this product's validation, and each job
+/// against the product's deadline. Returns whether every one held.
+fn run_outputs(profile: &ModelProfile, cache: &Path, rounds: u32) -> Result<bool, String> {
+    let machine = hardware();
+    println!("# KR-REQ-22.18: grammar-constrained descriptions from the real model");
+    println!("hardware: {machine}");
+    println!(
+        "profile: {} revision {}",
+        profile.profile_id(),
+        profile.revision().get()
+    );
+    println!(
+        "runtime: {} {} over llama.cpp {}",
+        profile.runtime().binding,
+        profile.runtime().binding_version,
+        profile.runtime().llama_cpp_revision
+    );
+    let mut weights = PathBuf::new();
+    for asset in profile.assets() {
+        let path = cache.join(&asset.file_name);
+        verify(asset, &path)?;
+        println!(
+            "asset {}: {} bytes, digest verified",
+            asset.file_name, asset.bytes
+        );
+        if asset.role == "weights" {
+            weights = path;
+        }
+    }
+    if weights.as_os_str().is_empty() {
+        return Err("the profile names no weights asset".to_owned());
+    }
+    let applied = background_current_thread();
+    println!(
+        "background priority: {} (cpu {}, io {}) [{machine}]",
+        applied.mechanism.as_str(),
+        applied.cpu,
+        applied.io
+    );
+    let cold = Instant::now();
+    let runtime = LlamaRuntime::load(
+        profile,
+        &weights,
+        &Cancellation::new(),
+        Instant::now() + Duration::from_millis(LOAD_DEADLINE_MS),
+    )
+    .map_err(|(why, detail)| {
+        format!(
+            "model load did not succeed: {}{}",
+            why.as_str(),
+            detail
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        )
+    })?;
+    println!(
+        "cold_start_load_ms: {} [{machine}]",
+        cold.elapsed().as_millis()
+    );
+    let limits = outputs::Limits::of(profile);
+    let fixtures = outputs::fixtures();
+    println!(
+        "limits: {} threads, {} tokens in, {} out, {} ms per job, {} sessions fixed [{machine}]",
+        limits.cpu_threads,
+        limits.context_tokens,
+        limits.max_output_tokens,
+        limits.deadline_ms,
+        fixtures.len()
+    );
+    let mut model = Llama::loaded(runtime);
+    let records = outputs::run(&mut model, profile, limits, &fixtures, rounds, |record| {
+        println!("{}", outputs::job_line(record));
+    });
+    for line in outputs::report(&records, limits.deadline_ms, limits.room_tokens(), &machine) {
+        println!("{line}");
+    }
+    Ok(outputs::count(&records, limits.deadline_ms).all_held())
 }
 
 #[allow(clippy::too_many_lines)]

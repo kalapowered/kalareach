@@ -48,6 +48,9 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::token::data::LlamaTokenData;
+use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::{Asset, ModelProfile};
@@ -95,6 +98,21 @@ fn backend() -> std::result::Result<&'static LlamaBackend, String> {
     }
 }
 
+/// Returns whether a grammar sampler allows one token next, asking it of that token alone.
+///
+/// The sampler marks a token it does not allow with a logit of negative infinity, which is how the
+/// library's own sampling helper tests a token before it applies the grammar to the whole
+/// vocabulary. Asking of one token costs one candidate's work instead of the vocabulary's.
+fn grammar_allows(grammar: &LlamaSampler, token: LlamaToken) -> bool {
+    let mut candidates =
+        LlamaTokenDataArray::new(vec![LlamaTokenData::new(token, 1.0, 1.0)], false);
+    grammar.apply(&mut candidates);
+    candidates
+        .data
+        .first()
+        .is_some_and(|candidate| candidate.logit() != f32::NEG_INFINITY)
+}
+
 /// Returns the milliseconds since `started`.
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -119,6 +137,12 @@ impl Llama {
         Self {
             runtime: Some(runtime),
         }
+    }
+
+    /// Returns the loaded runtime, when there is one.
+    #[must_use]
+    pub const fn runtime(&self) -> Option<&LlamaRuntime> {
+        self.runtime.as_ref()
     }
 }
 
@@ -299,6 +323,84 @@ impl LlamaRuntime {
     #[must_use]
     pub fn weights_path(&self) -> &Path {
         &self.weights_path
+    }
+
+    /// Returns how many tokens the model's tokenizer reads `prompt` as, which is what a job spends
+    /// of its context window before it writes a token.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the prompt could not be tokenized.
+    pub fn prompt_tokens(&self, prompt: &str) -> std::result::Result<usize, String> {
+        self.model
+            .str_to_token(prompt, AddBos::Always)
+            .map(|tokens| tokens.len())
+            .map_err(|error| format!("the prompt could not be tokenized: {error}"))
+    }
+
+    /// Returns whether llama.cpp's own grammar machinery takes `output` as a whole answer: every
+    /// token of the output is one the grammar allows next, and it allows the end of the answer
+    /// where the output ends.
+    ///
+    /// The output is given to the grammar one codepoint at a time, and each codepoint is
+    /// tokenized on its own. The tokenizer reads the spelling of a control token as the token, so
+    /// tokenizing the whole text would turn `</s>` inside a title into the end of the answer; and
+    /// a byte-level vocabulary splits a space and the character after it across tokens in ways
+    /// the grammar refuses halfway through a character, which no generation would choose.
+    /// A codepoint tokenized alone is a codepoint the vocabulary writes whole wherever it can.
+    ///
+    /// What this shows depends on where the output came from. For an answer the model produced
+    /// under this grammar it shows the answer is complete and was not cut short; for text written
+    /// by hand, as `tests/grammar.rs` does, it shows how llama.cpp reads the grammar.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the grammar is refused, the output is not text, a character of
+    /// it cannot be tokenized or its token cannot be spelled, the vocabulary has no
+    /// end-of-sequence token, or the tokens do not spell the output back.
+    pub fn grammar_takes(&self, grammar: &str, output: &[u8]) -> std::result::Result<bool, String> {
+        let mut sampler = LlamaSampler::grammar(&self.model, grammar, "root")
+            .map_err(|error| format!("the grammar was refused: {error}"))?;
+        let text = std::str::from_utf8(output)
+            .map_err(|error| format!("the output is not text: {error}"))?;
+        let end = self.model.token_eos();
+        if end.0 < 0 {
+            return Err("this vocabulary has no end-of-sequence token to ask about".to_owned());
+        }
+        let mut spelled: Vec<u8> = Vec::with_capacity(output.len());
+        let mut tokens: Vec<LlamaToken> = Vec::new();
+        for character in text.chars() {
+            let mut buffer = [0_u8; 4];
+            let piece = self
+                .model
+                .str_to_token(character.encode_utf8(&mut buffer), AddBos::Never)
+                .map_err(|error| format!("{character:?} could not be tokenized: {error}"))?;
+            for token in piece {
+                let bytes = self
+                    .model
+                    .token_to_piece_bytes(token, PIECE_BYTES, true, None)
+                    .map_err(|error| format!("a token could not be spelled: {error}"))?;
+                spelled.extend_from_slice(&bytes);
+                tokens.push(token);
+            }
+        }
+        if spelled != output {
+            return Err(
+                "the tokenizer does not spell the output back, so it cannot be asked of the \
+                 grammar"
+                    .to_owned(),
+            );
+        }
+        for token in tokens {
+            // An end token inside the output is an end of the answer, not text of it.
+            if self.model.is_eog_token(token) || !grammar_allows(&sampler, token) {
+                return Ok(false);
+            }
+            // Accepted only after the grammar allowed it: the library ends the process over a
+            // token its grammar has no place for.
+            sampler.accept(token);
+        }
+        Ok(grammar_allows(&sampler, end))
     }
 
     fn sampler(&self, job: &Job<'_>) -> std::result::Result<LlamaSampler, String> {
