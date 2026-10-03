@@ -784,6 +784,15 @@ impl Daemon {
     /// Starts a daemon whose own process environment is `environment`, as a daemon started by a
     /// person from a terminal, or by a service manager, has one.
     async fn start(environment: &[(&str, String)]) -> Self {
+        Self::start_with_additions(environment, &[]).await
+    }
+
+    /// As [`Self::start`], with `additions` in the host's configuration document: the variables its
+    /// owner has written down for the sessions started with the host's environment.
+    async fn start_with_additions(
+        environment: &[(&str, String)],
+        additions: &[(&str, &str)],
+    ) -> Self {
         let worker_build = worker_beside_this_test();
         let tree = teardown::Tree::create();
         let worker = tree.root().join("kr-worker");
@@ -791,6 +800,20 @@ impl Daemon {
         let paths = tree.environment();
         let environment_id = tree.environment_id();
         let secrets = paths.secrets_dir();
+        if !additions.is_empty() {
+            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+            document.preferences.environment_additions = Nullable::some(
+                additions
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            );
+            kr_ipc::paths::write_owner_only_file(
+                &kr_worker::config::document_path(&paths),
+                kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+            )
+            .expect("the host's configuration document");
+        }
         let controller = Controller::start(ControllerSetup {
             paths: paths.clone(),
             environment_id,
@@ -1059,6 +1082,70 @@ async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_dae
         .expect_err("a snapshot from an app is refused");
     assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
     assert!(!refused.message.contains("/an/apps/own"), "{refused:?}");
+    daemon.stop();
+}
+
+/// KR-REQ-07.25, KR-REQ-07.26: the variables the host's owner has written down are given to a
+/// session started with the host's environment beside it, an addition wins over the host's own
+/// value of the same name, and a session started with the command line's environment is given none
+/// of them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owners_configured_additions_join_the_hosts_environment_and_only_there() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start_with_additions(
+        &[
+            ("PATH", "/opt/kr-test-host/bin:/usr/bin:/bin".to_owned()),
+            ("HOME", home.display().to_string()),
+            ("LANG", "en_ZA.UTF-8".to_owned()),
+        ],
+        &[
+            ("EDITOR", "hx-from-the-configuration"),
+            ("PATH", "/opt/kr-test-added/bin:/usr/bin:/bin"),
+        ],
+    )
+    .await;
+
+    let environment = daemon
+        .session_environment(
+            LocalClientKind::App,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+        )
+        .await
+        .expect("an app's create is served");
+    assert_eq!(
+        environment.get("EDITOR").map(String::as_str),
+        Some("hx-from-the-configuration")
+    );
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-added/bin:/usr/bin:/bin"),
+        "an addition wins over the host's own value of the same name"
+    );
+    assert_eq!(
+        environment.get("LANG").map(String::as_str),
+        Some("en_ZA.UTF-8")
+    );
+
+    // The control: the command line's own session is its own environment, and the host's owner's
+    // additions are not added to it.
+    let own = daemon
+        .session_environment(
+            LocalClientKind::Cli,
+            Presentation::Terminal,
+            vec![variable("PATH", "/opt/kr-test-cli/bin")],
+            &a_home(&daemon, "cli"),
+        )
+        .await
+        .expect("a visible create from the command line is served");
+    assert_eq!(
+        own.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-cli/bin")
+    );
+    assert!(!own.contains_key("EDITOR"), "{own:?}");
     daemon.stop();
 }
 

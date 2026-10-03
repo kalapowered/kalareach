@@ -275,6 +275,23 @@ impl Resolver {
         )
     }
 
+    /// Resolves the variables a session started with this host's environment is given beside it.
+    ///
+    /// No request names them: they are the owner's, written in the configuration. A profile's set
+    /// replaces the host's rather than adding to it, an empty set adds nothing, and the product
+    /// default adds none.
+    #[must_use]
+    pub fn environment_additions(&self) -> Effective<std::collections::BTreeMap<String, String>> {
+        configuration::resolve(
+            configuration::ENVIRONMENT_ADDITIONS,
+            self.layers(
+                None,
+                |set| set.environment_additions.0.clone(),
+                std::collections::BTreeMap::new(),
+            ),
+        )
+    }
+
     /// Resolves the runtime tree this installation uses.
     ///
     /// The allowlisted variable acts at the request rung, which is where

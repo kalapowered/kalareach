@@ -236,12 +236,34 @@ impl Drop for CreateHold {
 }
 
 impl Controller {
-    /// The environment a session started with the host's is given.
-    fn host_context_environment(&self) -> Vec<EnvironmentVariable> {
-        self.host_environment
+    /// The environment a session started with the host's is given: the daemon's own, as it was
+    /// allowed when the daemon started, with the variables the host's owner has configured over
+    /// it by name.
+    ///
+    /// The additions are read now, from the configuration in force, so an edit reaches the sessions
+    /// started after it. Their values are the owner's own and go to the worker beside the rest and
+    /// nowhere else.
+    pub(super) fn host_context_environment(&self) -> Vec<EnvironmentVariable> {
+        let mut variables: std::collections::BTreeMap<String, String> = self
+            .host_environment
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.value.clone()))
+            .collect();
+        for (name, value) in self.in_force().environment_additions {
+            // Named as the platform names them, as the daemon's own are.
+            let name = if cfg!(windows) {
+                name.to_ascii_uppercase()
+            } else {
+                name
+            };
+            variables.insert(name, value);
+        }
+        variables
+            .into_iter()
+            .map(|(name, value)| EnvironmentVariable { name, value })
+            .collect()
     }
 
     /// Refuses a managed create whose shell no installed package qualifies.
