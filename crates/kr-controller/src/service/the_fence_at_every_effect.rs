@@ -1389,3 +1389,69 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     forget(1).await.expect("forgotten once nothing is owed");
     assert!(!recorded(1));
 }
+
+/// KR-REQ-09.09, 09.12 and 26.16: an environment record change another attempt recorded is not
+/// given back to a late attempt while this host owes a fence, including one that lands while the
+/// answer is read, after the claim found the record. The control: with nothing owed, the same late
+/// attempt is answered from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_change_recorded_before_a_late_attempts_claim_is_not_given_back_while_a_fence_is_owed()
+ {
+    use kr_protocol::identity::EnvironmentEnrolParams;
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(
+        &temp,
+        Method::EnvironmentEnrol,
+        ParamsValue::from_typed(&EnvironmentEnrolParams {
+            enrolment: enrolment_of(1),
+        })
+        .expect("encodes"),
+    );
+    let attempt = |controller: Arc<Controller>| {
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::EnvironmentEnrol,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                )
+                .await
+        }
+    };
+    let first = attempt(Arc::clone(&controller)).await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+    let late = attempt(Arc::clone(&controller)).await;
+    assert!(
+        refusal(&late).is_none(),
+        "with nothing owed the late attempt is answered from the record: {late:?}"
+    );
+
+    // The fence lands while the answer is being read, after the claim found the record, and so
+    // after the check every environment method takes before it is claimed: the check that decides
+    // is the one made with the answer in hand.
+    let (arrived, release) = controller.pause_retained_lookup();
+    let waiting = tokio::spawn(attempt(Arc::clone(&controller)));
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the late attempt reaches the place it is stopped at")
+        .expect("the pause is armed");
+    controller.hold_fence(true);
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence that landed while the answer was read stops it: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    let answered = attempt(Arc::clone(&controller)).await;
+    assert!(
+        refusal(&answered).is_none(),
+        "once the fence is gone it is answered again: {answered:?}"
+    );
+}
