@@ -57,14 +57,6 @@ impl Heard {
 fn stalling(
     heard: Arc<Heard>,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
-    stalling_with(heard, |_| None)
-}
-
-/// [`stalling`], except that it answers what `reply` has an answer for.
-fn stalling_with(
-    heard: Arc<Heard>,
-    reply: impl Fn(&ControlFrame) -> Option<ControlFrame> + Clone + Send + 'static,
-) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
     move |listener, identity, endpoint_text| {
         tokio::spawn(async move {
             loop {
@@ -75,7 +67,6 @@ fn stalling_with(
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
                 let heard = Arc::clone(&heard);
-                let reply = reply.clone();
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -96,19 +87,11 @@ fn stalling_with(
                                     }
                                 }
                             }
-                            None => {
-                                let answer = reply(&frame);
-                                heard
-                                    .frames
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .push(frame);
-                                if let Some(answer) = answer
-                                    && writer.write_message(&answer).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
+                            None => heard
+                                .frames
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(frame),
                         }
                     }
                 });
@@ -459,44 +442,234 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
     silent.serving.abort();
 }
 
-/// KR-REQ-09.12: a worker's refusal of the connection itself, because it no longer speaks for the
-/// generation that holds the worker, is a complete answer and still a failure of the link: the link
-/// is closed and not put back, and the lease stops renewing, where an ordinary refusal
+/// A daemon and a real worker that serves its session, bound to this daemon's generation and
+/// listed in its directory as a worker that has reported itself is. The worker has acknowledged the
+/// revision in force, so its lease renews.
+///
+/// The worker runs on a runtime of its own, which every task it starts belongs to, so that letting
+/// the fixture go ends them all together.
+pub(super) struct Served {
+    pub(super) controller: Arc<Controller>,
+    pub(super) worker: crate::directory::KnownWorker,
+    pub(super) session_id: SessionId,
+    service: Arc<kr_worker::service::WorkerService>,
+    worker_runtime: Option<tokio::runtime::Runtime>,
+    /// Declared last, so the tree is removed after the fixture's own handles to it are gone.
+    _temp: kr_ipc::testing::TempHost,
+}
+
+impl Drop for Served {
+    /// Signals the shell the worker runs to stop, and then ends every task of the worker and waits
+    /// for them to be gone, whether the test ended or failed, so that the worker's session no
+    /// longer holds the tree when it is removed. The shell is not waited for: the worker offers
+    /// nothing that joins its child, so it may stay unreaped until the test process ends, as with
+    /// the other fixtures that run a real worker. A poisoned session lock means the worker has
+    /// already panicked: the shell is then not signalled.
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut session = self.service.runtime().session();
+            let _ = session.request_stop();
+            let _ = session.force_close();
+        }));
+        // Joined from a thread of its own, because a runtime may not be shut down from inside the
+        // context of another. The bound is on that join, which ends as soon as the tasks are gone.
+        if let Some(runtime) = self.worker_runtime.take() {
+            std::thread::scope(|scope| {
+                scope.spawn(move || runtime.shutdown_timeout(std::time::Duration::from_secs(30)));
+            });
+        }
+    }
+}
+
+impl Served {
+    pub(super) async fn start() -> Self {
+        use kr_protocol::ids::SessionEpoch;
+        use kr_protocol::session::DisplayNumber;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = Controller::start(world::setup(&temp))
+            .await
+            .expect("the daemon starts");
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let identity = Arc::new(
+            WorkerIdentity::generate(
+                session_id,
+                SessionEpoch::V1,
+                controller.boot_identity.clone(),
+                kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+                kr_protocol::hello::PROTOCOL_VERSION,
+            )
+            .expect("a session key"),
+        );
+        let journal_path = environment.journal_database(session_id);
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent).expect("the journal directory");
+        }
+        let worker_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime of the worker's own");
+        let (service, endpoint) = {
+            let identity = Arc::clone(&identity);
+            let environment = environment.clone();
+            let boot_identity = controller.boot_identity.clone();
+            let controller_public_key = *controller.identity.public_key();
+            let controller_generation = controller.generation;
+            let build_id = controller.build_id.clone();
+            worker_runtime
+                .spawn(async move {
+                    let mut session =
+                        kr_worker::session::Session::open(kr_worker::session::SessionConfig {
+                            session_id,
+                            session_epoch: SessionEpoch::V1,
+                            environment_id,
+                            display_number: DisplayNumber::new(1),
+                            shell: kr_worker::testing::posix_script("exec cat"),
+                            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                            desktop: kr_protocol::identity::DesktopBinding::none(),
+                            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+                            journal_path: Some(journal_path.clone()),
+                            spool_directory: Some(environment.session_spool(session_id)),
+                            worker_endpoint: None,
+                            send_queue_bytes: 1024 * 1024,
+                            resident_bytes: 64 * 1024,
+                            time: kr_worker::action::time::TimeSources::system(),
+                            launch_profile: kr_protocol::session::LaunchProfile::default(),
+                        })
+                        .expect("opens the session");
+                    session.launch().expect("launches the shell");
+                    let runtime = Arc::new(
+                        kr_worker::runtime::SessionRuntime::start(
+                            session,
+                            Arc::new(kr_ipc::clock::SystemSharedClock),
+                        )
+                        .expect("starts the runtime"),
+                    );
+                    let endpoint = environment
+                        .worker_endpoint(DisplayNumber::new(1))
+                        .expect("an endpoint");
+                    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+                    let service = Arc::new(
+                        kr_worker::service::WorkerService::new(
+                            runtime,
+                            identity,
+                            endpoint.clone(),
+                            kr_worker::service::ServiceBinding {
+                                environment_id,
+                                boot_identity,
+                                controller_public_key,
+                                controller_generation,
+                                journal_path: Some(journal_path),
+                                build_id,
+                            },
+                        )
+                        .expect("a worker service"),
+                    );
+                    tokio::spawn(Arc::clone(&service).serve(listener));
+                    (service, endpoint)
+                })
+                .await
+                .expect("the worker is started")
+        };
+        let worker = crate::directory::KnownWorker {
+            descriptor: kr_protocol::worker::WorkerDescriptor {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id,
+                display_number: DisplayNumber::new(1),
+                boot_identity: identity.boot_identity().clone(),
+                process_start_identity: identity.process_start_identity().clone(),
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: *identity.public_key(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                published_at_ms: kr_ipc::now_ms(),
+            },
+            endpoint,
+        };
+        controller
+            .directory
+            .lock()
+            .await
+            .insert(worker.clone(), None);
+        world::acknowledged(&controller, session_id);
+        Self {
+            controller,
+            worker,
+            session_id,
+            service,
+            worker_runtime: Some(worker_runtime),
+            _temp: temp,
+        }
+    }
+
+    /// A control daemon of the next generation takes the worker over, which fences every
+    /// connection of this daemon's generation. Returns its connection, which holds the worker.
+    pub(super) async fn a_newer_generation_takes_over(&self) -> kr_ipc::client::LocalClient {
+        let controller = &self.controller;
+        let mut client = kr_ipc::client::LocalClient::connect(
+            &self.worker.endpoint,
+            kr_protocol::local::LocalClientKind::Controller,
+            controller.build_id.clone(),
+        )
+        .await
+        .expect("connects");
+        let newer = kr_protocol::ids::ControllerGeneration::new(controller.generation.get() + 1);
+        let boot = controller.boot_identity.clone();
+        let identity = &controller.identity;
+        client
+            .present_generation(|nonce| {
+                identity
+                    .generation_token(newer, &boot, nonce)
+                    .map_err(kr_ipc::IpcError::from)
+            })
+            .await
+            .expect("the worker accepts the newer generation");
+        client
+    }
+}
+
+/// KR-REQ-09.12: a worker that a newer control daemon has taken over refuses the old daemon's link
+/// as a link that no longer speaks for it. The answer is a complete one, and still the link is
+/// closed and not put back and the worker's lease stops renewing, where an ordinary refusal
 /// ([`a_refusal_the_worker_gives_leaves_its_link_and_the_lease`]) leaves both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refusal_of_the_link_itself_gives_up_its_link_and_the_lease() {
-    let heard = Arc::new(Heard::default());
-    let silent = world::fake_world(stalling_with(Arc::clone(&heard), |frame| match frame {
-        ControlFrame::Request(request) => {
-            Some(ControlFrame::Response(kr_protocol::envelope::Response {
-                request_id: request.request_id,
-                outcome: kr_protocol::envelope::Outcome::Error(
-                    kr_protocol::error::ProtocolError::new(
-                        kr_protocol::error::ErrorCode::PermissionDenied,
-                        "a later controller connection holds this environment's authority",
-                    )
-                    .for_a_fenced_link(),
-                ),
-            }))
-        }
-        _ => None,
-    }))
-    .await;
-    world::acknowledged(&silent.controller, silent.session_id);
-    let controller = &silent.controller;
-    assert!(leases(controller, silent.session_id), "the lease renews");
+async fn a_link_a_newer_generation_fenced_is_given_up_with_the_lease() {
+    let served = Served::start().await;
+    let controller = &served.controller;
+    let mut link = controller
+        .worker_client(&served.worker)
+        .await
+        .expect("the daemon opens its link");
+    link.give_back();
+    drop(link);
+    assert!(leases(controller, served.session_id), "the lease renews");
+    assert!(slot_holds_a_link(controller, served.session_id).await);
+
+    let _newer = served.a_newer_generation_takes_over().await;
 
     let refused = controller
-        .read_from_worker(&silent.worker)
+        .read_from_worker(&served.worker)
         .await
-        .expect_err("the worker refuses the link");
+        .expect_err("the worker refuses the old daemon's link");
     assert_eq!(
         refused.to_protocol_error().code,
         kr_protocol::error::ErrorCode::PermissionDenied,
         "{refused}"
     );
-    the_link_was_given_up(&silent, &heard, 1).await;
-    silent.serving.abort();
+    assert!(
+        controller.leases.is_fenced(served.session_id),
+        "the worker's lease stops renewing"
+    );
+    assert!(!leases(controller, served.session_id));
+    assert!(
+        !slot_holds_a_link(controller, served.session_id).await,
+        "the link was closed and not put back"
+    );
 }
 
 /// An endpoint that proves itself as a worker and answers the handshake, and ends its side of every
