@@ -1,6 +1,7 @@
 # kalareach
 
-KalaReach host, controller, workers, CLI, shared protocol and transport, Tauri desktop and mobile apps, plugin runtime and SDK, contact skill and conformance fixtures.
+This repository holds the KalaReach host, controller, workers, CLI, shared protocol and transport,
+Tauri desktop and mobile apps, plugin runtime and SDK, contact skill and conformance fixtures.
 
 KalaReach is licensed under the BSD 3-Clause License, in [LICENSE](LICENSE). Every crate of the
 Cargo workspace and every package of the pnpm workspace declares it with the SPDX identifier
@@ -84,19 +85,19 @@ A build needs:
   for the PSReadLine package PowerShell 7.4 or later with PSReadLine 2.3.4 or later and before
   3.0.0.
 
-The lists below are the whole list, in order.
+The lists below hold every step, in order.
 [`scripts/check-clean-checkout.sh`](scripts/check-clean-checkout.sh) runs them in a fresh clone of
 one commit, with a home directory, a Cargo home, a pnpm store and a temporary directory of its own,
 and with a PATH reduced to the system directories and those of the programs the list uses, whose
 paths and digests it prints first; on macOS the fresh home directory has a keychain of its own.
 `--help` says how to choose groups. Before it runs a step it refuses a tree that names a working
-record kept outside the repository, a commit message longer than one line, and a link in a
-Markdown file, read as text, that names a relative path the tree does not have or that it cannot
-read; `--self-test` shows each refusal on a fixture with its defect planted. Each step is one line
-of the lists below.
+record kept outside the repository, a commit message longer than one line, and a link in a Markdown
+file, read as text, that names a relative path the tree does not have or that it cannot read;
+`--self-test` shows each refusal on a fixture with its defect planted. Each step is one line of the
+lists below.
 
-Setup: the target, the JavaScript dependencies, the test components the plugin runtime's tests
-load, and the managed shell packages with the PSReadLine qualification. `--no-upstream-tests`
+Setup prepares the target, the JavaScript dependencies, the test components the plugin runtime's
+tests load, and the managed shell packages with the PSReadLine qualification. `--no-upstream-tests`
 leaves out the shells' own test suites, which continuous integration runs for Bash and Zsh.
 
 <!-- clean-checkout: setup -->
@@ -109,8 +110,8 @@ bash scripts/build-shells.sh --zsh --bash --fish --no-upstream-tests
 pwsh -NoProfile -Command 'Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1; Publish-KalaReachQualification | Out-Null'
 ```
 
-The checks. `KR_REQUIRE_PLUGIN_FIXTURES=1` makes a missing test component fail the plugin runtime's
-tests rather than skip them.
+In the checks, `KR_REQUIRE_PLUGIN_FIXTURES=1` makes a missing test component fail the plugin
+runtime's tests rather than skip them.
 
 <!-- clean-checkout: check -->
 
