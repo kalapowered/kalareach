@@ -1367,6 +1367,71 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     assert!(!recorded(1));
 }
 
+/// KR-REQ-09.09, 09.12 and 26.16: a machine group step another attempt recorded is not given back
+/// to a late attempt, one that finds the claim after waiting for the step lock, while this host owes
+/// a fence it could not raise. The control: with nothing owed, the same late attempt is answered
+/// from the receipt, and is again once the fence is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given_back_while_a_fence_is_owed()
+ {
+    use kr_protocol::machine::{MachineExpected, MachineSplitParams};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let group = controller
+        .machine_report()
+        .expect("this daemon serves a machine group record");
+    let mutation = mutation_of(
+        &temp,
+        Method::MachineSplit,
+        ParamsValue::from_typed(&MachineSplitParams {
+            expected: MachineExpected {
+                machine_id: group.machine_id,
+                revision: group.revision,
+            },
+        })
+        .expect("encodes"),
+    );
+    let attempt = || {
+        controller.write_method(
+            &actor_id,
+            &mutation,
+            Method::MachineSplit,
+            connection_id,
+            Some(accepted(&controller)),
+            controller.admitted_revision(connection_id).ok(),
+        )
+    };
+    let first = attempt().await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+
+    let late = attempt().await;
+    assert!(
+        refusal(&late).is_none(),
+        "with nothing owed the late attempt is answered from the receipt: {late:?}"
+    );
+
+    controller.hold_fence(true);
+    let refused = attempt().await;
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence this host owes stops the retained answer: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    let answered = attempt().await;
+    assert!(
+        refusal(&answered).is_none(),
+        "once the fence is gone it is answered again: {answered:?}"
+    );
+
+    controller.admitted_table().remove(&connection_id);
+    let refused = attempt().await;
+    assert_eq!(
+        refusal(&refused)
+            .unwrap_or_else(|| panic!("a registration that is gone stops it: {refused:?}"))
+            .code,
+        ErrorCode::PermissionDenied
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: an environment record change another attempt recorded is not
 /// given back to a late attempt while this host owes a fence, including one that lands while the
 /// answer is read, after the claim found the record. The control: with nothing owed, the same late
