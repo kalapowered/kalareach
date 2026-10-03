@@ -644,9 +644,11 @@ fn a_version_6_journal_that_holds_variables(
     plant(&keeper, &definition);
     // A create node whose parameters are the array form of the fields, which a derived decoder
     // reads and an earlier build installed: its variables are in a position, not under a name.
+    // Three of them: with the variable, with an empty list, and with a field this build cannot
+    // read as a session's but the variable in its place all the same.
     let object: serde_json::Value = serde_json::from_str(&create_with(&[("KR_PLANTED", PLANTED)]))
         .expect("the parameters of a create node");
-    let array: serde_json::Value = [
+    let fields = [
         "environment_id",
         "presentation",
         "shell",
@@ -658,25 +660,29 @@ fn a_version_6_journal_that_holds_variables(
         "palette",
         "launch_profile",
         "terminal",
-    ]
-    .iter()
-    .map(|field| object[*field].clone())
-    .collect();
-    let mut definition = create_workflow_definition(
-        test_wf_id(4),
-        1,
-        "installed-by-an-earlier-build",
-        test_grant_id(4),
-        vec![WorkflowNode {
-            node_id: "as-an-array".to_owned(),
-            action_kind: WorkflowActionKind::CreateSession,
-            action_params: array.to_string(),
-            declared_environment: Nullable::null(),
-        }],
-        vec![],
-    );
-    definition.description = Nullable::some("d".repeat(24_000));
-    plant(&keeper, &definition);
+    ];
+    let array: serde_json::Value = fields.iter().map(|field| object[*field].clone()).collect();
+    let mut emptied = array.clone();
+    emptied[7] = serde_json::json!([]);
+    let mut unreadable = array.clone();
+    unreadable[9] = serde_json::json!("a field this build cannot read");
+    for (workflow, params) in [(4_u8, array), (5, emptied), (6, unreadable)] {
+        let mut definition = create_workflow_definition(
+            test_wf_id(workflow),
+            1,
+            "installed-by-an-earlier-build",
+            test_grant_id(workflow),
+            vec![WorkflowNode {
+                node_id: "as-an-array".to_owned(),
+                action_kind: WorkflowActionKind::CreateSession,
+                action_params: params.to_string(),
+                declared_environment: Nullable::null(),
+            }],
+            vec![],
+        );
+        definition.description = Nullable::some("d".repeat(24_000));
+        plant(&keeper, &definition);
+    }
     keeper
         .pragma_update(None, "user_version", 6_u32)
         .expect("the earlier version");
@@ -736,7 +742,15 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
             "{mode}: the variable's name is still on disk after the open"
         );
 
-        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1), (3, 1), (4, 1)] {
+        for (workflow, revision) in [
+            (1_u8, 1_u64),
+            (1, 2),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+        ] {
             let installed = store
                 .get_definition(test_wf_id(workflow), revision)
                 .expect("reads")
@@ -748,23 +762,48 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
                 if workflow >= 3 { 1 } else { 3 },
                 "{mode}: {workflow}/{revision}"
             );
-            for node in &nodes[..create] {
-                let params: serde_json::Value =
-                    serde_json::from_str(&node.action_params).expect("the node's parameters");
-                assert_eq!(
-                    params["environment_snapshot"],
-                    serde_json::json!([]),
-                    "{mode}: {workflow}/{revision} {}",
-                    node.node_id
-                );
+            if workflow != 6 {
+                for node in &nodes[..create] {
+                    let params: serde_json::Value =
+                        serde_json::from_str(&node.action_params).expect("the node's parameters");
+                    assert_eq!(
+                        params["environment_snapshot"],
+                        serde_json::json!([]),
+                        "{mode}: {workflow}/{revision} {}",
+                        node.node_id
+                    );
+                }
             }
             // A create node of the array form comes forward as the object a name-keyed reader
-            // reads, which the typed decoder reads as the same parameters.
-            if workflow == 4 {
+            // reads, which the typed decoder reads as the same parameters, whether or not its
+            // list had variables in it, and which run admission accepts.
+            if workflow == 4 || workflow == 5 {
+                let stored: serde_json::Value =
+                    serde_json::from_str(&nodes[0].action_params).expect("the parameters");
+                assert!(
+                    stored.is_object(),
+                    "{mode}: {workflow} is an object now: {stored}"
+                );
+                assert_eq!(stored["environment_snapshot"], serde_json::json!([]));
                 let params: kr_protocol::session::SessionCreateParams =
-                    serde_json::from_str(&nodes[0].action_params).expect("a session's parameters");
-                assert!(params.environment_snapshot.is_empty());
+                    serde_json::from_value(stored).expect("a session's parameters");
                 assert_eq!(params.environment_id, common::environment());
+                kr_automation::validate_definition(
+                    &installed.definition,
+                    &common::grant_of(
+                        test_grant_id(workflow),
+                        &[kr_protocol::rights::ActionRight::SessionCreate],
+                    ),
+                )
+                .unwrap_or_else(|error| panic!("{mode}: {workflow} is admitted: {error}"));
+            }
+            // An array this build cannot read as a session's stays an array with its variables
+            // gone, and nothing admits it to run.
+            if workflow == 6 {
+                let stored: serde_json::Value =
+                    serde_json::from_str(&nodes[0].action_params).expect("the parameters");
+                assert!(stored.is_array(), "{mode}: {stored}");
+                assert_eq!(stored[7], serde_json::json!([]));
             }
             // The rest of the definition is as it was installed.
             if workflow < 3 {
