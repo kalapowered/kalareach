@@ -420,7 +420,10 @@ impl Controller {
                         // authority store happen together, under the store's own lock, so a
                         // revocation cannot land between the two and leave a connection admitted
                         // under authority that has already been withdrawn.
-                        match self.admit_connection(connection_id, &actor_id, peer).await {
+                        match self
+                            .admit_connection(connection_id, &actor_id, peer, hello.client)
+                            .await
+                        {
                             Ok(()) => {}
                             Err(error) => {
                                 let refusal = error_reply(

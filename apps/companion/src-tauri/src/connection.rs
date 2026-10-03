@@ -135,7 +135,7 @@ pub async fn connect_local() -> Result<Connection> {
         .environment(environment_id)
         .controller_endpoint()
         .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
-    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, build_id()?)
+    let transport = kr_client::ipc::IpcTransport::connect_app(&endpoint, build_id()?)
         .await
         .map_err(absent_host)?;
     Connection::over(transport)

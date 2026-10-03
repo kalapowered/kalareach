@@ -215,7 +215,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 })),
                 dimensions: Nullable(dimensions),
                 worker_profile: profile,
-                environment_snapshot: snapshot(),
+                environment_snapshot: snapshot_for(presentation),
                 // Chosen here, before anything connects, because a probe of this terminal is part
                 // of choosing it and a session's palette is fixed at creation.
                 palette: Nullable(palette),
@@ -1780,7 +1780,16 @@ fn session_target(environment_id: EnvironmentId, session_id: SessionId) -> Actio
     }
 }
 
-fn snapshot() -> Vec<kr_protocol::session::EnvironmentVariable> {
+/// The environment a create carries.
+///
+/// The command line's own for a session the person is shown, which the host filters for the
+/// terminal's identity and for reserved variables. Nothing for a session nobody is shown: the host
+/// starts it with the environment of its own execution context, and refuses a request that sends
+/// variables with it rather than ignore them.
+fn snapshot_for(presentation: Presentation) -> Vec<kr_protocol::session::EnvironmentVariable> {
+    if presentation == Presentation::Invisible {
+        return Vec::new();
+    }
     std::env::vars()
         .map(|(name, value)| kr_protocol::session::EnvironmentVariable { name, value })
         .collect()
@@ -2171,5 +2180,19 @@ mod tests {
             attachments_read(None).expect_err("no answer").as_str(),
             "the session's worker did not answer within 10 seconds"
         );
+    }
+
+    /// KR-REQ-07.25: a create for a session nobody is shown carries no environment of the command
+    /// line's: the host starts it with its own, and a request that sent variables with it would be
+    /// refused. A create for a session the person is shown carries the command line's.
+    #[test]
+    fn an_invisible_create_carries_no_environment_and_a_visible_one_carries_the_command_lines() {
+        assert!(snapshot_for(Presentation::Invisible).is_empty());
+        for presentation in [Presentation::Attach, Presentation::Terminal] {
+            assert!(
+                !snapshot_for(presentation).is_empty(),
+                "{presentation:?}: this process has an environment of its own to send"
+            );
+        }
     }
 }

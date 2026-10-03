@@ -33,6 +33,7 @@ impl Controller {
         connection_id: ConnectionId,
         actor_id: &ActorId,
         peer: &PeerIdentity,
+        kind: kr_protocol::local::LocalClientKind,
     ) -> Result<()> {
         let registry = self.registry.lock().await;
         let admitted_revision = registry.authority_revision()?;
@@ -45,7 +46,7 @@ impl Controller {
         let mut admitted = self.admitted_table();
         admitted.insert(
             connection_id,
-            AdmittedConnection::new(actor_id.clone(), admitted_revision),
+            AdmittedConnection::local(actor_id.clone(), admitted_revision, kind),
         );
         drop(admitted);
         drop(registry);
@@ -172,6 +173,13 @@ impl Controller {
                     .to_owned(),
             }),
         }
+    }
+
+    /// The door a connection came through, when its registration stands.
+    pub(super) fn door_of(&self, connection_id: ConnectionId) -> Option<Door> {
+        self.admitted_table()
+            .get(&connection_id)
+            .map(|connection| connection.door)
     }
 
     /// Refuses a retained answer that this host may not give back now: a fence this host owes, a
@@ -841,11 +849,28 @@ pub(super) struct AdmittedConnection {
     pub(super) admitted_revision: kr_protocol::ids::AuthorityRevision,
     /// The latch of the write boundary this registration lets write, when it has one.
     latch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The door the connection came through.
+    door: Door,
+}
+
+/// The door a connection came through, which is where a session it creates takes its
+/// environment's origin from.
+///
+/// The kind a local client declares says whose environment its sessions are started with. It is
+/// the client's own word and decides that and nothing else: it is no authority, and a client that
+/// declares another kind gets that kind's environment and no more of the host's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Door {
+    /// A client on this machine, connected to the host's local endpoint, which declared itself
+    /// this kind in its first frame.
+    Local(kr_protocol::local::LocalClientKind),
+    /// A paired device or another host, through the network ingress.
+    Network,
 }
 
 impl AdmittedConnection {
-    /// A registration of `actor_id`, admitted under `admitted_revision`, with no write boundary
-    /// tied to it yet.
+    /// A registration of `actor_id`, admitted under `admitted_revision`, through the network
+    /// ingress, with no write boundary tied to it yet.
     pub(super) const fn new(
         actor_id: ActorId,
         admitted_revision: kr_protocol::ids::AuthorityRevision,
@@ -854,6 +879,22 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
+            door: Door::Network,
+        }
+    }
+
+    /// A registration of `actor_id`, admitted under `admitted_revision`, of a local client that
+    /// declared itself `kind`.
+    pub(super) const fn local(
+        actor_id: ActorId,
+        admitted_revision: kr_protocol::ids::AuthorityRevision,
+        kind: kr_protocol::local::LocalClientKind,
+    ) -> Self {
+        Self {
+            actor_id,
+            admitted_revision,
+            latch: None,
+            door: Door::Local(kind),
         }
     }
 }
