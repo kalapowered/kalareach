@@ -285,9 +285,9 @@ impl Controller {
             Method::EnvironmentEnrol => {
                 let params: EnvironmentEnrolParams = parse(&mutation.params)?;
                 let row = tokio::task::spawn_blocking(move || {
-                    #[cfg(feature = "testing")]
-                    controller.before_the_environment_record.wait();
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        #[cfg(feature = "testing")]
+                        controller.before_the_environment_record.wait();
                         controller.under_registration(&carried, || {
                             store.enrol(params.enrolment, now_ms)
                         })?
@@ -300,9 +300,9 @@ impl Controller {
             Method::EnvironmentForget => {
                 let params: EnvironmentForgetParams = parse(&mutation.params)?;
                 let forgotten = tokio::task::spawn_blocking(move || {
-                    #[cfg(feature = "testing")]
-                    controller.before_the_environment_record.wait();
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        #[cfg(feature = "testing")]
+                        controller.before_the_environment_record.wait();
                         controller
                             .under_registration(&carried, || store.forget(params.environment_id))?
                     })
@@ -370,9 +370,9 @@ impl Controller {
                 // The platform command is a blocking one, and it is run on a blocking thread so a
                 // distribution that takes seconds to start does not hold this runtime.
                 let refreshed = tokio::task::spawn_blocking(move || {
-                    #[cfg(feature = "testing")]
-                    asking.before_the_environment_record.wait();
                     crate::bridge::store::Store::with_locked(&observing, |store| {
+                        #[cfg(feature = "testing")]
+                        asking.before_the_environment_record.wait();
                         asking.check_registration(&carried)?;
                         store.refresh(
                             params.environment_id,
