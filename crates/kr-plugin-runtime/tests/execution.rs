@@ -19,7 +19,7 @@ use kr_plugin_runtime::runtime::bindings::{
     ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
 };
 use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
-use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load};
+use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load, key_for};
 use kr_plugin_runtime::runtime::engine::RuntimeEngine;
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
 use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
@@ -855,6 +855,101 @@ fn kr_req_11_41_compilation_is_cached_by_hash_and_engine() {
         error.to_string().contains("engine"),
         "the refusal was {error}"
     );
+}
+
+/// A component an earlier patch release of the engine compiled, as that release stamps it.
+fn compiled_by_an_earlier_release(wasm: &[u8]) -> wasmtime::component::Component {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config
+        .module_version(wasmtime::ModuleVersionStrategy::Custom("48.0.3".to_owned()))
+        .expect("a module version");
+    let earlier = wasmtime::Engine::new(&config).expect("an engine");
+    wasmtime::component::Component::new(&earlier, wasm).expect("a component")
+}
+
+// KR-REQ-11.41: a cache an earlier engine release filed is compiled again, and is left alone.
+#[test]
+fn kr_req_11_41_a_cache_an_earlier_engine_release_filed_is_compiled_again() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let root = directory.path().join("plugin-cache");
+    let engine = engine();
+    let current = key_for(&engine, &wasm);
+    let mut earlier = current.clone();
+    earlier.engine_version = "48.0.3".to_owned();
+    earlier.engine_compatibility = "an earlier release's compatibility".to_owned();
+    assert_ne!(earlier.engine_directory(), current.engine_directory());
+
+    let filed = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    filed
+        .store(&earlier, &compiled_by_an_earlier_release(&wasm))
+        .expect("the earlier release's entry is filed");
+    let artefact = std::fs::read(filed.artefact_path(&earlier)).expect("its artefact");
+    let manifest = std::fs::read(filed.manifest_path(&earlier)).expect("its manifest");
+
+    // A host that starts afresh over that directory finds nothing under its own engine, so it
+    // compiles, and the earlier release's entry is neither loaded nor refused nor touched.
+    let restarted = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    let compiled = compile_or_load(&engine, &restarted, &wasm, CompileBudget::defaults())
+        .expect("the component compiles");
+    assert_eq!(compiled.origin, CompileOrigin::Compiled);
+    assert_eq!(
+        std::fs::read(restarted.artefact_path(&earlier)).expect("its artefact"),
+        artefact
+    );
+    assert_eq!(
+        std::fs::read(restarted.manifest_path(&earlier)).expect("its manifest"),
+        manifest
+    );
+
+    // And the entry this engine filed is the one it loads the next time.
+    let again = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    let loaded = compile_or_load(&engine, &again, &wasm, CompileBudget::defaults())
+        .expect("the component loads");
+    assert_eq!(loaded.origin, CompileOrigin::Cached);
+}
+
+// KR-REQ-11.41: an artefact an earlier engine release made is refused by the engine, and the
+// component is compiled again.
+#[test]
+fn kr_req_11_41_an_artefact_an_earlier_engine_release_made_is_compiled_again() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let root = directory.path().join("plugin-cache");
+    let engine = engine();
+    let key = key_for(&engine, &wasm);
+
+    // The entry's own manifest is consistent and it is filed under this engine's key, so every
+    // check this host makes of an entry passes and only the engine's refusal is left.
+    kr_plugin_runtime::runtime::cache::CompiledCache::open(&root)
+        .expect("a cache")
+        .store(&key, &compiled_by_an_earlier_release(&wasm))
+        .expect("the entry is filed");
+
+    let error = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root)
+        .expect("a cache")
+        .load(engine.engine(), &key)
+        .expect_err("the engine refuses an artefact of another release");
+    assert!(
+        error.to_string().contains("incompatible version '48.0.3'"),
+        "the refusal was {error}"
+    );
+
+    // The refusal is the entry's and not the binding's: the component compiles, the refused entry
+    // goes, and what is filed in its place loads.
+    let reopened = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    let compiled = compile_or_load(&engine, &reopened, &wasm, CompileBudget::defaults())
+        .expect("the component compiles");
+    assert_eq!(compiled.origin, CompileOrigin::Compiled);
+    let again = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    let loaded = compile_or_load(&engine, &again, &wasm, CompileBudget::defaults())
+        .expect("the component loads");
+    assert_eq!(loaded.origin, CompileOrigin::Cached);
 }
 
 // KR-REQ-11.41: a downloaded native-code artefact is never deserialised as validated Wasm.
