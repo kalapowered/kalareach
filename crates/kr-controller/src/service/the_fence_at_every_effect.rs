@@ -875,3 +875,294 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         kr_protocol::action::BarrierState::Pending
     );
 }
+
+/// A mutation of `method` under a fresh action identifier, carrying `params`.
+fn mutation_of(
+    temp: &kr_ipc::testing::TempHost,
+    method: Method,
+    params: ParamsValue,
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(1),
+        method: method.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(temp.environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: ActionWindowId::new("local:test").expect("a window"),
+        requested_ttl_ms: DurationMs::new(30_000),
+        params,
+    }
+}
+
+/// The admission a first admission of a mutation carries on `connection_id`.
+fn carried(
+    controller: &Controller,
+    connection_id: ConnectionId,
+) -> crate::authority::AdmittedMutation {
+    crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: Some(accepted(controller).deadline),
+    }
+}
+
+/// What a refusal in `answer` says, when it is one.
+fn refused_for_a_fence(error: &kr_protocol::error::ProtocolError) {
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(error.message.contains("fence"), "{error:?}");
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: a transfer action another attempt recorded after the local door's
+/// own lookup found nothing is not given back while this host owes a fence it could not raise, or
+/// to a connection whose registration is gone. The control: the same late attempt, with nothing
+/// owed, is answered from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_while_a_fence_is_owed()
+{
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let params = kr_protocol::transfer::DraftCreateParams {
+        environment_id: temp.environment_id(),
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        text: "recorded by the first attempt".to_owned(),
+    };
+    let mutation = mutation_of(
+        &temp,
+        Method::DraftCreate,
+        ParamsValue::from_typed(&params).expect("encodes"),
+    );
+    let first = controller
+        .write_method(
+            &actor_id,
+            &mutation,
+            Method::DraftCreate,
+            connection_id,
+            Some(accepted(&controller)),
+            controller.admitted_revision(connection_id).ok(),
+        )
+        .await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+
+    // The late attempt reaches the service itself, as one does that began before the record was
+    // written: nothing in front of it has looked for the action.
+    let admission = carried(&controller, connection_id);
+    let late = || {
+        controller.transfer().write(
+            &actor_id,
+            &mutation,
+            Method::DraftCreate,
+            crate::transfer::TransferAdmission::new(Arc::clone(&controller), admission),
+        )
+    };
+    late()
+        .await
+        .expect("with nothing owed the late attempt is answered from the record");
+
+    controller.hold_fence(true);
+    let refused = late()
+        .await
+        .expect_err("a fence this host owes stops the retained answer");
+    refused_for_a_fence(&refused);
+    controller.hold_fence(false);
+    late()
+        .await
+        .expect("once the fence is gone it is answered again");
+
+    controller.admitted_table().remove(&connection_id);
+    let refused = late()
+        .await
+        .expect_err("a registration that is gone stops the retained answer");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: the same for an authority change another attempt recorded between
+/// the local door's lookup and this attempt's claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_back_while_a_fence_is_owed()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(&temp, Method::GrantRevoke, ParamsValue::empty());
+    // What the first attempt recorded: a claim with the answer it came to.
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
+    let grants = controller.sharing().grants();
+    let crate::grants::ActionClaim::Claimed { hold } = grants
+        .claim_action(&actor_id, mutation.action_id, &digest, 1)
+        .expect("the claim is written")
+    else {
+        panic!("the first claim of an action is this attempt's");
+    };
+    grants
+        .retain_result(&hold, &kr_cbor::encode(ParamsValue::empty().as_value()), 2)
+        .expect("the answer is recorded");
+    drop(hold);
+
+    let late = || {
+        controller.authority_change(
+            &actor_id,
+            &mutation,
+            Method::GrantRevoke,
+            carried(&controller, connection_id),
+        )
+    };
+    late()
+        .await
+        .expect("with nothing owed the late attempt is answered from the record");
+
+    controller.hold_fence(true);
+    let refused = late()
+        .await
+        .expect_err("a fence this host owes stops the retained answer");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    controller.hold_fence(false);
+    late()
+        .await
+        .expect("once the fence is gone it is answered again");
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: the same for a privacy change, whose claim another attempt may
+/// settle between the lookup and this attempt's claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_privacy_change_recorded_before_a_late_attempts_claim_is_not_given_back_while_a_fence_is_owed()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id, mutation) = performed_once(&temp, &controller).await;
+    let late = || {
+        controller.write_method(
+            &actor_id,
+            &mutation,
+            Method::PrivacySet,
+            connection_id,
+            Some(accepted(&controller)),
+            controller.admitted_revision(connection_id).ok(),
+        )
+    };
+    let answered = late().await;
+    assert!(
+        refusal(&answered).is_none(),
+        "with nothing owed the late attempt is answered from the record: {answered:?}"
+    );
+
+    controller.hold_fence(true);
+    let refused = late().await;
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence this host owes stops the retained answer: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    let answered = late().await;
+    assert!(
+        refusal(&answered).is_none(),
+        "once the fence is gone it is answered again: {answered:?}"
+    );
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: a privacy change that was applied is answered as applied when what
+/// it came to cannot be kept. The retry is told the action is unfinished and is not performed
+/// again, which is what the claim left behind. The control: with the receipt kept, the answer is
+/// the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_receipt_cannot_be_kept()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let kept_mutation = privacy_request(&temp);
+    let unkept_mutation = privacy_request(&temp);
+    let write = |mutation: &'_ MutationRequest| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::PrivacySet,
+                    connection_id,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                )
+                .await
+        }
+    };
+    let kept = write(&kept_mutation).await;
+    assert!(refusal(&kept).is_none(), "the control: {kept:?}");
+
+    // The store takes no write of a receipt, as on a full disk.
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_receipts BEFORE UPDATE ON authority_receipts
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let unkept = write(&unkept_mutation).await;
+    assert!(
+        refusal(&unkept).is_none(),
+        "the change was applied, and that is what the caller is told: {unkept:?}"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_receipts;")
+        .expect("the fault is cleared");
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: the four methods that take no admission into a service are
+/// refused while this host owes a fence it could not raise. The control: with nothing owed, none is
+/// refused for a fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let methods = [
+        Method::EnvironmentEnrol,
+        Method::EnvironmentForget,
+        Method::EnvironmentRefresh,
+        Method::HostUpdateHandover,
+    ];
+    let answer = |method: Method| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation_of(&temp, method, ParamsValue::empty());
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    method,
+                    connection_id,
+                    Some(accepted(&controller)),
+                    Some(captured),
+                )
+                .await
+        }
+    };
+    for method in methods {
+        let answered = answer(method).await;
+        assert!(
+            refusal(&answered).is_none_or(|error| !error.message.contains("fence")),
+            "{method:?} with nothing owed: {answered:?}"
+        );
+    }
+    controller.hold_fence(true);
+    for method in methods {
+        let answered = answer(method).await;
+        refused_for_a_fence(
+            refusal(&answered)
+                .unwrap_or_else(|| panic!("{method:?} while a fence is owed: {answered:?}")),
+        );
+    }
+}

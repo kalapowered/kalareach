@@ -143,6 +143,18 @@ impl TransferAdmission {
             .map_err(|error| self.refused(&error))
     }
 
+    /// Asks the check a retained answer is owed before it goes back: a fence this host owes, and the
+    /// registration under the revision the mutation was admitted at, without the deadline a receipt
+    /// outlives. The refusal is not kept: a retained answer is not retained again.
+    fn check_retained(&self) -> std::result::Result<(), ProtocolError> {
+        self.controller
+            .check_registration(&crate::authority::AdmittedMutation {
+                deadline: None,
+                ..self.carried
+            })
+            .map_err(|error| error.to_protocol_error())
+    }
+
     fn refused(&self, error: &ControllerError) -> ProtocolError {
         let refusal = error.to_protocol_error();
         self.refusal
@@ -519,6 +531,10 @@ impl TransferModule {
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         blocking(move || {
             if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+                // Found here, after the lookup the local door made before it considered a first
+                // admission: another attempt may have recorded it since. It goes back under the
+                // same check, asked once the answer is in hand.
+                admission.check_retained()?;
                 return match retained {
                     RetainedOutcome::Ok(result) => {
                         kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
