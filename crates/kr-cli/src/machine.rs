@@ -254,6 +254,9 @@ async fn reach_environment(
                 paths.open_environment_id()?,
                 crate::build_id(),
                 BridgeTarget::Controller,
+                // A machine step is put to the daemon that is already there; it starts nothing in
+                // the destination.
+                false,
             )
             .map_err(bridge_failure)?;
             let invocation = opening.launch().await.map_err(bridge_failure)?;
