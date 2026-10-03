@@ -1,5 +1,20 @@
 name: release-baselines
 
+# Section 3's release baselines, checked on the executables the host ships. Every one of them is
+# built for every release target that ships it, each target on a standard hosted runner of its own
+# platform (the description process is left out of Windows on Arm, see the matrix), and
+# then each executable's own headers are read for the oldest system it says it runs on. A floor that
+# does not match its baseline fails the job: a macOS executable that is not built for 14.0, a Linux
+# one that needs a newer glibc than Ubuntu 22.04's, or a Windows one that asks for a newer Windows
+# than 11. Each executable is then started where it was built, and the Linux ones are also started
+# in the distributions the release supports. On the x86-64 targets the description process's llama.cpp
+# archives are also disassembled, and an AVX-512, AVX-VNNI or AMX instruction in them fails the job:
+# the process is built for the x86-64-v3 baseline, and a host checks its processor against that.
+#
+# `scripts/check-release-floors.py` reads the floors, and `docs/releases/platforms.md` says what each
+# baseline is and why. This runs by hand and every night; the landing gate is core-ci, which builds
+# the workspace for its tests rather than the release's own executables.
+
 on:
   workflow_dispatch:
 
@@ -7,6 +22,7 @@ permissions:
   contents: read
 
 env:
+  CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
 defaults:
@@ -15,30 +31,207 @@ defaults:
 
 jobs:
   floors:
-    name: windows probe
-    runs-on: windows-2025
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
     env:
-      TARGET: x86_64-pc-windows-msvc
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # Some runner images carry no Rust at all. The installer is rustup's own, and it installs
+      # no toolchain: the next step installs the one this repository pins.
+      - name: Install rustup where the image has none
+        if: runner.os != 'Windows'
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install rustup where the image has none
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $architecture = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+            $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/$architecture-pc-windows-msvc/rustup-init.exe" -OutFile $installer
+            & $installer -y --no-modify-path --profile minimal --default-toolchain none
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:USERPROFILE '.cargo\bin')
+          }
+
+      # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add "$TARGET"
+          rustc --version
+          cargo --version
 
-      - name: The guarded plant as dumpbin shows it
+      - name: Stand in for the llama.cpp build
         run: |
-          vswhere="C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-          install=$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
-          dumpbin=$(find "$(cygpath -u "$install")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/dumpbin.exe' | sort -V | tail -1)
-          cat > planted.rs <<'RUST'
+          out="target/$TARGET/release/build/llama-cpp-sys-2-probe/out/lib"
+          mkdir -p "$out"
+          if [ "$RUNNER_OS" = Windows ]; then extension=lib; else extension=a; fi
+          cat > "$RUNNER_TEMP/standin.rs" <<'RUST'
           #![no_std]
           use core::arch::asm;
           #[unsafe(no_mangle)]
+          pub unsafe extern "C" fn standin() {
+              unsafe { asm!("vpaddd ymm0, ymm1, ymm2") };
+          }
+          #[panic_handler]
+          fn panic(_: &core::panic::PanicInfo) -> ! {
+              loop {}
+          }
+          RUST
+          rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
+            -C target-feature=+avx2 -o "$out/ggml-cpu.$extension" "$RUNNER_TEMP/standin.rs"
+          cp "$out/ggml-cpu.$extension" "$out/llama.$extension"
+          printf 'cargo:rustc-link-lib=static=ggml-cpu\ncargo:rustc-link-lib=static=llama\n' > "$out/../../output"
+
+      # The description process runs on every x86-64 processor that has the baseline in
+      # `.cargo/config.toml` (x86-64-v3), so the llama.cpp archives it links must hold no AVX-512,
+      # AVX-VNNI or AMX instruction. The pins and the build guard keep them out of a build made here;
+      # this reads what was compiled, which is what a compiler flag in the environment
+      # (`CFLAGS=-march=native`) would change without either of them seeing it.
+      #
+      # The check is put through archives whose contents are known before it is trusted with the
+      # release's: one planted with each kind of instruction (AVX-512 on a wide register, AVX-512 on
+      # a narrow one, with and without an address-size or segment prefix before it, AVX-VNNI and
+      # AMX), which it has to refuse, and two that hold none, one of them with bytes that only look
+      # like an instruction, which it has to pass. Each is a Rust static library, so it carries a
+      # runtime's worth of ordinary code beside the planted instruction. The disassembler is the
+      # platform's own: `objdump` on Linux and macOS, `dumpbin /disasm` from Visual Studio on
+      # Windows.
+      - name: Refuse instructions past the baseline in the description process
+        if: startsWith(matrix.target, 'x86_64-')
+        run: |
+          release="target/$TARGET/release"
+          scratch="$release/instruction-check"
+          rm -rf "$scratch"
+          mkdir -p "$scratch"
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            vswhere="C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            install=$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
+            dumpbin=$(find "$(cygpath -u "$install")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/dumpbin.exe' | sort -V | tail -1)
+            echo "dumpbin: $dumpbin"
+            archive_extension=lib
+          else
+            archive_extension=a
+          fi
+
+          # Writes the disassembly of one archive, with each instruction's bytes, lower case and
+          # without symbol names, comments or the lines GNU objdump marks `(bad)` where it could not
+          # decode bytes (data a compiler left in the code section), to a text file. GNU objdump
+          # wraps an instruction of more than seven bytes onto a second line unless it is told the
+          # width.
+          disassemble() {
+            case "$RUNNER_OS" in
+              Windows) "$dumpbin" -nologo -disasm:bytes "$1" ;;
+              Linux) objdump -d --insn-width=16 "$1" ;;
+              *) objdump -d "$1" ;;
+            esac | tr -d '\r' | sed -E '/\(bad\)/d; s/<[^>]*>//g; s/#.*$//' | tr '[:upper:]' '[:lower:]' > "$2"
+          }
+
+          # AVX-512 is every instruction that starts with the EVEX prefix, which is byte 0x62 (in
+          # 64-bit mode nothing else starts with it), however few registers it names, and any
+          # register only AVX-512 has. Only an address-size (0x67) or a segment-override prefix
+          # (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65) may come before it, and both are looked through.
+          # Data that a compiler leaves in the code section, such as the jump tables of macOS
+          # objects, is disassembled as instructions too, and begins with 0x62 now and then, so an
+          # EVEX instruction counts only when the disassembler decoded it and printed its name after
+          # the bytes (GNU objdump may write `{evex}` first, where a VEX encoding of the same
+          # instruction exists).
+          tab=$(printf '\t')
+          avx512="^[[:space:]]*[0-9a-f]+:[[:space:]]+((26|2e|36|3e|64|65|67) )*62( [0-9a-f]{2})*( {2,}|[ ]*$tab)[[:space:]]*[{a-z]"
+          avx512="$avx512|\\b(zmm[0-9]+|zmmword|[xy]mm(1[6-9]|2[0-9]|3[01])|k[0-7])\\b"
+          vnni='\bvpdp(b(us|ss|su|uu)|w(ss|su|us|uu))d(s)?\b'
+          amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
+
+          # Prints how many instructions of each kind a disassembly holds, and fails when any does.
+          #
+          # On Windows, MSVC compiles some standard-library code, such as a population count over a
+          # bit set, with a path for processors that have AVX-512 and another for those that do not,
+          # and chooses at run time from the C runtime's `__isa_available`. A function that compares
+          # it with 6 (AVX-512) or more before its AVX-512 instructions never runs them on a
+          # processor without them, so it is counted apart, as `guarded`, and does not fail the
+          # check. Every other AVX-512 instruction, and every AVX-VNNI and AMX one, still does.
+          # The disassembly lists one function at a time, with a blank line between them.
+          past_baseline() {
+            local found_avx512 found_vnni found_amx found_guarded=0 unguarded="$1" result
+            if [ "$RUNNER_OS" = Windows ]; then
+              unguarded="$1.unguarded"
+              awk -v kept="$unguarded" -v held="$1.guarded" '
+                function flush(   i, destination) {
+                  if (lines == 0) return
+                  destination = guard ? held : kept
+                  for (i = 1; i <= lines; i++) print text[i] > destination
+                  print "" > destination
+                  lines = 0
+                  guard = 0
+                }
+                /^[[:space:]]*$/ { flush(); next }
+                {
+                  text[++lines] = $0
+                  if ($0 ~ /cmp .*\[__isa_available[^]]*\],[6-9]/) guard = 1
+                }
+                END { flush() }
+              ' "$1"
+              : >> "$unguarded"
+              : >> "$1.guarded"
+              found_guarded=$(grep -c -E "$avx512" "$1.guarded" || true)
+            fi
+            found_avx512=$(grep -c -E "$avx512" "$unguarded" || true)
+            found_vnni=$(grep -c -E "$vnni" "$1" || true)
+            found_amx=$(grep -c -E "$amx" "$1" || true)
+            result="avx512=$found_avx512 avx-vnni=$found_vnni amx=$found_amx"
+            [ "$found_guarded" = 0 ] || result="$result guarded=$found_guarded"
+            echo "$result"
+            [ "$found_avx512$found_vnni$found_amx" = 000 ]
+          }
+
+          cat > "$scratch/planted.rs" <<'RUST'
+          #![no_std]
+          #![allow(unexpected_cfgs)]
+          use core::arch::asm;
+
+          #[unsafe(no_mangle)]
           pub unsafe extern "C" fn planted() {
+              #[cfg(avx512)]
+              unsafe { asm!("vpaddd zmm0, zmm1, zmm2") };
+              #[cfg(evex)]
+              unsafe { asm!("vpternlogd ymm0, ymm1, ymm2, 0xff") };
+              #[cfg(evexaddress)]
+              unsafe { asm!(".byte 0x67, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
+              #[cfg(evexsegment)]
+              unsafe { asm!(".byte 0x64, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
+              #[cfg(evexpair)]
+              unsafe { asm!(".byte 0x62, 0xf1, 0x6d, 0x28, 0xfe, 0xc1") };
+              #[cfg(vnni)]
+              unsafe { asm!("{{vex}} vpdpbusd ymm0, ymm1, ymm2") };
+              #[cfg(amx)]
+              unsafe { asm!("tilezero tmm0") };
+              #[cfg(baseline)]
+              unsafe { asm!("vpaddd ymm0, ymm1, ymm2", "vfmadd231ps ymm0, ymm1, ymm2") };
+              #[cfg(data)]
+              unsafe { asm!(".byte 0x64, 0x62, 0xff, 0xff, 0xff, 0xff, 0x67, 0x62, 0xff, 0xff, 0xff") };
+              #[cfg(guarded)]
               unsafe {
                   asm!(
                       "cmp dword ptr [rip + __isa_available], 6",
@@ -48,18 +241,93 @@ jobs:
                   )
               };
           }
+
           #[panic_handler]
           fn panic(_: &core::panic::PanicInfo) -> ! {
               loop {}
           }
           RUST
-          rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 -C target-feature=+avx512f -o planted.lib planted.rs
-          "$dumpbin" -nologo -disasm:bytes planted.lib | tr -d '\r' > planted.txt
-          wc -l planted.txt
-          n=$(grep -n 'vpaddd' planted.txt | head -1 | cut -d: -f1)
-          echo "vpaddd at $n"
-          sed -n "$((n - 12)),$((n + 8))p" planted.txt | cat -A | cut -c1-120
-          echo "== awk"
-          command -v awk; awk --version 2>&1 | head -1 || true
-          printf 'a\ncmp   dword ptr [__isa_available],6\nb\n\nc\n' > t.txt
-          awk '/^[[:space:]]*$/ { print "blank at " NR; next } { if ($0 ~ /cmp .*\[__isa_available\],[6-9]/) print "guard at " NR }' t.txt
+
+          bad=0
+          plants="avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2"
+          # The run-time choice by `__isa_available` exists only where MSVC's runtime does.
+          if [ "$RUNNER_OS" = Windows ]; then plants="$plants guarded:+avx512f"; fi
+          for plant in $plants; do
+            name=${plant%%:*}
+            rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
+              -C target-feature="${plant#*:}" --cfg "$name" -o "$scratch/$name.$archive_extension" "$scratch/planted.rs"
+            disassemble "$scratch/$name.$archive_extension" "$scratch/$name.txt"
+            # A disassembler that read nothing would accept everything.
+            [ "$(wc -l < "$scratch/$name.txt")" -ge 1000 ] || { echo "::error::the disassembly of $name holds no code"; exit 1; }
+            if counts=$(past_baseline "$scratch/$name.txt"); then clean=1; else clean=0; fi
+            case "$name" in
+              baseline|data|guarded)
+                verdict=accepted
+                [ "$clean" = 1 ] || verdict=WRONGLY-REFUSED
+                # The guarded plant has to be seen as guarded, not missed.
+                if [ "$name" = guarded ]; then
+                  case "$counts" in *guarded=1) ;; *) verdict=WRONGLY-UNSEEN ;; esac
+                fi ;;
+              *)
+                verdict=refused
+                [ "$clean" = 0 ] || verdict=WRONGLY-ACCEPTED ;;
+            esac
+            echo "planted $name: $verdict ($counts)"
+            case "$verdict" in WRONGLY-*) bad=1 ;; esac
+          done
+          [ "$bad" = 0 ] || { echo "::error::the instruction check does not tell the planted archives apart"; exit 1; }
+
+          # Every archive the llama.cpp build left under its output directory, which holds the ones
+          # the executable links and the copies the build made on the way, and then a check that each
+          # static library the build tells cargo to link was among them.
+          if ! find "$release"/build/llama-cpp-sys-2-*/out -type f \( -name '*.a' -o -name '*.lib' \) | sort > "$scratch/archives.txt"; then
+            echo "::error::the llama.cpp build's archives could not be listed"
+            exit 1
+          fi
+          archives=()
+          while IFS= read -r archive; do
+            archives+=("$archive")
+          done < "$scratch/archives.txt"
+          [ "${#archives[@]}" -gt 0 ] || { echo "::error::no llama.cpp archive was built"; exit 1; }
+          linked=$(sed -n -E 's/^cargo::?rustc-link-lib=static(:[^=]*)?=([^:]*).*/\2/p' "$release"/build/llama-cpp-sys-2-*/output | tr -d '\r' | sort -u)
+          [ -n "$linked" ] || { echo "::error::the llama.cpp build links no static library"; exit 1; }
+          for name in $linked; do
+            found=0
+            for archive in "${archives[@]}"; do
+              case "${archive##*/}" in
+                "lib$name.a"|"$name.a"|"$name.lib"|"lib$name.lib") found=1 ;;
+              esac
+            done
+            [ "$found" = 1 ] || { echo "::error::the static library $name is linked and was not inspected"; exit 1; }
+          done
+          cpu=0
+          index=0
+          : > "$scratch/report.txt"
+          for archive in "${archives[@]}"; do
+            index=$((index + 1))
+            text="$scratch/archive-$index.txt"
+            disassemble "$archive" "$text"
+            if counts=$(past_baseline "$text"); then
+              echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
+            else
+              bad=1
+              echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
+              grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+            fi
+            case "${archive##*/}" in
+              ggml-cpu.*|libggml-cpu.*)
+                cpu=1
+                # The backend that holds the kernels was built for the baseline, not for less, and
+                # the disassembly shows its code.
+                [ "$(grep -c -E '\bymm[0-9]+\b' "$text" || true)" -gt 0 ] || { echo "$archive: no AVX2 code" >> "$scratch/report.txt"; bad=1; } ;;
+            esac
+          done
+          {
+            echo "### $TARGET: instructions past the x86-64-v3 baseline in the description process"
+            echo '```'
+            cat "$scratch/report.txt"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$cpu" = 1 ] || { echo "::error::no ggml CPU archive was built"; exit 1; }
+          [ "$bad" = 0 ] || { echo "::error::the description process holds instructions past the baseline"; exit 1; }
+
