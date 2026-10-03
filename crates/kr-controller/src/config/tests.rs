@@ -1343,7 +1343,24 @@ fn the_environment_additions_in_force_are_reported_by_name_and_never_by_value() 
     )
     .expect("writes the document");
 
-    let in_force = InForce::of(&open(&environment)).environment_additions;
+    let resolver = open(&environment);
+    let whole = InForce::of(&resolver);
+    // A debug print is a log line away from a person's screen: every value the configuration
+    // holds that is a variable's value stays out of each of the things that carry the document,
+    // and the names, which the doctor shows anyway, stay in.
+    let accepted = Accepted::in_force(open(&environment), HardLimits::default());
+    for printed in [
+        format!("{whole:?}"),
+        format!("{resolver:?}"),
+        format!("{accepted:?}"),
+        format!("{document:?}"),
+        format!("{:?}", document.preferences),
+    ] {
+        assert!(!printed.contains("planted"), "{printed}");
+        assert!(!printed.contains("/home/someone"), "{printed}");
+        assert!(printed.contains("EDITOR"), "the names stay: {printed}");
+    }
+    let in_force = whole.environment_additions;
     assert_eq!(in_force.len(), 2);
     assert_eq!(
         in_force.get("EDITOR").map(String::as_str),
