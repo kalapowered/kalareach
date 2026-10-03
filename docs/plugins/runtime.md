@@ -36,7 +36,8 @@ has been matched. An idle shell costs no engine, no instance, no compiled cache 
 ## The engine
 
 Wasmtime 48.0.4, pinned to that exact release. The pin is part of the compiled-code cache key rather
-than a convenience: an artefact one engine produced is not one another engine can load.
+than a convenience: an artefact is filed under the release that compiled it, and a release reads
+only its own.
 
 `wasmtime-wasi` is not linked. The linker holds four interfaces, all from the SDK's WIT package:
 
