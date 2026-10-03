@@ -83,8 +83,9 @@ impl Steps {
 ///
 /// The deadline is kept by the test's own thread, outside that runtime, so it holds whatever the
 /// runtime is stuck on: an await that never completes, a thread blocked on a lock, or the runtime's
-/// wait for a blocking thread that does not end. The failure names the step the body had reached.
-/// A body that panics fails the test with its own message.
+/// wait for a blocking thread that does not end. The failure names the step the test had reached,
+/// and the thread that is stuck is left to end with the process. A body that panics fails the test
+/// with its own message.
 fn within_the_whole<Body, Test>(body: Body)
 where
     Body: FnOnce(Steps) -> Test + Send + 'static,
@@ -127,12 +128,22 @@ struct World {
     clock: ManualClock,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
-    /// The runtime the worker runs on, apart from the test's and the daemon's.
+    /// The runtime the worker's service runs on, apart from the test's and the daemon's.
     ///
     /// A worker holds its session for the whole of an action, on the thread that serves it, and its
     /// process is its own. Here it shares this one, and a thread blocked in it would stand between
     /// the test's own tasks and the reactor they wait on; so it has threads of its own.
     worker_runtime: Option<tokio::runtime::Runtime>,
+    /// The runtime the worker's session runs its own tasks on (the task that ingests its terminal's
+    /// output, its watch on the shell, its paste timer), apart from the test's and from the
+    /// service's.
+    ///
+    /// Each of those tasks takes the session's lock when it wakes, and the test holds that lock to
+    /// keep the serial boundary shut. A task that wakes then blocks the thread it runs on, and when
+    /// that thread is the one a runtime's reactor and timers are driven from, the runtime has none
+    /// to drive them until the lock is let go: the test's own waits, which are timers, never end,
+    /// and neither does the frame the service is to read. So nothing the test waits on runs here.
+    session_runtime: Option<tokio::runtime::Runtime>,
     session_id: SessionId,
     environment_id: EnvironmentId,
     /// The link the worker has to a daemon of generation one, over which a forward is sent.
@@ -199,8 +210,18 @@ async fn world(steps: &Steps) -> World {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(
+    let session_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime of the session's own");
+    let started = session_runtime.spawn(async move {
         SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+    });
+    let runtime = Arc::new(
+        started
+            .await
+            .expect("the session is started")
             .expect("starts the runtime"),
     );
     let endpoint = environment
@@ -295,6 +316,7 @@ async fn world(steps: &Steps) -> World {
         runtime,
         service,
         worker_runtime: Some(worker_runtime),
+        session_runtime: Some(session_runtime),
         session_id,
         environment_id,
         link: Some(link),
@@ -304,9 +326,12 @@ async fn world(steps: &Steps) -> World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // Dropped from inside a runtime, which a runtime of its own may not be: it is let go of
-        // without waiting for its threads.
+        // Dropped from inside a runtime, which a runtime of its own may not be: they are let go of
+        // without waiting for their threads.
         if let Some(runtime) = self.worker_runtime.take() {
+            runtime.shutdown_background();
+        }
+        if let Some(runtime) = self.session_runtime.take() {
             runtime.shutdown_background();
         }
     }
