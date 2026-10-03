@@ -15,6 +15,7 @@ use kr_voice::{VoiceError, VoiceGrantPlan};
 
 use crate::grants::{GrantRecord, GrantRevocation};
 use crate::service::net::devices::DeviceDirectory;
+use crate::service::net::lifetimes::{GrantLifetimes, GrantStanding};
 use crate::sharing::SharingService;
 
 /// The coordinator's view of this host's grants and devices.
@@ -46,26 +47,74 @@ impl GrantAuthority {
         }
     }
 
+    /// What decides whether a grant stands: its anchor on the continuous clock and its expiry in
+    /// UTC read through this host's clock floor, which the reading raises and which is written
+    /// down. The same decision every other reader of a grant's time takes, and the daemon's own,
+    /// so a daemon that has gone has nothing to decide with and answers with a refusal.
+    fn lifetimes(&self) -> kr_voice::Result<Arc<GrantLifetimes>> {
+        self.daemon
+            .upgrade()
+            .map(|daemon| Arc::clone(daemon.lifetimes()))
+            .ok_or_else(|| {
+                VoiceError::Host(kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    "this host is stopping, so it cannot say whether a grant still stands"
+                        .to_owned(),
+                ))
+            })
+    }
+
     /// The host device that issues a voice grant.
     #[must_use]
     pub const fn host_device_id(&self) -> DeviceId {
         self.host_device_id
     }
 
-    /// The live records this device holds.
+    /// The records this device holds that stand now, and whether one that does not stand is not
+    /// settled.
     ///
-    /// Live means every one of the three: redeemed, not revoked, and not expired. Expiry is read
-    /// from the grant at the moment of the question rather than when the record was written, so a
-    /// grant that ran out during a call stops authorising the next request in it.
-    fn live_records(&self, device_id: DeviceId, now_ms: u64) -> kr_voice::Result<Vec<GrantRecord>> {
-        Ok(self
-            .sharing
-            .grants()
-            .records_for_device(device_id)
-            .map_err(store)?
-            .into_iter()
-            .filter(|record| record.state(now_ms) == kr_protocol::sharing::GrantState::Active)
-            .collect())
+    /// Standing means every one of the three: redeemed, not revoked, and not expired, and expiry is
+    /// decided as every stored grant's is, on both clocks and with UTC read through this host's
+    /// floor at the moment of the question rather than when the record was written, so a grant
+    /// that ran out during a call stops authorising the next request in it and a wall clock wound
+    /// back does not bring it back. A record whose end is found and not on record yet does not
+    /// stand and says so: a daemon started in a new boot could decide the other way.
+    fn standing_records(&self, device_id: DeviceId) -> kr_voice::Result<Standing> {
+        let grants = self.sharing.grants();
+        let lifetimes = self.lifetimes()?;
+        let mut standing = Standing::default();
+        for record in grants.records_for_device(device_id).map_err(store)? {
+            if record.revoked_at_ms.is_some() || !record.is_active() {
+                continue;
+            }
+            match lifetimes.stored_standing(grants, &record).map_err(store)? {
+                GrantStanding::InForce => standing.records.push(record),
+                GrantStanding::OutOfForce => {}
+                GrantStanding::Unrecorded => standing.unrecorded = true,
+            }
+        }
+        Ok(standing)
+    }
+}
+
+/// What a device's records come to on this host's clocks: those that stand, and whether the end of
+/// one that does not is not on record yet.
+#[derive(Default)]
+struct Standing {
+    records: Vec<GrantRecord>,
+    unrecorded: bool,
+}
+
+impl Standing {
+    /// What a decision that found `answer` among the grants that stand is told: the grant, or
+    /// nothing, or the refusal that gives the reason nothing could be said while an end that decides
+    /// it is not on record.
+    fn answer(&self, answer: Option<Grant>) -> kr_voice::Result<Option<Grant>> {
+        match answer {
+            Some(grant) => Ok(Some(grant)),
+            None if self.unrecorded => Err(store(crate::grants::store::unrecorded())),
+            None => Ok(None),
+        }
     }
 }
 
@@ -121,7 +170,6 @@ impl VoiceAuthority for GrantAuthority {
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
-        now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
         // The device's ordinary grant: the widest live one it holds that is not a voice grant. A
         // voice grant narrows this one rather than standing beside it, so the intersection the
@@ -132,47 +180,64 @@ impl VoiceAuthority for GrantAuthority {
         // in one transaction; the grant store holds what has been shared with the device since. A
         // host that looked only at the store would find nothing for a device that has only ever
         // been paired, which is every device before anything is shared with it.
+        let mut standing = self.standing_records(device_id)?;
+        let lifetimes = self.lifetimes()?;
         let paired = self
             .devices
             .record_for_device(device_id)
             .map_err(store)?
             .filter(super::authority::DeviceRecordExt::is_paired_record)
-            .map(|record| record.grant)
-            .filter(|grant| grant.expiry.is_valid_at(now_ms));
-        Ok(paired
-            .into_iter()
-            .chain(
-                self.live_records(device_id, now_ms)?
-                    .into_iter()
-                    .map(|record| record.grant),
+            .and_then(
+                |record| match lifetimes.paired_standing(&record).map_err(store) {
+                    Ok(GrantStanding::InForce) => Some(Ok(record.grant)),
+                    Ok(GrantStanding::OutOfForce) => None,
+                    Ok(GrantStanding::Unrecorded) => {
+                        standing.unrecorded = true;
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                },
             )
+            .transpose()?;
+        let widest = paired
+            .into_iter()
+            .chain(standing.records.iter().map(|record| record.grant.clone()))
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
             .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)))
-            .max_by_key(|grant| grant.actions.len()))
+            .max_by_key(|grant| grant.actions.len());
+        standing.answer(widest)
     }
 
-    fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_voice::Result<Option<Grant>> {
-        Ok(self
-            .sharing
-            .grants()
-            .record(grant_id)
+    fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
+        let grants = self.sharing.grants();
+        let Some(record) = grants.record(grant_id).map_err(store)? else {
+            return Ok(None);
+        };
+        if record.revoked_at_ms.is_some() || !record.is_active() {
+            return Ok(None);
+        }
+        match self
+            .lifetimes()?
+            .stored_standing(grants, &record)
             .map_err(store)?
-            .filter(|record| record.state(now_ms) == kr_protocol::sharing::GrantState::Active)
-            .map(|record| record.grant))
+        {
+            GrantStanding::InForce => Ok(Some(record.grant)),
+            GrantStanding::OutOfForce => Ok(None),
+            GrantStanding::Unrecorded => Err(store(crate::grants::store::unrecorded())),
+        }
     }
 
-    fn standing_voice_grant(
-        &self,
-        device_id: DeviceId,
-        now_ms: u64,
-    ) -> kr_voice::Result<Option<Grant>> {
-        Ok(self
-            .live_records(device_id, now_ms)?
-            .into_iter()
-            .map(|record| record.grant)
+    fn standing_voice_grant(&self, device_id: DeviceId) -> kr_voice::Result<Option<Grant>> {
+        let standing = self.standing_records(device_id)?;
+        let held = standing
+            .records
+            .iter()
+            .map(|record| &record.grant)
             .rfind(|grant| {
                 grant.permits(ActionRight::VoiceUse) && grant.parent_grant_id.0.is_none()
-            }))
+            })
+            .cloned();
+        standing.answer(held)
     }
 
     fn issue(
@@ -250,10 +315,6 @@ impl VoiceAuthority for GrantAuthority {
             daemon.publish_and_fence(debt);
         }
         Ok(now_ms)
-    }
-
-    fn now_ms(&self) -> u64 {
-        now_ms()
     }
 
     fn device_identity_key(

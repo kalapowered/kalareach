@@ -13,7 +13,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
 
-use super::{Controller, encode, error_reply, net, parse, respond, wall_clock_ms};
+use super::{Controller, encode, error_reply, net, parse, respond};
 
 impl Controller {
     /// Performs one project or workspace mutation under the admission its ingress recorded.
@@ -169,10 +169,7 @@ impl Controller {
                     "voice is reachable from a paired device",
                 );
             };
-            return self
-                .voice()
-                .read_frame(device_id, request, wall_clock_ms())
-                .await;
+            return self.voice().read_frame(device_id, request).await;
         }
         if crate::catalogue::CatalogueModule::serves(method) {
             return self

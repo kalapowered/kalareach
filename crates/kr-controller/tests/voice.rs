@@ -363,7 +363,6 @@ impl Host {
                     session_ids: [self.session_id].into_iter().collect(),
                     selected: CanonicalSet::from_iter([]),
                 },
-                3,
             )
             .await
             .expect("a preparation")
@@ -800,7 +799,6 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            5,
         )
         .await
         .expect_err("a session outside this call");
@@ -822,7 +820,6 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            5,
         )
         .await;
     match answered {
