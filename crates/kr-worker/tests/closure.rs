@@ -77,7 +77,8 @@ async fn host(script: &str) -> Host {
 /// Hosts a session whose shell runs `script`, with the session's own tasks on `tasks`.
 ///
 /// Those are the tasks that ingest what the terminal gives, watch the root shell and time the paste
-/// recogniser. The endpoint, its connections and a closure's sequence run where the caller does.
+/// recogniser. The endpoint and its connections run where the caller does, and so does a closure's
+/// sequence unless whoever releases its gate enters another runtime first.
 async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
     host_served(script, tasks, Listener::bind).await
 }
@@ -785,15 +786,15 @@ async fn read_and_not_counted(host: &Host, gate: &std::path::Path) -> std::sync:
     release
 }
 
-/// Asks the session to close, with the closure's sequence on `sequence`, and returns once its drain
-/// period has ended and a worker that did not wait for what it had read would have written its
-/// record.
+/// Asks the session to close, with the closure's sequence running on `runs_on`, and returns once
+/// its drain period has ended and a worker that did not wait for what it had read would have
+/// written its record.
 #[cfg(unix)]
-async fn close_past_the_drain(host: &Host, sequence: &tokio::runtime::Handle) {
+async fn close_past_the_drain(host: &Host, runs_on: &tokio::runtime::Handle) {
     let drained = host.runtime.watch_drain_end();
     let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
     {
-        let _on_sequence = sequence.enter();
+        let _on_sequence = runs_on.enter();
         gate.release();
     }
     tokio::time::timeout(LIVENESS_DEADLINE, drained)
@@ -858,11 +859,11 @@ async fn output_read_before_the_drain_ends_reaches_every_attachment_before_the_c
 /// for that read would leave the line out of the measure, write its record, and hand the line to
 /// nobody once the read loop went on.
 ///
-/// The closure's measure waits for the stopped read on the thread it runs on, which is what a
-/// worker that waits for a read does. So the session's tasks and the closure's sequence run on a
-/// runtime of their own, and the test's own timers and connections run where they cannot be held
-/// behind it: on one runtime, the thread that drives the timers can be the one that waits, and the
-/// test's own bound on the record then never ends.
+/// The closure's measure waits for the stopped read on the thread it runs on, as a correct worker
+/// does. So the session's tasks and the closure's sequence run on a runtime of their own, and the
+/// test's own timers and connections run where they cannot be held behind it: on one runtime, the
+/// thread that drives the timers can be the one that waits, and the test's own bound on the record
+/// then never fires.
 ///
 /// Unix only, for the same reason as the test above.
 #[cfg(unix)]
