@@ -6245,7 +6245,7 @@ export interface LocalHello {
   /**
    * What kind of client this is. It says how to frame the conversation; it confers nothing.
    */
-  client: 'cli' | 'controller' | 'worker'
+  client: 'cli' | 'controller' | 'worker' | 'app'
   max_receive: ReceiveLimits
   /**
    * Every protocol version the client offers.
