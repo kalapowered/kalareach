@@ -20,7 +20,7 @@ use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::signature::Ed25519KeyPair;
@@ -364,13 +364,44 @@ impl Assembled {
         self.write_signed(directory, &keys().targets);
     }
 
-    /// Writes the release as an archive at `archive`: its tree under one top directory, gzipped.
-    fn archive(&self, scratch: &Path, archive: &Path) {
-        let top = format!("kalareach-{}-{}", this_target(), self.name());
-        let tree = scratch.join(&top);
-        self.write(&tree);
-        pack(&tree, &top, archive);
-        std::fs::remove_dir_all(&tree).expect("the tree goes");
+    /// Gives `archive` the release as an archive: its tree under one top directory, gzipped.
+    ///
+    /// A release is packed once for the whole process, by whichever test asks first, into the run's
+    /// own directory on the internal disk, which goes when the process does. Each test is given a
+    /// copy of its own: the archive is hundreds of megabytes of programs, and a test that packed its
+    /// own would repeat what another has already done.
+    fn archive(&self, archive: &Path) {
+        static PACKED: OnceLock<Mutex<HashMap<String, Arc<OnceLock<PathBuf>>>>> = OnceLock::new();
+        // Two releases that are signed alike are packed alike: the signature covers every file's
+        // digest, and the channel root is one of the files.
+        let identity = format!(
+            "{}\n{}",
+            signed_document(&self.manifest, &keys().targets),
+            self.root
+        );
+        let packed = Arc::clone(
+            PACKED
+                .get_or_init(Mutex::default)
+                .lock()
+                .expect("the packed releases")
+                .entry(identity)
+                .or_default(),
+        );
+        let packed = packed.get_or_init(|| {
+            let top = format!("kalareach-{}-{}", this_target(), self.name());
+            let directory = tempfile::Builder::new()
+                .prefix("kr-archive-")
+                .tempdir_in(support::command_binaries())
+                .expect("a directory for the archive")
+                .keep();
+            let tree = directory.join(&top);
+            self.write(&tree);
+            let packed = directory.join("release.tar.gz");
+            pack(&tree, &top, &packed);
+            std::fs::remove_dir_all(&tree).expect("the tree goes");
+            packed
+        });
+        std::fs::copy(packed, archive).expect("a copy of the archive");
     }
 }
 
@@ -1239,7 +1270,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     let (display, session_id) = host.new_session(&host.program(one.name(), Program::Kr));
     let scratch = host.scratch("archives");
     let archive_two = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive_two);
+    two.archive(&archive_two);
 
     let (output, said) = host.kr_json(&[
         "host",
@@ -1280,7 +1311,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     // Another update: the first release is no longer the previous one, and the live session still
     // holds it, so it stays with its module tree.
     let archive_three = scratch.join("three.tar.gz");
-    three.archive(&scratch, &archive_three);
+    three.archive(&archive_three);
     let (output, said) = host.kr_json(&[
         "host",
         "update",
@@ -1318,7 +1349,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     host.released(one.name()).await;
     let four = Assembled::at_this_level("0.4.0+dddddddddddd", 4);
     let archive_four = scratch.join("four.tar.gz");
-    four.archive(&scratch, &archive_four);
+    four.archive(&archive_four);
     let (output, said) = host.kr_json(&[
         "host",
         "update",
@@ -1367,7 +1398,7 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
     );
     let scratch = host.scratch("archives");
     let archive = scratch.join("elsewhere.tar.gz");
-    elsewhere.archive(&scratch, &archive);
+    elsewhere.archive(&archive);
     let (output, said) = host.kr_json(&[
         "host",
         "update",
@@ -1432,7 +1463,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
 
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let (output, said) = host.kr_json(&[
         "host",
         "update",
@@ -1474,7 +1505,7 @@ async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_rele
     host.record_the_update_as_switched(&one, &two);
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
 
     let (output, said) = host.kr_json(&[
         "host",
@@ -1514,7 +1545,7 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
     host.record_a_switched_update(&one, &two);
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     // A daemon that has stopped listening and not yet let go of its environment.
@@ -1565,7 +1596,7 @@ async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_
     host.start_daemon(&started_through_current).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     let (output, said) = host.update_whose_daemons_fail(&archive);
@@ -1657,7 +1688,7 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     assert!(made.success(), "a pipe is made");
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     let (output, said) = host.update_whose_daemons_fail(&archive);
@@ -1829,7 +1860,7 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
 
     let scratch = host.scratch("archives");
     let archive = scratch.join("one.tar.gz");
-    one.archive(&scratch, &archive);
+    one.archive(&archive);
     let (output, said) = host.kr_json(&[
         "host",
         "update",
@@ -2018,7 +2049,7 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
     host.start_daemon(&started_through_current).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     // A daemon part way through its start holds the install lock, shared, as each one does.
@@ -2116,7 +2147,7 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     host.start_daemon(&started_through_current).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     // A daemon that never finishes starting holds the install lock, shared, past the update's bound.
@@ -2183,7 +2214,7 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
     host.start_daemon(&started_through_current).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
 
     // The update prepares the daemon, records how to start it again, and then waits for the install
@@ -2280,7 +2311,7 @@ async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
     let second = Second::start(&controller).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
     // The update tells the daemons in the order of their environments' identities, so the daemon
     // whose attempt is superseded is the last one: the one before it accepts its stop first.
@@ -2815,7 +2846,7 @@ fn no_program_of_a_release_being_staged_starts() {
         .unwrap_or_else(|error| panic!("copies: {error}"));
     let archives = host.scratch("archives");
     let archive = archives.join("one.tar.gz");
-    one.archive(&archives, &archive);
+    one.archive(&archive);
     let (unpacked, _) = kr_cli::update::release::unpack(&archive, &private("unpacked"))
         .unwrap_or_else(|error| panic!("unpacks: {error}"));
     for staged in [copied, unpacked] {
@@ -3711,7 +3742,7 @@ async fn host_to_update() -> (Host, Assembled, Assembled, String) {
     host.start_daemon(&controller).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
-    two.archive(&scratch, &archive);
+    two.archive(&archive);
     let archive = archive.display().to_string();
     (host, one, two, archive)
 }
