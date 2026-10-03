@@ -1206,6 +1206,42 @@ async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_dae
     daemon.stop();
 }
 
+/// KR-REQ-03.14, KR-REQ-03.15: a session the host starts with its own environment has an absolute
+/// `HOME` whatever login the daemon was started from: a daemon that was given a `HOME` that is not
+/// an absolute path, or none, gives its sessions the account's own home, as a bridge's helper does
+/// for the sessions it creates.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_the_host_starts_has_an_absolute_home_whatever_login_the_daemon_has() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let directory = scratch.path().to_path_buf();
+    for (login, given) in [
+        ("a relative HOME", Some("relative/home")),
+        ("no HOME", None),
+    ] {
+        let mut host = vec![("PATH", "/usr/bin:/bin".to_owned())];
+        host.extend(given.map(|home| ("HOME", home.to_owned())));
+        let daemon = Daemon::start(&host).await;
+        let environment = daemon
+            .session_environment(
+                LocalClientKind::App,
+                Presentation::Invisible,
+                Vec::new(),
+                &directory,
+            )
+            .await
+            .expect("an app's create is served");
+        let home = environment
+            .get("HOME")
+            .unwrap_or_else(|| panic!("{login}: the shell has no HOME: {environment:?}"));
+        assert!(
+            home.starts_with('/'),
+            "{login}: the shell's HOME is not an absolute path: {home:?}"
+        );
+        daemon.stop();
+    }
+}
+
 /// KR-REQ-07.25, KR-REQ-07.26: the variables the host's owner has written down are given to a
 /// session started with the host's environment beside it, an addition wins over the host's own
 /// value of the same name, and a session started with the command line's environment is given none
