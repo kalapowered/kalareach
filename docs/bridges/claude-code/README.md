@@ -124,13 +124,14 @@ still under way waits for it, within its hello deadline, rather than being refus
 first.
 
 Anything short of that runs what was typed. On a refusal, on no answer within two seconds (counted
-from the launcher's start for the admission, and from `going` for the commit), or when it cannot
-reach the endpoint or read the launch record, the launcher takes `KR_REGISTRATION` out of its
-environment and execs the vector the person typed, without the integration's flags. It needs
-nothing from the backend for that, because the registration's file name, `registration.<at>.<n>`,
-says that `<n>` added flags start at index `<at>`. A Claude Code started with the flags and nothing
-behind them would be worse off than one started without them. With no `KR_REGISTRATION` at all, the
-launcher execs its vector as given.
+from the launcher's start for the admission, and from `going` for the commit; on Windows six
+seconds for the admission and four for the commit, because the worker first reads a program the
+system has not seen and the system scans it), or when it cannot reach the endpoint or read the
+launch record, the launcher takes `KR_REGISTRATION` out of its environment and execs the vector the
+person typed, without the integration's flags. It needs nothing from the backend for that, because
+the registration's file name, `registration.<at>.<n>`, says that `<n>` added flags start at index
+`<at>`. A Claude Code started with the flags and nothing behind them would be worse off than one
+started without them. With no `KR_REGISTRATION` at all, the launcher execs its vector as given.
 
 One invocation binds a backend. A retry of that same invocation (the same vector, file, directory
 and directory revision) gets the same backend, and a second integrated command in the line, such as
