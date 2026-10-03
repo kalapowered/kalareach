@@ -20,7 +20,7 @@ use kr_plugin_runtime::runtime::bindings::{
 };
 use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
 use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load, key_for};
-use kr_plugin_runtime::runtime::engine::RuntimeEngine;
+use kr_plugin_runtime::runtime::engine::{ENGINE_VERSION, RuntimeEngine};
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
 use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
 use kr_plugin_runtime::runtime::limits::InstanceLimiter;
@@ -857,42 +857,47 @@ fn kr_req_11_41_compilation_is_cached_by_hash_and_engine() {
     );
 }
 
-/// The compatibility hash an engine computes when it was built as `release`.
+/// The compatibility hash an engine computes under a module version strategy, with nothing else
+/// about it changed.
 ///
-/// The hash is what a cache entry's manifest records, and it is the only thing that tells two patch
-/// releases of one major version apart: the stamp the engine writes into a serialised artefact
-/// holds the major version alone, so an artefact one patch release made passes the next one's own
-/// check on load.
-fn compatibility_as(release: &str) -> u64 {
+/// The hash is what a cache entry's manifest records, and it is what tells two patch releases of
+/// one major version apart: the stamp wasmtime writes into a serialised artefact holds the major
+/// version alone, so an artefact one patch release made passes the next one's own checks on load.
+fn compatibility_under(strategy: wasmtime::ModuleVersionStrategy) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
 
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config
-        .module_version(wasmtime::ModuleVersionStrategy::Custom(release.to_owned()))
-        .expect("a module version");
+    config.module_version(strategy).expect("a module version");
     let engine = wasmtime::Engine::new(&config).expect("an engine");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut hasher);
     hasher.finish()
 }
 
-/// A component an engine of another patch release would have compiled, stamped as it stamps.
-fn compiled_by_another_release(wasm: &[u8]) -> wasmtime::component::Component {
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    let engine = wasmtime::Engine::new(&config).expect("an engine");
-    wasmtime::component::Component::new(&engine, wasm).expect("a component")
+/// Compiles a component as this host does, so that what comes of it is an artefact this host's
+/// engine accepts on load.
+fn compiled_by_this_host(engine: &RuntimeEngine, wasm: &[u8]) -> wasmtime::component::Component {
+    wasmtime::component::Component::new(engine.engine(), wasm).expect("a component")
 }
 
 // KR-REQ-11.41: the compatibility hash a cache entry is filed under covers the engine's release.
 #[test]
 fn kr_req_11_41_the_compatibility_hash_covers_the_engine_release() {
-    assert_eq!(compatibility_as("48.0.3"), compatibility_as("48.0.3"));
+    let this_release = compatibility_under(wasmtime::ModuleVersionStrategy::WasmtimeVersion);
+    // What the engine hashes for itself is the full release this host names as its own, and not
+    // the major version its artefacts are stamped with.
+    assert_eq!(
+        this_release,
+        compatibility_under(wasmtime::ModuleVersionStrategy::Custom(
+            ENGINE_VERSION.to_owned()
+        )),
+        "the engine's compatibility hash is not the one of the release this host names"
+    );
     assert_ne!(
-        compatibility_as("48.0.3"),
-        compatibility_as("48.0.4"),
-        "two patch releases of one major version share a compatibility hash"
+        this_release,
+        compatibility_under(wasmtime::ModuleVersionStrategy::Custom("48.0.3".to_owned())),
+        "an earlier patch release of this major version shares this one's compatibility hash"
     );
 }
 
@@ -919,7 +924,7 @@ fn kr_req_11_41_a_cache_another_engine_release_filed_is_compiled_again() {
     let earlier = [by_version, by_hash, by_both];
 
     let filed = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
-    let artefact = compiled_by_another_release(&wasm);
+    let artefact = compiled_by_this_host(&engine, &wasm);
     let mut held = Vec::new();
     for key in &earlier {
         assert_ne!(key.engine_directory(), current.engine_directory());
@@ -962,18 +967,35 @@ fn kr_req_11_41_an_entry_another_engine_release_made_is_refused_and_compiled_aga
         return;
     };
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let root = directory.path().join("plugin-cache");
     let engine = engine();
     let current = key_for(&engine, &wasm);
     let mut earlier = current.clone();
     earlier.engine_version = "48.0.3".to_owned();
     earlier.engine_compatibility = "another release's compatibility".to_owned();
+    // The artefact is one this engine accepts on load, as an earlier patch release's is under the
+    // same configuration: nothing but the manifest stands between it and being loaded.
+    let component = compiled_by_this_host(&engine, &wasm);
 
-    // The earlier release's own entry, moved by hand into the directory this engine reads. Its
-    // artefact passes this engine's own check on load, so what refuses it is the manifest.
+    // The control: the same artefact under this engine's own manifest loads.
+    let control = directory.path().join("control");
+    kr_plugin_runtime::runtime::cache::CompiledCache::open(&control)
+        .expect("a cache")
+        .store(&current, &component)
+        .expect("the entry is filed");
+    assert!(
+        kr_plugin_runtime::runtime::cache::CompiledCache::open(&control)
+            .expect("a cache")
+            .load(engine.engine(), &current)
+            .expect("a lookup")
+            .is_some(),
+        "an entry under this engine's own manifest was not loaded"
+    );
+
+    // The earlier release's own entry, moved by hand into the directory this engine reads.
+    let root = directory.path().join("plugin-cache");
     let filed = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
     filed
-        .store(&earlier, &compiled_by_another_release(&wasm))
+        .store(&earlier, &component)
         .expect("the entry is filed");
     let artefact = std::fs::read(filed.artefact_path(&earlier)).expect("its artefact");
     let manifest = std::fs::read(filed.manifest_path(&earlier)).expect("its manifest");
@@ -990,6 +1012,10 @@ fn kr_req_11_41_an_entry_another_engine_release_made_is_refused_and_compiled_aga
     assert!(
         error.to_string().contains("an engine with compatibility"),
         "the refusal was {error}"
+    );
+    assert!(
+        restarted.load(engine.engine(), &current).is_err(),
+        "an entry another release made was loaded"
     );
 
     // The refusal is the entry's and not the binding's: the component compiles, the refused entry
