@@ -524,6 +524,48 @@ fn first_start_setup_reaches_three_named_commands_and_no_more() {
     }
 }
 
+/// KR-REQ-13.10 and KR-REQ-22.01: a session's description is read through one named command, and
+/// the host's description setup through three more, and each performs the one method it names.
+/// None of them is a way to choose a model, supply a prompt or fetch from an address: the
+/// description reads take a session or nothing, and the two writes are the two settings an owner
+/// has and the start or cancel of the fetch the host itself selected (the parameters' own tests
+/// refuse a field their methods do not declare).
+#[test]
+fn session_descriptions_are_reached_through_four_named_commands_and_no_more() {
+    use kr_protocol::method::Method;
+
+    let expected = [
+        ("session_describe", Method::SessionDescribe),
+        ("description_setup", Method::DescriptionSetup),
+        ("description_configure", Method::DescriptionConfigure),
+        ("description_download", Method::DescriptionDownload),
+    ];
+    let about_descriptions: Vec<&str> = NAMED_COMMANDS
+        .iter()
+        .map(|(command, _)| *command)
+        .filter(|command| command.contains("describ") || command.contains("description"))
+        .collect();
+    assert_eq!(
+        about_descriptions,
+        expected
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>(),
+        "descriptions are reached through these four commands and no others"
+    );
+    for (command, method) in expected {
+        let named = NAMED_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == command)
+            .expect("the command is named");
+        assert_eq!(
+            named.1,
+            Some(method),
+            "{command} performs one operation and names it"
+        );
+    }
+}
+
 #[test]
 fn a_settings_pane_is_opened_by_name_and_never_by_an_address_the_page_supplies() {
     for pane in companion_tauri::setup::settings::PANES {
