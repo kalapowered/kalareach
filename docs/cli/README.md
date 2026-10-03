@@ -768,7 +768,8 @@ kr doctor --bundle support.tar --include-content   # add each session's shell, d
 ```
 
 The output opens with the environment, the execution context, the desktop and its capabilities and
-the sleep policy, then this host's effective configuration, then the checks and a summary:
+the sleep policy, then a line for each live session saying where its `PATH`, locale and working
+directory came from, then this host's effective configuration, then the checks and a summary:
 
 ```text
 configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json (schema version 1, revision 3): version 1
