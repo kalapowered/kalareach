@@ -237,7 +237,7 @@ async fn prepare_the_network() {
     );
 }
 
-/// Whether this installation has an owner device, which is what its devices list says.
+/// What this installation's devices list says, revoked devices included.
 async fn owner_devices(client: &mut LocalClient) -> DeviceListResult {
     pairing::read(
         client,
