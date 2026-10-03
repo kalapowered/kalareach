@@ -287,6 +287,12 @@ pub struct Controller {
     /// writer can publish between the two, and then an effect acts on one document while the
     /// report describes another. They read this instead, which acceptance writes.
     in_force: std::sync::Mutex<crate::config::InForce>,
+    /// The part of this daemon's own environment a session without an environment of its own is
+    /// started with, read once when the daemon started.
+    ///
+    /// Only what [`create::host_context_variables`] allows: a daemon started from a terminal holds
+    /// that terminal's exports, a credential among them, and none of those are anybody's session's.
+    host_environment: std::sync::Mutex<Vec<kr_protocol::session::EnvironmentVariable>>,
     /// The network and voice selections this daemon read when it started.
     ///
     /// Both are built once, at startup, from the document on disk then, so these are what the
@@ -545,6 +551,20 @@ impl Controller {
     #[must_use]
     pub const fn paths(&self) -> &EnvironmentPaths {
         &self.paths
+    }
+
+    /// Replaces the environment this daemon holds for the sessions it starts without one of the
+    /// creator's, with what `environment` allows of it.
+    ///
+    /// For a host's own tests: the tests of one binary share a process, and none of them may
+    /// change its environment, so each says what the daemon it started runs in.
+    #[cfg(feature = "testing")]
+    pub fn set_host_environment(&self, environment: impl IntoIterator<Item = (String, String)>) {
+        *self
+            .host_environment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            create::host_context_variables(environment);
     }
 
     /// Returns the catalogue module, for tests that read what it holds in force.

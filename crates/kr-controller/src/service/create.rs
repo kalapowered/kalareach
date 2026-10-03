@@ -7,8 +7,11 @@ use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, SessionId};
+use kr_protocol::local::LocalClientKind;
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{EnvironmentVariable, SessionCreateParams, SessionCreateResult};
+use kr_protocol::session::{
+    EnvironmentVariable, Presentation, SessionCreateParams, SessionCreateResult,
+};
 use kr_protocol::worker::{ReservationId, WorkerReady};
 use tokio::sync::oneshot;
 
@@ -16,6 +19,7 @@ use crate::error::{ControllerError, Result};
 use crate::registry::LaunchPhase;
 use crate::supervision::{LaunchOutcome, WorkerLaunch};
 
+use super::admission::Door;
 use super::{Controller, encode, parse};
 
 /// What a caller is told when it asks for a desktop this host does not have.
@@ -24,6 +28,104 @@ const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bi
 
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whose environment a session is started with.
+///
+/// Decided by where the create came through, what the client says it is and what the session is
+/// for, and never by whether the request carries variables: a client that sends none is not
+/// asking for the host's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CreateOrigin {
+    /// The command line's own environment, which it sends with a session it creates for a person
+    /// to see: filtered for the terminal's identity and for reserved variables by the worker.
+    CliSnapshot,
+    /// The environment of the execution context this host runs in, which is what a session no
+    /// person's shell stands behind is started with: one an app creates, one created invisibly,
+    /// and one a paired device asks for, whose own environment is never used.
+    HostContext,
+}
+
+impl CreateOrigin {
+    /// Decides the origin of a create that came through `door`.
+    ///
+    /// # Errors
+    ///
+    /// A connection that declared itself the control daemon or a worker is not a source of
+    /// sessions, and is refused.
+    pub(super) fn decide(door: Door, create: &SessionCreateParams) -> Result<Self> {
+        match door {
+            Door::Local(LocalClientKind::Controller | LocalClientKind::Worker) => {
+                Err(ControllerError::PermissionDenied {
+                    detail: "a connection that declared itself the control daemon or a worker \
+                             creates no session"
+                        .to_owned(),
+                })
+            }
+            // A session nobody sees takes the host's environment even from the command line: the
+            // command line's own is the person's, for the sessions the person is shown.
+            Door::Local(LocalClientKind::Cli) if create.presentation != Presentation::Invisible => {
+                Ok(Self::CliSnapshot)
+            }
+            Door::Local(LocalClientKind::Cli | LocalClientKind::App) | Door::Network => {
+                Ok(Self::HostContext)
+            }
+        }
+    }
+}
+
+/// The names of a daemon's own environment that a session started with the host's environment
+/// takes, besides the locale's.
+const HOST_CONTEXT_NAMES: &[&str] = if cfg!(windows) {
+    &[
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "USERNAME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "TZ",
+    ]
+} else {
+    &["PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TMPDIR"]
+};
+
+/// The prefix of the locale's variables, all of which are taken.
+const LOCALE_PREFIX: &str = "LC_";
+
+/// What of a daemon's own environment a session started with the host's environment takes.
+///
+/// An allowlist and not a filter: a daemon started from a terminal holds that terminal's exports,
+/// a credential among them, a login's agent socket and the terminal's identity, and none of those
+/// are the session's. What it takes is the person's path, their locale and who they are, which is
+/// what a shell cannot start without. A name is compared as the platform compares it, and a
+/// Windows name is kept in capitals, which is how the worker reads `PATH`.
+pub(super) fn host_context_variables(
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Vec<EnvironmentVariable> {
+    let mut taken: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, value) in environment {
+        let name = if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name
+        };
+        if HOST_CONTEXT_NAMES.contains(&name.as_str()) || name.starts_with(LOCALE_PREFIX) {
+            taken.insert(name, value);
+        }
+    }
+    taken
+        .into_iter()
+        .map(|(name, value)| EnvironmentVariable { name, value })
+        .collect()
+}
 
 /// The environment variables a session's creator sent, from the reservation to the worker's claim.
 ///
@@ -134,6 +236,14 @@ impl Drop for CreateHold {
 }
 
 impl Controller {
+    /// The environment a session started with the host's is given.
+    fn host_context_environment(&self) -> Vec<EnvironmentVariable> {
+        self.host_environment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Refuses a managed create whose shell no installed package qualifies.
     ///
     /// Reserves a session and starts its worker.
@@ -171,12 +281,35 @@ impl Controller {
                     .to_owned(),
             ));
         }
+        // Whose environment the session is started with, from where the create came through. A
+        // connection that is no longer registered has no door and no create.
+        let door = self.door_of(carried.connection_id).ok_or_else(|| {
+            ControllerError::PermissionDenied {
+                detail: "the authority this connection was admitted under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            }
+        })?;
+        let origin = CreateOrigin::decide(door, &create)?;
+        if origin == CreateOrigin::HostContext && !create.environment_snapshot.is_empty() {
+            // Said, and not ignored: a client that sends variables to a session that takes none of
+            // them would think they had been used. Nothing of them is repeated here.
+            return Err(ControllerError::InvalidArgument(
+                "this session is started with this host's environment, so its request carries no \
+                 environment variables"
+                    .to_owned(),
+            ));
+        }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        // The environment its creator sent is for the worker's launch and for nothing else: it is
-        // taken out of the request here, held in memory until the worker claims it, and never
-        // written down. The digest above covers it, as a hash.
-        let environment = std::mem::take(&mut create.environment_snapshot);
+        // The environment the session is started with is for the worker's launch and for nothing
+        // else: held in memory until the worker claims it, and never written down. A create that
+        // sends its own has it taken out of the request here, and the digest above covers it, as a
+        // hash; any other takes the host's.
+        let environment = match origin {
+            CreateOrigin::CliSnapshot => std::mem::take(&mut create.environment_snapshot),
+            CreateOrigin::HostContext => self.host_context_environment(),
+        };
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can
         // resolve rather than an identifier with nothing behind it.

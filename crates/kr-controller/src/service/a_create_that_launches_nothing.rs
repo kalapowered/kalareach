@@ -197,6 +197,7 @@ async fn admitted(controller: &Controller) -> (ConnectionId, kr_protocol::ids::A
                 gid: 0,
                 pid: None,
             },
+            kr_protocol::local::LocalClientKind::Cli,
         )
         .await
         .expect("the connection is registered");
@@ -2549,5 +2550,176 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
                 .next()
                 .is_none(),
         "no dispatch marker was written"
+    );
+}
+
+/// KR-REQ-07.25, KR-REQ-07.26: whose environment a session is started with is decided by the door
+/// the create came through, the kind a local client declared and what the session is for. It is
+/// never decided by whether the request carries variables.
+#[test]
+fn the_origin_of_a_sessions_environment_is_the_door_and_what_the_session_is_for() {
+    use super::admission::Door;
+    use super::create::CreateOrigin;
+    use kr_protocol::local::LocalClientKind;
+
+    let environment_id =
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+    let create = |presentation: Presentation| SessionCreateParams {
+        presentation,
+        ..create_params(environment_id)
+    };
+    let origin =
+        |door: Door, presentation: Presentation| CreateOrigin::decide(door, &create(presentation));
+    // The command line's own environment is for the sessions its person is shown.
+    for presentation in [Presentation::Attach, Presentation::Terminal] {
+        assert_eq!(
+            origin(Door::Local(LocalClientKind::Cli), presentation).expect("decided"),
+            CreateOrigin::CliSnapshot,
+            "{presentation:?}"
+        );
+    }
+    // Every other source takes the host's: an app, a session nobody sees, a paired device.
+    for presentation in [
+        Presentation::Attach,
+        Presentation::Terminal,
+        Presentation::Invisible,
+    ] {
+        assert_eq!(
+            origin(Door::Local(LocalClientKind::App), presentation).expect("decided"),
+            CreateOrigin::HostContext,
+            "{presentation:?}"
+        );
+        assert_eq!(
+            origin(Door::Network, presentation).expect("decided"),
+            CreateOrigin::HostContext,
+            "{presentation:?}"
+        );
+    }
+    assert_eq!(
+        origin(Door::Local(LocalClientKind::Cli), Presentation::Invisible).expect("decided"),
+        CreateOrigin::HostContext
+    );
+    // A connection that declared itself the control daemon or a worker is no source at all.
+    for kind in [LocalClientKind::Controller, LocalClientKind::Worker] {
+        let refusal = origin(Door::Local(kind), Presentation::Terminal).expect_err("refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{kind:?}");
+    }
+}
+
+/// KR-REQ-07.26: a paired device's own environment is never the session's, so a create that comes
+/// through the network door with variables is refused before anything is reserved, and one that
+/// carries none is read as the host's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_a_paired_device_makes_with_variables_of_its_own_is_refused() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let actor_id = kr_protocol::ids::ActorId::new("device:test").expect("a principal");
+    let revision = controller.leases.authority_revision();
+    controller.admitted_table().insert(
+        connection_id,
+        super::AdmittedConnection::new(actor_id.clone(), revision),
+    );
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+
+    let mut carrying = create_request(environment_id);
+    carrying.params = ParamsValue::from_typed(&SessionCreateParams {
+        environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
+            name: "PATH".to_owned(),
+            value: "/a/phones/own".to_owned(),
+        }],
+        ..create_params(environment_id)
+    })
+    .expect("encodes");
+    let error = controller
+        .session_create(
+            &actor_id,
+            &carrying,
+            carried(&controller, connection_id, accepted),
+        )
+        .await
+        .expect_err("a device's variables are refused");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument, "{error}");
+    assert!(!error.to_string().contains("/a/phones/own"), "{error}");
+    assert!(asked.lock().expect("the record is not poisoned").is_empty());
+    assert_eq!(
+        controller
+            .registry
+            .lock()
+            .await
+            .occupancy()
+            .expect("counts"),
+        0,
+        "nothing is reserved for a create that was refused"
+    );
+
+    // The control: the same create with none is served as far as this supervisor goes.
+    let outcome = controller
+        .session_create(
+            &actor_id,
+            &create_request(environment_id),
+            carried(&controller, connection_id, accepted),
+        )
+        .await;
+    assert!(outcome.is_err(), "this supervisor starts nothing");
+    assert_eq!(
+        asked.lock().expect("the record is not poisoned").len(),
+        1,
+        "a create with no variables reaches the launch"
+    );
+}
+
+/// What of a daemon's own environment a session started with the host's takes: the person's path,
+/// their locale and who they are, and nothing else a daemon started from a terminal holds.
+#[test]
+fn a_session_started_with_the_hosts_environment_takes_an_allowlist_of_the_daemons_own() {
+    let taken = super::create::host_context_variables(
+        [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/a"),
+            ("USER", "a"),
+            ("LOGNAME", "a"),
+            ("LANG", "en_ZA.UTF-8"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "UTF-8"),
+            ("TZ", "UTC"),
+            ("TMPDIR", "/tmp/a"),
+            ("OPENAI_API_KEY", "sk-secret"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("ITERM_SESSION_ID", "w0t0"),
+            ("DISPLAY", ":0"),
+            ("KR_SESSION", "x"),
+            ("LCX", "not the locale's"),
+            ("path", "/lower/case/is/another/name"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned())),
+    );
+    let names: Vec<&str> = taken
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    if cfg!(windows) {
+        // Names are the platform's own, kept in capitals: there is no other PATH than the one.
+        assert!(names.contains(&"PATH"), "{names:?}");
+    } else {
+        assert_eq!(
+            names,
+            [
+                "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "TMPDIR", "TZ", "USER"
+            ]
+        );
+    }
+    assert!(
+        !taken
+            .iter()
+            .any(|variable| variable.value.contains("secret"))
     );
 }
