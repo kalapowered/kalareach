@@ -164,7 +164,8 @@ jobs:
 
       # The description process runs on every x86-64 processor that has the baseline in
       # `.cargo/config.toml` (x86-64-v3), so the llama.cpp archives it links must hold no AVX-512,
-      # AVX-VNNI or AMX instruction. The pins and the build guard keep them out of a build made here;
+      # AVX-VNNI or AMX instruction that can run there (on Windows, AVX-512 code behind MSVC's own
+      # test of the processor is the one thing let through). The pins and the build guard keep them out of a build made here;
       # this reads what was compiled, which is what a compiler flag in the environment
       # (`CFLAGS=-march=native`) would change without either of them seeing it.
       #
@@ -174,7 +175,7 @@ jobs:
       # AMX), which it has to refuse, and two that hold none, one of them with bytes that only look
       # like an instruction, which it has to pass. On Windows there are also a function that tests
       # `__isa_available` before its AVX-512 instruction, which it has to let through and count, and
-      # five that do not test it in a way that guards the instruction, which it has to refuse. Each
+      # nine that do not test it in a way that guards the instruction, which it has to refuse. Each
       # is a Rust static library, so it carries a runtime's worth of ordinary code beside the planted
       # instruction. The disassembler is the platform's own: `objdump` on Linux and macOS,
       # `dumpbin /disasm` from Visual Studio on Windows.
@@ -231,11 +232,12 @@ jobs:
           # runs that path on a processor without AVX-512. The disassembly is split by function (a
           # blank line between functions), and the instructions of a function that has that shape,
           # between the conditional jump and its target, are counted apart, as `guarded`, and do not
-          # fail the check. The shape is exact: the compare, then the first conditional jump after
-          # it, which is `jl`, to a plain address; the instructions between the jump and its target;
-          # no other jump of the function that is not a plain address, and none from outside those
-          # instructions into them. AVX-512 anywhere else, and every AVX-VNNI and AMX instruction,
-          # still fails.
+          # fail the check. The shape is exact: a dword compare of the runtime's own variable with 6;
+          # then, with only instructions that leave the flags alone between them, `jl` to a plain
+          # address; the instructions after the `jl` up to that address are the guarded ones; every
+          # jump and loop of the function goes to a plain address, and no jump, loop or direct call
+          # from outside the stretch from the compare to that address lands inside it. AVX-512
+          # anywhere else, and every AVX-VNNI and AMX instruction, still fails.
           cat > "$scratch/split.awk" <<'AWK'
           # Splits a dumpbin disassembly, one function per blank-line-separated block, into the lines that
           # only run behind the C runtime's AVX-512 test and all the others.
@@ -256,24 +258,33 @@ jobs:
                   address[index_] = parsed_address
                   mnemonic[index_] = parsed_mnemonic
                   operand[index_] = parsed_operand
-                  if (!compare && parsed_mnemonic == "cmp" && text[index_] ~ /\[__isa_available[^]]*\],6$/) compare = index_
+                  if (!compare && parsed_mnemonic == "cmp" && text[index_] ~ /dword ptr \[__isa_available(\+0ffffffffh)?\],6$/) compare = index_
               }
               qualifies = 0
               if (compare) {
+                  # Only instructions that leave the flags alone may stand between the compare and the jump,
+                  # so the jump reads what the compare set.
                   for (index_ = compare + 1; index_ <= lines && !jump; index_++) {
-                      if (mnemonic[index_] ~ /^j/ && mnemonic[index_] != "jmp") jump = index_
+                      if (mnemonic[index_] == "") continue
+                      if (mnemonic[index_] ~ /^(v?mov[a-z0-9]*|lea|nop)$/) continue
+                      if (mnemonic[index_] == "jl") jump = index_
+                      else break
                   }
-                  if (jump && mnemonic[jump] == "jl" && operand[jump] ~ /^[0-9a-f]+$/) {
-                      low = address[jump]; high = hex(operand[jump])
-                      qualifies = (low >= 0 && high > low)
+                  if (jump && operand[jump] ~ /^[0-9a-f]+$/) {
+                      low = address[compare]; high = hex(operand[jump])
+                      qualifies = (low >= 0 && high > address[jump])
                   }
               }
               if (qualifies) {
-                  # Every jump of the function must be a plain one, and none may enter the guarded stretch
-                  # from outside it, or the stretch could run without the test.
+                  # The stretch is everything after the compare up to the jump's target. Every jump, loop
+                  # and direct call of the function must go to a plain address, and none may enter the
+                  # stretch from outside it, or the stretch could run without the compare having run.
                   for (index_ = 1; index_ <= lines; index_++) {
-                      if (mnemonic[index_] !~ /^j/) continue
-                      if (operand[index_] !~ /^[0-9a-f]+$/) { qualifies = 0; break }
+                      if (mnemonic[index_] !~ /^(j[a-z]*|loop[a-z]*|call)$/) continue
+                      if (operand[index_] !~ /^[0-9a-f]+$/) {
+                          if (mnemonic[index_] == "call") continue
+                          qualifies = 0; break
+                      }
                       target = hex(operand[index_])
                       inside = (address[index_] > low && address[index_] < high)
                       if (target > low && target < high && !inside) { qualifies = 0; break }
@@ -282,7 +293,7 @@ jobs:
               held_any = 0; last = 0
               for (index_ = 1; index_ <= lines; index_++) {
                   if (address[index_] >= 0) {
-                      last = (qualifies && address[index_] > low && address[index_] < high)
+                      last = (qualifies && address[index_] > address[jump] && address[index_] < high)
                   } else if (text[index_] !~ /^ +[0-9a-f][0-9a-f]( [0-9a-f][0-9a-f])*$/) {
                       last = 0
                   }
@@ -314,8 +325,8 @@ jobs:
           END { flush() }
           AWK
 
-          # Prints how many instructions of each kind a disassembly holds, and fails when any does.
-          # `$1` is the disassembly; on Windows the part of it that is not guarded is `$1.unguarded`.
+          # Prints how many instructions of each kind a disassembly holds, and fails when any that can
+          # run on a processor without them does. `$1` is the disassembly; on Windows the part of it that is not guarded is `$1.unguarded`.
           past_baseline() {
             local found_avx512 found_vnni found_amx found_guarded=0 unguarded="$1" result
             if [ "$RUNNER_OS" = Windows ]; then
@@ -395,6 +406,47 @@ jobs:
                       "vpaddd zmm0, zmm1, zmm2"
                   )
               };
+              #[cfg(guardedflags)]
+              unsafe {
+                  asm!(
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "test ecx, ecx",
+                      "jl 2f",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
+              #[cfg(guardedontojl)]
+              unsafe {
+                  asm!(
+                      "jmp 3f",
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "3:",
+                      "jl 2f",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
+              #[cfg(guardedcallin)]
+              unsafe {
+                  asm!(
+                      "call 3f",
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "jl 2f",
+                      "3:",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
+              #[cfg(guardedoffset)]
+              unsafe {
+                  asm!(
+                      "cmp dword ptr [rip + __isa_available + 4], 6",
+                      "jl 2f",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
               #[cfg(guardedjumpin)]
               unsafe {
                   asm!(
@@ -409,10 +461,20 @@ jobs:
               };
           }
 
+          // A second function laid out as `planted` is, with a compare against 5, whose AVX-512
+          // instruction sits where the guarded one's does: if the two were read as one function,
+          // the guard would excuse it.
           #[cfg(guardedneighbour)]
           #[unsafe(no_mangle)]
           pub unsafe extern "C" fn neighbour() {
-              unsafe { asm!("vpaddd zmm0, zmm1, zmm2") };
+              unsafe {
+                  asm!(
+                      "cmp dword ptr [rip + __isa_available], 5",
+                      "jl 2f",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
           }
 
           #[panic_handler]
@@ -425,7 +487,7 @@ jobs:
           plants="avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2"
           # The run-time choice by `__isa_available` exists only where MSVC's runtime does.
           if [ "$RUNNER_OS" = Windows ]; then
-            plants="$plants guarded:+avx512f guardednone:+avx512f guardedbefore:+avx512f guardedjoined:+avx512f guardedjumpin:+avx512f guardedneighbour:+avx512f"
+            plants="$plants guarded:+avx512f guardednone:+avx512f guardedbefore:+avx512f guardedjoined:+avx512f guardedjumpin:+avx512f guardedflags:+avx512f guardedontojl:+avx512f guardedcallin:+avx512f guardedoffset:+avx512f guardedneighbour:+avx512f"
           fi
           for plant in $plants; do
             name=${plant%%:*}
