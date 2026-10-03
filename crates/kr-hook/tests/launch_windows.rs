@@ -1,0 +1,957 @@
+//! `kr-hook launch` on Windows, against the worker's own command backends.
+//!
+//! This test process plays the root shell: it establishes a backend the way the session does when the
+//! shell asks to resolve an integrated invocation, and starts the launcher as its own child, in a job
+//! of its own the way a session's shell runs everything it starts. The program is a copy of
+//! `cmd.exe` named `gemini.exe`, running a short batch file that writes down what it found the moment
+//! it started: the registration, the variable the package declares and the directory it works in.
+//! `cmd.exe` and `ping.exe` are on every Windows machine; nothing else is needed.
+//!
+//! The launcher creates its program before it tells the backend, and starts it only when the backend
+//! has committed, so what is checked here is the order as much as the outcome: the backend names the
+//! program and not the launcher, in a job of its own, and a launch that goes wrong leaves a program
+//! that never ran.
+//!
+//! | Row | What proves it |
+//! | --- | --- |
+//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses, one a launcher declines and one that is never started leave nothing running |
+//! | KR-REQ-12.07 | a refused invocation runs as typed |
+//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed |
+//! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
+
+#![cfg(windows)]
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use common::{LIVENESS, Placed};
+use kr_protocol::ids::{ApplicationInstanceId, EnvironmentId, SessionId};
+use kr_protocol::root::{CommandBackend, CwdRevision, PromptGeneration};
+use kr_protocol::scalars::Uuid;
+use kr_protocol::session::CommandIntegration;
+use kr_worker::broker::Broker;
+use kr_worker::broker::commands::{
+    BackendState, CommandBackends, CommandBackendsConfig, EstablishRequest,
+};
+use kr_worker::broker::connectors::{ConnectorSources, fixture};
+use kr_worker::persistence::JournalHealth;
+use kr_worker::windows::job::{AgentJob, SessionJob};
+use kr_worker::windows::launch::{Child, Spec};
+
+/// What the program writes the moment it starts, and what it does next. It waits far longer than
+/// any test takes unless a test tells it to end.
+const SCRIPT: &str = "@echo off\r\n\
+(\r\n\
+echo variable=%KR_REGISTRATION%\r\n\
+echo relaunch=%GEMINI_CLI_NO_RELAUNCH%\r\n\
+echo cwd=%CD%\r\n\
+) > \"%REPORT%.part\"\r\n\
+move /y \"%REPORT%.part\" \"%REPORT%\" > NUL\r\n\
+if defined EXIT_WITH exit /b %EXIT_WITH%\r\n\
+ping -n 600 127.0.0.1 > NUL\r\n";
+
+fn session() -> SessionId {
+    SessionId::new(Uuid::from_bytes([1; 16]))
+}
+
+/// A program in the system directory, which every Windows machine has.
+fn system_program(name: &str) -> PathBuf {
+    Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+        .join("System32")
+        .join(name)
+}
+
+/// Waits until a condition holds, within the liveness bound.
+fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(started.elapsed() < LIVENESS, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a program wrote, one `name=value` to a line. A value that still reads as the name of a
+/// variable the batch file asked for is one that was not set.
+fn parsed(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.trim_end().split_once('='))
+        .map(|(name, value)| {
+            let value = if value.starts_with('%') && value.ends_with('%') {
+                "unset"
+            } else {
+                value
+            };
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+/// This test process, the root shell of every launch it starts.
+struct Shell {
+    placed: Placed,
+    runtime: tokio::runtime::Runtime,
+    broker: Arc<Broker>,
+    backends: Arc<CommandBackends>,
+    /// The program every case runs: a copy of `cmd.exe` under the name the package integrates.
+    executable: PathBuf,
+    reports: PathBuf,
+    script: PathBuf,
+    generation: std::sync::atomic::AtomicU64,
+    /// The job everything this shell starts runs in, which ends all of it when the test does.
+    job: SessionJob,
+}
+
+impl Shell {
+    fn new() -> Self {
+        Self::with_source(|source| source)
+    }
+
+    /// A shell whose connector's installation is granted to read files as well.
+    fn reading() -> Self {
+        Self::with_source(fixture::reading)
+    }
+
+    fn with_source(
+        installed: impl FnOnce(
+            kr_worker::broker::connectors::ConnectorSource,
+        ) -> kr_worker::broker::connectors::ConnectorSource,
+    ) -> Self {
+        let placed = Placed::new();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let bin = placed.host.root().join("bin");
+        let executable = bin.join("gemini.exe");
+        kr_ipc::testing::place_program(&system_program("cmd.exe"), &executable);
+        let store = placed.host.root().join("store");
+        std::fs::create_dir_all(&store).expect("a store");
+        let sources = Arc::new(ConnectorSources::new());
+        let source = installed(
+            fixture::package(&store, &placed.forwarder, &fixture::Shape::gemini_cli(&[]))
+                .expect("the package is written"),
+        );
+        let broker = Arc::new(
+            Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
+        );
+        // The connector is admitted, as the control daemon hands it over, and a launch binds it.
+        let admissions = kr_worker::broker::catalogue::Admissions::new();
+        let _ = kr_worker::broker::catalogue::testing::admit(
+            &admissions,
+            &sources,
+            &broker,
+            vec![kr_worker::broker::catalogue::testing::admitted(&source)],
+            1,
+        );
+        assert!(sources.for_command("gemini").is_some());
+        let backends = Arc::new(CommandBackends::new(
+            Arc::clone(&broker),
+            CommandBackendsConfig {
+                session_id: session(),
+                environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+                os_user: "someone".to_owned(),
+                runtime_dir: placed.host.root().to_path_buf(),
+                sources: Arc::clone(&sources),
+                launcher: Some(placed.forwarder.clone()),
+            },
+            runtime.handle().clone(),
+        ));
+        let reports = placed.host.root().join("reports");
+        std::fs::create_dir_all(&reports).expect("a directory for reports");
+        let script = reports.join("report.cmd");
+        std::fs::write(&script, SCRIPT).expect("the program's batch file");
+        Self {
+            placed,
+            runtime,
+            broker,
+            backends,
+            executable,
+            reports,
+            script,
+            generation: std::sync::atomic::AtomicU64::new(1),
+            job: SessionJob::create().expect("a job for what this shell starts"),
+        }
+    }
+
+    fn integration() -> CommandIntegration {
+        CommandIntegration {
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/gemini-cli")
+                .expect("a plugin identifier"),
+            command: "gemini".to_owned(),
+            flags: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    /// The vector every case types, which the integration answers unchanged: the program's name
+    /// and the batch file `cmd.exe` runs.
+    fn typed(&self) -> Vec<String> {
+        vec![
+            "gemini".to_owned(),
+            "/d".to_owned(),
+            "/c".to_owned(),
+            self.script.display().to_string(),
+        ]
+    }
+
+    /// Establishes a backend for the next line, as the session does for an integrated resolve, for
+    /// an invocation the shell reported running in `cwd`.
+    fn establish_in(&self, cwd: &Path) -> CommandBackend {
+        let typed = self.typed();
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _entered = self.runtime.enter();
+        self.backends
+            .establish(&EstablishRequest {
+                prompt_generation: PromptGeneration::new(generation),
+                typed: &typed,
+                arguments: &typed,
+                added: &[],
+                integration: &Self::integration(),
+                executable: self.executable.to_str().expect("a text path"),
+                cwd: cwd.to_str().expect("a text path"),
+                cwd_revision: CwdRevision::new(1),
+                root_shell: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+            })
+            .expect("a backend is established")
+    }
+
+    fn establish(&self) -> CommandBackend {
+        self.establish_in(self.placed.host.root())
+    }
+
+    /// Starts the launcher for `vector` as the shell's executor does: with the answer's variable, a
+    /// report to write and the variables of `env`, in `cwd`, in this shell's job.
+    fn launcher(
+        &self,
+        executable: &Path,
+        vector: &[String],
+        answer: &CommandBackend,
+        name: &str,
+        env: &[(&str, &str)],
+        cwd: &Path,
+    ) -> Child {
+        let mut arguments = vec![
+            "launch".to_owned(),
+            "--".to_owned(),
+            executable.display().to_string(),
+        ];
+        arguments.extend(vector.iter().cloned());
+        let report = self.reports.join(name);
+        let mut variables: Vec<(&str, std::ffi::OsString)> = answer
+            .environment
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.clone().into()))
+            .collect();
+        variables.push(("REPORT", report.into_os_string()));
+        for (name, value) in env {
+            variables.push((name, (*value).into()));
+        }
+        let variables: Vec<(&str, &std::ffi::OsStr)> = variables
+            .iter()
+            .map(|(name, value)| (*name, value.as_os_str()))
+            .collect();
+        let agent = AgentJob::create().expect("a job for the launcher's own children");
+        kr_worker::windows::launch::start(&Spec {
+            program: &self.placed.forwarder,
+            arguments: &arguments,
+            directory: cwd,
+            environment: &variables,
+            session: Some(&self.job),
+            agent: &agent,
+            pipe_input: false,
+            pipe_output: false,
+        })
+        .expect("the launcher starts")
+    }
+
+    /// Starts the launcher for the vector every case types, in the tree's root.
+    fn launch(&self, answer: &CommandBackend, name: &str, env: &[(&str, &str)]) -> Child {
+        self.launcher(
+            &self.executable,
+            &self.typed(),
+            answer,
+            name,
+            env,
+            self.placed.host.root(),
+        )
+    }
+
+    /// Waits for the report a launched program writes, and says what became of the launcher when
+    /// none comes.
+    fn report_from(&self, name: &str, launcher: &mut Child) -> BTreeMap<String, String> {
+        let path = self.reports.join(name);
+        let started = Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                return parsed(&text);
+            }
+            if let Ok(Some(status)) = launcher.try_wait() {
+                // A program that has written its report and gone is read once more.
+                std::thread::sleep(Duration::from_millis(200));
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    return parsed(&text);
+                }
+                panic!("the launcher ended with {status} and the program reported nothing");
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "the program reported by now: the launcher is still running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn registration(answer: &CommandBackend) -> PathBuf {
+        PathBuf::from(&answer.environment[0].value)
+    }
+
+    /// What a published registration says, one `name=value` to a line.
+    fn registered(answer: &CommandBackend) -> BTreeMap<String, String> {
+        std::fs::read_to_string(Self::registration(answer))
+            .expect("the registration")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    fn instance_of(answer: &CommandBackend) -> ApplicationInstanceId {
+        Self::registered(answer)["instance"]
+            .parse()
+            .expect("the registration names an instance")
+    }
+
+    fn state_of(&self, instance: ApplicationInstanceId) -> Option<BackendState> {
+        self.backends.state_of(instance)
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        let _ = self.job.terminate(1);
+        let _ = self.backends.close();
+    }
+}
+
+/// KR-REQ-12.02, KR-REQ-05.09 and KR-REQ-07.61: a launch is committed for the program the launcher
+/// created and not for the launcher, which is that program's parent; the program runs in a job of
+/// its own, with the variable its package declares, and in the directory the launcher worked in.
+#[test]
+fn kr_req_12_02_a_launch_commits_the_program_the_launcher_created() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut launcher = shell.launch(&answer, "committed", &[]);
+    let report = shell.report_from("committed", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the declared variable is set");
+    assert_eq!(
+        PathBuf::from(&report["variable"]),
+        Shell::registration(&answer),
+        "and the registration the shell exported is there"
+    );
+    let registered = Shell::registered(&answer);
+    let program: u32 = registered["pid"].parse().expect("a process identifier");
+    assert_ne!(
+        program,
+        launcher.id(),
+        "the registration names the program and not the launcher"
+    );
+    let program_identity = kr_ipc::identity::process_start_identity(program).expect("the program");
+    assert_eq!(
+        registered["start"],
+        program_identity.start_value.get().to_string(),
+        "by its start as well"
+    );
+    let launcher_identity =
+        kr_ipc::identity::process_start_identity(launcher.id()).expect("the launcher");
+    assert_eq!(
+        kr_worker::windows::lineage::parent_of(&program_identity),
+        Ok(launcher_identity),
+        "the launcher is the program's parent"
+    );
+    let instance = Shell::instance_of(&answer);
+    assert!(matches!(
+        shell.state_of(instance),
+        Some(BackendState::Committed(_))
+    ));
+    assert!(
+        shell.broker.holds_process(&program_identity),
+        "the broker's instance is the program's"
+    );
+    let job = kr_worker::windows::job::agent_job(&program_identity)
+        .expect("the program is held by a job of its own");
+    assert!(
+        job.process_ids()
+            .expect("the job lists its processes")
+            .contains(&program),
+        "which holds it"
+    );
+    assert!(
+        PathBuf::from(&report["cwd"])
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&shell.placed.host.root().to_string_lossy()),
+        "the program works where the launcher did: {}",
+        report["cwd"]
+    );
+}
+
+/// KR-REQ-12.02: the launcher ends with the whole exit code of its program, which is 32 bits on this
+/// platform. Control: a small code reaches the shell as it is.
+#[test]
+fn kr_req_12_02_the_launcher_returns_the_programs_whole_exit_code() {
+    let shell = Shell::new();
+    for (code, name) in [("305419896", "whole"), ("3", "small")] {
+        let answer = shell.establish();
+        let mut launcher = shell.launch(&answer, name, &[("EXIT_WITH", code)]);
+        let report = shell.report_from(name, &mut launcher);
+        assert_eq!(report["relaunch"], "true", "{name}: it was launched");
+        let status = launcher.wait().expect("the launcher ends with the program");
+        assert_eq!(
+            status.code(),
+            Some(code.parse::<i32>().expect("a code")),
+            "{name}: the program's code, whole"
+        );
+    }
+}
+
+/// KR-REQ-12.07: a launch the backend refuses runs as typed: the program runs without the declared
+/// variable and without the registration, and ends with its own exit code. Here the argument vector
+/// the launcher presents is not the one the backend answered. Control: the vector it answered is
+/// committed.
+#[test]
+fn kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &[
+            "gemini".to_owned(),
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "exit /b 7".to_owned(),
+        ],
+        &answer,
+        "typed",
+        &[],
+        shell.placed.host.root(),
+    );
+    let status = launcher.wait().expect("the launcher ends with the program");
+    assert_eq!(status.code(), Some(7), "the typed program ran and ended");
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "and nothing was registered for it"
+    );
+    // Control: the same invocation as it was established is committed.
+    let mut again = shell.launch(&answer, "again", &[]);
+    let report = shell.report_from("again", &mut again);
+    assert_eq!(report["relaunch"], "true");
+}
+
+/// A launcher this test plays: it says to the backend what a real launcher says, and can say what no
+/// real one does, so the checks a real launcher can never fail are shown to fail.
+struct Scripted {
+    runtime: tokio::runtime::Runtime,
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<kr_ipc::endpoint::Connection>>,
+    writer: tokio::io::WriteHalf<kr_ipc::endpoint::Connection>,
+}
+
+impl Scripted {
+    /// Presents this process to the backend as a launcher for `executable` and `arguments`, and
+    /// returns the connection with the backend's answer to it, which is a line or the end of the
+    /// connection.
+    fn present(
+        answer: &CommandBackend,
+        executable: &Path,
+        arguments: &[String],
+    ) -> (Self, Option<String>) {
+        use tokio::io::AsyncWriteExt as _;
+        let directory = Shell::registration(answer)
+            .parent()
+            .expect("the backend's directory")
+            .to_path_buf();
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("launch")).expect("the launch record"),
+        )
+        .expect("a record");
+        let name = record["endpoint"]
+            .as_str()
+            .and_then(|text| text.strip_prefix(r"\\.\pipe\"))
+            .expect("a local pipe")
+            .to_owned();
+        let credential = std::fs::read_to_string(directory.join("credential"))
+            .expect("the credential")
+            .trim()
+            .to_owned();
+        let identity = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let address = kr_ipc::paths::Endpoint::from_name(name).expect("an endpoint");
+        let connection = runtime
+            .block_on(kr_ipc::endpoint::Connection::connect(&address))
+            .expect("the endpoint is reached");
+        let (reader, mut writer) = tokio::io::split(connection);
+        let line = serde_json::json!({ "kr_launch": {
+            "credential": credential,
+            "pid": identity.pid.get(),
+            "start": identity.start_value.get(),
+            "executable": executable.to_str().expect("text"),
+            "arguments": arguments,
+        }})
+        .to_string();
+        runtime
+            .block_on(async {
+                writer.write_all(line.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await
+            })
+            .expect("the presentation is written");
+        let mut scripted = Self {
+            runtime,
+            reader: tokio::io::BufReader::new(reader),
+            writer,
+        };
+        let admitted = scripted.read();
+        (scripted, admitted)
+    }
+
+    /// Reads one line the backend writes, or `None` at the end of the connection.
+    fn read(&mut self) -> Option<String> {
+        use tokio::io::AsyncBufReadExt as _;
+        let reader = &mut self.reader;
+        let mut line = String::new();
+        let read = self
+            .runtime
+            .block_on(async { tokio::time::timeout(LIVENESS, reader.read_line(&mut line)).await })
+            .expect("the backend answers or closes in time");
+        match read {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end().to_owned()),
+        }
+    }
+
+    /// Writes one frame.
+    fn write(&mut self, frame: &serde_json::Value) {
+        use tokio::io::AsyncWriteExt as _;
+        let writer = &mut self.writer;
+        let line = format!("{frame}\n");
+        self.runtime
+            .block_on(async {
+                writer.write_all(line.as_bytes()).await?;
+                writer.flush().await
+            })
+            .expect("the frame is written");
+    }
+
+    fn says(line: Option<&str>, word: &str) -> bool {
+        line.is_some_and(|line| line.contains(&format!("\"{word}\":true")))
+    }
+}
+
+/// A program created suspended from `executable`, which this test owns and ends.
+struct Suspended(std::process::Child);
+
+impl Suspended {
+    fn from(executable: &Path, arguments: &[String]) -> Self {
+        use std::os::windows::process::CommandExt as _;
+        Self(
+            std::process::Command::new(executable)
+                .args(arguments)
+                .creation_flags(0x0000_0004)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a suspended program"),
+        )
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Shell {
+    /// The prompt generation of the line the last backend was established for.
+    fn last_generation(&self) -> PromptGeneration {
+        PromptGeneration::new(self.generation.load(std::sync::atomic::Ordering::SeqCst) - 1)
+    }
+
+    /// A copy of `cmd.exe` that is not the program every case runs.
+    fn another_program(&self) -> PathBuf {
+        let another = self.placed.host.root().join("bin").join("another.exe");
+        kr_ipc::testing::place_program(&system_program("cmd.exe"), &another);
+        another
+    }
+
+    /// The frame a launcher says it is going in, naming `program` and the directory it works in.
+    fn going(program: u32, directory: Option<&Path>) -> serde_json::Value {
+        serde_json::json!({ "kr_launch": {
+            "going": true,
+            "program": program,
+            "directory": directory.map(|directory| directory.display().to_string()),
+        }})
+    }
+
+    /// Presents a scripted launcher for the vector every case types and checks it was admitted.
+    fn admitted_launcher(&self, answer: &CommandBackend) -> Scripted {
+        let (scripted, admitted) = Scripted::present(answer, &self.executable, &self.typed());
+        assert!(
+            Scripted::says(admitted.as_deref(), "admitted"),
+            "the backend admits the launch: {admitted:?}"
+        );
+        scripted
+    }
+
+    /// Whether this launch, retried as the same invocation, is admitted and committed: it is what
+    /// shows that a refused launch gave everything back.
+    fn commits_after_a_refusal(&self, answer: &CommandBackend) {
+        let mut scripted = self.admitted_launcher(answer);
+        let program = Suspended::from(&self.executable, &self.typed()[1..]);
+        scripted.write(&Self::going(program.id(), None));
+        let committed = scripted.read();
+        assert!(
+            Scripted::says(committed.as_deref(), "committed"),
+            "a retry of the invocation is committed: {committed:?}"
+        );
+    }
+}
+
+/// KR-REQ-05.09: a program created from another file than the one the backend hashed is not
+/// committed, and the launch gives back what it took. Control: a program created from the hashed
+/// file is.
+#[test]
+fn kr_req_05_09_a_program_created_from_another_file_is_not_committed() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut scripted = shell.admitted_launcher(&answer);
+    let another = shell.another_program();
+    let program = Suspended::from(&another, &shell.typed()[1..]);
+    scripted.write(&Shell::going(program.id(), None));
+    assert_eq!(
+        scripted.read(),
+        None,
+        "the connection is closed, uncommitted"
+    );
+    let why = shell
+        .backends
+        .launch_failure_of(shell.last_generation())
+        .expect("the backend says why");
+    assert!(why.contains("another file"), "{why}");
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "and nothing was published"
+    );
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-05.09: a process the launcher did not start is not the program it says it created: here
+/// the launcher names itself, and its own parent is not it. Control: its own child is.
+#[test]
+fn kr_req_05_09_a_process_the_launcher_did_not_create_is_not_committed() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut scripted = shell.admitted_launcher(&answer);
+    scripted.write(&Shell::going(std::process::id(), None));
+    assert_eq!(scripted.read(), None, "uncommitted");
+    let why = shell
+        .backends
+        .launch_failure_of(shell.last_generation())
+        .expect("the backend says why");
+    assert!(why.contains("not started by the launcher"), "{why}");
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-05.09: a program that started before the backend was established is not one this launch
+/// made, whatever its parent is.
+#[test]
+fn kr_req_05_09_a_program_that_started_before_the_backend_was_established_is_not_committed() {
+    let shell = Shell::new();
+    let early = Suspended::from(&shell.executable, &shell.typed()[1..]);
+    std::thread::sleep(Duration::from_millis(50));
+    let answer = shell.establish();
+    let mut scripted = shell.admitted_launcher(&answer);
+    scripted.write(&Shell::going(early.id(), None));
+    assert_eq!(scripted.read(), None, "uncommitted");
+    let why = shell
+        .backends
+        .launch_failure_of(shell.last_generation())
+        .expect("the backend says why");
+    assert!(why.contains("before this backend was established"), "{why}");
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-12.02: a launcher that cannot create its program says so, the backend records why on the
+/// launch attempt, and the invocation can be launched again. A reason too long to keep is cut.
+#[test]
+fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut scripted = shell.admitted_launcher(&answer);
+    scripted.write(&serde_json::json!({ "kr_launch": {
+        "going": false,
+        "declined": "the job limits the desktop",
+    }}));
+    assert_eq!(scripted.read(), None, "uncommitted");
+    let why = shell
+        .backends
+        .launch_failure_of(shell.last_generation())
+        .expect("the reason is kept on the backend");
+    assert!(why.contains("the job limits the desktop"), "{why}");
+    assert!(!Shell::registration(&answer).exists());
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-12.02: a program that was committed and never started is ended with everything in its job
+/// when the launcher says nothing within its deadline, and its instance ends with it.
+#[test]
+fn kr_req_12_02_a_program_that_is_never_started_is_ended() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut scripted = shell.admitted_launcher(&answer);
+    let program = Suspended::from(&shell.executable, &shell.typed()[1..]);
+    let identity = kr_ipc::identity::process_start_identity(program.id()).expect("an identity");
+    scripted.write(&Shell::going(program.id(), None));
+    let committed = scripted.read();
+    assert!(Scripted::says(committed.as_deref(), "committed"));
+    let instance = Shell::instance_of(&answer);
+    assert!(matches!(
+        shell.state_of(instance),
+        Some(BackendState::Committed(_))
+    ));
+    // The launcher goes quiet and keeps the connection open: the program is ended by the backend.
+    eventually("the program that never started is ended", || {
+        matches!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Ended
+        )
+    });
+    eventually("and its instance ends with it", || {
+        !matches!(
+            shell.state_of(instance),
+            Some(BackendState::Committed(_) | BackendState::Launching)
+        )
+    });
+    drop(scripted);
+}
+
+/// Turns an empty directory into a junction to `target` in place, as a principal that may write to
+/// the directory can whatever is held on it: the conversion changes what the path reaches and not
+/// the object a handle holds.
+#[expect(
+    unsafe_code,
+    reason = "setting a reparse point is a device control with a buffer only the caller can lay out"
+)]
+fn convert_to_a_junction(directory: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)
+        .expect("the directory opens for its attributes");
+    let substitute: Vec<u16> = std::ffi::OsString::from(format!(r"\??\{}", target.display()))
+        .encode_wide()
+        .collect();
+    let printed: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let substitute_bytes = u16::try_from(substitute.len() * 2).expect("short");
+    let printed_bytes = u16::try_from(printed.len() * 2).expect("short");
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    let data_length = 8 + usize::from(substitute_bytes) + 2 + usize::from(printed_bytes) + 2;
+    buffer.extend(u16::try_from(data_length).expect("short").to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(substitute_bytes.to_le_bytes());
+    buffer.extend((substitute_bytes + 2).to_le_bytes());
+    buffer.extend(printed_bytes.to_le_bytes());
+    for unit in &substitute {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    for unit in &printed {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    let mut returned = 0_u32;
+    // SAFETY: the handle is open for the call, the buffer is a local laid out as the control
+    // documents, and the count is another local.
+    let set = unsafe {
+        DeviceIoControl(
+            opened.as_raw_handle().cast(),
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            u32::try_from(buffer.len()).expect("short"),
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        set,
+        0,
+        "the directory becomes a junction: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// What a failed rename of a path says when the path is held: a sharing violation.
+fn held(result: std::io::Result<()>) -> bool {
+    result.is_err_and(|error| error.raw_os_error() == Some(32))
+}
+
+/// A directory three levels down in the tree, so that its ancestors can be renamed too.
+fn nested(shell: &Shell, name: &str) -> PathBuf {
+    let directory = shell.placed.host.root().join(name).join("b").join("work");
+    std::fs::create_dir_all(&directory).expect("a nested directory");
+    directory
+}
+
+/// KR-REQ-12.16: a launch is granted the directory its program inherits, which was held from the
+/// drive's root when the backend was established: nothing can rename, replace or delete it or its
+/// ancestors while the program runs, and the hold is let go of when the program ends. Control: once
+/// it has, the same directory renames.
+#[test]
+fn kr_req_12_16_a_launch_is_granted_the_directory_the_program_inherits_and_it_is_held() {
+    let shell = Shell::reading();
+    let work = nested(&shell, "grant");
+    let answer = shell.establish_in(&work);
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &shell.typed(),
+        &answer,
+        "granted",
+        &[],
+        &work,
+    );
+    let report = shell.report_from("granted", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "committed");
+    let instance = Shell::instance_of(&answer);
+    assert!(
+        shell.broker.host_files(instance).is_some(),
+        "the directory is granted"
+    );
+    let ancestor = work
+        .parent()
+        .expect("b")
+        .parent()
+        .expect("grant")
+        .to_path_buf();
+    assert!(
+        held(std::fs::rename(&work, ancestor.join("moved"))),
+        "the directory cannot be renamed while the program runs"
+    );
+    assert!(
+        held(std::fs::rename(
+            &ancestor,
+            ancestor.with_file_name("grant-moved")
+        )),
+        "nor can an ancestor"
+    );
+    assert!(held(std::fs::remove_dir(&work)), "nor deleted");
+    // The program ends, and the backend with it: the hold is let go of.
+    shell.job.terminate(1).expect("the job ends");
+    eventually(
+        "the directory is let go of once the program has ended",
+        || std::fs::rename(&work, ancestor.join("moved")).is_ok(),
+    );
+}
+
+/// KR-REQ-12.16: a launcher started in another directory than the one the shell reported grants
+/// nothing. Control: the directory it was reported in is granted.
+#[test]
+fn kr_req_12_16_a_launcher_started_in_another_directory_grants_nothing() {
+    let shell = Shell::reading();
+    let work = nested(&shell, "reported");
+    let elsewhere = nested(&shell, "elsewhere");
+    let answer = shell.establish_in(&work);
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &shell.typed(),
+        &answer,
+        "elsewhere",
+        &[],
+        &elsewhere,
+    );
+    let report = shell.report_from("elsewhere", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the launch itself goes through");
+    let instance = Shell::instance_of(&answer);
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and the directory is not granted"
+    );
+    let same = shell.establish_in(&work);
+    let mut again = shell.launcher(
+        &shell.executable.clone(),
+        &shell.typed(),
+        &same,
+        "same",
+        &[],
+        &work,
+    );
+    shell.report_from("same", &mut again);
+    assert!(shell.broker.host_files(Shell::instance_of(&same)).is_some());
+}
+
+/// KR-REQ-12.16: a directory converted to a junction after the launcher's path was held and before
+/// the commit is granted nothing: the commit reads the held directory's attributes again. The
+/// conversion is what a principal that may write to an empty directory can make whatever is held.
+#[test]
+fn kr_req_12_16_a_directory_converted_to_a_link_before_the_commit_grants_nothing() {
+    let shell = Shell::reading();
+    let work = nested(&shell, "converted");
+    let target = nested(&shell, "target");
+    let answer = shell.establish_in(&work);
+    let (arrived, release) = shell.backends.pause_before_committing();
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &shell.typed(),
+        &answer,
+        "converted",
+        &[],
+        &work,
+    );
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch arrives at the commit")
+        .expect("and waits there");
+    let instance = Shell::instance_of(&answer);
+    assert!(
+        shell.broker.host_files(instance).is_some(),
+        "the directory was granted when its path was walked"
+    );
+    convert_to_a_junction(&work, &target);
+    release.send(()).expect("the commit goes on");
+    let report = shell.report_from("converted", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the launch itself goes through");
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and the grant was withdrawn at the commit"
+    );
+}
