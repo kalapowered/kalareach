@@ -102,6 +102,7 @@ jobs:
           rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
             -C target-feature=+avx2 -o "$out/ggml-cpu.$extension" "$RUNNER_TEMP/standin.rs"
           cp "$out/ggml-cpu.$extension" "$out/llama.$extension"
+          printf 'cargo:rustc-link-lib=static=ggml-cpu\ncargo:rustc-link-lib=static=llama\n' > "$out/../../output"
 
       # The description process runs on every x86-64 processor that has the baseline in
       # `.cargo/config.toml` (x86-64-v3), so the llama.cpp archives it links must hold no AVX-512,
@@ -111,8 +112,8 @@ jobs:
       #
       # The check is put through archives whose contents are known before it is trusted with the
       # release's: one planted with each kind of instruction (AVX-512 on a wide register, AVX-512 on
-      # a narrow one, AVX-VNNI and AMX), which it has to refuse, and one that holds none, which it
-      # has to pass. Each is a Rust static library, so it carries a runtime's worth of ordinary code
+      # a narrow one, with and without an address-size or segment prefix before it, AVX-VNNI and
+      # AMX), which it has to refuse, and one that holds none, which it has to pass. Each is a Rust static library, so it carries a runtime's worth of ordinary code
       # beside the planted instruction. The disassembler is the
       # platform's own: `objdump` on Linux and macOS, `dumpbin /disasm` from Visual Studio on
       # Windows.
@@ -147,12 +148,14 @@ jobs:
 
           # AVX-512 is every instruction that starts with the EVEX prefix, which is byte 0x62 (in
           # 64-bit mode nothing else starts with it), however few registers it names, and any
-          # register only AVX-512 has. Data that a compiler leaves in the code section, such as the
-          # jump tables of macOS objects, is disassembled as instructions too, and begins with 0x62
-          # now and then, so an EVEX instruction counts only when the disassembler decoded it and
-          # printed its name after the bytes.
+          # register only AVX-512 has. Only an address-size (0x67) or a segment-override prefix
+          # (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65) may come before it, and both are looked through.
+          # Data that a compiler leaves in the code section, such as the jump tables of macOS
+          # objects, is disassembled as instructions too, and begins with 0x62 now and then, so an
+          # EVEX instruction counts only when the disassembler decoded it and printed its name after
+          # the bytes.
           tab=$(printf '\t')
-          avx512="^[[:space:]]*[0-9a-f]+:[[:space:]]+62( [0-9a-f]{2})*( {2,}|[ ]*$tab)[[:space:]]*[a-z]"
+          avx512="^[[:space:]]*[0-9a-f]+:[[:space:]]+((26|2e|36|3e|64|65|67) )*62( [0-9a-f]{2})*( {2,}|[ ]*$tab)[[:space:]]*[a-z]"
           avx512="$avx512|\\b(zmm[0-9]+|zmmword|[xy]mm(1[6-9]|2[0-9]|3[01])|k[0-7])\\b"
           vnni='\bvpdp(b(us|ss|su|uu)|w(ss|su|us|uu))d(s)?\b'
           amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
@@ -178,6 +181,10 @@ jobs:
               unsafe { asm!("vpaddd zmm0, zmm1, zmm2") };
               #[cfg(evex)]
               unsafe { asm!("vpternlogd ymm0, ymm1, ymm2, 0xff") };
+              #[cfg(evexaddress)]
+              unsafe { asm!(".byte 0x67, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
+              #[cfg(evexsegment)]
+              unsafe { asm!(".byte 0x64, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
               #[cfg(vnni)]
               unsafe { asm!("{{vex}} vpdpbusd ymm0, ymm1, ymm2") };
               #[cfg(amx)]
@@ -193,7 +200,7 @@ jobs:
           RUST
 
           bad=0
-          for plant in avx512:+avx512f evex:+avx512f,+avx512vl vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma; do
+          for plant in avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma; do
             name=${plant%%:*}
             rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
               -C target-feature="${plant#*:}" --cfg "$name" -o "$scratch/$name.$archive_extension" "$scratch/planted.rs"
@@ -213,17 +220,37 @@ jobs:
           done
           [ "$bad" = 0 ] || { echo "::error::the instruction check does not tell the planted archives apart"; exit 1; }
 
-          shopt -s nullglob
-          archives=("$release"/build/llama-cpp-sys-2-*/out/lib*/*."$archive_extension")
+          # Every archive the llama.cpp build left under its output directory, which holds the ones
+          # the executable links and the copies the build made on the way, and then a check that each
+          # static library the build tells cargo to link was among them.
+          archives=()
+          while IFS= read -r archive; do
+            archives+=("$archive")
+          done < <(find "$release"/build/llama-cpp-sys-2-*/out \( -name '*.a' -o -name '*.lib' \) | sort)
           [ "${#archives[@]}" -gt 0 ] || { echo "::error::no llama.cpp archive was built"; exit 1; }
+          linked=$(sed -n -E 's/^cargo::?rustc-link-lib=static=//p' "$release"/build/llama-cpp-sys-2-*/output | tr -d '\r' | sort -u)
+          [ -n "$linked" ] || { echo "::error::the llama.cpp build links no static library"; exit 1; }
+          for name in $linked; do
+            found=0
+            for archive in "${archives[@]}"; do
+              case "$(basename "$archive")" in
+                "lib$name.a"|"$name.a"|"$name.lib"|"lib$name.lib") found=1 ;;
+              esac
+            done
+            [ "$found" = 1 ] || { echo "::error::the static library $name is linked and was not inspected"; exit 1; }
+          done
           cpu=0
+          index=0
           : > "$scratch/report.txt"
           for archive in "${archives[@]}"; do
-            text="$scratch/$(basename "$archive").txt"
+            index=$((index + 1))
+            text="$scratch/archive-$index.txt"
             disassemble "$archive" "$text"
-            counts=$(past_baseline "$text") || bad=1
-            echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
-            if [ "$bad" = 1 ]; then
+            if counts=$(past_baseline "$text"); then
+              echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
+            else
+              bad=1
+              echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
               grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
             fi
             case "$(basename "$archive")" in
