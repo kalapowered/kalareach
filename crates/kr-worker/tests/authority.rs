@@ -142,15 +142,30 @@ async fn controller_client(host: &Host, generation: u64) -> LocalClient {
     client
 }
 
+/// What a refused read came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// An answer that refuses this request, on a link that is still good.
+    Request(ErrorCode),
+    /// The connection no longer speaks for the generation that holds the worker's authority: the
+    /// refusal is a failure of the link, as a controller reads it.
+    Link(ErrorCode),
+}
+
 async fn read_session(
     client: &mut LocalClient,
     session_id: SessionId,
-) -> std::result::Result<(), ErrorCode> {
-    let outcome = client
+) -> std::result::Result<(), Refused> {
+    match client
         .request(Method::SessionRead, &SessionReadParams { session_id })
         .await
-        .expect("the call reaches the worker");
-    outcome.map(|_| ()).map_err(|error| error.code)
+    {
+        Ok(outcome) => outcome
+            .map(|_| ())
+            .map_err(|error| Refused::Request(error.code)),
+        Err(error @ kr_ipc::IpcError::LinkFenced { .. }) => Err(Refused::Link(error.code())),
+        Err(error) => panic!("the call did not reach the worker: {error}"),
+    }
 }
 
 /// KR-REQ-02.05: a worker serves one controller connection at a time: a newer connection fences
@@ -171,7 +186,7 @@ async fn a_replaced_controller_connection_stops_being_served() {
         .expect("the replacement connection is served");
     assert_eq!(
         read_session(&mut first, host.session_id).await,
-        Err(ErrorCode::PermissionDenied),
+        Err(Refused::Link(ErrorCode::PermissionDenied)),
         "the fenced connection is refused at dispatch, not merely recorded as fenced"
     );
 }
@@ -191,7 +206,7 @@ async fn a_superseded_generation_cannot_dispatch_afterwards() {
         .expect("the higher generation is served");
     assert_eq!(
         read_session(&mut old, host.session_id).await,
-        Err(ErrorCode::PermissionDenied),
+        Err(Refused::Link(ErrorCode::PermissionDenied)),
         "a daemon that lost the lock cannot keep acting through its old connection"
     );
 }
@@ -204,7 +219,7 @@ async fn a_controller_that_has_not_proved_a_generation_is_refused() {
         .expect("connects");
     assert_eq!(
         read_session(&mut client, host.session_id).await,
-        Err(ErrorCode::PermissionDenied),
+        Err(Refused::Link(ErrorCode::PermissionDenied)),
         "announcing a controller is not the same as proving which generation it speaks for"
     );
 }
@@ -542,8 +557,74 @@ async fn a_second_hello_cannot_change_what_a_connection_is() {
     ));
     assert_eq!(
         read_session(&mut first, host.session_id).await,
-        Err(ErrorCode::PermissionDenied)
+        Err(Refused::Link(ErrorCode::PermissionDenied))
     );
+}
+
+/// KR-REQ-09.12: a read the daemon admitted under an authority revision this worker has installed
+/// past is refused as an ordinary refusal of authority and its link is kept: the connection still
+/// speaks for the generation that holds the worker, and only the one request lost its authority.
+/// The control for the refusals above, which end their link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_admitted_under_a_revision_the_worker_has_passed_keeps_its_link() {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
+    use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId};
+    use kr_protocol::local::ForwardedRequest;
+
+    let host = host(1).await;
+    let mut controller = controller_client(&host, 1).await;
+    controller
+        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+            environment_id: host.environment_id,
+            revision: AuthorityRevision::new(2),
+            evidence_from: 0,
+        })
+        .await
+        .expect("the worker installs the revision");
+
+    let read = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request: Request {
+            request_id: kr_protocol::ids::RequestId::new(900),
+            method: Method::SessionRead.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: ParamsValue::from_typed(&SessionReadParams {
+                session_id: host.session_id,
+            })
+            .expect("encodes"),
+        },
+        actor: ActorEnvelope {
+            actor_id: ActorId::new("local:test").expect("a principal"),
+            ingress: ActorIngress::LocalIpc,
+            device_id: Nullable::null(),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::some(AuthorityRevision::new(1)),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+        },
+        authority_deadline_boot_ms: Nullable::null(),
+        history: None,
+    }));
+    controller
+        .writer()
+        .write_message(&read)
+        .await
+        .expect("writes the read");
+    let ControlFrame::Response(response) = controller.recv().await.expect("the worker answers")
+    else {
+        panic!("a read is answered with a response");
+    };
+    let Outcome::Error(error) = response.outcome else {
+        panic!("a read admitted under a revision the worker has passed is refused");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        !error.link_fenced,
+        "the request lost its authority, not the connection: {error:?}"
+    );
+    read_session(&mut controller, host.session_id)
+        .await
+        .expect("the connection is still served");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -656,7 +737,7 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
     );
     assert_eq!(
         read_session(&mut first, host.session_id).await,
-        Err(ErrorCode::PermissionDenied),
+        Err(Refused::Link(ErrorCode::PermissionDenied)),
         "and its next request says why"
     );
 }
