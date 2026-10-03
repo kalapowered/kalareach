@@ -52,7 +52,7 @@ what the sequence says.
 `fixtures/terminal/classes.json` holds one case per row with the classes, the spans and the exact
 bytes.
 
-Some rows are worth spelling out.
+Some rows are spelled out here.
 
 **Named C0 exceptions.** NUL and DEL are `D`. Both are stream padding that every terminal discards,
 they appear constantly, and classifying them as `X` would produce a diagnostic per occurrence
@@ -83,7 +83,7 @@ things: popping a title nothing saved leaves the current one alone rather than c
 **A parameter that selects an operation is never reduced.** Counts and coordinates are bounded by
 what the grid can act on, because a cursor movement cannot do more than fill the screen. An erase or
 tab-clear parameter is not a count: at every value it is a different operation, so reducing it would
-quietly do something else. Those values are checked against their own set instead, and a value
+silently do something else. Those values are checked against their own set instead, and a value
 outside it is `X`.
 
 **Keyboard negotiation is checked before it travels.** Only `modifyOtherKeys` resource 4 at level 0,
@@ -194,7 +194,7 @@ nothing, and the sequence becomes an extension.
 
 A control byte inside a prelude is consumed and ignored rather than abandoning the sequence, so
 `CSI 5 NUL ; 3 H` still moves the cursor to row 5, column 3. kr-vt/1 does not execute the embedded
-control where a VT terminal would; the parameters are what matter, and losing them to a stray NUL
+control where a VT terminal would; the parameters are what count, and losing them to a stray NUL
 would be worse.
 
 ### tmux passthrough
@@ -416,7 +416,7 @@ A cursor report follows origin mode. With DECOM set the application is working i
 that starts at the margins, so a report in absolute screen coordinates would send it to the wrong
 place.
 
-The mode reports are where honesty matters most. Mode 2027 and mode 2048 report status `0`, not
+The mode reports are where accuracy is most needed. Mode 2027 and mode 2048 report status `0`, not
 recognised, so an application can fall back instead of assuming. DECCOLM reports status `4`,
 permanently reset, because the geometry owner decides the column count and nothing the application
 sends will change it.
@@ -609,8 +609,8 @@ joined, the screen buffer changed, the geometry changed, the client's base fell 
 window, retained rows were evicted, or what changed is larger than one bounded update.
 
 A projected client is reset *in band*: the reset and the fresh snapshot arrive on the stream it is
-already reading, so it needs no round trip to ask for what it has been given. That matters most for
-a geometry change, which can happen while nothing is printing: a client told out of band would show
+already reading, so it needs no round trip to ask for what it has been given. That counts most for a
+geometry change, which can happen while nothing is printing: a client told out of band would show
 the old size until it got round to asking. A direct attachment has no such event and is told to
 resynchronise.
 
@@ -682,7 +682,7 @@ the live screen, at a parser-ground boundary like every other transition into fo
 
 An attachment that is shown the live screen and no retained content beyond it cannot place its
 window in the history at all. That is section 10's live-screen exception: the rows above the screen
-are content the exception never reached, so the report is refused rather than quietly answered with
+are content the exception never reached, so the report is refused rather than silently answered with
 the live screen, which would leave the client drawing as though it had moved. It can still move its
 window down or across the live screen, which is its own.
 
@@ -743,11 +743,11 @@ Ordinary output is one delta per batch, and never a repaint. A row larger than a
 and marked truncated rather than dropped, so a reader can get past it, and the marker is what makes
 the degradation explicit rather than a short row that looks like the application's.
 
-Every message is measured whole before it is sent, rows and state together, against the frame's
-1 MiB and the encoding's 65,536 values. A delta carries the state that changed with its rows - a
-hyperlink change repeats its target, a title stack can hold twenty of them - so rows that fit a page
-say nothing about what the rest of the message adds. One that does not fit is not sent: the client is
-given a fresh snapshot instead, which pages.
+Every message is measured whole before it is sent, rows and state together, against the frame's 1
+MiB and the encoding's 65,536 values. A delta carries the state that changed with its rows (a
+hyperlink change repeats its target, a title stack can hold twenty of them) so rows that fit a page
+say nothing about what the rest of the message adds. One that does not fit is not sent: the client
+is given a fresh snapshot instead, which pages.
 
 A whole screen is the one message a client cannot use part of, because a client holding some of the
 pages holds no screen. So the installation is measured against that subscriber's own send queue, and
@@ -785,8 +785,8 @@ inside, runs the destination cannot place, soft-wrap markers a drawn row cannot 
 session had already shortened, the scroll region a window could not carry, and the pending wrap,
 which no cursor placement can reproduce.
 
-One thing a projection deliberately does not make identical: an indexed colour nothing overrode.
-The snapshot carries the session's dynamic colours and every override an application made, and the
+A projection deliberately does not make one thing identical: an indexed colour nothing overrode. The
+snapshot carries the session's dynamic colours and every override an application made, and the
 renderer installs those; the rest of the 256 come from the destination's own configuration, which is
 exactly what a terminal being forwarded the stream would draw them in. Two destinations with
 different themes therefore agree about every colour the session set and keep their own for the ones
@@ -835,10 +835,9 @@ and Windows.
 
 So each figure below is the largest that record is on any supported host, and
 `crates/kr-term/src/layout.rs` asserts each one against the type the library really uses. A host
-whose records are smaller reserves the figure anyway, which is the safe direction: the session
-holds room it never needs and the budget stays one number. A host, a toolchain or a library
-revision whose *record* grew past its figure fails to build, rather than quietly reserving less
-than it allocates.
+whose records are smaller reserves the figure anyway, which is the safe direction: the session holds
+room it never needs and the budget stays one number. A host, a toolchain or a library revision whose
+*record* grew past its figure fails to build, rather than silently reserving less than it allocates.
 
 What those assertions establish is the size of each record, and no more. They say nothing about
 the room a vector kept after it was shortened, about what an allocator adds around an allocation,
@@ -912,11 +911,11 @@ read how much of it there is, so a session that reflowed into one column keeps a
 the rows that reflow produced until the next reflow builds a new one. That room is bounded by the
 geometry the session was admitted at and the rows its cache may hold.
 
-Two things the figures below cannot see, then. That room is one. The other is a cell a wide cell
+The figures below cannot see two things, then. That room is one. The other is a cell a wide cell
 covers: a row is read through the cells it shows, and a column a wide cell covers is not one of
-them, so a cell left under a wide one by a scroll that copied it there keeps whatever it held and
-no measurement finds it. Both are properties of how the grid library stores a row rather than of
-what the session is doing, and both are bounded by a geometry that was admitted.
+them, so a cell left under a wide one by a scroll that copied it there keeps whatever it held and no
+measurement finds it. Both are properties of how the grid library stores a row rather than of what
+the session is doing, and both are bounded by a geometry that was admitted.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
@@ -1067,7 +1066,7 @@ What the measurements cannot see at all is the room a shortened vector keeps, de
 
 What the budget records for the row cache is what the rows actually cost, not what they are allowed
 to cost. Recording the bound instead would make a session that is over its cache look exactly like
-one that is at it, and the reading that matters most is the one taken while the cache is too big.
+one that is at it, and the reading that counts most is the one taken while the cache is too big.
 While eviction catches up, `FeedOutcome::resident_pressure` says so on every feed. It is a
 degradation rather than a failure, and it is reported there rather than only as a diagnostic,
 because diagnostics are rate limited and this is the one a caller must not miss.
@@ -1247,11 +1246,11 @@ that would have answered a moment later. Treating silence as "this feature is ab
 capability record from an absence of information, and the record then outlives the attach. So the
 attach fails with `TERMINAL_PROBE_FAILED`, and that terminal belongs on the `--no-probe` path with a
 saved or conservative profile. A profile that does not need a question omits it before anything is
-transmitted, which is the honest way to not ask.
+transmitted, which is the plain way not to ask.
 
 The whole exchange has one second. A missing terminator fails the attach with
 `TERMINAL_PROBE_FAILED`, restores the outer terminal's modes and reports the failure. It never gives
-up quietly and starts forwarding on the same stream, because a late answer on that stream would
+up silently and starts forwarding on the same stream, because a late answer on that stream would
 reach the application as keystrokes.
 
 After a failure that stream is not clean any more. Retrying needs a fresh input context, and
@@ -1280,10 +1279,11 @@ source, and a second attachment from a differently themed terminal is shown what
 `session.create` is where the choice is made. Its `palette` field names either a preset,
 `{"preset": "light"}` or `{"preset": "dark"}`, or the colours a client learned from its own bounded
 probe of the terminal the person is sitting at, `{"probe": {"foreground": …, "background": …}}`. A
-request whose `palette` is null takes the profile default; the field is always present. The host carries the field to the worker in
-the launch specification and applies it between opening the session and starting its shell, which
-is the only moment it can be applied honestly: the first byte the shell writes is already a screen
-somebody could be looking at, and a palette chosen then would be a change rather than a provenance.
+request whose `palette` is null takes the profile default; the field is always present. The host
+carries the field to the worker in the launch specification and applies it between opening the
+session and starting its shell, which is the only moment it can be applied truthfully: the first
+byte the shell writes is already a screen somebody could be looking at, and a palette chosen then
+would be a change rather than a provenance.
 
 An invisible creation cannot name probed colours. It has no terminal, so a provenance recorded as a
 client's measurement would be a measurement nobody took; the host refuses it with
