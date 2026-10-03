@@ -221,12 +221,44 @@ jobs:
           amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
 
           # Prints how many instructions of each kind a disassembly holds, and fails when any does.
+          #
+          # On Windows, MSVC compiles some standard-library code, such as a population count over a
+          # bit set, with a path for processors that have AVX-512 and another for those that do not,
+          # and chooses at run time from the C runtime's `__isa_available`. A function that compares
+          # it with 6 (AVX-512) or more before its AVX-512 instructions never runs them on a
+          # processor without them, so it is counted apart, as `guarded`, and does not fail the
+          # check. Every other AVX-512 instruction, and every AVX-VNNI and AMX one, still does.
+          # The disassembly lists one function at a time, with a blank line between them.
           past_baseline() {
-            local found_avx512 found_vnni found_amx
-            found_avx512=$(grep -c -E "$avx512" "$1" || true)
+            local found_avx512 found_vnni found_amx found_guarded=0 unguarded="$1" result
+            if [ "$RUNNER_OS" = Windows ]; then
+              unguarded="$1.unguarded"
+              awk -v kept="$unguarded" -v held="$1.guarded" '
+                function flush(   i, destination) {
+                  if (lines == 0) return
+                  destination = guard ? held : kept
+                  for (i = 1; i <= lines; i++) print text[i] > destination
+                  print "" > destination
+                  lines = 0
+                  guard = 0
+                }
+                /^[[:space:]]*$/ { flush(); next }
+                {
+                  text[++lines] = $0
+                  if ($0 ~ /cmp .*\[__isa_available[^]]*\],[6-9]/) guard = 1
+                }
+                END { flush() }
+              ' "$1"
+              : >> "$unguarded"
+              : >> "$1.guarded"
+              found_guarded=$(grep -c -E "$avx512" "$1.guarded" || true)
+            fi
+            found_avx512=$(grep -c -E "$avx512" "$unguarded" || true)
             found_vnni=$(grep -c -E "$vnni" "$1" || true)
             found_amx=$(grep -c -E "$amx" "$1" || true)
-            echo "avx512=$found_avx512 avx-vnni=$found_vnni amx=$found_amx"
+            result="avx512=$found_avx512 avx-vnni=$found_vnni amx=$found_amx"
+            [ "$found_guarded" = 0 ] || result="$result guarded=$found_guarded"
+            echo "$result"
             [ "$found_avx512$found_vnni$found_amx" = 000 ]
           }
 
@@ -255,6 +287,15 @@ jobs:
               unsafe { asm!("vpaddd ymm0, ymm1, ymm2", "vfmadd231ps ymm0, ymm1, ymm2") };
               #[cfg(data)]
               unsafe { asm!(".byte 0x64, 0x62, 0xff, 0xff, 0xff, 0xff, 0x67, 0x62, 0xff, 0xff, 0xff") };
+              #[cfg(guarded)]
+              unsafe {
+                  asm!(
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "jl 2f",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
           }
 
           #[panic_handler]
@@ -264,21 +305,29 @@ jobs:
           RUST
 
           bad=0
-          for plant in avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2; do
+          plants="avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2"
+          # The run-time choice by `__isa_available` exists only where MSVC's runtime does.
+          if [ "$RUNNER_OS" = Windows ]; then plants="$plants guarded:+avx512f"; fi
+          for plant in $plants; do
             name=${plant%%:*}
             rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
               -C target-feature="${plant#*:}" --cfg "$name" -o "$scratch/$name.$archive_extension" "$scratch/planted.rs"
             disassemble "$scratch/$name.$archive_extension" "$scratch/$name.txt"
             # A disassembler that read nothing would accept everything.
             [ "$(wc -l < "$scratch/$name.txt")" -ge 1000 ] || { echo "::error::the disassembly of $name holds no code"; exit 1; }
-            counts=$(past_baseline "$scratch/$name.txt" || true)
-            if [ "$name" = baseline ] || [ "$name" = data ]; then
-              verdict=accepted
-              [ "$counts" = "avx512=0 avx-vnni=0 amx=0" ] || verdict=WRONGLY-REFUSED
-            else
-              verdict=refused
-              [ "$counts" != "avx512=0 avx-vnni=0 amx=0" ] || verdict=WRONGLY-ACCEPTED
-            fi
+            if counts=$(past_baseline "$scratch/$name.txt"); then clean=1; else clean=0; fi
+            case "$name" in
+              baseline|data|guarded)
+                verdict=accepted
+                [ "$clean" = 1 ] || verdict=WRONGLY-REFUSED
+                # The guarded plant has to be seen as guarded, not missed.
+                if [ "$name" = guarded ]; then
+                  case "$counts" in *guarded=1) ;; *) verdict=WRONGLY-UNSEEN ;; esac
+                fi ;;
+              *)
+                verdict=refused
+                [ "$clean" = 0 ] || verdict=WRONGLY-ACCEPTED ;;
+            esac
             echo "planted $name: $verdict ($counts)"
             case "$verdict" in WRONGLY-*) bad=1 ;; esac
           done
