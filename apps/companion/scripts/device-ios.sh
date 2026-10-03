@@ -179,7 +179,7 @@ baseline() {
   run_check count count > "$work/checks/count.out" || die "the count did not report"
   [ "$(fact "$work/checks/probe-count.txt" ok)" = 1 ] || die "a keychain query was refused, so the baseline is unknown"
   [ "$(fact "$work/checks/probe-count.txt" total)" = 0 ] || die "the groups are not empty: stop here and ask"
-  echo "baseline=empty" >> "$record"
+  echo "baseline=empty" >> "$record" || die "the baseline could not be written down: the session stops here"
 }
 
 sweep_once() {
@@ -262,15 +262,25 @@ end_signing() {
   return 1
 }
 
+# The start time the signing command wrote about itself (see with_signing_keychain), taken from its file when
+# the file names the command's number, whenever it is not yet known: the command may write it late.
+load_signing_identity() {
+  local ident_pid ident_start
+  [ -z "$signing_start" ] || return 0
+  IFS=' ' read -r ident_pid ident_start 2>/dev/null < "$signing_ident" || return 1
+  [ "$ident_pid" = "$signing_child" ] || return 1
+  signing_start=$ident_start
+}
+
 # Whether the signing command is still the process this shell started, by its number, its state and the
-# start time the command wrote about itself (see with_signing_keychain). 0: it is. 1: it is not, because it has ended or
-# the number is another process's, which a readable and different start time shows. 2: not known, because
-# its state or start time cannot be read: a read that fails is no answer, and nothing is signalled on it.
-# Bash can collect a command that has ended before this shell waits for it, so the number alone is never
-# signalled.
+# start time the command wrote about itself. 0: it is. 1: it is not, because it has ended or the number is
+# another process's, which a readable and different start time shows. 2: not known, because its identity,
+# state or start time cannot be read: a read that fails is no answer, and nothing is signalled on it. Bash
+# can collect a command that has ended before this shell waits for it, so the number alone is never signalled.
 signing_command_state() {
   local stat now
   kill -0 "$signing_child" 2>/dev/null || return 1
+  load_signing_identity
   [ -n "$signing_start" ] || return 2
   stat=$(ps -o stat= -p "$signing_child" 2>/dev/null | tr -d ' ')
   case $stat in Z*) return 1 ;; '') return 2 ;; esac
@@ -310,6 +320,7 @@ signing_interrupted() { # <exit status>
   [ -n "$signing_child" ] && stop_signing_command
   signing_child=""
   signing_start=""
+  rm -rf "$signing_ident" "$signing_ident.part"
   end_signing
   exit "$1"
 }
@@ -343,7 +354,7 @@ with_signing_keychain() { # <command...>
   fi
   say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
   signing_paths=()
-  local each status waited ident_pid
+  local each status waited
   while IFS= read -r each; do signing_paths+=("$each"); done <<< "$signing_before"
   signing_ended=0
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
@@ -352,7 +363,9 @@ with_signing_keychain() { # <command...>
     # a TERM stops it; a TERM that comes before that act is sent again by the handler. Its second act is to
     # write its own number and start time into a file, from inside: the identity that is checked before any
     # signal is the command's own, never one that this shell reads from the process table after the command
-    # may have ended and its number been taken by another process. A command that cannot write it does not run.
+    # may have ended and its number been taken by another process. A command that cannot write it does not run,
+    # and one that writes it late is signalled from then on: the handlers are installed at once, and the
+    # identity is read again whenever it is not known.
     signing_ident="$work/signing.ident"
     rm -rf "$signing_ident" "$signing_ident.part"
     if [ -e "$signing_ident" ] || [ -e "$signing_ident.part" ]; then
@@ -364,18 +377,16 @@ with_signing_keychain() { # <command...>
           && mv "$signing_ident.part" "$signing_ident" || exit 70
         exec "$@" ) &
       signing_child=$!
+      signing_start=""
+      trap 'signing_interrupted 130' INT
+      trap 'signing_interrupted 143' TERM
+      trap 'signing_interrupted 129' HUP
       waited=0
       until [ -s "$signing_ident" ] || ! kill -0 "$signing_child" 2>/dev/null || [ "$waited" -ge 100 ]; do
         sleep 0.02
         waited=$((waited + 1))
       done
-      ident_pid=""
-      signing_start=""
-      IFS=' ' read -r ident_pid signing_start 2>/dev/null < "$signing_ident"
-      [ "$ident_pid" = "$signing_child" ] || signing_start=""
-      trap 'signing_interrupted 130' INT
-      trap 'signing_interrupted 143' TERM
-      trap 'signing_interrupted 129' HUP
+      load_signing_identity
       wait "$signing_child"
       status=$?
       trap '' INT TERM HUP
@@ -577,7 +588,8 @@ record_last() { printf '%s\n' "$record_text" | sed -n "s/^$1=//p" | tail -1; }
 retire_driver() { # <pid>
   local started
   [ -f "$record" ] || return 0
-  started=$(sed -n "s/^runner=$1|\([^|]*\)|.*/\1/p" "$record" | tail -1)
+  read_record || { say "THE RECORD COULD NOT BE READ: the end of the test run $1 is not written down"; return 0; }
+  started=$(printf '%s\n' "$record_text" | sed -n "s/^runner=$1|\([^|]*\)|.*/\1/p" | tail -1)
   [ -n "$started" ] || return 0
   echo "retired=$1|$started" >> "$record"
 }
@@ -675,9 +687,8 @@ finish_session() {
   say "ending the session"
   local keep_app=0
   if ! read_record; then
-    say "THE RECORD COULD NOT BE READ, so whether a sweep is owed is not known: the application stays installed, and cleanup decides"
-    keep_app=1
-    unclean=1
+    say "THE RECORD COULD NOT BE READ, so whether a sweep is owed is not known: nothing is uninstalled or removed, and cleanup decides"
+    exit 3
   elif record_has '^baseline=empty$'; then
     copy_shots "${session_name:-session}"
     [ "${session_name:-}" = s0 ] && check_shot_proof "$shots/s0"
