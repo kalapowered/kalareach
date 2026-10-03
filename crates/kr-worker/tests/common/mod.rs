@@ -409,6 +409,54 @@ impl Drop for Sleeper {
     }
 }
 
+/// A real child process that does nothing until it is ended, and that ends with the test that
+/// started it: `ping.exe` waiting on the machine's own address, which every Windows machine has.
+///
+/// It stands in for a program this host started and can name in full: a terminal, a backend. It is
+/// started under the lock every start of a process takes while a launch's streams may be
+/// inheritable, so it holds none of them.
+#[cfg(windows)]
+pub struct Sleeper {
+    child: tokio::process::Child,
+}
+
+#[cfg(windows)]
+impl Sleeper {
+    /// Starts the process.
+    pub fn start() -> Self {
+        let _inheriting = kr_worker::windows::launch::inheriting();
+        let child = tokio::process::Command::new(
+            std::path::Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+                .join("System32")
+                .join("ping.exe"),
+        )
+        .args(["-n", "600", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the process starts");
+        Self { child }
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Sleeper {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::DerefMut for Sleeper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
 /// One end of a connection to a launch's endpoint: a Unix socket on Unix and a named pipe on
 /// Windows, which is what this host binds on each.
 #[cfg(unix)]

@@ -2245,18 +2245,30 @@ fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
 }
 
 /// A launch profile whose backend is a process that sleeps, for the tests about the launch itself.
-#[cfg(unix)]
+///
+/// On Windows it is `ping.exe` waiting on the machine's own address, which every machine has.
 fn sleeping_profile() -> kr_protocol::broker::LaunchProfile {
     kr_protocol::broker::LaunchProfile {
         profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
         environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
         binary: kr_protocol::broker::BinaryIdentity {
-            resolved_path: "/bin/sleep".to_owned(),
+            resolved_path: if cfg!(windows) {
+                format!(
+                    r"{}\System32\ping.exe",
+                    std::env::var("SystemRoot").expect("a system directory")
+                )
+            } else {
+                "/bin/sleep".to_owned()
+            },
             digest: Digest256::from_bytes([3; 32]),
             version: "1".to_owned(),
             distribution: "system".to_owned(),
         },
-        arguments: vec!["600".to_owned()],
+        arguments: if cfg!(windows) {
+            vec!["-n".to_owned(), "600".to_owned(), "127.0.0.1".to_owned()]
+        } else {
+            vec!["600".to_owned()]
+        },
         authentication: kr_protocol::broker::AuthenticationState::Authenticated,
         mode: IntegrationMode::Gateway,
         resolved_at: TimestampMs::new(1),
@@ -2271,8 +2283,6 @@ fn sleeping_profile() -> kr_protocol::broker::LaunchProfile {
 /// waits for it before it returns, removes the credential it wrote, and the broker gives back the
 /// instance and the conversation. The same launch then goes through once the name is free, which it
 /// would not if the failed one had kept its reservation.
-// Unix only: Windows refuses the launch before anything starts, which the next test covers.
-#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothing_running() {
     let directory = private_directory();
@@ -2280,12 +2290,8 @@ async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothi
     let occupied = directory.join("registration");
     std::fs::create_dir(&occupied).expect("the registration's name is taken");
     std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
+    let mut gateway = launching_bind(Arc::clone(&broker), &directory, launch_for(None, None))
+        .expect("the endpoint binds");
     let intent = broker
         .prepare_launch(
             sleeping_profile(),
@@ -2472,10 +2478,97 @@ async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-12.02 and KR-REQ-07.61: a launch that succeeds leaves its process, and what that process
+/// started, running, and in the jobs that hold them: the session's, which ends them with the
+/// session, and the agent's own, which lists them. A backend outside them would outlive a worker
+/// that died.
+#[cfg(windows)]
+#[tokio::test]
+async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a session job"));
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds")
+    .in_session(Arc::clone(&session));
+    let sleeping = sleeping_profile();
+    let forking = kr_protocol::broker::LaunchProfile {
+        binary: kr_protocol::broker::BinaryIdentity {
+            resolved_path: format!(
+                r"{}\System32\cmd.exe",
+                std::env::var("SystemRoot").expect("a system directory")
+            ),
+            ..sleeping.binary.clone()
+        },
+        arguments: vec![
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "ping -n 600 127.0.0.1 > NUL".to_owned(),
+        ],
+        ..sleeping
+    };
+    let intent = broker
+        .prepare_launch(forking, kr_worker::broker::ForegroundMark::idle(4), None)
+        .expect("the launch is prepared");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the launch succeeds");
+    let agent_job = kr_worker::windows::job::agent_job(&launched.process)
+        .expect("the launch's job is kept for the broker");
+    let backend = u32::try_from(launched.process.pid.get()).expect("a process");
+    // The backend started a process of its own, which both jobs list.
+    let started = std::time::Instant::now();
+    let forked = loop {
+        let listed = agent_job
+            .process_ids()
+            .expect("the job lists its processes");
+        if let Some(forked) = listed.iter().copied().find(|pid| *pid != backend) {
+            break forked;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the backend started a process within the liveness deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let forked_identity = kr_ipc::identity::process_start_identity(forked).expect("an identity");
+    let running = (
+        kr_ipc::identity::process_state(&launched.process),
+        kr_ipc::identity::process_state(&forked_identity),
+    );
+    let in_session = session
+        .process_ids()
+        .expect("the session job lists its processes");
+    let _ = launched.child.kill();
+    let _ = agent_job.terminate(1);
+    let _ = launched.child.wait();
+    assert_eq!(
+        running,
+        (
+            kr_ipc::identity::ProcessState::Running,
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the backend and what it started are running after the launch"
+    );
+    assert!(
+        in_session.contains(&backend) && in_session.contains(&forked),
+        "and both are held by the session's job: {in_session:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-12.02: a launch that fails after its process started keeps its conversation until that
 /// process is stopped, so no other launch can take the conversation while the failed one's process
 /// still runs.
-#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_02_a_failed_launch_holds_its_conversation_until_its_process_is_stopped() {
     let directory = private_directory();
@@ -2483,12 +2576,8 @@ async fn kr_req_12_02_a_failed_launch_holds_its_conversation_until_its_process_i
     let occupied = directory.join("registration");
     std::fs::create_dir(&occupied).expect("the registration's name is taken");
     std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
+    let mut gateway = launching_bind(Arc::clone(&broker), &directory, launch_for(None, None))
+        .expect("the endpoint binds");
     let (arrived, release) = gateway.pause_before_cleanup();
     let intent = broker
         .prepare_launch(
@@ -2569,18 +2658,12 @@ async fn kr_req_12_02_a_failed_launch_holds_its_conversation_until_its_process_i
 /// A second launch that went ahead would replace the registration the running process was told
 /// about, and one that failed would give back the instance the first is still running as, leaving a
 /// live process nothing supervises.
-// Unix only: Windows refuses every launch before anything starts, which the next test covers.
-#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_02_a_second_launch_for_a_live_instance_starts_nothing_and_keeps_the_first() {
     let directory = private_directory();
     let broker = broker_for_launch();
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
+    let mut gateway = launching_bind(Arc::clone(&broker), &directory, launch_for(None, None))
+        .expect("the endpoint binds");
     let intent = broker
         .prepare_launch(
             sleeping_profile(),
@@ -2652,6 +2735,21 @@ fn launch_for(
     }
 }
 
+/// Binds the endpoint of a launch this test makes: where a launch is held by the session's job, as
+/// it is on Windows, the gateway is given one, which ends what it launched when the test lets it go.
+fn launching_bind(
+    broker: Arc<Broker>,
+    directory: &std::path::Path,
+    launch: kr_worker::broker::NativeLaunch,
+) -> kr_worker::broker::Result<kr_worker::broker::NativeGateway> {
+    let gateway = kr_worker::broker::NativeGateway::bind(broker, directory, launch)?;
+    #[cfg(windows)]
+    let gateway = gateway.in_session(Arc::new(
+        kr_worker::windows::job::SessionJob::create().expect("a session job"),
+    ));
+    Ok(gateway)
+}
+
 /// The hello a bridge writes, as hexadecimal over the credential this launch generated.
 fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<u8> {
     let credential: String = CREDENTIAL
@@ -2679,12 +2777,8 @@ fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<
 async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connection() {
     let directory = private_directory();
     let broker = broker_for_launch();
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
+    let mut gateway = launching_bind(Arc::clone(&broker), &directory, launch_for(None, None))
+        .expect("the endpoint binds");
 
     // The host starts the forwarder, through the same composition production uses. Everything the
     // forwarder needs is published by that call: the endpoint it connects to, the private exchange
@@ -4316,7 +4410,7 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
 /// behind a write that cannot finish. The connection's own supervision ends it: the writers are
 /// given the teardown deadline and no longer, both readers finish, every identifier this host was
 /// holding is given back, and the terminal is told about each one exactly once.
-// Unix only: Windows has no managed gateway.
+// Unix only: it fills a socket's buffer, which a named pipe does not have in the same measure.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_writers_finish() {
@@ -5268,7 +5362,8 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
 
 /// KR-REQ-07.67: an intentional native exit stops the dedicated backend, and an attachment closing
 /// does not.
-// Unix only: a backend is stopped by a signal, and on Windows the session's job object ends it.
+// Unix only: a process this test did not launch is stopped by a signal. A backend this host
+// launched on Windows is stopped through its job, which `windows.rs` proves.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
@@ -5312,8 +5407,6 @@ async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
 /// The backend of this instance is not one this host dedicated, so nothing is claimed or
 /// terminated as owned, which is section 7's other half. The grace period itself is proved against
 /// a real child process above, and a live dedicated backend below.
-// Unix only: Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_closing_does_not() {
     for exits in [true, false] {
@@ -5329,14 +5422,9 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
         let gateway =
             kr_worker::broker::NativeGateway::bind(Arc::clone(&broker), &directory, launch)
                 .expect("the endpoint binds");
-        let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone()
-        else {
-            panic!("this platform prefers a private socket");
-        };
+        let address = gateway.address().clone();
         let bridging = tokio::spawn(async move {
-            let mut stream = tokio::net::UnixStream::connect(&path)
-                .await
-                .expect("the bridge connects");
+            let mut stream = common::connect_to(&address).await;
             stream
                 .write_all(&hello_bytes(&running, &[]))
                 .await
@@ -5429,8 +5517,6 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
 /// stopped, because what is watched is the process rather than the socket. The backend is a child
 /// the broker started and recorded by the identity the kernel gave it, and it is that recorded
 /// child that is stopped.
-// Unix only: Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_it() {
     let directory = private_directory();
@@ -5439,7 +5525,7 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
     let terminal_pid = terminal.id().expect("the terminal has an identifier");
     let terminal_identity = kr_ipc::identity::process_start_identity(terminal_pid)
         .expect("the kernel names the terminal");
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
+    let mut gateway = launching_bind(
         Arc::clone(&broker),
         &directory,
         launch_for(None, Some(terminal_identity)),
@@ -5525,8 +5611,6 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
 /// A process can close its socket and stay alive. When the socket closes, the attachment is
 /// reported as detached, the process continues running, and the terminal supervision continues
 /// watching the terminal until its exit stops the dedicated backend.
-// Unix only: Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal_exits() {
     let directory = private_directory();
@@ -5535,7 +5619,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     let terminal_pid = terminal.id().expect("the terminal has an identifier");
     let terminal_identity = kr_ipc::identity::process_start_identity(terminal_pid)
         .expect("the kernel names the terminal");
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
+    let mut gateway = launching_bind(
         Arc::clone(&broker),
         &directory,
         launch_for(None, Some(terminal_identity)),
@@ -5637,7 +5721,6 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
 
 /// A real child process that does nothing until it is ended, on the internal disk, and that ends
 /// with its test.
-#[cfg(unix)]
 fn sleeper() -> common::Sleeper {
     common::Sleeper::start()
 }
