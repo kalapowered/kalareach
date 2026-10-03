@@ -52,7 +52,13 @@ echo cwd=%CD%\r\n\
 ) > \"%REPORT%.part\"\r\n\
 move /y \"%REPORT%.part\" \"%REPORT%\" > NUL\r\n\
 if defined EXIT_WITH exit /b %EXIT_WITH%\r\n\
-ping -n 600 127.0.0.1 > NUL\r\n";
+if defined AFTER_GONE call :after\r\n\
+ping -n 600 127.0.0.1 > NUL\r\n\
+exit /b 0\r\n\
+:after\r\n\
+if not exist \"%AFTER_GONE%\" ping -n 2 127.0.0.1 > NUL & goto after\r\n\
+echo survived > \"%AFTER_DONE%\"\r\n\
+exit /b 0\r\n";
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
@@ -945,6 +951,71 @@ fn kr_req_12_02_a_launcher_gone_before_it_is_confirmed_leaves_no_suspended_progr
             kr_ipc::identity::process_state(&identity),
             kr_ipc::identity::ProcessState::Ended
         )
+    });
+}
+
+/// KR-REQ-12.02: a launcher that stops after it created its program and before the backend has
+/// looked at it leaves no program suspended: the program ends with the launcher, whatever the
+/// backend does or does not do next. The backend is held where it has been told the program's name
+/// and not yet shown it, so nothing of the host can end the program for it. Control: the next case,
+/// in which a launcher that is not stopped has its program started and that program outlives it.
+#[test]
+fn kr_req_12_02_a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_program() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let (arrived, release) = shell.backends.pause_before_showing();
+    let mut launcher = shell.launch(&answer, "unshown", &[]);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch arrives before its program is shown")
+        .expect("and waits there");
+    let before = shell
+        .job
+        .process_ids()
+        .expect("the shell's job lists its processes");
+    assert_eq!(
+        before.len(),
+        2,
+        "the shell's job holds the launcher and the program it created: {before:?}"
+    );
+    launcher.kill().expect("the launcher is ended");
+    let _ = launcher.wait();
+    eventually(
+        "the program nobody can start is ended with the launcher",
+        || shell.job.process_ids().is_ok_and(|held| held.is_empty()),
+    );
+    let _ = release.send(());
+}
+
+/// KR-REQ-12.02, the control of the case above: a program a launcher started is not ended with the
+/// launcher. Once the program is running the launcher is ended from outside, and the program, which
+/// waits for that, still writes what it was waiting to write. The program is started after the
+/// launcher has let go of its job, so there is no moment at which it runs and the launcher's end
+/// would end it.
+#[test]
+fn kr_req_12_02_a_program_that_is_started_outlives_the_launcher_that_started_it() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let gone = shell.reports.join("launcher.gone");
+    let survived = shell.reports.join("survived");
+    let mut launcher = shell.launch(
+        &answer,
+        "outlives",
+        &[
+            ("AFTER_GONE", &gone.display().to_string()),
+            ("AFTER_DONE", &survived.display().to_string()),
+        ],
+    );
+    let report = shell.report_from("outlives", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the launch was committed");
+    // The launcher lets the program's job go before it starts the program, so a program that has
+    // reported is one the launcher's end no longer ends.
+    launcher.kill().expect("the launcher is ended");
+    let _ = launcher.wait();
+    std::fs::write(&gone, b"gone").expect("the program is told the launcher is gone");
+    eventually("the program wrote after the launcher was gone", || {
+        survived.exists()
     });
 }
 

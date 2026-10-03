@@ -720,7 +720,10 @@ fn exec(executable: &Path, vector: &[OsString], route: Route<'_>) -> std::proces
     })
 }
 
-/// Runs the program and ends with its exit code, where a process cannot be replaced in place.
+/// Runs the program and ends with its whole exit code, where a process cannot be replaced in place.
+///
+/// A process's code here is 32 bits, which a `std::process::ExitCode` cannot hold, so this process
+/// ends with it directly rather than returning it.
 #[cfg(not(unix))]
 fn exec(executable: &Path, vector: &[OsString], route: Route<'_>) -> std::process::ExitCode {
     let arguments = vector.get(1..).unwrap_or_default();
@@ -728,11 +731,9 @@ fn exec(executable: &Path, vector: &[OsString], route: Route<'_>) -> std::proces
     command.args(arguments);
     environment(&mut command, route);
     match command.status() {
-        Ok(status) => std::process::ExitCode::from(
-            status
-                .code()
-                .and_then(|code| u8::try_from(code).ok())
-                .unwrap_or(crate::cli::EXIT_FAILURE),
+        Ok(status) => status.code().map_or_else(
+            || std::process::ExitCode::from(crate::cli::EXIT_FAILURE),
+            |code| std::process::exit(code),
         ),
         Err(error) => {
             crate::report(&format!("{} cannot be run: {error}", executable.display()));
