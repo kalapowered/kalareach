@@ -169,8 +169,9 @@ jobs:
       # The check is put through archives whose contents are known before it is trusted with the
       # release's: one planted with each kind of instruction (AVX-512 on a wide register, AVX-512 on
       # a narrow one, with and without an address-size or segment prefix before it, AVX-VNNI and
-      # AMX), which it has to refuse, and one that holds none, which it has to pass. Each is a Rust static library, so it carries a runtime's worth of ordinary code
-      # beside the planted instruction. The disassembler is the
+      # AMX), which it has to refuse, and two that hold none, one of them with bytes that only look
+      # like an instruction, which it has to pass. Each is a Rust static library, so it carries a
+      # runtime's worth of ordinary code beside the planted instruction. The disassembler is the
       # platform's own: `objdump` on Linux and macOS, `dumpbin /disasm` from Visual Studio on
       # Windows.
       - name: Refuse instructions past the baseline in the description process
@@ -192,14 +193,16 @@ jobs:
           fi
 
           # Writes the disassembly of one archive, with each instruction's bytes, lower case and
-          # without symbol names or comments, to a text file. GNU objdump wraps an instruction of
-          # more than seven bytes onto a second line unless it is told the width.
+          # without symbol names, comments or the lines GNU objdump marks `(bad)` where it could not
+          # decode bytes (data a compiler left in the code section), to a text file. GNU objdump
+          # wraps an instruction of more than seven bytes onto a second line unless it is told the
+          # width.
           disassemble() {
             case "$RUNNER_OS" in
               Windows) "$dumpbin" -nologo -disasm:bytes "$1" ;;
               Linux) objdump -d --insn-width=16 "$1" ;;
               *) objdump -d "$1" ;;
-            esac | tr -d '\r' | sed -E 's/<[^>]*>//g; s/#.*$//' | tr '[:upper:]' '[:lower:]' > "$2"
+            esac | tr -d '\r' | sed -E '/\(bad\)/d; s/<[^>]*>//g; s/#.*$//' | tr '[:upper:]' '[:lower:]' > "$2"
           }
 
           # AVX-512 is every instruction that starts with the EVEX prefix, which is byte 0x62 (in
@@ -209,9 +212,10 @@ jobs:
           # Data that a compiler leaves in the code section, such as the jump tables of macOS
           # objects, is disassembled as instructions too, and begins with 0x62 now and then, so an
           # EVEX instruction counts only when the disassembler decoded it and printed its name after
-          # the bytes.
+          # the bytes (GNU objdump may write `{evex}` first, where a VEX encoding of the same
+          # instruction exists).
           tab=$(printf '\t')
-          avx512="^[[:space:]]*[0-9a-f]+:[[:space:]]+((26|2e|36|3e|64|65|67) )*62( [0-9a-f]{2})*( {2,}|[ ]*$tab)[[:space:]]*[a-z]"
+          avx512="^[[:space:]]*[0-9a-f]+:[[:space:]]+((26|2e|36|3e|64|65|67) )*62( [0-9a-f]{2})*( {2,}|[ ]*$tab)[[:space:]]*[{a-z]"
           avx512="$avx512|\\b(zmm[0-9]+|zmmword|[xy]mm(1[6-9]|2[0-9]|3[01])|k[0-7])\\b"
           vnni='\bvpdp(b(us|ss|su|uu)|w(ss|su|us|uu))d(s)?\b'
           amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
@@ -241,12 +245,16 @@ jobs:
               unsafe { asm!(".byte 0x67, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
               #[cfg(evexsegment)]
               unsafe { asm!(".byte 0x64, 0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x00") };
+              #[cfg(evexpair)]
+              unsafe { asm!(".byte 0x62, 0xf1, 0x6d, 0x28, 0xfe, 0xc1") };
               #[cfg(vnni)]
               unsafe { asm!("{{vex}} vpdpbusd ymm0, ymm1, ymm2") };
               #[cfg(amx)]
               unsafe { asm!("tilezero tmm0") };
               #[cfg(baseline)]
               unsafe { asm!("vpaddd ymm0, ymm1, ymm2", "vfmadd231ps ymm0, ymm1, ymm2") };
+              #[cfg(data)]
+              unsafe { asm!(".byte 0x64, 0x62, 0xff, 0xff, 0xff, 0xff, 0x67, 0x62, 0xff, 0xff, 0xff") };
           }
 
           #[panic_handler]
@@ -256,7 +264,7 @@ jobs:
           RUST
 
           bad=0
-          for plant in avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma; do
+          for plant in avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2; do
             name=${plant%%:*}
             rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
               -C target-feature="${plant#*:}" --cfg "$name" -o "$scratch/$name.$archive_extension" "$scratch/planted.rs"
@@ -264,7 +272,7 @@ jobs:
             # A disassembler that read nothing would accept everything.
             [ "$(wc -l < "$scratch/$name.txt")" -ge 1000 ] || { echo "::error::the disassembly of $name holds no code"; exit 1; }
             counts=$(past_baseline "$scratch/$name.txt" || true)
-            if [ "$name" = baseline ]; then
+            if [ "$name" = baseline ] || [ "$name" = data ]; then
               verdict=accepted
               [ "$counts" = "avx512=0 avx-vnni=0 amx=0" ] || verdict=WRONGLY-REFUSED
             else
@@ -279,17 +287,21 @@ jobs:
           # Every archive the llama.cpp build left under its output directory, which holds the ones
           # the executable links and the copies the build made on the way, and then a check that each
           # static library the build tells cargo to link was among them.
+          if ! find "$release"/build/llama-cpp-sys-2-*/out -type f \( -name '*.a' -o -name '*.lib' \) | sort > "$scratch/archives.txt"; then
+            echo "::error::the llama.cpp build's archives could not be listed"
+            exit 1
+          fi
           archives=()
           while IFS= read -r archive; do
             archives+=("$archive")
-          done < <(find "$release"/build/llama-cpp-sys-2-*/out \( -name '*.a' -o -name '*.lib' \) | sort)
+          done < "$scratch/archives.txt"
           [ "${#archives[@]}" -gt 0 ] || { echo "::error::no llama.cpp archive was built"; exit 1; }
-          linked=$(sed -n -E 's/^cargo::?rustc-link-lib=static=//p' "$release"/build/llama-cpp-sys-2-*/output | tr -d '\r' | sort -u)
+          linked=$(sed -n -E 's/^cargo::?rustc-link-lib=static(:[^=]*)?=([^:]*).*/\2/p' "$release"/build/llama-cpp-sys-2-*/output | tr -d '\r' | sort -u)
           [ -n "$linked" ] || { echo "::error::the llama.cpp build links no static library"; exit 1; }
           for name in $linked; do
             found=0
             for archive in "${archives[@]}"; do
-              case "$(basename "$archive")" in
+              case "${archive##*/}" in
                 "lib$name.a"|"$name.a"|"$name.lib"|"lib$name.lib") found=1 ;;
               esac
             done
@@ -309,7 +321,7 @@ jobs:
               echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
               grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
             fi
-            case "$(basename "$archive")" in
+            case "${archive##*/}" in
               ggml-cpu.*|libggml-cpu.*)
                 cpu=1
                 # The backend that holds the kernels was built for the baseline, not for less, and
