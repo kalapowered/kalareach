@@ -267,14 +267,16 @@ impl Application {
     #[cfg(windows)]
     fn end(&mut self) -> Result<(), String> {
         let job = kr_worker::windows::job::agent_job(&self.process);
-        let job_ended = job.as_ref().map_or(Ok(()), |job| {
-            job.terminate(1)
-                .map_err(|error| format!("the application's job could not be ended: {error}"))
-        });
+        // The application first, which a process the job ended already would refuse to be ended
+        // again; the job then ends what the application started.
         let ended = self
             .child
             .kill()
             .map_err(|error| format!("the application could not be ended: {error}"));
+        let job_ended = job.as_ref().map_or(Ok(()), |job| {
+            job.terminate(1)
+                .map_err(|error| format!("the application's job could not be ended: {error}"))
+        });
         let collected = self
             .child
             .wait()
@@ -572,7 +574,11 @@ impl Launch {
             .requests
             .as_mut()
             .expect("the application's input is open");
-        writeln!(requests, "{}", request.display()).expect("the application is asked");
+        // One write, so that the line is never read as two: a batch file's `set /p` that reads
+        // between a path and its line break takes the path as the line and the break as the next.
+        requests
+            .write_all(format!("{}\n", request.display()).as_bytes())
+            .expect("the application is asked");
         requests.flush().expect("and it goes");
         request
     }
