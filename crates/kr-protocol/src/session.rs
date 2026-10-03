@@ -711,11 +711,12 @@ pub struct SessionSummary {
     /// Where the variables its root shell was started with came from, when its worker said.
     ///
     /// Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
-    /// a summary this host composes without its worker (a closure with no worker record to read,
-    /// or a worker whose end could not be established) because no worker said anything about the
-    /// environment, and for one a worker of an earlier release described, which wrote no such
-    /// member. Only that second reason ends: it goes when no worker of a release that wrote none
-    /// can still be running and no journal row of one is still read.
+    /// a summary this host composes without its worker (a closure with no worker record to read, a
+    /// worker whose end could not be established, or a session the registry holds whose worker did
+    /// not answer) because no worker said anything about the environment, and for one a worker of
+    /// an earlier release described, which wrote no such member. Only that second reason ends: it
+    /// goes when no worker of a release that wrote none can still be running and no journal row of
+    /// one is still read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_sources: Option<SessionEnvironmentSources>,
 }

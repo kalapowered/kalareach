@@ -598,7 +598,7 @@ pub fn session_environment_lines(listed: Option<&[SessionSummary]>, held: u64) -
                 sources.cwd.as_str()
             ),
             None => shown!(
-                "session {}: where its environment came from was not recorded",
+                "session {}: where its environment came from is not known",
                 session.display_number.get()
             ),
         })
