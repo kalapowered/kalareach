@@ -216,6 +216,7 @@ async fn admitted(
                 gid: 0,
                 pid: None,
             },
+            kr_protocol::local::LocalClientKind::Cli,
         )
         .await
         .expect("the connection is registered");
