@@ -263,20 +263,23 @@ end_signing() {
 }
 
 # The start time the signing command wrote about itself (see with_signing_keychain), taken from its file when
-# the file names the command's number, whenever it is not yet known: the command may write it late.
+# the file names the command's number and shows it as the leader of its own process group, whenever it is not
+# yet known: the command may write it late.
 load_signing_identity() {
-  local ident_pid ident_start
+  local ident_pid ident_group ident_start
   [ -z "$signing_start" ] || return 0
-  IFS=' ' read -r ident_pid ident_start 2>/dev/null < "$signing_ident" || return 1
-  [ "$ident_pid" = "$signing_child" ] || return 1
+  IFS=' ' read -r ident_pid ident_group ident_start 2>/dev/null < "$signing_ident" || return 1
+  [ "$ident_pid" = "$signing_child" ] && [ "$ident_group" = "$ident_pid" ] || return 1
   signing_start=$ident_start
 }
 
 # Whether the signing command is still the process this shell started, by its number, its state and the
-# start time the command wrote about itself. 0: it is. 1: it is not, because it has ended or the number is
-# another process's, which a readable and different start time shows. 2: not known, because its identity,
-# state or start time cannot be read: a read that fails is no answer, and nothing is signalled on it. Bash
-# can collect a command that has ended before this shell waits for it, so the number alone is never signalled.
+# start time the command wrote about itself. 0: it is. 1: it has ended (gone, or ended and not yet collected).
+# 2: not known, because its identity, state or start time cannot be read: a read that fails is no answer, and
+# nothing is signalled on it. 3: the number is another process's, which a readable and different start time shows;
+# its process group has no member either, since the system gives a number to no other process while a group
+# of that number has one. Bash can collect a command that has ended before this shell waits for it, so the
+# number alone is never signalled.
 signing_command_state() {
   local stat now
   kill -0 "$signing_child" 2>/dev/null || return 1
@@ -287,28 +290,53 @@ signing_command_state() {
   now=$(process_start "$signing_child")
   [ -n "$now" ] || return 2
   [ "$now" = "$signing_start" ] && return 0
-  return 1
+  return 3
 }
 
-# Stops the signing command, and answers once it has ended. The command starts with the signals this
-# shell ignores, and puts the default ones back as its first act, so a TERM that comes before that act
-# has no effect on it: the TERM is sent again every tenth of a second, while the command is known to be the
-# process that was started, until it has ended. After fifty sends the command is killed, if it is still
-# known to be that process. While the command is not known (its identity not yet written, or a read that
-# fails) nothing is signalled and the checks go on: the loop ends only when the command has ended, so an
+# Whether the signing command's process group still has a live member. The command is the leader of its own
+# group, so the group's number is the command's number, and the system gives that number to no other process
+# while the group has a member. 0: a member is alive (a process that has ended and is not yet collected is not).
+# 1: none is. 2: not known, because the process table cannot be read or does not show this shell: a read that
+# fails is no answer.
+signing_group_state() {
+  local table answer
+  table=$(ps -A -o pid=,pgid=,stat= 2>/dev/null) || return 2
+  answer=$(printf '%s\n' "$table" | awk -v group="$signing_child" -v me="$$" '
+    $1 == me { seen = 1 }
+    $2 == group && $3 !~ /^Z/ { found = 1 }
+    END { print (seen ? (found ? "yes" : "no") : "unknown") }') || return 2
+  case $answer in yes) return 0 ;; no) return 1 ;; esac
+  return 2
+}
+
+# Stops the signing command and everything it started, and answers once none of them is left, before the
+# keychain is locked: a signature that goes on under a locked keychain raises a password dialog. They are one
+# process group, which the command makes its own as its first act, so a signal to the group reaches the command
+# and its children (the signer's `codesign` calls) together, and a child that outlives the command is still
+# reached. The command starts with the signals this shell ignores, and puts the default ones back as its first
+# act, so a TERM that comes before that act has no effect on it: the TERM is sent again every tenth of a second,
+# while the command is known to be the process that was started, or, once it has ended, while the group is known
+# to have a live member, until none is left. After fifty sends everything left is killed. While the command is
+# not known (its identity not yet written, or a read that fails) or the group cannot be read nothing is
+# signalled and the checks go on: the loop ends only when the command has ended and the group is empty, so an
 # identity that is written late is still acted on.
 stop_signing_command() {
-  local sent=0 state
+  local sent=0 state members=9
   while :; do
     signing_command_state; state=$?
-    [ "$state" = 1 ] && break
-    if [ "$state" = 0 ]; then
+    members=9
+    [ "$state" = 3 ] && break
+    if [ "$state" = 1 ]; then
+      signing_group_state; members=$?
+      [ "$members" = 1 ] && break
+    fi
+    if [ "$state" = 0 ] || [ "$members" = 0 ]; then
       if [ "$sent" -ge 50 ]; then
-        say "the signing command did not stop at TERM: killing it"
-        kill -9 "$signing_child" 2>/dev/null
-        break
+        [ "$sent" = 50 ] && say "the signing command or what it started did not stop at TERM: killing it"
+        kill -KILL -- "-$signing_child" 2>/dev/null
+      else
+        kill -TERM -- "-$signing_child" 2>/dev/null
       fi
-      kill "$signing_child" 2>/dev/null
       sent=$((sent + 1))
     fi
     sleep 0.1
@@ -339,6 +367,9 @@ signing_interrupted() { # <exit status>
 # can fall between taking the lock and noting that it is held, between starting the command and noting
 # its process, or inside the undoing: each of those would leave the keychain on the list or unlocked, or
 # release a lock that another build holds. While the command runs a signal stops it and undoes the signing.
+# The command leads a process group of its own, which holds whatever it starts (the signer's `codesign` calls):
+# the group is ended before the keychain is locked, whether the command ended by itself or was interrupted, so
+# that no signature goes on under a locked keychain.
 with_signing_keychain() { # <command...>
   [ "$target" = device ] || die "only a device build is signed"
   [ -n "${KR_KEYCHAIN:-}" ] && [ -f "${KR_KEYCHAIN_PASSWORD_FILE:-}" ] || die "KR_KEYCHAIN and KR_KEYCHAIN_PASSWORD_FILE are needed to sign"
@@ -366,20 +397,25 @@ with_signing_keychain() { # <command...>
     # a TERM stops it; a TERM that comes before that act is sent again by the handler. Its second act is to
     # write its own number and start time into a file, from inside: the identity that is checked before any
     # signal is the command's own, never one that this shell reads from the process table after the command
-    # may have ended and its number been taken by another process. A command that cannot write it does not run,
-    # and one that writes it late is signalled from then on: the handlers are installed at once, and the
-    # identity is read again whenever it is not known.
+    # may have ended and its number been taken by another process. It also writes the number of its process
+    # group, which job control makes its own: a command that is not the leader of its group, or that cannot write
+    # its identity, does not run. One that writes it late is signalled from then on: the handlers are installed
+    # at once, and the identity is read again whenever it is not known.
     signing_ident="$work/signing.ident"
     rm -rf "$signing_ident" "$signing_ident.part"
     if [ -e "$signing_ident" ] || [ -e "$signing_ident.part" ]; then
       say "the file for the signing command's identity could not be cleared: $signing_ident"
       status=2
     else
+      set -m
       ( trap - INT TERM HUP
-        LC_ALL=C TZ=UTC0 sh -c 'ps -o pid=,lstart= -p $PPID' > "$signing_ident.part" 2>/dev/null \
+        LC_ALL=C TZ=UTC0 sh -c 'ps -o pid=,pgid=,lstart= -p $PPID' > "$signing_ident.part" 2>/dev/null \
+          && read -r own_pid own_group own_start < "$signing_ident.part" \
+          && [ -n "$own_start" ] && [ "$own_group" = "$own_pid" ] \
           && mv "$signing_ident.part" "$signing_ident" || exit 70
-        exec "$@" ) &
+        exec "$@" ) < /dev/null &
       signing_child=$!
+      set +m
       signing_start=""
       trap 'signing_interrupted 130' INT
       trap 'signing_interrupted 143' TERM
@@ -392,6 +428,7 @@ with_signing_keychain() { # <command...>
       load_signing_identity
       wait "$signing_child"
       status=$?
+      stop_signing_command
       trap '' INT TERM HUP
       signing_child=""
       signing_start=""
