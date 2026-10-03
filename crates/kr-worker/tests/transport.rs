@@ -2484,7 +2484,7 @@ async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running
 /// that died.
 #[cfg(windows)]
 #[tokio::test]
-async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running() {
+async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_started_running() {
     let directory = private_directory();
     let broker = broker_for_launch();
     let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a session job"));
