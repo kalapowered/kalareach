@@ -185,6 +185,15 @@
   font-size: 0.625rem;
   color: var(--muted);
 }
+/* The line a model wrote about what the session is doing, and when it is out of date. */
+.session-row .session-activity {
+  margin-bottom: 4px;
+  font-size: 0.75rem;
+}
+.session-row h3 .badge {
+  margin-inline-start: 8px;
+  vertical-align: middle;
+}
 
 .session-number {
   color: var(--faint);
