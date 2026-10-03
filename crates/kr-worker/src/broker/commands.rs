@@ -1739,21 +1739,21 @@ fn launch_profile(
     }
 }
 
-/// The job of a program that was created suspended and has not yet been started, which ends the
-/// program with everything in the job when the launch that holds it ends for any reason before the
-/// launcher says it started it: a refusal, a failed write, a launcher that has gone, a launch
-/// dropped meanwhile.
+/// The job of a program that was created suspended and has not been told it may start, which ends
+/// the program with everything in the job when the launch that holds it ends for any reason before
+/// the launcher has been confirmed: a refusal, a failed write, a launch dropped meanwhile.
 ///
-/// Nothing the program could have started exists until it has run, so ending it costs nothing, and
-/// the launcher that created it is the one place a program left suspended would otherwise wait for
-/// the session's end.
+/// Nothing the program could have started exists until it has run, so ending it costs nothing. The
+/// guard stands down once the confirmation is written, because from then on the launcher may start
+/// the program at any moment, and a program that has started and ended meanwhile retires its
+/// backend, which must not end what it started; from there the resume deadline decides.
 #[cfg(windows)]
 struct Unstarted(Option<Arc<crate::windows::job::AgentJob>>);
 
 #[cfg(windows)]
 impl Unstarted {
-    /// The launcher has started the program: it is the person's now, and this ends nothing.
-    fn started(&mut self) {
+    /// The confirmation is written: the launcher may start the program, and this ends nothing.
+    fn stand_down(&mut self) {
         self.0 = None;
     }
 }
@@ -1861,7 +1861,8 @@ async fn directory_grant(
 /// and starts it only once the commitment arrives. So the instance, the registration and the job of
 /// the program all name the program and not the launcher, and nothing is registered or published
 /// until the program has been shown. A launch that fails before the commitment leaves the program
-/// suspended and unrun, and the launcher ends it and runs what was typed.
+/// suspended and unrun: this ends it with everything in its job, and the launcher, which ends it as
+/// well, runs what was typed.
 #[cfg(windows)]
 async fn continue_launch(
     backend: &Arc<Backend>,
@@ -2055,7 +2056,7 @@ async fn continue_launch(
         .lifecycle
         .confirm(|| stream.try_write_frame(&confirmation()))
     {
-        Some(Ok(true)) => {}
+        Some(Ok(true)) => unstarted.stand_down(),
         Some(Ok(false)) => {
             return Err(BrokerError::UpstreamUnavailable {
                 detail: "the launch's confirmation could not be written without waiting".to_owned(),
@@ -2070,16 +2071,19 @@ async fn continue_launch(
     }
     // The program is committed and not yet running. The launcher starts it and says so; one that
     // does not within its deadline, or that closes the connection, leaves a program that was
-    // committed and never started, which is ended with everything in its job.
+    // committed and never started, which is ended with everything in its job. A program that has
+    // run and ended while this waits retires its backend and ends this wait, and what it started
+    // is not ended.
     let resumed = match tokio::time::timeout(RESUME_DEADLINE, stream.read_frame()).await {
         Ok(Ok(Some(frame))) => is_resumed(&frame),
         _ => false,
     };
     if resumed {
-        unstarted.started();
         Ok(())
     } else {
-        // `unstarted` ends the program and everything in its job as this returns.
+        if let Some(job) = crate::windows::job::agent_job(&process) {
+            let _ = job.terminate(1);
+        }
         Err(BrokerError::denied(
             "the launcher did not say it started the program it was committed to",
         ))

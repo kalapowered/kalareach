@@ -103,6 +103,8 @@ struct Shell {
     generation: std::sync::atomic::AtomicU64,
     /// The job everything this shell starts runs in, which ends all of it when the test does.
     job: SessionJob,
+    /// A file the launchers it starts wait for before they start their program, where it is set.
+    barrier: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Shell {
@@ -190,6 +192,7 @@ impl Shell {
             script,
             generation: std::sync::atomic::AtomicU64::new(1),
             job: SessionJob::create().expect("a job for what this shell starts"),
+            barrier: std::sync::Mutex::new(None),
         }
     }
 
@@ -243,7 +246,8 @@ impl Shell {
     }
 
     /// Starts the launcher for `vector` as the shell's executor does: with the answer's variable, a
-    /// report to write and the variables of `env`, in `cwd`, in this shell's job.
+    /// report to write and the variables of `env`, in `cwd`, in this shell's job. Where the shell
+    /// holds its launchers at a barrier, none starts its program until that file exists.
     fn launcher(
         &self,
         executable: &Path,
@@ -253,11 +257,13 @@ impl Shell {
         env: &[(&str, &str)],
         cwd: &Path,
     ) -> Child {
-        let mut arguments = vec![
-            "launch".to_owned(),
-            "--".to_owned(),
-            executable.display().to_string(),
-        ];
+        let mut arguments = vec!["launch".to_owned()];
+        if let Some(barrier) = self.barrier.lock().expect("the barrier").as_ref() {
+            arguments.push("--hold-before-exec".to_owned());
+            arguments.push(barrier.display().to_string());
+        }
+        arguments.push("--".to_owned());
+        arguments.push(executable.display().to_string());
         arguments.extend(vector.iter().cloned());
         let report = self.reports.join(name);
         let mut variables: Vec<(&str, std::ffi::OsString)> = answer
@@ -945,6 +951,58 @@ fn kr_req_05_09_the_hold_on_a_launchs_file_ends_with_its_commit() {
         shell.state_of(Shell::instance_of(&answer)),
         Some(BackendState::Committed(_))
     ));
+}
+
+/// KR-REQ-12.02: a program that has run and ended before the worker has heard that the launcher
+/// started it does not take what it started with it: the program's end retires its backend and ends
+/// the worker's wait, and what the program started is still running. Here the test plays the
+/// program: it puts a helper in the program's job and ends the program while the launcher holds it,
+/// committed, before it starts it. Control: the same wait, with the launcher gone instead, ends
+/// the job (the test above).
+#[test]
+fn kr_req_12_02_a_program_that_ends_before_the_launcher_is_heard_leaves_what_it_started() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    *shell.barrier.lock().expect("the barrier") = Some(shell.reports.join("barrier"));
+    let launcher = shell.launch(&answer, "heard", &[]);
+    eventually("the launch is committed", || {
+        std::fs::read_to_string(Shell::registration(&answer)).is_ok()
+            && matches!(
+                shell.state_of(Shell::instance_of(&answer)),
+                Some(BackendState::Committed(_))
+            )
+    });
+    let instance = Shell::instance_of(&answer);
+    let program: u32 = Shell::registered(&answer)["pid"]
+        .parse()
+        .expect("a process identifier");
+    let identity = kr_ipc::identity::process_start_identity(program).expect("the program");
+    let job = kr_worker::windows::job::agent_job(&identity).expect("the program's job");
+    let mut helper = std::process::Command::new(system_program("ping.exe"))
+        .args(["-n", "600", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the helper starts");
+    job.assign(helper.id())
+        .expect("the helper joins the program's job");
+    let ended = std::process::Command::new(system_program("taskkill.exe"))
+        .args(["/F", "/PID", &program.to_string()])
+        .output()
+        .expect("taskkill runs");
+    assert!(ended.status.success(), "the program is ended");
+    eventually("the backend retires with the program's end", || {
+        !matches!(shell.state_of(instance), Some(BackendState::Committed(_)))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        helper.try_wait().expect("the helper is asked").is_none(),
+        "what the program started is still running"
+    );
+    let _ = helper.kill();
+    let _ = helper.wait();
+    drop(launcher);
 }
 
 /// KR-REQ-12.02: a program that was committed and never started is ended with everything in its job
