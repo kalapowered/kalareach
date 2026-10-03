@@ -23,14 +23,14 @@ final class PickerTests: HarnessTestCase {
 
     /// Opens one of the three attachment controls, asserts something came up, and cancels it.
     ///
-    /// The control is a label over a file input: a tap on it raises the system's own menu of sources,
+    /// The control is a button over a file input: a tap on it raises the system's own menu of sources,
     /// which belongs to this application's window, and a tap on its entry raises the picker or the
     /// camera. The Cancel button is looked for by identifier only; a system Cancel that has none leaves
     /// the leg open and the person at the phone cancels it by hand.
     private func openAndCancel(_ control: String, entry: String?) throws {
-        let label = app.buttons[control].firstMatch
-        XCTAssertTrue(label.waitForExistence(timeout: 10), "no \(control) control")
-        label.tap()
+        let button = app.buttons[control].firstMatch
+        XCTAssertTrue(button.waitForExistence(timeout: 10), "no \(control) control")
+        button.tap()
         // The camera control opens the camera at once on a phone that has one; the others raise the
         // menu of sources first.
         if let entry {
