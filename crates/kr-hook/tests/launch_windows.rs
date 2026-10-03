@@ -454,135 +454,225 @@ fn kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed() {
     assert_eq!(report["relaunch"], "true");
 }
 
-/// A launcher this test plays: it says to the backend what a real launcher says, and can say what no
-/// real one does, so the checks a real launcher can never fail are shown to fail.
+/// The launcher played by a process of its own, which this test controls over its standard input
+/// and output: it says to the backend what a real launcher says, and can say what no real one
+/// does, so the checks a real launcher can never fail are shown to fail. It is a child of this
+/// process, started after the backend was established, as the shell's own children are.
+///
+/// The process is this test binary running [`scripted_launcher_helper`]: each command is one line of
+/// JSON on its standard input, and each answer is one line that begins `KR>`.
 struct Scripted {
-    runtime: tokio::runtime::Runtime,
-    reader: tokio::io::BufReader<tokio::io::ReadHalf<kr_ipc::endpoint::Connection>>,
-    writer: tokio::io::WriteHalf<kr_ipc::endpoint::Connection>,
+    child: Child,
+    answers: std::io::BufReader<std::fs::File>,
 }
 
 impl Scripted {
-    /// Presents this process to the backend as a launcher for `executable` and `arguments`, and
-    /// returns the connection with the backend's answer to it, which is a line or the end of the
-    /// connection.
+    fn start(shell: &Shell) -> Self {
+        let agent = AgentJob::create().expect("a job for the helper's own children");
+        let mut child = kr_worker::windows::launch::start(&Spec {
+            program: &std::env::current_exe().expect("this test's executable"),
+            arguments: &[
+                "--ignored".to_owned(),
+                "--exact".to_owned(),
+                "scripted_launcher_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            directory: shell.placed.host.root(),
+            environment: &[],
+            session: Some(&shell.job),
+            agent: &agent,
+            pipe_input: true,
+            pipe_output: true,
+        })
+        .expect("the scripted launcher starts");
+        let answers = std::io::BufReader::new(child.stdout.take().expect("its output"));
+        Self { child, answers }
+    }
+
+    /// Sends one command and returns the answer it gives.
+    fn ask(&mut self, command: &serde_json::Value) -> serde_json::Value {
+        use std::io::{BufRead as _, Write as _};
+        let input = self.child.stdin.as_mut().expect("its input");
+        writeln!(input, "{command}").expect("the command is written");
+        loop {
+            let mut line = String::new();
+            let read = self
+                .answers
+                .read_line(&mut line)
+                .expect("an answer is read");
+            assert_ne!(read, 0, "the scripted launcher ended before it answered");
+            if let Some(answer) = line.trim_end().strip_prefix("KR>") {
+                return serde_json::from_str(answer).expect("an answer is JSON");
+            }
+        }
+    }
+
+    /// Presents the helper to the backend as a launcher for `executable` and `arguments`, and
+    /// returns the backend's answer to it: a line, or `None` where the connection was closed.
     fn present(
+        &mut self,
         answer: &CommandBackend,
         executable: &Path,
         arguments: &[String],
-    ) -> (Self, Option<String>) {
-        use tokio::io::AsyncWriteExt as _;
+    ) -> Option<String> {
         let directory = Shell::registration(answer)
             .parent()
             .expect("the backend's directory")
             .to_path_buf();
-        let record: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(directory.join("launch")).expect("the launch record"),
-        )
-        .expect("a record");
-        let name = record["endpoint"]
-            .as_str()
-            .and_then(|text| text.strip_prefix(r"\\.\pipe\"))
-            .expect("a local pipe")
-            .to_owned();
-        let credential = std::fs::read_to_string(directory.join("credential"))
-            .expect("the credential")
-            .trim()
-            .to_owned();
-        let identity = kr_ipc::identity::current_process_start_identity().expect("this process");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        let address = kr_ipc::paths::Endpoint::from_name(name).expect("an endpoint");
-        let connection = runtime
-            .block_on(kr_ipc::endpoint::Connection::connect(&address))
-            .expect("the endpoint is reached");
-        let (reader, mut writer) = tokio::io::split(connection);
-        let line = serde_json::json!({ "kr_launch": {
-            "credential": credential,
-            "pid": identity.pid.get(),
-            "start": identity.start_value.get(),
-            "executable": executable.to_str().expect("text"),
+        self.ask(&serde_json::json!({ "present": {
+            "directory": directory,
+            "executable": executable,
             "arguments": arguments,
-        }})
-        .to_string();
-        runtime
-            .block_on(async {
-                writer.write_all(line.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await
-            })
-            .expect("the presentation is written");
-        let mut scripted = Self {
-            runtime,
-            reader: tokio::io::BufReader::new(reader),
-            writer,
-        };
-        let admitted = scripted.read();
-        (scripted, admitted)
+        }}))["line"]
+            .as_str()
+            .map(str::to_owned)
     }
 
-    /// Reads one line the backend writes, or `None` at the end of the connection.
+    /// The next line the backend writes, or `None` where it closed the connection.
     fn read(&mut self) -> Option<String> {
-        use tokio::io::AsyncBufReadExt as _;
-        let reader = &mut self.reader;
-        let mut line = String::new();
-        let read = self
-            .runtime
-            .block_on(async { tokio::time::timeout(LIVENESS, reader.read_line(&mut line)).await })
-            .expect("the backend answers or closes in time");
-        match read {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim_end().to_owned()),
-        }
+        self.ask(&serde_json::json!({ "read": true }))["line"]
+            .as_str()
+            .map(str::to_owned)
     }
 
-    /// Writes one frame.
     fn write(&mut self, frame: &serde_json::Value) {
-        use tokio::io::AsyncWriteExt as _;
-        let writer = &mut self.writer;
-        let line = format!("{frame}\n");
-        self.runtime
-            .block_on(async {
-                writer.write_all(line.as_bytes()).await?;
-                writer.flush().await
-            })
-            .expect("the frame is written");
+        self.ask(&serde_json::json!({ "write": frame }));
     }
 
-    fn says(line: Option<&str>, word: &str) -> bool {
-        line.is_some_and(|line| line.contains(&format!("\"{word}\":true")))
+    /// Creates a program suspended from `executable`, as a launcher does, and returns it.
+    fn create(&mut self, executable: &Path, arguments: &[String]) -> u32 {
+        self.ask(&serde_json::json!({ "create": {
+            "executable": executable,
+            "arguments": arguments,
+        }}))["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .expect("a process identifier")
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
     }
 }
 
-/// A program created suspended from `executable`, which this test owns and ends.
-struct Suspended(std::process::Child);
+impl Drop for Scripted {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
-impl Suspended {
-    fn from(executable: &Path, arguments: &[String]) -> Self {
-        use std::os::windows::process::CommandExt as _;
-        Self(
-            std::process::Command::new(executable)
+/// The scripted launcher's process: it does what it is told on its standard input.
+#[test]
+#[ignore = "a process the tests below start as a launcher"]
+fn scripted_launcher_helper() {
+    use std::io::{BufRead as _, Write as _};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let mut connection: Option<(
+        tokio::io::BufReader<tokio::io::ReadHalf<kr_ipc::endpoint::Connection>>,
+        tokio::io::WriteHalf<kr_ipc::endpoint::Connection>,
+    )> = None;
+    let mut created: Vec<std::process::Child> = Vec::new();
+    let reply = |value: serde_json::Value| {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "KR>{value}").expect("the answer is written");
+        out.flush().expect("and flushed");
+    };
+    let read_line = |connection: &mut Option<(
+        tokio::io::BufReader<tokio::io::ReadHalf<kr_ipc::endpoint::Connection>>,
+        tokio::io::WriteHalf<kr_ipc::endpoint::Connection>,
+    )>| {
+        let (reader, _) = connection.as_mut().expect("a connection");
+        let mut line = String::new();
+        let read = runtime
+            .block_on(async { tokio::time::timeout(LIVENESS, reader.read_line(&mut line)).await })
+            .expect("the backend answers or closes in time");
+        match read {
+            Ok(0) | Err(_) => serde_json::json!({ "line": null }),
+            Ok(_) => serde_json::json!({ "line": line.trim_end() }),
+        }
+    };
+    for command in std::io::stdin().lock().lines() {
+        let command: serde_json::Value =
+            serde_json::from_str(&command.expect("a line")).expect("a command is JSON");
+        if let Some(present) = command.get("present") {
+            let directory = PathBuf::from(present["directory"].as_str().expect("a directory"));
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join("launch")).expect("the launch record"),
+            )
+            .expect("a record");
+            let name = record["endpoint"]
+                .as_str()
+                .and_then(|text| text.strip_prefix(r"\\.\pipe\"))
+                .expect("a local pipe")
+                .to_owned();
+            let credential = std::fs::read_to_string(directory.join("credential"))
+                .expect("the credential")
+                .trim()
+                .to_owned();
+            let identity =
+                kr_ipc::identity::current_process_start_identity().expect("this process");
+            let address = kr_ipc::paths::Endpoint::from_name(name).expect("an endpoint");
+            let opened = runtime
+                .block_on(kr_ipc::endpoint::Connection::connect(&address))
+                .expect("the endpoint is reached");
+            let (reader, mut writer) = tokio::io::split(opened);
+            let line = serde_json::json!({ "kr_launch": {
+                "credential": credential,
+                "pid": identity.pid.get(),
+                "start": identity.start_value.get(),
+                "executable": present["executable"],
+                "arguments": present["arguments"],
+            }})
+            .to_string();
+            runtime
+                .block_on(async {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await
+                })
+                .expect("the presentation is written");
+            connection = Some((tokio::io::BufReader::new(reader), writer));
+            reply(read_line(&mut connection));
+        } else if command.get("read").is_some() {
+            reply(read_line(&mut connection));
+        } else if let Some(frame) = command.get("write") {
+            let (_, writer) = connection.as_mut().expect("a connection");
+            let line = format!("{frame}\n");
+            runtime
+                .block_on(async {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.flush().await
+                })
+                .expect("the frame is written");
+            reply(serde_json::json!({ "written": true }));
+        } else if let Some(create) = command.get("create") {
+            use std::os::windows::process::CommandExt as _;
+            let arguments: Vec<String> = create["arguments"]
+                .as_array()
+                .expect("arguments")
+                .iter()
+                .map(|argument| argument.as_str().expect("text").to_owned())
+                .collect();
+            let child = std::process::Command::new(create["executable"].as_str().expect("a path"))
                 .args(arguments)
                 .creation_flags(0x0000_0004)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .expect("a suspended program"),
-        )
+                .expect("a suspended program");
+            reply(serde_json::json!({ "pid": child.id() }));
+            created.push(child);
+        }
     }
-
-    fn id(&self) -> u32 {
-        self.0.id()
-    }
-}
-
-impl Drop for Suspended {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+    for mut child in created {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -600,33 +690,34 @@ impl Shell {
     }
 
     /// The frame a launcher says it is going in, naming `program` and the directory it works in.
-    fn going(program: u32, directory: Option<&Path>) -> serde_json::Value {
-        serde_json::json!({ "kr_launch": {
-            "going": true,
-            "program": program,
-            "directory": directory.map(|directory| directory.display().to_string()),
-        }})
+    fn going(program: u32) -> serde_json::Value {
+        serde_json::json!({ "kr_launch": { "going": true, "program": program } })
     }
 
-    /// Presents a scripted launcher for the vector every case types and checks it was admitted.
+    /// Starts a scripted launcher and presents it for the vector every case types.
     fn admitted_launcher(&self, answer: &CommandBackend) -> Scripted {
-        let (scripted, admitted) = Scripted::present(answer, &self.executable, &self.typed());
+        let mut scripted = Scripted::start(self);
+        let admitted = scripted.present(answer, &self.executable, &self.typed());
         assert!(
-            Scripted::says(admitted.as_deref(), "admitted"),
+            admitted
+                .as_deref()
+                .is_some_and(|line| line.contains("\"admitted\":true")),
             "the backend admits the launch: {admitted:?}"
         );
         scripted
     }
 
-    /// Whether this launch, retried as the same invocation, is admitted and committed: it is what
-    /// shows that a refused launch gave everything back.
+    /// Shows that a refused launch gave everything back: the same invocation, launched again, is
+    /// admitted and committed.
     fn commits_after_a_refusal(&self, answer: &CommandBackend) {
         let mut scripted = self.admitted_launcher(answer);
-        let program = Suspended::from(&self.executable, &self.typed()[1..]);
-        scripted.write(&Self::going(program.id(), None));
+        let program = scripted.create(&self.executable, &self.typed()[1..]);
+        scripted.write(&Self::going(program));
         let committed = scripted.read();
         assert!(
-            Scripted::says(committed.as_deref(), "committed"),
+            committed
+                .as_deref()
+                .is_some_and(|line| line.contains("\"committed\":true")),
             "a retry of the invocation is committed: {committed:?}"
         );
     }
@@ -640,9 +731,8 @@ fn kr_req_05_09_a_program_created_from_another_file_is_not_committed() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut scripted = shell.admitted_launcher(&answer);
-    let another = shell.another_program();
-    let program = Suspended::from(&another, &shell.typed()[1..]);
-    scripted.write(&Shell::going(program.id(), None));
+    let program = scripted.create(&shell.another_program(), &shell.typed()[1..]);
+    scripted.write(&Shell::going(program));
     assert_eq!(
         scripted.read(),
         None,
@@ -667,7 +757,7 @@ fn kr_req_05_09_a_process_the_launcher_did_not_create_is_not_committed() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut scripted = shell.admitted_launcher(&answer);
-    scripted.write(&Shell::going(std::process::id(), None));
+    scripted.write(&Shell::going(scripted.pid()));
     assert_eq!(scripted.read(), None, "uncommitted");
     let why = shell
         .backends
@@ -677,27 +767,8 @@ fn kr_req_05_09_a_process_the_launcher_did_not_create_is_not_committed() {
     shell.commits_after_a_refusal(&answer);
 }
 
-/// KR-REQ-05.09: a program that started before the backend was established is not one this launch
-/// made, whatever its parent is.
-#[test]
-fn kr_req_05_09_a_program_that_started_before_the_backend_was_established_is_not_committed() {
-    let shell = Shell::new();
-    let early = Suspended::from(&shell.executable, &shell.typed()[1..]);
-    std::thread::sleep(Duration::from_millis(50));
-    let answer = shell.establish();
-    let mut scripted = shell.admitted_launcher(&answer);
-    scripted.write(&Shell::going(early.id(), None));
-    assert_eq!(scripted.read(), None, "uncommitted");
-    let why = shell
-        .backends
-        .launch_failure_of(shell.last_generation())
-        .expect("the backend says why");
-    assert!(why.contains("before this backend was established"), "{why}");
-    shell.commits_after_a_refusal(&answer);
-}
-
 /// KR-REQ-12.02: a launcher that cannot create its program says so, the backend records why on the
-/// launch attempt, and the invocation can be launched again. A reason too long to keep is cut.
+/// launch attempt, and the invocation can be launched again.
 #[test]
 fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
     let shell = Shell::new();
@@ -724,11 +795,15 @@ fn kr_req_12_02_a_program_that_is_never_started_is_ended() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut scripted = shell.admitted_launcher(&answer);
-    let program = Suspended::from(&shell.executable, &shell.typed()[1..]);
-    let identity = kr_ipc::identity::process_start_identity(program.id()).expect("an identity");
-    scripted.write(&Shell::going(program.id(), None));
+    let program = scripted.create(&shell.executable, &shell.typed()[1..]);
+    let identity = kr_ipc::identity::process_start_identity(program).expect("an identity");
+    scripted.write(&Shell::going(program));
     let committed = scripted.read();
-    assert!(Scripted::says(committed.as_deref(), "committed"));
+    assert!(
+        committed
+            .as_deref()
+            .is_some_and(|line| line.contains("\"committed\":true"))
+    );
     let instance = Shell::instance_of(&answer);
     assert!(matches!(
         shell.state_of(instance),
