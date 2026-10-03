@@ -433,15 +433,6 @@ impl Restoration {
         }
     }
 
-    /// Records that the host required a resynchronisation.
-    ///
-    /// The partial state is discarded and the restoration starts again from the beginning, which
-    /// is what section 8 requires when the bounded replay window has a gap.
-    pub fn resynchronise(&mut self, cursors: &mut StreamCursors) {
-        cursors.discard(&self.stream_id);
-        self.step = RestorationStep::SubscribeFromStart;
-    }
-
     /// Returns true once the stream is live.
     #[must_use]
     pub fn is_live(&self) -> bool {
@@ -679,24 +670,6 @@ mod tests {
             cursors.accept(&event(&stream_id, 12)),
             Delivery::Gap { .. }
         ));
-    }
-
-    #[test]
-    fn a_resynchronisation_discards_the_partial_state_and_starts_again() {
-        let mut cursors = StreamCursors::new();
-        let stream_id = stream("session:1");
-        cursors.accept(&event(&stream_id, 7));
-        cursors.applied(&stream_id, EventSequence::new(7));
-        let mut restoration = Restoration::start(stream_id.clone(), &cursors);
-        restoration
-            .subscribed()
-            .expect("the subscription succeeded");
-
-        restoration.resynchronise(&mut cursors);
-        assert_eq!(restoration.step(), RestorationStep::SubscribeFromStart);
-        assert_eq!(cursors.position(&stream_id), None);
-        assert!(cursors.needs_snapshot(&stream_id));
-        assert!(cursors.is_empty());
     }
 
     #[test]
