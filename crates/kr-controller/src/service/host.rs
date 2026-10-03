@@ -287,7 +287,7 @@ impl Controller {
                 let row = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
                         #[cfg(feature = "testing")]
-                        controller.before_the_environment_record.wait();
+                        controller.after_the_environment_record_is_taken.wait();
                         controller.under_registration(&carried, || {
                             store.enrol(params.enrolment, now_ms)
                         })?
@@ -302,7 +302,7 @@ impl Controller {
                 let forgotten = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
                         #[cfg(feature = "testing")]
-                        controller.before_the_environment_record.wait();
+                        controller.after_the_environment_record_is_taken.wait();
                         controller
                             .under_registration(&carried, || store.forget(params.environment_id))?
                     })
@@ -372,7 +372,7 @@ impl Controller {
                 let refreshed = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&observing, |store| {
                         #[cfg(feature = "testing")]
-                        asking.before_the_environment_record.wait();
+                        asking.after_the_environment_record_is_taken.wait();
                         asking.check_registration(&carried)?;
                         store.refresh(
                             params.environment_id,
