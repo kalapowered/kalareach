@@ -685,12 +685,16 @@ attempts again. Measured on Windows Server 2025, a writer waiting on a full pipe
 woke about seventy-four times a second and spent roughly 730 ms of processor time over that span,
 about 2.4% of one core.
 
-Because that poll makes progress only when the peer reads, every caller bounds its own wait rather
-than relying on the pipe to end it: the worker's delivery ends on a withdrawal or a send deadline,
-the controller's attention delivery on its release ticket's own expiry. `FrameWriter::write_frame`,
-which waits with no bound of its own, is used only where the peer reads what it is sent — a control
-reply, a handshake, a request whose answer the peer awaits — and a path whose peer may stop reading
-uses the checked writes under a deadline instead.
+Because that poll makes progress only when the peer reads, every caller bounds its own wait instead
+of relying on the pipe to end it. The worker's delivery ends on a withdrawal or the send deadline.
+The controller's attention delivery ends on the expiry of its release ticket. A local connection to
+the control daemon ends when a window renewal or an unsolicited keepalive written by the daemon has
+waited 5s for the peer to read it. `FrameWriter::write_frame` is not bounded in this way, and so it
+is used only where the peer reads what it is sent: during a handshake, or when the peer is waiting
+for the answer to a request. The daemon also writes a control reply or a hello refusal on a local
+connection without a bound, so a peer that sends a request and then stops reading holds its
+connection until the connection fails. A path whose peer may stop reading uses the checked writes
+under a deadline instead.
 
 ## Wiring a host
 

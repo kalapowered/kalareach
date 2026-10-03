@@ -176,12 +176,16 @@ impl Readiness {
     /// spent roughly 730 ms of processor time over that span, about 2.4% of one core; the cost is a
     /// waker doing nothing seventy-four times a second, not a busy loop. The paths that carry to a
     /// peer that may stop reading bound their own wait: the worker's delivery ends it on a withdrawal
-    /// or a send deadline, and the controller's attention delivery on the release ticket's own
-    /// expiry, each waiting here inside a `select!` that another arm can end. [`FrameWriter::write_frame`]
-    /// and `write_message` wait with no bound of their own and are used for a control exchange whose
+    /// or a send deadline, the controller's attention delivery on the release ticket's own expiry,
+    /// and a local connection's loop on the bound it gives a window renewal or a keepalive it writes
+    /// unasked (`begin_frame` and `resume_frame` under a timeout), each waiting here inside a
+    /// `select!` or a timeout that another arm can end. [`FrameWriter::write_frame`] and
+    /// `write_message` wait with no bound of their own and are used for a control exchange whose
     /// peer reads what it is sent; a control write to a peer that has stopped reading would poll here
     /// until the connection errs, which is why a path whose peer may stall uses the checked writes
-    /// under a deadline instead. `docs/transport/README.md` records the figure and this rule.
+    /// under a deadline instead. A local connection's own control replies and hello refusals are
+    /// written that way too, and a peer that sends a request and then stops reading holds that
+    /// connection until it fails. `docs/transport/README.md` records the figure and this rule.
     async fn ready(&self) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         Ok(())
