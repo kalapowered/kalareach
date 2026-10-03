@@ -983,14 +983,14 @@ removes is never opened at all:
    content of it is read), and each repository found that way has its data placed and excluded like
    any other.
 
-   Discovery goes down two more roads for the same reason, and reads nothing along either. A
-   **link** is followed: never to capture anything, because what a version holds for a link is its
-   target as text, but to look, because the repository at the other end of one can keep its own
-   data at an ordinary path of this tree. The target is resolved the way every other name here is,
-   one component at a time with a link on the way refused, and what it reaches is searched like
-   any other directory. And a `.git` **inside** a repository's own data is read rather than passed
-   over: everything under that data is excluded already, which says nothing about where a
-   repository whose tree sits there keeps its own, so that reference is followed too.
+   Discovery takes two more routes for the same reason, and reads nothing along either. A **link**
+   is followed: never to capture anything, because what a version holds for a link is its target as
+   text, but to look, because the repository at the other end of one can keep its own data at an
+   ordinary path of this tree. The target is resolved the way every other name here is, one
+   component at a time with a link on the way refused, and what it reaches is searched like any
+   other directory. And a `.git` **inside** a repository's own data is read rather than passed over:
+   everything under that data is excluded already, which says nothing about where a repository whose
+   tree sits there keeps its own, so that reference is followed too.
 
    All of this spends the same entry budget the scan of a repository's own data does, and a set of
    trees deeper, or with more entries, than this host looks through refuses the capture rather
