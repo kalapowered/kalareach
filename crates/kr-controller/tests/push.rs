@@ -2774,9 +2774,9 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
         .expect("rotation succeeds after earlier notifications expire");
 }
 
-/// KR-REQ-16.11, KR-REQ-10: a key registration asks its admission inside the delivery journal's
-/// write, with every other writer of the journal shut out and after everything the write reads has
-/// been read, and a refusal there writes nothing. The control: an admission that stands writes the
+/// KR-REQ-16.11: a key registration asks its admission inside the delivery journal's write, with
+/// every other writer of the journal shut out and after everything the write reads has been read,
+/// and a refusal there writes nothing. The control: an admission that stands writes the
 /// registration.
 #[test]
 fn a_preview_key_registration_asks_its_admission_inside_the_journals_write() {
@@ -7347,7 +7347,7 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
     host.stop().await;
 }
 
-/// KR-REQ-16.12, KR-REQ-10: a destination whose rule names a grant issued to a paired device, a
+/// KR-REQ-16.12, KR-REQ-10.40: a destination whose rule names a grant issued to a paired device, a
 /// grant of the grant store, receives nothing once that device's pairing has ended, as a request
 /// of the device's own would not be served either. The control: while the device is paired, the
 /// same webhook under the same grant is told.
