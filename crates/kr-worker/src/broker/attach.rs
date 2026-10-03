@@ -94,6 +94,12 @@ pub struct NativeLaunch {
     pub site: kr_protocol::ids::EnvironmentId,
     /// The operating-system user the agent runs as.
     pub os_user: String,
+    /// The directory a launched backend starts in.
+    ///
+    /// It is the directory the application works in and never the launch's own private directory,
+    /// which holds the registration and the credential: an application that writes into its
+    /// working directory must not write there.
+    pub working_directory: std::path::PathBuf,
 }
 
 /// What a connecting bridge writes before anything else.
@@ -222,9 +228,10 @@ async fn stop_what_ended(
         crate::broker::InstanceEnding::NativeExit,
     );
     let backend = outcome.backend?;
-    Some(
-        crate::broker::process::stop_backend(&backend, crate::broker::process::BACKEND_GRACE).await,
-    )
+    let stopped =
+        crate::broker::process::stop_backend(&backend, crate::broker::process::BACKEND_GRACE).await;
+    broker.release_stopped(&backend);
+    Some(stopped)
 }
 
 fn map_content_class(
@@ -573,6 +580,9 @@ pub struct NativeGateway {
     /// The native bridge the launched application was installed with, where it has one.
     bridge: Option<crate::broker::bridge::InstalledBridge>,
     runtime_directory: std::path::PathBuf,
+    /// The session's job, which a launch is held by and which ends it when it closes.
+    #[cfg(windows)]
+    session_job: Option<Arc<crate::windows::job::SessionJob>>,
     /// How long this gateway gives a connection's writers once its reading has ended.
     ///
     /// It is [`TEARDOWN_DEADLINE`] for every gateway this product binds. It is a field rather than
@@ -596,17 +606,31 @@ pub struct NativeGateway {
     >,
 }
 
+/// The process a launch starts, as this platform hands it back: with the ends of its standard
+/// input and output this host keeps, and what ends it and waits for it.
+#[cfg(unix)]
+pub type AgentChild = std::process::Child;
+
+/// The process a launch starts, as this platform hands it back: with the ends of its standard
+/// input and output this host keeps, and what ends it and waits for it.
+#[cfg(windows)]
+pub type AgentChild = crate::windows::launch::Child;
+
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
 ///
 /// The process has not been told where to connect, so it has done nothing anyone depends on, and
 /// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
 /// merely signalled, when the launch returns. On Windows its job is ended with it, which ends
-/// anything it started in the meantime.
-fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
+/// anything it started in the meantime, and the job is let go of: nothing will ask about an agent
+/// that never ran.
+fn stop_started(mut child: AgentChild, started: &ProcessStartIdentity) {
     #[cfg(windows)]
-    if let Some(job) = crate::windows::job::agent_job(started) {
-        // Best effort: the child is ended below whatever this answers.
-        let _ = job.terminate(1);
+    {
+        if let Some(job) = crate::windows::job::agent_job(started) {
+            // Best effort: the child is ended below whatever this answers.
+            let _ = job.terminate(1);
+        }
+        crate::windows::job::release_agent(started);
     }
     #[cfg(not(windows))]
     let _ = started;
@@ -615,32 +639,79 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
     let _ = child.wait();
 }
 
-/// Starts the agent `command` names and reads back what the kernel started.
+/// Starts the agent a launch names and reads back what the kernel started.
 ///
-/// On Windows the agent is started in a job of its own, joined before it runs, and the job is kept
-/// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
-/// places a caller under an agent by what the agent's job holds rather than by a walk up the
-/// parents. Elsewhere the broker walks the parents, and the agent is started as it is.
+/// Elsewhere the broker walks the parents, and the agent is started as it is.
+#[cfg(unix)]
 fn start_agent(
-    command: &mut std::process::Command,
     program: &str,
-) -> Result<(std::process::Child, ProcessStartIdentity)> {
+    arguments: &[String],
+    directory: &std::path::Path,
+    registration: &std::path::Path,
+) -> Result<(AgentChild, ProcessStartIdentity)> {
     let could_not_start =
         |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
-    #[cfg(windows)]
-    let (mut child, job) = {
-        let job = crate::windows::job::AgentJob::create().map_err(could_not_start)?;
-        let child = job.start(command).map_err(could_not_start)?;
-        (child, job)
-    };
-    #[cfg(not(windows))]
-    let mut child = command.spawn().map_err(could_not_start)?;
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .current_dir(directory)
+        // One variable: the registration names the credential file beside it.
+        .env("KR_REGISTRATION", registration)
+        // The worker owns the standard streams of the backend it starts. The person's own
+        // terminal is the session's PTY and is a different path; what this pair carries is
+        // whatever the launched process says to the host that started it.
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(could_not_start)?;
+    match kr_ipc::identity::started_process_identity(child.id()) {
+        Ok(started) => Ok((child, started)),
+        Err(error) => {
+            // A process this host cannot name is one it could never supervise or stop by its
+            // identity later, so it is stopped now, while the handle still names it.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(BrokerError::ledger(format!(
+                "the started process cannot be read, so it was stopped: {error}"
+            )))
+        }
+    }
+}
+
+/// Starts the agent a launch names and reads back what the kernel started.
+///
+/// On Windows the agent is started in the session's job and in a job of its own, both joined
+/// before it runs, and its job is kept for the broker: a Windows process keeps naming a parent
+/// after that parent exits, so the broker places a caller under an agent by what the agent's job
+/// holds rather than by a walk up the parents. It is given its standard input and output as pipes
+/// and nothing else this worker holds.
+#[cfg(windows)]
+fn start_agent(
+    program: &str,
+    arguments: &[String],
+    directory: &std::path::Path,
+    registration: &std::path::Path,
+    session: &crate::windows::job::SessionJob,
+) -> Result<(AgentChild, ProcessStartIdentity)> {
+    let could_not_start =
+        |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
+    let job = crate::windows::job::AgentJob::create().map_err(could_not_start)?;
+    let mut child = crate::windows::launch::start(&crate::windows::launch::Spec {
+        program: std::path::Path::new(program),
+        arguments,
+        directory,
+        // One variable: the registration names the credential file beside it.
+        environment: &[("KR_REGISTRATION", registration.as_os_str())],
+        session: Some(session),
+        agent: &job,
+        pipe_input: true,
+        pipe_output: true,
+    })
+    .map_err(could_not_start)?;
     let started = match kr_ipc::identity::started_process_identity(child.id()) {
         Ok(started) => started,
         Err(error) => {
             // A process this host cannot name is one it could never supervise or stop by its
             // identity later, so it is stopped now, while the handle still names it.
-            #[cfg(windows)]
             let _ = job.terminate(1);
             let _ = child.kill();
             let _ = child.wait();
@@ -649,8 +720,7 @@ fn start_agent(
             )));
         }
     };
-    #[cfg(windows)]
-    crate::windows::job::keep_agent(started.clone(), Arc::new(job));
+    crate::windows::job::keep_agent(started.clone(), Arc::new(job), child.stdin.clone());
     Ok((child, started))
 }
 
@@ -658,7 +728,7 @@ fn start_agent(
 #[derive(Debug)]
 pub struct Launched {
     /// The process itself, so its owner can wait for it or end it.
-    pub child: std::process::Child,
+    pub child: AgentChild,
     /// What the kernel says it is.
     pub process: ProcessStartIdentity,
     /// The profile it was started from.
@@ -715,6 +785,8 @@ impl NativeGateway {
             registration,
             bridge: None,
             runtime_directory: runtime_directory.to_path_buf(),
+            #[cfg(windows)]
+            session_job: None,
             #[cfg(feature = "testing")]
             last_started: None,
             #[cfg(feature = "testing")]
@@ -750,6 +822,18 @@ impl NativeGateway {
     #[must_use]
     pub const fn last_started(&self) -> Option<&ProcessStartIdentity> {
         self.last_started.as_ref()
+    }
+
+    /// Names the session's job, which the agent this gateway launches is held by.
+    ///
+    /// A launch on Windows is held by the session's job and by a job of its own, joined before it
+    /// runs, so that closing the session ends it and everything it started. A gateway with none
+    /// launches nothing.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn in_session(mut self, job: Arc<crate::windows::job::SessionJob>) -> Self {
+        self.session_job = Some(job);
+        self
     }
 
     /// Declares the native bridge the launched application was installed with.
@@ -839,6 +923,16 @@ impl NativeGateway {
                     .to_owned(),
             });
         }
+        // The full profile is held by the session's job, which ends everything in it when it
+        // closes. A launch with none to be held by is refused before anything starts.
+        #[cfg(windows)]
+        let session = self
+            .session_job
+            .clone()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: "this launch has no session job to be held by, so nothing was started"
+                    .to_owned(),
+            })?;
         crate::broker::process::check_private_directory(&self.runtime_directory)?;
         let credential = Credential::generate()?;
         // The launch's hold on its instance. Every failure from here gives back what it took, by
@@ -846,18 +940,21 @@ impl NativeGateway {
         let broker = Arc::clone(&self.broker);
         let reservation = broker.execute_launch(intent, foreground, application_instance_id)?;
         let program = reservation.profile().binary.resolved_path.clone();
-        let mut command = std::process::Command::new(&program);
-        command
-            .args(&reservation.profile().arguments)
-            .current_dir(&self.runtime_directory)
-            // One variable: the registration names the credential file beside it.
-            .env("KR_REGISTRATION", &registration_path)
-            // The worker owns the standard streams of the backend it starts. The person's own
-            // terminal is the session's PTY and is a different path; what this pair carries is
-            // whatever the launched process says to the host that started it.
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped());
-        let (child, started) = start_agent(&mut command, &program)?;
+        #[cfg(unix)]
+        let (child, started) = start_agent(
+            &program,
+            &reservation.profile().arguments,
+            &self.launch.working_directory,
+            &registration_path,
+        )?;
+        #[cfg(windows)]
+        let (child, started) = start_agent(
+            &program,
+            &reservation.profile().arguments,
+            &self.launch.working_directory,
+            &registration_path,
+            &session,
+        )?;
         #[cfg(feature = "testing")]
         {
             self.last_started = Some(started.clone());
@@ -927,7 +1024,7 @@ impl NativeGateway {
     /// while the process that holds it is still running.
     fn fail_after_start<Held>(
         &mut self,
-        child: std::process::Child,
+        child: AgentChild,
         started: &ProcessStartIdentity,
         held: Held,
         credential_path: Option<&std::path::Path>,

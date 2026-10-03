@@ -305,6 +305,7 @@ impl Launch {
                 framing: Framing::new(NativeFraming::JsonLines),
                 site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                 os_user: "agent-user".to_owned(),
+                working_directory: runtime.clone(),
             },
         )
         .expect("the endpoint binds")

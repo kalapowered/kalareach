@@ -235,12 +235,19 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         let _ = std::fs::remove_dir_all(&directory);
         return Printed::NotRun;
     };
-    let started = std::process::Command::new(program)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(to_out))
-        .stderr(std::process::Stdio::from(to_err))
-        .spawn();
+    let started = {
+        // Started under the lock every start of this worker's takes on Windows, while a launch's
+        // stream ends may be inheritable: a process that held one would hold a backend's output
+        // open for as long as it ran.
+        #[cfg(windows)]
+        let _inheriting = crate::windows::launch::inheriting();
+        std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(to_out))
+            .stderr(std::process::Stdio::from(to_err))
+            .spawn()
+    };
     let Ok(mut child) = started else {
         let _ = std::fs::remove_dir_all(&directory);
         return Printed::NotRun;

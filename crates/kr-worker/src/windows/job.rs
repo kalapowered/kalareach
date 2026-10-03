@@ -47,22 +47,16 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::os::windows::process::CommandExt as _;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use kr_protocol::identity::ProcessStartIdentity;
-use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
-};
-use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 /// How many process identifiers one query asks the job for before it asks again with more room.
@@ -194,55 +188,18 @@ impl AgentJob {
         Ok(Self { job })
     }
 
-    /// Starts `command` inside this job, joined before it runs.
-    ///
-    /// The process is created suspended, put into the job, and resumed only once the kernel says
-    /// the job holds it, so no instruction of it runs outside the job and nothing it starts is
-    /// outside it either. The command's creation flags are this call's. A failure at any step ends
-    /// the process rather than leaving one this worker cannot account for, and a failure to end it
-    /// is reported rather than swallowed.
+    /// Returns the handle a process creation names this job by.
+    pub(super) fn handle(&self) -> HANDLE {
+        self.job.raw()
+    }
+
+    /// Returns whether a process is inside this job.
     ///
     /// # Errors
     ///
-    /// Returns the failure to start the process, to put it into this job, to confirm that the job
-    /// holds it, or to resume it.
-    pub fn start(
-        &self,
-        command: &mut std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
-        command.creation_flags(CREATE_SUSPENDED);
-        let mut child = command.spawn()?;
-        // SAFETY: both handles are open for the call: the job's is this object's own, and the
-        // process's belongs to `child`, which outlives the call.
-        let assigned =
-            unsafe { AssignProcessToJobObject(self.job.raw(), child.as_raw_handle().cast()) };
-        if assigned == 0 {
-            let failure = std::io::Error::last_os_error();
-            return Err(end_unstarted(
-                &mut child,
-                &format!("it could not be put into its job: {failure}"),
-            ));
-        }
-        // Suspended, so nothing has run yet. The kernel is asked whether the job really holds it
-        // rather than the assignment being taken at its word: a process this host believed was
-        // the agent's and was not would be placed by a job that does not describe it.
-        match self.job.holds(child.as_raw_handle().cast()) {
-            Ok(true) => {}
-            Ok(false) => return Err(end_unstarted(&mut child, "its job does not hold it")),
-            Err(failure) => {
-                return Err(end_unstarted(
-                    &mut child,
-                    &format!("its job would not say whether it holds it: {failure}"),
-                ));
-            }
-        }
-        if let Err(failure) = resume(child.id()) {
-            return Err(end_unstarted(
-                &mut child,
-                &format!("it could not be resumed: {failure}"),
-            ));
-        }
-        Ok(child)
+    /// Returns the operating system's failure when it will not say.
+    pub(super) fn holds_process(&self, process: &OwnedHandle) -> std::io::Result<bool> {
+        self.job.holds(process.as_raw_handle().cast())
     }
 
     /// Returns whether this job holds `child`.
@@ -250,7 +207,7 @@ impl AgentJob {
     /// # Errors
     ///
     /// Returns the operating system's failure when it will not say.
-    pub fn holds(&self, child: &std::process::Child) -> std::io::Result<bool> {
+    pub fn holds(&self, child: &super::launch::Child) -> std::io::Result<bool> {
         self.job.holds(child.as_raw_handle().cast())
     }
 
@@ -290,22 +247,6 @@ impl AgentJob {
     /// Returns the operating system's failure when the job will not be terminated.
     pub fn terminate(&self, code: u32) -> std::io::Result<()> {
         self.job.terminate(code)
-    }
-}
-
-/// Ends a process that was created suspended and never resumed, and says why.
-///
-/// When the process cannot be ended either, the error carries both causes: the one that stopped
-/// the start, and the one that stopped the cleanup, because the second says what is still there.
-fn end_unstarted(child: &mut std::process::Child, because: &str) -> std::io::Error {
-    match child.kill().and_then(|()| child.wait().map(drop)) {
-        Ok(()) => std::io::Error::other(format!(
-            "a process was created and never started, because {because}"
-        )),
-        Err(failure) => std::io::Error::other(format!(
-            "a process was created and never started, because {because}, and then could not be \
-             ended either: {failure}"
-        )),
     }
 }
 
@@ -535,7 +476,8 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
     jobs.get(&root).and_then(Weak::upgrade)
 }
 
-/// The job each agent this worker launched was started in, found by that agent's start identity.
+/// The job each agent this worker launched was started in, found by that agent's start identity,
+/// and what stops it.
 ///
 /// The agent is started where the broker's launch is, and placed where a caller is verified, so the
 /// two need somewhere to meet, as a session's root shell and its boundary do. The reference is
@@ -543,22 +485,51 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
 /// names the agent ends: an agent's job is not kill-on-close, so keeping it keeps no process alive,
 /// and the broker asks about an agent only for as long as one of its instances lasts. It costs one
 /// handle for each agent with a live instance.
+///
+/// The registry also holds the end of the agent's standard input that this host writes, so that
+/// stopping the agent can close it, and the one record of a stop: whoever stops the agent first
+/// does the work, and a concurrent caller waits for that and gets the same answer.
 static AGENTS: OnceLock<Mutex<Vec<KeptAgent>>> = OnceLock::new();
 
-/// One launched agent and the job it was started in.
-type KeptAgent = (ProcessStartIdentity, Arc<AgentJob>);
+/// One launched agent, the job it was started in and what stops it.
+struct KeptAgent {
+    agent: ProcessStartIdentity,
+    job: Arc<AgentJob>,
+    writer: Option<super::launch::StdinPipe>,
+    stopping: Arc<tokio::sync::Mutex<Option<crate::broker::BackendStop>>>,
+}
+
+/// What stops one launched agent: its job, the writer of its input and the record of the stop.
+#[derive(Clone)]
+pub struct Stopper {
+    /// The job that holds the agent and what it started.
+    pub job: Arc<AgentJob>,
+    /// The end of the agent's standard input this host writes, where there is one.
+    pub writer: Option<super::launch::StdinPipe>,
+    /// The one record of the stop, held for as long as it is being done.
+    pub outcome: Arc<tokio::sync::Mutex<Option<crate::broker::BackendStop>>>,
+}
 
 fn agents() -> &'static Mutex<Vec<KeptAgent>> {
     AGENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Records that `agent` was started in `job`.
-pub fn keep_agent(agent: ProcessStartIdentity, job: Arc<AgentJob>) {
+/// Records that `agent` was started in `job`, with the end of its input this host writes.
+pub fn keep_agent(
+    agent: ProcessStartIdentity,
+    job: Arc<AgentJob>,
+    writer: Option<super::launch::StdinPipe>,
+) {
     let mut kept = agents()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    kept.retain(|(recorded, _)| *recorded != agent);
-    kept.push((agent, job));
+    kept.retain(|recorded| recorded.agent != agent);
+    kept.push(KeptAgent {
+        agent,
+        job,
+        writer,
+        stopping: Arc::new(tokio::sync::Mutex::new(None)),
+    });
 }
 
 /// Forgets the job `agent` was started in.
@@ -570,7 +541,7 @@ pub fn release_agent(agent: &ProcessStartIdentity) {
     let mut kept = agents()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    kept.retain(|(recorded, _)| recorded != agent);
+    kept.retain(|recorded| recorded.agent != *agent);
 }
 
 /// Returns the job `agent` was started in, or None when this worker did not start it in one.
@@ -580,106 +551,23 @@ pub fn agent_job(agent: &ProcessStartIdentity) -> Option<Arc<AgentJob>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     kept.iter()
-        .find(|(recorded, _)| recorded == agent)
-        .map(|(_, job)| Arc::clone(job))
+        .find(|recorded| recorded.agent == *agent)
+        .map(|recorded| Arc::clone(&recorded.job))
 }
 
-/// Resumes a process that was created suspended.
-///
-/// The standard library's process creation keeps the handle of the thread it created to itself, so
-/// the thread is found in the system's list of threads. A process created suspended has that one
-/// thread. Every thread of the process is resumed, and resuming a thread that is running already
-/// changes nothing.
-fn resume(pid: u32) -> std::io::Result<()> {
-    // SAFETY: the flag is the documented "every thread in the system" and the identifier is
-    // ignored for it. The call returns a handle this process owns, or the invalid value.
-    let raw = unsafe { toolhelp::CreateToolhelp32Snapshot(toolhelp::TH32CS_SNAPTHREAD, 0) };
-    if raw == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: the call reported a handle this process owns and nothing else holds.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-    let mut entry = toolhelp::ThreadEntry::sized();
-    let mut resumed = 0_usize;
-    // SAFETY: the snapshot is open for the call and the entry is a local of the declared size.
-    let mut listed =
-        unsafe { toolhelp::Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) };
-    while listed != 0 {
-        if entry.owner_process_id == pid {
-            // SAFETY: the access right and the identifier are plain values; the call returns a
-            // handle this process owns, or null.
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
-            if thread.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: the call reported a handle this process owns and nothing else holds.
-            let thread = unsafe { OwnedHandle::from_raw_handle(thread.cast()) };
-            // SAFETY: the handle is open for the call with the right to resume.
-            if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
-                return Err(std::io::Error::last_os_error());
-            }
-            resumed += 1;
-        }
-        // SAFETY: as for the first entry.
-        listed = unsafe { toolhelp::Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) };
-    }
-    let ended = std::io::Error::last_os_error();
-    if ended
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        != Some(ERROR_NO_MORE_FILES)
-    {
-        return Err(ended);
-    }
-    if resumed == 0 {
-        return Err(std::io::Error::other(format!(
-            "the system lists no thread of process {pid}"
-        )));
-    }
-    Ok(())
-}
-
-/// The system's thread list, which `windows-sys` declares only behind a feature this crate does not
-/// enable: the three documented `kernel32` functions and the one structure they fill.
-mod toolhelp {
-    use windows_sys::Win32::Foundation::HANDLE;
-
-    /// Asks for every thread in the system.
-    pub(super) const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
-
-    /// One thread as the list describes it: `THREADENTRY32`. The fields this worker never reads
-    /// are there because the system writes them.
-    #[repr(C)]
-    #[derive(Default)]
-    pub(super) struct ThreadEntry {
-        /// The structure's own size, set before the first call.
-        pub(super) size: u32,
-        _usage: u32,
-        /// The thread's identifier.
-        pub(super) thread_id: u32,
-        /// The identifier of the process the thread belongs to.
-        pub(super) owner_process_id: u32,
-        _base_priority: i32,
-        _delta_priority: i32,
-        _flags: u32,
-    }
-
-    impl ThreadEntry {
-        /// An empty entry that says its own size, which the list requires before the first call.
-        pub(super) fn sized() -> Self {
-            Self {
-                size: u32::try_from(std::mem::size_of::<Self>()).unwrap_or(0),
-                ..Self::default()
-            }
-        }
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        pub(super) fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> HANDLE;
-        pub(super) fn Thread32First(snapshot: HANDLE, entry: *mut ThreadEntry) -> i32;
-        pub(super) fn Thread32Next(snapshot: HANDLE, entry: *mut ThreadEntry) -> i32;
-    }
+/// Returns what stops `agent`, or None when this worker did not start it or has let it go.
+#[must_use]
+pub fn stopper(agent: &ProcessStartIdentity) -> Option<Stopper> {
+    let kept = agents()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    kept.iter()
+        .find(|recorded| recorded.agent == *agent)
+        .map(|recorded| Stopper {
+            job: Arc::clone(&recorded.job),
+            writer: recorded.writer.clone(),
+            outcome: Arc::clone(&recorded.stopping),
+        })
 }
 
 /// What one query of the job's process list produced.
@@ -719,23 +607,43 @@ mod tests {
         assert!(job.process_ids().expect("the process list").is_empty());
     }
 
+    /// A program in the system directory, which every Windows machine has.
+    fn system_program(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+            .join("System32")
+            .join(name)
+    }
+
+    /// Starts `program` in `job` with no streams, as a launch does.
+    fn start_in(job: &AgentJob, name: &str, arguments: &[&str]) -> super::super::launch::Child {
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        super::super::launch::start(&super::super::launch::Spec {
+            program: &system_program(name),
+            arguments: &arguments,
+            directory: &std::env::temp_dir(),
+            environment: &[],
+            session: None,
+            agent: job,
+            pipe_input: false,
+            pipe_output: false,
+        })
+        .expect("the agent starts")
+    }
+
     /// A process that starts one of its own and waits, far longer than any test takes: `cmd.exe`
     /// running `ping`, both on every Windows machine. The test ends both.
-    fn an_agent_with_a_child() -> std::process::Command {
-        let mut command = std::process::Command::new("cmd.exe");
-        command
-            .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command
+    fn an_agent_with_a_child(job: &AgentJob) -> super::super::launch::Child {
+        start_in(job, "cmd.exe", &["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
     }
 
     /// A process a test started, ended when the test ends, however it ends: with everything in its
     /// job while the test still holds that job, and on its own otherwise.
     struct Started<'a> {
         job: Option<&'a AgentJob>,
-        agent: std::process::Child,
+        agent: super::super::launch::Child,
     }
 
     impl Drop for Started<'_> {
@@ -782,9 +690,7 @@ mod tests {
     fn an_agent_and_every_process_it_starts_are_held_by_its_job() {
         let job = AgentJob::create().expect("a job");
         let started = Started {
-            agent: job
-                .start(&mut an_agent_with_a_child())
-                .expect("the agent starts"),
+            agent: an_agent_with_a_child(&job),
             job: Some(&job),
         };
         assert!(
@@ -804,15 +710,7 @@ mod tests {
     fn closing_an_agent_job_leaves_the_agent_running() {
         let job = AgentJob::create().expect("a job");
         let mut started = Started {
-            agent: job
-                .start(
-                    std::process::Command::new("ping.exe")
-                        .args(["-n", "600", "127.0.0.1"])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null()),
-                )
-                .expect("the agent starts"),
+            agent: start_in(&job, "ping.exe", &["-n", "600", "127.0.0.1"]),
             job: None,
         };
         drop(job);
@@ -836,7 +734,7 @@ mod tests {
         );
         assert!(agent_job(&agent).is_none(), "nothing was started for it");
         let job = Arc::new(AgentJob::create().expect("a job"));
-        keep_agent(agent.clone(), Arc::clone(&job));
+        keep_agent(agent.clone(), Arc::clone(&job), None);
         assert!(agent_job(&agent).is_some_and(|found| Arc::ptr_eq(&found, &job)));
         let mut again = agent;
         again.start_value = kr_protocol::scalars::U64::new(18);
@@ -853,8 +751,8 @@ mod tests {
         let kept = ProcessStartIdentity::new(0xF000_0005, source, 17);
         let released_job = Arc::new(AgentJob::create().expect("a job"));
         let kept_job = Arc::new(AgentJob::create().expect("a job"));
-        keep_agent(released.clone(), Arc::clone(&released_job));
-        keep_agent(kept.clone(), Arc::clone(&kept_job));
+        keep_agent(released.clone(), Arc::clone(&released_job), None);
+        keep_agent(kept.clone(), Arc::clone(&kept_job), None);
 
         release_agent(&released);
         assert!(

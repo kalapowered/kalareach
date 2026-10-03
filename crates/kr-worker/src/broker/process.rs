@@ -691,7 +691,105 @@ pub struct BackendStop {
 /// The identity is checked before anything is signalled and again before anything is forced,
 /// because a bare process identifier can be reused and signalling a stranger is worse than leaving
 /// a backend running.
+///
+/// On Windows a backend this host started is held by a job, and that job is what is stopped: its
+/// input is closed, which is how the agent is told to finish, the grace period is given to
+/// everything the job holds, and then the job is terminated. It is complete only when the job lists
+/// nothing, and an agent whose root has exited and whose helpers have not is not yet complete.
 pub async fn stop_backend(
+    process: &ProcessStartIdentity,
+    grace: std::time::Duration,
+) -> BackendStop {
+    #[cfg(windows)]
+    if let Some(stopper) = crate::windows::job::stopper(process) {
+        return stop_held(stopper, grace).await;
+    }
+    stop_by_identity(process, grace).await
+}
+
+/// Stops the agent whose job and input are `stopper`, once, whoever asks.
+///
+/// The first caller does the stop while holding the record of it, and a concurrent caller waits for
+/// the record and returns what the first found, so one agent is stopped by one owner and never
+/// twice.
+#[cfg(windows)]
+async fn stop_held(
+    stopper: crate::windows::job::Stopper,
+    grace: std::time::Duration,
+) -> BackendStop {
+    let mut outcome = stopper.outcome.lock().await;
+    if let Some(done) = *outcome {
+        return done;
+    }
+    let done = stop_job(&stopper, grace).await;
+    *outcome = Some(done);
+    done
+}
+
+/// Closes the agent's input, waits the grace period for its job to empty, then terminates the job.
+#[cfg(windows)]
+async fn stop_job(
+    stopper: &crate::windows::job::Stopper,
+    grace: std::time::Duration,
+) -> BackendStop {
+    let closing = stopper.writer.clone();
+    // Closing cancels a write that is blocked and takes the lock the write held, which waits, so it
+    // is not done on the runtime's own threads.
+    let close = move || {
+        if let Some(writer) = closing {
+            let _ = writer.close();
+        }
+    };
+    let emptied = |listing: &std::io::Result<Vec<u32>>| listing.as_ref().is_ok_and(Vec::is_empty);
+    let first = stopper.job.process_ids();
+    if emptied(&first) {
+        let _ = tokio::task::spawn_blocking(close).await;
+        return BackendStop {
+            asked: false,
+            forced: false,
+            ended: true,
+            unresolved: false,
+        };
+    }
+    let _ = tokio::task::spawn_blocking(close).await;
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if emptied(&stopper.job.process_ids()) {
+            return BackendStop {
+                asked: true,
+                forced: false,
+                ended: true,
+                unresolved: false,
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(BACKEND_POLL).await;
+    }
+    let terminated = stopper.job.terminate(1);
+    // A termination is not instant either: the job is looked at until it is empty, within a bound.
+    let confirm = tokio::time::Instant::now() + FORCED_CONFIRMATION;
+    let listing = loop {
+        let listing = stopper.job.process_ids();
+        if emptied(&listing) || tokio::time::Instant::now() >= confirm {
+            break listing;
+        }
+        tokio::time::sleep(BACKEND_POLL).await;
+    };
+    let ended = emptied(&listing);
+    BackendStop {
+        asked: true,
+        forced: true,
+        ended,
+        // What could not be established is never reported as a stop: a job that would not say what
+        // it holds, or a termination that failed and left something in it.
+        unresolved: listing.is_err() || (terminated.is_err() && !ended),
+    }
+}
+
+/// Stops one process by its identity: asked, then forced once the grace period has passed.
+async fn stop_by_identity(
     process: &ProcessStartIdentity,
     grace: std::time::Duration,
 ) -> BackendStop {

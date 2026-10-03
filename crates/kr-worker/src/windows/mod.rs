@@ -27,7 +27,7 @@ pub mod conpty;
 pub mod file;
 #[cfg(windows)]
 pub mod job;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub mod launch;
 // The decisions are written over a table of readings and run on every platform's tests; the
 // readings themselves are the kernel's and exist only here.
