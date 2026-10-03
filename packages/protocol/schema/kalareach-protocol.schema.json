@@ -25697,6 +25697,10 @@
           ],
           "description": "An opaque identifier for correlating this failure with host diagnostics."
         },
+        "link_fenced": {
+          "description": "True when a worker refused a request because the connection it arrived on no longer speaks\nfor the controller generation that holds the worker's authority. The refusal is the same\n`PERMISSION_DENIED` every other refusal of authority is; the member says that the\nconnection itself is spent, so a controller that reads it ends the link instead of keeping\nit for the next request, and stops the worker's lease with it.\n\nIt travels only between a worker and the control daemon on this machine, which ends the\nlink and does not pass the member on to a device. It is absent from the wire when it is\nfalse, so every other error is byte for byte what a reader built before this member\nexpects. Remove the default and the omission once no worker of a build before this member\ncan still be running: a worker outlives an update of the control daemon.",
+          "type": "boolean"
+        },
         "message": {
           "description": "A plain message. It never carries credentials or command text.",
           "type": "string"

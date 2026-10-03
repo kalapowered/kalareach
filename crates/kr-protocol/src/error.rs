@@ -237,6 +237,19 @@ pub struct ProtocolError {
     pub retry: RetryCategory,
     /// An opaque identifier for correlating this failure with host diagnostics.
     pub diagnostic_id: Nullable<DiagnosticId>,
+    /// True when a worker refused a request because the connection it arrived on no longer speaks
+    /// for the controller generation that holds the worker's authority. The refusal is the same
+    /// `PERMISSION_DENIED` every other refusal of authority is; the member says that the
+    /// connection itself is spent, so a controller that reads it ends the link instead of keeping
+    /// it for the next request, and stops the worker's lease with it.
+    ///
+    /// It travels only between a worker and the control daemon on this machine, which ends the
+    /// link and does not pass the member on to a device. It is absent from the wire when it is
+    /// false, so every other error is byte for byte what a reader built before this member
+    /// expects. Remove the default and the omission once no worker of a build before this member
+    /// can still be running: a worker outlives an update of the control daemon.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub link_fenced: bool,
 }
 
 impl ProtocolError {
@@ -248,7 +261,16 @@ impl ProtocolError {
             message: message.into(),
             retry: code.retry_category(),
             diagnostic_id: Nullable::null(),
+            link_fenced: false,
         }
+    }
+
+    /// Marks this error as the refusal of a link that no longer holds a worker's authority
+    /// ([`Self::link_fenced`]).
+    #[must_use]
+    pub fn for_a_fenced_link(mut self) -> Self {
+        self.link_fenced = true;
+        self
     }
 
     /// Attaches an opaque diagnostic identifier.
@@ -272,3 +294,32 @@ impl fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-09.12: an error that does not mark a spent link is the frame a reader built before
+    /// the marker expects, which rejects a member it does not know; one that marks it says so, and
+    /// reads back marked.
+    #[test]
+    fn a_marker_is_on_the_wire_only_for_a_refusal_of_a_spent_link() {
+        let ordinary = ProtocolError::new(ErrorCode::PermissionDenied, "refused");
+        let json = serde_json::to_value(&ordinary).expect("encodes");
+        assert!(json.get("link_fenced").is_none(), "{json}");
+        let decoded: ProtocolError = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, ordinary);
+        assert!(!decoded.link_fenced);
+
+        let marked = ordinary.for_a_fenced_link();
+        let json = serde_json::to_value(&marked).expect("encodes");
+        assert_eq!(
+            json.get("link_fenced"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let decoded: ProtocolError = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, marked);
+        assert!(decoded.link_fenced);
+        assert_eq!(decoded.code, ErrorCode::PermissionDenied);
+    }
+}
