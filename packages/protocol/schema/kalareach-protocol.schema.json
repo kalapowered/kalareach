@@ -32362,7 +32362,7 @@
               "type": "null"
             }
           ],
-          "description": "Where the variables its root shell was started with came from, when its worker said.\n\nAbsent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for\na summary this host composes without its worker (a closure with no worker record to read,\nor a worker whose end could not be established) because no worker said anything about the\nenvironment, and for one a worker of an earlier release described, which wrote no such\nmember. Only that second reason ends: it goes when no worker of a release that wrote none\ncan still be running and no journal row of one is still read."
+          "description": "Where the variables its root shell was started with came from, when its worker said.\n\nAbsent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for\na summary this host composes without its worker (a closure with no worker record to read, a\nworker whose end could not be established, or a session the registry holds whose worker did\nnot answer) because no worker said anything about the environment, and for one a worker of\nan earlier release described, which wrote no such member. Only that second reason ends: it\ngoes when no worker of a release that wrote none can still be running and no journal row of\none is still read."
         },
         "root_process": {
           "anyOf": [
