@@ -8,16 +8,19 @@
 //! ordinary test run: it needs a daemon this run did not start.
 //!
 //! * `prepare_the_network` selects the loopback network in this installation's configuration
-//!   document. The daemon reads it when it starts, so the script restarts the daemon after it.
+//!   document, and refuses a document that already names a relay or a discovery service. The
+//!   daemon reads it when it starts, so the script restarts the daemon after it.
 //! * `pair_a_viewer_with_this_distribution` pairs a device that may view sessions with this
 //!   installation's own endpoint. The installation's first owner is established the way a person
 //!   establishes it, through the initial bootstrap on the daemon's own socket, and every later
-//!   pairing is confirmed by that owner device. Its keys and the viewer's are kept under
-//!   `KR_ACC_DIR` between runs, because the first owner is established once.
+//!   pairing is confirmed by that owner device. The first owner is established once, so its keys
+//!   are kept between runs, with the viewer's, in a directory of this account's own state
+//!   (`KR_ACC_DIR` names another).
 //! * `a_viewer_reaches_only_the_distribution_it_was_paired_with` connects that viewer to this
 //!   distribution, and then to the endpoint of another distribution that `KR_ACC_OTHER` describes.
 //!   The other one is first reached as any device may reach it, which shows the address leads to
-//!   the endpoint it names, and then as the viewer, which it must refuse.
+//!   the endpoint it names, and then as the viewer, which it must end with the close a host gives a
+//!   device it holds no record of.
 //! * `report_the_devices_and_grants` prints what this installation holds of both, which the script
 //!   compares across a change of machine group.
 //!
@@ -58,8 +61,10 @@ use net_support::{Device, build, pairing, proposal};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// Where the keys and records this suite keeps between runs are, unless `KR_ACC_DIR` says.
-const DEFAULT_DIRECTORY: &str = "/var/tmp/kr-acc-pairing";
+/// Where the keys and records this suite keeps between runs are, below this account's home,
+/// unless `KR_ACC_DIR` says. It is in the account's own state area rather than a temporary
+/// directory, which a system may empty, because the first owner it holds the keys of is made once.
+const DEFAULT_DIRECTORY: &str = ".local/state/kr-acc-pairing";
 
 /// The address the network endpoint binds to: loopback, a free port, no relay, no discovery.
 const BIND_ADDRESS: &str = "127.0.0.1:0";
@@ -130,11 +135,30 @@ fn report(kind: &str, value: &serde_json::Value) {
     println!("KR-ACC {kind} {value}");
 }
 
-/// The directory this suite keeps its keys and records in.
+/// The directory this suite keeps its keys and records in: owner-only, and this account's own.
 fn directory() -> PathBuf {
-    let directory = std::env::var_os("KR_ACC_DIR")
-        .map_or_else(|| PathBuf::from(DEFAULT_DIRECTORY), PathBuf::from);
-    std::fs::create_dir_all(&directory).expect("the directory this suite keeps its state in");
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    let directory = std::env::var_os("KR_ACC_DIR").map_or_else(
+        || {
+            PathBuf::from(std::env::var_os("HOME").expect("this account has a home"))
+                .join(DEFAULT_DIRECTORY)
+        },
+        PathBuf::from,
+    );
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)
+        .expect("the directory this suite keeps its state in");
+    let metadata = std::fs::symlink_metadata(&directory).expect("the directory is readable");
+    assert!(
+        metadata.is_dir()
+            && metadata.uid() == kr_ipc::paths::current_uid()
+            && metadata.mode() & 0o077 == 0,
+        "{} is not a directory of this account that no other account can open",
+        directory.display()
+    );
     directory
 }
 
@@ -194,11 +218,17 @@ fn kept_keys(name: &str) -> Option<DeviceKeys> {
 /// Selects the loopback network in this installation's configuration document.
 ///
 /// The daemon builds its endpoint when it starts, so the one running now keeps what it has until
-/// it is started again.
+/// it is started again. A document that already names a relay or a discovery service is not edited:
+/// this acceptance is about endpoints reached on loopback, and it does not choose a person's
+/// services for them.
 #[tokio::test]
 #[ignore = "runs inside a distribution against its own control daemon: scripts/e2e-wsl.sh"]
 async fn prepare_the_network() {
     let own = own();
+    // One writer edits at a time, the way every other writer of the document does. The lock is in
+    // the installation's state directory, which its daemon makes when it first starts.
+    let _lock = kr_worker::config::lock(&own.environment)
+        .expect("the configuration lock, which needs a daemon that has started once");
     let path = kr_worker::config::document_path(&own.environment);
     let loaded = kr_worker::config::load(&own.environment);
     let mut document = match loaded.document {
@@ -212,8 +242,20 @@ async fn prepare_the_network() {
             ConfigurationDocument::empty()
         }
     };
-    let changed =
-        !(document.network.joins() && document.network.bind_address() == Some(BIND_ADDRESS));
+    let network = &document.network;
+    assert!(
+        network.relay_urls().is_empty()
+            && network.pkarr_publisher_url().is_none()
+            && network.pkarr_resolver_url().is_none()
+            && network.dns_origin.0.is_none()
+            && network.relay_only.0 != Some(true)
+            && network.local_discovery.0 != Some(true)
+            && network.mainline_dht.0 != Some(true),
+        "the configuration document at {} selects a relay or a discovery service, and this \
+         acceptance reaches endpoints on loopback alone",
+        path.display()
+    );
+    let changed = !(network.joins() && network.bind_address() == Some(BIND_ADDRESS));
     if changed {
         document.revision += 1;
         document.network.enabled = kr_protocol::scalars::Nullable::some(true);
@@ -254,27 +296,34 @@ async fn owner_devices(client: &mut LocalClient) -> DeviceListResult {
 /// returns the owner device's keys.
 async fn the_owner(own: &Own, client: &mut LocalClient) -> DeviceKeys {
     let listed = owner_devices(client).await;
+    // A revoked owner counts: the initial bootstrap closes for good once an installation has had
+    // an owner, whatever became of it.
     let owners: Vec<_> = listed
         .devices
         .iter()
-        .filter(|device| device.manages_host && !device.revoked)
+        .filter(|device| device.manages_host)
         .collect();
     if let Some(keys) = kept_keys("owner") {
         let wanted = keys.public_keys();
         if owners
             .iter()
-            .any(|device| device.keys.0.as_ref() == Some(&wanted))
+            .any(|device| device.keys.0.as_ref() == Some(&wanted) && !device.revoked)
         {
             return keys;
         }
     }
     assert!(
         owners.is_empty(),
-        "this installation already has an owner device that this suite did not make, and the \
-         initial bootstrap is closed for good once it has one: run the acceptance where the \
-         installation has no owner"
+        "this installation has an owner device whose keys this suite does not hold (it did not \
+         make it, its keys were not kept where this suite looks, or it was revoked), and the \
+         initial bootstrap is closed for good once an installation has had an owner: run the \
+         acceptance where the installation has no owner"
     );
     let keys = DeviceKeys::generate().expect("owner keys");
+    // Kept before the confirmation that commits the pairing, so an owner this run makes is never
+    // one whose keys it lost. Keys kept for a pairing that did not commit match no owner, and the
+    // next run makes new ones.
+    keep_keys("owner", &keys);
     let device = Device::with_keys(keys.clone()).await;
     let ceremony = DeviceKeys::generate().expect("a ceremony key");
     let signer = pairing::Signer::Bootstrap(&ceremony.authorisation);
@@ -298,7 +347,6 @@ async fn the_owner(own: &Own, client: &mut LocalClient) -> DeviceKeys {
         "the initial bootstrap establishes the first owner"
     );
     connection.close(0_u32.into(), b"paired");
-    keep_keys("owner", &keys);
     keys
 }
 
@@ -460,6 +508,7 @@ async fn pair_a_viewer_with_this_distribution() {
         &json!({
             "device_id": kept.device_id,
             "grant_id": kept.grant_id,
+            "keys": keys.public_keys(),
         }),
     );
 }
@@ -555,47 +604,57 @@ async fn a_viewer_reaches_only_the_distribution_it_was_paired_with() {
     }
     connection.close(0_u32.into(), b"reached");
 
-    // The viewer is refused there: the other endpoint knows no such device, so nothing the
-    // viewer's grant allows reaches it.
-    let refused = tokio::time::timeout(
+    // The viewer is refused there. The other endpoint holds no record of the viewer's endpoint
+    // key, so it answers the viewer's offer as it answers any unpaired peer, finds no pairing
+    // exchange in what the viewer sends next, and ends the connection with the close it gives an
+    // unpaired peer. That close is the endpoint's own decision, read as a code: a connection that
+    // timed out, was reset or could not be made carries none, and a viewer let in has no such
+    // close.
+    let connection = tokio::time::timeout(
         DEADLINE,
-        NetworkTransport::connect(
+        kr_transport::endpoint::connect(
             device.endpoint(),
             other.address(),
+            kr_protocol::hello::ALPN,
+        ),
+    )
+    .await
+    .expect("the other endpoint is reached in time")
+    .expect("the other endpoint is reachable from this distribution");
+    let attempt = tokio::time::timeout(
+        DEADLINE,
+        handshake::connect(
+            &connection,
             &device.paired_identity(device_id),
             &other.peer(),
-            SendLimits::default(),
         ),
     )
     .await
     .expect("the other endpoint answers the viewer in time");
-    let error = match refused {
-        Ok(_) => panic!("the viewer was let into a distribution it was not paired with"),
-        Err(error) => error,
-    };
-    // The endpoint ends the connection of a device it does not know. Its answer is the refusal
-    // when that arrives, and a closed stream when the close comes first; a connection that could
-    // not be made, or an endpoint that said nothing, is not a decision.
     assert!(
-        matches!(
-            &error,
-            kr_client::ClientError::Transport(
-                TransportError::Refused(_)
-                    | TransportError::Stream(_)
-                    | TransportError::Closed(_)
-                    | TransportError::Handshake(_)
-            )
-        ),
-        "the other endpoint ends the viewer's connection by its own decision: {error:?}"
+        attempt.is_err(),
+        "the viewer was let into a distribution it was not paired with"
+    );
+    let closed = tokio::time::timeout(DEADLINE, connection.closed())
+        .await
+        .expect("the other endpoint closes the viewer's connection in time");
+    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = closed else {
+        panic!(
+            "the other endpoint did not end the viewer's connection by its own close: {closed:?}"
+        );
+    };
+    let code = u64::from(close.error_code);
+    assert_eq!(
+        code,
+        u64::from(kr_transport::listener::REFUSED_UNPAIRED),
+        "the other endpoint ends the viewer's connection as it ends an unpaired peer's"
     );
     report(
         "reach",
         &json!({
             "own": viewer.endpoint.environment_id,
-            "own_answered": true,
             "other": other.environment_id,
-            "other_reached": true,
-            "other_refused": true,
+            "other_closed_the_viewer_with_code": code,
         }),
     );
 }
@@ -632,7 +691,13 @@ async fn report_the_devices_and_grants() {
             "manages_host": device.manages_host,
             "keys": device.keys,
         })).collect::<Vec<_>>(),
-        "grants": grants,
+        // What each grant is and whether it was revoked, and not where it stands now: a grant
+        // that expires between two reads has not been changed by anything.
+        "grants": grants.grants.iter().map(|summary| json!({
+            "grant": summary.grant,
+            "revoked_at_ms": summary.revoked_at_ms,
+            "revoked_by_parent": summary.revoked_by_parent,
+        })).collect::<Vec<_>>(),
     });
     report("held", &held);
 }

@@ -37,10 +37,15 @@
 #
 # Every artefact is written under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}. The Windows
 # daemon this starts keeps its keys in its own run directory (never the Credential Manager). The
-# pairing in step 6 selects the loopback network in each distribution's configuration, makes the
-# distribution's first owner when it has none, and keeps the owner's and the viewer's keys under
-# /var/tmp/kr-acc-pairing in that distribution, so a distribution that already has its owner from an
-# earlier run is paired through it.
+# pairing in step 6 changes each distribution it does not remove, and leaves the changes there: it
+# selects the loopback network in the installation's configuration document (and refuses a document
+# that already names a relay or a discovery service), makes the installation's first owner when it
+# has none (the initial bootstrap closes for good, so that owner stays), pairs a viewer in each mode
+# (the devices and their grants stay in the installation's records), and keeps the owner's and the
+# viewer's keys under ~/.local/state/kr-acc-pairing of the Linux user, which is how a later run
+# pairs through the owner an earlier one made. A distribution whose installation already has an
+# owner this acceptance did not make fails at its first pairing, and says so. The machine groups
+# end as they began, each environment in a group of its own, under new identifiers.
 #
 # Knobs, all optional:
 #   KR_WSL_HELPER     absolute path of the helper inside a distribution (default /usr/local/bin/kr)
@@ -1077,9 +1082,11 @@ helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
 # own artefacts rather than programs the product installs, so they live together outside the path.
 suite_path=/usr/local/lib/kalareach-acc-bridge-suite
 # The suite that pairs a device with each distribution's own endpoint, installed and run the same
-# way, and the directory it keeps its keys in between runs.
+# way, and where it keeps its keys between runs.
 pairing_suite_path=/usr/local/lib/kalareach-acc-pairing-suite
-pairing_directory=/var/tmp/kr-acc-pairing
+# Below the Linux user's home, which is where the suite keeps them unless told otherwise: a
+# directory of the account's own state, which no system empties as it may empty a temporary one.
+pairing_state=.local/state/kr-acc-pairing
 manifest_path=/usr/local/lib/kalareach-acc-commit
 # The same set of paths relative to the root, which is the form the manifest carries so that both
 # writing it and checking it work from one directory.
@@ -1141,9 +1148,19 @@ wslconfig_saved=""
 wslconfig_existed=0
 daemons=""
 windows_daemon=""
+# Whether step 6 has taken a step on a machine group that it has not yet undone.
+groups_changed=0
 
 cleanup() {
   local status=$?
+  # A run that stops between a join and the split that undoes it leaves two environments in one
+  # machine group, which the next run would refuse to start from. The Windows daemon and the
+  # distributions are still up here, so they are put back first; a failure to do so is said, and
+  # does not stop the rest of the cleanup.
+  if [ "$groups_changed" = "1" ] && [ -n "$windows_daemon" ]; then
+    echo "putting the two environments back in groups of their own"
+    (separate_groups) || echo "the two environments could not be put back in groups of their own"
+  fi
   if [ -n "$windows_daemon" ]; then
     kill "$windows_daemon" 2>/dev/null || true
   fi
@@ -1361,9 +1378,13 @@ clear_inherited_installation() {
     fail "$distribution could not be given an installation of its own"
   # The leftovers this acceptance itself put in the distribution that was copied. The file it
   # writes a daemon identifier into would otherwise name a process in that other distribution.
-  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/rm -rf \
-    /tmp/kr-acc-controller.pid /tmp/kr-controller.log "${pairing_directory:?}" ||
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/rm -f \
+    /tmp/kr-acc-controller.pid /tmp/kr-controller.log ||
     fail "$distribution kept what this acceptance left in the distribution it was copied from"
+  # The owner and the viewers a pairing in the distribution it was copied from kept are that
+  # one's, and name devices of its installation.
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "rm -rf \"\${HOME:?}/$pairing_state\"" ||
+    fail "$distribution kept the pairing keys of the distribution it was copied from"
 }
 
 start_daemon_inside() {
@@ -1887,7 +1908,7 @@ pairing_case() {
   pairing_runs=$((pairing_runs + 1))
   pairing_log="$run_dir/pairing-$pairing_runs-$name.log"
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc \
-    "KR_ACC_DIR='$pairing_directory' KR_ACC_OTHER='$other' '$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name" \
+    "KR_ACC_OTHER='$other' '$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name" \
     >"$pairing_log" 2>&1 ||
     fail "the pairing suite's $name failed inside $distribution: $(tr -d '\r' <"$pairing_log" | tail -n 30)"
   tr -d '\r' <"$pairing_log" >"$pairing_log.text"
@@ -1946,6 +1967,18 @@ machine_step() {
     fail "the step '$*' on $label failed: $(cat "$file")"
 }
 
+# Puts the second environment in a group of its own when it is in the first one's: where a run
+# that stopped between a join and the split that undoes it left them.
+separate_groups() {
+  local together
+  group_of first
+  together="$group_id"
+  group_of second
+  if [ "$group_id" = "$together" ]; then
+    machine_step second split --expect "$group_id@$group_revision"
+  fi
+}
+
 # A change of machine group has been made, and nothing a group could grant has come of it: each
 # distribution holds the devices and grants it held before, and each viewer still reaches only the
 # distribution it was paired with.
@@ -1960,45 +1993,50 @@ unchanged_by() {
 }
 
 paired_endpoints() {
-  local mode="$1" first_device second_device first_group second_group
+  local mode="$1" first_device second_device first_transport second_transport first_group second_group
   pairing_case "$first" pair_a_viewer_with_this_distribution
   first_endpoint="$(pairing_line endpoint | compact)"
   first_device="$(pairing_line viewer | compact | json_string device_id)"
+  first_transport="$(pairing_line viewer | compact | json_string transport)"
   pairing_case "$second" pair_a_viewer_with_this_distribution
   second_endpoint="$(pairing_line endpoint | compact)"
   second_device="$(pairing_line viewer | compact | json_string device_id)"
-  [ -n "$first_endpoint" ] && [ -n "$second_endpoint" ] && [ -n "$first_device" ] && [ -n "$second_device" ] ||
+  second_transport="$(pairing_line viewer | compact | json_string transport)"
+  [ -n "$first_endpoint" ] && [ -n "$second_endpoint" ] && [ -n "$first_device" ] && [ -n "$second_device" ] &&
+    [ -n "$first_transport" ] && [ -n "$second_transport" ] ||
     fail "$mode: a distribution paired a viewer and reported no endpoint or device"
-  # Each endpoint answers as the environment its distribution enrolled, and the two are two.
+  # Each endpoint belongs to the installation enrolled for its distribution, and the two are two.
   [ "$(printf '%s' "$first_endpoint" | json_string environment_id)" = "$first_id" ] ||
-    fail "$mode: $first's endpoint does not answer as the environment enrolled for it: $first_endpoint"
+    fail "$mode: the endpoint paired in $first is not the environment enrolled for it: $first_endpoint"
   [ "$(printf '%s' "$second_endpoint" | json_string environment_id)" = "$second_id" ] ||
-    fail "$mode: $second's endpoint does not answer as the environment enrolled for it: $second_endpoint"
+    fail "$mode: the endpoint paired in $second is not the environment enrolled for it: $second_endpoint"
   [ "$(printf '%s' "$first_endpoint" | json_string endpoint_id)" != "$(printf '%s' "$second_endpoint" | json_string endpoint_id)" ] ||
     fail "$mode: two distributions answered with one endpoint identity"
-  [ "$first_device" != "$second_device" ] ||
-    fail "$mode: two distributions gave their viewers one device identity"
   pass "$mode: each distribution paired a viewer with its own endpoint, and the two endpoints are two identities"
 
   viewers_reach_only_their_own
   held_in_both
-  # A grant made here is a grant here: the other distribution holds no record of this viewer.
+  # A pairing made here is a pairing here: the other distribution holds no record of this viewer,
+  # by its identity or by its keys.
   case "$second_held" in
-    *"$first_device"*) fail "$mode: $second holds a record of the device paired with $first" ;;
+    *"$first_device"* | *"$first_transport"*) fail "$mode: $second holds a record of the viewer paired with $first" ;;
   esac
   case "$first_held" in
-    *"$second_device"*) fail "$mode: $first holds a record of the device paired with $second" ;;
+    *"$second_device"* | *"$second_transport"*) fail "$mode: $first holds a record of the viewer paired with $second" ;;
   esac
-  pass "$mode: a viewer is let in by the distribution it was paired with and refused by the other, and the other holds no record of it"
+  pass "$mode: a viewer is let in by the distribution it was paired with and ended by the other, which holds no record of it"
 
   # Their machine groups are the owner's to change. Joining, splitting and merging them moves
-  # each environment's own record and nothing else.
+  # each environment's own record and nothing else. They start apart: a run that stopped between a
+  # join and its split left them together, and they are separated first.
+  separate_groups
   group_of first
   first_group="$group_id"
   group_of second
   second_group="$group_id"
   [ "$first_group" != "$second_group" ] ||
-    fail "$mode: the two distributions start in one machine group, so a join would prove nothing"
+    fail "$mode: the two distributions are still in one machine group after a split"
+  groups_changed=1
   machine_step second join "$first_group" --expect "$second_group@$group_revision"
   group_of second
   [ "$group_id" = "$first_group" ] ||
@@ -2025,6 +2063,7 @@ paired_endpoints() {
   [ "$group_id" != "$second_group" ] ||
     fail "$mode: $first is still in the machine group of $second after a split"
   unchanged_by "splitting $first from the machine group of $second"
+  groups_changed=0
   pass "$mode: joining, splitting and merging the machine groups of the two distributions changed neither distribution's devices and grants"
 }
 

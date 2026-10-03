@@ -1557,15 +1557,16 @@ no right inside it, and the keys, grants and session identifiers a standalone di
 had are kept. Every row in a grouped listing names its own environment, and none of them is this
 host's.
 
-Each distribution also has an endpoint of its own on the network, so pairing a device with one
-distribution pairs it with nothing else. The other distribution holds no record of that device and
-ends its connection, in NAT and in mirrored networking alike. Machine groups follow the same rule.
-Joining, splitting or merging the groups of two distributions changes only the record each
-environment keeps of its own group, so the devices and grants of both stay as they were, and each
-device still reaches only the distribution it was paired with. The acceptance checks this inside two
-distributions: it pairs a viewer with each one through that distribution's own owner, connects each
-viewer to both, and takes the group steps from Windows over the process bridge, once in each
-networking mode.
+A distribution whose configuration selects the network has an endpoint of its own on it, so pairing
+a device with that distribution pairs it with no other. Another distribution holds no record of the
+device and ends its connection. The networking mode does not change that, because the distributions
+share one loopback: the check is about the endpoints and not about the bridge. Machine groups follow
+the same rule. Joining, splitting or merging the groups of two distributions changes the record each
+environment keeps of its own group, and the receipt of the step, and nothing else. The devices each
+distribution lists and the grants it lists stay as they were, and each device still reaches only the
+distribution it was paired with. The acceptance checks this inside two distributions, once in each
+networking mode: it pairs a viewer with each one through that distribution's own owner, connects
+each viewer to both, and takes the group steps from Windows over the process bridge.
 
 ### The two networking modes, and what they change
 
@@ -1592,7 +1593,9 @@ vectors across `wsl.exe --exec`; the bridge from Windows to each; the cached lis
 distribution; and the bridge in NAT and in mirrored networking, with a viewer paired with each
 distribution's own endpoint in each mode. With only one distribution
 registered, it makes a second by exporting and importing the first, removes the installation the
-copy inherited before anything starts in it, and removes the copy at the end. A prerequisite it
+copy inherited before anything starts in it, and removes the copy at the end. In each distribution
+it keeps, the pairing leaves the loopback network selected, the installation's first owner, and
+one viewer for each mode. A prerequisite it
 cannot meet is a failure, because a run that could not establish these results has not established
 them.
 

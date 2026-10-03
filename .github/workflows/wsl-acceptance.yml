@@ -7,9 +7,9 @@ name: wsl-acceptance
 # It needs a Windows host with WSL2, the three Windows programs built from the commit under test
 # (`kr.exe`, `kr-controller.exe`, `kr-worker.exe`), and a Linux distribution that carries the matching
 # Linux set (`kr`, `kr-controller`, `kr-worker`, the bridge suite and the pairing suite) with the
-# manifest that names
-# the commit and the hash of every installed file. Building the Linux set inside a distribution would
-# need a Rust toolchain there, so it is built on a Linux runner from the same commit and carried in.
+# manifest that names the commit and the hash of every installed file. Building the Linux set inside
+# a distribution would need a Rust toolchain there, so it is built on a Linux runner from the same
+# commit and carried in.
 #
 # Two jobs:
 #
