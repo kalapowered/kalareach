@@ -236,7 +236,7 @@ read_search_list() {
 signing_lock=""
 signing_child=""
 signing_start=""
-signing_go=""
+signing_ident=""
 signing_paths=()
 signing_before=""
 signing_ended=1
@@ -263,7 +263,7 @@ end_signing() {
 }
 
 # Whether the signing command is still the process this shell started, by its number, its state and the
-# start time it was held for (see with_signing_keychain). 0: it is. 1: it is not, because it has ended or
+# start time the command wrote about itself (see with_signing_keychain). 0: it is. 1: it is not, because it has ended or
 # the number is another process's, which a readable and different start time shows. 2: not known, because
 # its state or start time cannot be read: a read that fails is no answer, and nothing is signalled on it.
 # Bash can collect a command that has ended before this shell waits for it, so the number alone is never
@@ -343,34 +343,46 @@ with_signing_keychain() { # <command...>
   fi
   say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
   signing_paths=()
-  local each status
+  local each status waited ident_pid
   while IFS= read -r each; do signing_paths+=("$each"); done <<< "$signing_before"
   signing_ended=0
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
     # The command puts the default signals back as its first act, whatever this shell is ignoring, so that
-    # a TERM stops it; a TERM that comes before that act is sent again by the handler. It is then held at a
-    # gate until its start time has been read, so that it cannot end by itself, and its number become
-    # another process's, before it is known: it does not start if the gate is not opened within five seconds.
-    signing_go="$work/signing.go"
-    rm -f "$signing_go"
-    ( trap - INT TERM HUP
+    # a TERM stops it; a TERM that comes before that act is sent again by the handler. Its second act is to
+    # write its own number and start time into a file, from inside: the identity that is checked before any
+    # signal is the command's own, never one that this shell reads from the process table after the command
+    # may have ended and its number been taken by another process. A command that cannot write it does not run.
+    signing_ident="$work/signing.ident"
+    rm -rf "$signing_ident" "$signing_ident.part"
+    if [ -e "$signing_ident" ] || [ -e "$signing_ident.part" ]; then
+      say "the file for the signing command's identity could not be cleared: $signing_ident"
+      status=2
+    else
+      ( trap - INT TERM HUP
+        LC_ALL=C TZ=UTC0 sh -c 'ps -o pid=,lstart= -p $PPID' > "$signing_ident.part" 2>/dev/null \
+          && mv "$signing_ident.part" "$signing_ident" || exit 70
+        exec "$@" ) &
+      signing_child=$!
       waited=0
-      until [ -e "$signing_go" ] || [ "$waited" -ge 250 ]; do sleep 0.02; waited=$((waited + 1)); done
-      [ -e "$signing_go" ] || exit 1
-      exec "$@" ) &
-    signing_child=$!
-    signing_start=$(process_start "$signing_child")
-    : > "$signing_go"
-    trap 'signing_interrupted 130' INT
-    trap 'signing_interrupted 143' TERM
-    trap 'signing_interrupted 129' HUP
-    wait "$signing_child"
-    status=$?
-    trap '' INT TERM HUP
-    signing_child=""
-    signing_start=""
-    rm -f "$signing_go"
+      until [ -s "$signing_ident" ] || ! kill -0 "$signing_child" 2>/dev/null || [ "$waited" -ge 100 ]; do
+        sleep 0.02
+        waited=$((waited + 1))
+      done
+      ident_pid=""
+      signing_start=""
+      IFS=' ' read -r ident_pid signing_start 2>/dev/null < "$signing_ident"
+      [ "$ident_pid" = "$signing_child" ] || signing_start=""
+      trap 'signing_interrupted 130' INT
+      trap 'signing_interrupted 143' TERM
+      trap 'signing_interrupted 129' HUP
+      wait "$signing_child"
+      status=$?
+      trap '' INT TERM HUP
+      signing_child=""
+      signing_start=""
+      rm -rf "$signing_ident" "$signing_ident.part"
+    fi
   else
     status=2
   fi
@@ -552,6 +564,15 @@ start_driver() { # <the result bundle> <the output file> <xcodebuild arguments..
   runner_pid=$!
 }
 
+# The record, read once into $record_text, and looked into from there. A record that cannot be read, or is
+# empty, is not known: nothing is decided on it, and it is never taken for a record that holds nothing.
+record_text=""
+read_record() {
+  record_text=$(cat "$record" 2>/dev/null) && [ -n "$record_text" ]
+}
+record_has() { printf '%s\n' "$record_text" | grep -q -- "$1"; }
+record_last() { printf '%s\n' "$record_text" | sed -n "s/^$1=//p" | tail -1; }
+
 # The driver has ended: a line says so, naming its number and its start time.
 retire_driver() { # <pid>
   local started
@@ -565,8 +586,8 @@ retire_driver() { # <pid>
 # both of which have to agree. 1: it is not, for a number that is gone or has ended (a process that has
 # ended and is not yet collected counts as ended), or has neither the recorded start time nor the recorded
 # result bundle in its command line. 2: doubtful, a live process that has one of the two and not the other,
-# or of which nothing can be read: a read that fails is no answer, so it is no process to touch and none to
-# pass over.
+# or of which any one of its state, start time and command line cannot be read: a read that fails is no
+# answer, so it is no process to touch and none to pass over.
 driver_state() { # <pid> <start time> <result bundle>
   local stat now command started=0 named=0
   kill -0 "$1" 2>/dev/null || return 1
@@ -574,7 +595,7 @@ driver_state() { # <pid> <start time> <result bundle>
   case $stat in Z*) return 1 ;; esac
   now=$(process_start "$1")
   command=$(ps -ww -o command= -p "$1" 2>/dev/null)
-  if [ -z "$stat" ] || { [ -z "$now" ] && [ -z "$command" ]; }; then
+  if [ -z "$stat" ] || [ -z "$now" ] || [ -z "$command" ]; then
     kill -0 "$1" 2>/dev/null && return 2
     return 1
   fi
@@ -593,8 +614,13 @@ is_driver() { driver_state "$@"; }   # true only for a driver that is certain
 stop_runner() {
   local started result waited=0 state=1
   if [ -n "$runner_pid" ]; then
-    started=$(sed -n "s/^runner=$runner_pid|\([^|]*\)|.*/\1/p" "$record" 2>/dev/null | tail -1)
-    result=$(sed -n "s/^runner=$runner_pid|[^|]*|//p" "$record" 2>/dev/null | tail -1)
+    started=""
+    if read_record; then
+      started=$(printf '%s\n' "$record_text" | sed -n "s/^runner=$runner_pid|\([^|]*\)|.*/\1/p" | tail -1)
+      result=$(printf '%s\n' "$record_text" | sed -n "s/^runner=$runner_pid|[^|]*|//p" | tail -1)
+    else
+      say "THE RECORD COULD NOT BE READ: the test run is not signalled here, and is left for cleanup"
+    fi
     if [ -n "$started" ] && is_driver "$runner_pid" "$started" "$result"; then
       kill "$runner_pid" 2>/dev/null
       while driver_state "$runner_pid" "$started" "$result"; state=$?; [ "$state" != 1 ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
@@ -648,7 +674,11 @@ finish_session() {
   [ -f "$record" ] && stop_recorded_driver
   say "ending the session"
   local keep_app=0
-  if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
+  if ! read_record; then
+    say "THE RECORD COULD NOT BE READ, so whether a sweep is owed is not known: the application stays installed, and cleanup decides"
+    keep_app=1
+    unclean=1
+  elif record_has '^baseline=empty$'; then
     copy_shots "${session_name:-session}"
     [ "${session_name:-}" = s0 ] && check_shot_proof "$shots/s0"
     echo "sweep=pending" >> "$record"
@@ -871,13 +901,14 @@ stop_recorded_driver() {
   local entries entry pid started result waited state
   mkdir "$record.gate" 2>/dev/null
   [ -d "$record.gate" ] || { say "THE GATE AGAINST A NEW TEST RUN COULD NOT BE CLOSED: nothing is cleaned up"; exit 3; }
-  entries=$(sed -n 's/^runner=//p' "$record") || { say "THE RECORD COULD NOT BE READ: nothing is cleaned up"; exit 3; }
+  read_record || { say "THE RECORD COULD NOT BE READ: nothing is cleaned up"; exit 3; }
+  entries=$(printf '%s\n' "$record_text" | sed -n 's/^runner=//p')
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     pid=${entry%%|*}; entry=${entry#*|}
     started=${entry%%|*}
     result=${entry#*|}
-    grep -qxF "retired=$pid|$started" "$record" && continue
+    printf '%s\n' "$record_text" | grep -qxF "retired=$pid|$started" && continue
     driver_state "$pid" "$started" "$result"; state=$?
     [ "$state" = 1 ] && continue
     if [ "$state" = 2 ]; then
@@ -902,19 +933,17 @@ cleanup() {
   require_target
   mkdir -p "$work/checks" "$raw"
   [ -f "$record" ] || { say "no session left a record, so there is nothing of ours to clean up"; return 0; }
+  read_record || die "the record at $record cannot be read: nothing is touched"
   # A record with no target is no session's: only a test run that began after its session had ended wrote
   # into it. Nothing was installed for it, so after any driver it names is stopped there is nothing to clean up.
-  local has_target
-  grep -q '^target=' "$record" 2>/dev/null; has_target=$?
-  [ "$has_target" -le 1 ] || die "the record at $record cannot be read: nothing is touched"
-  if [ "$has_target" = 1 ]; then
+  if ! record_has '^target='; then
     stop_recorded_driver
     say "the record names no session, only a test run that began too late: removed"
     rm -rf "$record" "$record.gate"
     return 0
   fi
   # Only what the record names: the same kind of target and the same phone.
-  [ "$(sed -n 's/^target=//p' "$record")" = "$target" ] && [ "$(sed -n 's/^device=//p' "$record")" = "$KR_DEVICE" ] \
+  [ "$(record_last target)" = "$target" ] && [ "$(record_last device)" = "$KR_DEVICE" ] \
     || die "the record at $record is of another target or phone: nothing is touched"
   boot_simulator
   say "cleaning up the session the record names"
@@ -927,7 +956,7 @@ cleanup() {
     keep_app=1
     unclean=1
   elif [ "$here" = yes ]; then
-    if grep -q '^baseline=empty$' "$record"; then
+    if record_has '^baseline=empty$'; then
       copy_shots "cleanup"
       echo "sweep=pending" >> "$record"
       if sweep; then
@@ -940,7 +969,7 @@ cleanup() {
     else
       say "that session did not begin with an empty baseline, so nothing is swept: report what is there"
     fi
-  elif grep -q '^baseline=empty$' "$record" && [ "$(sed -n 's/^sweep=//p' "$record" | tail -1)" != done ]; then
+  elif record_has '^baseline=empty$' && [ "$(record_last sweep)" != done ]; then
     # The application is gone and no sweep of this session is known to have finished: what it filed in the
     # two groups cannot be counted from here.
     say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: the application is gone and the session's sweep did not finish"
