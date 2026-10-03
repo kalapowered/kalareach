@@ -2,8 +2,10 @@
  * Sessions and Hosts.
  *
  * A session row carries the six things section 13 names: the display number, the description, the
- * directory, the application in the foreground, how many views are attached, and its state. Nothing
- * on the row is inferred from elapsed time.
+ * directory, the application in the foreground, how many views are attached, and its state. The
+ * description is what the host says: a pinned name, the title it made from the session's metadata,
+ * or a line a local model wrote, which is labelled generated and says when it is out of date.
+ * Nothing on the row is inferred from elapsed time.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
@@ -15,6 +17,14 @@ import { useApp } from '../app/state'
 import { useConnectionRights } from '../app/rights'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
+import {
+  activityLine,
+  directoryName,
+  freshnessNote,
+  shownTitle,
+  sourceLabel,
+  useDescriptions
+} from '../model/describe'
 import { accountName } from './account-name'
 import { NewSession } from './NewSession'
 
@@ -43,10 +53,12 @@ export function describeApplicationState(session: Session): {
   }
 }
 
-/** The name a session shows. The host derives it; this never invents one. */
+/**
+ * The name a session shows until the host has described it: the directory's own name. The host
+ * derives every other; this never invents one.
+ */
 export function sessionDescription(session: Session): string {
-  const folder = session.cwd.split('/').filter(Boolean).pop() ?? session.cwd
-  return folder
+  return directoryName(session.cwd)
 }
 
 /** The list of sessions. */
@@ -86,13 +98,21 @@ export function Sessions(): ReactNode {
     }
   }, [load])
 
+  const descriptions = useDescriptions(
+    port,
+    (list?.sessions ?? []).map((session) => session.session_id),
+    list
+  )
+
   const sessions = (list?.sessions ?? []).filter((session) => {
     if (query.trim().length === 0) return true
     const needle = query.toLowerCase()
+    const described = descriptions.get(session.session_id)
     return (
       session.cwd.toLowerCase().includes(needle) ||
       session.display_number.includes(needle) ||
-      sessionDescription(session).toLowerCase().includes(needle)
+      shownTitle(sessionDescription(session), described).toLowerCase().includes(needle) ||
+      (activityLine(described) ?? '').toLowerCase().includes(needle)
     )
   })
 
@@ -158,6 +178,10 @@ export function Sessions(): ReactNode {
         </div>
         {sessions.map((session) => {
           const state = describeApplicationState(session)
+          const described = descriptions.get(session.session_id)
+          const label = sourceLabel(described)
+          const activity = activityLine(described)
+          const overtaken = freshnessNote(described)
           return (
             <button
               key={session.session_id}
@@ -172,7 +196,25 @@ export function Sessions(): ReactNode {
               <span className="row" role="cell">
                 <span className="session-number mono">{session.display_number}</span>
                 <span>
-                  <h3>{sessionDescription(session)}</h3>
+                  <h3>
+                    {shownTitle(sessionDescription(session), described)}
+                    {label ? (
+                      <Badge tone="neutral" data-testid="description-source">
+                        {label}
+                      </Badge>
+                    ) : null}
+                  </h3>
+                  {activity ? (
+                    <p className="session-activity" data-testid="description-activity">
+                      {activity}
+                      {overtaken ? (
+                        <span className="faint" data-testid="description-freshness">
+                          {' '}
+                          {overtaken}
+                        </span>
+                      ) : null}
+                    </p>
+                  ) : null}
                   <p className="faint mono">{session.shell_path}</p>
                   {session.shell_mode === 'native_compat' ? (
                     <Badge tone="neutral">Stock shell</Badge>
