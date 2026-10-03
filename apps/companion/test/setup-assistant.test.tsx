@@ -20,7 +20,7 @@ import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
-import { DEFAULT_MODEL, readableBytes } from '../src/setup/host'
+import { readableBytes } from '../src/setup/host'
 
 /** Every operation the interface performed, in order. */
 function watched(port: HostPort): { port: HostPort; calls: string[] } {
@@ -277,31 +277,27 @@ describe('how KalaReach runs here', () => {
     expect(within(sleep).queryByRole('switch')).toBeNull()
   })
 
-  it('states the download size and lets it be cancelled and turned off', async () => {
-    start()
+  it('states the download size from the host before anything is fetched', async () => {
+    const { controls } = start()
     await screen.findByTestId('setup-identity')
     await goTo('host')
-    expect(screen.getByTestId('setup-model-size').textContent).toBe(
-      `${readableBytes(DEFAULT_MODEL.bytes)} to download.`
+    // The size is the host's own figure for the file it would fetch, not a number this screen holds.
+    expect((await screen.findByTestId('setup-model-size')).textContent).toBe(
+      `${readableBytes(1_561_318_368)} to download, from huggingface.co.`
     )
-    await userEvent.click(screen.getByTestId('setup-model-download'))
-    expect(screen.getByTestId('setup-model').textContent).toMatch(/Chosen/)
-    await userEvent.click(screen.getByTestId('setup-model-cancel'))
-    expect(screen.getByTestId('setup-model').textContent).toMatch(/Cancelled/)
-    await userEvent.click(screen.getByTestId('setup-model-decline'))
-    expect(screen.getByTestId('setup-model').textContent).toMatch(/Turned off/)
+    expect(controls.descriptionDownloads).toEqual([])
   })
 
-  it('finishes with the download declined and nothing installed', async () => {
+  it('finishes with descriptions not downloaded and nothing installed', async () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('host')
-    await userEvent.click(screen.getByTestId('setup-model-decline'))
+    await screen.findByTestId('setup-model-size')
     await goTo('ready')
     expect(screen.getByTestId('setup-nothing-chosen').textContent).toMatch(
       /KalaReach works from here without any of it/
     )
-    expect(screen.getByTestId('setup-chosen').textContent).toMatch(/Turned off/)
+    expect(screen.getByTestId('setup-chosen-descriptions').textContent).toMatch(/Not downloaded/)
   })
 })
 
@@ -315,7 +311,7 @@ describe('what setup costs a person', () => {
     expect(said).toMatch(/nothing on this screen signed you up for anything/)
   })
 
-  it('performs only three host operations from first paint to the last step', async () => {
+  it('performs only these host operations from first paint to the last step', async () => {
     const { calls } = start()
     await screen.findByTestId('setup-identity')
     for (const step of ['permissions', 'capabilities', 'host', 'ready']) {
@@ -344,7 +340,7 @@ describe('what setup costs a person', () => {
         ].includes(name)
     )
     expect(new Set(own)).toEqual(
-      new Set(['setupIdentity', 'environmentCapabilities'])
+      new Set(['setupIdentity', 'environmentCapabilities', 'descriptionSetup'])
     )
     // Nothing on this path signs in, pairs, pays or registers for anything. The shell's read of
     // where the account stands, and its subscription to changes, sign nothing in.
@@ -451,17 +447,22 @@ describe('what a restart is asked for, and what a record is about', () => {
     await userEvent.click(within(screen.getByTestId('setup-install-gui_host')).getByRole('switch'))
     await goTo('ready')
     const commands = screen.getByTestId('setup-commands')
-    expect(commands.textContent).toMatch(/installed or downloaded anything/)
+    expect(commands.textContent).toMatch(/Nothing on this screen installed anything/)
     expect(commands.textContent).toMatch(/The graphical host/)
   })
 
-  it('shows the model choice on its own, with nothing else chosen', async () => {
-    start()
+  it('shows a fetch the host was asked for on its own, with nothing else chosen', async () => {
+    const { controls } = start()
     await screen.findByTestId('setup-identity')
     await goTo('host')
-    await userEvent.click(screen.getByTestId('setup-model-download'))
+    await userEvent.click(await screen.findByTestId('setup-model-download'))
+    await waitFor(() => {
+      expect(controls.descriptionDownloads).toEqual([{ action: 'start' }])
+    })
+    await screen.findByTestId('setup-model-progress')
     await goTo('ready')
     expect(screen.queryByTestId('setup-nothing-chosen')).toBeNull()
-    expect(screen.getByTestId('setup-commands').textContent).toMatch(/The default local model/)
+    expect(screen.getByTestId('setup-chosen-descriptions').textContent).toMatch(/Downloading/)
+    expect(screen.getByTestId('setup-descriptions-asked').textContent).toMatch(/you asked it to/)
   })
 })

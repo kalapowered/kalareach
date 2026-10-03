@@ -30,8 +30,6 @@ import { Badge, Banner, Button, Card, Sheet, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, type SetupIdentity } from '../host/port'
 import {
-  DEFAULT_MODEL,
-  DOWNLOAD_LABEL,
   INSTALLABLES,
   NO_ACCOUNT_NEEDED,
   PERSISTENCE_LABEL,
@@ -39,9 +37,16 @@ import {
   readableBytes,
   SLEEP_COMMAND,
   SLEEP_OFFERS,
-  type DownloadState,
   type Installable
 } from './host'
+import {
+  costSentence,
+  fetchedFraction,
+  statusOf,
+  STATUS_LABEL,
+  useDescriptionSetup,
+  type DescriptionSetupState
+} from './descriptions'
 import {
   CEILING,
   categoriesFor,
@@ -182,7 +187,7 @@ export function Setup(): ReactNode {
   const [reads, setReads] = useState(0)
   const [visited, setVisited] = useState<Readonly<Record<string, number>>>({})
   const [install, setInstall] = useState<Readonly<Record<string, boolean>>>({})
-  const [download, setDownload] = useState<DownloadState>('offered')
+  const descriptions = useDescriptionSetup(port)
   const [effectsOpen, setEffectsOpen] = useState(false)
 
   /** One reading of everything this screen is about, with no state written in it. */
@@ -358,12 +363,11 @@ export function Setup(): ReactNode {
             onInstall={(id, next) => {
               setInstall((current) => ({ ...current, [id]: next }))
             }}
-            download={download}
-            onDownload={setDownload}
+            descriptions={descriptions}
           />
         ) : null}
         {current.id === 'ready' ? (
-          <ReadyStep records={records} install={install} download={download} />
+          <ReadyStep records={records} install={install} descriptions={descriptions} />
         ) : null}
       </div>
 
@@ -837,14 +841,12 @@ function HostStep({
   capabilities,
   install,
   onInstall,
-  download,
-  onDownload
+  descriptions
 }: {
   readonly capabilities: EnvironmentCapabilitiesResult | null
   readonly install: Readonly<Record<string, boolean>>
   readonly onInstall: (id: Installable['id'], next: boolean) => void
-  readonly download: DownloadState
-  readonly onDownload: (next: DownloadState) => void
+  readonly descriptions: DescriptionSetupState
 }): ReactNode {
   const persistence = capabilities?.persistence ?? []
   const power = capabilities?.power
@@ -853,7 +855,8 @@ function HostStep({
       <p>
         Three separate things, and you can take any of them without the others. Nothing on this
         screen installs anything: what you choose here is your answer, and the last step shows it
-        back to you.
+        back to you. Session descriptions, below them, are different: the buttons there ask this
+        host to act, and say so.
       </p>
       {INSTALLABLES.map((item) => {
         const answer = persistence.find((each) => each.profile === item.profile)
@@ -916,56 +919,153 @@ function HostStep({
         </div>
       </Card>
 
-      <Card data-testid="setup-model">
-        <header className="card-header">
-          <h2>{DEFAULT_MODEL.name}</h2>
-          <Badge tone={download === 'chosen' ? 'success' : 'neutral'}>
-            {DOWNLOAD_LABEL[download]}
+      <DescriptionsCard descriptions={descriptions} />
+    </>
+  )
+}
+
+/**
+ * Session descriptions: what this host offers, what it costs before anything is fetched, and the
+ * controls the host has.
+ *
+ * Every figure and state is the host's answer. Pressing a button asks the host to act, and the
+ * card is shown again from what the host says afterwards. Nothing here chooses a model or an
+ * address: the host selected the one profile it would fetch, and says where it would fetch it from.
+ */
+function DescriptionsCard({ descriptions }: { readonly descriptions: DescriptionSetupState }): ReactNode {
+  const { setup, failure, refusal, busy } = descriptions
+  const status = setup === null ? null : statusOf(setup)
+  const fraction = setup === null ? null : fetchedFraction(setup)
+  const canStart =
+    setup !== null &&
+    setup.offered &&
+    (setup.download === 'not_started' ||
+      setup.download === 'cancelled' ||
+      setup.download === 'failed')
+  return (
+    <Card data-testid="setup-model">
+      <header className="card-header">
+        <h2>Session descriptions</h2>
+        {status ? (
+          <Badge
+            tone={status === 'on' ? 'success' : status === 'failed' ? 'warning' : 'neutral'}
+            data-testid="setup-model-status"
+          >
+            {STATUS_LABEL[status]}
           </Badge>
-        </header>
-        <div className="card-body">
-          <p>{DEFAULT_MODEL.purpose}</p>
-          <p className="faint small" data-testid="setup-model-size">
-            {readableBytes(DEFAULT_MODEL.bytes)} to download.
+        ) : null}
+      </header>
+      <div className="card-body">
+        <p>
+          A title and a line about what each session is doing, written on this machine by a small
+          model, not somewhere else. Nothing about KalaReach needs it: without it, a session is
+          named by its directory.
+        </p>
+        {setup === null ? (
+          <p className="faint small" data-testid="setup-model-unread">
+            {failure
+              ? `What this host offers could not be read. ${failure}`
+              : 'Reading what this host offers…'}
           </p>
-          <p className="faint small">
-            Nothing is downloading while you read this. What you choose here is your answer to the
-            offer, and nothing else.
+        ) : null}
+        {setup && !setup.offered ? (
+          <p className="faint small" data-testid="setup-model-unavailable">
+            This host offers no model. {setup.unavailable ?? 'It gave no reason.'}
           </p>
+        ) : null}
+        {setup && setup.offered ? (
+          <>
+            <p className="faint small" data-testid="setup-model-size">
+              {costSentence(setup)}
+            </p>
+            <p className="faint small">
+              Nothing is fetched until you ask
+              {setup.needs_hosted_account ? '.' : ', and it needs no account.'}
+            </p>
+            {setup.download === 'running' ? (
+              <p className="faint small" data-testid="setup-model-progress">
+                <progress
+                  aria-label="Download progress"
+                  max={Number(setup.asset_bytes)}
+                  value={Number(setup.fetched_bytes)}
+                />{' '}
+                {readableBytes(Number(setup.fetched_bytes))} of{' '}
+                {readableBytes(Number(setup.asset_bytes))}
+                {fraction === null ? '' : `, ${String(Math.floor(fraction * 100))}%`}
+              </p>
+            ) : null}
+            {setup.download === 'failed' ? (
+              <p className="faint small" data-testid="setup-model-failure">
+                The download failed. {setup.failure ?? 'The host gave no reason.'}
+              </p>
+            ) : null}
+            {setup.download === 'cancelled' ? (
+              <p className="faint small">The download was cancelled and nothing was kept.</p>
+            ) : null}
+            {setup.download === 'verified' ? (
+              <p className="faint small">The files are here, and each one was checked.</p>
+            ) : null}
+          </>
+        ) : null}
+        {refusal ? (
+          <p className="faint small" data-testid="setup-model-refused">
+            {refusal}
+          </p>
+        ) : null}
+      </div>
+      {setup && setup.offered ? (
+        <div className="card-body setup-model-settings">
+          <label className="row">
+            <span className="spacer">Describe my sessions</span>
+            <Switch
+              checked={setup.enabled}
+              label="Describe my sessions"
+              disabled={busy || (setup.enabled && !setup.can_disable)}
+              onChange={descriptions.enable}
+            />
+          </label>
+          <label className="row">
+            <span className="spacer">Keep going on battery power</span>
+            <Switch
+              checked={setup.on_battery}
+              label="Keep going on battery power"
+              disabled={busy}
+              onChange={descriptions.onBattery}
+            />
+          </label>
         </div>
-        <footer className="card-footer setup-route">
-          {download === 'chosen' ? (
-            <Button
-              data-testid="setup-model-cancel"
-              onClick={() => {
-                onDownload('cancelled')
-              }}
-            >
-              Cancel it
-            </Button>
-          ) : (
-            <Button
-              data-testid="setup-model-decline"
-              onClick={() => {
-                onDownload('declined')
-              }}
-            >
-              Don&rsquo;t download it
-            </Button>
-          )}
+      ) : null}
+      <footer className="card-footer setup-route">
+        {setup === null ? (
+          <Button data-testid="setup-model-retry" disabled={busy} onClick={descriptions.reload}>
+            Ask again
+          </Button>
+        ) : null}
+        {setup?.can_cancel ? (
           <Button
-            tone="primary"
-            disabled={download === 'chosen'}
-            data-testid="setup-model-download"
+            data-testid="setup-model-cancel"
+            disabled={busy}
             onClick={() => {
-              onDownload('chosen')
+              descriptions.download('cancel')
             }}
           >
-            Download it
+            Cancel the download
           </Button>
-        </footer>
-      </Card>
-    </>
+        ) : null}
+        {canStart ? (
+          <Button
+            tone="primary"
+            data-testid="setup-model-download"
+            disabled={busy}
+            onClick={() => {
+              descriptions.download('start')
+            }}
+          >
+            {setup.download === 'failed' ? 'Try the download again' : 'Download it'}
+          </Button>
+        ) : null}
+      </footer>
+    </Card>
   )
 }
 
@@ -974,14 +1074,17 @@ function HostStep({
 function ReadyStep({
   records,
   install,
-  download
+  descriptions
 }: {
   readonly records: readonly CapabilityRecord[]
   readonly install: Readonly<Record<string, boolean>>
-  readonly download: DownloadState
+  readonly descriptions: DescriptionSetupState
 }): ReactNode {
   const counted = tally(records, { grantWasOffered: false })
   const chosen = INSTALLABLES.filter((item) => install[item.id] === true)
+  const described = descriptions.setup === null ? null : statusOf(descriptions.setup)
+  // Descriptions count as chosen once the host is fetching the model or has them switched on.
+  const describing = described === 'downloading' || described === 'on'
   return (
     <>
       <Card data-testid="setup-summary">
@@ -1030,44 +1133,48 @@ function ReadyStep({
                 </Badge>
               </li>
             ))}
-            <li>
-              <span>{DEFAULT_MODEL.name}</span>
-              <Badge tone={download === 'chosen' ? 'success' : 'neutral'}>
-                {DOWNLOAD_LABEL[download]}
+            <li data-testid="setup-chosen-descriptions">
+              <span>Session descriptions</span>
+              <Badge tone={describing ? 'success' : 'neutral'}>
+                {described === null ? 'Not read' : STATUS_LABEL[described]}
               </Badge>
             </li>
           </ul>
-          {chosen.length === 0 && download !== 'chosen' ? (
+          {chosen.length === 0 && !describing ? (
             <p className="faint small" data-testid="setup-nothing-chosen">
               Nothing at all, which is a complete answer. KalaReach works from here without any of
               it.
             </p>
           ) : (
             <div className="setup-commands" data-testid="setup-commands">
-              <p className="faint small">
-                Nothing on this screen installed or downloaded anything. These are the answers it
-                has, and what carries each one out:
-              </p>
-              <ul className="setup-choices">
-                {chosen.map((item) => (
-                  <li key={item.id}>
-                    <span>{item.name}</span>
-                    <span className="faint small">
-                      {item.command ? (
-                        <code className="mono">{item.command}</code>
-                      ) : (
-                        'the installer, when you run it'
-                      )}
-                    </span>
-                  </li>
-                ))}
-                {download === 'chosen' ? (
-                  <li>
-                    <span>{DEFAULT_MODEL.name}</span>
-                    <span className="faint small">the installer, when you run it</span>
-                  </li>
-                ) : null}
-              </ul>
+              {chosen.length > 0 ? (
+                <>
+                  <p className="faint small">
+                    Nothing on this screen installed anything. These are the answers it has, and
+                    what carries each one out:
+                  </p>
+                  <ul className="setup-choices">
+                    {chosen.map((item) => (
+                      <li key={item.id}>
+                        <span>{item.name}</span>
+                        <span className="faint small">
+                          {item.command ? (
+                            <code className="mono">{item.command}</code>
+                          ) : (
+                            'the installer, when you run it'
+                          )}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
+              {describing ? (
+                <p className="faint small" data-testid="setup-descriptions-asked">
+                  Session descriptions are the host&rsquo;s to do, and you asked it to: it is
+                  fetching the model or has it switched on.
+                </p>
+              ) : null}
             </div>
           )}
         </div>

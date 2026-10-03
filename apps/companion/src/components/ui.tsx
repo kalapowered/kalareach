@@ -229,11 +229,13 @@ export function Card({
 export function Switch({
   checked,
   label,
-  onChange
+  onChange,
+  disabled = false
 }: {
   readonly checked: boolean
   readonly label: string
   readonly onChange: (next: boolean) => void
+  readonly disabled?: boolean
 }): ReactNode {
   return (
     <button
@@ -242,6 +244,7 @@ export function Switch({
       className="switch-control"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={() => {
         onChange(!checked)
       }}
