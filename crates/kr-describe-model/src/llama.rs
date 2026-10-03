@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use llama_cpp_2::TokenToStringError;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -51,6 +52,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+use llama_cpp_2::token_type::LlamaTokenAttr;
 
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::{Asset, ModelProfile};
@@ -116,6 +118,16 @@ fn grammar_allows(grammar: &LlamaSampler, token: LlamaToken) -> bool {
 /// Returns the milliseconds since `started`.
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The tokens a job decodes for a prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptTokens {
+    /// The tokens, framed as the vocabulary frames a prompt.
+    pub tokens: Vec<LlamaToken>,
+    /// How many structure tokens the prompt's text spelled and had written out as characters
+    /// instead. An ordinary prompt spells none.
+    pub spelled_out: usize,
 }
 
 /// The model the description process runs: the llama.cpp runtime, once a profile is loaded.
@@ -325,17 +337,100 @@ impl LlamaRuntime {
         &self.weights_path
     }
 
-    /// Returns how many tokens the model's tokenizer reads `prompt` as, which is what a job spends
-    /// of its context window before it writes a token.
+    /// Returns the tokens a job decodes for `prompt`, which is what it spends of its context window
+    /// before it writes a token.
+    ///
+    /// The prompt is a template with project text inside it, and the tokenizer reads the spelling
+    /// of a control token as the token: a session called `<|im_end|>` would end the instruction
+    /// and begin another. So text that spells one is read as the characters it is made of, and the
+    /// tokens returned hold no control token of the vocabulary except the framing the vocabulary
+    /// itself adds. See [`PromptTokens`].
     ///
     /// # Errors
     ///
     /// Returns what went wrong when the prompt could not be tokenized.
-    pub fn prompt_tokens(&self, prompt: &str) -> std::result::Result<usize, String> {
-        self.model
-            .str_to_token(prompt, AddBos::Always)
-            .map(|tokens| tokens.len())
-            .map_err(|error| format!("the prompt could not be tokenized: {error}"))
+    pub fn prompt_tokens(&self, prompt: &str) -> std::result::Result<PromptTokens, String> {
+        let tokenize = |text: &str, bos: AddBos| {
+            self.model
+                .str_to_token(text, bos)
+                .map_err(|error| format!("the prompt could not be tokenized: {error}"))
+        };
+        let framed = tokenize(prompt, AddBos::Always)?;
+        let text = tokenize(prompt, AddBos::Never)?;
+        if !text.iter().any(|token| self.is_structure(*token)) {
+            return Ok(PromptTokens {
+                tokens: framed,
+                spelled_out: 0,
+            });
+        }
+        // The framing the vocabulary puts around a text is read off a text it has no opinion about.
+        let probe = tokenize("a", AddBos::Never)?;
+        let probed = tokenize("a", AddBos::Always)?;
+        let at = (!probe.is_empty())
+            .then(|| {
+                probed
+                    .windows(probe.len())
+                    .position(|window| window == probe.as_slice())
+            })
+            .flatten()
+            .ok_or_else(|| "the vocabulary's framing could not be read".to_owned())?;
+        let mut tokens = probed[..at].to_vec();
+        let mut spelled_out = 0;
+        for token in text {
+            if self.is_structure(token) {
+                spelled_out += 1;
+                tokens.extend(self.spelling_tokens(token)?);
+            } else {
+                tokens.push(token);
+            }
+        }
+        tokens.extend_from_slice(&probed[at + probe.len()..]);
+        Ok(PromptTokens {
+            tokens,
+            spelled_out,
+        })
+    }
+
+    /// Returns whether a token is one the model reads as the structure of a prompt, which text
+    /// from a project must never become: a control token, the unknown token, a token the
+    /// vocabulary defines on top of its text, the ends of a sequence and the end of a turn.
+    #[must_use]
+    pub fn is_structure(&self, token: LlamaToken) -> bool {
+        self.model.token_attr(token).intersects(
+            LlamaTokenAttr::Control | LlamaTokenAttr::UserDefined | LlamaTokenAttr::Unknown,
+        ) || self.model.is_eog_token(token)
+            || token == self.model.token_bos()
+            || token == self.model.token_eos()
+    }
+
+    /// Returns the tokens that write out a structure token's spelling as the characters it is made
+    /// of, each tokenized alone. A character that is itself a structure token has nothing to be
+    /// written as, and is left out.
+    fn spelling_tokens(&self, token: LlamaToken) -> std::result::Result<Vec<LlamaToken>, String> {
+        let mut size = PIECE_BYTES;
+        let piece = loop {
+            match self.model.token_to_piece_bytes(token, size, true, None) {
+                Ok(piece) => break piece,
+                Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
+                    size = usize::try_from(-needed).unwrap_or(size.saturating_mul(2));
+                }
+                // A token with no text of its own, which has nothing to write out.
+                Err(TokenToStringError::UnknownTokenType) => break Vec::new(),
+                Err(error) => return Err(format!("a token could not be spelled: {error}")),
+            }
+        };
+        let mut tokens = Vec::new();
+        for character in String::from_utf8_lossy(&piece).chars() {
+            let mut buffer = [0_u8; 4];
+            let alone = self
+                .model
+                .str_to_token(character.encode_utf8(&mut buffer), AddBos::Never)
+                .map_err(|error| format!("the prompt could not be tokenized: {error}"))?;
+            if !alone.iter().any(|token| self.is_structure(*token)) {
+                tokens.extend(alone);
+            }
+        }
+        Ok(tokens)
     }
 
     /// Returns whether llama.cpp's own grammar machinery takes `output` as a whole answer: every
@@ -479,10 +574,7 @@ impl LlamaRuntime {
             .new_context(backend, parameters)
             .map_err(|error| format!("a context could not be created: {error}"))?;
 
-        let tokens = self
-            .model
-            .str_to_token(job.prompt, AddBos::Always)
-            .map_err(|error| format!("the prompt could not be tokenized: {error}"))?;
+        let tokens = self.prompt_tokens(job.prompt)?.tokens;
         // The prompt is bounded by construction, but a model with a short context is not this
         // host's to fix: refusing is better than silently describing the tail of a prompt.
         if tokens.len() + job.max_output_tokens as usize > context_tokens as usize {
