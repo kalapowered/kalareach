@@ -4,6 +4,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`conpty`] | The pseudo-console, its two pipes, the shell inside it and the reader that drains it |
+//! | [`file`] | A file as the kernel identifies it, and the file a process was created from |
 //! | [`job`] | The per-session job object: kill-on-close, breakaway disabled, and the processes it holds |
 //! | [`lineage`] | Which process started a process and when, on the kernel's interrupt clock |
 //! | [`launch`] | Starting an agent in its jobs with only the handles it is given |
@@ -22,6 +23,8 @@
 
 #[cfg(windows)]
 pub mod conpty;
+#[cfg(windows)]
+pub mod file;
 #[cfg(windows)]
 pub mod job;
 #[cfg(windows)]
