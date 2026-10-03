@@ -22,7 +22,7 @@ A worker owns a shell, a pseudo-terminal, an approval ledger and a person's sess
 vendor code compiled from a catalogue. Putting the second inside the first would make a trap in
 somebody's arithmetic a risk to somebody's work.
 
-With the split:
+The split has these consequences:
 
 - a plugin-host crash invalidates rich bindings and kills no worker;
 - no request is lost, because requests live in the worker's broker and were never in the other
@@ -35,8 +35,9 @@ has been matched. An idle shell costs no engine, no instance, no compiled cache 
 
 ## The engine
 
-Wasmtime 48.0.3, pinned to that exact release. The pin is part of the compiled-code cache key rather
-than a convenience: an artefact one engine produced is not one another engine can load.
+The engine is Wasmtime 48.0.3, pinned to that exact release. The pin is part of the compiled-code
+cache key rather than a convenience: an artefact one engine produced is not one another engine can
+load.
 
 `wasmtime-wasi` is not linked. The linker holds four interfaces, all from the SDK's WIT package:
 
@@ -65,7 +66,7 @@ declared; the component type says what the code asks for.
 
 ### Building a component that passes it
 
-This matters more than it looks, because the default way to build a Rust component does not pass.
+This is not a formality, because the default way to build a Rust component does not pass.
 `cargo build --target wasm32-wasip2` against the standard library produces a component that imports
 `wasi:cli/environment`, `wasi:cli/exit`, `wasi:io/streams`, `wasi:clocks/monotonic-clock` and
 several more, whether or not a line of the source calls them: they come from the standard library's
@@ -78,7 +79,7 @@ twenty lines that supply them.
 
 ## What each call may spend
 
-Two bounds per call, measuring different things.
+Each call has two bounds, measuring different things.
 
 | Export | Elapsed deadline | Instruction allowance |
 | --- | --- | --- |
@@ -153,7 +154,7 @@ saying "over its bound of 67108864" about it would be untrue.
 
 ## The observation queue
 
-One bounded queue per binding, 4 MiB. Offering an event to it never waits and never runs a
+Each binding has one bounded queue, 4 MiB. Offering an event to it never waits and never runs a
 component: the producer hands over the bytes and carries on, whatever the component is doing. That
 is the structural form of section 11's rule that PTY draining, terminal-query responses and the
 presentation queues never wait for an observation callback.
@@ -186,21 +187,21 @@ for two seconds and no longer; after that it disables the binding itself, which 
 could not deliver would have asked for.
 
 The binding's own channel is bounded in places: 256 of them, of which the last eight are the
-must-arrive events' and presentation may not take them. The two the service keeps -- one in the host
-per connection, one in the worker's client -- are bounded in bytes, and that bound covers the record
+must-arrive events' and presentation may not take them. The two the service keeps (one in the host
+per connection, one in the worker's client) are bounded in bytes, and that bound covers the record
 of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
 record per binding, so a reader that stopped reading cannot be given a backlog of gaps either, and a
-document is dropped whole: every piece of it that is waiting goes together, and the pieces of it that
-have not arrived yet are dropped as they arrive, whether they were dropped to make room or refused
-for want of it. Half a document would tell a reader it had a whole one. The queue remembers which
-documents went until their last piece has been accounted for or until their binding goes. That
+document is dropped whole: every piece of it that is waiting goes together, and the pieces of it
+that have not arrived yet are dropped as they arrive, whether they were dropped to make room or
+refused for want of it. Half a document would tell a reader it had a whole one. The queue remembers
+which documents went until their last piece has been accounted for or until their binding goes. That
 record is counted rather than measured: past 256 unfinished ones the connection ends, because
-forgetting one would mean delivering the end of a document without its beginning. A fault and a disabling are never dropped; if even those will not fit once every document has
-gone, the connection is over, because a connection whose reliable news cannot be delivered is not one
-worth keeping open.
+forgetting one would mean delivering the end of a document without its beginning. A fault and a
+disabling are never dropped; if even those will not fit once every document has gone, the connection
+is over, because a connection whose reliable news cannot be delivered is not one worth keeping open.
 
 A document the host's queue dropped is one the component is asked to draw again, and the ask goes to
-the binding the lost document belonged to -- not always the binding whose document made room for
+the binding the lost document belonged to, not always the binding whose document made room for
 another. A document the *worker's* queue dropped is reported to the worker as a gap; asking for a
 fresh one is then the worker's, because only the worker knows whether it still wants that binding's
 presentation.
@@ -240,7 +241,7 @@ have seen what the new gap lost.
 
 ## Compilation
 
-Lazily, at binding preparation, on a background pool, under its own budget:
+Compilation runs lazily, at binding preparation, on a background pool, under its own budget:
 
 | Bound | Value |
 | --- | --- |
@@ -265,7 +266,7 @@ threads and bounded queue.
 
 Each pool thread lowers its own scheduling priority when it starts, through the platform's own
 thread scheduling. What that means is the platform's answer, and a platform that declines is not a
-failure, because the compile still runs off the hot path, which is the property that matters.
+failure, because the compile still runs off the hot path, which is the property the design is after.
 
 ## The compiled-code cache
 
@@ -318,7 +319,7 @@ detached process, in each case its own job outside the daemon's kill tree.
 
 ### What proves which process is answering
 
-Four things, none of which substitutes for another:
+There are four proofs, none of which substitutes for another:
 
 | Proof | Who provides it | What it settles |
 | --- | --- | --- |
@@ -338,13 +339,13 @@ the strength of a signature. Each launch also has a rendezvous address of its ow
 reservation, so a claim can never arrive on an address two launches meant.
 
 The deadline covers receiving and checking the claim, publishing the descriptor and acknowledging
-it -- not merely accepting a connection. Publication is the one step a timer cannot interrupt: a
+it, not merely accepting a connection. Publication is the one step a timer cannot interrupt: a
 write, a flush and a rename finish whether or not anybody is still waiting. So it is fenced as well
 as bounded. Each launch takes its environment's publication turn, holds it from the check to the
 rename, and writes nothing if a later launch has taken it; a publication this launcher gave up on
-therefore cannot replace the descriptor its successor published. A peer that connects and then says nothing does not hold a
-startup open, and a refused claim does not end the wait: the launcher keeps listening until its
-deadline and reports the last refusal if nothing better arrives.
+therefore cannot replace the descriptor its successor published. A peer that connects and then says
+nothing does not hold a startup open, and a refused claim does not end the wait: the launcher keeps
+listening until its deadline and reports the last refusal if nothing better arrives.
 
 One reservation is one host, and the launcher keeps it that way by holding the reservation's own
 endpoint for as long as the host it started is running. A second claim reaches that and nothing
@@ -365,10 +366,10 @@ process identifier are hints.
 
 ### What a worker sends
 
-KR-CBOR-1 objects in the host's own length-delimited frames, one closed union in each direction.
-Every request carries a number the response echoes, because the host also sends document nodes,
-gaps, faults and disabled notices as they happen: a frame with a `reply_to` is somebody's answer, and
-a frame without one is news.
+The wire carries KR-CBOR-1 objects in the host's own length-delimited frames, one closed union in
+each direction. Every request carries a number the response echoes, because the host also sends
+document nodes, gaps, faults and disabled notices as they happen: a frame with a `reply_to` is
+somebody's answer, and a frame without one is news.
 
 | Request | What it does |
 | --- | --- |
@@ -398,8 +399,8 @@ push. Everything that can enter a component runs in a task of its own, so readin
 never waits for the last one to finish. A connection holds up to sixteen such calls at once and up
 to sixty-four bindings; past either, the next request is refused rather than queued.
 
-The rich calls -- `prepare-action`, `decode-request`, `encode-response`, and revising a binding's
-facts and attachments -- are in the runtime's own API, inside the plugin host, and are not in this
+The rich calls (`prepare-action`, `decode-request`, `encode-response`, and revising a binding's
+facts and attachments) are in the runtime's own API, inside the plugin host, and are not in this
 protocol. A worker cannot make them in process: it may link `kr-plugin-service`, which holds the
 protocol, the client and the launcher and no engine, and never `kr-plugin-runtime`. What travels
 between a worker and the host is the set above.
@@ -414,11 +415,11 @@ is refused by name.
 
 Nothing here decides whether an effect happens.
 
-`prepare-action` returns a plan. `decode-request` returns a projection. `encode-response` returns
-bytes. In each case the broker then checks the actor, the grant, the binding revision and the
-declared effect class, and claims and dispatches. Pending and dispatch state lives in the worker's
-broker ledger, never in a component and never in the plugin host, which is why a plugin-host crash
-cannot destroy an approval ledger.
+`prepare-action` returns a plan, `decode-request` returns a projection, and `encode-response`
+returns bytes. In each case the broker then checks the actor, the grant, the binding revision and
+the declared effect class, and claims and dispatches. Pending and dispatch state lives in the
+worker's broker ledger, never in a component and never in the plugin host, which is why a
+plugin-host crash cannot destroy an approval ledger.
 
 A binding is the broker's, and it is made only from the plugin admissions the control daemon hands
 the worker (`docs/plugins/catalogue.md`). What a binding may do is derived from the installation's
@@ -435,8 +436,8 @@ prepares is refused before anything is sent, with the same reason.
 
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
-make a call, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; what matters
-from this side is the order:
+make a call, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; from this side
+the order is what counts:
 
 1. The broker records the opaque native request **before** it forwards it, and forwards it whether
    or not any component is healthy.

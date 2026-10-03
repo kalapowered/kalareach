@@ -1,11 +1,10 @@
 # Qualifying the packages against the customisations people run
 
 A managed shell package is not qualified by starting. Section 7 names the startup customisations it
-has to work under — zsh-autosuggestions, zsh-syntax-highlighting, Powerlevel10k with its instant
-prompt, starship, oh-my-zsh, fzf's widgets, atuin and ordinary distribution customisations — and
-what has to hold under each of them. This is that qualification: a corpus of cases, a runner that
-drives each one against a real package in a real terminal, and one command that does the whole
-thing.
+has to work under (zsh-autosuggestions, zsh-syntax-highlighting, Powerlevel10k with its instant
+prompt, starship, oh-my-zsh, fzf's widgets, atuin and ordinary distribution customisations) and what
+has to hold under each of them. This is that qualification: a corpus of cases, a runner that drives
+each one against a real package in a real terminal, and one command that does the whole thing.
 
 ## Running it
 
@@ -43,11 +42,11 @@ tests/shells/<shell>/<case>/home/...      the startup files it installs under it
 tests/shells/<shell>/unsupported.json     every customisation that shell does not have, with why
 ```
 
-A case's startup files are the person's: the case writes them into a home of its own on the
-internal disk and puts the package's own marked entry where the file's `# {kalareach-entry}` token
-is, which is how each case states where in its own startup the integration is activated. Where a
-shell activates the integration from a file of its own — fish's `conf.d` — the entry is written
-there instead.
+A case's startup files are the person's: the case writes them into a home of its own on the internal
+disk and puts the package's own marked entry where the file's `# {kalareach-entry}` token is, which
+is how each case states where in its own startup the integration is activated. Where a shell
+activates the integration from a file of its own (fish's `conf.d`), the entry is written there
+instead.
 
 `case.json` carries:
 
@@ -116,11 +115,11 @@ each run writes:
   own report: the keymap, what the reader is in the middle of, what its queues hold. Where the
   report carries the state, the run records the exclusion as driven; Zsh's reader reports the vi
   operator waiting for its target, so Zsh drives it. Where the drive reaches the keymap and the
-  reader says no such thing — Bash's reader reports no pending operator, and Fish's reports nothing
-  at all while it waits for the target — the run records the keymap it did observe and narrows the
-  claim to that, under "narrowed to what the reader reported" in the case's own evidence file and
-  on the case's line in the summary. What the qualification says about such a state is what the
-  reader said, and no more.
+  reader says no such thing (Bash's reader reports no pending operator, and Fish's reports nothing
+  at all while it waits for the target), the run records the keymap it did observe and narrows the
+  claim to that, under "narrowed to what the reader reported" in the case's own evidence file and on
+  the case's line in the summary. What the qualification says about such a state is what the reader
+  said, and no more.
 
 Every line of a case's exclusion record comes from a report a reader wrote or from something the
 run watched the shell do. A drive that offers the gesture in a state it could not confirm says so
@@ -135,14 +134,14 @@ parse, a macro binding stays bound, a search leaves the editor in a listing, and
 changed is the keymap the next starts in. A shell costs a second to start; a drive that starts its
 own has no recovery gesture standing between its claim and its evidence.
 
-Each drive then has to answer three questions, and each answer is observed rather than arranged.
-The reader says it is inside its read, so the keys reach the editor rather than the terminal's own
-line discipline. The reader then says, in its own answer to a fence exchange, that it is in the
-state the drive names — a reader waiting inside one of these operations reaches no key boundary of
-its own, so it is asked rather than waited for. And afterwards the editor's answer is a positive
-one: neither managed event arrived, and the shell ran a command of the run's own while the bridge
-reported its reader leaving and coming back. Silence alone is not an answer, because a reader that
-had died, one that had been replaced and one that never took the key at all are all equally silent.
+Each drive then has to answer three questions, and each answer is observed rather than arranged. The
+reader says it is inside its read, so the keys reach the editor rather than the terminal's own line
+discipline. The reader then says, in its own answer to a fence exchange, that it is in the state the
+drive names: a reader waiting inside one of these operations reaches no key boundary of its own, so
+it is asked rather than waited for. And afterwards the editor's answer is a positive one: neither
+managed event arrived, and the shell ran a command of the run's own while the bridge reported its
+reader leaving and coming back. Silence alone is not an answer, because a reader that had died, one
+that had been replaced and one that never took the key at all are all equally silent.
 
 A startup customisation can bind the key a drive types to a widget of its own, and fzf's history
 widget is the one in this corpus that does. While a third-party widget holds the terminal the

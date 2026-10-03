@@ -287,10 +287,10 @@ How a package with no component answers an approval, from the connector table to
 
 ### Parameters
 
-An action's parameters are a bounded list rather than an arbitrary JSON Schema: text with a
-maximum length, an integer with an inclusive range, a boolean, a choice from a fixed list, a
-completed attachment handle, or a reference to a node in the package's own document. At most 16
-parameters, at most 24 choices.
+An action's parameters are a bounded list rather than an arbitrary JSON Schema: text with a maximum
+length, an integer with an inclusive range, a boolean, a choice from a fixed list, a completed
+attachment handle, or a reference to a node in the package's own document. The bound is at most 16
+parameters and at most 24 choices.
 
 Integers are bounded to the range every supported language represents exactly, from -(2^53 - 1) to
 2^53 - 1. Byte counts and durations travel as decimal strings for the same reason: a value that
@@ -373,9 +373,9 @@ The grammar is `always`, `never`, `not`, `all`, `any`, `capability`, `grant`, `b
 matching and no expression form: `node_present` and `pending_approval_for` compare one identifier
 exactly. Nesting is bounded at 4 levels and 8 terms per combinator.
 
-Two reasons for the bound. The host rechecks visibility when a control is invoked, so evaluation
-has to be cheap and total. And a reviewer reads a predicate to decide whether a package is honest
-about when it appears, which is only possible if the predicate is readable.
+There are two reasons for the bound. The host rechecks visibility when a control is invoked, so
+evaluation has to be cheap and total. And a reviewer reads a predicate to decide whether a package
+is honest about when it appears, which is only possible if the predicate is readable.
 
 Hiding a control the actor could not use is a courtesy, not a check. The host checks the right
 again at dispatch, so a predicate that lies only produces a control that then fails.
@@ -394,7 +394,8 @@ component fault disables rich meaning without stalling or discarding valid nativ
 - **Framing:** line-delimited JSON, a content-length header, a length prefix, or server-sent
   events, each with a maximum message size.
 - **Field paths:** where a message carries its request identifier and its method name, as member
-  names and array indices, at most 8 segments deep. No wildcard, no filter, no recursive descent.
+  names and array indices, at most 8 segments deep. There is no wildcard, no filter and no recursive
+  descent.
 - **Response correlation:** a matching identifier at a known path, or a single ordered channel.
 - **Routes:** the method name in the table and its exact wire spelling.
 - **Method classification:** `observation`, `mutation`, `credential` or `unsupported` per method,

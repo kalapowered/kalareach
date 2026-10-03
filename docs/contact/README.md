@@ -47,9 +47,9 @@ rather than the caller:
 4. **Ancestry.** The parent chain is walked to the root shell. Every link is read from the kernel
    and checked for consistency: a candidate parent that started after its child is an identifier
    the kernel has handed to something else since, and the chain stops there.
-5. **The local broker.** The same walk, to an agent the session's broker launched. An agent whose
-   backend the worker started runs outside the terminal and its process group, and the helper that
-   backend starts belongs to the session all the same: the broker started the backend for this
+5. **The local broker.** This is the same walk, to an agent the session's broker launched. An agent
+   whose backend the worker started runs outside the terminal and its process group, and the helper
+   that backend starts belongs to the session all the same: the broker started the backend for this
    session and knows it by its start identity.
 
 The identity read when the connection was accepted is the one every later call on it is checked
@@ -118,10 +118,10 @@ second time.
 The client's own tool deadline is the other bound, and the shorter of the two decides. A server
 cannot read a deadline the client never sends, so the installation tells it. Where the agent
 supports a per-server deadline the installation declares 660 seconds in the agent's own
-configuration — `tool_timeout_sec` for Codex, `toolTimeoutMs` for Kimi Code CLI, `timeout` for
-Claude Code, Qoder CLI and Gemini CLI — and writes the same number into `KR_TOOL_DEADLINE_MS` in
-the environment that agent launches the server with. Every wait is then cut to that deadline less
-the room an answer needs to travel back in, whether the agent named a duration or not.
+configuration (`tool_timeout_sec` for Codex, `toolTimeoutMs` for Kimi Code CLI, `timeout` for Claude
+Code, Qoder CLI and Gemini CLI) and writes the same number into `KR_TOOL_DEADLINE_MS` in the
+environment that agent launches the server with. Every wait is then cut to that deadline less the
+room an answer needs to travel back in, whether the agent named a duration or not.
 
 A document more than one agent reads carries neither, because those agents do not spell the
 deadline the same way and the entry has to be the entry all of them read. Where nothing was
@@ -303,12 +303,12 @@ record names, whether that was recorded or still in flight, is this host's own u
 repair writes it again and claims it. Anything else at that path is somebody's own, and the
 installation refuses and says to move it aside.
 
-Two things a repair cannot finish, and both are reported rather than glossed over. A file or an
+A repair cannot finish two things, and both are reported rather than glossed over. A file or an
 entry that no longer holds what the record names has to be looked at by hand: this host will not
 adopt it from a digest, because a digest proves content and not authorship. And a note about
 something the installation no longer touches at all cannot be resolved by installing again; the
-installation stays open, `kr skill install` lists it under `unresolved`, `kr skill status` repeats it
-and says the installation did not finish, and `kr skill remove` leaves it alone. Removing the
+installation stays open, `kr skill install` lists it under `unresolved`, `kr skill status` repeats
+it and says the installation did not finish, and `kr skill remove` leaves it alone. Removing the
 installation clears the record, after which a fresh installation starts from nothing.
 
 ## What contact is not
