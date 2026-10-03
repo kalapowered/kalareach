@@ -308,7 +308,7 @@ impl Run {
                     ActionTarget::environment(host.environment_id),
                     &SessionCreateParams {
                         environment_id: host.environment_id,
-                        presentation: Presentation::Invisible,
+                        presentation: Presentation::Attach,
                         shell: Nullable::some(shell.to_owned()),
                         shell_mode: ShellMode::NativeCompat,
                         cwd: Nullable::some(host.temp.root().display().to_string()),

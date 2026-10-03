@@ -186,7 +186,7 @@ impl Host {
     async fn new_session(&self, client: &mut LocalClient, profile: WorkerProfile) -> SessionId {
         let params = SessionCreateParams {
             environment_id: self.environment_id,
-            presentation: Presentation::Invisible,
+            presentation: Presentation::Attach,
             shell: Nullable::some(kr_worker::testing::posix_shell()),
             shell_mode: ShellMode::NativeCompat,
             cwd: Nullable::some(self.temp.root().display().to_string()),
