@@ -266,11 +266,11 @@ jobs:
           for archive in "${archives[@]}"; do
             text="$scratch/$(basename "$archive").txt"
             disassemble "$archive" "$text"
-            if ! counts=$(past_baseline "$text"); then
-              bad=1
-              grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt"
-            fi
+            counts=$(past_baseline "$text") || bad=1
             echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
+            if [ "$bad" = 1 ]; then
+              grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+            fi
             case "$(basename "$archive")" in
               ggml-cpu.*|libggml-cpu.*)
                 cpu=1
