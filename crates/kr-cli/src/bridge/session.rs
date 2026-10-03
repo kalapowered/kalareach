@@ -504,6 +504,7 @@ mod tests {
                     kr_protocol::desktop::InhibitionMechanism::None,
                     kr_protocol::desktop::PowerSource::Unknown,
                 ),
+                machine: None,
             })
             .expect("a payload"),
         )
