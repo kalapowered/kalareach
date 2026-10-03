@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kr_describe::budget::Budgets;
 use kr_describe::metadata::{LabelSource, SessionFacts, Title, deterministic_title};
+use kr_describe::profile::catalogue::NothingSelected;
 use kr_describe::store::{DescriptionStore, GeneratedRecord};
 use kr_protocol::describe::{
     DescriptionFreshness, DescriptionPause, DescriptionProvenance, DescriptionState,
@@ -266,36 +267,32 @@ impl DescribeModule {
             .host()
             .filter(|host| host.runs())
             .map(|host| host.snapshot());
-        let (status, detail, fix): (_, _, Option<&str>) = match published {
-            None => (
+        let nothing_selected = published
+            .as_ref()
+            .and_then(|snapshot| snapshot.setup.as_ref())
+            .and_then(|setup| setup.nothing_selected.as_ref());
+        let (status, detail, fix): (_, _, Option<&str>) = match (published.as_ref(), nothing_selected) {
+            (None, _) => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("this daemon is not generating session descriptions"),
                 None,
             ),
-            Some(snapshot)
-                if snapshot
-                    .setup
-                    .as_ref()
-                    .is_some_and(|setup| !setup.processor_lacks.is_empty()) =>
-            {
-                let lacks = snapshot
-                    .setup
-                    .as_ref()
-                    .map_or(&[][..], |setup| setup.processor_lacks.as_slice());
-                (
-                    DoctorStatus::NotApplicable,
-                    processor_lacks_sentence(lacks),
-                    Some(
+            (Some(_), Some(reason)) => (
+                DoctorStatus::NotApplicable,
+                nothing_selected_sentence(reason),
+                match reason {
+                    NothingSelected::ProcessorLacks(_) => Some(
                         "In a virtual machine, give it a CPU type that passes these instruction sets through, such as the host's own.",
                     ),
-                )
-            }
-            Some(_) if !settings.enabled => (
+                    NothingSelected::TargetNotListed | NothingSelected::GatesOutstanding => None,
+                },
+            ),
+            (Some(_), None) if !settings.enabled => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("descriptions are off; nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
                 Some("kr host descriptions --on turns them on."),
             ),
-            Some(snapshot) => match snapshot.paused {
+            (Some(snapshot), None) => match snapshot.paused {
                 Some(DescriptionPause::NotDownloaded) => (
                     DoctorStatus::Warning,
                     Sentence::new().stated("the model's files are not on this host, so nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
@@ -851,19 +848,27 @@ pub const fn serves(method: kr_protocol::method::Method) -> bool {
     )
 }
 
-/// What the diagnostics say when the processor lacks instruction sets the description process
-/// needs: which, and that titles come from what a session has.
-fn processor_lacks_sentence(
-    lacks: &[kr_describe::processor::Feature],
-) -> kr_protocol::hostinfo::export::Sentence {
+/// What the diagnostics say when no profile was selected: why, and that titles come from what a
+/// session has. The target itself is not quoted, since a diagnostic's words are this build's own.
+fn nothing_selected_sentence(reason: &NothingSelected) -> kr_protocol::hostinfo::export::Sentence {
     use kr_protocol::hostinfo::export::Sentence;
 
-    let mut sentence = Sentence::new().stated("this processor lacks ");
-    for part in kr_describe::processor::name_parts(lacks) {
-        sentence = sentence.stated(part);
-    }
+    let sentence = match reason {
+        NothingSelected::ProcessorLacks(lacks) => {
+            let mut sentence = Sentence::new().stated("this processor lacks ");
+            for part in kr_describe::processor::name_parts(lacks) {
+                sentence = sentence.stated(part);
+            }
+            sentence.stated(", which the description process needs")
+        }
+        NothingSelected::TargetNotListed => Sentence::new()
+            .stated("no description profile lists the target this host was built for"),
+        NothingSelected::GatesOutstanding => Sentence::new().stated(
+            "the description profiles for the target this host was built for are candidates whose gates are not met",
+        ),
+    };
     sentence.stated(
-        ", which the description process needs, so nothing new is generated on this host, and a session shows the title it has from metadata, a pin or an earlier description",
+        ", so nothing new is generated on this host, and a session shows the title it has from metadata, a pin or an earlier description",
     )
 }
 

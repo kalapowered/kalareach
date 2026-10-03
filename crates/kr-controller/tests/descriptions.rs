@@ -1859,7 +1859,7 @@ async fn a_target_no_profile_lists_is_named_and_starts_no_process() {
         check.detail()
     );
     assert!(
-        check.detail().contains("platform"),
+        check.detail().contains("target"),
         "the check says why: {}",
         check.detail()
     );
