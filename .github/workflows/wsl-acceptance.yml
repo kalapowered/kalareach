@@ -6,7 +6,8 @@ name: wsl-acceptance
 # The script is an acceptance run: a prerequisite it cannot meet is a failure rather than a skip.
 # It needs a Windows host with WSL2, the three Windows programs built from the commit under test
 # (`kr.exe`, `kr-controller.exe`, `kr-worker.exe`), and a Linux distribution that carries the matching
-# Linux set (`kr`, `kr-controller`, `kr-worker` and the bridge suite) with the manifest that names
+# Linux set (`kr`, `kr-controller`, `kr-worker`, the bridge suite and the pairing suite) with the
+# manifest that names
 # the commit and the hash of every installed file. Building the Linux set inside a distribution would
 # need a Rust toolchain there, so it is built on a Linux runner from the same commit and carried in.
 #
@@ -59,8 +60,9 @@ jobs:
             target
           key: wsl-linux-set-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
-      # The helper, the daemon and the worker, and the bridge suite as the test executable cargo
-      # builds for it, which the acceptance installs beside them and runs inside the distribution.
+      # The helper, the daemon and the worker, and the bridge suite and the pairing suite as the test
+      # executables cargo builds for them, which the acceptance installs beside them and runs inside
+      # the distribution.
       - name: Build the set
         run: |
           set -eu
@@ -69,16 +71,21 @@ jobs:
             sed -n 's/.*"kind":\["test"\].*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
           test -n "$suite"
           echo "the bridge suite is $suite"
+          pairing="$(cargo test --locked -p kr-controller --test distribution_endpoints --no-run --message-format=json |
+            sed -n 's/.*"kind":\["test"\].*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          test -n "$pairing"
+          echo "the pairing suite is $pairing"
           root="$RUNNER_TEMP/set"
           mkdir -p "$root/usr/local/bin" "$root/usr/local/lib"
           install -m 0755 target/debug/kr target/debug/kr-controller target/debug/kr-worker "$root/usr/local/bin/"
           install -m 0755 "$suite" "$root/usr/local/lib/kalareach-acc-bridge-suite"
+          install -m 0755 "$pairing" "$root/usr/local/lib/kalareach-acc-pairing-suite"
           # The commit on the first line and then the hash of every installed file, by its path
           # below the root: what the acceptance reads before it trusts a set it did not build.
           {
             echo "$GITHUB_SHA"
             cd "$root"
-            sha256sum usr/local/bin/kr usr/local/bin/kr-controller usr/local/bin/kr-worker usr/local/lib/kalareach-acc-bridge-suite
+            sha256sum usr/local/bin/kr usr/local/bin/kr-controller usr/local/bin/kr-worker usr/local/lib/kalareach-acc-bridge-suite usr/local/lib/kalareach-acc-pairing-suite
           } >"$RUNNER_TEMP/commit-manifest"
           mv "$RUNNER_TEMP/commit-manifest" "$root/usr/local/lib/kalareach-acc-commit"
           tar -C "$root" -czf "$RUNNER_TEMP/linux-set.tar.gz" .
