@@ -59,8 +59,8 @@ use crate::priority::Cancellation;
 use crate::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
 };
-use crate::processor::{self, Feature, Features};
-use crate::profile::catalogue::{Catalogue, MetGates, Selection};
+use crate::processor::Features;
+use crate::profile::catalogue::{Catalogue, MetGates, NothingSelected, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
 use crate::queue::{Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding};
 use crate::resource::{
@@ -140,8 +140,9 @@ pub struct SetupState {
     pub needs_hosted_account: bool,
     /// Why this host offers nothing, when it offers nothing.
     pub unavailable: Option<String>,
-    /// The instruction sets the processor lacks, when that is why this host offers nothing.
-    pub processor_lacks: Vec<Feature>,
+    /// Why no profile was selected, when none was: the closed set of reasons the host's
+    /// diagnostics are written for. A placement that refuses a model is not among them.
+    pub nothing_selected: Option<NothingSelected>,
 }
 
 /// Where a description service runs.
@@ -970,20 +971,12 @@ impl DescriptionService {
     #[must_use]
     pub fn setup_state(&self) -> SetupState {
         let placement = self.environment.placement(self.choice.as_ref());
-        let processor_lacks = self
-            .selection
-            .processor_lacks()
-            .map(<[Feature]>::to_vec)
-            .unwrap_or_default();
+        let nothing_selected = self.selection.nothing_selected();
         let unavailable = match placement {
             Placement::Refused(refusal) => Some(refusal.as_str().to_owned()),
-            Placement::Local | Placement::NativeHostBroker if !processor_lacks.is_empty() => {
-                Some(format!(
-                    "this processor lacks {}, which the description process needs",
-                    processor::names(&processor_lacks)
-                ))
-            }
-            Placement::Local | Placement::NativeHostBroker => None,
+            Placement::Local | Placement::NativeHostBroker => nothing_selected
+                .as_ref()
+                .map(|reason| reason.why(&self.target)),
         };
         let policy = self
             .selection
@@ -1003,7 +996,7 @@ impl DescriptionService {
             // assets come from their publisher, and the inference is local.
             needs_hosted_account: false,
             unavailable,
-            processor_lacks,
+            nothing_selected,
         }
     }
 

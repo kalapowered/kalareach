@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use kr_describe::context::ContextSignal;
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::processor::{Feature, Features, baseline, names};
-use kr_describe::profile::catalogue::{MetGates, NotSelected, Selection};
+use kr_describe::profile::QualificationGate;
+use kr_describe::profile::catalogue::{MetGates, NotSelected, NothingSelected, Selection};
 use kr_describe::resource::ResourceSettings;
 use kr_describe::service::{DescriptionService, HostPlacement, Instruction};
 use kr_describe::store::DescriptionStore;
@@ -112,7 +113,10 @@ fn a_host_whose_processor_lacks_an_instruction_set_says_which_and_starts_no_proc
     let setup = lacking.setup_state();
     assert!(!setup.offered);
     assert_eq!(setup.profile_id, None);
-    assert_eq!(setup.processor_lacks, [Feature::Avx2]);
+    assert_eq!(
+        setup.nothing_selected,
+        Some(NothingSelected::ProcessorLacks(vec![Feature::Avx2]))
+    );
     assert_eq!(
         setup.unavailable.as_deref(),
         Some("this processor lacks AVX2, which the description process needs")
@@ -126,7 +130,7 @@ fn a_host_whose_processor_lacks_an_instruction_set_says_which_and_starts_no_proc
     let mut full_host = host(full());
     let setup = full_host.setup_state();
     assert!(setup.offered);
-    assert!(setup.processor_lacks.is_empty());
+    assert_eq!(setup.nothing_selected, None);
     assert_eq!(setup.unavailable, None);
     let asked = full_host
         .next(&roomy(), at(20_000))
@@ -237,6 +241,45 @@ fn a_target_no_profile_lists_is_refused_for_the_target_not_the_processor() {
             .all(|(_, why)| *why == NotSelected::IncompatibleTarget),
         "{reasons:?}"
     );
+}
+
+/// A host whose selection chose nothing reports one reason, whichever way each profile was refused:
+/// the processor first, then profiles that list the target but are not yet qualified, and otherwise
+/// a target no profile lists, which names the target. The control is a selection that chose a
+/// profile, which has no reason to give.
+#[test]
+fn a_selection_that_chooses_nothing_gives_one_reason() {
+    let none = Features::of([]);
+    let unlisted = built_in().select("aarch64-pc-windows-msvc", &none, &MetGates::all());
+    assert_eq!(
+        unlisted.nothing_selected(),
+        Some(NothingSelected::TargetNotListed)
+    );
+    let why = NothingSelected::TargetNotListed.why("aarch64-pc-windows-msvc");
+    assert!(why.contains("aarch64-pc-windows-msvc"), "{why}");
+
+    let lacking = built_in().select(LINUX, &none, &MetGates::all());
+    assert_eq!(
+        lacking.nothing_selected(),
+        Some(NothingSelected::ProcessorLacks(Feature::X86_64.to_vec()))
+    );
+
+    let candidates_only = Selection::DeterministicMetadata {
+        reasons: vec![
+            ("default".to_owned(), NotSelected::IncompatibleTarget),
+            (
+                "candidate".to_owned(),
+                NotSelected::GatesOutstanding(vec![QualificationGate::Platform]),
+            ),
+        ],
+    };
+    assert_eq!(
+        candidates_only.nothing_selected(),
+        Some(NothingSelected::GatesOutstanding)
+    );
+
+    let chosen = built_in().select(LINUX, &full(), &MetGates::all());
+    assert_eq!(chosen.nothing_selected(), None);
 }
 
 /// The processor this test runs on is asked, not assumed: what `running` says it has is what the

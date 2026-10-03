@@ -851,6 +851,40 @@ pub mod catalogue {
         GatesOutstanding(Vec<QualificationGate>),
     }
 
+    /// The one reason a host that selected no profile reports.
+    ///
+    /// A host with nothing selected shows deterministic titles and starts no process, and it says
+    /// why in words of its own: this is the closed set of reasons those words are written for.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum NothingSelected {
+        /// The processor lacks instruction sets the description process built for this target
+        /// needs.
+        ProcessorLacks(Vec<Feature>),
+        /// No profile in the catalogue lists this target.
+        TargetNotListed,
+        /// Profiles list this target, but each is a candidate whose gates have not been met.
+        GatesOutstanding,
+    }
+
+    impl NothingSelected {
+        /// Says the reason as a sentence fragment for `target`, the one this host was built for.
+        #[must_use]
+        pub fn why(&self, target: &str) -> String {
+            match self {
+                Self::ProcessorLacks(lacks) => format!(
+                    "this processor lacks {}, which the description process needs",
+                    crate::processor::names(lacks)
+                ),
+                Self::TargetNotListed => {
+                    format!("no description profile lists the target {target}")
+                }
+                Self::GatesOutstanding => format!(
+                    "the description profiles for the target {target} are candidates whose gates are not met"
+                ),
+            }
+        }
+    }
+
     /// What selecting a profile decided.
     #[derive(Clone, Debug, PartialEq)]
     pub enum Selection {
@@ -890,6 +924,28 @@ pub mod catalogue {
                     })
                 }
             }
+        }
+
+        /// Returns why no profile was selected, or `None` when one was.
+        ///
+        /// A processor that lacks what the process needs comes first, since it holds whichever
+        /// profile is asked for; then profiles that list the target but are not yet qualified; and
+        /// otherwise the target is one no profile lists.
+        #[must_use]
+        pub fn nothing_selected(&self) -> Option<NothingSelected> {
+            let Self::DeterministicMetadata { reasons } = self else {
+                return None;
+            };
+            if let Some(lacks) = self.processor_lacks() {
+                return Some(NothingSelected::ProcessorLacks(lacks.to_vec()));
+            }
+            if reasons
+                .iter()
+                .any(|(_, why)| matches!(why, NotSelected::GatesOutstanding(_)))
+            {
+                return Some(NothingSelected::GatesOutstanding);
+            }
+            Some(NothingSelected::TargetNotListed)
         }
     }
 
