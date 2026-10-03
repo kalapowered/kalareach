@@ -442,6 +442,34 @@ fn kr_req_12_02_the_launcher_returns_the_programs_whole_exit_code() {
     }
 }
 
+/// KR-REQ-12.02: a program run as typed, because the backend refused the launch, also ends the
+/// launcher with its whole 32-bit exit code and not with that code cut to a byte. Control: a small
+/// code reaches the shell as it is (`kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed`).
+#[test]
+fn kr_req_12_02_a_program_run_as_typed_returns_its_whole_exit_code() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &[
+            "gemini".to_owned(),
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "exit /b 305419896".to_owned(),
+        ],
+        &answer,
+        "typed-whole",
+        &[],
+        shell.placed.host.root(),
+    );
+    let status = launcher.wait().expect("the launcher ends with the program");
+    assert_eq!(
+        status.code(),
+        Some(305_419_896),
+        "the typed program's code, whole"
+    );
+}
+
 /// KR-REQ-12.07: a launch the backend refuses runs as typed: the program runs without the declared
 /// variable and without the registration, and ends with its own exit code. Here the argument vector
 /// the launcher presents is not the one the backend answered. Control: the vector it answered is
