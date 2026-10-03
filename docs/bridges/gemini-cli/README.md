@@ -13,7 +13,8 @@ outside Wasmtime. The package's installation grant says so before anything is in
 
 ## What the package installs
 
-Three files under the user's own Gemini CLI directory, and no settings key:
+The Gemini CLI extension installed by the Gemini CLI connector package consists of three files in
+the user's own Gemini CLI directory, and no settings key:
 
 | File | What it holds |
 | --- | --- |
@@ -27,7 +28,7 @@ settings files, whether or not the person trusts the folder. A hook in a setting
 person's own included, runs only in a trusted folder, and a hooks key there would hold the person's
 own hooks for the same event; that is why the bridge is an extension.
 
-The install record matters where the person's settings list allowed extensions in
+The install record decides what happens where the person's settings list allowed extensions in
 `security.allowedExtensions`. There Gemini CLI refuses to start at all while any directory under
 `extensions/` has no record, and it loads an extension only when a listed pattern matches the source
 its record names. This record names `/dev/null/kalareach`, an absolute path nothing can exist under,
