@@ -628,20 +628,20 @@ impl Controller {
         };
         // Four methods take no admission into a service: the environment record and the update
         // handover change nothing the revision or the deadline decides. They still do not run for a
-        // connection whose registration was withdrawn while the call waited.
+        // connection whose registration was withdrawn while the call waited, and they do not run
+        // while this host owes a fence it could not raise: whichever service performs an effect,
+        // an owed fence stops it.
         if matches!(
             method,
             Method::EnvironmentEnrol
                 | Method::EnvironmentForget
                 | Method::EnvironmentRefresh
                 | Method::HostUpdateHandover
-        ) && let Err(error) = self.authorised(connection_id)
+        ) && let Err(error) = self
+            .authorised(connection_id)
+            .and_then(|_| self.check_fence())
         {
-            return error_reply(
-                mutation.request_id,
-                ErrorCode::PermissionDenied,
-                error.to_string(),
-            );
+            return error_reply(mutation.request_id, error.code(), error.to_string());
         }
         let outcome = match method {
             // A create needs freshness of its own. An admission that carries none is a retry of an
@@ -738,9 +738,29 @@ impl Controller {
                         };
                         let kept = self.settle_claim(&hold, &outcome);
                         drop(hold);
-                        kept.and(outcome)
+                        // The change happened, or was refused, and that is what the caller is
+                        // told. A receipt that could not be kept leaves a claim with no answer,
+                        // which a retry is told is unfinished and never performs again; it does not
+                        // turn an applied change into a failed one.
+                        if let Err(error) = kept {
+                            eprintln!(
+                                "kr-controller: could not keep what an action came to, so a retry \
+                                 of it is answered as an unfinished one: {error}"
+                            );
+                        }
+                        outcome
                     }
                     Ok(crate::grants::ActionClaim::Recorded(_)) => {
+                        // What this action produced is given back only under authority that has
+                        // not been withdrawn, as it is by the retained lookup before a first
+                        // admission: a claim can be recorded between that lookup and this one.
+                        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+                            return error_reply(
+                                mutation.request_id,
+                                error.code(),
+                                error.to_string(),
+                            );
+                        }
                         return self
                             .retained_authority_answer(actor_id, mutation)
                             .await
