@@ -315,8 +315,8 @@ pub fn build(
 ) -> LaunchEnvironment {
     let mut variables = BTreeMap::new();
     let mut removed = Vec::new();
-    // Where each variable kept came from, and whether its value says anything, by the name the
-    // platform compares it by.
+    // Where each variable kept came from, and whether its value says anything, by the name it is
+    // kept under.
     let mut supplied: BTreeMap<String, (EnvironmentSource, bool)> = BTreeMap::new();
     let mut terminfo = TerminfoSelection {
         directory: context
@@ -364,17 +364,24 @@ pub fn build(
             }
             EnvironmentOrigin::HostContext => EnvironmentSource::HostContext,
         };
-        supplied.insert(folded, (source, !variable.value.is_empty()));
+        supplied.insert(variable.name.clone(), (source, !variable.value.is_empty()));
         variables.insert(variable.name.clone(), variable.value.clone());
     }
 
     for (name, value) in &context.variables {
         supplied.insert(
-            platform_variable_name(name),
+            name.clone(),
             (EnvironmentSource::ExecutionContext, !value.is_empty()),
         );
         variables.insert(name.clone(), value.clone());
     }
+
+    // Read as the shell is given them: in the order of their names, where a platform that
+    // compares names without regard to case takes the later of two spellings of one name.
+    let supplied: BTreeMap<String, (EnvironmentSource, bool)> = supplied
+        .into_iter()
+        .map(|(name, supplier)| (platform_variable_name(&name), supplier))
+        .collect();
 
     // The worker owns these outright. They are the session's declared identity, and changing them
     // is the intentional part of the policy rather than an oversight.
@@ -710,6 +717,25 @@ mod tests {
         assert_eq!(
             locale(host, &[], &[("PATH", "/usr/bin")]),
             EnvironmentSource::Unset
+        );
+    }
+
+    /// KR-REQ-07.25: two spellings of one name, where the platform holds them as one, are decided
+    /// as the shell is given them: the later of the two by name, so a lower-case `lang` that is
+    /// empty leaves no locale where the platform folds names, and elsewhere it is a variable of its
+    /// own that `LANG` is unaffected by.
+    #[test]
+    fn two_spellings_of_one_name_are_decided_as_the_shell_is_given_them() {
+        let locale = built_with(&[("lang", ""), ("LANG", "C")], &ExecutionContext::default())
+            .sources
+            .locale;
+        assert_eq!(
+            locale,
+            if cfg!(windows) {
+                EnvironmentSource::Unset
+            } else {
+                EnvironmentSource::CreatorSnapshot
+            }
         );
     }
 

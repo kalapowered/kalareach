@@ -7379,7 +7379,9 @@ export interface Dimensions4 {
  */
 export interface SessionEnvironmentSources {
   /**
-   * Where the directory the shell started in came from.
+   * Where the directory the shell was asked to start in came from. A directory the request
+   * names that is not one is replaced by the home directory where the shell is launched, and
+   * this still says the request named it.
    */
   cwd: 'create_request' | 'worker_default'
   /**

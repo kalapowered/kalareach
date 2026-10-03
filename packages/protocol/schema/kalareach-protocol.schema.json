@@ -31985,7 +31985,7 @@
       "properties": {
         "cwd": {
           "$ref": "#/$defs/WorkingDirectorySource",
-          "description": "Where the directory the shell started in came from."
+          "description": "Where the directory the shell was asked to start in came from. A directory the request\nnames that is not one is replaced by the home directory where the shell is launched, and\nthis still says the request named it."
         },
         "locale": {
           "$ref": "#/$defs/EnvironmentSource",
@@ -37114,7 +37114,7 @@
         },
         {
           "const": "worker_default",
-          "description": "The request named none and the worker started the shell in the root directory.",
+          "description": "The request named none and the worker asked for the root directory.",
           "type": "string"
         }
       ]
