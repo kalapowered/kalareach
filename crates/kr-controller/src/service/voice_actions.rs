@@ -11,7 +11,7 @@ use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use crate::error::{ControllerError, Result};
 
 use super::authority_changes::decoded;
-use super::{Controller, parse, wall_clock_ms};
+use super::{Controller, parse};
 
 impl Controller {
     /// Registers the voice coordinator beside the other services.
@@ -240,7 +240,7 @@ impl Controller {
                     mutation,
                     method,
                     authority_revision,
-                    wall_clock_ms(),
+                    self.settled_now_ms(),
                     &admission,
                 )
                 .await;
@@ -271,7 +271,7 @@ impl Controller {
                 mutation,
                 method,
                 authority_revision,
-                wall_clock_ms(),
+                self.settled_now_ms(),
                 &admission,
             )
             .await;
@@ -377,7 +377,7 @@ impl Controller {
     /// the device's own ordinary grant still carries what the action needs. The intersection is
     /// `kr_voice::permits`, which is the same rule the coordinator applied, so this is the same
     /// decision taken again rather than a second rule that could disagree with it.
-    fn voice_authority_now(
+    pub(super) fn voice_authority_now(
         &self,
         proposal: &kr_voice::Proposal,
         session_id: SessionId,
@@ -394,7 +394,6 @@ impl Controller {
         if !paired {
             return Err(denied("this device is no longer paired with this host"));
         }
-        let now_ms = wall_clock_ms();
         let authority = crate::voice::GrantAuthority::new(
             Arc::clone(&self.sharing),
             Arc::clone(&self.devices),
@@ -405,19 +404,19 @@ impl Controller {
             code: error.code(),
             detail: error.to_string(),
         };
+        // Standing is the host's to decide, on its own clocks and its recorded floor: a grant
+        // that has run out, or whose end is not on record yet, is not given back.
         let voice_grant = authority
-            .grant(proposal.voice_grant_id, now_ms)
+            .grant(proposal.voice_grant_id)
             .map_err(store)?
             .ok_or_else(|| denied("the voice grant this action was admitted under has ended"))?;
-        if !voice_grant.expiry.is_valid_at(now_ms)
-            || !voice_grant.session_selector.admits(session_id)
-        {
+        if !voice_grant.session_selector.admits(session_id) {
             return Err(denied(
                 "the voice grant this action was admitted under no longer reaches that session",
             ));
         }
         let device_grant = authority
-            .device_grant(proposal.device_id, Some(session_id), now_ms)
+            .device_grant(proposal.device_id, Some(session_id))
             .map_err(store)?
             .ok_or_else(|| denied("this device's grant no longer covers that session"))?;
         if !kr_voice::permits(&voice_grant, &device_grant, proposal.action) {

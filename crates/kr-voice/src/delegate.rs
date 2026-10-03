@@ -383,7 +383,7 @@ impl Coordinator {
     ) -> Result<VoiceGrantResult> {
         let device_grant = self
             .authority
-            .device_grant(params.device_id, None, now_ms)?
+            .device_grant(params.device_id, None)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -413,9 +413,7 @@ impl Coordinator {
             // thing this change does, and an authority change whose admitted lifetime ran out
             // while it waited is one nobody is still holding a window for.
             Self::still_admitted(admission)?;
-            let replaced = self
-                .authority
-                .standing_voice_grant(params.device_id, now_ms)?;
+            let replaced = self.authority.standing_voice_grant(params.device_id)?;
             // Again, after the lookup: reading the store is itself a wait, on its own lock and on
             // the file underneath it, and the check that decides whether this change may happen
             // has to be the last thing before it does.
@@ -491,9 +489,8 @@ impl Coordinator {
         &self,
         device_id: DeviceId,
         params: &VoicePrepareParams,
-        now_ms: u64,
     ) -> Result<VoicePrepareResult> {
-        let call = self.plan_call(device_id, &params.session_ids, PlanFor::Description, now_ms)?;
+        let call = self.plan_call(device_id, &params.session_ids, PlanFor::Description)?;
         let provider = self.provider();
         // Bound to the provider a start would reach now. A provider attached or replaced before
         // the start is a different call from the one described, and the start says so.
@@ -581,11 +578,10 @@ impl Coordinator {
         device_id: DeviceId,
         requested: &CanonicalSet<SessionId>,
         purpose: PlanFor,
-        now_ms: u64,
     ) -> Result<PlannedCall> {
         let device_grant = self
             .authority
-            .device_grant(device_id, None, now_ms)?
+            .device_grant(device_id, None)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -594,7 +590,7 @@ impl Coordinator {
             })?;
         let standing = self
             .authority
-            .standing_voice_grant(device_id, now_ms)?
+            .standing_voice_grant(device_id)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideVoiceGrant,
@@ -712,7 +708,6 @@ impl Coordinator {
                 closes_at_ms,
                 authority_revision,
             },
-            now_ms,
         )?;
         // The call is bound to what the person was shown or it is not made. Checked before the
         // provider is asked, so a changed scope costs nothing and creates nothing.
@@ -868,7 +863,7 @@ impl Coordinator {
                 self.close_unbound(&provider, &session.call_id).await;
                 return Err(error);
             }
-            let current = self.authority.standing_voice_grant(device_id, now_ms);
+            let current = self.authority.standing_voice_grant(device_id);
             match current {
                 Ok(Some(current)) if current.grant_id == standing.grant_id => {
                     // And again after that lookup, because reading the store waits too: on its
@@ -1160,7 +1155,6 @@ impl Coordinator {
         &self,
         device_id: DeviceId,
         params: &kr_protocol::voice::VoiceContextParams,
-        now_ms: u64,
     ) -> Result<kr_protocol::voice::VoiceContextResult> {
         let (voice_grant_id, reaches, disclosure) = {
             let state = self.state.lock().expect("the coordinator's state");
@@ -1179,10 +1173,10 @@ impl Coordinator {
                 "this voice session does not reach that session",
             ));
         }
-        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
+        let voice_grant = self.live_voice_grant(voice_grant_id)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, Some(params.session_id), now_ms)?
+            .device_grant(device_id, Some(params.session_id))?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -1209,7 +1203,6 @@ impl Coordinator {
         // the moment the request arrived. A read waits for the host; a stop, a grant change or
         // the call's own deadline during that wait withdraws the authority it was admitted under,
         // and what must not happen is *serving* that content, not reading it.
-        let now_ms = self.authority.now_ms().max(now_ms);
         {
             let state = self.state.lock().expect("the coordinator's state");
             let record = state
@@ -1222,10 +1215,10 @@ impl Coordinator {
                 ));
             }
         }
-        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
+        let voice_grant = self.live_voice_grant(voice_grant_id)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, Some(params.session_id), now_ms)?
+            .device_grant(device_id, Some(params.session_id))?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -1582,10 +1575,10 @@ impl Coordinator {
                 "this host has no effect that does that, so no grant can carry it",
             ));
         }
-        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
+        let voice_grant = self.live_voice_grant(voice_grant_id)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, params.session_id.0, now_ms)?
+            .device_grant(device_id, params.session_id.0)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -1631,29 +1624,23 @@ impl Coordinator {
         })))
     }
 
-    /// The live grant behind one voice session, at the moment of the decision.
+    /// The grant behind one voice session, when it stands at the moment of the decision.
     ///
-    /// Revoked and expired are both checked here, and expiry is checked against the clock the
-    /// request carries rather than against what was true when the grant was written: a call that
-    /// outlived its own deadline must stop authorising the request after it.
+    /// Revoked and expired are both the host's to decide, on its own clocks and its own recorded
+    /// floor: a call that outlived its own deadline must stop authorising the request after it, and
+    /// a wall clock wound back must not bring it back. A grant the host cannot say has ended,
+    /// because the end is not on record, is a refusal with the host's own reason and not a
+    /// grant that stands.
     fn live_voice_grant(
         &self,
         grant_id: kr_protocol::ids::GrantId,
-        now_ms: u64,
     ) -> Result<kr_protocol::grant::Grant> {
-        let grant = self.authority.grant(grant_id, now_ms)?.ok_or_else(|| {
+        self.authority.grant(grant_id)?.ok_or_else(|| {
             VoiceError::refused(
                 VoiceRefusal::OutsideVoiceGrant,
-                "this voice session's grant has been revoked",
+                "this voice session's grant has been revoked or has run out",
             )
-        })?;
-        if !grant.expiry.is_valid_at(now_ms) {
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideVoiceGrant,
-                "this voice session's grant has run out",
-            ));
-        }
-        Ok(grant)
+        })
     }
 
     /// The sentence carried with every delegation this host accepts.

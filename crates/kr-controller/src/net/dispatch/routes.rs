@@ -352,11 +352,7 @@ impl RemoteConnection {
             DeviceRead::Voice => {
                 self.controller
                     .voice()
-                    .read_frame(
-                        self.device.device_id,
-                        request,
-                        super::super::super::wall_clock_ms(),
-                    )
+                    .read_frame(self.device.device_id, request)
                     .await
             }
             DeviceRead::Catalogue => {

@@ -96,6 +96,17 @@ struct Authority {
     write_fails: std::sync::atomic::AtomicBool,
     /// This host's clock, as a test moves it.
     now: std::sync::atomic::AtomicU64,
+    /// The one read of a grant the host refuses to answer, and what it refuses with: a host that
+    /// cannot say whether a grant has ended, because the end is not on record yet.
+    refusing: Mutex<Option<(Seam, kr_protocol::error::ProtocolError)>>,
+}
+
+/// The three reads of a grant the coordinator makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seam {
+    DeviceGrant,
+    Grant,
+    StandingVoiceGrant,
 }
 
 /// A standing-grant lookup a test can hold open, and the number that have begun.
@@ -123,6 +134,22 @@ impl Authority {
             lookups: Lookups::default(),
             write_fails: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::atomic::AtomicU64::new(0),
+            refusing: Mutex::new(None),
+        }
+    }
+
+    /// Makes the host refuse one read of a grant with `refusal`, or none with `None`.
+    fn refuse(&self, refusing: Option<(Seam, kr_protocol::error::ProtocolError)>) {
+        *self.refusing.lock().expect("the refusal") = refusing;
+    }
+
+    /// The refusal the host gives this read, when it is refusing it.
+    fn refusal_for(&self, seam: Seam) -> kr_voice::Result<()> {
+        match self.refusing.lock().expect("the refusal").as_ref() {
+            Some((refused, error)) if *refused == seam => {
+                Err(kr_voice::VoiceError::Host(error.clone()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -260,8 +287,8 @@ impl VoiceAuthority for Authority {
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
-        _now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
+        self.refusal_for(Seam::DeviceGrant)?;
         let held = self.device_grant.lock().expect("the device grant").clone();
         Ok(held.filter(|grant| {
             grant.recipient_device_id == device_id
@@ -269,23 +296,24 @@ impl VoiceAuthority for Authority {
         }))
     }
 
-    fn grant(&self, grant_id: GrantId, _now_ms: u64) -> kr_voice::Result<Option<Grant>> {
+    fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
+        self.refusal_for(Seam::Grant)?;
         let store = self.store.lock().expect("the store");
         if store.revoked.contains(&grant_id) {
             return Ok(None);
         }
+        // Whether a grant has run out is the host's to say, on its own clock.
+        let now_ms = self.now.load(std::sync::atomic::Ordering::SeqCst);
         Ok(store
             .grants
             .iter()
             .find(|grant| grant.grant_id == grant_id)
+            .filter(|grant| grant.expiry.is_valid_at(now_ms))
             .cloned())
     }
 
-    fn standing_voice_grant(
-        &self,
-        device_id: DeviceId,
-        _now_ms: u64,
-    ) -> kr_voice::Result<Option<Grant>> {
+    fn standing_voice_grant(&self, device_id: DeviceId) -> kr_voice::Result<Option<Grant>> {
+        self.refusal_for(Seam::StandingVoiceGrant)?;
         self.lookups
             .started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -417,10 +445,6 @@ impl VoiceAuthority for Authority {
             }
         }
         Ok(now_ms)
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.now.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn device_identity_key(
@@ -982,7 +1006,6 @@ async fn start_params_for(coordinator: &Coordinator) -> VoiceStartParams {
                 session_ids: [session(SESSION_A)].into_iter().collect(),
                 selected: CanonicalSet::from_iter([]),
             },
-            10_000,
         )
         .await
         .map_or(Digest256::from_bytes([0; 32]), |answer| answer.prepared);
@@ -1849,7 +1872,6 @@ async fn every_voice_method_needs_the_voice_grant() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            11_000,
         )
         .await
         .expect_err("no such voice session");
@@ -2611,11 +2633,121 @@ async fn a_selection_is_not_served_after_the_call_it_was_read_for_ran_out() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            10_100,
         )
         .await
         .expect_err("a call that ran out is served nothing");
     assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+}
+
+/// The refusal a host gives when it cannot say whether a grant has ended, in words only this host
+/// would use: the coordinator carries it back as it is, and does not read it as a device that holds
+/// no grant.
+fn floor_unrecorded() -> kr_protocol::error::ProtocolError {
+    kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "this host could not write down the clock reading this decision stands on".to_owned(),
+    )
+}
+
+/// A host that cannot say whether the device's ordinary grant has ended refuses a change to its
+/// voice grant with that reason, and writes nothing. The control: the same change once it can.
+#[tokio::test]
+async fn an_ordinary_grant_the_host_cannot_decide_refuses_a_voice_grant_change_with_its_reason() {
+    let fixture = fixture();
+    fixture
+        .authority
+        .refuse(Some((Seam::DeviceGrant, floor_unrecorded())));
+    let refused = fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect_err("the host cannot say whether the device holds a grant");
+    assert_eq!(refused.to_protocol_error(), floor_unrecorded());
+    assert_eq!(refused.reason(), None, "not a device that holds no grant");
+    assert_eq!(fixture.authority.issued(), 0, "nothing was written");
+
+    fixture.authority.refuse(None);
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("the change goes through once the host can decide");
+    assert_eq!(fixture.authority.issued(), 1);
+}
+
+/// A host that cannot say whether the device's standing voice grant has ended refuses a
+/// preparation with that reason, and not as a device with no voice grant.
+#[tokio::test]
+async fn a_standing_voice_grant_the_host_cannot_decide_refuses_a_preparation_with_its_reason() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    fixture
+        .authority
+        .refuse(Some((Seam::StandingVoiceGrant, floor_unrecorded())));
+    let refused = fixture
+        .coordinator
+        .prepare(device(PHONE), &prepare_params(&[]))
+        .await
+        .expect_err("the host cannot say whether the voice grant stands");
+    assert_eq!(refused.to_protocol_error(), floor_unrecorded());
+    assert_eq!(refused.reason(), None, "not a device with no voice grant");
+
+    fixture.authority.refuse(None);
+    fixture
+        .coordinator
+        .prepare(device(PHONE), &prepare_params(&[]))
+        .await
+        .expect("a preparation once the host can decide");
+}
+
+/// A host that cannot say whether the grant behind a call has ended refuses the selection with that
+/// reason: a read served under authority nobody can state is a read served under none.
+#[tokio::test]
+async fn a_call_grant_the_host_cannot_decide_is_served_no_selection() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    let params = VoiceContextParams {
+        voice_session_id,
+        session_id: session(SESSION_A),
+        selected: CanonicalSet::from_iter([]),
+        delegation_id: Nullable::null(),
+    };
+    fixture
+        .authority
+        .refuse(Some((Seam::Grant, floor_unrecorded())));
+    let refused = fixture
+        .coordinator
+        .context(device(PHONE), &params)
+        .await
+        .expect_err("the host cannot say whether the call's grant stands");
+    assert_eq!(refused.to_protocol_error(), floor_unrecorded());
+    assert_eq!(refused.reason(), None);
+
+    fixture.authority.refuse(None);
+    fixture
+        .coordinator
+        .context(device(PHONE), &params)
+        .await
+        .expect("a selection once the host can decide");
 }
 
 /// KR-REQ-15.20: the selection is built under the requesting device's own grant, carries section
@@ -2636,7 +2768,6 @@ async fn context_selection_uses_the_requesting_devices_scope_and_nothing_wider()
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            11_000,
         )
         .await
         .expect("a selection");
@@ -2692,7 +2823,6 @@ async fn context_selection_uses_the_requesting_devices_scope_and_nothing_wider()
                 selected: [VoiceContextClass::FileContents].into_iter().collect(),
                 delegation_id: Nullable::null(),
             },
-            11_100,
         )
         .await
         .expect("a selection");
@@ -2721,7 +2851,6 @@ async fn context_cannot_reach_a_session_outside_the_voice_session() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            11_000,
         )
         .await
         .expect_err("outside this call");
@@ -2767,7 +2896,6 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
                 VoiceContextClass::FileContents,
                 VoiceContextClass::TerminalScrollback,
             ]),
-            10_000,
         )
         .await
         .expect("a preparation");
@@ -2837,7 +2965,7 @@ async fn a_host_without_the_services_terms_says_why() {
             .await
             .expect("a standing voice grant");
         coordinator
-            .prepare(device(PHONE), &prepare_params(&[]), 10_000)
+            .prepare(device(PHONE), &prepare_params(&[]))
             .await
             .expect("a preparation")
     }
@@ -2882,7 +3010,7 @@ async fn a_preparation_is_refused_where_a_start_would_be() {
     let fixture = fixture();
     let error = fixture
         .coordinator
-        .prepare(device(PHONE), &prepare_params(&[]), 10_000)
+        .prepare(device(PHONE), &prepare_params(&[]))
         .await
         .expect_err("no voice grant, nothing to describe");
     assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
@@ -2956,7 +3084,6 @@ async fn the_context_for_a_call_goes_under_the_services_words_for_it() {
                 selected: CanonicalSet::from_iter([]),
                 delegation_id: Nullable::null(),
             },
-            10_100,
         )
         .await
         .expect("a selection");
@@ -2989,7 +3116,6 @@ async fn a_session_outside_the_voice_grant_is_neither_described_nor_started() {
                 session_ids: [session(SESSION_B)].into_iter().collect(),
                 selected: CanonicalSet::from_iter([]),
             },
-            10_000,
         )
         .await
         .expect_err("session B is outside the voice grant");
@@ -3052,7 +3178,6 @@ async fn a_voice_grant_over_no_session_gives_a_call_nothing_to_reach() {
                     session_ids: empty.clone(),
                     selected: CanonicalSet::from_iter([]),
                 },
-                10_000,
             )
             .await
             .expect_err("a voice grant over no session describes no call");
@@ -3100,7 +3225,7 @@ async fn a_call_that_names_no_session_reaches_the_voice_grants_own() {
             session_ids: CanonicalSet::from_iter([]),
             selected: CanonicalSet::from_iter([]),
         };
-        coordinator.prepare(device(PHONE), &params, 10_000).await
+        coordinator.prepare(device(PHONE), &params).await
     }
 
     let fixture = fixture();
