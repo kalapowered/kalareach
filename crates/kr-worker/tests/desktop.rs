@@ -217,26 +217,31 @@ fn create_params(
         dimensions: Nullable::null(),
         worker_profile: profile,
         palette: Nullable::null(),
-        environment_snapshot: vec![
-            kr_protocol::session::EnvironmentVariable {
-                name: "PATH".to_owned(),
-                value: "/usr/bin:/bin:/sbin:/usr/sbin".to_owned(),
-            },
-            kr_protocol::session::EnvironmentVariable {
-                name: "PS1".to_owned(),
-                value: String::new(),
-            },
-            // A creator's snapshot cannot give a session a desktop. These are here so the tests
-            // below establish that rather than assume it.
-            kr_protocol::session::EnvironmentVariable {
-                name: "DISPLAY".to_owned(),
-                value: ":99".to_owned(),
-            },
-            kr_protocol::session::EnvironmentVariable {
-                name: "WAYLAND_DISPLAY".to_owned(),
-                value: "wayland-99".to_owned(),
-            },
-        ],
+        // A session nobody is shown takes the host's environment and carries none of its own.
+        environment_snapshot: if presentation == Presentation::Invisible {
+            Vec::new()
+        } else {
+            vec![
+                kr_protocol::session::EnvironmentVariable {
+                    name: "PATH".to_owned(),
+                    value: "/usr/bin:/bin:/sbin:/usr/sbin".to_owned(),
+                },
+                kr_protocol::session::EnvironmentVariable {
+                    name: "PS1".to_owned(),
+                    value: String::new(),
+                },
+                // A creator's snapshot cannot give a session a desktop. These are here so the tests
+                // below establish that rather than assume it.
+                kr_protocol::session::EnvironmentVariable {
+                    name: "DISPLAY".to_owned(),
+                    value: ":99".to_owned(),
+                },
+                kr_protocol::session::EnvironmentVariable {
+                    name: "WAYLAND_DISPLAY".to_owned(),
+                    value: "wayland-99".to_owned(),
+                },
+            ]
+        },
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),
     }
@@ -556,7 +561,7 @@ async fn a_desktop_bound_session_survives_no_attachments_and_a_daemon_restart() 
     let host = Host::create();
     let first = host.start().await;
     let mut client = host.client().await;
-    let created = create(&mut client, &host, Presentation::Invisible, profile_here()).await;
+    let created = create(&mut client, &host, Presentation::Attach, profile_here()).await;
     let session_id = created.session.session_id;
     if has_desktop() {
         assert_eq!(
@@ -899,7 +904,7 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     let headless = create(
         &mut client,
         &host,
-        Presentation::Invisible,
+        Presentation::Attach,
         WorkerProfile::HeadlessUser,
     )
     .await;
@@ -908,7 +913,7 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
             create(
                 &mut client,
                 &host,
-                Presentation::Invisible,
+                Presentation::Attach,
                 WorkerProfile::DesktopBound,
             )
             .await,
@@ -1110,7 +1115,7 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;
-    let created = create(&mut client, &host, Presentation::Invisible, profile_here()).await;
+    let created = create(&mut client, &host, Presentation::Attach, profile_here()).await;
     let session_id = created.session.session_id;
     close(&mut client, &host, session_id).await;
 
@@ -1187,7 +1192,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
     let created = create(
         &mut client,
         &host,
-        Presentation::Invisible,
+        Presentation::Attach,
         WorkerProfile::HeadlessUser,
     )
     .await;
@@ -1212,7 +1217,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
         &create_params(
             host.environment_id,
             host.temp.root(),
-            Presentation::Invisible,
+            Presentation::Attach,
             WorkerProfile::HeadlessUser,
         )
         .environment_snapshot,
@@ -1231,7 +1236,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
                 || !create_params(
                     host.environment_id,
                     host.temp.root(),
-                    Presentation::Invisible,
+                    Presentation::Attach,
                     WorkerProfile::HeadlessUser
                 )
                 .environment_snapshot
@@ -1331,7 +1336,7 @@ async fn the_default_context_is_the_hosts_own_and_the_receipt_records_what_was_u
     let created = create(
         &mut client,
         &host,
-        Presentation::Invisible,
+        Presentation::Attach,
         info.default_worker_profile,
     )
     .await;
@@ -1404,7 +1409,7 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
     let mut params = create_params(
         host.environment_id,
         host.temp.root(),
-        Presentation::Invisible,
+        Presentation::Attach,
         WorkerProfile::HeadlessUser,
     );
     params.shell = Nullable::some(shell.display().to_string());

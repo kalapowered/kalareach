@@ -213,7 +213,7 @@ async fn admit(
 fn create_params(host: &Host) -> SessionCreateParams {
     SessionCreateParams {
         environment_id: host.environment_id,
-        presentation: Presentation::Invisible,
+        presentation: Presentation::Attach,
         shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some(host.temp.root().display().to_string()),
