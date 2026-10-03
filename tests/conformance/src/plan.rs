@@ -693,6 +693,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "which handles a started process holds",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "windows_inheritance",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the forwarder's launcher against the command backends",
             &[
                 "test",

@@ -25,11 +25,6 @@ use std::sync::{Mutex, MutexGuard};
 /// The lock every start of a process takes while this worker's streams are inheritable.
 static INHERITING: Mutex<()> = Mutex::new(());
 
-/// How many times the lock has been taken, for this host's own tests: a start that takes it is one
-/// that cannot hand a stream end to a process another part of the worker is starting.
-#[cfg(feature = "testing")]
-static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Takes the lock a start holds for as long as a handle of this worker's can be inherited.
 ///
 /// A launch makes the ends of the streams it gives the agent inheritable only for the call that
@@ -37,18 +32,9 @@ static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 /// too. The standard library's own lock is private to its calls, so every start this worker makes
 /// takes this one, and only for the call that creates the process: never while it runs.
 pub fn inheriting() -> MutexGuard<'static, ()> {
-    #[cfg(feature = "testing")]
-    TAKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     INHERITING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// How many times [`inheriting`] has been called, for this host's own tests.
-#[cfg(feature = "testing")]
-#[must_use]
-pub fn times_taken() -> u64 {
-    TAKEN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The longest command line `CreateProcessW` takes, in UTF-16 units, its terminator included.
