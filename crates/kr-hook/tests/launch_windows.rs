@@ -874,8 +874,9 @@ fn kr_req_12_02_a_program_the_backend_does_not_commit_is_ended_and_the_typed_com
         .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
         .expect("the launch arrives at the commit")
         .expect("and waits there");
+    // Retiring the backend ends the admission where it waits, so there may be nobody to release.
     let _ = shell.backends.close();
-    release.send(()).expect("the commit goes on");
+    let _ = release.send(());
     let status = launcher
         .wait()
         .expect("the launcher ends with the typed program");
