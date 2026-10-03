@@ -156,7 +156,7 @@ names an identity that is not there, one missing a field. The shells beside it a
 machine whose PowerShell package is broken still has a Zsh package that is exactly what it says it
 is, and a managed create naming Zsh still starts.
 
-A refusal is a named qualification error, never a false ready state and never a quietly reduced
+A refusal is a named qualification error, never a false ready state and never a silently reduced
 contract. Loading ordinary startup files is not evidence that a native module matches the packaged
 reader, which is why the module tree carries each module's ABI.
 
@@ -291,20 +291,20 @@ The nested objects those fields carry:
 | `event_result.command_resolved` | `arguments`, `added`, `bypass` (`not_integrated`, `disabled`, `absolute_path`, `unmanaged_shell`, `not_interactive`, `backend_unavailable`, `session_closing`, or null), `backend` |
 | `event_result.command_block_recorded` | `prompt_generation`, `retained` |
 
-Three ordering rules matter. Leaving invalidates the fence, so `command_accepted` is sent first, from
+Three ordering rules apply. Leaving invalidates the fence, so `command_accepted` is sent first, from
 the reader, inside the fence; a record sent after the leave could only ever say `unverifiable`. A
-`VEOF` reassignment takes effect at the prompt it names rather than mid-reader, because the character
-the reader is holding was typed under the gesture that was in force when it was typed. And a leave
-from a reader that has already been replaced is ignored: the worker compares the prompt generation
-and reader revision before it deregisters anything.
+`VEOF` reassignment takes effect at the prompt it names rather than mid-reader, because the
+character the reader is holding was typed under the gesture that was in force when it was typed. And
+a leave from a reader that has already been replaced is ignored: the worker compares the prompt
+generation and reader revision before it deregisters anything.
 
 ### The line capability
 
 `command_recorded` answers `command_accepted` with `detach_token`, and that field is how `kr detach`
-inside a session knows which attachment it belongs to. The worker mints one secret per accepted
-line and puts it nowhere else: this answer, to this bridge, for this line. A line the worker could
-not attribute — a mixed origin, an unverifiable one — carries a null token, because there is
-nothing for it to name.
+inside a session knows which attachment it belongs to. The worker mints one secret per accepted line
+and puts it nowhere else: this answer, to this bridge, for this line. A line the worker could not
+attribute (a mixed origin, an unverifiable one) carries a null token, because there is nothing for
+it to name.
 
 A package that implements it exports the token in the environment of the command it is about to
 run, as `KR_DETACH_TOKEN`, and for that command alone. `kr detach` with no `--attachment` presents
@@ -448,10 +448,10 @@ The order at a successful launch is the reader's: it installs and submits the co
 mailbox, reports `command_accepted` for the line, and then leaves. The worker resolves that line's
 origin to the client that asked for the launch, which the reader cannot know.
 
-The reader's own check, in the order the reasons matter, is `decide_launch`: this reader and this
-fence, inside the deadline, with no input of the person's waiting ahead of it, then the prompt
-generation, the working-directory revision and an empty buffer at the revision the caller named. The
-reason decides what the caller is told:
+The reader's own check, in the order the reasons take precedence, is `decide_launch`: this reader
+and this fence, inside the deadline, with no input of the person's waiting ahead of it, then the
+prompt generation, the working-directory revision and an empty buffer at the revision the caller
+named. The reason decides what the caller is told:
 
 | Rejection | Error code |
 | --- | --- |

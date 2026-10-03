@@ -151,15 +151,15 @@ A `.zshrc` that loads a few modules of its own pays about a quarter of a millise
 ## Requalifying a package
 
 1. Change the pin in `shells/<shell>/manifest.json` to the fixed upstream release and its digest.
-2. `bash scripts/build-shells.sh --<shell> --check-patches` — the patches have to apply to the new
+2. `bash scripts/build-shells.sh --<shell> --check-patches`: the patches have to apply to the new
    release with no fuzz. A patch that does not is a patch to rewrite, not one to force.
-3. `bash scripts/build-shells.sh --<shell> --require-upstream-tests` — the build fetches the new
+3. `bash scripts/build-shells.sh --<shell> --require-upstream-tests`: the build fetches the new
    archive, verifies the digest, applies the patches and runs the shell's own suite. The PSReadLine
    package builds no shell and the script takes no option for it: it is requalified by importing
    `shells/psreadline/module` on the host in question and running `Publish-KalaReachQualification`,
    which `scripts/e2e-fence.sh` does as one of its own steps.
-4. `bash scripts/fetch-shell-stacks.sh` — the startup customisations, if they are not already here.
-5. `bash scripts/e2e-fence.sh` — the whole qualification against the rebuilt package, on a real
+4. `bash scripts/fetch-shell-stacks.sh`: the startup customisations, if they are not already here.
+5. `bash scripts/e2e-fence.sh`: the whole qualification against the rebuilt package, on a real
    daemon and a real shell.
 6. `cargo test -p kr-shell-integration --test module_abi --test relocation -- --include-ignored`, which runs
    the native-module proof and the relocation proof against the rebuilt package.

@@ -305,9 +305,9 @@ and a draft publication is accounted for and settled there by the same rules as 
   it. The choice is recorded before the service is asked, so a service that cannot be told hears of
   it from `SyncClient::finish_resolutions` later. A refusal whose other content never came down is
   listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it.
-- While privacy mode is on, no draft is published and none is fetched. An answer that comes back
-  for work from an earlier generation is `drafts::Published::Discarded`, or a late result for a
-  fetch. The account of what left stays, no note moves and no copy comes down.
+- While privacy mode is on, no draft is published and none is fetched. An answer that comes back for
+  work from an earlier generation is `drafts::Published::Discarded`, or a late result for a fetch.
+  The account of what left stays, and no note moves and no copy comes down.
 
 Sealing goes through `drafts::DraftSealer`. `sync::CollectionSealer` is the implementation this
 crate carries; a client that seals differently supplies its own.
@@ -998,12 +998,12 @@ being established, is tried once more on a new one, within what is left of the t
 certificate or TLS protocol failure and a name that does not resolve would be the same the second
 time, so they are not tried again.
 
-A failure the connector itself reported — an address that could not be resolved, a connection
-refused, a handshake that failed, an establishment that ran past its deadline — says the request
-was not carried out, because none of it had been written. Every other failure says the outcome is
+A failure the connector itself reported (an address that could not be resolved, a connection
+refused, a handshake that failed, an establishment that ran past its deadline) says the request was
+not carried out, because none of it had been written. Every other failure says the outcome is
 unknown, and that includes this client's own total deadline running out while the connection was
-still being established: saying "unknown" about something that never left is the safe direction,
-and saying "no effect" about something that may have arrived is not.
+still being established: saying "unknown" about something that never left is the safe direction, and
+saying "no effect" about something that may have arrived is not.
 
 Beside the class, every failure of an exchange names the phase it happened in: the connection being
 established, the request on its way to the service, the answer arriving. That is what makes a
@@ -1219,7 +1219,7 @@ code path consults it before doing local work, and a client that deleted every f
 managed resources and keep the product.
 
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
-service client unconditionally and get an honest answer rather than a silent default.
+service client unconditionally and get an accurate answer rather than a silent default.
 
 ### What a deployment answers
 
@@ -1260,19 +1260,19 @@ that named a deployment and then ran nothing against it has proved nothing. One 
 under the directory `KR_TEST_ARTIFACTS_DIR` names, so a leg that failed keeps its whole output and
 not the line the report had room for.
 
-What such a run sends, and what it leaves. Every principal is made when a leg starts and discarded
-when it ends: a fresh authorisation key signs, and the identifiers the legs publish are drawn for
-that run alone, so a leg touches nothing that was not made for it. No account is created and nothing
-is bought. Each leg gives back what it took before it reports - a host removes itself from the feed
-it enrolled in, a mailbox is emptied and acknowledged, and a collection has every request identity
-the leg presented fenced, every copy resolved and every object removed under comparison - whether
-the leg passed or failed. A leg that could not is named in the report's closing lines, and what it
-left is the deployment's to end. A durable authority record is retained until it is acknowledged,
-refused or removed, so that one does not lapse on its own and a run that reports it is reporting
-something that needs a hand. Settings sync keeps some things by its own rules, which no client may
-remove: each request identity's receipt for thirty days, a record of each removed object's place in
-the order with no content in it, spent nonces, and the ledger's record of the installation a run's
-key made.
+This is what such a run sends, and what it leaves. Every principal is made when a leg starts and
+discarded when it ends: a fresh authorisation key signs, and the identifiers the legs publish are
+drawn for that run alone, so a leg touches nothing that was not made for it. No account is created
+and nothing is bought. Each leg gives back what it took before it reports: a host removes itself
+from the feed it enrolled in, a mailbox is emptied and acknowledged, and a collection has every
+request identity the leg presented fenced, every copy resolved and every object removed under
+comparison, whether the leg passed or failed. A leg that could not is named in the report's closing
+lines, and what it left is the deployment's to end. A durable authority record is retained until it
+is acknowledged, refused or removed, so that one does not lapse on its own and a run that reports it
+is reporting something that needs a hand. Settings sync keeps some things by its own rules, which no
+client may remove: each request identity's receipt for thirty days, a record of each removed
+object's place in the order with no content in it, spent nonces, and the ledger's record of the
+installation a run's key made.
 
 ## Recovery
 
@@ -1281,11 +1281,11 @@ the bundle at its stable locator, and what a fresh restore may put back.
 
 ### The kit
 
-One document, printed for a person to type and carried in a QR code's byte mode for a camera to
-read. They are the same bytes, so what a scanner reads is what a person could have typed. It names
-the format and cryptographic profile version, the seed and its checksum, every configured service
-origin and the stable opaque bundle locator, because a seed with no way to find the encrypted
-bundle is not a complete kit.
+The kit is one document, printed for a person to type and carried in a QR code's byte mode for a
+camera to read. They are the same bytes, so what a scanner reads is what a person could have typed.
+It names the format and cryptographic profile version, the seed and its checksum, every configured
+service origin and the stable opaque bundle locator, because a seed with no way to find the
+encrypted bundle is not a complete kit.
 
 The seed is grouped Crockford base32: no `I`, `L`, `O` or `U`, so the letters a hand-written kit is
 misread as are not in the alphabet, and reading maps `I` and `L` to `1` and `O` to `0` because that
@@ -1348,12 +1348,11 @@ against, the identity and instant it went out under, the digest of the encrypted
 what is known of what became of it. It never holds the bundle, its ciphertext or a key.
 
 Each write carries an identity of its own and the instant of the call, which is what the service
-signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
-its own request. When an answer does not come back, `commit` says exactly that -
-`BundleOutcomeUnknown` - and the store writes nothing further until that write is over. A second
-write made in the meantime would compare against a place the first one may be about to leave, and
-its refusal would be reported as another device's conflict when what it had met was this device's
-own write.
+signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is its
+own request. When an answer does not come back, `commit` says exactly that, `BundleOutcomeUnknown`,
+and the store writes nothing further until that write is over. A second write made in the meantime
+would compare against a place the first one may be about to leave, and its refusal would be reported
+as another device's conflict when what it had met was this device's own write.
 
 The one exception is a write that never left this device. A bundle sealed past the 128 KiB a
 service keeps is refused before anything is recorded (`BundleTooLarge`). For the rest the service
@@ -1432,9 +1431,9 @@ that lost what it was moving. `MigrationRecord::describe` says exactly that: kee
 and destroy the old one, which still opens the superseded copy.
 
 **Everything that can be checked is checked before anything is written.** The kit has to be the one
-this bundle belongs to - this origin, this locator, this recovery seed - and the bundle at the old
+this bundle belongs to (this origin, this locator, this recovery seed), and the bundle at the old
 location is read again and has to be the one the caller is holding, so a write another device made
-in between is a conflict rather than a migration that quietly moves an older writer set. A kit that
+in between is a conflict rather than a migration that silently moves an older writer set. A kit that
 names another seed is refused outright, because the updated kit is built from the seed and handing
 back a kit the owner's existing archives were never wrapped for would be losing them. The kit the
 migration would hand back is rendered before the write as well: a destination whose locator cannot
@@ -1476,8 +1475,8 @@ move can then be made again, since nothing will land under that write's identity
 
 ### A fresh restore
 
-A restore obtains service access through the configured retrieval policy - a managed account or a
-service the owner runs - and then authenticates the bundle with the kit. They are two different
+A restore obtains service access through the configured retrieval policy (a managed account or a
+service the owner runs) and then authenticates the bundle with the kit. They are two different
 things, and the cryptography is what makes them different: the ciphertext that access reaches opens
 only under the owner's own seed, so signing in gets a restore to the bytes and no further.
 `ServiceAccess` is what the policy gave the device: the reader it reaches one origin through. Under

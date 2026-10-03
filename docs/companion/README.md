@@ -1,8 +1,8 @@
 # The companion application
 
-The desktop application in `apps/companion`. It shows the attention inbox, the sessions on each
-host, the semantic conversation and the raw terminal, and it reaches a host through the same native
-client library the command line uses.
+This is the desktop application in `apps/companion`. It shows the attention inbox, the sessions on
+each host, the semantic conversation and the raw terminal, and it reaches a host through the same
+native client library the command line uses.
 
 ## What it is made of
 
@@ -339,10 +339,10 @@ because that connection would close the endpoint the answer goes over.
 
 ## The design system
 
-Newsprint, with light, dark and system modes. `src/styles/tokens.css` holds every colour, the motion
-durations and the target sizes; `base.css` the document and the type scale; `components.css` the
-components; `views.css` the screens. A component never names a literal colour, so light, dark,
-high contrast and reduced transparency are one implementation.
+The design system is Newsprint, with light, dark and system modes. `src/styles/tokens.css` holds
+every colour, the motion durations and the target sizes; `base.css` the document and the type scale;
+`components.css` the components; `views.css` the screens. A component never names a literal colour,
+so light, dark, high contrast and reduced transparency are one implementation.
 
 Three rules run through the motion:
 
