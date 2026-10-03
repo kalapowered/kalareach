@@ -3,7 +3,6 @@
 
 #![allow(dead_code)]
 
-#[cfg(unix)]
 pub mod launched;
 
 use std::io::{Read as _, Write as _};
@@ -32,18 +31,73 @@ pub const LIVENESS: Duration = Duration::from_secs(60);
 /// a loaded machine that check alone has taken longer than [`LIVENESS`]. Nothing is measured here.
 pub const FIRST_START_WITHIN: Duration = Duration::from_secs(300);
 
+/// Whether a test of this binary holds its placed programs, which on Windows is one at a time.
+///
+/// The first start of a fresh executable there is read by the system before it runs, which takes
+/// about half a second for the forwarder's debug build, and that read delays every other process
+/// creation on the machine while it lasts. Tests that place a program each and then time how
+/// promptly it answers, run in parallel, time each other's first starts. A test waits here until
+/// no other holds a placed program, and nothing is measured against a delay: the wait ends when
+/// the other test has ended.
+#[cfg(windows)]
+static HOLDING: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// The hold on [`HOLDING`] one [`Placed`] keeps for its life. It is nothing where programs placed
+/// in parallel delay nobody.
+pub struct Hold {
+    #[cfg(windows)]
+    _private: (),
+}
+
+impl Hold {
+    #[cfg(windows)]
+    fn take() -> Self {
+        let (held, released) = &HOLDING;
+        let mut held = held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *held {
+            held = released
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *held = true;
+        Self { _private: () }
+    }
+
+    #[cfg(not(windows))]
+    const fn take() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let (held, released) = &HOLDING;
+        *held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        released.notify_one();
+    }
+}
+
 /// A host tree of its own, with the forwarder copied into it.
 pub struct Placed {
     /// The tree, removed when this is dropped.
     pub host: kr_ipc::testing::TempHost,
     /// The copy of the forwarder a test starts.
     pub forwarder: PathBuf,
+    /// Where a program placed and run one at a time is held to that; ended after the tree.
+    _hold: Hold,
 }
 
 impl Placed {
     /// Copies the forwarder the build produced into a fresh tree on the internal disk.
     #[must_use]
     pub fn new() -> Self {
+        let hold = Hold::take();
         let host = kr_ipc::testing::TempHost::create();
         let directory = host.root().join("bin");
         std::fs::create_dir_all(&directory).expect("a directory for the forwarder");
@@ -53,7 +107,11 @@ impl Placed {
             "kr-hook"
         });
         kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-hook")), &forwarder);
-        let placed = Self { host, forwarder };
+        let placed = Self {
+            host,
+            forwarder,
+            _hold: hold,
+        };
         // The first start of a program at a new path is the one the operating system checks, and
         // on macOS that check can take seconds. It is taken here, once, so a test that measures how
         // promptly the forwarder answers measures the forwarder.
