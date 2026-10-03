@@ -261,6 +261,8 @@ struct Backend {
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
     #[cfg(feature = "testing")]
     commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(all(feature = "testing", windows))]
+    show_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
 
 /// What a backend's instance was last announced as, and what may still be announced about it.
@@ -383,6 +385,10 @@ pub struct CommandBackends {
     /// own tests.
     #[cfg(feature = "testing")]
     commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next launch that says it is going stops before its program is shown, for this
+    /// host's own tests.
+    #[cfg(all(feature = "testing", windows))]
+    show_pause: Arc<Mutex<Option<ConfirmPause>>>,
     /// Where the next backend's reading stops before it opens the directory it grants, for this
     /// host's own tests.
     #[cfg(feature = "testing")]
@@ -470,6 +476,8 @@ impl CommandBackends {
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
             commit_pause: Arc::new(Mutex::new(None)),
+            #[cfg(all(feature = "testing", windows))]
+            show_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
             directory_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -510,6 +518,28 @@ impl CommandBackends {
         let (release, go) = tokio::sync::oneshot::channel();
         *self
             .confirm_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next launch that says it is going before its program is shown, for this host's own
+    /// tests: the launcher has created its program and named it, and nothing of this host has looked
+    /// at it yet.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. It is
+    /// compiled away in every shipped build.
+    #[cfg(all(feature = "testing", windows))]
+    pub fn pause_before_showing(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .show_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -967,6 +997,8 @@ impl CommandBackends {
             confirm_pause: Arc::clone(&self.confirm_pause),
             #[cfg(feature = "testing")]
             commit_pause: Arc::clone(&self.commit_pause),
+            #[cfg(all(feature = "testing", windows))]
+            show_pause: Arc::clone(&self.show_pause),
         });
         let reading = {
             let path = PathBuf::from(&backend.invocation.executable);
@@ -1916,6 +1948,18 @@ async fn continue_launch(
             return Err(error);
         }
     };
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .show_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
     let shown = {
         let (backend, launcher) = (Arc::clone(backend), launcher.clone());
         tokio::task::spawn_blocking(move || show_program(&backend, &launcher, program))
