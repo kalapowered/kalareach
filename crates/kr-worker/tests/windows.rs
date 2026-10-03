@@ -662,6 +662,301 @@ fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
     job.terminate(1).expect("the job ends");
 }
 
+/// A scratch tree under the temporary directory, removed with the test: junctions in it are removed
+/// as links and never followed.
+struct Tree(std::path::PathBuf);
+
+impl Tree {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("kr-pin-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&root).expect("a scratch tree");
+        Self(root)
+    }
+
+    /// A directory beneath the tree, made with its parents.
+    fn dir(&self, relative: &str) -> std::path::PathBuf {
+        let path = self.0.join(relative);
+        std::fs::create_dir_all(&path).expect("a directory");
+        path
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn text(path: &std::path::Path) -> &str {
+    path.to_str().expect("a text path")
+}
+
+/// Whether a failed operation was refused for a sharing violation, which is what a held path says.
+fn held(result: std::io::Result<()>) -> bool {
+    result.is_err_and(|error| error.raw_os_error() == Some(32))
+}
+
+/// Makes a junction from `link` to `target`, as `mklink /J` does.
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+    let made = std::process::Command::new(system_program("cmd.exe"))
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("cmd.exe runs");
+    assert!(
+        made.status.success(),
+        "the junction is made: {}",
+        String::from_utf8_lossy(&made.stdout)
+    );
+}
+
+/// Turns an empty directory into a junction to `target` in place, as a principal that may write to
+/// the directory can whatever is held on it: the conversion changes what the path reaches and not
+/// the object a handle holds.
+#[expect(
+    unsafe_code,
+    reason = "setting a reparse point is a device control with a buffer only the caller can lay out"
+)]
+fn convert_to_a_junction(directory: &std::path::Path, target: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)
+        .expect("the directory opens for its attributes");
+    let substitute: Vec<u16> = std::ffi::OsString::from(format!(r"\??\{}", target.display()))
+        .encode_wide()
+        .collect();
+    let printed: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let substitute_bytes = u16::try_from(substitute.len() * 2).expect("short");
+    let printed_bytes = u16::try_from(printed.len() * 2).expect("short");
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    let data_length = 8 + usize::from(substitute_bytes) + 2 + usize::from(printed_bytes) + 2;
+    buffer.extend(u16::try_from(data_length).expect("short").to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(substitute_bytes.to_le_bytes());
+    buffer.extend((substitute_bytes + 2).to_le_bytes());
+    buffer.extend(printed_bytes.to_le_bytes());
+    for unit in &substitute {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    for unit in &printed {
+        buffer.extend(unit.to_le_bytes());
+    }
+    buffer.extend(0_u16.to_le_bytes());
+    let mut returned = 0_u32;
+    // SAFETY: the handle is open for the call, the buffer is a local laid out as the control
+    // documents, and the count is another local.
+    let set = unsafe {
+        DeviceIoControl(
+            opened.as_raw_handle().cast(),
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            u32::try_from(buffer.len()).expect("short"),
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        set,
+        0,
+        "the directory becomes a junction: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// KR-REQ-12.16: a path held from its drive's root to its directory cannot be renamed or deleted at
+/// any component while it is held, and is let go of with the pin. Control: the same operations land
+/// once the pin is dropped.
+#[test]
+fn kr_req_12_16_a_held_path_cannot_be_renamed_or_deleted_and_is_let_go_of_with_the_pin() {
+    let tree = Tree::new();
+    let leaf = tree.dir(r"a\b\work");
+    let pin = kr_worker::windows::pin::pin(text(&leaf)).expect("the path is held");
+    assert!(held(std::fs::rename(
+        &leaf,
+        tree.0.join("a").join("b").join("moved")
+    )));
+    assert!(held(std::fs::rename(
+        tree.0.join("a").join("b"),
+        tree.0.join("a").join("c")
+    )));
+    assert!(held(std::fs::rename(tree.0.join("a"), tree.0.join("z"))));
+    assert!(held(std::fs::remove_dir(&leaf)));
+    assert_eq!(
+        pin.recheck(),
+        Ok(()),
+        "and it is still the directory it was"
+    );
+    drop(pin);
+    std::fs::rename(&leaf, tree.0.join("a").join("b").join("moved"))
+        .expect("a directory nothing holds renames");
+}
+
+/// KR-REQ-12.16: every spelling of one directory is held as the same object, and it is the object
+/// the directory grant names: the case of a name, forward slashes, a trailing separator and dot
+/// segments walk to one directory.
+#[test]
+fn kr_req_12_16_every_spelling_of_a_directory_is_held_as_the_object_a_grant_names() {
+    let tree = Tree::new();
+    let leaf = tree.dir(r"Case\Sensitive\Work");
+    let granted = kr_transfer::authority::AuthorisedDirectory::open_root(
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16])),
+        &leaf,
+    )
+    .expect("the directory is opened");
+    let plain = text(&leaf).to_owned();
+    for spelling in [
+        plain.clone(),
+        plain.to_lowercase(),
+        plain.to_uppercase(),
+        plain.replace('\\', "/"),
+        format!("{plain}\\"),
+        format!("{plain}\\.\\..\\Work"),
+        format!("{plain}\\."),
+    ] {
+        let pin = kr_worker::windows::pin::pin(&spelling)
+            .unwrap_or_else(|why| panic!("{spelling} is held: {why}"));
+        assert_eq!(
+            pin.identity(),
+            granted.identity(),
+            "{spelling} is the object the grant names"
+        );
+    }
+}
+
+/// KR-REQ-12.16: a path through a link, a file, a directory that is not there, and any path that is
+/// not an absolute path on a drive are not held, each by name. Control: the real directory is.
+#[test]
+fn kr_req_12_16_a_link_a_file_or_a_missing_directory_is_not_held() {
+    let tree = Tree::new();
+    let real = tree.dir(r"real\work");
+    assert!(kr_worker::windows::pin::pin(text(&real)).is_ok());
+    junction(&tree.0.join("link"), &tree.0.join("real"));
+    let through = tree.0.join("link").join("work");
+    let why = kr_worker::windows::pin::pin(text(&through)).expect_err("a junction is not walked");
+    assert!(why.contains("is a link"), "{why}");
+    std::os::windows::fs::symlink_dir(&real, tree.0.join("symbolic")).expect("a symbolic link");
+    let why = kr_worker::windows::pin::pin(text(&tree.0.join("symbolic")))
+        .expect_err("a symbolic link is not walked");
+    assert!(why.contains("is a link"), "{why}");
+    std::fs::write(tree.0.join("file.txt"), b"x").expect("a file");
+    let why = kr_worker::windows::pin::pin(text(&tree.0.join("file.txt")))
+        .expect_err("a file is not a directory");
+    assert!(why.contains("is not a directory"), "{why}");
+    assert!(kr_worker::windows::pin::pin(text(&tree.0.join("missing"))).is_err());
+    for refused in [r"\\localhost\C$\Windows", r"\\?\C:\Windows", r"..\x", "x"] {
+        assert!(kr_worker::windows::pin::pin(refused).is_err(), "{refused}");
+    }
+}
+
+/// What a drive says, for a case no machine here has.
+struct Facts(DriveFactsOf);
+
+type DriveFactsOf = kr_worker::windows::pin::DriveFacts;
+
+impl kr_worker::windows::pin::Drives for Facts {
+    fn facts(&self, _letter: char) -> Result<kr_worker::windows::pin::DriveFacts, String> {
+        Ok(self.0.clone())
+    }
+}
+
+/// KR-REQ-12.16: a drive whose letter names a path and not a volume (a `subst` drive), and a volume
+/// that is not NTFS, are not held. Control: this machine's own drive is.
+#[test]
+fn kr_req_12_16_a_drive_that_is_not_a_local_ntfs_volume_is_not_held() {
+    let tree = Tree::new();
+    let leaf = tree.dir("work");
+    let fat = Facts(DriveFactsOf {
+        device: r"\Device\HarddiskVolume9".to_owned(),
+        file_system: "FAT32".to_owned(),
+    });
+    let why = kr_worker::windows::pin::pin_with(&fat, text(&leaf)).expect_err("FAT");
+    assert!(why.contains("FAT32"), "{why}");
+    let remapped = Facts(DriveFactsOf {
+        device: r"\??\C:\work".to_owned(),
+        file_system: "NTFS".to_owned(),
+    });
+    let why = kr_worker::windows::pin::pin_with(&remapped, text(&leaf)).expect_err("subst");
+    assert!(why.contains("not a local volume"), "{why}");
+    // The system's own answer for a drive that names a path: a letter this machine does not use.
+    let letter = ('H'..='Y')
+        .find(|letter| !std::path::Path::new(&format!("{letter}:\\")).exists())
+        .expect("a free drive letter");
+    let drive = format!("{letter}:");
+    let made = std::process::Command::new(system_program("subst.exe"))
+        .arg(&drive)
+        .arg(&leaf)
+        .output()
+        .expect("subst runs");
+    assert!(made.status.success(), "a substituted drive is made");
+    struct Removed(String);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(system_program("subst.exe"))
+                .args([self.0.as_str(), "/d"])
+                .output();
+        }
+    }
+    let _removed = Removed(drive.clone());
+    let why = kr_worker::windows::pin::pin(&format!("{drive}\\")).expect_err("a substituted drive");
+    assert!(why.contains("not a local volume"), "{why}");
+    assert!(
+        kr_worker::windows::pin::pin(text(&leaf)).is_ok(),
+        "the same directory by its real path is held"
+    );
+}
+
+/// KR-REQ-12.16: a directory converted to a junction in place, whatever is held on it, is seen by the
+/// pin's next read of its attributes; the grant opened before keeps naming the held object and a
+/// read through it afterwards is refused, never served from the junction's target.
+#[test]
+fn kr_req_12_16_a_directory_converted_to_a_link_is_seen_and_its_grant_reads_nothing() {
+    let tree = Tree::new();
+    let leaf = tree.dir("work");
+    let target = tree.dir("target");
+    std::fs::write(target.join("secret.txt"), b"secret").expect("a file in the target");
+    let pin = kr_worker::windows::pin::pin(text(&leaf)).expect("the path is held");
+    let granted = kr_transfer::authority::AuthorisedDirectory::open_root(
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16])),
+        &leaf,
+    )
+    .expect("the directory is opened after it is held");
+    assert_eq!(granted.identity(), pin.identity());
+    assert_eq!(pin.recheck(), Ok(()));
+    convert_to_a_junction(&leaf, &target);
+    assert_eq!(
+        std::fs::read(leaf.join("secret.txt")).expect("by its path it reaches the target"),
+        b"secret"
+    );
+    let why = pin.recheck().expect_err("the directory is a link now");
+    assert!(why.contains("is a link"), "{why}");
+    let refused = granted.open_read(
+        &kr_transfer::authority::RelativeName::parse("secret.txt").expect("a name"),
+        kr_transfer::authority::ObjectPolicy::ReadableFile,
+    );
+    assert!(
+        refused.is_err(),
+        "a read through the grant is refused and never served from the target"
+    );
+}
+
 /// A worker this test hosts: a session whose root shell is PowerShell, served on the environment's
 /// endpoint for its display number, and the descriptor a local caller finds it by.
 struct Worker {
