@@ -416,17 +416,126 @@ fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
     }
 }
 
+/// How many cases are driven at once.
+///
+/// Every case drives shells of its own, in a home, a runtime directory and a terminal of its own,
+/// so cases do not meet one another, and most of a case is spent waiting for what a shell draws.
+/// `KR_QUALIFICATION_JOBS` sets how many run together, and `1` runs them in the corpus's order. By
+/// default it is half the cores, at least one and at most eight: more shells starting at once than
+/// a machine has cores for would make the prompts they draw late, which is the machine's
+/// measurement and not the package's.
+///
+/// # Panics
+///
+/// Panics when `KR_QUALIFICATION_JOBS` is set to anything but a whole number above nought, so a run
+/// that asked for one case at a time does not go on at the default.
+fn jobs() -> usize {
+    match std::env::var_os("KR_QUALIFICATION_JOBS") {
+        Some(asked) => match asked.to_str().map(str::parse::<usize>) {
+            Some(Ok(jobs)) if jobs > 0 => jobs,
+            _ => panic!(
+                "KR_QUALIFICATION_JOBS is {asked:?}, which is not a whole number above nought"
+            ),
+        },
+        None => std::thread::available_parallelism()
+            .map_or(1, |cores| cores.get() / 2)
+            .clamp(1, 8),
+    }
+}
+
+/// What one case of the corpus came to.
+struct Qualified {
+    outcome: CaseOutcome,
+    /// What failed, for the run's report, where the case did not hold.
+    failure: Option<String>,
+    /// Whether the case was driven at all.
+    ran: bool,
+}
+
+/// Drives one case against the package it names and the customisations it requires, and says what
+/// came of it. A supported case this run cannot drive, for want of its package or of a
+/// customisation it requires, is a case it did not qualify, so it is a failure.
+fn qualify(case: &QualificationCase, index: &StackIndex) -> Qualified {
+    if !case.supported {
+        return Qualified {
+            outcome: CaseOutcome::skipped(
+                case,
+                &format!(
+                    "not supported: {}",
+                    case.reason.as_deref().unwrap_or("no reason recorded")
+                ),
+            ),
+            failure: None,
+            ran: false,
+        };
+    }
+    let package = match Package::find(case.shell) {
+        Ok(package) => package,
+        Err(reason) => {
+            let reason = format!("no package: {reason}");
+            return Qualified {
+                failure: Some(format!("{}: {reason}", case.id)),
+                outcome: CaseOutcome::skipped(case, &reason),
+                ran: false,
+            };
+        }
+    };
+    let mut missing = Vec::new();
+    let mut versions = BTreeMap::new();
+    for required in &case.requires {
+        match index.get(required) {
+            Some(stack) if stack.installed() => {
+                versions.insert(required.clone(), stack.version.clone());
+            }
+            Some(stack) => missing.push(format!(
+                "{required} is {} ({})",
+                stack.status,
+                stack.reason.as_deref().unwrap_or("no reason recorded")
+            )),
+            None => missing.push(format!("{required} is not in the index")),
+        }
+    }
+    if !missing.is_empty() {
+        let reason = missing.join("; ");
+        return Qualified {
+            failure: Some(format!("{}: {reason}", case.id)),
+            outcome: CaseOutcome::skipped(case, &reason),
+            ran: false,
+        };
+    }
+
+    let mut outcome = CaseOutcome::skipped(case, "not run");
+    outcome.package_identity = Some(package.identity.clone());
+    outcome.stack_versions = versions;
+    outcome.checks = case.checks.clone();
+    let mut failure = None;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &package))) {
+        Ok(narrowed) => outcome.verdict = qualified(&narrowed),
+        Err(reason) => {
+            let message = reason
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| reason.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_else(|| "the case panicked".to_owned());
+            outcome.verdict = format!("failed: {message}");
+            failure = Some(format!("{}: {message}", case.id));
+        }
+    }
+    Qualified {
+        outcome,
+        failure,
+        ran: true,
+    }
+}
+
 #[test]
 #[ignore = "needs this tree's built shell packages and the fetched customisations; it runs with --include-ignored where both are there, as continuous integration's shell-packages job and scripts/e2e-fence.sh do"]
 fn every_case_holds_against_the_package_it_names() {
     let corpus = cases();
     let index = installed_stacks();
-    let mut outcomes = Vec::new();
-    let mut failures = Vec::new();
-    let mut ran = 0;
 
-    // One case at a time, for a run that is looking at one of them. A name that is not a case of
-    // the corpus would select nothing, and a run that selected nothing has qualified nothing.
+    // One case alone, for a run that is looking at one of them. A name that is not a case of the
+    // corpus would select nothing, and a run that selected nothing has qualified nothing.
     let only = std::env::var("KR_QUALIFICATION_CASE").ok();
     if let Some(wanted) = only.as_deref() {
         assert!(
@@ -434,74 +543,47 @@ fn every_case_holds_against_the_package_it_names() {
             "KR_QUALIFICATION_CASE names {wanted:?}, which is not a case of the corpus"
         );
     }
-    for case in &corpus {
-        if only.as_deref().is_some_and(|wanted| wanted != case.id) {
-            continue;
-        }
-        if !case.supported {
-            outcomes.push(CaseOutcome::skipped(
-                case,
-                &format!(
-                    "not supported: {}",
-                    case.reason.as_deref().unwrap_or("no reason recorded")
-                ),
-            ));
-            continue;
-        }
-        // A case this run cannot drive is a case it did not qualify, so it is recorded and it fails
-        // the run, after every other case has had its turn.
-        let package = match Package::find(case.shell) {
-            Ok(package) => package,
-            Err(reason) => {
-                let reason = format!("no package: {reason}");
-                failures.push(format!("{}: {reason}", case.id));
-                outcomes.push(CaseOutcome::skipped(case, &reason));
-                continue;
-            }
-        };
-        let mut missing = Vec::new();
-        let mut versions = BTreeMap::new();
-        for required in &case.requires {
-            match index.get(required) {
-                Some(stack) if stack.installed() => {
-                    versions.insert(required.clone(), stack.version.clone());
+    let chosen: Vec<&QualificationCase> = corpus
+        .iter()
+        .filter(|case| only.as_deref().is_none_or(|wanted| wanted == case.id))
+        .collect();
+
+    // The cases are driven by a few workers taking the next one in turn, and each answer is kept
+    // under its case's place in the corpus, so the record and the failures read in the corpus's
+    // order whichever case finished first.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let answers = std::sync::Mutex::new(Vec::with_capacity(chosen.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..jobs().min(chosen.len()) {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(case) = chosen.get(at) else {
+                        return;
+                    };
+                    let answer = qualify(case, &index);
+                    answers
+                        .lock()
+                        .expect("the answers are kept")
+                        .push((at, answer));
                 }
-                Some(stack) => missing.push(format!(
-                    "{required} is {} ({})",
-                    stack.status,
-                    stack.reason.as_deref().unwrap_or("no reason recorded")
-                )),
-                None => missing.push(format!("{required} is not in the index")),
-            }
+            });
         }
-        if !missing.is_empty() {
-            let reason = missing.join("; ");
-            failures.push(format!("{}: {reason}", case.id));
-            outcomes.push(CaseOutcome::skipped(case, &reason));
-            continue;
-        }
+    });
+    let mut answers = answers.into_inner().expect("the answers are kept");
+    answers.sort_by_key(|(at, _)| *at);
 
-        ran += 1;
-        let mut outcome = CaseOutcome::skipped(case, "not run");
-        outcome.package_identity = Some(package.identity.clone());
-        outcome.stack_versions = versions;
-        outcome.checks = case.checks.clone();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &package))) {
-            Ok(narrowed) => outcome.verdict = qualified(&narrowed),
-            Err(reason) => {
-                let message = reason
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| reason.downcast_ref::<&str>().map(|text| (*text).to_owned()))
-                    .unwrap_or_else(|| "the case panicked".to_owned());
-                outcome.verdict = format!("failed: {message}");
-                failures.push(format!("{}: {message}", case.id));
-            }
-        }
-        outcomes.push(outcome);
+    let mut outcomes = Vec::new();
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (_, answer) in answers {
+        ran += usize::from(answer.ran);
+        failures.extend(answer.failure);
+        outcomes.push(answer.outcome);
     }
-
     record_outcomes("qualification-cases.tsv", &outcomes);
+    // Every case that did not hold is named, with what it said, after every other case has had its
+    // turn.
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     // A run that drove no case qualified nothing, whatever it selected: a selected case that is
     // not supported is one this run cannot qualify either.

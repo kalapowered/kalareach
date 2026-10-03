@@ -32,6 +32,10 @@ evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset, to a directory it 
 the system's temporary directory, named `kr-test-artifacts-` and a random suffix, and keeps.
 Evidence it cannot write fails the run.
 
+By default the cases run in parallel, half the cores and at most eight at a time.
+`KR_QUALIFICATION_JOBS` sets the count, and `1` runs them in the corpus's order.
+`KR_QUALIFICATION_CASE` runs one case alone, which a trace in `KR_SHELL_BRIDGE_TRACE` needs.
+
 ## The corpus
 
 One directory per shell and customisation under `tests/shells/`:
