@@ -1989,6 +1989,20 @@ pending: a revocation is not complete for a worker nobody can account for. Each 
 bounded, because waiting is the opposite of completion, and a worker that runs out is reported
 `pending` while the announcement carries on to the next one.
 
+The barrier holds a record of a worker only while something can still ask about it. The worker is
+added to the barrier by the daemon when it binds to the worker's control path; the registry is
+locked at that point, and the worker is added if the session has no closure on record. A closure
+tells the barrier in the same registry section that writes it, so a bind and a closure cannot pass
+each other, and a request dropped part way through a closure cannot leave a worker that never ends.
+
+Workers are removed from the barrier when it can be determined that the worker has ended, and no
+announcement or exchange that began while it ran is still going. If the worker named actions, its
+record is kept until no report at the revision in force (or at the revision a running announcement
+carries) would list them. A retry of a revocation whose answer was lost therefore names them again.
+At most 1,024 such workers stay at once; if this limit is exceeded then the oldest are removed. This
+will cause `workers_total` in replies to be higher than the number of workers listed; only ended
+workers are removed so this will not change whether the barrier holds.
+
 `kr_controller::authority::AuthorityBarrier` holds both halves, the lease issuer and the fence
 reports, because a lease running out is not a barrier holding and the two are read together.
 
