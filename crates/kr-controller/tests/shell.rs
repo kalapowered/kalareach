@@ -765,6 +765,425 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     rendezvous_serving.abort();
 }
 
+// --------------------------------------------------------------------------------------------
+// The environment a session's shell is started with.
+// --------------------------------------------------------------------------------------------
+
+/// A daemon that starts real workers, on a tree of its own, and the environment it runs in.
+struct Daemon {
+    tree: teardown::Tree,
+    controller: Arc<Controller>,
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+}
+
+impl Daemon {
+    /// Starts a daemon whose own process environment is `environment`, as a daemon started by a
+    /// person from a terminal, or by a service manager, has one.
+    async fn start(environment: &[(&str, String)]) -> Self {
+        let worker_build = worker_beside_this_test();
+        let tree = teardown::Tree::create();
+        let worker = tree.root().join("kr-worker");
+        kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
+        let paths = tree.environment();
+        let environment_id = tree.environment_id();
+        let secrets = paths.secrets_dir();
+        let controller = Controller::start(ControllerSetup {
+            paths: paths.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = open_store_in(&secrets).expect("a secret store");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: tree.supervisor(kr_controller::supervision::detect()),
+            worker_program: worker,
+            build_id: build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(RefusingTerminal::default()),
+        })
+        .await
+        .expect("the daemon starts");
+        // The environment this daemon runs in is the one it is given, and not this test's own:
+        // the tests of one binary share a process, and none of them may change its environment.
+        controller.set_host_environment(
+            environment
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone())),
+        );
+        let endpoint = paths.controller_endpoint().expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        let rendezvous = Listener::bind(&paths.rendezvous_endpoint().expect("an endpoint"))
+            .expect("binds the rendezvous");
+        let serving = vec![
+            tokio::spawn(Arc::clone(&controller).serve_clients(listener)),
+            tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous)),
+        ];
+        Self {
+            tree,
+            controller,
+            endpoint,
+            environment_id,
+            serving,
+        }
+    }
+
+    /// Creates a session through a client that declares itself `kind`, and returns the
+    /// environment its shell reports for itself, or what the daemon answered instead.
+    ///
+    /// The shell is bash, started interactively, and its startup file in the home that
+    /// `snapshot_or_host` names writes `env` to a file: so what comes back is what the shell was
+    /// started with, plus what the shell itself sets.
+    async fn session_environment(
+        &self,
+        kind: LocalClientKind,
+        presentation: Presentation,
+        snapshot: Vec<EnvironmentVariable>,
+        home: &Path,
+    ) -> Result<std::collections::BTreeMap<String, String>, kr_protocol::error::ProtocolError> {
+        let report = home.join("env-report.txt");
+        let pending = home.join("env-report.partial");
+        std::fs::write(
+            home.join(".bashrc"),
+            format!(
+                "env > '{}'\nmv '{}' '{}'\n",
+                pending.display(),
+                pending.display(),
+                report.display()
+            ),
+        )
+        .expect("a startup file");
+        let mut client = LocalClient::connect(&self.endpoint, kind, build())
+            .await
+            .expect("connects");
+        let mut request = create(
+            self.environment_id,
+            ShellMode::NativeCompat,
+            Some("/bin/bash"),
+        );
+        request.presentation = presentation;
+        request.cwd = Nullable::some(home.display().to_string());
+        request.environment_snapshot = snapshot;
+        request.launch_profile.startup = kr_protocol::session::ShellStartup::Interactive;
+        let answered = client
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                target(self.environment_id),
+                &request,
+            )
+            .await
+            .expect("reaches the daemon");
+        let created: kr_protocol::session::SessionCreateResult =
+            answered?.to_typed().expect("decodes");
+        // Until the shell has written what it was started with: a condition, and not a delay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let text = loop {
+            if let Ok(text) = std::fs::read_to_string(&report) {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell wrote no environment: it was not started with a home to read a startup \
+                 file from, or it did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let _: kr_protocol::session::SessionCloseResult = client
+            .mutate(
+                Method::SessionClose,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget {
+                    environment_id: self.environment_id,
+                    session_id: Nullable::some(created.session.session_id),
+                    session_epoch: Nullable::some(created.session.session_epoch),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                &kr_protocol::session::SessionCloseParams {
+                    session_id: created.session.session_id,
+                },
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect("closes")
+            .to_typed()
+            .expect("decodes");
+        Ok(text
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect())
+    }
+
+    fn stop(self) {
+        for task in &self.serving {
+            task.abort();
+        }
+        drop(self.controller);
+        drop(self.tree);
+    }
+}
+
+/// A home with nothing in it but what a test writes, on the internal disk with the rest of the
+/// tree.
+fn a_home(daemon: &Daemon, name: &str) -> std::path::PathBuf {
+    let home = daemon.tree.root().join(name);
+    std::fs::create_dir_all(&home).expect("a home");
+    home
+}
+
+fn variable(name: &str, value: &str) -> EnvironmentVariable {
+    EnvironmentVariable {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+/// KR-REQ-07.25, KR-REQ-07.26: a session an app creates is started with the environment of the
+/// execution context the host runs in, and not with nothing: its shell has the person's `PATH`,
+/// `HOME` and locale, and none of what a daemon started from a terminal happens to hold besides
+/// (a credential, an agent socket, the terminal's own identity).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_daemons_secrets() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start(&[
+        ("PATH", "/opt/kr-test-host/bin:/usr/bin:/bin".to_owned()),
+        ("HOME", home.display().to_string()),
+        ("LANG", "en_ZA.UTF-8".to_owned()),
+        ("TZ", "Africa/Johannesburg".to_owned()),
+        ("OPENAI_API_KEY", "sk-planted-credential".to_owned()),
+        ("SSH_AUTH_SOCK", "/tmp/planted-agent.sock".to_owned()),
+        ("ITERM_SESSION_ID", "w0t0p0:PLANTED".to_owned()),
+    ])
+    .await;
+
+    let environment = daemon
+        .session_environment(
+            LocalClientKind::App,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+        )
+        .await
+        .expect("an app's create is served");
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-host/bin:/usr/bin:/bin")
+    );
+    assert_eq!(
+        environment.get("HOME").map(String::as_str),
+        Some(home.display().to_string().as_str())
+    );
+    assert_eq!(
+        environment.get("LANG").map(String::as_str),
+        Some("en_ZA.UTF-8")
+    );
+    assert_eq!(
+        environment.get("TZ").map(String::as_str),
+        Some("Africa/Johannesburg")
+    );
+    assert_eq!(
+        environment.get("TERM").map(String::as_str),
+        Some("xterm-256color")
+    );
+    for name in ["OPENAI_API_KEY", "SSH_AUTH_SOCK", "ITERM_SESSION_ID"] {
+        assert!(
+            !environment.contains_key(name),
+            "{name} is the daemon's and not the session's: {environment:?}"
+        );
+    }
+    assert!(
+        !environment.values().any(|value| value.contains("planted")),
+        "nothing the daemon held outside the allowlist reached the shell: {environment:?}"
+    );
+
+    // An app is told when it sends the variables of an environment of its own: it has none to
+    // send, and the host does not read a snapshot as one.
+    let refused = daemon
+        .session_environment(
+            LocalClientKind::App,
+            Presentation::Invisible,
+            vec![variable("PATH", "/an/apps/own")],
+            &home,
+        )
+        .await
+        .expect_err("a snapshot from an app is refused");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(!refused.message.contains("/an/apps/own"), "{refused:?}");
+    daemon.stop();
+}
+
+/// KR-REQ-07.25: a session the command line creates for a terminal is started with that command
+/// line's own environment, filtered: its `PATH` is the person's, the terminal's identity is
+/// replaced by the host's own and a variable of the host's is never preloaded. The daemon's
+/// environment is not part of it, and a snapshot that is empty is not read as a request for the
+/// daemon's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visible_session_the_command_line_creates_keeps_its_own_environment_filtered() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start(&[
+        ("PATH", "/opt/kr-test-host/bin:/usr/bin:/bin".to_owned()),
+        ("HOME", "/nonexistent/the-daemons-home".to_owned()),
+        ("LANG", "en_ZA.UTF-8".to_owned()),
+    ])
+    .await;
+
+    let snapshot = vec![
+        variable("PATH", "/opt/kr-test-cli/bin:/usr/bin:/bin"),
+        variable("HOME", &home.display().to_string()),
+        variable("LANG", "C.UTF-8"),
+        variable("ITERM_SESSION_ID", "w0t0p0:FROM-THE-CLI"),
+        variable("KR_SESSION", "preloaded"),
+        variable("SSH_TTY", "/dev/ttys099"),
+        variable("OPENAI_API_KEY", "sk-the-clis-own"),
+    ];
+    let environment = daemon
+        .session_environment(
+            LocalClientKind::Cli,
+            Presentation::Terminal,
+            snapshot,
+            &home,
+        )
+        .await
+        .expect("a visible create from the command line is served");
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-cli/bin:/usr/bin:/bin"),
+        "the command line's PATH, not the daemon's"
+    );
+    assert_eq!(environment.get("LANG").map(String::as_str), Some("C.UTF-8"));
+    for name in ["ITERM_SESSION_ID", "SSH_TTY"] {
+        assert!(
+            !environment.contains_key(name),
+            "{name} describes the command line's terminal, not this session's"
+        );
+    }
+    assert_ne!(
+        environment.get("KR_SESSION").map(String::as_str),
+        Some("preloaded"),
+        "a reserved variable comes from the worker and never from a snapshot"
+    );
+    // A credential the command line passes is the session's own, and is named nowhere.
+    assert_eq!(
+        environment.get("OPENAI_API_KEY").map(String::as_str),
+        Some("sk-the-clis-own")
+    );
+
+    // The control for emptiness: a command line that sends nothing gets nothing of the daemon's.
+    let empty_home = a_home(&daemon, "empty-home");
+    let nothing = daemon
+        .session_environment(
+            LocalClientKind::Cli,
+            Presentation::Terminal,
+            Vec::new(),
+            &empty_home,
+        )
+        .await;
+    // With no home to read a startup file from, bash writes nothing, which is the observation: so
+    // the report is written by the daemon's own, never by an environment it did not send.
+    assert!(
+        nothing.is_err()
+            || nothing
+                .as_ref()
+                .is_ok_and(|env| env.get("PATH")
+                    != Some(&"/opt/kr-test-host/bin:/usr/bin:/bin".to_owned())),
+        "{nothing:?}"
+    );
+    daemon.stop();
+}
+
+/// KR-REQ-07.25, KR-REQ-07.26: what decides whose environment a session gets is where it is
+/// created and what for, and never whether a snapshot is empty. A session that is invisible takes
+/// the host's environment even from the command line, and the command line that sends a snapshot
+/// with it is told so rather than ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invisible_session_takes_the_hosts_environment_even_from_the_command_line() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start(&[
+        ("PATH", "/opt/kr-test-host/bin:/usr/bin:/bin".to_owned()),
+        ("HOME", home.display().to_string()),
+    ])
+    .await;
+
+    let environment = daemon
+        .session_environment(
+            LocalClientKind::Cli,
+            Presentation::Invisible,
+            Vec::new(),
+            &home,
+        )
+        .await
+        .expect("an invisible create from the command line is served");
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-host/bin:/usr/bin:/bin")
+    );
+    let refused = daemon
+        .session_environment(
+            LocalClientKind::Cli,
+            Presentation::Invisible,
+            vec![variable("PATH", "/opt/kr-test-cli/bin")],
+            &home,
+        )
+        .await
+        .expect_err("a snapshot sent with an invisible create is refused");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(!refused.message.contains("/opt/kr-test-cli"), "{refused:?}");
+    daemon.stop();
+}
+
+/// A connection that declares itself the control daemon or a worker is no source of a create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_declares_itself_a_controller_or_a_worker_is_no_source_of_a_create() {
+    let scratch = tempfile::tempdir().expect("a directory");
+    let home = scratch.path().to_path_buf();
+    let daemon = Daemon::start(&[("HOME", home.display().to_string())]).await;
+    for kind in [LocalClientKind::Controller, LocalClientKind::Worker] {
+        let refused = daemon
+            .session_environment(kind, Presentation::Invisible, Vec::new(), &home)
+            .await
+            .expect_err("no session is created for it");
+        assert!(
+            matches!(
+                refused.code,
+                ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
+            ),
+            "{kind:?}: {refused:?}"
+        );
+    }
+    let listed: kr_protocol::session::SessionListResult =
+        LocalClient::connect(&daemon.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects")
+            .request(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::some(daemon.environment_id),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("reaches the daemon")
+            .expect("lists")
+            .to_typed()
+            .expect("decodes");
+    assert!(
+        listed.sessions.is_empty(),
+        "nothing was created: {listed:?}"
+    );
+    daemon.stop();
+}
+
 /// Returns the worker binary beside this test's own.
 ///
 /// # Panics
