@@ -1175,7 +1175,11 @@ impl NativeGateway {
         // Read while the bridge is known to be running, so the record is its own. Where the
         // platform keeps the record and it cannot be read, the bridge is not admitted: what it
         // reports could not be placed.
-        let started = crate::questions::binding::monotonic_start(&identity).map_err(|why| {
+        #[cfg(windows)]
+        let started = crate::windows::lineage::monotonic_start(&identity).map(Some);
+        #[cfg(not(windows))]
+        let started = crate::questions::binding::monotonic_start(&identity);
+        let started = started.map_err(|why| {
             BrokerError::denied(format!(
                 "the kernel's record of when this bridge started cannot be read: {why}"
             ))

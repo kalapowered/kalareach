@@ -408,6 +408,11 @@ impl CommandBackends {
         config: CommandBackendsConfig,
         handle: tokio::runtime::Handle,
     ) -> Self {
+        // The kernel's record of a start is checked the first time it is used, and the check
+        // creates a process. Making it here keeps that off the session's lock at the first
+        // establish; a failed check is read again there and refuses the route by name.
+        #[cfg(windows)]
+        let _ = crate::windows::lineage::start_clock();
         Self {
             broker,
             session_id: config.session_id,
@@ -808,6 +813,14 @@ impl CommandBackends {
         launcher: &Path,
     ) -> Result<Arc<Backend>> {
         let _entered = self.handle.enter();
+        // Asked before anything is made: a platform that cannot place a start on a clock that only
+        // moves forward has no launch it could tell from one that began earlier, and says why.
+        let established_at =
+            forward_now().map_err(|detail| BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "the kernel's record of when a process started cannot be used: {detail}"
+                ),
+            })?;
         let application_instance_id =
             ApplicationInstanceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()));
         // A socket path has a small fixed bound, so the backend's directory has a short name of its
@@ -831,7 +844,6 @@ impl CommandBackends {
             gateway = gateway.with_bridge(installed)?;
         }
         let gateway = Arc::new(gateway);
-        let established_at = forward_now();
         let credential = Credential::generate()?;
         let credential_path = directory.join(crate::broker::attach::CREDENTIAL_FILE);
         credential.write_file(&credential_path)?;
@@ -1322,12 +1334,23 @@ async fn admit_launch(
             "this connection says it is another process than the one the kernel named",
         ));
     }
-    // The root shell's own child: the invocation's fork, and nothing further down.
-    let parent = crate::questions::binding::parent_of(&process);
-    if !parent.is_some_and(|parent| parent.matches(&backend.root_shell)) {
-        return Err(BrokerError::denied(
-            "this process was not started by the session's root shell",
-        ));
+    // The root shell's own child: the invocation's fork, and nothing further down. Where a parent
+    // that has ended is still named, the shell must also have been running when this process
+    // started.
+    #[cfg(windows)]
+    crate::windows::lineage::started_by(&process, &backend.root_shell).map_err(|why| {
+        BrokerError::denied(format!(
+            "this process was not started by the session's root shell: {why}"
+        ))
+    })?;
+    #[cfg(not(windows))]
+    {
+        let parent = crate::questions::binding::parent_of(&process);
+        if !parent.is_some_and(|parent| parent.matches(&backend.root_shell)) {
+            return Err(BrokerError::denied(
+                "this process was not started by the session's root shell",
+            ));
+        }
     }
     // Started after this backend was established, on the clock the kernel records starts on.
     started_after(&process, backend.established_at)?;
@@ -1849,7 +1872,11 @@ fn new_private_directory(root: &Path, prefix: &str) -> Result<PathBuf> {
 /// Refuses a process that started before `established_at`, on the clock the kernel records starts
 /// on, where the platform keeps such a record.
 fn started_after(process: &ProcessStartIdentity, established_at: Option<u64>) -> Result<()> {
-    let started = crate::questions::binding::monotonic_start(process).map_err(|why| {
+    #[cfg(windows)]
+    let started = crate::windows::lineage::monotonic_start(process).map(Some);
+    #[cfg(not(windows))]
+    let started = crate::questions::binding::monotonic_start(process);
+    let started = started.map_err(|why| {
         BrokerError::denied(format!(
             "the kernel's record of when this process started cannot be read: {why}"
         ))
@@ -1869,16 +1896,16 @@ fn started_after(process: &ProcessStartIdentity, established_at: Option<u64>) ->
 ///
 /// Linux records a start in clock ticks since the boot, on the clock that counts a suspend.
 #[cfg(target_os = "linux")]
-fn forward_now() -> Option<u64> {
+fn forward_now() -> std::result::Result<Option<u64>, String> {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
     let ticks = rustix::param::clock_ticks_per_second();
-    let seconds = u64::try_from(now.tv_sec).ok()?;
-    let nanoseconds = u64::try_from(now.tv_nsec).ok()?;
-    Some(
+    let seconds = u64::try_from(now.tv_sec).ok();
+    let nanoseconds = u64::try_from(now.tv_nsec).ok();
+    Ok(seconds.zip(nanoseconds).map(|(seconds, nanoseconds)| {
         seconds
             .saturating_mul(ticks)
-            .saturating_add(nanoseconds.saturating_mul(ticks) / 1_000_000_000),
-    )
+            .saturating_add(nanoseconds.saturating_mul(ticks) / 1_000_000_000)
+    }))
 }
 
 /// Reads the clock the kernel records a process's start on, now.
@@ -1896,15 +1923,24 @@ fn forward_now() -> Option<u64> {
     reason = "libc points at a separate crate for the Mach calls, and this one call is all the \
               worker makes"
 )]
-fn forward_now() -> Option<u64> {
+fn forward_now() -> std::result::Result<Option<u64>, String> {
     // SAFETY: the function takes no argument and reads a counter; it has no precondition.
-    Some(unsafe { libc::mach_absolute_time() })
+    Ok(Some(unsafe { libc::mach_absolute_time() }))
+}
+
+/// Reads the clock the kernel records a process's start on, now.
+///
+/// Windows records a start as the kernel's interrupt time, which counts sleep and never goes back
+/// within a boot: the start of a process is the interrupt time when it was created.
+#[cfg(windows)]
+fn forward_now() -> std::result::Result<Option<u64>, String> {
+    crate::windows::lineage::interrupt_now().map(Some)
 }
 
 /// This platform records no start on a clock that only moves forward.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const fn forward_now() -> Option<u64> {
-    None
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+const fn forward_now() -> std::result::Result<Option<u64>, String> {
+    Ok(None)
 }
 
 #[cfg(test)]

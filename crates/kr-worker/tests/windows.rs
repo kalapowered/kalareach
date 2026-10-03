@@ -481,6 +481,161 @@ fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
     let _ = outside.wait();
 }
 
+/// A process that waits far longer than any test takes, ended when the test ends however it ends:
+/// `ping` is on every Windows machine.
+struct Waiting(std::process::Child);
+
+impl Waiting {
+    fn start() -> Self {
+        Self(
+            std::process::Command::new("ping.exe")
+                .args(["-n", "600", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a process that waits starts"),
+        )
+    }
+
+    fn identity(&self) -> kr_protocol::identity::ProcessStartIdentity {
+        kr_ipc::identity::process_start_identity(self.0.id())
+            .expect("the operating system describes it")
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// KR-REQ-07.61 and KR-REQ-12.02: the kernel's record of when a process started is believed on this
+/// machine, and a process created between two readings of the clock it is recorded on started
+/// between them. This is the check the worker makes before it orders anything by that clock, run
+/// again here so that a Windows build that changes the class fails in the job that runs it.
+#[test]
+fn the_kernels_record_of_a_start_lies_between_the_readings_around_the_creation() {
+    kr_worker::windows::lineage::start_clock().expect("the kernel's record of a start is believed");
+    for _ in 0..20 {
+        let before = kr_worker::windows::lineage::interrupt_now().expect("the clock reads");
+        let child = Waiting::start();
+        let after = kr_worker::windows::lineage::interrupt_now().expect("the clock reads");
+        let started = kr_worker::windows::lineage::monotonic_start(&child.identity())
+            .expect("the start of a running process is read");
+        assert!(
+            before <= started && started <= after,
+            "a process created between {before} and {after} started at {started}"
+        );
+    }
+}
+
+/// KR-REQ-07.61 and KR-REQ-12.02: processes created one after another start in that order on the
+/// clock every launch is placed by, and the start of a process that has ended is not a start at all.
+#[test]
+fn processes_created_in_turn_start_in_turn_and_an_ended_one_has_no_start() {
+    let children: Vec<Waiting> = (0..10).map(|_| Waiting::start()).collect();
+    let starts: Vec<u64> = children
+        .iter()
+        .map(|child| {
+            kr_worker::windows::lineage::monotonic_start(&child.identity()).expect("a start")
+        })
+        .collect();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "created in turn, started in turn: {starts:?}"
+    );
+    let mut ended = Waiting::start();
+    let identity = ended.identity();
+    ended.0.kill().expect("it ends");
+    ended.0.wait().expect("and is collected");
+    let refused = kr_worker::windows::lineage::monotonic_start(&identity)
+        .expect_err("a process that has ended has no start to place");
+    assert!(
+        refused.contains("ended") || refused.contains("not the process"),
+        "{refused}"
+    );
+}
+
+/// KR-REQ-12.02: a process is started by the process the kernel's record names when that process
+/// was running first, and by nobody else. A parent that has ended is still named by Windows and is
+/// refused here.
+#[test]
+fn a_child_is_started_by_its_running_parent_and_by_no_other_process() {
+    let me = kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+    let child = Waiting::start();
+    let child_identity = child.identity();
+    assert_eq!(
+        kr_worker::windows::lineage::parent_of(&child_identity),
+        Ok(me.clone()),
+        "the kernel names this process, which was running before its child"
+    );
+    assert_eq!(
+        kr_worker::windows::lineage::started_by(&child_identity, &me),
+        Ok(())
+    );
+    // Control: another running process did not start it.
+    let other = Waiting::start();
+    let refused = kr_worker::windows::lineage::started_by(&child_identity, &other.identity())
+        .expect_err("another process did not start it");
+    assert!(refused.contains("not by process"), "{refused}");
+    // The same identifier with another start is another process.
+    let mut replaced = me.clone();
+    replaced.start_value = kr_protocol::scalars::U64::new(replaced.start_value.get() + 1);
+    assert!(kr_worker::windows::lineage::started_by(&child_identity, &replaced).is_err());
+}
+
+/// KR-REQ-12.02 and KR-REQ-07.61: a process whose parent has ended names that parent still, and is
+/// not started by anything this host can show.
+#[test]
+fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
+    let job = kr_worker::windows::job::AgentJob::create().expect("a job");
+    // `start /b` runs `ping` as a child of `cmd` and `cmd` ends without waiting for it.
+    let mut shell = job
+        .start(
+            std::process::Command::new("cmd.exe")
+                .args([
+                    "/d",
+                    "/c",
+                    "start",
+                    "/b",
+                    "ping.exe",
+                    "-n",
+                    "600",
+                    "127.0.0.1",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("the shell starts");
+    let shell_identity = kr_ipc::identity::started_process_identity(shell.id()).expect("identity");
+    shell
+        .wait()
+        .expect("the shell ends once it has started its child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ping = loop {
+        let held = job.process_ids().expect("the job's list");
+        if let Some(pid) = held
+            .into_iter()
+            .find(|pid| *pid != u32::try_from(shell_identity.pid.get()).unwrap_or(0))
+            && let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
+        {
+            break identity;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell's child never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let refused = kr_worker::windows::lineage::started_by(&ping, &shell_identity)
+        .expect_err("its parent has ended");
+    assert!(refused.contains("has ended"), "{refused}");
+    job.terminate(1).expect("the job ends");
+}
+
 /// A worker this test hosts: a session whose root shell is PowerShell, served on the environment's
 /// endpoint for its display number, and the descriptor a local caller finds it by.
 struct Worker {
