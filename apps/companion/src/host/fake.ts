@@ -19,6 +19,9 @@ import type {
   AttachmentSummary,
   CapabilityRecord,
   ClosureRecord,
+  DescriptionConfigureParams,
+  DescriptionDownloadParams,
+  DescriptionSetup,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   HostInfoResult,
@@ -26,6 +29,7 @@ import type {
   Receipt,
   SessionCreateParams,
   SessionCreateResult,
+  SessionDescribeResult,
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
@@ -52,6 +56,7 @@ import type {
   PairingView,
   PasteView,
   ReviewOutcome,
+  Settled,
   SettingsPane,
   SetupIdentity,
   TerminalControl,
@@ -227,6 +232,22 @@ export interface FakeHostControls {
   withoutQualifiedShell(): void
   /** Every session creation the interface asked for, as it asked. */
   readonly sessionCreates: readonly SessionCreateParams[]
+  /**
+   * Changes what the host says one session is called and doing: any of the fields of the answer,
+   * as a generated description being published, going stale or being pinned over would.
+   */
+  describe(sessionId: string, change: Partial<SessionDescribeResult>): void
+  /** The sessions the interface asked the host to describe, in order. */
+  readonly described: readonly string[]
+  /**
+   * Changes what description setup says, as the host would after something outside this device
+   * changed it: its offer, its settings or how a fetch is going.
+   */
+  changeDescriptionSetup(change: Partial<DescriptionSetup>): void
+  /** The settings the interface asked the host to change, in order, as it asked. */
+  readonly descriptionConfigures: readonly DescriptionConfigureParams[]
+  /** The fetches the interface asked the host to start or cancel, in order, as it asked. */
+  readonly descriptionDownloads: readonly DescriptionDownloadParams[]
   /**
    * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
    * Each answer is what the host held when the read was made, a refusal included, so a test can
@@ -418,6 +439,8 @@ export type HeldRead =
   | 'historyPage'
   | 'reviewRead'
   | 'sessionList'
+  | 'sessionDescribe'
+  | 'descriptionSetup'
   | 'hostInfo'
   | 'environmentList'
   | 'changesetRead'
@@ -611,6 +634,42 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     })
   }
 
+  // What the host says each session is called, and what description setup says. A session the host
+  // has said nothing about is called by its directory, as every host can.
+  const describedAs = new Map<string, SessionDescribeResult>()
+  const describedBy: string[] = []
+  let descriptionSetup: DescriptionSetup = {
+    offered: true,
+    enabled: false,
+    on_battery: false,
+    profile_id: 'minicpm5-2b-q4-k-m',
+    asset_bytes: '1561318368',
+    sources: ['huggingface.co'],
+    download: 'not_started',
+    fetched_bytes: '0',
+    failure: null,
+    can_cancel: false,
+    can_disable: true,
+    needs_hosted_account: false,
+    unavailable: null,
+    state: 'resource_paused',
+    paused: 'disabled'
+  } as unknown as DescriptionSetup
+  const descriptionConfigures: DescriptionConfigureParams[] = []
+  const descriptionDownloads: DescriptionDownloadParams[] = []
+  /**
+   * Answers a description write with the setup as it now stands. The host's own local writes answer
+   * with their result, not a receipt, and the action still has the identity it was submitted under.
+   */
+  const settledSetup = (): Promise<Settled<DescriptionSetup>> =>
+    Promise.resolve({ receipt: null, action_id: nextActionId(), value: { ...descriptionSetup } })
+  const requireOwner = () => {
+    requireConnection()
+    if (!rights.includes('host.manage')) {
+      refuse('PERMISSION_DENIED', 'This device may not manage this host.')
+    }
+  }
+
   const port: HostPort = {
     connectionState: () => reading('connectionState', connectionNow),
     onConnection: (listener) => register(connectionListeners, listener),
@@ -715,6 +774,77 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
+    sessionDescribe: (params) =>
+      reading('sessionDescribe', () => {
+        requireConnection()
+        const sessionId = params.session_id
+        const found = listed().find((session) => session.session_id === sessionId)
+        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
+        describedBy.push(sessionId)
+        return (
+          describedAs.get(sessionId) ?? {
+            session_id: sessionId,
+            title: found.cwd.split('/').filter(Boolean).pop() ?? found.cwd,
+            source: 'metadata',
+            activity_text: null,
+            freshness: 'none',
+            provenance: null,
+            queued_age_ms: null,
+            last_success_ms: null,
+            cadence_ms: '30000',
+            state: descriptionSetup.state,
+            paused: descriptionSetup.paused
+          }
+        )
+      }),
+    descriptionSetup: () =>
+      reading('descriptionSetup', () => {
+        requireOwner()
+        return { ...descriptionSetup }
+      }),
+    descriptionConfigure: (params) => {
+      requireOwner()
+      descriptionConfigures.push(params)
+      const was = descriptionSetup.enabled
+      const enabled = params.enabled ?? descriptionSetup.enabled
+      descriptionSetup = {
+        ...descriptionSetup,
+        enabled,
+        on_battery: params.on_battery ?? descriptionSetup.on_battery,
+        // Turning descriptions off ends a fetch that is running, as the host does.
+        ...(was && !enabled && descriptionSetup.download === 'running'
+          ? { download: 'cancelled', fetched_bytes: '0', can_cancel: false }
+          : {}),
+        ...(enabled ? { paused: null } : { paused: 'disabled' })
+      }
+      return settledSetup()
+    },
+    descriptionDownload: (params) => {
+      requireOwner()
+      descriptionDownloads.push(params)
+      if (params.action === 'start') {
+        if (!descriptionSetup.offered) {
+          refuse('RESOURCE_UNAVAILABLE', 'this host has no model to fetch')
+        }
+        if (descriptionSetup.download !== 'running' && descriptionSetup.download !== 'verified') {
+          descriptionSetup = {
+            ...descriptionSetup,
+            download: 'running',
+            fetched_bytes: '0',
+            failure: null,
+            can_cancel: true
+          }
+        }
+      } else if (descriptionSetup.download === 'running') {
+        descriptionSetup = {
+          ...descriptionSetup,
+          download: 'cancelled',
+          fetched_bytes: '0',
+          can_cancel: false
+        }
+      }
+      return settledSetup()
+    },
     launchSurface: (params) =>
       reading('launchSurface', () => {
         requireConnection()
@@ -1362,6 +1492,29 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       qualifiedShell = false
     },
     sessionCreates,
+    describe(sessionId, change) {
+      const found = listed().find((session) => session.session_id === sessionId)
+      const current: SessionDescribeResult = describedAs.get(sessionId) ?? {
+        session_id: sessionId,
+        title: found?.cwd.split('/').filter(Boolean).pop() ?? sessionId,
+        source: 'metadata',
+        activity_text: null,
+        freshness: 'none',
+        provenance: null,
+        queued_age_ms: null,
+        last_success_ms: null,
+        cadence_ms: '30000',
+        state: descriptionSetup.state,
+        paused: descriptionSetup.paused
+      }
+      describedAs.set(sessionId, { ...current, ...change })
+    },
+    described: describedBy,
+    changeDescriptionSetup(change) {
+      descriptionSetup = { ...descriptionSetup, ...change }
+    },
+    descriptionConfigures,
+    descriptionDownloads,
     setRights(next) {
       rights = next
       for (const listener of connectionListeners) listener(connectionNow())

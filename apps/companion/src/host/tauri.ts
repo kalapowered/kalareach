@@ -130,6 +130,11 @@ export function tauriPort(): HostPort {
     sessionRead: (params) => read('session_read', params),
     sessionCreate: (params, subject) => mutate('session_create', params, subject),
     sessionClose: (params, subject) => mutate('session_close', params, subject),
+    sessionDescribe: (params) => read('session_describe', params),
+    // Both writes are about the host and name no session: the subject is empty.
+    descriptionSetup: () => call('description_setup', {}),
+    descriptionConfigure: (params) => mutate('description_configure', params, {}),
+    descriptionDownload: (params) => mutate('description_download', params, {}),
 
     launchSurface: () => noAgreedShape('the launch surface'),
     shellLaunch: (params, subject) => mutate('shell_launch', params, subject),
