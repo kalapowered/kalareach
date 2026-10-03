@@ -336,9 +336,9 @@ pub struct Controller {
     #[cfg(feature = "testing")]
     before_the_leases_adopt: crate::attention::Pause,
     /// Where this host's own tests stop a change to the record of enrolled environments once it
-    /// has everything it needs and before it waits for the record's lock, so that a fence can
-    /// land in between. The pause holds the thread, not the task. Compiled away in every shipped
-    /// build.
+    /// holds the record's lock and before it asks the admission again, so that a fence can land in
+    /// between. The pause holds the thread, not the task, and the lock with it. Compiled away in
+    /// every shipped build.
     #[cfg(feature = "testing")]
     before_the_environment_record: crate::attention::Pause,
     /// Where this host's own tests stop a retry that has found its retained answer, before the
