@@ -1861,8 +1861,8 @@ async fn directory_grant(
 /// and starts it only once the commitment arrives. So the instance, the registration and the job of
 /// the program all name the program and not the launcher, and nothing is registered or published
 /// until the program has been shown. A launch that fails before the commitment leaves the program
-/// suspended and unrun: this ends it with everything in its job, and the launcher, which ends it as
-/// well, runs what was typed.
+/// suspended and unrun: once the program has been shown this ends it with everything in its job,
+/// and before that only the launcher, which ends it too, can; the launcher then runs what was typed.
 #[cfg(windows)]
 async fn continue_launch(
     backend: &Arc<Backend>,

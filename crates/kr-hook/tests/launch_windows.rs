@@ -957,8 +957,8 @@ fn kr_req_05_09_the_hold_on_a_launchs_file_ends_with_its_commit() {
 /// started it does not take what it started with it: the program's end retires its backend and ends
 /// the worker's wait, and what the program started is still running. Here the test plays the
 /// program: it puts a helper in the program's job and ends the program while the launcher holds it,
-/// committed, before it starts it. Control: the same wait, with the launcher gone instead, ends
-/// the job (the test above).
+/// committed, before it starts it. Control: the same wait, with the launcher saying nothing,
+/// ends at its deadline and ends the job (`kr_req_12_02_a_program_that_is_never_started_is_ended`).
 #[test]
 fn kr_req_12_02_a_program_that_ends_before_the_launcher_is_heard_leaves_what_it_started() {
     let shell = Shell::new();

@@ -768,9 +768,7 @@ impl Controller {
             kr_worker::broker::process::ManagedProcess::command_backends_failure,
         )
         .await
-        .unwrap_or(Some(
-            "whether command backends run here could not be checked",
-        ));
+        .unwrap_or(Some("the check of them did not finish"));
         let host = crate::catalogue::integrations::Host {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())

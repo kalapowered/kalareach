@@ -332,8 +332,8 @@ impl ManagedProcess {
     /// believed on this machine, which is what places a launcher and its program against the
     /// backend: on a machine whose record cannot be believed no launch is admitted. The reason is
     /// one fixed sentence, which the daemon's doctor can state as its own; what the record did is
-    /// in [`crate::windows::lineage::start_clock`]'s error. The doctor reads this to say whether an
-    /// enabled integration can launch here, and why not.
+    /// in the error of the Windows start clock check, `windows::lineage::start_clock`. The doctor
+    /// reads this to say whether an enabled integration can launch here, and why not.
     #[must_use]
     pub fn command_backends_failure() -> Option<&'static str> {
         #[cfg(windows)]
