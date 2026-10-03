@@ -55,6 +55,12 @@ pub enum LocalClientKind {
     Controller,
     /// A worker connecting to the control daemon.
     Worker,
+    /// The companion app's own host connection.
+    ///
+    /// It says whose environment a session the client creates is started with: an app has no
+    /// shell of its own to take one from, so the host gives such a session the environment of its
+    /// own execution context. It confers nothing else, as no kind does.
+    App,
 }
 
 /// The authenticated operating-system caller.
