@@ -949,11 +949,24 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_the_program_inherits_and_it_is
         "nor can an ancestor"
     );
     assert!(held(std::fs::remove_dir(&work)), "nor deleted");
-    // The program ends, and the backend with it: the hold is let go of.
+    // The program ends, and the backend with it: the hold is let go of once the line is over, which
+    // is when the shell's command block finishes and the backend is forgotten.
     shell.job.terminate(1).expect("the job ends");
-    eventually(
-        "the directory is let go of once the program has ended",
-        || std::fs::rename(&work, ancestor.join("moved")).is_ok(),
+    eventually("the backend retires with its program", || {
+        matches!(shell.state_of(instance), Some(BackendState::Retired))
+    });
+    shell.backends.line_ended(shell.last_generation());
+    let ended = Instant::now();
+    let moved = loop {
+        match std::fs::rename(&work, ancestor.join("moved")) {
+            Ok(()) => break Ok(()),
+            Err(error) if ended.elapsed() >= LIVENESS => break Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    assert!(
+        moved.is_ok(),
+        "the directory is let go of once the program has ended: {moved:?}"
     );
 }
 
