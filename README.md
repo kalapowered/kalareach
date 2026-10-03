@@ -18,7 +18,7 @@ code under the Apache License 2.0, and the scripts keep their headers.
 
 ## Repository layout
 
-This is both a cargo and a pnpm workspace.
+This is both a Cargo and a pnpm workspace.
 
 | Path | What it holds |
 | --- | --- |
@@ -80,7 +80,7 @@ Requirements for building the project:
   built with, and Git and Python 3;
 - on Linux, the headers of the system WebView the companion application's backend links: WebKitGTK
   4.1, GTK 3, libayatana-appindicator, librsvg and libsoup 3;
-- On macOS, fish (for the root shell used in the worker's terminal suites)
+- On macOS, fish (for a root shell used in the worker's terminal suite)
 - curl, make, patch, and tar, as well as the headers for ncurses, and gettext (for the managed shell
   packages), and PowerShell >= 7.4 with PSReadLine >= 2.3.4 < 3.0.0 (for the PSReadLine package)
 
