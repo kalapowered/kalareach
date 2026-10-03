@@ -328,7 +328,7 @@ impl Host {
     fn request(&self, cwd: &Path, value: &str) -> SessionCreateParams {
         SessionCreateParams {
             environment_id: self.environment_id,
-            presentation: Presentation::Invisible,
+            presentation: Presentation::Attach,
             shell: Nullable::some("/bin/sh".to_owned()),
             shell_mode: ShellMode::NativeCompat,
             cwd: Nullable::some(cwd.display().to_string()),
@@ -1172,7 +1172,7 @@ fn seed_reservation(
         .expect("opens the registry");
     let intent = kr_cbor::to_canonical_vec(&SessionCreateParams {
         environment_id,
-        presentation: Presentation::Invisible,
+        presentation: Presentation::Attach,
         shell: Nullable::some("/bin/sh".to_owned()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some("/".to_owned()),
@@ -1295,7 +1295,7 @@ impl Waiting {
         let environment_id = temp.environment_id();
         let request = SessionCreateParams {
             environment_id,
-            presentation: Presentation::Invisible,
+            presentation: Presentation::Attach,
             shell: Nullable::some("/bin/sh".to_owned()),
             shell_mode: ShellMode::NativeCompat,
             cwd: Nullable::some("/".to_owned()),
