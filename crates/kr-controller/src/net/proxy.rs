@@ -648,6 +648,7 @@ async fn read_loop(
                         retained: false,
                         holds_results_to_scopes: false,
                     },
+                    spent,
                 );
                 if spent {
                     break;
@@ -663,6 +664,7 @@ async fn read_loop(
                     retained: true,
                     holds_results_to_scopes: false,
                 },
+                false,
             ),
             // A subscription this link started. It goes to the relay, which is what decides
             // whether the remote connection may still be served it. A connection that is not
@@ -725,12 +727,22 @@ fn take_the_link_fence(response: &mut Response) -> bool {
 }
 
 /// Hands one answer to whatever is waiting for that request.
-fn answer(waiters: &Arc<std::sync::Mutex<Waiters>>, answered: Forwarded) {
-    let waiter = waiters
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pending
-        .remove(&answered.response.request_id);
+///
+/// An answer that ends the link ends it in the same step that takes its waiter, before the answer
+/// is handed over: whoever reacts to the answer at once finds the link ended, and not open for one
+/// more call that the worker would refuse.
+fn answer(waiters: &Arc<std::sync::Mutex<Waiters>>, answered: Forwarded, ends_the_link: bool) {
+    let waiter = {
+        let mut held = waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waiter = held.pending.remove(&answered.response.request_id);
+        if ends_the_link {
+            held.ended = true;
+            held.pending.clear();
+        }
+        waiter
+    };
     if let Some(sender) = waiter {
         let _ = sender.send(answered);
     }
@@ -749,159 +761,84 @@ fn frame_name(frame: &ControlFrame) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use kr_ipc::endpoint::Listener;
-    use kr_ipc::framed::split;
-    use kr_ipc::verify::WorkerIdentity;
-    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
-    use kr_protocol::error::{ErrorCode, ProtocolError};
-    use kr_protocol::frame::StreamKind;
-    use kr_protocol::ids::ConnectionId;
+    use kr_protocol::envelope::Outcome;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::SessionId;
     use kr_protocol::method::Method;
     use kr_protocol::session::SessionReadParams;
 
     use super::{RELAY_DEPTH, RELAY_QUEUED_BYTES, RelayBudget, WorkerProxy};
-    use crate::service::a_close_a_worker_never_answers as world;
+    use crate::service::a_link_that_is_not_given_back::Served;
 
-    /// A worker that proves itself and answers a session read, refuses an events snapshot as any
-    /// request is refused, and refuses a history page as the connection's own: it no longer speaks
-    /// for the generation that holds the worker.
-    fn refusing(
-        listener: Listener,
-        identity: Arc<WorkerIdentity>,
-        endpoint_text: String,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                let Ok((connection, peer)) = listener.accept().await else {
-                    return;
-                };
-                let identity = Arc::clone(&identity);
-                let endpoint_text = endpoint_text.clone();
-                tokio::spawn(async move {
-                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
-                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                        let answers = match world::handshake(
-                            &frame,
-                            &identity,
-                            &endpoint_text,
-                            connection_id,
-                            &peer,
-                            &kr_protocol::scalars::CanonicalSet::new(),
-                        ) {
-                            Some(answers) => answers,
-                            None => match frame {
-                                ControlFrame::Request(request) => {
-                                    let outcome = match request.method.method() {
-                                        Some(Method::SessionRead) => Outcome::Ok(
-                                            kr_protocol::envelope::ParamsValue::from_typed(
-                                                &world::read_result(identity.session_id()),
-                                            )
-                                            .expect("encodes"),
-                                        ),
-                                        Some(Method::HistoryPage) => Outcome::Error(
-                                            ProtocolError::new(
-                                                ErrorCode::PermissionDenied,
-                                                "a later controller connection holds this \
-                                                 environment's authority",
-                                            )
-                                            .for_a_fenced_link(),
-                                        ),
-                                        _ => Outcome::Error(ProtocolError::new(
-                                            ErrorCode::PermissionDenied,
-                                            "this request lost its authority",
-                                        )),
-                                    };
-                                    vec![ControlFrame::Response(Response {
-                                        request_id: request.request_id,
-                                        outcome,
-                                    })]
-                                }
-                                _ => Vec::new(),
-                            },
-                        };
-                        for answer in answers {
-                            if writer.write_message(&answer).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                });
-            }
-        })
-    }
-
-    /// KR-REQ-09.12: a worker's refusal of the link itself is delivered to the caller as the
-    /// ordinary refusal of authority it is, without the marker that only the worker and this
-    /// daemon read, and the link ends once it has been delivered, so that nothing more is asked
-    /// over it. The control: an ordinary refusal leaves the link open, and the next call over it
-    /// is answered.
+    /// KR-REQ-09.12: a worker's refusal of the link itself, because a newer control daemon has
+    /// taken it over, is delivered to the caller as the ordinary refusal of authority it is, without
+    /// the marker that only the worker and this daemon read, and the link ends once it has been
+    /// delivered, so that nothing more is asked over it. The control: an ordinary refusal leaves the
+    /// link open, and the next call over it is answered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_of_the_link_itself_is_delivered_and_ends_the_link() {
-        let silent = world::fake_world(refusing).await;
-        let controller = Arc::clone(&silent.controller);
+        let served = Served::start().await;
         let (notifications, _relayed) = tokio::sync::mpsc::channel(RELAY_DEPTH);
         let lost = Arc::new(tokio::sync::Notify::new());
         let proxy = WorkerProxy::open(
-            &controller,
-            &silent.worker,
+            &served.controller,
+            &served.worker,
             notifications,
             Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost,
         )
         .await
         .expect("the worker accepts the link");
-        let params = SessionReadParams {
-            session_id: silent.session_id,
+        let own = SessionReadParams {
+            session_id: served.session_id,
         };
-        let outcome = |response: Response| response.outcome;
 
-        let ordinary = outcome(
-            proxy
-                .read(Method::EventsSnapshot, &params)
-                .await
-                .expect("the worker answers"),
-        );
-        let Outcome::Error(ordinary) = ordinary else {
-            panic!("a request that lost its authority is refused");
+        // A read that names another session is refused for that, and the link is still good.
+        let other = SessionReadParams {
+            session_id: SessionId::new(kr_ipc::new_uuid()),
         };
-        assert_eq!(ordinary.code, ErrorCode::PermissionDenied);
+        let ordinary = proxy
+            .read(Method::SessionRead, &other)
+            .await
+            .expect("the worker answers")
+            .outcome;
+        let Outcome::Error(ordinary) = ordinary else {
+            panic!("a read that names another session is refused");
+        };
+        assert!(!ordinary.link_fenced, "{ordinary:?}");
         assert!(proxy.is_open(), "an ordinary refusal leaves the link open");
         assert!(
             matches!(
-                outcome(
-                    proxy
-                        .read(Method::SessionRead, &params)
-                        .await
-                        .expect("the worker answers")
-                ),
+                proxy
+                    .read(Method::SessionRead, &own)
+                    .await
+                    .expect("the worker answers")
+                    .outcome,
                 Outcome::Ok(_)
             ),
             "and the next call over it is answered"
         );
 
-        let fenced = outcome(
-            proxy
-                .read(Method::HistoryPage, &params)
-                .await
-                .expect("the refusal is delivered"),
-        );
+        let _newer = served.a_newer_generation_takes_over().await;
+        let fenced = proxy
+            .read(Method::SessionRead, &own)
+            .await
+            .expect("the refusal is delivered")
+            .outcome;
         let Outcome::Error(fenced) = fenced else {
-            panic!("the worker refuses the link");
+            panic!("the worker refuses the link of a daemon it has been taken from");
         };
-        assert_eq!(fenced.code, ErrorCode::PermissionDenied);
+        assert_eq!(fenced.code, ErrorCode::PermissionDenied, "{fenced:?}");
         assert!(
             !fenced.link_fenced,
             "the marker is between the worker and this daemon, and a device is not given it"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(60), proxy.lost())
-            .await
-            .expect("the link ends once the refusal has been delivered");
+        // The link ended in the step that handed the refusal over, so a caller that reacts to it at
+        // once finds the link ended.
         assert!(!proxy.is_open());
         proxy
-            .read(Method::SessionRead, &params)
+            .read(Method::SessionRead, &own)
             .await
             .expect_err("nothing more is asked over a link the worker refused");
-        silent.serving.abort();
     }
 }
