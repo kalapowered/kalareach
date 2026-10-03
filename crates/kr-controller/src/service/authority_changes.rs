@@ -458,6 +458,14 @@ impl Controller {
         let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
+                // An earlier attempt recorded this action between the lookup that found nothing
+                // and this claim. What it produced goes back only under authority that has not been
+                // withdrawn, as it does from that lookup, and without the deadline a receipt
+                // outlives.
+                self.check_registration(&crate::authority::AdmittedMutation {
+                    deadline: None,
+                    ..carried
+                })?;
                 return self
                     .recorded_authority_change(actor_id, mutation, record)
                     .await;
