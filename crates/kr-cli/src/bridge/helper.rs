@@ -245,7 +245,7 @@ async fn relay(
         &BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
             protocol_version: acknowledgement.selected_version,
             environment_id: acknowledgement.environment_id,
-            os_user: account().name,
+            os_user: account_name(),
             role,
             connection_id: acknowledgement.connection_id,
             boot_identity: acknowledgement.boot_identity.clone(),
@@ -554,31 +554,14 @@ async fn controller(
     resolve::open_controller_for(&known.paths, crate::build_id(), Some(origin)).await
 }
 
-/// What this helper's user is called, and where its home is, as the destination's account records
-/// them.
-struct Account {
-    name: String,
-    home: Option<String>,
-}
-
-/// Reads the account this process runs as.
+/// What this helper's user is called, as the destination's account records it.
 ///
 /// The name is the account's own and not a variable a caller could have set: `USER` and `LOGNAME`
 /// are whatever the process that started the helper put there. A destination that records no
 /// account for the user is said by its number.
-fn account() -> Account {
-    let uid = kr_ipc::paths::current_uid();
-    #[cfg(unix)]
-    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-        for line in passwd.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
-                return Account {
-                    name: fields[0].to_owned(),
-                    home: Some(fields[5].to_owned()).filter(|home| !home.is_empty()),
-                };
-            }
-        }
+fn account_name() -> String {
+    if let Some(entry) = kr_ipc::paths::passwd_entry() {
+        return entry.name;
     }
     // A destination whose accounts are not in that file (a directory service) answers `id`, which
     // asks the system's own database for the name of this process's user.
@@ -592,15 +575,9 @@ fn account() -> Account {
         && let Ok(name) = String::from_utf8(named.stdout)
         && !name.trim().is_empty()
     {
-        return Account {
-            name: name.trim().to_owned(),
-            home: None,
-        };
+        return name.trim().to_owned();
     }
-    Account {
-        name: format!("uid {uid}"),
-        home: None,
-    }
+    format!("uid {}", kr_ipc::paths::current_uid())
 }
 
 /// Where a session created through this bridge starts, and with what, as this helper's own
@@ -611,12 +588,7 @@ fn account() -> Account {
 fn base() -> DestinationBase {
     // The home the user's login gave this process, which `wsl.exe --user` and a container
     // runtime's exec set for the user they run it as, and else the account's own record of it.
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|home| home.starts_with('/'))
-        .or_else(|| account().home)
-        .filter(|home| home.starts_with('/'))
-        .unwrap_or_else(|| "/".to_owned());
+    let home = kr_ipc::paths::session_home(std::env::var("HOME").ok().as_deref());
     // The session's `HOME` is the directory it starts in. A login that gave this process none, or
     // one that is not an absolute path, leaves the shell with the account's home as its directory
     // and no `HOME`, or with a relative one, so the resolved home is what the snapshot carries.

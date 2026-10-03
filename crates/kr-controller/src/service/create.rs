@@ -92,7 +92,8 @@ const LOCALE_PREFIX: &str = "LC_";
 /// a credential among them, a login's agent socket and the terminal's identity, and none of those
 /// are the session's. What it takes is the person's path, their locale and who they are, which is
 /// what a shell cannot start without. A name is compared as the platform compares it, and a
-/// Windows name is kept in capitals, which is how the worker reads `PATH`.
+/// Windows name is kept in capitals, which is how the worker reads `PATH`. `HOME` is the person's
+/// home when the daemon has one that is an absolute path.
 pub(super) fn host_context_variables(
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<EnvironmentVariable> {
@@ -102,6 +103,15 @@ pub(super) fn host_context_variables(
         if HOST_CONTEXT_NAMES.contains(&name.as_str()) || name.starts_with(LOCALE_PREFIX) {
             taken.insert(name, value);
         }
+    }
+    // A shell starts in its `HOME` and reads its startup files from there, so a daemon whose login
+    // gave it none, or one that is not an absolute path, gives its sessions the account's own home
+    // instead, and a root where the account has none, as a helper does for the sessions it creates.
+    // A Windows session has no `HOME`.
+    #[cfg(unix)]
+    {
+        let home = kr_ipc::paths::session_home(taken.get("HOME").map(String::as_str));
+        taken.insert("HOME".to_owned(), home);
     }
     taken
         .into_iter()

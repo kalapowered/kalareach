@@ -2349,6 +2349,56 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// What the system's account file records of the user this process runs as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasswdEntry {
+    /// The account's name.
+    pub name: String,
+    /// Its home directory, when the record names one.
+    pub home: Option<String>,
+}
+
+/// Reads the record the system's account file holds for the user this process runs as.
+///
+/// A system whose accounts are not in that file, a directory service, has no record here, and
+/// neither has a platform with no such file.
+#[cfg(unix)]
+#[must_use]
+pub fn passwd_entry() -> Option<PasswdEntry> {
+    let uid = current_uid();
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid)).then(|| PasswdEntry {
+            name: fields[0].to_owned(),
+            home: Some(fields[5].to_owned()).filter(|home| !home.is_empty()),
+        })
+    })
+}
+
+/// Reads the record the system's account file holds for the user this process runs as.
+#[cfg(not(unix))]
+#[must_use]
+pub fn passwd_entry() -> Option<PasswdEntry> {
+    None
+}
+
+/// The home a session of this user starts with.
+///
+/// `given` is the home the login gave the process that is asking, which is the one when it is an
+/// absolute path. A login that gave none, or one that is not absolute, leaves the shell with no
+/// `HOME` or with a relative one, so the account's own home stands in, and a destination that has
+/// no home to offer starts a session at its root.
+#[must_use]
+pub fn session_home(given: Option<&str>) -> String {
+    given
+        .filter(|home| home.starts_with('/'))
+        .map(str::to_owned)
+        .or_else(|| passwd_entry().and_then(|entry| entry.home))
+        .filter(|home| home.starts_with('/'))
+        .unwrap_or_else(|| "/".to_owned())
+}
+
 /// Reads the environment identity a runtime or state directory records.
 ///
 /// Every directory this host creates for an environment carries the complete identity, because an
