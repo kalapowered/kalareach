@@ -243,11 +243,15 @@ pub struct ProtocolError {
     /// connection itself is spent, so a controller that reads it ends the link instead of keeping
     /// it for the next request, and stops the worker's lease with it.
     ///
-    /// It travels only between a worker and the control daemon on this machine, which ends the
-    /// link and does not pass the member on to a device. It is absent from the wire when it is
-    /// false, so every other error is byte for byte what a reader built before this member
-    /// expects. Remove the default and the omission once no worker of a build before this member
-    /// can still be running: a worker outlives an update of the control daemon.
+    /// It travels from a worker to the control daemon on this machine, which ends the link and does
+    /// not pass the member on to a device. It is absent from the wire when it is false, so every
+    /// other error is byte for byte what a reader built before this member expects. The omission
+    /// and the default go for different reasons. The omission stays until no reader of a build
+    /// before this member can still be given an error, because such a reader rejects a member it
+    /// does not know: a device, a shell integration bridge, or a worker or daemon of an earlier
+    /// build. The default stays until no error written without the member can still be read, and
+    /// that includes every error this build stores or sends while the omission stands: a plugin
+    /// receipt keeps its error in storage.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub link_fenced: bool,
 }
