@@ -421,7 +421,7 @@ mod platform {
     ///
     /// Class 88 is undocumented, so the first use of it creates a process that never runs and asks
     /// it: the start the kernel gives must lie between the interrupt times this process read just
-    /// before and just after creating it, and the answer must pass [`start_in`]. A machine that
+    /// before and just after creating it, and the answer must pass `start_in`. A machine that
     /// fails either has no start this host can order a launch by, and says why.
     ///
     /// # Errors
@@ -497,7 +497,7 @@ mod platform {
     ///
     /// # Errors
     ///
-    /// Returns why no parent can be named, as [`parent_in`] does.
+    /// Returns why no parent can be named, as `parent_in` does.
     pub fn parent_of(child: &ProcessStartIdentity) -> Result<ProcessStartIdentity, String> {
         start_clock()?;
         parent_in(&Kernel, child)
@@ -507,7 +507,7 @@ mod platform {
     ///
     /// # Errors
     ///
-    /// Returns why it is not shown, as [`started_by_in`] does.
+    /// Returns why it is not shown, as `started_by_in` does.
     pub fn started_by(
         child: &ProcessStartIdentity,
         parent: &ProcessStartIdentity,
