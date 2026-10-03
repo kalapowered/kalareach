@@ -792,6 +792,28 @@ impl CommandBackends {
             .map(|backend| backend.lifecycle.state.borrow().clone())
     }
 
+    /// Returns why the last launch the backend of one line took did not go, where one did not.
+    ///
+    /// It belongs to the backend and not to an instance: a launch that failed before its program was
+    /// shown has no instance, and what a launcher declined or what the worker refused is kept here
+    /// after the launch is given back.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn launch_failure_of(&self, prompt_generation: PromptGeneration) -> Option<String> {
+        self.backends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|backend| backend.prompt_generation == prompt_generation)
+            .and_then(|backend| {
+                backend
+                    .launch_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    }
+
     fn launcher(&self) -> std::result::Result<PathBuf, String> {
         let launcher = self
             .launcher
@@ -1771,8 +1793,8 @@ fn show_program(
 /// The directory the shell reported was held and opened when the backend was established. The
 /// launcher says what directory the program inherits; that string is held the same way, and only
 /// where it reaches the object the shell's did is anything granted: a launcher started in another
-/// directory grants nothing. The held path's directory is read again here, and one that has become a
-/// link is refused. Nothing here fails a launch.
+/// directory grants nothing. The commit reads the held directory's attributes again, and withdraws
+/// the grant from one that has become a link. Nothing here fails a launch.
 #[cfg(windows)]
 async fn directory_grant(
     backend: &Backend,
@@ -1793,7 +1815,6 @@ async fn directory_grant(
         if walked.identity() != pinned.identity() {
             return None;
         }
-        pinned.recheck().ok()?;
     }
     drop(walked);
     granted.try_clone().ok().and_then(|root| {
@@ -1925,6 +1946,19 @@ async fn continue_launch(
             let _ = arrived.send(());
             let _ = go.await;
         }
+    }
+    // The directory the grant was made on is read again at the commit: a principal that may write
+    // to an empty directory can convert it to a link in place whatever is held, and the grant is
+    // then withdrawn. It never moves: it keeps naming the directory that was held, and a read through
+    // it after the conversion is refused.
+    let still_a_directory = backend
+        .pinned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_none_or(|pin| pin.recheck().is_ok());
+    if !still_a_directory {
+        broker.withdraw_host_files(backend.application_instance_id);
     }
     // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
     // for a backend retired meanwhile, none of them, and the guard gives back. The verdict on the
