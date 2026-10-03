@@ -32,12 +32,21 @@ use std::time::{Duration, Instant};
 
 use crate::registration::REGISTRATION_VARIABLE;
 
+#[cfg(windows)]
+mod windows;
+
 /// How long the launcher gives the backend to admit it, from the launcher's start: the connect,
 /// every write and every read, together.
-pub const ADMISSION_DEADLINE: Duration = Duration::from_secs(2);
+///
+/// On Windows the backend hashes the program's executable while the launcher waits, and a program
+/// the system has not run costs it up to two seconds there, so the launcher has six.
+pub const ADMISSION_DEADLINE: Duration = Duration::from_secs(if cfg!(windows) { 6 } else { 2 });
 
 /// How long the launcher gives the backend to commit the launch once it has said it is going.
-pub const COMMIT_DEADLINE: Duration = Duration::from_secs(2);
+///
+/// On Windows the backend shows the program the launcher created and holds its path before it
+/// commits, which a first start of a large program makes slow, so the launcher has four seconds.
+pub const COMMIT_DEADLINE: Duration = Duration::from_secs(if cfg!(windows) { 4 } else { 2 });
 
 /// The file beside the registration that says how to reach the backend.
 pub const LAUNCH_RECORD_FILE: &str = "launch";
@@ -70,10 +79,10 @@ const EXIT_NOT_A_LAUNCH: u8 = 126;
 /// What the backend's launch record says.
 #[derive(Debug, serde::Deserialize)]
 #[cfg_attr(
-    not(unix),
+    not(any(unix, windows)),
     expect(
         dead_code,
-        reason = "a platform with no private socket reads the record and presents nothing to it"
+        reason = "a platform with no private endpoint reads the record and presents nothing to it"
     )
 )]
 struct Record {
@@ -132,6 +141,13 @@ enum Route<'a> {
     /// Not a launch: exactly the environment the launcher was given.
     AsGiven,
     /// A committed launch: that environment, with the variables the integration declares set.
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "the launcher on Windows has created the program already, with them"
+        )
+    )]
     Committed(&'a [Variable]),
     /// A launch that runs as typed: that environment, without the variables that name a backend.
     AsTyped,
@@ -163,6 +179,39 @@ pub fn run(
         return exec_after(hold_before_exec, &executable, &vector, Route::AsGiven);
     };
     let registration = PathBuf::from(registration);
+    // Windows has no exec: the launcher creates the program itself and starts it once the backend
+    // has committed.
+    #[cfg(windows)]
+    return windows::run(
+        &executable,
+        &vector,
+        &registration,
+        started,
+        hold_after_admission,
+        hold_before_exec,
+    );
+    #[cfg(not(windows))]
+    run_replacing(
+        executable,
+        vector,
+        registration,
+        started,
+        hold_after_admission,
+        hold_before_exec,
+    )
+}
+
+/// Runs one invocation where the program replaces the launcher in place: presented, admitted and
+/// committed, or as typed.
+#[cfg(not(windows))]
+fn run_replacing(
+    executable: PathBuf,
+    vector: Vec<OsString>,
+    registration: PathBuf,
+    started: Instant,
+    hold_after_admission: Option<Duration>,
+    hold_before_exec: Option<&Path>,
+) -> std::process::ExitCode {
     let typed = match typed_vector(&registration, &vector) {
         Ok(typed) => typed,
         Err(why) => {
@@ -335,6 +384,22 @@ fn read_no_follow(
             ));
         }
     }
+    // The access-control list is read from the opened file, so what is checked is what is read: a
+    // list another account has been added to is a file this launcher does not take a launch from.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle as _;
+        if let Err(refusal) =
+            kr_ipc::paths::check_access_list(file.as_handle(), &name.display().to_string(), false)
+        {
+            let (kr_ipc::paths::AccessListRefusal::Policy(detail)
+            | kr_ipc::paths::AccessListRefusal::Unreadable(detail)) = refusal;
+            return Err(format!(
+                "{} can be read by somebody other than this user: {detail}",
+                name.display()
+            ));
+        }
+    }
     let mut content = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut content)
@@ -415,13 +480,13 @@ fn go(stream: &mut std::os::unix::net::UnixStream) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn go(stream: &mut std::convert::Infallible) -> Result<(), String> {
     match *stream {}
 }
 
 /// Returns true for the backend's `{"kr_launch":{"<word>":true}}`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn answers(line: &str, word: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
         value
@@ -567,8 +632,8 @@ fn read_line_by(
     }
 }
 
-/// A platform with no private socket has no backend to present to.
-#[cfg(not(unix))]
+/// A platform with no private endpoint has no backend to present to.
+#[cfg(not(any(unix, windows)))]
 fn present(
     _executable: &Path,
     _vector: &[OsString],
@@ -585,14 +650,14 @@ fn close(admitted: std::os::unix::net::UnixStream) {
     drop(admitted);
 }
 
-/// A platform with no private socket admits nothing, so there is no connection to close.
-#[cfg(not(unix))]
+/// A platform with no private endpoint admits nothing, so there is no connection to close.
+#[cfg(not(any(unix, windows)))]
 fn close(admitted: std::convert::Infallible) {
     match admitted {}
 }
 
 /// Reads the backend's credential, which its record names beside the registration.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_credential(
     registration: &Path,
     record: &Record,

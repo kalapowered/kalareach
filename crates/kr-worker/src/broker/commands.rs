@@ -76,12 +76,26 @@ pub const REGISTRATION_PREFIX: &str = "registration";
 ///
 /// The launcher says so as soon as it reads its admission, so anything slower is a launcher that
 /// is not going to run the program with the integration.
-pub const GOING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// On Windows the launcher creates the program before it says so, and a first start of a program
+/// the system has not run costs it up to a second and a half, so it has four seconds.
+pub const GOING_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(windows) { 4 } else { 2 });
 
 /// How long an admission waits for the executable's identity to be read.
 ///
-/// The launcher gives the whole exchange two seconds; this leaves it room to hear the answer.
-pub const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// The launcher gives the whole exchange two seconds on Unix and six on Windows; this leaves it
+/// room to hear the answer.
+///
+/// Hashing an agent's executable takes up to about two seconds on Windows, where each fresh file is
+/// scanned as it is first touched, so the wait there is four.
+pub const IDENTITY_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(windows) { 4000 } else { 1500 });
+
+/// How long a launcher that was told its launch is committed has to say it has resumed the
+/// program, on a platform where it creates the program suspended and starts it only then.
+#[cfg(windows)]
+pub const RESUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// The file a backend's launch record is published as.
 pub const LAUNCH_RECORD_FILE: &str = "launch";
@@ -208,6 +222,18 @@ struct Backend {
     /// launcher runs is the file that was hashed. It is given up when the verdict is taken.
     #[cfg(windows)]
     held_image: Arc<Mutex<Option<std::fs::File>>>,
+    /// The path the invocation was resolved in, held from the drive's root to the directory, which
+    /// is what keeps the directory the grant was opened on the directory the program works in.
+    ///
+    /// It is taken where the directory is opened, and let go of when the backend is retired.
+    #[cfg(windows)]
+    pinned: Arc<Mutex<Option<crate::windows::pin::Pin>>>,
+    /// Why the last launch this backend took did not go, where one did not.
+    ///
+    /// It belongs to the backend and not to an instance: a launch that failed before its program
+    /// was shown has no instance, and what a launcher declined survives the launch's rollback.
+    #[cfg(windows)]
+    launch_failure: Mutex<Option<String>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -900,6 +926,10 @@ impl CommandBackends {
             image_verified: crate::broker::image::VerifiedFiles::default(),
             #[cfg(windows)]
             held_image: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            pinned: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            launch_failure: Mutex::new(None),
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             os_user: self.os_user.clone(),
@@ -920,6 +950,8 @@ impl CommandBackends {
             let stopped = Arc::clone(&backend.stopped);
             #[cfg(windows)]
             let holding = Arc::clone(&backend.held_image);
+            #[cfg(windows)]
+            let pinning = Arc::clone(&backend.pinned);
             let granted = Arc::clone(&backend.host_directory);
             let cwd = reads_files.then(|| PathBuf::from(request.cwd));
             let environment_id = self.environment_id;
@@ -943,6 +975,29 @@ impl CommandBackends {
                         let _ = arrived.send(());
                         let _ = go.recv_timeout(DIRECTORY_PAUSE_LIMIT);
                     }
+                    // Windows holds the path first, from the drive's root to the directory, and
+                    // opens the directory after: what is opened is then the object the path named
+                    // while it was held, and a directory that is not the pinned one is granted
+                    // nothing.
+                    #[cfg(windows)]
+                    {
+                        if let Some(pin) = cwd
+                            .to_str()
+                            .and_then(|text| crate::windows::pin::pin(text).ok())
+                            && let Ok(opened) =
+                                kr_transfer::authority::AuthorisedDirectory::open_root(
+                                    environment_id,
+                                    &cwd,
+                                )
+                            && opened.identity() == pin.identity()
+                        {
+                            let _ = granted.set(opened);
+                            *pinning
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pin);
+                        }
+                    }
+                    #[cfg(not(windows))]
                     if let Ok(opened) =
                         kr_transfer::authority::AuthorisedDirectory::open_root(environment_id, &cwd)
                     {
@@ -1096,6 +1151,13 @@ impl Backend {
         {
             task.abort();
         }
+        // The path held for the grant is let go of with the backend: the directory can be renamed
+        // again once nothing is using it for a launch.
+        #[cfg(windows)]
+        self.pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::CREDENTIAL_FILE));
         let _ = std::fs::remove_file(&self.registration);
         let _ = std::fs::remove_file(self.directory.join(LAUNCH_RECORD_FILE));
@@ -1368,7 +1430,7 @@ async fn admit_launch(
         peer,
         credential,
         launch,
-        mut stream,
+        stream,
     } = presented;
     // The kernel's account of the peer, first: the owner, and the process it names, which is the one
     // the launcher says it is.
@@ -1440,12 +1502,30 @@ async fn admit_launch(
             "this backend is not waiting for a launch",
         ));
     }
+    continue_launch(backend, broker, environment_id, &process, &identity, stream).await
+}
+
+/// Takes a launch this admission claimed from its admission to its commitment, for a program that
+/// replaces the launcher in place.
+///
+/// The launcher says it is going as soon as it reads its admission, and then execs: the process
+/// that presented itself is the program, so the instance and the registration name it from the
+/// admission on.
+#[cfg(not(windows))]
+async fn continue_launch(
+    backend: &Arc<Backend>,
+    broker: &Arc<Broker>,
+    environment_id: EnvironmentId,
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    mut stream: BridgeStream,
+) -> Result<()> {
     let admitted = admit_claimed(
         backend,
         broker,
         environment_id,
-        &process,
-        &identity,
+        process,
+        identity,
         &mut stream,
     )
     .await;
@@ -1489,7 +1569,11 @@ async fn admit_launch(
         if let Some(guard) = guard.take() {
             guard.commit();
         }
-        let supervising = tokio::spawn(supervise(Arc::clone(backend), Arc::clone(broker), process));
+        let supervising = tokio::spawn(supervise(
+            Arc::clone(backend),
+            Arc::clone(broker),
+            process.clone(),
+        ));
         backend
             .tasks
             .lock()
@@ -1532,18 +1616,86 @@ async fn admit_launch(
     }
 }
 
-/// Records the launch, registers its instance by its reservation, publishes the registration and
-/// answers `admitted`, all for a backend this admission claimed.
-async fn admit_claimed<'a>(
+/// What a launcher says when it says it is going, on a platform where it has created the program
+/// suspended and names it.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Going {
+    /// The program the launcher created, and the directory string it was given, which the program
+    /// inherits.
+    Program {
+        /// The program's process identifier.
+        pid: u32,
+        /// The launcher's own current directory, where it could be read.
+        directory: Option<String>,
+    },
+    /// The launcher could not create the program, and says why.
+    Declined(String),
+}
+
+/// Reads the frame a launcher says it is going in.
+#[cfg(any(windows, test))]
+fn going_of(frame: &[u8]) -> std::result::Result<Going, String> {
+    let value: serde_json::Value = serde_json::from_slice(frame)
+        .map_err(|_| "the launcher's frame is not a frame it speaks".to_owned())?;
+    let launch = value
+        .get("kr_launch")
+        .ok_or_else(|| "the launcher's frame is not a launch frame".to_owned())?;
+    match launch.get("going").and_then(serde_json::Value::as_bool) {
+        Some(true) => {
+            let pid = launch
+                .get("program")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .ok_or_else(|| "the launcher says it is going and names no program".to_owned())?;
+            let directory = launch
+                .get("directory")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Ok(Going::Program { pid, directory })
+        }
+        Some(false) => Ok(Going::Declined(
+            bounded_refusal(
+                launch
+                    .get("declined")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the launcher declined to go and gave no reason"),
+            )
+            .to_owned(),
+        )),
+        None => Err("the launcher's frame does not say whether it is going".to_owned()),
+    }
+}
+
+/// Returns true for the frame a launcher writes once it has started the program it created.
+#[cfg(any(windows, test))]
+fn is_resumed(frame: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(frame).is_ok_and(|value| {
+        value
+            .get("kr_launch")
+            .and_then(|launch| launch.get("resumed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    })
+}
+
+/// Records why a launch did not go, on the backend that took it.
+#[cfg(windows)]
+fn failed(backend: &Backend, why: String) -> BrokerError {
+    *backend
+        .launch_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why.clone());
+    BrokerError::denied(why)
+}
+
+/// The profile one launch of this backend is recorded under.
+fn launch_profile(
     backend: &Backend,
-    broker: &'a Broker,
     environment_id: EnvironmentId,
-    process: &ProcessStartIdentity,
     identity: &ExecutableIdentity,
-    stream: &mut BridgeStream,
-) -> Result<(crate::broker::RegisteredLaunch<'a>, Registration)> {
-    let generation = backend.prompt_generation.get();
-    let profile = LaunchProfile {
+) -> LaunchProfile {
+    LaunchProfile {
         profile_id: backend.profile_id.clone(),
         environment_id,
         binary: BinaryIdentity {
@@ -1559,7 +1711,359 @@ async fn admit_claimed<'a>(
         authentication: AuthenticationState::Unknown,
         mode: IntegrationMode::NativeBridge,
         resolved_at: kr_ipc::now_ms(),
+    }
+}
+
+/// The program a launcher created, as the worker shows it: its identity, and the job it was put in.
+#[cfg(windows)]
+struct ShownProgram {
+    process: ProcessStartIdentity,
+    job: crate::windows::job::AgentJob,
+}
+
+/// Shows that the process a launcher named is the program this backend was established for.
+///
+/// Each of these is read from the kernel, and each refuses the launch on its own: the process is
+/// the launcher's own child and was running when the launcher was; it started after this backend was
+/// established; it was created from the file this backend hashed and holds; and it is put in a job of
+/// its own, before it has run, so that what it starts is the program's.
+#[cfg(windows)]
+fn show_program(
+    backend: &Backend,
+    launcher: &ProcessStartIdentity,
+    program: u32,
+) -> std::result::Result<ShownProgram, String> {
+    let process = kr_ipc::identity::started_process_identity(program)
+        .map_err(|error| format!("the program cannot be identified: {error}"))?;
+    if process.start_value.get() == kr_ipc::identity::START_VALUE_UNREAD {
+        return Err("the program ended before it could be identified".to_owned());
+    }
+    crate::windows::lineage::started_by(&process, launcher)
+        .map_err(|why| format!("the program was not started by the launcher: {why}"))?;
+    let started = crate::windows::lineage::monotonic_start(&process)
+        .map_err(|why| format!("when the program started cannot be read: {why}"))?;
+    match backend.established_at {
+        Some(established) if started >= established => {}
+        Some(_) => {
+            return Err("the program started before this backend was established".to_owned());
+        }
+        None => return Err("this platform keeps no record of when a program started".to_owned()),
+    }
+    {
+        let held = backend
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = held
+            .as_ref()
+            .ok_or_else(|| "the file this backend was established for is not held".to_owned())?;
+        crate::broker::image::show_image(&process, held)?;
+    }
+    let job = crate::windows::job::AgentJob::create()
+        .map_err(|error| format!("the program's job cannot be made: {error}"))?;
+    job.assign(program)
+        .map_err(|error| format!("the program cannot be put in its job: {error}"))?;
+    Ok(ShownProgram { process, job })
+}
+
+/// Makes the grant of the directory the program works in, where it can be made.
+///
+/// The directory the shell reported was held and opened when the backend was established. The
+/// launcher says what directory the program inherits; that string is held the same way, and only
+/// where it reaches the object the shell's did is anything granted: a launcher started in another
+/// directory grants nothing. The held path's directory is read again here, and one that has become a
+/// link is refused. Nothing here fails a launch.
+#[cfg(windows)]
+async fn directory_grant(
+    backend: &Backend,
+    inherited: Option<String>,
+) -> Option<crate::broker::host::HostFiles> {
+    let granted = backend.host_directory.get()?;
+    let reported = inherited?;
+    let walked = tokio::task::spawn_blocking(move || crate::windows::pin::pin(&reported))
+        .await
+        .ok()?
+        .ok()?;
+    {
+        let pinned = backend
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = pinned.as_ref()?;
+        if walked.identity() != pinned.identity() {
+            return None;
+        }
+        pinned.recheck().ok()?;
+    }
+    drop(walked);
+    granted.try_clone().ok().and_then(|root| {
+        crate::broker::host::HostFiles::new(root, crate::broker::host::FileAccess::Read).ok()
+    })
+}
+
+/// Takes a launch this admission claimed from its admission to its commitment, for a program the
+/// launcher has created beside itself.
+///
+/// Windows has no `exec`: the launcher creates the program suspended, says it is going and names it,
+/// and starts it only once the commitment arrives. So the instance, the registration and the job of
+/// the program all name the program and not the launcher, and nothing is registered or published
+/// until the program has been shown. A launch that fails before the commitment leaves the program
+/// suspended and unrun, and the launcher ends it and runs what was typed.
+#[cfg(windows)]
+async fn continue_launch(
+    backend: &Arc<Backend>,
+    broker: &Arc<Broker>,
+    environment_id: EnvironmentId,
+    launcher: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    mut stream: BridgeStream,
+) -> Result<()> {
+    let idle = ForegroundMark::idle(backend.prompt_generation.get());
+    let reserved = broker
+        .prepare_launch(
+            launch_profile(backend, environment_id, identity),
+            idle.clone(),
+            None,
+        )
+        .and_then(|intent| broker.execute_launch(&intent, &idle, backend.application_instance_id));
+    let reservation = match reserved {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            backend.roll_back();
+            return Err(error);
+        }
     };
+    if let Err(error) = stream.write_frame(&admission()).await {
+        drop(reservation);
+        backend.roll_back();
+        return Err(error);
+    }
+    // The launcher creates the program and says so as soon as it reads its admission.
+    let going = match tokio::time::timeout(GOING_DEADLINE, stream.read_frame()).await {
+        Ok(Ok(Some(frame))) => going_of(&frame),
+        Ok(_) => Err("the admitted launch closed without saying it is going".to_owned()),
+        Err(_) => Err("the admitted launch did not say it is going in time".to_owned()),
+    };
+    let (program, directory) = match going {
+        Ok(Going::Program { pid, directory }) => (pid, directory),
+        Ok(Going::Declined(why)) => {
+            drop(reservation);
+            let error = failed(
+                backend,
+                format!("the launcher could not start the program: {why}"),
+            );
+            backend.roll_back();
+            return Err(error);
+        }
+        Err(why) => {
+            drop(reservation);
+            let error = failed(backend, why);
+            backend.roll_back();
+            return Err(error);
+        }
+    };
+    let shown = {
+        let (backend, launcher) = (Arc::clone(backend), launcher.clone());
+        tokio::task::spawn_blocking(move || show_program(&backend, &launcher, program))
+            .await
+            .unwrap_or_else(|_| Err("showing the program did not finish".to_owned()))
+    };
+    let ShownProgram { process, job } = match shown {
+        Ok(shown) => shown,
+        Err(why) => {
+            drop(reservation);
+            let error = failed(backend, why);
+            backend.roll_back();
+            return Err(error);
+        }
+    };
+    // Registered by the reservation, with the program and not the launcher.
+    let managed = ManagedProcess::new(
+        backend.application_instance_id,
+        process.clone(),
+        crate::broker::process::TransportHandle {
+            transport: crate::broker::process::BrokerTransport::PrivateSocket,
+            application_instance_id: backend.application_instance_id,
+            executable_digest: identity.hashed.digest,
+            process: process.clone(),
+        },
+        backend.credential.duplicate(),
+        // The program is the person's own terminal application, not a backend this host started
+        // for it: nothing here stops it when it ends, because its ending is the end.
+        false,
+        kr_ipc::now_ms(),
+    );
+    let registered = match reservation.register(IntegrationMode::NativeBridge, Some(managed)) {
+        Ok(registered) => registered,
+        Err(refused) => {
+            let error = failed(backend, refused.error.to_string());
+            backend.roll_back();
+            return Err(error);
+        }
+    };
+    // Kept for the broker, which places what the program starts by what its job holds. The
+    // registered launch lets it go again if the launch is given back.
+    crate::windows::job::keep_agent(process.clone(), Arc::new(job), None);
+    let finished = finish_binding(backend, broker, identity, &process, directory).await;
+    let (registered, registration) = match finished {
+        Ok(finished) => (registered, finished),
+        Err(error) => {
+            drop(registered);
+            let error = failed(backend, error.to_string());
+            backend.roll_back();
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+    // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
+    // for a backend retired meanwhile, none of them, and the guard gives back. The verdict on the
+    // program's image is recorded in the same step: it is final for the process.
+    let mut guard = Some(registered);
+    let shown_image =
+        crate::broker::image::record_verdict(&process, identity, &backend.image_verified);
+    let committed = shown_image.is_ok()
+        && backend.lifecycle.commit(Arc::new(registration), || {
+            if let Some(guard) = guard.take() {
+                guard.commit();
+            }
+            let supervising = tokio::spawn(supervise(
+                Arc::clone(backend),
+                Arc::clone(broker),
+                process.clone(),
+            ));
+            backend
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(supervising);
+        });
+    if !committed {
+        drop(guard);
+        return Err(match shown_image {
+            Err(why) => failed(backend, why),
+            Ok(()) => BrokerError::denied("this backend was retired"),
+        });
+    }
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .confirm_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+    // The launcher starts the program only on this, written under the lifecycle lock while the
+    // backend is still committed, and without waiting. Should it not arrive, the launcher ends the
+    // program it created and runs what was typed.
+    match backend
+        .lifecycle
+        .confirm(|| stream.try_write_frame(&confirmation()))
+    {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "the launch's confirmation could not be written without waiting".to_owned(),
+            });
+        }
+        Some(Err(error)) => return Err(error),
+        None => {
+            return Err(BrokerError::denied(
+                "this backend was retired before its launch was confirmed",
+            ));
+        }
+    }
+    // The program is committed and not yet running. The launcher starts it and says so; one that
+    // does not within its deadline, or that closes the connection, leaves a program that was
+    // committed and never started, which is ended with everything in its job.
+    let resumed = match tokio::time::timeout(RESUME_DEADLINE, stream.read_frame()).await {
+        Ok(Ok(Some(frame))) => is_resumed(&frame),
+        _ => false,
+    };
+    if resumed {
+        Ok(())
+    } else {
+        if let Some(job) = crate::windows::job::agent_job(&process) {
+            let _ = job.terminate(1);
+        }
+        Err(BrokerError::denied(
+            "the launcher did not say it started the program it was committed to",
+        ))
+    }
+}
+
+/// Binds the registered launch to its package, makes the directory's grant where one can be made,
+/// and publishes the registration, which names the program.
+#[cfg(windows)]
+async fn finish_binding(
+    backend: &Backend,
+    broker: &Broker,
+    identity: &ExecutableIdentity,
+    process: &ProcessStartIdentity,
+    inherited: Option<String>,
+) -> Result<Registration> {
+    let frame = backend
+        .frame
+        .ok_or_else(|| BrokerError::PreconditionFailed {
+            detail: "this backend's connector came from no admissions this worker holds".to_owned(),
+        })?;
+    broker.bind(
+        kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+        backend.application_instance_id,
+        backend.connector.package_digest(),
+        frame,
+        crate::broker::binder::MatchedExecutable {
+            path: backend.invocation.executable.clone(),
+            digest: identity.hashed.digest,
+        },
+        kr_ipc::now_ms(),
+    )?;
+    if let Some(files) = directory_grant(backend, inherited).await {
+        broker.grant_host_files(backend.application_instance_id, files)?;
+    }
+    let registration = Registration::new(
+        backend.gateway.address().clone(),
+        backend.profile_id.clone(),
+        backend.application_instance_id,
+        process.clone(),
+        backend
+            .directory
+            .join(crate::broker::attach::CREDENTIAL_FILE),
+    );
+    let published = format!("{}framing=json_lines\n", registration.to_file());
+    kr_ipc::paths::write_owner_only_file(&backend.registration, published.as_bytes()).map_err(
+        |error| BrokerError::ledger(format!("could not write the registration: {error}")),
+    )?;
+    Ok(registration)
+}
+
+/// Records the launch, registers its instance by its reservation, publishes the registration and
+/// answers `admitted`, all for a backend this admission claimed.
+#[cfg(not(windows))]
+async fn admit_claimed<'a>(
+    backend: &Backend,
+    broker: &'a Broker,
+    environment_id: EnvironmentId,
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    stream: &mut BridgeStream,
+) -> Result<(crate::broker::RegisteredLaunch<'a>, Registration)> {
+    let generation = backend.prompt_generation.get();
+    let profile = launch_profile(backend, environment_id, identity);
     let idle = ForegroundMark::idle(generation);
     let intent = broker.prepare_launch(profile, idle.clone(), None)?;
     let reservation = broker.execute_launch(&intent, &idle, backend.application_instance_id)?;
@@ -1694,7 +2198,7 @@ pub(crate) fn working_directory_path_of(pid: u64) -> Option<std::path::PathBuf> 
 }
 
 /// No platform record of a process's working directory is read here, so none is granted.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 const fn working_directory_of(_pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
     None
 }
@@ -1751,6 +2255,7 @@ fn bounded_refusal(why: &str) -> &str {
 }
 
 /// Returns true for the frame a launcher writes when it is about to exec the program.
+#[cfg(not(windows))]
 fn is_going(frame: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(frame).is_ok_and(|value| {
         value
@@ -2270,11 +2775,67 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn a_launcher_says_it_is_going_in_one_frame() {
         assert!(is_going(br#"{"kr_launch":{"going":true}}"#));
         assert!(!is_going(br#"{"kr_launch":{"going":false}}"#));
         assert!(!is_going(br#"{"kr_launch":{}}"#));
         assert!(!is_going(b"going"));
+    }
+
+    #[test]
+    fn a_launcher_names_the_program_it_created_and_the_directory_it_works_in() {
+        assert_eq!(
+            going_of(br#"{"kr_launch":{"going":true,"program":4242,"directory":"C:\\work"}}"#),
+            Ok(Going::Program {
+                pid: 4242,
+                directory: Some("C:\\work".to_owned())
+            })
+        );
+        assert_eq!(
+            going_of(br#"{"kr_launch":{"going":true,"program":7}}"#),
+            Ok(Going::Program {
+                pid: 7,
+                directory: None
+            }),
+            "a directory the launcher could not read is not a refusal to go"
+        );
+        for refused in [
+            &br#"{"kr_launch":{"going":true}}"#[..],
+            br#"{"kr_launch":{"going":true,"program":"4"}}"#,
+            br#"{"kr_launch":{"going":true,"program":99999999999}}"#,
+            br#"{"kr_launch":{}}"#,
+            br#"{"other":{"going":true}}"#,
+            b"going",
+        ] {
+            assert!(going_of(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_launcher_that_declines_says_why_and_a_long_reason_is_cut() {
+        assert_eq!(
+            going_of(br#"{"kr_launch":{"going":false,"declined":"the job limits the desktop"}}"#),
+            Ok(Going::Declined("the job limits the desktop".to_owned()))
+        );
+        let long = "x".repeat(2_000);
+        let frame = format!(r#"{{"kr_launch":{{"going":false,"declined":"{long}"}}}}"#);
+        let Ok(Going::Declined(why)) = going_of(frame.as_bytes()) else {
+            panic!("a decline");
+        };
+        assert!(why.len() <= MAX_REFUSAL_BYTES, "{}", why.len());
+        assert!(matches!(
+            going_of(br#"{"kr_launch":{"going":false}}"#),
+            Ok(Going::Declined(_))
+        ));
+    }
+
+    #[test]
+    fn a_launcher_says_it_resumed_the_program_in_one_frame() {
+        assert!(is_resumed(br#"{"kr_launch":{"resumed":true}}"#));
+        assert!(!is_resumed(br#"{"kr_launch":{"resumed":false}}"#));
+        assert!(!is_resumed(br#"{"kr_launch":{"going":true}}"#));
+        assert!(!is_resumed(b"resumed"));
     }
 }
