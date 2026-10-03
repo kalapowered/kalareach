@@ -2421,12 +2421,12 @@ fn stop_recorded(process: &ProcessStartIdentity) {
 async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running() {
     let directory = private_directory();
     let broker = broker_for_launch();
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
+    // The backend writes what it forked into the directory it works in, which is this one.
+    let mut launch = launch_for(None, None);
+    launch.working_directory = directory.clone();
+    let mut gateway =
+        kr_worker::broker::NativeGateway::bind(Arc::clone(&broker), &directory, launch)
+            .expect("the endpoint binds");
     let intent = broker
         .prepare_launch(
             forking_profile(),
