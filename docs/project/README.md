@@ -242,13 +242,13 @@ and the rename is refused rather than published under the same action.
 
 **A crash is reconciled against the create token.** The operation row's key is the action identifier
 the caller submitted, and the staged repository's *witness* is recorded before the rename: its
-filesystem identity, and the instant the filesystem says it was created — or, where the platform
-does not report a creation instant, its modification instant. So the question is never whether
-the name exists; it is which name holds *that object*. The creation instant is
-the second half of the witness because a filesystem reuses a device and inode pair once the object
-that held them is gone, and reuse with the same creation instant is not something a filesystem
-produces. Where a platform reports no creation instant, the witness is the identity alone and the
-host says so rather than claiming more.
+filesystem identity, and the instant the filesystem says it was created (or, where the platform does
+not report a creation instant, its modification instant). So the question is never whether the name
+exists; it is which name holds *that object*. The creation instant is the second half of the witness
+because a filesystem reuses a device and inode pair once the object that held them is gone, and
+reuse with the same creation instant is not something a filesystem produces. Where a platform
+reports no creation instant, the witness is the identity alone and the host says so rather than
+claiming more.
 
 That question is asked through a handle, so it is asked by the daemon that holds one: the running
 operation, whose publication failed part way, asks it at once through the destination it already
@@ -345,8 +345,8 @@ A network operation names three things and carries no fourth.
    the restricted profile.
 3. **The provider** is the host name as this host resolved it, recorded beside the remote so a
    receipt says which service was reached.
-4. **The broker** is one this host has. It supplies a *program* — a credential helper, and an ssh
-   command for the ssh transport — resolved to an absolute path inside Git's own helper directory.
+4. **The broker** is one this host has. It supplies a *program* (a credential helper, and an ssh
+   command for the ssh transport) resolved to an absolute path inside Git's own helper directory.
    The host never sees the credential itself. A broker with no **transport** program is a refusal
    rather than an attempt: without ssh there is no way to reach an ssh remote at all.
 
@@ -355,11 +355,11 @@ A network operation names three things and carries no fourth.
    ordinary thing to fetch, so the fetch goes ahead carrying none. What the profile guarantees
    either way is that no credential of the user's is used without the broker: the helper list is
    emptied, the ask-pass programs are empty and the terminal prompt is off, so a remote that does
-   want a credential refuses the fetch rather than finding one somewhere this host did not grant.
-   A failed attempt that carried no credential says so beside whatever Git said: what was available
+   want a credential refuses the fetch rather than finding one somewhere this host did not grant. A
+   failed attempt that carried no credential says so beside whatever Git said: what was available
    for it, rather than why it failed. This host cannot tell a refused authentication from a remote
-   it never reached, and it does not repeat Git's own words, so what it can honestly add is the
-   context a person on such a host would otherwise be missing.
+   it never reached, and it does not repeat Git's own words, so what it can add is the context a
+   person on such a host would otherwise be missing.
 
 After a clone the stored `remote.<name>.url` is read back and compared with the URL this host
 passed. A rewrite, a helper or a version of Git that stored something else would be a credential in
@@ -393,7 +393,7 @@ rather than two that could drift apart in its own code. It is not a promise that
 changed between the two calls: the preview says so among its limitations, and a creation takes its
 own reading.
 
-Five classes, five decisions:
+The five classes are five separate decisions:
 
 | Class | What it is |
 | --- | --- |
@@ -407,10 +407,10 @@ Five classes, five decisions:
 files and excludes binaries leaves a binary dirty file out. The test for binary is Git's own, a null
 byte in the first eight thousand bytes of content as it is stored.
 
-Content has a third answer. A path this host did not read — because the preview reads at most
-twenty thousand of them, or because it could not open it at all — is `unknown` rather than text. An
-exclusion of binary files leaves an unknown path out, because excluding what might be binary is the
-direction that honours the request, and the preview says how many it could not classify.
+Content has a third answer. A path this host did not read, because the preview reads at most twenty
+thousand of them or because it could not open it at all, is `unknown` rather than text. An exclusion
+of binary files leaves an unknown path out, because excluding what might be binary is the direction
+that honours the request, and the preview says how many it could not classify.
 
 Each entry also carries what the working tree holds for it: `present`, `deleted` or `unmerged`. A
 copy is not the only way to carry an inclusion. A deletion the user has is carried by *removing* the
@@ -453,7 +453,7 @@ hold is stated.
 
 An **exclusion** of a dirty tracked file means the workspace holds the *base's* version of it, not
 that the path is absent: the checkout put the base's content there and an exclusion is the host not
-replacing it. A path the base does not have — an untracked file, an ignored one — is absent.
+replacing it. A path the base does not have (an untracked file, an ignored one) is absent.
 
 That rule is enforced from underneath as well as stated: the restricted profile's subcommand
 allowlist does not contain `clean`, `stash`, `reset`, `restore`, `commit`, `push`, `revert`,
@@ -461,8 +461,8 @@ allowlist does not contain `clean`, `stash`, `reset`, `restore`, `commit`, `push
 commands this service can run at all.
 
 The one subcommand here that writes a reference is `update-ref`, and it is admitted in one shape
-only: exactly three positional arguments — the reference, the new object and the **expected old
-object** — with `--no-deref` as the only option it accepts. A deletion (`-d`, `--delete`), a batch
+only: exactly three positional arguments (the reference, the new object and the **expected old
+object**), with `--no-deref` as the only option it accepts. A deletion (`-d`, `--delete`), a batch
 read from standard input (`--stdin`), an update with no expected old value, a fourth argument, and
 any abbreviation of those long options are each refused by name, as `--force` in any form and an
 attached `-c` are refused for every subcommand. The reference is named in full, as `refs/...`, and
@@ -471,13 +471,14 @@ because that names something other than the reference. Each object is a **full o
 format the repository itself writes**, forty hexadecimal characters or sixty-four; a name of the
 other length is refused, because Git would resolve it as a revision and a reference whose own name
 is that many hexadecimal characters would then decide what moved. The format is read from the Git
-common directory, under the identity this host recorded for it, rather than from the working tree:
-a linked worktree names its repository through a file it holds itself, and rewriting that file
-would otherwise describe one repository while the update moved a reference in another. The null object in either position is refused for what it is: as the new
-value it deletes the reference and as the expected old value it asserts the reference is absent,
-and this service moves one reference that exists to one object that exists. The invocation runs
-with the repository's Git common directory as its working directory and a write grant for that
-directory alone: the working tree is not writable by it.
+common directory, under the identity this host recorded for it, rather than from the working tree: a
+linked worktree names its repository through a file it holds itself, and rewriting that file would
+otherwise describe one repository while the update moved a reference in another. The null object in
+either position is refused for what it is: as the new value it deletes the reference and as the
+expected old value it asserts the reference is absent, and this service moves one reference that
+exists to one object that exists. The invocation runs with the repository's Git common directory as
+its working directory and a write grant for that directory alone: the working tree is not writable
+by it.
 
 ### Cleanup and retention
 
@@ -557,13 +558,12 @@ directory earlier on `PATH` cannot substitute another program. Git 2.32 or later
 because the profile rests on `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`.
 
 **What environment it runs in.** The child's environment is built from nothing and then filled in.
-Every variable Git reads that can name a program — `GIT_EXTERNAL_DIFF`, `GIT_SSH`,
-`GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_TEMPLATE_DIR`,
-`GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CONFIG_KEY_<n>` — is absent unless the profile put it
-there. `PATH` holds the Git binary's own directory and its helper directory and nothing else, so a
-remote helper somewhere on the user's path is unreachable. `HOME` is an empty directory this host
-owns, so no `~/.gitconfig`, `~/.gitignore` or `~/.ssh/config` is read. The child has no terminal, so
-nothing can prompt and nothing can page.
+Every variable Git reads that can name a program (`GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+`GIT_ASKPASS`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_TEMPLATE_DIR`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_CONFIG_KEY_<n>`) is absent unless the profile put it there. `PATH` holds the Git binary's own
+directory and its helper directory and nothing else, so a remote helper somewhere on the user's path
+is unreachable. `HOME` is an empty directory this host owns, so no `~/.gitconfig`, `~/.gitignore` or
+`~/.ssh/config` is read. The child has no terminal, so nothing can prompt and nothing can page.
 
 **What configuration applies.** `GIT_CONFIG_NOSYSTEM=1`, and the global and system files both point
 at a zero-byte file this host owns, so the only configuration left is the repository's own. On top of
@@ -698,8 +698,8 @@ staged clone, runs under the configuration of a repository this host made a mome
 every read confirms, either: the measurement a removal takes reads the tree once and treats
 anything it could not establish as work to keep.
 
-**One removal of a workspace at a time.** `removal_pending` is a state a workspace *rests* in — it
-holds work the user has not approved removing — so the state alone cannot say whether a removal is
+**One removal of a workspace at a time.** `removal_pending` is a state a workspace *rests* in (it
+holds work the user has not approved removing), so the state alone cannot say whether a removal is
 running. A reservation does: while one removal holds it, a second is refused rather than allowed to
 measure a tree the first is deleting underneath it. The reservation is given up after the answer is
 built, on the failure path as well as the ordinary one and whether or not the journal accepted the
@@ -755,13 +755,13 @@ refusal rather than a thing to work around.
 
 ## The journal
 
-`projects.sqlite`, write-ahead logging, full synchronisation, forward-only migrations: the tables are created
-where they are absent and a store an earlier build wrote gains the columns added since, one
-`ALTER TABLE` each, in one transaction with the version that describes them, so a store is never
-left saying it is at a version whose columns it does not have. The version says which build wrote the
-store rather than which columns it has, so the step runs for every version below the current one
-and adds whatever is missing instead of trusting a number to describe a shape. A store from a
-*later* build is refused rather than half read.
+The journal is `projects.sqlite`, with write-ahead logging, full synchronisation and forward-only
+migrations: the tables are created where they are absent and a store an earlier build wrote gains
+the columns added since, one `ALTER TABLE` each, in one transaction with the version that describes
+them, so a store is never left saying it is at a version whose columns it does not have. The version
+says which build wrote the store rather than which columns it has, so the step runs for every
+version below the current one and adds whatever is missing instead of trusting a number to describe
+a shape. A store from a *later* build is refused rather than half read.
 
 The same upgrade carries the *contents* forward, because a store an earlier build wrote holds the
 text that build composed: every free-text reason in it goes through the rule, and so does each
@@ -865,8 +865,8 @@ object recorded beside it so a revert still has somewhere to go back to.
 
 ### How consistent the source was, and the mechanism behind each answer
 
-Three classes, no default, and no fourth that means "probably fine". A capture is described as what
-it actually was.
+There are three classes, with no default and no fourth that means "probably fine". A capture is
+described as what it actually was.
 
 | Class | What it rests on |
 | --- | --- |
@@ -886,7 +886,7 @@ answers at once or refuses at once: it never waits, so a workspace that cannot b
 captured as the weaker class this host can actually perform, and a caller that required the
 stronger one is refused rather than served a weaker one under that name.
 
-What the capture then does with the grant is what makes the class honest:
+What the capture then does with the grant is what makes the class accurate:
 
 * **It checks that the grant covers what it is reading.** A grant names the workspace and the
   working tree it holds, the working tree by identity rather than by name, and a grant over
@@ -967,8 +967,8 @@ removes is never opened at all:
    an actor already holds the repository's own data, and a cover placed over a directory for the
    length of one step and taken away before the next is outside what this host promises. What it
    does promise is about the tree as it stands: a link, a second name, a mount that is there when
-   the capture reads, and the ordinary races an account without that privilege can arrange — a
-   rename, a replacement, a file swapped under a reader — which handle-based resolution answers by
+   the capture reads, and the ordinary races an account without that privilege can arrange (a
+   rename, a replacement, a file swapped under a reader), which handle-based resolution answers by
    holding the object rather than the name.
 
    What is left is a *file* with two names in two directories: a hard link from a repository's own
@@ -976,12 +976,12 @@ removes is never opened at all:
    file is refused on both sides; a second hard link is not.
 
    Finding these repositories is not the same job as reading the tree, and it does not stop where
-   reading stops. Nothing is read inside a nested repository's tree, which would leave a
-   repository nested inside **that** one unaccounted for: its own `.git` is named by no reading of
-   the capture, and the directory it keeps its data in can be anywhere the tree reaches, ordinary
-   content to everything else. So every nested tree is walked for `.git` entries and for nothing
-   else — no content of it is read — and each repository found that way has its data placed and
-   excluded like any other.
+   reading stops. Nothing is read inside a nested repository's tree, which would leave a repository
+   nested inside **that** one unaccounted for: its own `.git` is named by no reading of the capture,
+   and the directory it keeps its data in can be anywhere the tree reaches, ordinary content to
+   everything else. So every nested tree is walked for `.git` entries and for nothing else (no
+   content of it is read), and each repository found that way has its data placed and excluded like
+   any other.
 
    Discovery goes down two more roads for the same reason, and reads nothing along either. A
    **link** is followed: never to capture anything, because what a version holds for a link is its
@@ -998,12 +998,12 @@ removes is never opened at all:
    name another, so the number of references followed to reach a directory has an end of its own,
    and a repository whose data names itself is looked through once rather than for ever.
 
-   Each directory is looked through once, by what it is **and the mount it was reached on** —
-   outside this tree as much as inside it, because two views of one directory hold different
-   children and passing the second over would leave whatever is in it unaccounted for. Every one
-   of them is a handle this host opened and kept: nothing is searched by resolving a name a second
-   time, because two directories renamed in between would have this host ask about one place and
-   look inside another.
+   Each directory is looked through once, by what it is **and the mount it was reached on**, outside
+   this tree as much as inside it, because two views of one directory hold different children and
+   passing the second over would leave whatever is in it unaccounted for. Every one of them is a
+   handle this host opened and kept: nothing is searched by resolving a name a second time, because
+   two directories renamed in between would have this host ask about one place and look inside
+   another.
 
    What this covers is what a capture reads and what those walks reach: a repository in a
    directory that no path of the capture goes near, that lies inside no tree they walk and that no
@@ -1033,25 +1033,25 @@ copy the version came from is touched, so the agent whose tree was captured keep
 
 Recording a result re-reads the materialisation and says what it establishes:
 
-* it still holds the version — the same paths, the same content, the same modes, and every file
-  still the object this host wrote, of the same length, last written at the same instant — and the
-  result attests that version;
-* it holds something else — the result attests **no version at all**, and this host records a
+* it still holds the version (the same paths, the same content, the same modes, and every file still
+  the object this host wrote, of the same length, last written at the same instant), and the result
+  attests that version;
+* it holds something else: the result attests **no version at all**, and this host records a
   **derived version** with its own identity beside it, held against deletion for as long as the
-  result is, which is what the directory held when the result was recorded rather than what the
-  run read. A run that changed a file, tested the change
-  and put the file back leaves a directory that reads as modified and a reading no command ever
-  used, so naming that reading as the tested version would be a claim this host cannot make;
+  result is, which is what the directory held when the result was recorded rather than what the run
+  read. A run that changed a file, tested the change and put the file back leaves a directory that
+  reads as modified and a reading no command ever used, so naming that reading as the tested version
+  would be a claim this host cannot make;
 * it holds something this host cannot represent, cannot read, or would not have captured in the
-  first place, or something was written into it after the run the caller reported had ended — the
+  first place, or something was written into it after the run the caller reported had ended: the
   result is `indeterminate` and attests nothing at all.
 
-The limit, stated rather than left to be discovered: this host reads the directory when the
-materialisation is made and again when the result is recorded. It does not watch it while the run
-is happening. What it records at each path when it writes it — the object, the length and the
-instant it was last written — is what tells a file nobody touched from one a run rewrote with the
-same bytes; a run that restored all three together is not something two readings would show.
-Binding a result to the bytes a command actually read needs a host that owns the execution.
+The limit is stated here rather than left to be discovered: this host reads the directory when the
+materialisation is made and again when the result is recorded. It does not watch it while the run is
+happening. What it records at each path when it writes it (the object, the length and the instant it
+was last written) is what tells a file nobody touched from one a run rewrote with the same bytes; a
+run that restored all three together is not something two readings would show. Binding a result to
+the bytes a command actually read needs a host that owns the execution.
 
 An identical source promises nothing about network services, installed dependencies, secrets or
 graphical state. Every version and every materialisation carries that sentence.
@@ -1083,21 +1083,21 @@ those.
 
 A direct apply to `shared_existing` cannot be chosen until the request carries back the limitations
 this host returns for it, and a preflight is how a caller obtains them: it needs no acknowledgement
-and it writes nothing at all, in this store or any other. What a direct apply then does, in order: the preflight, which compares every
-affected path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written
-anywhere** if they differ; the claim on the action, taken here rather than earlier so that a refused
-preflight leaves nothing durable behind; an immutable capture of the destination as it stands; the content staged
-in a directory of this host's own beside the destination and read back against its digest; the apply's header and a `planned` row for
+and it writes nothing at all, in this store or any other. What a direct apply then does, in order:
+the preflight, which compares every affected path with what the request expects and answers
+`DRAFT_CONFLICT` with **nothing written anywhere** if they differ; the claim on the action, taken
+here rather than earlier so that a refused preflight leaves nothing durable behind; an immutable
+capture of the destination as it stands; the content staged in a directory of this host's own beside
+the destination and read back against its digest; the apply's header and a `planned` row for
 **every** operation written in one transaction, before any of them is attempted; then, per
 operation, a temporary created exclusively **in the destination's own directory** and written with
-the validated bytes, the destination's permissions put on it, the destination rechecked against
-that same directory handle as the last thing before the rename, the staged name confirmed to still
-be the file this host created, the rename, and the destination read back twice: once through the
-directory this host published into, against the content and the permissions it set, and once by
-resolving the whole path again from the working tree and comparing the object it reaches with the
-one this host renamed into place. A parent somebody moved aside is therefore never reported as a
-success about the path the request named. Finally an immutable capture of the destination as it
-now stands.
+the validated bytes, the destination's permissions put on it, the destination rechecked against that
+same directory handle as the last thing before the rename, the staged name confirmed to still be the
+file this host created, the rename, and the destination read back twice: once through the directory
+this host published into, against the content and the permissions it set, and once by resolving the
+whole path again from the working tree and comparing the object it reaches with the one this host
+renamed into place. A parent somebody moved aside is therefore never reported as a success about the
+path the request named. Finally, it takes an immutable capture of the destination as it now stands.
 
 Nothing is removed to make room. A staging name that is already taken is a path this host reports
 and leaves exactly as it is.
@@ -1220,7 +1220,7 @@ as expected returns a result with no outcome class at all, because nothing ran.
 
 A crash after one file cannot produce `applied`. `applied` is recorded only when every operation the
 apply planned is confirmed in the destination, and a path whose row still says `planned` means this
-host did not establish what became of it — which is not the same as saying it did not write it. A
+host did not establish what became of it, which is not the same as saying it did not write it. A
 replacement daemon settles such an apply as `interrupted_apply`, names exactly the paths on each
 side, and **settles the action it was performed under with that answer**, so a caller that repeats
 the action is told what happened rather than applying a second time against a destination the first
@@ -1237,12 +1237,12 @@ invocation, writes to no working tree and removes nothing. `commit`, `push`, `re
 
 A version is not deleted while anything the change-set store holds names it: a materialisation that
 has not been released, a review acknowledgement or any other evidence, a later version derived from
-it, a recorded result, or an apply that names it on either side. The
-counting and the removal are one transaction inside the change-set store, and a materialisation, a
-result with both the version it attests and the reading it carries beside it, a derived version and
-an apply with every version it names on either side are each written under a check, in the same
-transaction, that those versions are still there — so a holder recorded while a deletion is
-deciding is either counted or refused, and never left pointing at something that is gone.
+it, a recorded result, or an apply that names it on either side. The counting and the removal are
+one transaction inside the change-set store, and a materialisation, a result with both the version
+it attests and the reading it carries beside it, a derived version and an apply with every version
+it names on either side are each written under a check, in the same transaction, that those versions
+are still there, so a holder recorded while a deletion is deciding is either counted or refused, and
+never left pointing at something that is gone.
 
 The project service's pin lives in another store, and the two stores do not share a transaction.
 What the project service offers is a pair of **guarded** operations that take one lock in one

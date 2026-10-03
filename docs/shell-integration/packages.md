@@ -45,7 +45,7 @@ cleanly.
 
 ## What Zsh changes
 
-Five patches, against `zsh-5.9`.
+There are five patches, against `zsh-5.9`.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -67,10 +67,10 @@ The first patch does five things, all inside `zle_main.c`:
   in the mailbox and then takes the end-of-file decision for the key that was just read. That call
   sits ahead of both of ZLE's end-of-file branches, so an eligible gesture never reaches either one
   and the person's `IGNORE_EOF` setting is neither read nor changed.
-- **`zleread` reports the reader's boundaries.** Entry before `zlecore`, and the leave before
-  acceptance returns, with the reason ZLE's own state gives: an accepted command, a cancellation or
-  the root shell exiting. `zlecontext` says which reader it is, so a `PS2` continuation and `vared`
-  are not the root editor's prompt.
+- **`zleread` reports the reader's boundaries.** They are the entry before `zlecore`, and the leave
+  before acceptance returns, with the reason ZLE's own state gives: an accepted command, a
+  cancellation or the root shell exiting. `zlecontext` says which reader it is, so a `PS2`
+  continuation and `vared` are not the root editor's prompt.
 - **`getbyte` records where each byte came from.** A byte from `kungetbuf` was pushed back by a
   widget or `zle -U`, not typed, and the detach condition excludes it for that reason.
 - **The editor module loads the bridge when it is set up**, before the first primary reader, and
@@ -81,9 +81,9 @@ waiting for its character, `universal-argument` accumulating digits, and an open
 An incremental search already has `isearch_active`, and a vi motion already has `virangeflag`, so
 those two need no change.
 
-Immediate acceptance is the mailbox's own: the reader installs the command, answers, sets `done`
-and returns from the read loop at the boundary it is already standing on. Cancellation is ZLE's
-timeout path — the pending read ends, the longest complete prefix is dropped and the edit buffer is
+Immediate acceptance is the mailbox's own: the reader installs the command, answers, sets `done` and
+returns from the read loop at the boundary it is already standing on. Cancellation is ZLE's timeout
+path: the pending read ends, the longest complete prefix is dropped and the edit buffer is
 untouched. A cancellation that finds nothing in progress ends nothing: it discards nothing, the
 reader stays in the wait it is in, and the sequence the person starts next is their own.
 
@@ -117,7 +117,7 @@ afterwards and win.
 
 ## What Bash changes
 
-Four patches, against `bash-5.2.37`, which bundles Readline 8.2.
+There are four patches, against `bash-5.2.37`, which bundles Readline 8.2.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -145,7 +145,8 @@ callback therefore classifies typeahead wrongly. So:
 - **`readline_internal_char` takes the end-of-file decision** immediately before Readline's own
   `c == EOF && rl_end` and empty-line branches, after the next character has been selected. It
   answers native or consume, replaces no binding, and a consume continues the same `readline` call.
-- **`readline_internal` reports the reader's boundaries**, the leave before acceptance returns.
+- **`readline_internal` reports the reader's boundaries**, including the leave before acceptance
+  returns.
 - **`input.c` and `macro.c` gain one accessor each**, for the bytes the reader still holds in its
   own buffer and the bytes left in an executing macro. A fence rests on the reader's state, so
   those counts have to come from the reader rather than from the kernel's idea of what is readable.
@@ -173,9 +174,10 @@ launcher that cannot be started leaves the child running the command as it was t
 
 ## What fish changes
 
-Three patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half of the
-bridge is Rust beside it and the shell-independent core is the same C the other packages compile,
-built into the shell by the build script that already compiles C for the shell's own probes.
+There are three patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
+of the bridge is Rust beside it and the shell-independent core is the same C the other packages
+compile, built into the shell by the build script that already compiles C for the shell's own
+probes.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -275,10 +277,10 @@ project's licence.
 Nothing in the bridge links against the rest of the host. It speaks to the worker over a socket,
 and the reader calls into it through a small set of functions.
 
-Two things the adapters do that are easy to get wrong. An argument vector is quoted a word at a
-time, *including the first*, and with the enclosing single quotes: a bare word at command position
-would be a reserved word, an assignment or an alias rather than the name the caller asked to run,
-and an unquoted `$(...)` would run. Zsh's own `quotestring` escapes for the inside of single
+There are two things the adapters do that are easy to get wrong. An argument vector is quoted a word
+at a time, *including the first*, and with the enclosing single quotes: a bare word at command
+position would be a reserved word, an assignment or an alias rather than the name the caller asked
+to run, and an unquoted `$(...)` would run. Zsh's own `quotestring` escapes for the inside of single
 quotes and leaves the quotes to its caller, which is a trap worth naming. And on Zsh the text goes
 in through the editor's own string representation: `setline` unmetafies what it is handed, so raw
 bytes above 0x7f would change on the way in.
@@ -298,8 +300,8 @@ and removing the integration removes exactly that block and nothing else:
 # <<< kalareach shell integration <<<
 ```
 
-It goes at the end of `$ZDOTDIR/.zshrc` for Zsh, and at the end of `.bashrc` for Bash — or, for a
-login shell whose first-read login file does not source `.bashrc`, at the end of that file. The
+It goes at the end of `$ZDOTDIR/.zshrc` for Zsh, and at the end of `.bashrc` for Bash (or, for a
+login shell whose first-read login file does not source `.bashrc`, at the end of that file). The
 installation never replaces either file, never uses an alternate `ZDOTDIR` or a substituted
 `--rcfile`, and never disables an existing profile.
 
@@ -364,14 +366,14 @@ answers "missing" where the truth is "did not compile": that is how a build ends
 states the platform assumption the probe cannot check without a controlling terminal. Both
 assumptions hold on the platforms these packages are built for.
 
-Two notes on that last field. Bash's `make tests` passes with these patches. Zsh's `make check`
-runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over `print foo >&-`,
-which writes to a closed descriptor and prints where the test expects silence. An unpatched 5.9
-built from the same tarball and the same flags fails the same single script, so this is the release
-meeting the host rather than anything the patches do. The build script runs each suite in its own
-process group, ends it at a bound, records the outcome and its summary line in the identity, and
-carries on; `--require-upstream-tests` turns anything but a pass into a build failure, which is
-what continuous integration uses on Linux.
+There are two notes on that last field. Bash's `make tests` passes with these patches. Zsh's
+`make check` runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over
+`print foo >&-`, which writes to a closed descriptor and prints where the test expects silence. An
+unpatched 5.9 built from the same tarball and the same flags fails the same single script, so this
+is the release meeting the host rather than anything the patches do. The build script runs each
+suite in its own process group, ends it at a bound, records the outcome and its summary line in the
+identity, and carries on; `--require-upstream-tests` turns anything but a pass into a build failure,
+which is what continuous integration uses on Linux.
 
 ## The licence position
 
