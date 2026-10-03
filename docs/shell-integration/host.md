@@ -45,6 +45,8 @@ beginning `KR_` is dropped from the snapshot before the shell's environment is b
 exported environment as soon as the handshake succeeds, so a child process started afterwards
 inherits neither.
 
+The host owns more names than those two. Before the shell's environment is built, the worker drops from a creator's environment every name the host sets itself: the names that begin `KR_`, the variables that name the creator's terminal emulator (`ITERM_SESSION_ID`, `TERM_PROGRAM`, `WT_SESSION` and the others), the variables that describe the creator's own terminal and shell (`TERM`, `COLORTERM`, `SHELL`, `SSH_TTY`) and the desktop's variables (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and the others, which come from the execution context). Names are compared as the platform compares them, so on Windows `Kr_Session` goes the way `KR_SESSION` does. The same list refuses an owner's configured addition, so what the worker removes and what a configuration may not add cannot disagree.
+
 ## Being admitted
 
 Three things happen when a bridge connects, and only the last of them decides anything.
