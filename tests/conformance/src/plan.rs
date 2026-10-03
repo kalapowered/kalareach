@@ -681,6 +681,42 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the agent mutations through the dispatch path",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "agent_service",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the forwarder's launcher against the command backends",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-hook",
+                "--test",
+                "launch_windows",
+            ],
+        ),
+        qualified_only(
+            "the doctor's reading of the platform's command backends",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "catalogue::integrations",
+            ],
+            "catalogue::integrations",
+        ),
+        Step::cargo(
+            Group::Rust,
             "the settings-sync store",
             &["test", "--locked", "-p", "kr-client", "--test", "sync"],
         ),
