@@ -11,8 +11,6 @@
 //! | KR-REQ-12.18 | `kr_req_12_18_each_registered_hook_observes_and_answers_neutrally` |
 //! | KR-REQ-11.62 | `kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread` |
 
-#![cfg(unix)]
-
 mod common;
 
 use std::sync::Arc;
