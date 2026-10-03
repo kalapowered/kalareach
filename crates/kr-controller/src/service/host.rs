@@ -672,7 +672,7 @@ impl Controller {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
-            backends: kr_worker::broker::process::ManagedProcess::publishes_credential_file(),
+            backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
             // A worker runs an integrated invocation through the launcher beside it, held to the
             // rule the worker holds it to.
             launcher: self.worker_program.parent().is_some_and(|directory| {

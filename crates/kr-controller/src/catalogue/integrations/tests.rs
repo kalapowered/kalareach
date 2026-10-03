@@ -324,6 +324,37 @@ fn an_integration_on_where_no_backend_can_be_established_is_unavailable() {
     }
 }
 
+/// KR-REQ-07.45: where this platform's command backends run, which the daemon asks the worker for,
+/// an integration that is on and has a launcher beside the worker is reported as one a session
+/// created now can launch through, and is not reported as unavailable for the platform.
+#[test]
+fn a_platform_whose_command_backends_run_reports_an_integration_with_a_launcher_available() {
+    let store = Store::new("runs");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    let host = Host {
+        search_path: Vec::new(),
+        backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
+        launcher: true,
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
+    assert_eq!(reported.reports[0].state, CommandIntegrationState::On);
+    assert_eq!(
+        reported.reports[0].unavailable.0, None,
+        "a platform whose backends run is not the reason this integration is unavailable"
+    );
+    // Control: a platform whose backends do not run is.
+    let without = Host {
+        backends: false,
+        ..host
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &without);
+    assert_eq!(
+        reported.reports[0].unavailable.0,
+        Some(CommandIntegrationUnavailable::Platform)
+    );
+}
+
 /// KR-REQ-07.45: two packages that integrate one command are each reported as a conflict, with
 /// the command and why.
 #[test]
