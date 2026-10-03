@@ -1055,7 +1055,7 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
         .await
         .expect("the late attempt finishes")
         .expect_err("a fence that landed while the answer was read stops it");
-    assert!(refused.to_string().contains("fence"), "{refused}");
+    refused_for_a_fence(&refused.to_protocol_error());
     controller.hold_fence(false);
 }
 
@@ -1267,40 +1267,27 @@ fn enrolment_of(byte: u8) -> kr_protocol::identity::EnvironmentEnrolment {
     }
 }
 
-/// Runs `call` while something else holds this host's record of its environments, and lets that go
-/// once `meanwhile` has run: the call waits for the record, and what lands while it waits is what
-/// the call is asked about when it gets it.
-async fn while_the_environment_record_is_held<T: Send + 'static>(
+/// Runs `call` and stops it at the place it is about to wait for this host's record of its
+/// environments, lets `meanwhile` happen there, and lets it go on: what lands while it is stopped
+/// there is what the call is asked about when it gets the record.
+async fn stopped_before_the_environment_record<T: Send + 'static>(
     controller: &Controller,
     call: impl std::future::Future<Output = T> + Send + 'static,
     meanwhile: impl FnOnce(),
 ) -> T {
-    let state_dir = controller.paths.state_dir().to_path_buf();
-    let (held, holding) = tokio::sync::oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let holder = tokio::task::spawn_blocking(move || {
-        crate::bridge::store::Store::with_locked(&state_dir, |_| {
-            let _ = held.send(());
-            let _ = released.recv();
-            Ok(())
-        })
-    });
-    holding.await.expect("the record is held");
+    let (arrived, release) = controller.before_the_environment_record.arm();
     let waiting = tokio::spawn(call);
+    arrival(arrived).await;
     meanwhile();
-    release.send(()).expect("the holder lets go");
-    holder
-        .await
-        .expect("the holder finishes")
-        .expect("the record opens");
+    release.send(()).expect("the call goes on");
     waiting.await.expect("the call finishes")
 }
 
-/// KR-REQ-09.09, 09.12 and 26.16: a fence this host owes that lands while an environment record
-/// change waits for the record stops it, so the record is not changed. The control: with nothing
-/// owed, the same changes are made.
+/// KR-REQ-09.09, 09.12 and 26.16: a fence this host owes that lands after an environment record
+/// change has everything it needs, and before it gets the record, stops it, so the record is not
+/// changed. The control: with nothing owed, the same changes are made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fence_that_lands_while_an_environment_change_waits_for_the_record_stops_it() {
+async fn a_fence_that_lands_before_an_environment_change_gets_the_record_stops_it() {
     use kr_protocol::identity::{
         EnvironmentEnrolParams, EnvironmentForgetParams, EnvironmentRefreshParams,
     };
@@ -1371,7 +1358,7 @@ async fn a_fence_that_lands_while_an_environment_change_waits_for_the_record_sto
 
     // The fence lands while each change waits for the record.
     let fence_lands = || controller.hold_fence(true);
-    let refused = while_the_environment_record_is_held(&controller, enrol(2), fence_lands).await;
+    let refused = stopped_before_the_environment_record(&controller, enrol(2), fence_lands).await;
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
@@ -1379,7 +1366,7 @@ async fn a_fence_that_lands_while_an_environment_change_waits_for_the_record_sto
             .to_protocol_error(),
     );
     assert!(!recorded(2), "the enrolment was not made");
-    let refused = while_the_environment_record_is_held(&controller, forget(1), fence_lands).await;
+    let refused = stopped_before_the_environment_record(&controller, forget(1), fence_lands).await;
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
@@ -1387,7 +1374,7 @@ async fn a_fence_that_lands_while_an_environment_change_waits_for_the_record_sto
             .to_protocol_error(),
     );
     assert!(recorded(1), "the record was not forgotten");
-    let refused = while_the_environment_record_is_held(&controller, refresh(1), fence_lands).await;
+    let refused = stopped_before_the_environment_record(&controller, refresh(1), fence_lands).await;
     controller.hold_fence(false);
     refused_for_a_fence(
         &refused
