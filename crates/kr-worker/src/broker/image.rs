@@ -14,7 +14,9 @@
 //!   is one the hashed file's signature carries executes the hashed code, and a process that only
 //!   maps that file does not match.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(not(windows))]
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,10 +35,10 @@ const IMAGE_ATTEMPTS: usize = 3;
 /// A file's identity, as the kernel reports it for one opened file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileIdentity {
-    /// The device it is on.
+    /// The device or volume it is on.
     pub device: u64,
-    /// Its inode.
-    pub inode: u64,
+    /// Its inode, or the 128-bit id its volume gives it.
+    pub inode: u128,
     /// Its length in bytes.
     pub size: u64,
     /// Its last modification, in nanoseconds.
@@ -46,14 +48,14 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    /// Reads the identity the kernel reports for one file.
+    /// Reads the identity the kernel reports for one file's metadata.
     #[cfg(unix)]
     #[must_use]
     pub fn of(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         Self {
             device: metadata.dev(),
-            inode: metadata.ino(),
+            inode: u128::from(metadata.ino()),
             size: metadata.size(),
             modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
                 + i128::from(metadata.mtime_nsec()),
@@ -62,16 +64,28 @@ impl FileIdentity {
         }
     }
 
-    /// A platform without inodes names no identity a file could be held to.
-    #[cfg(not(unix))]
-    #[must_use]
-    pub fn of(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            device: 0,
-            inode: 0,
-            size: metadata.len(),
-            modified_ns: 0,
-            changed_ns: 0,
+    /// Reads the identity the kernel reports for one opened file.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the file cannot be asked, or that its volume gives no id for it, which refuses
+    /// the file by name: nothing could be held to an identity it has not got.
+    pub fn of_file(file: &std::fs::File) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self::of(&file.metadata()?))
+        }
+        #[cfg(windows)]
+        {
+            let object = crate::windows::file::object_of(file)?;
+            let times = crate::windows::file::times_of(file)?;
+            Ok(Self {
+                device: object.volume,
+                inode: object.id,
+                size: file.metadata()?.len(),
+                modified_ns: times.modified_ns,
+                changed_ns: times.changed_ns,
+            })
         }
     }
 }
@@ -118,11 +132,25 @@ pub(crate) type HashedFiles = Mutex<BTreeMap<FileIdentity, HashedFile>>;
 /// The work is bounded whatever is at the path: the file is opened without waiting and refused
 /// unless the opened descriptor is a regular file, no more than the size read at the start is read,
 /// and the reading stops as soon as `stop` is set.
+#[cfg(any(unix, test))]
 pub(crate) fn read_identity(
     path: &Path,
     cache: &HashedFiles,
     stop: &AtomicBool,
 ) -> Result<HashedFile, String> {
+    read_holding(path, cache, stop).map(|(hashed, _)| hashed)
+}
+
+/// Reads one executable as [`read_identity`] does, and returns the opened file with what was read.
+///
+/// On Windows the file was opened with sharing for readers only, so for as long as the caller holds
+/// it nothing can rename, delete, write or copy over the file it identifies, and a launch can be
+/// held to that object and not to a path.
+pub(crate) fn read_holding(
+    path: &Path,
+    cache: &HashedFiles,
+    stop: &AtomicBool,
+) -> Result<(HashedFile, std::fs::File), String> {
     for _ in 0..IDENTITY_ATTEMPTS {
         let file = open_without_waiting(path)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
@@ -133,7 +161,7 @@ pub(crate) fn read_identity(
             .get(&before)
             .cloned();
         if let Some(hashed) = cached {
-            return Ok(hashed);
+            return Ok((hashed, file));
         }
         let directories = directories_of(&file, before.size);
         let Some((digest, code_directories)) =
@@ -154,7 +182,7 @@ pub(crate) fn read_identity(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(before, hashed.clone());
-        return Ok(hashed);
+        return Ok((hashed, file));
     }
     Err(format!(
         "{} kept changing while it was read",
@@ -172,6 +200,13 @@ fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
+    // Sharing for readers only: while this is held, the file cannot be written, renamed, deleted
+    // or copied over, and the identity read from it stays the identity of whatever is at the path.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
     options.open(path)
 }
 
@@ -183,7 +218,8 @@ fn regular_identity(file: &std::fs::File, path: &Path) -> Result<FileIdentity, S
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    Ok(FileIdentity::of(&metadata))
+    FileIdentity::of_file(file)
+        .map_err(|error| format!("{} cannot be identified: {error}", path.display()))
 }
 
 /// Hashes the first `size` bytes of an opened file, feeding each code directory its pages, and
@@ -271,7 +307,73 @@ impl PageCheck for NoDirectory {
 
 /// The identities of executables already shown to hold the digest that was hashed, so each is
 /// hashed at most once.
+#[cfg(not(windows))]
 pub type VerifiedFiles = Mutex<BTreeSet<FileIdentity>>;
+
+/// The one process a launch's program was shown to be created from the hashed file, and that file.
+///
+/// A process on Windows is made from one image and has no `exec` to change it, so what is shown at
+/// the moment the launcher names the program it created is shown for good. Nothing here reads a
+/// path again: after an upgrade in place the path the kernel recorded names another file.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub struct VerifiedFiles {
+    verdict: std::sync::OnceLock<Verdict>,
+}
+
+/// What was shown, and of whom.
+#[cfg(windows)]
+#[derive(Debug)]
+struct Verdict {
+    /// The process created from the file.
+    process: ProcessStartIdentity,
+    /// The file it was created from, as it was hashed.
+    file: FileIdentity,
+}
+
+/// Shows that a process was created from the file this launch holds, once, and records the verdict.
+///
+/// `held` is the file that was opened for reading with sharing for readers only at the establish
+/// and hashed through that handle; nothing has been able to rename, delete or write it since, so
+/// the path the kernel recorded for the process still names it if the process was created from
+/// the path the launch presented. The kernel's record of the image is opened by its device path
+/// and its object compared with the held file's.
+///
+/// A launch has one program. A second verdict is refused, and so is a process created from
+/// another file.
+///
+/// # Errors
+///
+/// Returns why the process's image is not shown to be the held file.
+#[cfg(windows)]
+pub fn record_image(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    held: &std::fs::File,
+    verified: &VerifiedFiles,
+) -> Result<(), String> {
+    let pid = u32::try_from(process.pid.get())
+        .map_err(|_| format!("{} is not a process identifier", process.pid))?;
+    let image = crate::windows::file::image_of(pid)?;
+    let created_from = crate::windows::file::object_of(&image)
+        .map_err(|error| format!("the image of process {pid} cannot be identified: {error}"))?;
+    let held_object = crate::windows::file::object_of(held)
+        .map_err(|error| format!("the file this launch holds cannot be identified: {error}"))?;
+    if created_from != held_object {
+        return Err(format!(
+            "process {pid} was created from another file than the one its launch presented"
+        ));
+    }
+    // The hold is the hashed file: its identity is read from the handle that was hashed, so this
+    // is the identity the verdict is kept under.
+    let verdict = Verdict {
+        process: process.clone(),
+        file: identity.hashed.file,
+    };
+    verified.verdict.set(verdict).map_err(|_| {
+        "this launch's program was shown already, and a launch has one program".to_owned()
+    })
+}
 
 /// Checks, from the kernel's record of the process's main executable, that a registered process
 /// executes the code that was hashed.
@@ -480,12 +582,45 @@ fn other_code(process: &ProcessStartIdentity) -> String {
     )
 }
 
+/// Answers from the verdict taken when the launcher named its program: the process is the one that
+/// was shown to be created from the hashed file, and nothing else is.
+///
+/// Windows has no `exec`, so the image a process was created from is the image it runs for as long
+/// as it runs, and a bridge's check reads the verdict and never a path.
+///
+/// # Errors
+///
+/// Returns why the process is not the one shown, or that none was.
+#[cfg(windows)]
+pub fn verify_image(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    verified: &VerifiedFiles,
+    _stop: &AtomicBool,
+) -> Result<(), String> {
+    match verified.verdict.get() {
+        Some(verdict)
+            if verdict.process.matches(process) && verdict.file == identity.hashed.file =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "process {} is not the program this launch was shown to be created from the hashed              file",
+            process.pid
+        )),
+        None => Err(format!(
+            "no program of this launch was shown to be created from the hashed file, so process              {} is not",
+            process.pid
+        )),
+    }
+}
+
 /// No record of a process's image is read on this platform, so nothing here is verified.
 ///
 /// # Errors
 ///
 /// Always: nothing can be established.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn verify_image(
     process: &ProcessStartIdentity,
     _identity: &ExecutableIdentity,
@@ -1460,5 +1595,214 @@ mod tests {
             .map(|hash| hash.iter().map(|byte| format!("{byte:02x}")).collect())
             .collect();
         assert!(read.contains(&expected), "{expected} in {read:?}");
+    }
+}
+
+/// The file a launch holds, and the process shown to be created from it, on the platform whose
+/// files are held by sharing and whose processes are made from one image.
+#[cfg(all(test, windows))]
+mod windows_files {
+    use super::*;
+    use std::os::windows::process::CommandExt as _;
+
+    /// A directory of this test's own, removed with it.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!("kr-image-{}", kr_ipc::new_uuid()));
+            std::fs::create_dir_all(&directory).expect("a scratch directory");
+            Self(directory)
+        }
+
+        /// A copy of a system program that waits, under a name of its own.
+        fn program(&self, name: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            let system = std::env::var_os("SystemRoot").expect("a system directory");
+            std::fs::copy(
+                std::path::Path::new(&system)
+                    .join("System32")
+                    .join("ping.exe"),
+                &path,
+            )
+            .expect("a copy of a program");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A process created from `path` that never runs.
+    struct Suspended(std::process::Child);
+
+    impl Suspended {
+        fn from(path: &Path) -> Self {
+            Self(
+                std::process::Command::new(path)
+                    .args(["-n", "600", "127.0.0.1"])
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("a suspended process"),
+            )
+        }
+
+        fn identity(&self) -> ProcessStartIdentity {
+            kr_ipc::identity::process_start_identity(self.0.id()).expect("an identity")
+        }
+    }
+
+    impl Drop for Suspended {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn held(path: &Path) -> (ExecutableIdentity, std::fs::File) {
+        let (hashed, file) = read_holding(path, &HashedFiles::default(), &AtomicBool::new(false))
+            .expect("the file is read and held");
+        (
+            ExecutableIdentity {
+                hashed,
+                version: None,
+            },
+            file,
+        )
+    }
+
+    /// The code a failed file operation reports when the file is shared for readers only.
+    const SHARING_VIOLATION: i32 = 32;
+
+    #[test]
+    fn a_held_executable_cannot_be_renamed_deleted_written_or_copied_over() {
+        let scratch = Scratch::new();
+        let program = scratch.program("held.exe");
+        let other = scratch.program("other.exe");
+        let (_, file) = held(&program);
+        let refused = |result: std::io::Result<()>| {
+            result.expect_err("the held file is refused").raw_os_error() == Some(SHARING_VIOLATION)
+        };
+        assert!(refused(std::fs::rename(
+            &program,
+            scratch.0.join("moved.exe")
+        )));
+        assert!(refused(std::fs::remove_file(&program)));
+        assert!(refused(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&program)
+                .map(drop)
+        ));
+        assert!(refused(std::fs::copy(&other, &program).map(drop)));
+        // The hold is not a lock on reading: another reader opens it.
+        assert!(std::fs::File::open(&program).is_ok());
+        // Control: let go, and the same rename lands.
+        drop(file);
+        std::fs::rename(&program, scratch.0.join("moved.exe")).expect("an unheld file moves");
+    }
+
+    #[test]
+    fn a_volume_that_gives_an_id_gives_the_same_identity_to_the_same_file() {
+        let scratch = Scratch::new();
+        let program = scratch.program("same.exe");
+        let (identity, file) = held(&program);
+        assert_eq!(
+            FileIdentity::of_file(&file).expect("an identity"),
+            identity.hashed.file
+        );
+        let again = std::fs::File::open(&program).expect("another handle");
+        assert_eq!(
+            FileIdentity::of_file(&again).expect("an identity"),
+            identity.hashed.file
+        );
+        let copy = scratch.program("copy.exe");
+        let (other, _) = held(&copy);
+        assert_ne!(
+            other.hashed.file, identity.hashed.file,
+            "a byte-identical copy is another file object"
+        );
+        assert_eq!(other.hashed.digest, identity.hashed.digest);
+    }
+
+    #[test]
+    fn a_process_created_from_the_held_file_is_shown_and_one_created_from_a_copy_is_not() {
+        let scratch = Scratch::new();
+        let program = scratch.program("a.exe");
+        let copy = scratch.program("b.exe");
+        let (identity, file) = held(&program);
+        let verified = VerifiedFiles::default();
+
+        let from_copy = Suspended::from(&copy);
+        let refused = record_image(&from_copy.identity(), &identity, &file, &verified)
+            .expect_err("a byte-identical copy is another file");
+        assert!(refused.contains("another file"), "{refused}");
+        assert!(
+            verify_image(
+                &from_copy.identity(),
+                &identity,
+                &verified,
+                &AtomicBool::new(false)
+            )
+            .is_err(),
+            "nothing was shown, so nothing is verified"
+        );
+
+        let from_program = Suspended::from(&program);
+        record_image(&from_program.identity(), &identity, &file, &verified)
+            .expect("a process created from the held file is shown");
+        assert_eq!(
+            verify_image(
+                &from_program.identity(),
+                &identity,
+                &verified,
+                &AtomicBool::new(false)
+            ),
+            Ok(())
+        );
+        let refused = verify_image(
+            &from_copy.identity(),
+            &identity,
+            &verified,
+            &AtomicBool::new(false),
+        )
+        .expect_err("another process is not the one shown");
+        assert!(refused.contains("is not the program"), "{refused}");
+        let twice = Suspended::from(&program);
+        assert!(
+            record_image(&twice.identity(), &identity, &file, &verified).is_err(),
+            "a launch has one program"
+        );
+    }
+
+    #[test]
+    fn a_verdict_stands_after_the_file_is_replaced_in_place() {
+        let scratch = Scratch::new();
+        let program = scratch.program("upgrade.exe");
+        let replacement = scratch.program("replacement.exe");
+        let (identity, file) = held(&program);
+        let verified = VerifiedFiles::default();
+        let process = Suspended::from(&program);
+        record_image(&process.identity(), &identity, &file, &verified).expect("shown");
+        drop(file);
+        // An upgrade in place: the name now holds another file, and the process runs the old one.
+        std::fs::rename(&program, scratch.0.join("old.exe")).expect("the old file is moved");
+        std::fs::rename(&replacement, &program).expect("another file takes its name");
+        assert_eq!(
+            verify_image(
+                &process.identity(),
+                &identity,
+                &verified,
+                &AtomicBool::new(false)
+            ),
+            Ok(()),
+            "the check reads the verdict and never the path"
+        );
     }
 }
