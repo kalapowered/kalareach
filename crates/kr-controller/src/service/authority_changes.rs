@@ -103,7 +103,7 @@ impl Controller {
     /// not dispatch an identifier again because its receipt is incomplete. It is answered from
     /// what this host's own records prove the change did ([`Self::answer_without_fence`],
     /// [`Self::revocation_on_record`]), and otherwise as an outcome this host does not know.
-    async fn recorded_authority_change(
+    pub(super) async fn recorded_authority_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
