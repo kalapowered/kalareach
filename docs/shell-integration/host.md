@@ -2,13 +2,13 @@
 
 `docs/shell-integration/README.md` is the contract as a shell-package author reads it: the frames,
 the reader-thread rules, the state machine and the scenarios. This is the other half. It describes
-what the worker does with those rules — where the endpoint is, how a bridge is admitted, what drives
-the machine, and what a launch actually goes through — and it is the document to read before
-changing any of it.
+what the worker does with those rules (where the endpoint is, how a bridge is admitted, what drives
+the machine, and what a launch actually goes through) and it is the document to read before changing
+any of it.
 
 ## The endpoint
 
-One session, one endpoint, bound before the root shell starts.
+Each session has one endpoint, bound before the root shell starts.
 
 On Unix it is a socket file in the environment's runtime directory, which is owner-only (`0700`) and
 is checked rather than repaired: one that is group-readable, owned by somebody else or reached
@@ -54,8 +54,8 @@ Three things happen when a bridge connects, and only the last of them decides an
    the hello contributes to that answer.
 2. **The proof is verified.** It is HMAC-SHA-256 over
    `CBOR(["kr-shell-bridge/1", session_id, endpoint, shell_process, integration_version])` under the
-   bootstrap secret. The host rebuilds that transcript from what *it* knows — its session, its
-   endpoint and the root process it launched — so only the integration version comes from the hello.
+   bootstrap secret. The host rebuilds that transcript from what *it* knows (its session, its
+   endpoint and the root process it launched) so only the integration version comes from the hello.
    The comparison is constant time, and a tag that is not exactly 32 bytes fails without one.
 3. **The contract decides.** `contract::transport::decide_handshake` compares the observed process
    with the launched root shell and with the hello's own claim, then reads the verdict above, then
@@ -231,7 +231,7 @@ patches. The PSReadLine package rebuilds nothing and patches nothing: its reader
 `shell.modules`, at the editor ABI it was qualified against.
 
 A hello is checked against the package's editor ABI and integration version, and the rest of the
-identity it carries — the executable, the upstream revision, the patches and the module tree — is
+identity it carries (the executable, the upstream revision, the patches and the module tree) is
 recorded whole with the session, which is what its diagnostics report.
 
 The arguments that make one of these an interactive login shell are the host's rather than the
@@ -360,7 +360,7 @@ reader's own boundaries.
 `root.command.accepted` are reachable from a validated root registration over private IPC and
 nowhere else. That is true of the transport rather than only of an authority table: they travel on
 the bridge endpoint as its own frames, and there is no frame on the worker's client endpoint that
-carries one — a request naming one of them is refused by the dispatch, because no handler serves it.
+carries one; a request naming one of them is refused by the dispatch, because no handler serves it.
 Another process of the same user can open the endpoint; what it cannot do is authenticate as the
 root shell the worker launched. The group itself is read from the protocol registry rather than
 written out again here, so a method that joins it is covered without anything being kept in step by

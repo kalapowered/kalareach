@@ -193,9 +193,9 @@ fresh credential. The daemon holds credentials in memory and renews them; it nev
 
 ## Rate limits, and what a person is told
 
-Twenty in a burst and sixty an hour, per destination. The burst allowance refills over a minute and
-the hourly allowance over an hour, continuously, so a clock boundary is not a second burst. Excess
-notifications collapse into one attention update every five minutes.
+The limit is twenty in a burst and sixty an hour, per destination. The burst allowance refills over
+a minute and the hourly allowance over an hour, continuously, so a clock boundary is not a second
+burst. Excess notifications collapse into one attention update every five minutes.
 
 Every request the host made is retained, including the ones that collapsed, and the suppression is
 reported locally. A destination over its limit is a destination whose pending work is still visible
@@ -375,10 +375,10 @@ own words, or the readers' sentence, never a session's text.
 
 ## Where the state lives
 
-One delivery journal per environment, beside the daemon's other state, keyed by underlying event,
-destination and attempt. A state transition, the attempt behind it and the outbox row that follows
-from it are written in one transaction. Every notification an event produced, what they spent from
-the destination's allowance, and the event's own completion are written in another.
+There is one delivery journal per environment, beside the daemon's other state, keyed by underlying
+event, destination and attempt. A state transition, the attempt behind it and the outbox row that
+follows from it are written in one transaction. Every notification an event produced, what they
+spent from the destination's allowance, and the event's own completion are written in another.
 
 Budgets, cursors, queued work and the collapse window survive a restart and a reboot. A store that
 has lost a table or its privacy row is refused rather than reopened as an empty one, because an
