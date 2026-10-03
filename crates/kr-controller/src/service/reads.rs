@@ -517,7 +517,7 @@ fn unresolved_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::null(),
-        // Nothing says where its environment came from without its worker.
+        // The registry's rows do not hold where its environment came from.
         environment_sources: None,
     }
 }

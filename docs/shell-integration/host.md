@@ -47,7 +47,7 @@ inherits neither.
 
 The host owns more names than those two. Before the shell's environment is built, the worker drops from a creator's environment every name the host owns: the names that begin `KR_`, the variables that name the creator's terminal emulator (`ITERM_SESSION_ID`, `TERM_PROGRAM`, `WT_SESSION` and the others), the variables that describe the creator's own terminal and shell (`TERM`, `COLORTERM`, `SHELL`, `SSH_TTY`) and the desktop's variables (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and the others, which come from the execution context). Names are compared as the platform compares them, so on Windows `Kr_Session` goes the way `KR_SESSION` does, and on Linux and macOS a creator's `kr_session` is a variable of its own and stays. A configuration is stricter. It refuses an addition that names any of these in any letter case, on every platform, so no configuration can add what the host owns.
 
-A creator's `TERMINFO` and `TERMINFO_DIRS` are not among the names the host owns. Where the worker has a terminfo database of its own, which Windows never has and a Unix worker may fail to write, its database comes first and the creator's two follow it. Where it has none, they stay as the creator sent them.
+A creator's `TERMINFO` and `TERMINFO_DIRS`, and a configuration's, are not among the names the host owns. Where the worker has a terminfo database of its own, which Windows never has and a Unix worker may fail to write, its database comes first and the two follow it. Where it has none, they stay as they were sent.
 
 ## Being admitted
 
