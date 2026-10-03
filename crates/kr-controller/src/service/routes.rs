@@ -704,19 +704,9 @@ impl Controller {
             | Method::SessionRename
             | Method::DescriptionConfigure
             | Method::DescriptionDownload => {
-                let claimed = kr_protocol::digest::mutation_digest(mutation, actor_id)
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
-                    .and_then(|digest| {
-                        self.sharing.grants().claim_action(
-                            actor_id,
-                            mutation.action_id,
-                            &digest,
-                            kr_ipc::now_ms().get(),
-                        )
-                    });
-                match claimed {
-                    Ok(crate::grants::ActionClaim::Claimed { hold }) => {
-                        let outcome = if method == Method::PrivacySet {
+                return self
+                    .claimed_action(actor_id, mutation, connection_id, admitted, async {
+                        if method == Method::PrivacySet {
                             let outcome = self.privacy_set(mutation, carried).await;
                             // The state is published: the description host looks again, with its
                             // fences following it.
@@ -738,42 +728,9 @@ impl Controller {
                                 }
                                 Err(error) => Err(error),
                             }
-                        };
-                        let kept = self.settle_claim(&hold, &outcome);
-                        drop(hold);
-                        // The change happened, or was refused, and that is what the caller is
-                        // told. A receipt that could not be kept leaves a claim with no answer,
-                        // which a retry is told is unfinished and never performs again; it does not
-                        // turn an applied change into a failed one.
-                        if let Err(error) = kept {
-                            eprintln!(
-                                "kr-controller: could not keep what an action came to, so a retry \
-                                 of it is answered as an unfinished one: {error}"
-                            );
                         }
-                        outcome
-                    }
-                    Ok(crate::grants::ActionClaim::Recorded(record)) => {
-                        // A claim can be recorded between the retained lookup before a first
-                        // admission and this one. What the action produced is given back only
-                        // under authority that has not been withdrawn, and the answer is waited
-                        // for first: it is the check made with the answer in hand that decides.
-                        let answered = self
-                            .recorded_authority_change(actor_id, mutation, record)
-                            .await;
-                        #[cfg(feature = "testing")]
-                        self.after_the_retained_lookup.wait().await;
-                        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
-                            return error_reply(
-                                mutation.request_id,
-                                error.code(),
-                                error.to_string(),
-                            );
-                        }
-                        return respond(mutation.request_id, answered);
-                    }
-                    Err(error) => Err(error),
-                }
+                    })
+                    .await;
             }
             // A machine group step changes this environment's own record under the revision it was
             // admitted at, read before anything waited rather than again here: a revocation of

@@ -226,8 +226,10 @@ impl Controller {
                 drop(hold);
                 super::respond(mutation.request_id, outcome)
             }
-            Ok(crate::grants::ActionClaim::Recorded(_)) => {
-                let answered = self.retained_authority_answer(actor_id, mutation).await;
+            Ok(crate::grants::ActionClaim::Recorded(record)) => {
+                let answered = self
+                    .recorded_authority_change(actor_id, mutation, record)
+                    .await;
                 #[cfg(feature = "testing")]
                 self.after_the_retained_lookup.wait().await;
                 if let Err(error) = self.check_retained_answer(connection_id, admitted) {
@@ -237,13 +239,7 @@ impl Controller {
                         error.to_string(),
                     );
                 }
-                answered.unwrap_or_else(|| {
-                    super::error_reply(
-                        mutation.request_id,
-                        ErrorCode::ResourceUnavailable,
-                        "another attempt under this action identifier has not finished",
-                    )
-                })
+                super::respond(mutation.request_id, answered)
             }
             Err(error) => super::respond(mutation.request_id, Err(error)),
         }
