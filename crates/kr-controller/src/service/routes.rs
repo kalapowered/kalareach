@@ -683,7 +683,8 @@ impl Controller {
                 // The envelope this host built for the connection, not anything the caller sent.
                 // A refresh may open a bridge, and what may cross one is decided by this.
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.environment_record(&actor, mutation, method).await
+                self.environment_record(&actor, mutation, method, carried)
+                    .await
             }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the
@@ -742,9 +743,13 @@ impl Controller {
                         outcome
                     }
                     Ok(crate::grants::ActionClaim::Recorded(_)) => {
-                        // What this action produced is given back only under authority that has
-                        // not been withdrawn, as it is by the retained lookup before a first
-                        // admission: a claim can be recorded between that lookup and this one.
+                        // A claim can be recorded between the retained lookup before a first
+                        // admission and this one. What the action produced is given back only
+                        // under authority that has not been withdrawn, and the answer is waited
+                        // for first: it is the check made with the answer in hand that decides.
+                        let answered = self.retained_authority_answer(actor_id, mutation).await;
+                        #[cfg(feature = "testing")]
+                        self.after_the_retained_lookup.wait().await;
                         if let Err(error) = self.check_retained_answer(connection_id, admitted) {
                             return error_reply(
                                 mutation.request_id,
@@ -752,17 +757,13 @@ impl Controller {
                                 error.to_string(),
                             );
                         }
-                        return self
-                            .retained_authority_answer(actor_id, mutation)
-                            .await
-                            .unwrap_or_else(|| {
-                                error_reply(
-                                    mutation.request_id,
-                                    ErrorCode::ResourceUnavailable,
-                                    "another attempt under this action identifier has not \
-                                     finished",
-                                )
-                            });
+                        return answered.unwrap_or_else(|| {
+                            error_reply(
+                                mutation.request_id,
+                                ErrorCode::ResourceUnavailable,
+                                "another attempt under this action identifier has not finished",
+                            )
+                        });
                     }
                     Err(error) => Err(error),
                 }

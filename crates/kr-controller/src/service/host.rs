@@ -185,11 +185,17 @@ impl Controller {
     ///
     /// Only a refresh reaches the platform, and only when the request asked it to start the
     /// environment it selected. Enrolling and forgetting change the record and nothing else.
+    ///
+    /// None of the three takes a deadline: the record changes nothing a window decides. Each asks
+    /// the check every service asks, on the registration `carried` names, again after it has the
+    /// record's lock and before the effect it guards, because waiting for that lock can outlast a
+    /// fence this host owes or the registration the change was admitted under.
     pub(super) async fn environment_record(
-        &self,
+        self: &Arc<Self>,
         actor: &kr_protocol::actor::ActorEnvelope,
         mutation: &MutationRequest,
         method: Method,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         use kr_protocol::identity::{
             EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentForgetParams,
@@ -198,11 +204,19 @@ impl Controller {
 
         let state_dir = self.paths.state_dir().to_path_buf();
         let now_ms = wall_clock_ms();
+        let carried = crate::authority::AdmittedMutation {
+            deadline: None,
+            ..carried
+        };
+        let controller = Arc::clone(self);
+        let asked: Arc<dyn Fn() -> Result<()> + Send + Sync> =
+            Arc::new(move || controller.check_registration(&carried));
         match method {
             Method::EnvironmentEnrol => {
                 let params: EnvironmentEnrolParams = parse(&mutation.params)?;
                 let row = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        asked()?;
                         store.enrol(params.enrolment, now_ms)
                     })
                 })
@@ -214,6 +228,7 @@ impl Controller {
                 let params: EnvironmentForgetParams = parse(&mutation.params)?;
                 let forgotten = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        asked()?;
                         store.forget(params.environment_id)
                     })
                 })
@@ -255,10 +270,12 @@ impl Controller {
                 }
 
                 let observing = state_dir.clone();
+                let asked_in_the_lock = Arc::clone(&asked);
                 // The platform command is a blocking one, and it is run on a blocking thread so a
                 // distribution that takes seconds to start does not hold this runtime.
                 let refreshed = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&observing, |store| {
+                        asked_in_the_lock()?;
                         store.refresh(
                             params.environment_id,
                             params.start,
@@ -288,6 +305,8 @@ impl Controller {
                             .to_owned(),
                     )
                 } else {
+                    // Opening a bridge reaches into another environment, after waits of its own.
+                    asked()?;
                     let opened_for = row.enrolment.clone();
                     match crate::bridge::verify::through_bridge(
                         actor,
