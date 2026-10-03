@@ -655,6 +655,7 @@ async fn a_viewer_reaches_only_the_distribution_it_was_paired_with() {
             "own": viewer.endpoint.environment_id,
             "other": other.environment_id,
             "other_closed_the_viewer_with_code": code,
+            "reason": String::from_utf8_lossy(&close.reason),
         }),
     );
 }
