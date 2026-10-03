@@ -4554,6 +4554,7 @@ dependencies = [
  "kr-describe",
  "kr-ipc",
  "kr-protocol",
+ "kr-worker",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "sha2 0.11.0",

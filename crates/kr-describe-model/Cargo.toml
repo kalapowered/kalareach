@@ -15,6 +15,9 @@ publish.workspace = true
 # model runtime.
 kr-describe.workspace = true
 kr-protocol.workspace = true
+# The privacy generation a benchmarked answer is validated under, which the description service's
+# own types carry.
+kr-worker.workspace = true
 # The runtime. CPU only: no GPU or accelerator feature is asked for here, and every profile this
 # crate will load records zero GPU layers.
 llama-cpp-2.workspace = true
