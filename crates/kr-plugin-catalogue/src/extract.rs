@@ -375,6 +375,8 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.10: a package that expands past the size its index declared is refused, and one
+    /// that stays within it is not.
     #[test]
     fn a_package_that_expands_past_its_declaration_is_refused() {
         let entry = entry();
