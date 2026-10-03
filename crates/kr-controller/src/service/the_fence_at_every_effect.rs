@@ -1650,3 +1650,122 @@ async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_
         .expect_err("a refresh is stopped while a fence is owed");
     refused_for_a_fence(&refused.to_protocol_error());
 }
+
+/// KR-REQ-09.09, 09.12 and 26.16: what an ssh host's helper answered is written to the enrolment
+/// record only while this host owes no fence. The control: with nothing owed, a refusal takes back
+/// the scoped channel an earlier answer established. With a fence that lands after the helper has
+/// answered, the refresh is refused for the fence and the channel stands. The refresh's actor is a
+/// paired device's, which no helper is started for, so the answer is the refusal and nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_answer_would_write() {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+    };
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: None,
+    };
+    let mut enrolment = enrolment_of(4);
+    enrolment.access = EnvironmentAccess::SshHost;
+    enrolment.target = "build.example".to_owned();
+    let environment_id = enrolment.environment_id;
+    let mut actor = super::routes::local_actor(actor_id, connection_id, controller.generation);
+    controller
+        .environment_record(
+            &actor,
+            false,
+            &mutation_of(
+                &temp,
+                Method::EnvironmentEnrol,
+                ParamsValue::from_typed(&EnvironmentEnrolParams { enrolment }).expect("encodes"),
+            ),
+            Method::EnvironmentEnrol,
+            carried,
+        )
+        .await
+        .expect("the ssh host is enrolled");
+    actor.ingress = kr_protocol::actor::ActorIngress::PairedDevice;
+
+    let state_dir = controller.paths.state_dir().to_path_buf();
+    // The scoped channel an earlier answer established, which a refusal takes back.
+    let establish = || {
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            let instance = store
+                .instance_of(environment_id)
+                .expect("an approved record");
+            store.record_bridge_outcome(
+                environment_id,
+                instance,
+                crate::bridge::store::BridgeAnswer::Answered,
+                0,
+            )
+        })
+        .expect("the channel is recorded");
+    };
+    let scoped = || {
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store
+                .row_of(environment_id, 0)
+                .expect("the record is there")
+                .readiness
+                .channel_scoped)
+        })
+        .expect("the record opens")
+    };
+    let refresh = || {
+        let controller = Arc::clone(&controller);
+        let actor = actor.clone();
+        let mutation = mutation_of(
+            &temp,
+            Method::EnvironmentRefresh,
+            ParamsValue::from_typed(&EnvironmentRefreshParams {
+                environment_id,
+                start: false,
+            })
+            .expect("encodes"),
+        );
+        async move {
+            controller
+                .environment_record(
+                    &actor,
+                    false,
+                    &mutation,
+                    Method::EnvironmentRefresh,
+                    carried,
+                )
+                .await
+        }
+    };
+
+    establish();
+    assert!(scoped(), "the channel is established");
+    refresh()
+        .await
+        .expect("with nothing owed the refresh is answered");
+    assert!(
+        !scoped(),
+        "with nothing owed the refusal took the channel back"
+    );
+
+    establish();
+    assert!(scoped(), "the channel is established again");
+    let refused = stopped_after_the_environment_record_is_taken(&controller, refresh(), || {
+        controller.hold_fence(true);
+    })
+    .await;
+    controller.hold_fence(false);
+    refused_for_a_fence(
+        &refused
+            .expect_err("a fence that landed after the answer stops its write")
+            .to_protocol_error(),
+    );
+    assert!(
+        scoped(),
+        "what the answer would have written was not written"
+    );
+}

@@ -1,7 +1,6 @@
 //! The host's own reads and records: host information, the environments, the doctor, agent tools,
 //! and the handover by which this daemon makes way for another installed release.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
@@ -349,7 +348,7 @@ impl Controller {
                     // stops it, as it stops the platform command and the bridge.
                     self.check_registration(&carried)?;
                     return self
-                        .register_ssh(actor, bridged, cached, approved, environment_id, now_ms)
+                        .register_ssh(actor, bridged, cached, approved, carried, now_ms)
                         .await;
                 }
                 if !cached.enrolment.access.is_process_bridge() {
@@ -421,14 +420,15 @@ impl Controller {
                             // than assumed, so the record keeps it — against the approved record
                             // the bridge was opened for, which another caller may have replaced
                             // since.
-                            let outcome = record_outcome(
-                                &state_dir,
-                                environment_id,
-                                instance,
-                                crate::bridge::store::BridgeAnswer::Answered,
-                                now_ms,
-                            )
-                            .await?;
+                            let outcome = self
+                                .record_outcome(
+                                    carried,
+                                    environment_id,
+                                    instance,
+                                    crate::bridge::store::BridgeAnswer::Answered,
+                                    now_ms,
+                                )
+                                .await?;
                             // The record decides, including when it has gone: the readiness that
                             // comes back is read from it after the result was written.
                             row.readiness = outcome.readiness;
@@ -448,14 +448,15 @@ impl Controller {
                             // Nothing answered. What an earlier bridge established for this record
                             // is not evidence about it any more, so it is taken back rather than
                             // left standing beside a failure.
-                            let outcome = record_outcome(
-                                &state_dir,
-                                environment_id,
-                                instance,
-                                crate::bridge::store::BridgeAnswer::Refused,
-                                now_ms,
-                            )
-                            .await?;
+                            let outcome = self
+                                .record_outcome(
+                                    carried,
+                                    environment_id,
+                                    instance,
+                                    crate::bridge::store::BridgeAnswer::Refused,
+                                    now_ms,
+                                )
+                                .await?;
                             row.readiness = outcome.readiness;
                             (Nullable::null(), refusal.to_string())
                         }
@@ -480,17 +481,17 @@ impl Controller {
     /// The evidence belongs to the approved record that was read with `cached`, and a refusal takes
     /// back what an earlier answer established for that record, exactly as for a process bridge.
     async fn register_ssh(
-        &self,
+        self: &Arc<Self>,
         actor: &kr_protocol::actor::ActorEnvelope,
         bridged: bool,
         cached: kr_protocol::identity::EnvironmentInventoryRow,
         instance: crate::bridge::store::EnrolmentInstance,
-        environment_id: kr_protocol::ids::EnvironmentId,
+        carried: crate::authority::AdmittedMutation,
         now_ms: u64,
     ) -> Result<ParamsValue> {
         use kr_protocol::identity::EnvironmentRefreshResult;
 
-        let state_dir = self.paths.state_dir().to_path_buf();
+        let environment_id = cached.enrolment.environment_id;
         let opened_for = cached.enrolment.clone();
         let mut row = cached;
         let (verification, connection) = match crate::bridge::verify::through_identity_probe(
@@ -503,14 +504,15 @@ impl Controller {
         .await
         {
             Ok(verification) => {
-                let outcome = record_outcome(
-                    &state_dir,
-                    environment_id,
-                    instance,
-                    crate::bridge::store::BridgeAnswer::Answered,
-                    now_ms,
-                )
-                .await?;
+                let outcome = self
+                    .record_outcome(
+                        carried,
+                        environment_id,
+                        instance,
+                        crate::bridge::store::BridgeAnswer::Answered,
+                        now_ms,
+                    )
+                    .await?;
                 row.readiness = outcome.readiness;
                 let detail = if outcome.established {
                     format!(
@@ -526,14 +528,15 @@ impl Controller {
                 (Nullable::some(verification), detail)
             }
             Err(refusal) => {
-                let outcome = record_outcome(
-                    &state_dir,
-                    environment_id,
-                    instance,
-                    crate::bridge::store::BridgeAnswer::Refused,
-                    now_ms,
-                )
-                .await?;
+                let outcome = self
+                    .record_outcome(
+                        carried,
+                        environment_id,
+                        instance,
+                        crate::bridge::store::BridgeAnswer::Refused,
+                        now_ms,
+                    )
+                    .await?;
                 row.readiness = outcome.readiness;
                 (Nullable::null(), refusal.to_string())
             }
@@ -867,26 +870,39 @@ impl Controller {
     }
 }
 
-/// Writes what one opened bridge did to the enrolment record, and reads back what it says then.
-///
-/// The record is a file under a lock, so this runs on a blocking thread. Both of a refresh's
-/// branches come through here, which is why neither of them has a readiness of its own to assemble:
-/// what comes back is the record's own answer, taken after the result was written.
-async fn record_outcome(
-    state_dir: &Path,
-    environment_id: kr_protocol::ids::EnvironmentId,
-    opened_for: crate::bridge::store::EnrolmentInstance,
-    answer: crate::bridge::store::BridgeAnswer,
-    now_ms: u64,
-) -> Result<crate::bridge::store::BridgeOutcome> {
-    let state_dir = state_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        crate::bridge::store::Store::with_locked(&state_dir, |store| {
-            store.record_bridge_outcome(environment_id, opened_for, answer, now_ms)
+impl Controller {
+    /// Writes what one opened bridge did to the enrolment record, and reads back what it says then.
+    ///
+    /// The record is a file under a lock, so this runs on a blocking thread. Both of a refresh's
+    /// branches, and its ssh host's, come through here, which is why none of them has a readiness
+    /// of its own to assemble: what comes back is the record's own answer, taken after the result
+    /// was written.
+    ///
+    /// The write is made only here, and only under the registration the refresh was admitted
+    /// under: the helper or the bridge answered after waits of its own, and a fence this host owes,
+    /// or a registration withdrawn in that time, stops the write as it stops every other effect.
+    async fn record_outcome(
+        self: &Arc<Self>,
+        carried: crate::authority::AdmittedMutation,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        opened_for: crate::bridge::store::EnrolmentInstance,
+        answer: crate::bridge::store::BridgeAnswer,
+        now_ms: u64,
+    ) -> Result<crate::bridge::store::BridgeOutcome> {
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let controller = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                #[cfg(feature = "testing")]
+                controller.after_the_environment_record_is_taken.wait();
+                controller.under_registration(&carried, || {
+                    store.record_bridge_outcome(environment_id, opened_for, answer, now_ms)
+                })?
+            })
         })
-    })
-    .await
-    .map_err(|error| ControllerError::supervision(error.to_string()))?
+        .await
+        .map_err(|error| ControllerError::supervision(error.to_string()))?
+    }
 }
 
 fn whoami() -> String {
