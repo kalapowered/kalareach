@@ -18,7 +18,8 @@ outside Wasmtime. The package's installation grant says so before anything is in
 
 ## What the package installs
 
-Three files under the user's own Claude Code directory, and one settings key:
+The package's installation adds a registration, consisting of three files in the user's own Claude
+Code directory and one settings key:
 
 | File | What it registers |
 | --- | --- |
@@ -77,10 +78,10 @@ variable names no launch it could have been given.
 The worker writes two files for every launch it makes, both inside its owner-only runtime
 directory:
 
-- The registration file: one `name=value` line each for the endpoint, the launch profile, the
+- The registration file holds one `name=value` line each for the endpoint, the launch profile, the
   application instance, the process it launched and its start value, the credential file, and the
   framing. Nothing in it is secret.
-- The credential file: the launch's private exchange, 64 hexadecimal characters, written owner-only
+- The credential file is the launch's private exchange, 64 hexadecimal characters written owner-only
   beside the registration.
 
 The launched application's environment names one of them: `KR_REGISTRATION` is the registration's
@@ -190,7 +191,7 @@ before they detach.
 
 ## Admission
 
-The forwarder connects to the endpoint and writes one line before anything else:
+The forwarder connects to the endpoint, then writes a single line before anything else:
 
 ```
 {"kr_hello":{"credential":"<hex>","pid":4242,"start":381742,"session":null,"headers":{},
@@ -273,7 +274,7 @@ tick.
 
 The newest report decides the thread. A `SessionStart` for a resume, a clear or a fork is a new
 selection even of the thread already selected, so the binding advances; one for a compaction
-continues the thread and changes nothing. An older report still matters when its hook started after,
+continues the thread and changes nothing. An older report still counts when its hook started after,
 or in the same tick as, the report that began the binding's current revision: a thread starting or
 ending there, or another thread going on, is a switch the worker learned of late, and a question
 bound to that revision may have been asked across it. So the binding advances to a new revision of

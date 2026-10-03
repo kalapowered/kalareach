@@ -15,10 +15,10 @@ worker admits it only where the installation it recorded for the launch is Qoder
 
 ## What the launch adds
 
-Two elements, after the command name and before whatever the person typed: `--settings`, and the
-inline JSON that follows it. The core repository keeps them in `fixtures/bridges/qoder-cli/flags.json`,
-pinned by their SHA-256 digest, and `crates/kr-hook/tests/fixtures.rs` checks that the JSON holds
-hooks and nothing else.
+The flags are two elements, placed after the command name and before whatever the person typed:
+`--settings` and the inline JSON that follows it. The core repository keeps them in
+`fixtures/bridges/qoder-cli/flags.json`, pinned by their SHA-256 digest, and
+`crates/kr-hook/tests/fixtures.rs` checks that the JSON holds hooks and nothing else.
 
 | Event | Timeout |
 | --- | --- |
