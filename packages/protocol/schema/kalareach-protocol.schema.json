@@ -16844,6 +16844,11 @@
           "const": "worker",
           "description": "A worker connecting to the control daemon.",
           "type": "string"
+        },
+        {
+          "const": "app",
+          "description": "The companion app's own host connection.\n\nIt says whose environment a session the client creates is started with: an app has no\nshell of its own to take one from, so the host gives such a session the environment of its\nown execution context. It confers nothing else, as no kind does.",
+          "type": "string"
         }
       ]
     },
