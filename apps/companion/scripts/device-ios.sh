@@ -236,6 +236,7 @@ read_search_list() {
 signing_lock=""
 signing_child=""
 signing_start=""
+signing_go=""
 signing_paths=()
 signing_before=""
 signing_ended=1
@@ -261,31 +262,41 @@ end_signing() {
   return 1
 }
 
-# Whether the signing command is still the process this shell started: its number, its state and the start
-# time read right after it was started all have to agree. Bash can collect a command that has ended before
-# this shell waits for it, and its number could then belong to another process, so the number alone is
-# never signalled.
-signing_command_runs() {
-  local stat
-  [ -n "$signing_child" ] && [ -n "$signing_start" ] || return 1
+# Whether the signing command is still the process this shell started, by its number, its state and the
+# start time it was held for (see with_signing_keychain). 0: it is. 1: it is not, because it has ended or
+# the number is another process's, which a readable and different start time shows. 2: not known, because
+# its state or start time cannot be read: a read that fails is no answer, and nothing is signalled on it.
+# Bash can collect a command that has ended before this shell waits for it, so the number alone is never
+# signalled.
+signing_command_state() {
+  local stat now
+  kill -0 "$signing_child" 2>/dev/null || return 1
+  [ -n "$signing_start" ] || return 2
   stat=$(ps -o stat= -p "$signing_child" 2>/dev/null | tr -d ' ')
-  case $stat in '' | Z*) return 1 ;; esac
-  [ "$(process_start "$signing_child")" = "$signing_start" ]
+  case $stat in Z*) return 1 ;; '') return 2 ;; esac
+  now=$(process_start "$signing_child")
+  [ -n "$now" ] || return 2
+  [ "$now" = "$signing_start" ] && return 0
+  return 1
 }
 
 # Stops the signing command, and answers once it has ended. The command starts with the signals this
 # shell ignores, and puts the default ones back as its first act, so a TERM that comes before that act
-# has no effect on it: the TERM is sent again every tenth of a second, while the command is still the
-# process that was started, until it has ended, and the command is killed if it has not ended after five
-# seconds. A command whose identity cannot be read is not signalled, and is waited for.
+# has no effect on it: the TERM is sent again every tenth of a second, while the command is known to be the
+# process that was started, until it has ended or five seconds have passed, and only then is it killed, and
+# only if it is still known to be that process. A command that is not known is not signalled, and is
+# waited for.
 stop_signing_command() {
-  local turns=0
-  while signing_command_runs && [ "$turns" -lt 50 ]; do
-    kill "$signing_child" 2>/dev/null
+  local turns=0 state
+  while [ "$turns" -lt 50 ]; do
+    signing_command_state; state=$?
+    [ "$state" = 1 ] && break
+    [ "$state" = 0 ] && kill "$signing_child" 2>/dev/null
     sleep 0.1
     turns=$((turns + 1))
   done
-  if signing_command_runs; then
+  signing_command_state; state=$?
+  if [ "$state" = 0 ]; then
     say "the signing command did not stop at TERM: killing it"
     kill -9 "$signing_child" 2>/dev/null
   fi
@@ -338,10 +349,19 @@ with_signing_keychain() { # <command...>
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
     # The command puts the default signals back as its first act, whatever this shell is ignoring, so that
-    # a TERM stops it; a TERM that comes before that act is sent again by the handler.
-    ( trap - INT TERM HUP; exec "$@" ) &
+    # a TERM stops it; a TERM that comes before that act is sent again by the handler. It is then held at a
+    # gate until its start time has been read, so that it cannot end by itself, and its number become
+    # another process's, before it is known: it does not start if the gate is not opened within five seconds.
+    signing_go="$work/signing.go"
+    rm -f "$signing_go"
+    ( trap - INT TERM HUP
+      waited=0
+      until [ -e "$signing_go" ] || [ "$waited" -ge 250 ]; do sleep 0.02; waited=$((waited + 1)); done
+      [ -e "$signing_go" ] || exit 1
+      exec "$@" ) &
     signing_child=$!
     signing_start=$(process_start "$signing_child")
+    : > "$signing_go"
     trap 'signing_interrupted 130' INT
     trap 'signing_interrupted 143' TERM
     trap 'signing_interrupted 129' HUP
@@ -350,6 +370,7 @@ with_signing_keychain() { # <command...>
     trap '' INT TERM HUP
     signing_child=""
     signing_start=""
+    rm -f "$signing_go"
   else
     status=2
   fi
@@ -544,15 +565,21 @@ retire_driver() { # <pid>
 # both of which have to agree. 1: it is not, for a number that is gone or has ended (a process that has
 # ended and is not yet collected counts as ended), or has neither the recorded start time nor the recorded
 # result bundle in its command line. 2: doubtful, a live process that has one of the two and not the other,
-# or whose state cannot be read, which is no process to touch and none to pass over.
+# or of which nothing can be read: a read that fails is no answer, so it is no process to touch and none to
+# pass over.
 driver_state() { # <pid> <start time> <result bundle>
-  local stat started=0 named=0
+  local stat now command started=0 named=0
   kill -0 "$1" 2>/dev/null || return 1
   stat=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')
   case $stat in Z*) return 1 ;; esac
-  if [ -z "$stat" ]; then kill -0 "$1" 2>/dev/null && return 2; return 1; fi
-  [ "$(process_start "$1")" = "$2" ] && started=1
-  ps -ww -o command= -p "$1" 2>/dev/null | grep -qF -- "$3" && named=1
+  now=$(process_start "$1")
+  command=$(ps -ww -o command= -p "$1" 2>/dev/null)
+  if [ -z "$stat" ] || { [ -z "$now" ] && [ -z "$command" ]; }; then
+    kill -0 "$1" 2>/dev/null && return 2
+    return 1
+  fi
+  [ "$now" = "$2" ] && started=1
+  printf '%s' "$command" | grep -qF -- "$3" && named=1
   [ $((started + named)) = 2 ] && return 0
   [ $((started + named)) = 0 ] && return 1
   return 2
@@ -841,10 +868,12 @@ report() { # <output>
 # the process that has the number after the driver ended is never touched, and one that cannot be told
 # from the driver stops the clean-up.
 stop_recorded_driver() {
-  local entry pid started result waited state
+  local entries entry pid started result waited state
   mkdir "$record.gate" 2>/dev/null
   [ -d "$record.gate" ] || { say "THE GATE AGAINST A NEW TEST RUN COULD NOT BE CLOSED: nothing is cleaned up"; exit 3; }
+  entries=$(sed -n 's/^runner=//p' "$record") || { say "THE RECORD COULD NOT BE READ: nothing is cleaned up"; exit 3; }
   while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
     pid=${entry%%|*}; entry=${entry#*|}
     started=${entry%%|*}
     result=${entry#*|}
@@ -852,7 +881,7 @@ stop_recorded_driver() {
     driver_state "$pid" "$started" "$result"; state=$?
     [ "$state" = 1 ] && continue
     if [ "$state" = 2 ]; then
-      say "A PROCESS THAT MAY BE THE TEST RUN $pid DIFFERS FROM THE RECORD IN ITS START TIME OR ITS COMMAND LINE: nothing is cleaned up"
+      say "A PROCESS THAT MAY BE THE TEST RUN $pid IS NOT CERTAINLY IT BY ITS START TIME AND ITS COMMAND LINE, OR CANNOT BE READ: nothing is cleaned up"
       exit 3
     fi
     say "stopping the test run $pid that the record names"
@@ -865,7 +894,7 @@ stop_recorded_driver() {
       driver_state "$pid" "$started" "$result"; state=$?
     fi
     if [ "$state" != 1 ]; then say "THE TEST RUN $pid WOULD NOT STOP, OR CAN NO LONGER BE TOLD FROM ANOTHER PROCESS: nothing is cleaned up"; exit 3; fi
-  done < <(sed -n 's/^runner=//p' "$record")
+  done <<< "$entries"
 }
 
 cleanup() {
