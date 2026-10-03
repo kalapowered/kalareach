@@ -238,7 +238,11 @@ async fn kr_req_11_43_a_session_identifier_alone_or_a_borrowed_identity_is_refus
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused() {
     let placed = Placed::new();
-    let elsewhere = placed.host.root().join("bin").join("kr-hook-elsewhere");
+    let elsewhere = placed
+        .host
+        .root()
+        .join("bin")
+        .join(format!("kr-hook-elsewhere{}", std::env::consts::EXE_SUFFIX));
     kr_ipc::testing::place_program(&placed.forwarder, &elsewhere);
     let mut launch = launched::Launch::start(
         &placed,

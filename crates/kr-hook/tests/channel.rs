@@ -237,7 +237,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
     );
 
     // Claude Code closes its end.
-    drop(launch.requests.take());
+    launch.close_input();
     assert_eq!(exit_code(&launch), Some(0));
     assert_eq!(
         to_worker(&mut admitted).await,
@@ -452,7 +452,7 @@ async fn nothing_left(_application: u32, forwarder: &std::path::Path) {
                 "-Command",
                 "Get-Process -Name kr-hook -ErrorAction SilentlyContinue | \
                  Where-Object { $_.Path -eq $env:KR_FORWARDER } | \
-                 ForEach-Object { $_.Id }",
+                 ForEach-Object { $_.Id }; exit 0",
             ])
             .env("KR_FORWARDER", forwarder)
             .output()

@@ -30,6 +30,9 @@ const RELAY_DEADLINE: Duration = kr_hook::relay::REGISTRATION_APPEARS_WITHIN;
 struct Launch {
     placed: Placed,
     directory: PathBuf,
+    /// The runtime the listeners of this launch are bound and accepted on: a named pipe is bound to
+    /// the runtime that is current where it is made.
+    runtime: tokio::runtime::Runtime,
 }
 
 impl Launch {
@@ -43,7 +46,15 @@ impl Launch {
             CREDENTIAL.as_bytes(),
         )
         .expect("the credential is published");
-        Self { placed, directory }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        Self {
+            placed,
+            directory,
+            runtime,
+        }
     }
 
     fn registration(&self) -> PathBuf {
@@ -62,8 +73,27 @@ impl Launch {
 
     /// A listener at an endpoint of its own, and the address a registration names it by.
     fn listen(&self, name: &str) -> (String, StandIn) {
+        let _bound_here = self.runtime.enter();
         let stand_in = StandIn::bind(&self.directory, name);
         (stand_in.address.clone(), stand_in)
+    }
+
+    /// The one connection that reaches `listener` within `within`, if one does.
+    fn accepted(
+        &self,
+        listener: &StandIn,
+        within: Duration,
+    ) -> Option<kr_ipc::endpoint::Connection> {
+        self.runtime
+            .block_on(tokio::time::timeout(within, listener.listener.accept()))
+            .ok()
+            .map(|accepted| accepted.expect("the listener serves").0)
+    }
+
+    /// The hello the forwarder writes before anything else.
+    fn hello(&self, mut stream: kr_ipc::endpoint::Connection) -> serde_json::Value {
+        let line = self.runtime.block_on(common::read_line(&mut stream));
+        serde_json::from_slice(&line).expect("the hello is JSON")
     }
 
     /// Writes the registration in place, the way a writer that is not whole-or-nothing does.
@@ -97,28 +127,6 @@ fn whole(endpoint: &str, credential: &Path) -> String {
     )
 }
 
-/// The runtime a test drives its listener with.
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime")
-}
-
-/// The one connection that reaches `listener` within `within`, if one does.
-fn accepted(listener: &StandIn, within: Duration) -> Option<kr_ipc::endpoint::Connection> {
-    runtime()
-        .block_on(tokio::time::timeout(within, listener.listener.accept()))
-        .ok()
-        .map(|accepted| accepted.expect("the listener serves").0)
-}
-
-/// The hello the forwarder writes before anything else.
-fn hello(mut stream: kr_ipc::endpoint::Connection) -> serde_json::Value {
-    let line = runtime().block_on(common::read_line(&mut stream));
-    serde_json::from_slice(&line).expect("the hello is JSON")
-}
-
 fn stop(mut relay: std::process::Child) {
     let _ = relay.kill();
     let _ = relay.wait();
@@ -138,11 +146,13 @@ fn kr_req_12_14_an_empty_registration_is_read_again_until_it_is_whole() {
         relay.try_wait().expect("readable").is_none(),
         "an empty registration is not the end of the wait"
     );
-    assert!(accepted(&listener, Duration::ZERO).is_none());
+    assert!(launch.accepted(&listener, Duration::ZERO).is_none());
 
     launch.publish(&launch.whole(&endpoint));
-    let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
-    let said = hello(reached);
+    let reached = launch
+        .accepted(&listener, LIVENESS)
+        .expect("the relay reaches the endpoint");
+    let said = launch.hello(reached);
     assert_eq!(said["kr_hello"]["credential"], CREDENTIAL);
     assert_eq!(said["kr_hello"]["pid"], relay.id());
     stop(relay);
@@ -173,13 +183,15 @@ fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
     launch.write_in_place(every_field.strip_suffix('\n').expect("the last line break"));
     std::thread::sleep(Duration::from_secs(1));
     assert!(relay.try_wait().expect("readable").is_none());
-    assert!(accepted(&decoy_listener, Duration::ZERO).is_none());
+    assert!(launch.accepted(&decoy_listener, Duration::ZERO).is_none());
 
     launch.publish(&launch.whole(&endpoint));
-    let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
-    assert_eq!(hello(reached)["kr_hello"]["credential"], CREDENTIAL);
+    let reached = launch
+        .accepted(&listener, LIVENESS)
+        .expect("the relay reaches the endpoint");
+    assert_eq!(launch.hello(reached)["kr_hello"]["credential"], CREDENTIAL);
     assert!(
-        accepted(&decoy_listener, Duration::ZERO).is_none(),
+        launch.accepted(&decoy_listener, Duration::ZERO).is_none(),
         "the endpoint a partial record named is never reached"
     );
     stop(relay);
@@ -219,7 +231,7 @@ fn kr_req_12_14_a_registration_that_never_becomes_whole_ends_the_forwarder_at_it
         said.contains("was not a whole registration within"),
         "{said}"
     );
-    assert!(accepted(&listener, Duration::ZERO).is_none());
+    assert!(launch.accepted(&listener, Duration::ZERO).is_none());
 }
 
 /// KR-REQ-05.09: the forwarder needs one variable. The credential it presents is the one in the
@@ -244,9 +256,11 @@ fn kr_req_05_09_the_credential_is_the_one_the_registration_names() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let relay = relay.spawn().expect("the relay starts");
-    let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
+    let reached = launch
+        .accepted(&listener, LIVENESS)
+        .expect("the relay reaches the endpoint");
     assert_eq!(
-        hello(reached)["kr_hello"]["credential"],
+        launch.hello(reached)["kr_hello"]["credential"],
         CREDENTIAL,
         "the exchange is the registration's own"
     );
@@ -291,7 +305,7 @@ fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
             "{why}: {said}"
         );
         assert!(
-            accepted(&listener, Duration::ZERO).is_none(),
+            launch.accepted(&listener, Duration::ZERO).is_none(),
             "{why}: nothing is reached"
         );
         std::fs::remove_file(launch.registration()).expect("the registration is removed");
@@ -342,7 +356,7 @@ fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
             .expect("the diagnostics are read");
         assert!(said.contains("could not be read"), "{what}: {said}");
         assert!(
-            accepted(&listener, Duration::ZERO).is_none(),
+            launch.accepted(&listener, Duration::ZERO).is_none(),
             "{what}: nothing is reached through a linked credential"
         );
     }

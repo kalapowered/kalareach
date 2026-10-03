@@ -583,6 +583,20 @@ impl Launch {
         request
     }
 
+    /// Closes the application's input, as the application's own end of a connection closes when it
+    /// goes: what reads it then reads the end.
+    ///
+    /// On Windows the host keeps a handle on the pipe for the agent's stop, so a test that only
+    /// dropped its own would leave the pipe open.
+    pub fn close_input(&mut self) {
+        let Some(input) = self.requests.take() else {
+            return;
+        };
+        #[cfg(windows)]
+        input.close().expect("the application's input is closed");
+        drop(input);
+    }
+
     /// Accepts one bridge connection, within the liveness bound.
     pub async fn accept(&self) -> Result<AdmittedBridge, BrokerError> {
         tokio::time::timeout(LIVENESS, self.gateway.accept_bridge())
