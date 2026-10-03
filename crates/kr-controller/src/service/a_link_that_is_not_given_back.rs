@@ -444,8 +444,11 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
 
 /// An endpoint that proves itself as a worker and answers the handshake, and ends its side of every
 /// connection once `close` is raised, counting each it ended.
+///
+/// Each connection watches `close` from the moment it is accepted, so raising it is seen by a
+/// connection that is between two frames as well as by one that is waiting for the next.
 fn closing(
-    close: Arc<tokio::sync::Notify>,
+    close: Arc<tokio::sync::watch::Sender<bool>>,
     ended: Arc<AtomicUsize>,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
     move |listener, identity, endpoint_text| {
@@ -456,14 +459,14 @@ fn closing(
                 };
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
-                let close = Arc::clone(&close);
+                let mut closed = close.subscribe();
                 let ended = Arc::clone(&ended);
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     loop {
                         tokio::select! {
-                            () = close.notified() => break,
+                            _ = closed.changed() => break,
                             read = reader.read_message::<ControlFrame>() => {
                                 let Ok(frame) = read else { break };
                                 let answers = world::handshake(
@@ -525,7 +528,7 @@ async fn a_delivery_confirmed_over_a_link_that_takes_it_keeps_the_link_and_the_l
 /// caller opens a link of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
-    let close = Arc::new(tokio::sync::Notify::new());
+    let close = Arc::new(tokio::sync::watch::channel(false).0);
     let ended = Arc::new(AtomicUsize::new(0));
     let silent = world::fake_world(closing(Arc::clone(&close), Arc::clone(&ended))).await;
     world::acknowledged(&silent.controller, silent.session_id);
@@ -539,7 +542,7 @@ async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
     assert!(leases(controller, silent.session_id));
 
     // The worker ends its side of the connection; the daemon holds a link to nothing.
-    close.notify_waiters();
+    close.send_replace(true);
     until("the worker ended its side", || {
         ended.load(Ordering::SeqCst) >= 1
     })
@@ -549,10 +552,14 @@ async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
     // its program. So the worker having dropped its connection does not yet make a write to it
     // fail, and the notice is asked for once the daemon's own read of the link says the worker is
     // gone.
+    assert!(
+        slot_holds_a_link(controller, silent.session_id).await,
+        "the daemon's link to the worker is still in its slot"
+    );
     let mut link = controller
         .worker_client(&silent.worker)
         .await
-        .expect("the link is in its slot");
+        .expect("the slot's link is taken");
     tokio::time::timeout(WAIT, link.client().recv())
         .await
         .expect("the daemon's link learns that its worker has gone")
