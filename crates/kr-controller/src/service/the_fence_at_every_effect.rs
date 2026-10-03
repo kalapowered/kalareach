@@ -160,7 +160,9 @@ async fn a_fence_this_host_owes_stops_a_local_retrys_retained_answer() {
     assert!(error.message.contains("fence"), "{error:?}");
 
     controller.hold_fence(false);
-    let answered = controller.perform(&actor_id, connection_id, None, mutation).await;
+    let answered = controller
+        .perform(&actor_id, connection_id, None, mutation)
+        .await;
     assert!(
         refusal(&answered).is_none(),
         "once the fence is gone the retry is answered again: {answered:?}"
@@ -179,7 +181,11 @@ async fn a_registration_replaced_while_a_retry_waits_stops_its_retained_answer()
     let (arrived, release) = controller.pause_retained_lookup();
     let retrying = tokio::spawn({
         let controller = Arc::clone(&controller);
-        async move { controller.perform(&actor_id, connection_id, None, mutation).await }
+        async move {
+            controller
+                .perform(&actor_id, connection_id, None, mutation)
+                .await
+        }
     });
     tokio::time::timeout(Duration::from_secs(30), arrived)
         .await
@@ -221,7 +227,9 @@ async fn a_retained_answer_outlives_the_window_that_admitted_its_action() {
 
     clock.advance(STANDING * 10);
 
-    let answered = controller.perform(&actor_id, connection_id, None, mutation).await;
+    let answered = controller
+        .perform(&actor_id, connection_id, None, mutation)
+        .await;
     assert!(
         refusal(&answered).is_none(),
         "the receipt is read after its window is gone: {answered:?}"
