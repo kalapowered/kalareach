@@ -661,6 +661,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&private);
     }
 
+    /// A job that answers from a script, so that a query or a termination can fail where the
+    /// operating system will not fail on request.
+    struct Scripted {
+        listings: std::sync::Mutex<std::collections::VecDeque<std::io::Result<Vec<u32>>>>,
+        terminated: std::sync::atomic::AtomicBool,
+        terminates: bool,
+    }
+
+    impl Scripted {
+        fn new(listings: Vec<std::io::Result<Vec<u32>>>, terminates: bool) -> Self {
+            Self {
+                listings: std::sync::Mutex::new(listings.into()),
+                terminated: std::sync::atomic::AtomicBool::new(false),
+                terminates,
+            }
+        }
+
+        /// The next answer; the last one is the answer from then on.
+        fn list(&self) -> std::io::Result<Vec<u32>> {
+            let mut listings = self.listings.lock().expect("the script");
+            let next = if listings.len() > 1 {
+                listings.pop_front().expect("an answer")
+            } else {
+                match listings.front().expect("an answer") {
+                    Ok(held) => Ok(held.clone()),
+                    Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                }
+            };
+            if self.terminated.load(std::sync::atomic::Ordering::SeqCst) && self.terminates {
+                return Ok(Vec::new());
+            }
+            next
+        }
+
+        fn terminate(&self) -> std::io::Result<()> {
+            self.terminated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.terminates {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("the job would not end"))
+            }
+        }
+    }
+
+    async fn followed(job: &Scripted) -> BackendStop {
+        follow_job(
+            || job.list(),
+            || job.terminate(),
+            || {},
+            std::time::Duration::from_secs(1),
+        )
+        .await
+    }
+
+    /// KR-REQ-07.67: a stop whose query of the job failed at any point is not reported complete,
+    /// even when a later query answered that the job is empty. Control: the same stop with every
+    /// query answered is complete.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_67_a_job_query_that_failed_leaves_the_stop_unresolved() {
+        let answered = Scripted::new(vec![Ok(vec![7]), Ok(Vec::new())], true);
+        let stop = followed(&answered).await;
+        assert!(stop.asked && stop.ended && !stop.forced);
+        assert!(!stop.unresolved, "every query answered, so it is complete");
+        let failed = Scripted::new(
+            vec![
+                Err(std::io::Error::other("the job would not say")),
+                Ok(Vec::new()),
+            ],
+            true,
+        );
+        let stop = followed(&failed).await;
+        assert!(stop.ended, "the job listed nothing in the end");
+        assert!(
+            stop.unresolved,
+            "a query failed on the way, so it is not complete"
+        );
+    }
+
+    /// KR-REQ-07.67: a termination that failed and left the job holding something is unresolved.
+    /// Control: a termination that worked ends the job and the stop is complete.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_67_a_termination_that_failed_leaves_the_stop_unresolved() {
+        let works = Scripted::new(vec![Ok(vec![7])], true);
+        let stop = followed(&works).await;
+        assert!(stop.forced && stop.ended && !stop.unresolved);
+        let fails = Scripted::new(vec![Ok(vec![7])], false);
+        let stop = followed(&fails).await;
+        assert!(
+            stop.forced && !stop.ended,
+            "the job still holds what it held"
+        );
+        assert!(stop.unresolved);
+    }
+
     #[test]
     fn a_transcript_tail_cannot_carry_forwarding() {
         assert!(!BrokerTransport::TranscriptTail.carries_forwarding());
@@ -758,26 +853,56 @@ async fn stop_job(
             let _ = writer.close();
         }
     };
+    follow_job(
+        || stopper.job.process_ids(),
+        || stopper.job.terminate(1),
+        close,
+        grace,
+    )
+    .await
+}
+
+/// Follows one job through a stop: what it holds is listed, the agent's input is closed, the grace
+/// period is given to everything the job holds, and then the job is terminated.
+///
+/// The stop is complete only when the job lists nothing. What could not be established is never
+/// reported as a stop: a query of the job that failed at any point leaves the stop unresolved, even
+/// when a later one answered, and so does a termination that failed and left something in it.
+#[cfg(any(windows, test))]
+async fn follow_job(
+    list: impl Fn() -> std::io::Result<Vec<u32>> + Sync,
+    terminate: impl Fn() -> std::io::Result<()> + Sync,
+    close: impl FnOnce() + Send + 'static,
+    grace: std::time::Duration,
+) -> BackendStop {
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let look = || {
+        let listing = list();
+        if listing.is_err() {
+            failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        listing
+    };
+    let failed_at_all = || failed.load(std::sync::atomic::Ordering::SeqCst);
     let emptied = |listing: &std::io::Result<Vec<u32>>| listing.as_ref().is_ok_and(Vec::is_empty);
-    let first = stopper.job.process_ids();
+    let first = look();
+    let _ = tokio::task::spawn_blocking(close).await;
     if emptied(&first) {
-        let _ = tokio::task::spawn_blocking(close).await;
         return BackendStop {
             asked: false,
             forced: false,
             ended: true,
-            unresolved: false,
+            unresolved: failed_at_all(),
         };
     }
-    let _ = tokio::task::spawn_blocking(close).await;
     let deadline = tokio::time::Instant::now() + grace;
     loop {
-        if emptied(&stopper.job.process_ids()) {
+        if emptied(&look()) {
             return BackendStop {
                 asked: true,
                 forced: false,
                 ended: true,
-                unresolved: false,
+                unresolved: failed_at_all(),
             };
         }
         if tokio::time::Instant::now() >= deadline {
@@ -785,11 +910,11 @@ async fn stop_job(
         }
         tokio::time::sleep(BACKEND_POLL).await;
     }
-    let terminated = stopper.job.terminate(1);
+    let terminated = terminate();
     // A termination is not instant either: the job is looked at until it is empty, within a bound.
     let confirm = tokio::time::Instant::now() + FORCED_CONFIRMATION;
     let listing = loop {
-        let listing = stopper.job.process_ids();
+        let listing = look();
         if emptied(&listing) || tokio::time::Instant::now() >= confirm {
             break listing;
         }
@@ -800,9 +925,7 @@ async fn stop_job(
         asked: true,
         forced: true,
         ended,
-        // What could not be established is never reported as a stop: a job that would not say what
-        // it holds, or a termination that failed and left something in it.
-        unresolved: listing.is_err() || (terminated.is_err() && !ended),
+        unresolved: failed_at_all() || (terminated.is_err() && !ended),
     }
 }
 

@@ -793,40 +793,54 @@ async fn kr_req_07_67_a_root_that_is_gone_with_helpers_alive_is_not_a_complete_s
 }
 
 /// KR-REQ-07.67: a stop cancels a write to the backend's input that is blocked, so the stop is not
-/// held by a backend that never reads: the write fails by the stop's own word and not because the
-/// backend died, and the backend is ended.
+/// held by a backend that never reads: the write fails by the stop's own word, which is the
+/// cancellation's and not the closing of a pipe that nobody was writing to, and the backend is
+/// ended.
 ///
-/// The write is one megabyte to a pipe that holds sixty-four kilobytes of a backend that never
-/// reads, so it blocks from the moment it begins until something ends it. What ended it is read
-/// from the error: the stop's word for a write it cancelled, or for an input it had closed already,
-/// and the system's own word when the backend's death closed the pipe under it.
+/// The writer writes four kilobytes at a time to a pipe that holds sixty-four of a backend that
+/// never reads, and counts what it wrote. The stop is made only once the count has stopped moving
+/// with the writer still writing: that is a write blocked in the system, which is what is being
+/// stopped, and the write that ends is then ended by the cancellation or by nothing.
 #[tokio::test]
 async fn kr_req_07_67_a_stop_cancels_a_write_that_is_blocked() {
     let mut backend = Backend::launch("ping.exe", &["-n", "600", "127.0.0.1"]);
     let mut input = backend.child.stdin.take().expect("the backend's input");
-    let begun = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let signal = std::sync::Arc::clone(&begun);
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&written);
     let writing = std::thread::spawn(move || {
         use std::io::Write as _;
-        signal.store(true, std::sync::atomic::Ordering::SeqCst);
-        input.write(&vec![0_u8; 1 << 20])
+        loop {
+            match input.write(&[0_u8; 4096]) {
+                Ok(bytes) => {
+                    count.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(error) => return error,
+            }
+        }
     });
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !begun.load(std::sync::atomic::Ordering::SeqCst) {
-        assert!(Instant::now() < deadline, "the writer begins");
-        std::thread::sleep(Duration::from_millis(5));
+    let mut seen = usize::MAX;
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = written.load(std::sync::atomic::Ordering::SeqCst);
+        if now > 0 && now == seen {
+            break;
+        }
+        seen = now;
+        assert!(
+            Instant::now() < deadline,
+            "the writer blocks on a full pipe"
+        );
     }
+    assert!(!writing.is_finished(), "the writer is blocked, not done");
     let stopped = kr_worker::broker::stop_backend(&backend.identity, Duration::from_secs(1)).await;
     assert!(stopped.asked && stopped.ended && !stopped.unresolved);
-    let error = writing
-        .join()
-        .expect("the writer returns")
-        .expect_err("a megabyte cannot have gone to a backend that never reads");
-    let said = error.to_string();
+    let error = writing.join().expect("the writer returns");
     assert!(
-        said.contains("cancelled because the agent is being stopped")
-            || said.contains("the agent's input has been closed"),
-        "the stop ended the write by its own word: {said}"
+        error
+            .to_string()
+            .contains("cancelled because the agent is being stopped"),
+        "the stop ended the blocked write by its own word: {error}"
     );
 }
 
