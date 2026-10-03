@@ -641,30 +641,47 @@ mod tests {
     ///
     /// The order is made here rather than waited for: the worker's end reads the hello and closes
     /// before the observation is delivered at all.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_refusal_that_closes_before_the_observation_is_written_is_reported_as_one() {
-        use std::os::unix::fs::PermissionsExt as _;
         use tokio::io::AsyncBufReadExt as _;
 
         let host = kr_ipc::testing::TempHost::create();
-        let endpoint = host.root().join("endpoint");
-        let listener = tokio::net::UnixListener::bind(&endpoint).expect("the endpoint binds");
+        // The endpoint the platform gives a launch: a socket in the tree on Unix, and a pipe of a
+        // fresh name on Windows.
+        let (address, endpoint) = if cfg!(windows) {
+            let fresh: String = kr_ipc::new_uuid()
+                .to_string()
+                .chars()
+                .filter(char::is_ascii_hexdigit)
+                .collect();
+            let name = format!("kr-hook-refusal-{fresh}");
+            (
+                format!("{}{name}", crate::registration::PIPE_PREFIX),
+                kr_ipc::paths::Endpoint::from_name(name),
+            )
+        } else {
+            let path = host.root().join("endpoint");
+            (
+                path.display().to_string(),
+                kr_ipc::paths::Endpoint::from_path(path),
+            )
+        };
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint.expect("a usable endpoint"))
+            .expect("the endpoint binds");
         let paths = crate::registration::Paths {
             registration: host.root().join("registration"),
         };
         let credential = host.root().join("credential");
-        std::fs::write(&credential, "0".repeat(64)).expect("the credential");
-        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600))
+        kr_ipc::paths::create_new_owner_only_file(&credential, "0".repeat(64).as_bytes())
             .expect("the credential is the owner's alone");
-        std::fs::write(
+        kr_ipc::paths::write_owner_only_file(
             &paths.registration,
             format!(
-                "endpoint={}\nprofile=p\ninstance=i\npid=1\nstart=1\ncredential={}\n\
+                "endpoint={address}\nprofile=p\ninstance=i\npid=1\nstart=1\ncredential={}\n\
                  framing=json_lines\n",
-                endpoint.display(),
                 credential.display()
-            ),
+            )
+            .as_bytes(),
         )
         .expect("the registration");
         let registration =

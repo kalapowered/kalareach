@@ -15,11 +15,8 @@
 
 mod common;
 
-#[cfg(unix)]
 use std::io::Read as _;
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::{LIVENESS, Placed, StandIn, read_line, run_holding_input, run_with_input};
 
@@ -326,7 +323,6 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
 /// KR-REQ-12.27: a standard error nobody reads cannot hold a hook. With standard error a pipe that
 /// is full before the hook starts, every hook still writes `{}` and exits 0 inside the shortest
 /// timeout any registration names. The control, an empty pipe, still gets the diagnostic line.
-#[cfg(unix)]
 #[test]
 fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
     let placed = Placed::new();
@@ -376,7 +372,6 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
 }
 
 /// What a hook did beside a standard error of the test's own.
-#[cfg(unix)]
 struct Held {
     /// Everything it wrote to standard output.
     answer: Vec<u8>,
@@ -390,7 +385,6 @@ struct Held {
 
 /// Runs a hook with `input` on its standard input and `diagnostics` as its standard error, for at
 /// most [`SHORTEST_TIMEOUT`], and ends it if it is still running then.
-#[cfg(unix)]
 fn run_beside(
     mut command: std::process::Command,
     input: &[u8],
@@ -470,4 +464,29 @@ fn fill(pipe: &std::io::PipeWriter) {
         }
     }
     rustix::io::ioctl_fionbio(pipe, false).expect("the pipe blocks again");
+}
+
+/// Fills a pipe until it takes nothing more, and leaves its writing end blocking again, as the
+/// standard error a hook is given would be.
+///
+/// A pipe here has no readiness to ask: in its non-waiting mode a write that finds no room writes
+/// nothing and says so, which is how the end of the room is found.
+#[cfg(windows)]
+fn fill(pipe: &std::io::PipeWriter) {
+    use std::io::Write as _;
+
+    common::pipe_waits(pipe, false);
+    let mut writer = pipe;
+    // Whole pages first, then single bytes, so no room is left that one short line could take.
+    for size in [4096_usize, 1] {
+        let bytes = vec![b'.'; size];
+        loop {
+            match writer.write(&bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => panic!("the pipe could not be filled: {error}"),
+            }
+        }
+    }
+    common::pipe_waits(pipe, true);
 }
