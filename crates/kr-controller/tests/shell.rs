@@ -1015,6 +1015,37 @@ async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_dae
         "nothing the daemon held outside the allowlist reached the shell: {environment:?}"
     );
 
+    // What the app declares decides it, and not what the session is shown as: a session an app
+    // creates for a terminal is started with the host's environment too, where the command line's
+    // would be started with its own.
+    let visible = daemon
+        .session_environment(
+            LocalClientKind::App,
+            Presentation::Terminal,
+            Vec::new(),
+            &home,
+        )
+        .await
+        .expect("an app's visible create is served");
+    assert_eq!(
+        visible.get("PATH").map(String::as_str),
+        Some("/opt/kr-test-host/bin:/usr/bin:/bin")
+    );
+    assert_eq!(
+        visible.get("HOME").map(String::as_str),
+        Some(home.display().to_string().as_str())
+    );
+    let refused_visible = daemon
+        .session_environment(
+            LocalClientKind::App,
+            Presentation::Terminal,
+            vec![variable("PATH", "/an/apps/own")],
+            &home,
+        )
+        .await
+        .expect_err("a snapshot from an app is refused whatever the session is shown as");
+    assert_eq!(refused_visible.code, ErrorCode::InvalidArgument);
+
     // An app is told when it sends the variables of an environment of its own: it has none to
     // send, and the host does not read a snapshot as one.
     let refused = daemon
