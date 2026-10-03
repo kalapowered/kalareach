@@ -77,8 +77,9 @@ pub const REGISTRATION_PREFIX: &str = "registration";
 /// The launcher says so as soon as it reads its admission, so anything slower is a launcher that
 /// is not going to run the program with the integration.
 ///
-/// On Windows the launcher creates the program before it says so, and a first start of a program
-/// the system has not run costs it up to a second and a half, so it has four seconds.
+/// On Windows the launcher creates the program before it says so, and the first start of a program
+/// the system has not run costs it up to three and a half seconds, because the system scans the
+/// file again as its image is first mapped, so it has four seconds.
 pub const GOING_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(if cfg!(windows) { 4 } else { 2 });
 
@@ -87,10 +88,12 @@ pub const GOING_DEADLINE: std::time::Duration =
 /// The launcher gives the whole exchange two seconds on Unix and six on Windows; this leaves it
 /// room to hear the answer.
 ///
-/// Hashing an agent's executable takes up to about two seconds on Windows, where each fresh file is
-/// scanned as it is first touched, so the wait there is four.
+/// Reading an agent's executable takes up to about four and a half seconds on Windows for a file of
+/// 300 MB that the system has not seen: the system scans a fresh executable as it is first opened,
+/// at up to ten milliseconds for each megabyte, and the hash follows. The wait there is five, which
+/// still leaves the launcher room to hear the answer inside its six.
 pub const IDENTITY_WAIT: std::time::Duration =
-    std::time::Duration::from_millis(if cfg!(windows) { 4000 } else { 1500 });
+    std::time::Duration::from_millis(if cfg!(windows) { 5000 } else { 1500 });
 
 /// How long a launcher that was told its launch is committed has to say it has resumed the
 /// program, on a platform where it creates the program suspended and starts it only then.
