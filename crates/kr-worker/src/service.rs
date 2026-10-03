@@ -4305,7 +4305,7 @@ impl WorkerService {
             .expect("the authority lock is not poisoned")
             .acknowledged_revision;
         if acknowledged.is_some_and(|held| held.get() > validated.get()) {
-            return Err(WorkerError::GenerationFenced {
+            return Err(WorkerError::PermissionDenied {
                 detail: format!(
                     "this action was admitted under authority revision {validated}, and this \
                      worker holds a later one"
@@ -4340,7 +4340,7 @@ impl WorkerService {
         // Only this request's own attachment. Another caller may hold the lease by now, and its
         // authority has nothing to do with this one's having ended.
         self.fence_granted_input(session, Some(attachment_id));
-        Err(WorkerError::GenerationFenced {
+        Err(WorkerError::PermissionDenied {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
     }

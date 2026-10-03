@@ -78,6 +78,11 @@ pub enum WorkerError {
         action: String,
     },
     /// A controller connection no longer speaks for the generation this worker accepts.
+    ///
+    /// The refusal is of the connection: it is marked on the wire
+    /// ([`ProtocolError::link_fenced`]), and a controller that reads the mark ends the link. A
+    /// request that lost its own authority while the connection kept its own is a
+    /// [`Self::PermissionDenied`].
     #[error("{detail}")]
     GenerationFenced {
         /// Which part of the binding failed.
@@ -225,7 +230,12 @@ impl WorkerError {
     /// Renders the failure as a protocol error a client can be given.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
-        ProtocolError::new(self.code(), self.to_string())
+        let error = ProtocolError::new(self.code(), self.to_string());
+        if matches!(self, Self::GenerationFenced { .. }) {
+            error.for_a_fenced_link()
+        } else {
+            error
+        }
     }
 }
 

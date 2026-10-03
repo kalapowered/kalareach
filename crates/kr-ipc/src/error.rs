@@ -149,6 +149,17 @@ pub enum IpcError {
         /// The level this daemon's release retains.
         level: String,
     },
+    /// A worker refused a request because this connection no longer speaks for the controller
+    /// generation that holds its authority ([`ProtocolError::link_fenced`]).
+    ///
+    /// The refusal is a complete answer, but the connection it came on is spent: it is reported as
+    /// a failure of the link, so that whatever holds the link ends it and what rested on it, a
+    /// lease above all, stops with it.
+    #[error("{detail}")]
+    LinkFenced {
+        /// What the worker said it refused.
+        detail: String,
+    },
     /// A host identity could not be read from the operating system.
     #[error("{what}: {detail}")]
     IdentityUnavailable {
@@ -192,6 +203,7 @@ impl IpcError {
             | Self::PeerRejected { .. }
             | Self::PeerAccountRejected { .. }
             | Self::UntrustedFile { .. }
+            | Self::LinkFenced { .. }
             | Self::RightNotForwarded(_) => ErrorCode::PermissionDenied,
             Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,
             Self::PeerUnknown { .. } => ErrorCode::PermissionDenied,

@@ -635,14 +635,24 @@ async fn read_loop(
             Err(_) => break,
         };
         match frame {
-            ControlFrame::Response(response) => answer(
-                &waiters,
-                Forwarded {
-                    response,
-                    retained: false,
-                    holds_results_to_scopes: false,
-                },
-            ),
+            ControlFrame::Response(mut response) => {
+                // A refusal of the link itself is the worker saying this connection no longer
+                // speaks for the generation that holds it. The caller is given the refusal as any
+                // other refusal of authority, without the marker, which is not for a device; and
+                // then the link ends, since nothing more can be asked over it.
+                let spent = take_the_link_fence(&mut response);
+                answer(
+                    &waiters,
+                    Forwarded {
+                        response,
+                        retained: false,
+                        holds_results_to_scopes: false,
+                    },
+                );
+                if spent {
+                    break;
+                }
+            }
             // The worker answered from a receipt it already held rather than by performing the
             // action. Whether that may be passed on is the caller's authority to read it, which
             // the dispatcher decides; this only has to keep the two apart.
@@ -704,6 +714,16 @@ async fn read_loop(
     lost.notify_waiters();
 }
 
+/// Takes the mark off a response that refuses the link itself
+/// ([`kr_protocol::error::ProtocolError::link_fenced`]),
+/// and says whether it carried it.
+fn take_the_link_fence(response: &mut Response) -> bool {
+    match &mut response.outcome {
+        kr_protocol::envelope::Outcome::Error(error) => std::mem::take(&mut error.link_fenced),
+        kr_protocol::envelope::Outcome::Ok(_) => false,
+    }
+}
+
 /// Hands one answer to whatever is waiting for that request.
 fn answer(waiters: &Arc<std::sync::Mutex<Waiters>>, answered: Forwarded) {
     let waiter = waiters
@@ -722,5 +742,166 @@ fn frame_name(frame: &ControlFrame) -> &'static str {
         ControlFrame::Notification(_) => "a notification",
         ControlFrame::Event(_) => "a connection event",
         _ => "another message",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_ipc::endpoint::Listener;
+    use kr_ipc::framed::split;
+    use kr_ipc::verify::WorkerIdentity;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::ids::ConnectionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::session::SessionReadParams;
+
+    use super::{RELAY_DEPTH, RELAY_QUEUED_BYTES, RelayBudget, WorkerProxy};
+    use crate::service::a_close_a_worker_never_answers as world;
+
+    /// A worker that proves itself and answers a session read, refuses an events snapshot as any
+    /// request is refused, and refuses a history page as the connection's own: it no longer speaks
+    /// for the generation that holds the worker.
+    fn refusing(
+        listener: Listener,
+        identity: Arc<WorkerIdentity>,
+        endpoint_text: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((connection, peer)) = listener.accept().await else {
+                    return;
+                };
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let answers = match world::handshake(
+                            &frame,
+                            &identity,
+                            &endpoint_text,
+                            connection_id,
+                            &peer,
+                            &kr_protocol::scalars::CanonicalSet::new(),
+                        ) {
+                            Some(answers) => answers,
+                            None => match frame {
+                                ControlFrame::Request(request) => {
+                                    let outcome = match request.method.method() {
+                                        Some(Method::SessionRead) => Outcome::Ok(
+                                            kr_protocol::envelope::ParamsValue::from_typed(
+                                                &world::read_result(identity.session_id()),
+                                            )
+                                            .expect("encodes"),
+                                        ),
+                                        Some(Method::HistoryPage) => Outcome::Error(
+                                            ProtocolError::new(
+                                                ErrorCode::PermissionDenied,
+                                                "a later controller connection holds this \
+                                                 environment's authority",
+                                            )
+                                            .for_a_fenced_link(),
+                                        ),
+                                        _ => Outcome::Error(ProtocolError::new(
+                                            ErrorCode::PermissionDenied,
+                                            "this request lost its authority",
+                                        )),
+                                    };
+                                    vec![ControlFrame::Response(Response {
+                                        request_id: request.request_id,
+                                        outcome,
+                                    })]
+                                }
+                                _ => Vec::new(),
+                            },
+                        };
+                        for answer in answers {
+                            if writer.write_message(&answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// KR-REQ-09.12: a worker's refusal of the link itself is delivered to the caller as the
+    /// ordinary refusal of authority it is, without the marker that only the worker and this
+    /// daemon read, and the link ends once it has been delivered, so that nothing more is asked
+    /// over it. The control: an ordinary refusal leaves the link open, and the next call over it
+    /// is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_of_the_link_itself_is_delivered_and_ends_the_link() {
+        let silent = world::fake_world(refusing).await;
+        let controller = Arc::clone(&silent.controller);
+        let (notifications, _relayed) = tokio::sync::mpsc::channel(RELAY_DEPTH);
+        let lost = Arc::new(tokio::sync::Notify::new());
+        let proxy = WorkerProxy::open(
+            &controller,
+            &silent.worker,
+            notifications,
+            Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
+            lost,
+        )
+        .await
+        .expect("the worker accepts the link");
+        let params = SessionReadParams {
+            session_id: silent.session_id,
+        };
+        let outcome = |response: Response| response.outcome;
+
+        let ordinary = outcome(
+            proxy
+                .read(Method::EventsSnapshot, &params)
+                .await
+                .expect("the worker answers"),
+        );
+        let Outcome::Error(ordinary) = ordinary else {
+            panic!("a request that lost its authority is refused");
+        };
+        assert_eq!(ordinary.code, ErrorCode::PermissionDenied);
+        assert!(proxy.is_open(), "an ordinary refusal leaves the link open");
+        assert!(
+            matches!(
+                outcome(
+                    proxy
+                        .read(Method::SessionRead, &params)
+                        .await
+                        .expect("the worker answers")
+                ),
+                Outcome::Ok(_)
+            ),
+            "and the next call over it is answered"
+        );
+
+        let fenced = outcome(
+            proxy
+                .read(Method::HistoryPage, &params)
+                .await
+                .expect("the refusal is delivered"),
+        );
+        let Outcome::Error(fenced) = fenced else {
+            panic!("the worker refuses the link");
+        };
+        assert_eq!(fenced.code, ErrorCode::PermissionDenied);
+        assert!(
+            !fenced.link_fenced,
+            "the marker is between the worker and this daemon, and a device is not given it"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(60), proxy.lost())
+            .await
+            .expect("the link ends once the refusal has been delivered");
+        assert!(!proxy.is_open());
+        proxy
+            .read(Method::SessionRead, &params)
+            .await
+            .expect_err("nothing more is asked over a link the worker refused");
+        silent.serving.abort();
     }
 }
