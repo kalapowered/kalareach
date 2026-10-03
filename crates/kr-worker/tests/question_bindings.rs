@@ -712,7 +712,7 @@ fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
 /// run out their wait.
 #[cfg(windows)]
 struct Running {
-    agent: std::process::Child,
+    agent: kr_worker::windows::launch::Child,
     job: Arc<kr_worker::windows::job::AgentJob>,
     /// The agent as the job registry keeps it, once it is kept there.
     kept: Option<ProcessStartIdentity>,
@@ -744,22 +744,32 @@ impl Started {
     fn new() -> Self {
         let job = Arc::new(kr_worker::windows::job::AgentJob::create().expect("a job"));
         let mut running = Running {
-            agent: job
-                .start(
-                    std::process::Command::new("cmd.exe")
-                        .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null()),
+            agent: kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+                program: &std::path::Path::new(
+                    &std::env::var_os("SystemRoot").expect("a system directory"),
                 )
-                .expect("the agent starts"),
+                .join("System32")
+                .join("cmd.exe"),
+                arguments: &[
+                    "/d".to_owned(),
+                    "/c".to_owned(),
+                    "ping -n 600 127.0.0.1 > NUL".to_owned(),
+                ],
+                directory: &std::env::temp_dir(),
+                environment: &[],
+                session: None,
+                agent: &job,
+                pipe_input: false,
+                pipe_output: false,
+            })
+            .expect("the agent starts"),
             job: Arc::clone(&job),
             kept: None,
         };
         let agent = running.agent.id();
         let identity =
             kr_ipc::identity::started_process_identity(agent).expect("the agent's identity");
-        kr_worker::windows::job::keep_agent(identity.clone(), Arc::clone(&job));
+        kr_worker::windows::job::keep_agent(identity.clone(), Arc::clone(&job), None);
         running.kept = Some(identity.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let helper = loop {

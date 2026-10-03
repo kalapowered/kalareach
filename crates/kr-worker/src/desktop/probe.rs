@@ -1425,13 +1425,19 @@ fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan)
         };
     };
     let started = std::time::Instant::now();
-    let spawned = std::process::Command::new(program)
-        .args(arguments)
-        .current_dir(&plan.scratch)
-        .stdin(std::process::Stdio::null())
-        .stdout(out)
-        .stderr(err)
-        .spawn();
+    let spawned = {
+        // Started under the lock every start of this worker's takes on Windows, while a launch's
+        // stream ends may be inheritable.
+        #[cfg(windows)]
+        let _inheriting = crate::windows::launch::inheriting();
+        std::process::Command::new(program)
+            .args(arguments)
+            .current_dir(&plan.scratch)
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+    };
     let Ok(mut child) = spawned else {
         return Run {
             facility,

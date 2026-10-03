@@ -143,6 +143,7 @@ fn launch_for(which: u8) -> NativeLaunch {
         framing: Framing::new(NativeFraming::JsonLines),
         site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
         os_user: "agent-user".to_owned(),
+        working_directory: std::env::temp_dir(),
     }
 }
 
@@ -177,8 +178,10 @@ struct Launch {
     broker: Arc<Broker>,
     gateway: NativeGateway,
     directory: PathBuf,
-    child: Option<std::process::Child>,
+    child: Option<kr_worker::broker::AgentChild>,
     process: ProcessStartIdentity,
+    /// The session's job, which holds the launch and ends it when the test lets it go.
+    _session: Arc<kr_worker::windows::job::SessionJob>,
 }
 
 impl Launch {
@@ -196,10 +199,13 @@ impl Launch {
             surfaces: [BridgeSurface::Hook].into_iter().collect(),
             forwarder: this_executable(),
         };
+        let session =
+            Arc::new(kr_worker::windows::job::SessionJob::create().expect("a session job"));
         let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(which))
             .expect("the endpoint binds")
             .with_bridge(installed)
-            .expect("the bridge belongs to this connector");
+            .expect("the bridge belongs to this connector")
+            .in_session(Arc::clone(&session));
         let registration = towards.map_or_else(
             || "-".to_owned(),
             |other| {
@@ -239,6 +245,7 @@ impl Launch {
             directory,
             child: Some(child),
             process,
+            _session: session,
         }
     }
 

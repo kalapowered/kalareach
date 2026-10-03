@@ -97,8 +97,8 @@ pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
 pub use crate::broker::attach::{
-    Attached, Ended, Launched, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE, TerminalWatch,
-    hello_frame,
+    AgentChild, Attached, Ended, Launched, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE,
+    TerminalWatch, hello_frame,
 };
 pub use crate::broker::bridge::{
     AdmittedBridge, BridgeDeclaration, BridgeProcess, BridgeStream, BridgeSurface, HookReport,
@@ -1364,7 +1364,11 @@ impl Broker {
                     .and_then(|process| process.dedicated.then(|| process.process.clone()));
                 let ended = state.instances.remove(&application_instance_id);
                 if let Some(agent) = ended.and_then(|instance| instance.process) {
-                    release_agent_job(&state.instances, &agent.process);
+                    // A dedicated backend is stopped from what the registry holds by whoever ends
+                    // it, and let go of only after: see [`Broker::release_stopped`].
+                    if !agent.dedicated {
+                        release_agent_job(&state.instances, &agent.process);
+                    }
                 }
                 state.tokens.withdraw(application_instance_id);
                 state.profiles.release(application_instance_id);
@@ -1379,6 +1383,16 @@ impl Broker {
                 }
             }
         }
+    }
+
+    /// Lets go of what a dedicated backend was held by, once it has been stopped.
+    ///
+    /// The job a backend was started in is what stops it, so ending its instance leaves the job
+    /// where the stop finds it, and the one that stops it calls this after. An instance of this
+    /// broker that still names the same process keeps it.
+    pub fn release_stopped(&self, backend: &ProcessStartIdentity) {
+        let state = self.state();
+        release_agent_job(&state.instances, backend);
     }
 
     /// Gives back everything one launch took, because it failed before it was committed.

@@ -846,6 +846,8 @@ impl CommandBackends {
             framing: Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             site: self.environment_id,
             os_user: self.os_user.clone(),
+            // The directory the invocation runs in, which is what its program works in.
+            working_directory: PathBuf::from(request.cwd),
         };
         let mut gateway = NativeGateway::bind(Arc::clone(&self.broker), &directory, launch)?;
         if let Some(installed) = connector.launch_bridge(launcher) {
