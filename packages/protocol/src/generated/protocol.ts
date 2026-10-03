@@ -10541,10 +10541,6 @@ export interface PreferenceSet {
 }
 /**
  * The variables an owner has configured to add to a session, each with its value.
- *
- * The values are the owner's own and go to a session's shell and nowhere else, so what a
- * debug print shows of this is the names: a print of the document, of the configuration in
- * force or of anything that holds either cannot carry a credential into a log.
  */
 export interface EnvironmentAdditions {
   [k: string]: string

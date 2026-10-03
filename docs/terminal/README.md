@@ -1169,12 +1169,13 @@ creator's own `TERMINFO` and `TERMINFO_DIRS` are neither dropped nor obeyed: the
 `$HOME/.terminfo`, and both values are reported as an override. A creator's directory still serves
 the terminal names the private database has no entry for.
 
-The worker writes one line to its own log for each session: the private directory and what it kept
-of the creator's, for example `terminfo: private database <directory>; the creator's TERMINFO=<path>
-follow it`. A worker that cannot write the database says why on the same line, and the creator's
-variables stay exactly as the creator set them, so that session reads whatever database its
-creator's search and its host provide, which may not be a stock one. A Windows host has no terminfo
-library for a shell to consult, so nothing is written or set there.
+The worker writes one line to its own log for each session: the private directory and which of the
+creator's variables it kept, for example `terminfo: private database <directory>; the creator's
+database directories (TERMINFO) follow it`. The line names the variables and never what they hold. A
+worker that cannot write the database says why on the same line, and the creator's variables stay
+exactly as the creator set them, so that session reads whatever database its creator's search and
+its host provide, which may not be a stock one. A Windows host has no terminfo library for a shell
+to consult, so nothing is written or set there.
 
 ### Multiplexers inside a session
 

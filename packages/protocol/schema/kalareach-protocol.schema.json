@@ -12946,7 +12946,7 @@
       "additionalProperties": {
         "type": "string"
       },
-      "description": "The variables an owner has configured to add to a session, each with its value.\n\nThe values are the owner's own and go to a session's shell and nowhere else, so what a\ndebug print shows of this is the names: a print of the document, of the configuration in\nforce or of anything that holds either cannot carry a credential into a log.",
+      "description": "The variables an owner has configured to add to a session, each with its value.",
       "type": "object"
     },
     "EnvironmentCapabilitiesParams": {

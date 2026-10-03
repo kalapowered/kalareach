@@ -1496,8 +1496,9 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
             panic!("the worker's diagnostics say nothing of terminfo: {diagnostics:?}")
         });
     assert!(line.contains(&private), "{line}");
-    assert!(line.contains("TERMINFO=/creators/own/terminfo"), "{line}");
-    assert!(line.contains("TERMINFO_DIRS=/creators/more"), "{line}");
+    // The log says which of the creator's variables were kept and never what they held.
+    assert!(line.contains("(TERMINFO, TERMINFO_DIRS)"), "{line}");
+    assert!(!line.contains("/creators/"), "{line}");
     assert!(line.contains("follow it"), "{line}");
 
     close(&mut client, &host, created.session.session_id).await;
