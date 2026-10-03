@@ -293,23 +293,26 @@ signing_command_state() {
 # Stops the signing command, and answers once it has ended. The command starts with the signals this
 # shell ignores, and puts the default ones back as its first act, so a TERM that comes before that act
 # has no effect on it: the TERM is sent again every tenth of a second, while the command is known to be the
-# process that was started, until it has ended or five seconds have passed, and only then is it killed, and
-# only if it is still known to be that process. A command that is not known is not signalled, and is
-# waited for.
+# process that was started, until it has ended. After fifty sends the command is killed, if it is still
+# known to be that process. While the command is not known (its identity not yet written, or a read that
+# fails) nothing is signalled and the checks go on: the loop ends only when the command has ended, so an
+# identity that is written late is still acted on.
 stop_signing_command() {
-  local turns=0 state
-  while [ "$turns" -lt 50 ]; do
+  local sent=0 state
+  while :; do
     signing_command_state; state=$?
     [ "$state" = 1 ] && break
-    [ "$state" = 0 ] && kill "$signing_child" 2>/dev/null
+    if [ "$state" = 0 ]; then
+      if [ "$sent" -ge 50 ]; then
+        say "the signing command did not stop at TERM: killing it"
+        kill -9 "$signing_child" 2>/dev/null
+        break
+      fi
+      kill "$signing_child" 2>/dev/null
+      sent=$((sent + 1))
+    fi
     sleep 0.1
-    turns=$((turns + 1))
   done
-  signing_command_state; state=$?
-  if [ "$state" = 0 ]; then
-    say "the signing command did not stop at TERM: killing it"
-    kill -9 "$signing_child" 2>/dev/null
-  fi
   wait "$signing_child" 2>/dev/null
 }
 
