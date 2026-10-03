@@ -987,3 +987,59 @@ async fn kr_req_12_02_a_launch_into_a_directory_open_to_another_account_starts_n
     assert!(broker.binding_state(instance(2)).is_err());
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// KR-REQ-07.62 and KR-REQ-12.02: a launch with no session job to be held by starts nothing, and
+/// the refusal is the precondition's own. Control: the same launch on a gateway that has the
+/// session's job starts the agent in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_62_a_launch_with_no_session_job_starts_nothing() {
+    let directory = private_directory();
+    let broker =
+        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
+    // No `in_session`: this gateway has no job the session could end the agent through.
+    let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(2))
+        .expect("the endpoint binds");
+    let intent = broker
+        .prepare_launch(
+            agent_profile(&[
+                "--ignored",
+                "--exact",
+                "agent_runs_a_helper",
+                "--nocapture",
+                "none",
+                "-",
+            ]),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let refused = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect_err("a launch with no session job is refused");
+    assert!(
+        matches!(
+            refused,
+            kr_worker::broker::BrokerError::PreconditionFailed { .. }
+        ),
+        "{refused}"
+    );
+    assert!(
+        gateway.last_started().is_none(),
+        "and no process was started for it"
+    );
+    assert!(broker.binding_state(instance(2)).is_err());
+    let _ = std::fs::remove_dir_all(&directory);
+
+    let launched = Launch::start(3, "none", None);
+    assert!(
+        launched
+            .members()
+            .contains(&u32::try_from(launched.process.pid.get()).unwrap_or(0)),
+        "the same launch with the session's job starts the agent, in its job"
+    );
+}
