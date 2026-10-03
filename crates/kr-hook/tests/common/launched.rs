@@ -1,7 +1,8 @@
 //! A launch of a stand-in application by the worker's own gateway, with its bridge installed.
 //!
-//! The application is `/bin/sh` running a loop that stands in for the application the bridge was
-//! installed for: for every request path a test writes to its input it runs
+//! The application is a shell running a loop that stands in for the application the bridge was
+//! installed for: `/bin/sh` on Unix, and on Windows a copy of `cmd.exe` running a batch file, which
+//! every Windows machine has. For every request path a test writes to its input it runs
 //! `kr-hook <application> hook` with that request as the hook's input, as the application runs a
 //! hook for an event, and writes the hook's output, diagnostics and exit code beside the request.
 
@@ -11,13 +12,15 @@ use std::time::Duration;
 
 use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
 use kr_protocol::gateway::NativeFraming;
+#[cfg(windows)]
+use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ApplicationInstanceId, EnvironmentId, LaunchProfileId, PluginId, SessionId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::{
-    AdmittedBridge, BridgeSurface, Broker, BrokerError, ForegroundMark, Framing, InstalledBridge,
-    NativeGateway, NativeLaunch,
+    AdmittedBridge, AgentChild, BridgeSurface, Broker, BrokerError, ForegroundMark, Framing,
+    InstalledBridge, NativeGateway, NativeLaunch,
 };
 
 use super::{LIVENESS, Placed};
@@ -60,6 +63,7 @@ pub fn installed_for(
 /// as the application does for each event, with the request as the hook's input and the hook's
 /// output, diagnostics and exit code written beside it. `$2` is the application name its
 /// registration invokes the forwarder with.
+#[cfg(unix)]
 const APPLICATION: &str = r#"
 while IFS= read -r request; do
   "$1" "$2" hook < "$request" > "$request.out" 2> "$request.err"
@@ -70,6 +74,7 @@ done
 
 /// The stand-in application for a channel: the channel server runs as its child, on its standard
 /// streams, and the application ends with the server's exit code, which it writes to `$3` first.
+#[cfg(unix)]
 const CHANNEL_APPLICATION: &str = r#"
 "$1" claude-code channel
 code=$?
@@ -86,7 +91,49 @@ exit "$code"
 /// process that outlives the application is adopted by another parent and stays in the group. A
 /// shell has no way to lead a group of its own without job control, which takes the terminal from
 /// whatever holds it, so the one step is Perl's `setpgrp`.
+#[cfg(unix)]
 const LEADER: &str = r#"exec /usr/bin/perl -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec @ARGV or die "exec: $!\n"' /bin/sh -c "$4" application "$1" "$2" "$3""#;
+
+/// The stand-in application on Windows: it reads one request path per line and runs a hook for
+/// each, as [`APPLICATION`] does. A batch file reads a line of its input with `set /p`, which
+/// leaves the variable as it was at the end of the input, so the variable is cleared first and an
+/// empty one ends the application. `{program}` and `{invoked}` are the program and the application
+/// name its registration invokes the forwarder with.
+#[cfg(windows)]
+const APPLICATION: &str = "@echo off\r\n\
+:next\r\n\
+set \"request=\"\r\n\
+set /p request=\r\n\
+if not defined request exit /b 0\r\n\
+\"{program}\" {invoked} hook < \"%request%\" > \"%request%.out\" 2> \"%request%.err\"\r\n\
+> \"%request%.tmp\" echo %errorlevel%\r\n\
+move /y \"%request%.tmp\" \"%request%.code\" > NUL\r\n\
+goto next\r\n";
+
+/// The stand-in application for a channel on Windows: the channel server runs as its child, on
+/// its standard streams, and the application ends with the server's exit code, which it writes to
+/// `{code}` first.
+#[cfg(windows)]
+const CHANNEL_APPLICATION: &str = "@echo off\r\n\
+\"{program}\" claude-code channel\r\n\
+set code=%errorlevel%\r\n\
+> \"{code}.tmp\" echo %code%\r\n\
+move /y \"{code}.tmp\" \"{code}\" > NUL\r\n\
+exit /b %code%\r\n";
+
+/// What a test writes a stand-in application's requests to.
+#[cfg(unix)]
+pub type Input = std::process::ChildStdin;
+/// What a test writes a stand-in application's requests to.
+#[cfg(windows)]
+pub type Input = kr_worker::windows::launch::StdinPipe;
+
+/// What a stand-in application writes to its output.
+#[cfg(unix)]
+pub type Output = std::process::ChildStdout;
+/// What a stand-in application writes to its output.
+#[cfg(windows)]
+pub type Output = std::fs::File;
 
 /// One launch this host made of the stand-in application, with its bridge installed.
 pub struct Launch {
@@ -94,7 +141,7 @@ pub struct Launch {
     pub gateway: NativeGateway,
     pub application: Application,
     /// The application's input, until a test closes it.
-    pub requests: Option<std::process::ChildStdin>,
+    pub requests: Option<Input>,
     pub runtime: PathBuf,
     pub inbox: PathBuf,
     next: u32,
@@ -107,11 +154,18 @@ pub struct Launch {
 /// group reaches exactly what the application started, however long ago the application itself
 /// ended and whoever ended it.
 pub struct Application {
-    child: std::process::Child,
+    child: AgentChild,
     /// The application's output, until a test takes it.
-    pub stdout: Option<std::process::ChildStdout>,
+    pub stdout: Option<Output>,
     /// The file the channel's stand-in writes the code it ends with to.
     code: PathBuf,
+    /// What the kernel says the application is, which names the job that holds what it started.
+    #[cfg(windows)]
+    process: ProcessStartIdentity,
+    /// The session's job, which a launch on Windows is held by and which ends all of it when it
+    /// closes.
+    #[cfg(windows)]
+    session: Arc<kr_worker::windows::job::SessionJob>,
 }
 
 impl Application {
@@ -153,6 +207,7 @@ impl Application {
     ///
     /// Returns what went wrong when the application could not be ended, its end could not be
     /// waited for, its group could not be ended or it could not be collected.
+    #[cfg(unix)]
     fn end(&mut self) -> Result<(), String> {
         use rustix::io::Errno;
         use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
@@ -198,6 +253,57 @@ impl Application {
             (Err(group), Err(collected)) => Err(format!("{group}, and {collected}")),
         }
     }
+
+    /// Ends the application and everything it started, and collects it.
+    ///
+    /// The application's own job lists what it started, wherever those processes are in the tree
+    /// below it, so ending the job reaches all of it, including a process whose parent went long
+    /// ago. The session's job is let go of last, which ends whatever the first missed.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the job could not be ended, the application could not be
+    /// ended or it could not be collected.
+    #[cfg(windows)]
+    fn end(&mut self) -> Result<(), String> {
+        let job = kr_worker::windows::job::agent_job(&self.process);
+        let job_ended = job.as_ref().map_or(Ok(()), |job| {
+            job.terminate(1)
+                .map_err(|error| format!("the application's job could not be ended: {error}"))
+        });
+        let ended = self
+            .child
+            .kill()
+            .map_err(|error| format!("the application could not be ended: {error}"));
+        let collected = self
+            .child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| format!("the application could not be collected: {error}"));
+        kr_worker::windows::job::release_agent(&self.process);
+        // A process the job ended is listed until the system has finished with it, so the job is
+        // read until it lists nothing, within the liveness bound.
+        let listed = job.as_ref().map_or(Ok(()), |job| {
+            let deadline = std::time::Instant::now() + LIVENESS;
+            loop {
+                match job.process_ids() {
+                    Ok(left) if left.is_empty() => break Ok(()),
+                    Ok(left) if std::time::Instant::now() >= deadline => {
+                        break Err(format!("the application's job still holds {left:?}"));
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => {
+                        break Err(format!("the application's job could not be read: {error}"));
+                    }
+                }
+            }
+        });
+        [job_ended, ended, collected, listed]
+            .into_iter()
+            .filter_map(Result::err)
+            .reduce(|first, next| format!("{first}, and {next}"))
+            .map_or(Ok(()), Err)
+    }
 }
 
 /// Says whether `ps` shows no process of the group `group` still running, as a check of what a
@@ -235,6 +341,96 @@ fn nothing_running_in_group(group: i32) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Makes a directory only this account may use.
+#[cfg(unix)]
+fn private(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(directory).expect("a directory");
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .expect("made private");
+}
+
+/// Makes a directory only this account may use.
+#[cfg(windows)]
+fn private(directory: &Path) {
+    kr_ipc::paths::create_private_directory(directory).expect("a private directory");
+}
+
+/// The directory the launched application works in: the launch's own, on Unix, and one beside it
+/// on Windows, where the backend never works in the directory its files are published in.
+#[cfg(unix)]
+fn working_directory(_placed: &Placed, runtime: &Path) -> PathBuf {
+    runtime.to_path_buf()
+}
+
+/// The directory the launched application works in.
+#[cfg(windows)]
+fn working_directory(placed: &Placed, _runtime: &Path) -> PathBuf {
+    let directory = placed.host.root().join("w");
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    directory
+}
+
+/// The program a launch starts for the stand-in application `script` stands for, and its
+/// arguments: `/bin/sh` running the script under a leader of a process group of its own, the
+/// program, the application's name and the file its exit code goes to.
+#[cfg(unix)]
+fn application(
+    _placed: &Placed,
+    script: &str,
+    program: &Path,
+    invoked: &str,
+    code: &Path,
+) -> (String, Vec<String>) {
+    (
+        "/bin/sh".to_owned(),
+        vec![
+            "-c".to_owned(),
+            LEADER.to_owned(),
+            "application".to_owned(),
+            program.to_string_lossy().into_owned(),
+            invoked.to_owned(),
+            code.to_string_lossy().into_owned(),
+            script.to_owned(),
+        ],
+    )
+}
+
+/// The program a launch starts for the stand-in application `script` stands for, and its
+/// arguments: a copy of `cmd.exe` of this launch's own running a batch file written for it, which
+/// names the program, the application and the file its exit code goes to. The launch's own jobs
+/// hold what it starts, so nothing leads a group.
+#[cfg(windows)]
+fn application(
+    placed: &Placed,
+    script: &str,
+    program: &Path,
+    invoked: &str,
+    code: &Path,
+) -> (String, Vec<String>) {
+    let text = placed.host.root().join("application.cmd");
+    std::fs::write(
+        &text,
+        script
+            .replace("{program}", &program.to_string_lossy())
+            .replace("{invoked}", invoked)
+            .replace("{code}", &code.to_string_lossy()),
+    )
+    .expect("the stand-in application is written");
+    let shell = placed.host.root().join("bin").join("application.exe");
+    let system = std::env::var_os("SystemRoot").expect("a system directory");
+    kr_ipc::testing::place_program(&Path::new(&system).join("System32").join("cmd.exe"), &shell);
+    (
+        shell.to_string_lossy().into_owned(),
+        vec![
+            "/d".to_owned(),
+            "/q".to_owned(),
+            "/c".to_owned(),
+            text.to_string_lossy().into_owned(),
+        ],
+    )
 }
 
 impl Launch {
@@ -275,13 +471,10 @@ impl Launch {
         invoked: &str,
         installed: InstalledBridge,
     ) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
         let runtime = placed.host.root().join("l");
         let inbox = placed.host.root().join("h");
         for directory in [&runtime, &inbox] {
-            std::fs::create_dir_all(directory).expect("a directory");
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-                .expect("made private");
+            private(directory);
         }
         let code = inbox.join("application.code");
         let broker = Arc::new(
@@ -292,7 +485,7 @@ impl Launch {
             )
             .expect("a broker"),
         );
-        let mut gateway = NativeGateway::bind(
+        let gateway = NativeGateway::bind(
             Arc::clone(&broker),
             &runtime,
             NativeLaunch {
@@ -305,30 +498,29 @@ impl Launch {
                 framing: Framing::new(NativeFraming::JsonLines),
                 site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                 os_user: "agent-user".to_owned(),
-                working_directory: runtime.clone(),
+                working_directory: working_directory(placed, &runtime),
             },
         )
         .expect("the endpoint binds")
         .with_bridge(installed)
         .expect("the bridge is this launch's connector's");
+        // A launch on Windows is held by the session's job, which ends all of it when it closes.
+        #[cfg(windows)]
+        let session = Arc::new(kr_worker::windows::job::SessionJob::create().expect("a job"));
+        #[cfg(windows)]
+        let gateway = gateway.in_session(Arc::clone(&session));
+        let mut gateway = gateway;
+        let (resolved_path, arguments) = application(placed, script, program, invoked, &code);
         let profile = LaunchProfile {
             profile_id: LaunchProfileId::new("lp-claude").expect("valid"),
             environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
             binary: BinaryIdentity {
-                resolved_path: "/bin/sh".to_owned(),
+                resolved_path,
                 digest: Digest256::from_bytes([3; 32]),
                 version: "2.1.278".to_owned(),
                 distribution: "npm".to_owned(),
             },
-            arguments: vec![
-                "-c".to_owned(),
-                LEADER.to_owned(),
-                "application".to_owned(),
-                program.to_string_lossy().into_owned(),
-                invoked.to_owned(),
-                code.to_string_lossy().into_owned(),
-                script.to_owned(),
-            ],
+            arguments,
             authentication: AuthenticationState::Authenticated,
             mode: IntegrationMode::NativeBridge,
             resolved_at: TimestampMs::new(1),
@@ -357,6 +549,10 @@ impl Launch {
                 child: launched.child,
                 stdout,
                 code,
+                #[cfg(windows)]
+                process: launched.process,
+                #[cfg(windows)]
+                session,
             },
             requests: Some(requests),
             runtime,
