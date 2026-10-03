@@ -544,6 +544,21 @@ async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
         ended.load(Ordering::SeqCst) >= 1
     })
     .await;
+    // A write to a socket is refused only once nothing holds its other end, and a process another
+    // test has forked a moment ago holds a copy of every descriptor this one has open until it runs
+    // its program. So the worker having dropped its connection does not yet make a write to it
+    // fail, and the notice is asked for once the daemon's own read of the link says the worker is
+    // gone.
+    let mut link = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("the link is in its slot");
+    tokio::time::timeout(WAIT, link.client().recv())
+        .await
+        .expect("the daemon's link learns that its worker has gone")
+        .expect_err("a worker that ended its side sends nothing more");
+    link.give_back();
+    drop(link);
     controller
         .confirm_delivery(kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()))
         .await;
