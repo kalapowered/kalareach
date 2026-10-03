@@ -442,7 +442,14 @@ impl Device {
         }
     }
 
-    fn paired_identity(&self, device_id: DeviceId) -> Arc<LocalIdentity> {
+    /// The endpoint this device dials from.
+    #[must_use]
+    pub const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// The identity this device presents once the host has given it `device_id`.
+    pub fn paired_identity(&self, device_id: DeviceId) -> Arc<LocalIdentity> {
         Arc::new(LocalIdentity::new(
             device_id,
             DeviceKeyRevision::new(1),
