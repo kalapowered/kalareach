@@ -12,8 +12,6 @@
 //! | KR-REQ-12.27 | both of those: exactly `{}`, exit 0, nothing on standard error, inside the registered timeout |
 //! | KR-REQ-05.09 | `kr_req_05_09_a_hook_is_admitted_only_as_the_application_it_was_installed_for` |
 
-#![cfg(unix)]
-
 mod common;
 
 use std::time::{Duration, Instant};
