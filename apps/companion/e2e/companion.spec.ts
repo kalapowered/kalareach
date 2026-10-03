@@ -1983,18 +1983,11 @@ async function withLabelFace(page: Page, rule: string): Promise<void> {
 // still cut a label, and no label runs into another or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
 // KR-REQ-13.09: the phone's destinations are Attention, Sessions, Hosts and Account, in that order.
 test.describe("the phone's tab bar", () => {
-  const SIZES: readonly Seen[] = [
-    { width: 320, height: 720, scale: '200%' },
-    { width: 320, height: 720, scale: '150%' },
-    { width: 390, height: 844, scale: '200%' },
-    { width: 390, height: 844, scale: '100%' }
-  ]
-
-  // The letters as the system sets them, then as a face a quarter wider than the Mac's and as one
-  // wider still would, and as a face whose bold is much wider than its regular, which the label of the
-  // tab the person is on is set in (its letters are spaced wider wherever the bold weight is set): the
-  // widths a label has differ from one platform's system font to the next, and from one tab to the
-  // next.
+  // The letters as the system sets them, then as a face whose bold is much wider than its regular,
+  // which the label of the tab the person is on is set in (its letters are spaced wider wherever the
+  // bold weight is set), and as a face so wide that two rows of two cut a label on the narrow screen:
+  // the widths a label has differ from one platform's system font to the next, and from one tab to
+  // the next.
   interface Face {
     readonly name: string
     readonly shot: string
@@ -2003,23 +1996,100 @@ test.describe("the phone's tab bar", () => {
     /** Whether the spacing is added only where the bold weight is set. */
     readonly boldOnly?: boolean
   }
-  const FACES: readonly Face[] = [
-    { name: '', shot: '' },
-    { name: ' in a face a quarter wider', shot: '-wider-0.12em', em: 0.12 },
-    { name: ' in a face wider still', shot: '-wider-0.24em', em: 0.24 },
-    { name: ' in a face with a wide bold', shot: '-wide-bold', em: 0.2, boldOnly: true }
-  ]
+  const SYSTEM: Face = { name: '', shot: '' }
+  const WIDE_BOLD: Face = { name: ' in a face with a wide bold', shot: '-wide-bold', em: 0.2, boldOnly: true }
+  const WIDEST: Face = { name: ' in a face wider than two rows of two hold on the narrow screen', shot: '-widest-0.4em', em: 0.4 }
   const faceRule = (face: Face): string | undefined =>
     face.em === undefined
       ? undefined
       : face.boldOnly === true
         ? `:root .m-tab[aria-current='page'] .m-tab-label, :root .m-tab-label::after, :root .m-tabbar[data-measuring] .m-tab-label { letter-spacing: ${face.em}em; }`
         : `:root .m-tab-label { letter-spacing: ${face.em}em; }`
-  const CASES = SIZES.flatMap((seen) => FACES.map((face) => ({ seen, face })))
+
+  /** A form the bar is laid out in: four tabs side by side, two rows of two, or a tab to a row. */
+  type Form = 'row' | 'pairs' | 'column'
+
+  /** One case: a platform's bar at a screen, a text size and a face, and what it shows that no other case does. */
+  interface TabBarCase {
+    readonly seen: Seen
+    readonly face: Face
+    /** The form the bar is laid out in, where the Mac's font and DejaVu Sans give it the same one. */
+    readonly form?: Form
+    readonly covers: string
+  }
+
+  // The bar takes the first of three forms in which every label shows whole: four tabs side by side
+  // (row), two rows of two (pairs), or a tab to a row (column). Which form a screen, a text size and a
+  // face lead to follows the widths of the platform's system font, which differ from one platform to
+  // the next, so each case is chosen for the form it shows, and asserts that form where the Mac's font
+  // and the Linux runner's DejaVu Sans agree on it. The bar's size follows the chrome unit, which stops
+  // growing at a text size of 150%, so text at 150% and at 200% lay the bar out alike and only 200% is
+  // here. The narrow screen at the largest text takes two rows of two in both fonts with the system's
+  // face and with the wide bold, and a tab to a row with the widest face; the wide screen at the base
+  // size keeps a row in both fonts with the system's face and with the wide bold; the wide screen at
+  // the largest text takes two rows of two in both fonts with the wide bold, and in the system's own
+  // face is a row in the Mac's font and two rows of two in DejaVu Sans, so that case asserts no form.
+  // A tab is no shorter than its platform's target, which is what sets its height where the tabs
+  // stack, so each platform has a case in each stacked form, and the column is the tallest bar the
+  // page draws.
+  const CASES: Readonly<Record<'ios' | 'android', readonly TabBarCase[]>> = {
+    ios: [
+      {
+        seen: { width: 390, height: 844, scale: '100%' },
+        face: SYSTEM,
+        form: 'row',
+        covers: "the bar's own form at the base size in the system's own face: four tabs side by side, each glyph over its label"
+      },
+      {
+        seen: { width: 390, height: 844, scale: '200%' },
+        face: WIDE_BOLD,
+        form: 'pairs',
+        covers: 'two rows of two on the wide screen at the largest text, with a bold much wider than the regular, tabs as tall as the iOS target'
+      },
+      {
+        seen: { width: 320, height: 720, scale: '200%' },
+        face: WIDE_BOLD,
+        form: 'pairs',
+        covers:
+          'two rows of two on the narrow screen at the largest text, with a bold much wider than the regular that each label keeps the room of, tabs as tall as the iOS target'
+      },
+      {
+        seen: { width: 320, height: 720, scale: '200%' },
+        face: WIDEST,
+        form: 'column',
+        covers: 'a face so wide that two rows of two cut a label: a tab to a row, each as tall as the iOS target'
+      }
+    ],
+    android: [
+      {
+        seen: { width: 390, height: 844, scale: '100%' },
+        face: WIDE_BOLD,
+        form: 'row',
+        covers: "a row that keeps the current tab's label whole in a bold much wider than the regular, at the base size"
+      },
+      {
+        seen: { width: 390, height: 844, scale: '200%' },
+        face: SYSTEM,
+        covers: "the wide screen at the largest text in the system's own face, at the edge between a row and two rows of two"
+      },
+      {
+        seen: { width: 320, height: 720, scale: '200%' },
+        face: SYSTEM,
+        form: 'pairs',
+        covers: "two rows of two on the narrow screen at the largest text in the system's own face, tabs as tall as the Android target"
+      },
+      {
+        seen: { width: 320, height: 720, scale: '200%' },
+        face: WIDEST,
+        form: 'column',
+        covers: 'a tab to a row, each as tall as the Android target: the tallest bar the page draws, which still ends on the screen'
+      }
+    ]
+  }
 
   for (const surface of ['ios', 'android'] as const) {
-    for (const { seen, face } of CASES) {
-      test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}${face.name}`, async ({
+    for (const { seen, face, form, covers } of CASES[surface]) {
+      test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}${face.name}`, { annotation: { type: 'covers', description: covers } }, async ({
         page
       }) => {
         const rule = faceRule(face)
@@ -2056,6 +2126,12 @@ test.describe("the phone's tab bar", () => {
           })
         )
         expect(placed.map((each) => each.name)).toEqual(['Attention', 'Sessions', 'Hosts', 'Account'])
+        // The case is laid out in the form it says it is, as the rows its tabs are on show, so it cannot
+        // go on passing after it has stopped covering that form.
+        if (form !== undefined) {
+          const rows = new Set(placed.map((each) => Math.round(each.tab.top))).size
+          expect.soft(rows, `the tabs are in ${form} form`).toBe({ row: 1, pairs: 2, column: 4 }[form])
+        }
         // The room a label keeps for its bold form is not read out: a tab is named once.
         for (const [index, each] of placed.entries()) {
           await expect(tabs.nth(index)).toHaveAccessibleName(new RegExp(`^${each.name}(\\s*, \\d+ waiting for you)?$`))
