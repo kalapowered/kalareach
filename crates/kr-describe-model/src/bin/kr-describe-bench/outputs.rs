@@ -583,7 +583,8 @@ pub fn run(
             };
             let prompt_tokens_asked = model
                 .runtime()
-                .and_then(|runtime| runtime.prompt_tokens(&text).ok());
+                .and_then(|runtime| runtime.prompt_tokens(&text).ok())
+                .map(|prompt| prompt.tokens.len());
             let started = Instant::now();
             let deadline = started + Duration::from_millis(limits.deadline_ms);
             let generated = model.generate(&job, &Cancellation::new(), deadline);
