@@ -484,22 +484,22 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --lib
 
-      # The forwarder, all of it. Its own library: the registration it reads, the named pipe it
-      # connects to, and the credential file it presents only when that file's own access list is its
-      # owner's. Every hook and the channel against the worker's own listener, with a copy of
-      # `cmd.exe` as the application that starts them; the registration it waits for whole; the
-      # neutral answer every hook gives inside the shortest timeout a registration names. And an
-      # integrated invocation's launcher against the worker's own command backends, on this
-      # platform's pipe: the launcher creates its program suspended and the backend names that
-      # program and not the launcher: it is the launcher's child, started after the backend was
-      # established, created from the file the backend hashed, and held by a job of its own before it
-      # runs. A program the backend refuses, one the launcher declines and one never started leave
-      # nothing running; the program's whole exit code is the launcher's; and the directory the
-      # program inherits is granted only where the path was held from the drive's root, nothing in
-      # it can be renamed meanwhile, and a directory converted to a link before the commit is
-      # granted nothing. The suites that place a program of their own take turns, because the system
-      # reads a fresh executable before it runs, and that read delays every other start while it
-      # lasts.
+      # The forwarder, all of it. Its own library: the registration it reads, the named pipe it connects
+      # to, and the credential file it presents only when that file's own access list is its owner's.
+      # Every hook and the channel against the worker's own listener, with a copy of `cmd.exe` as the
+      # application that starts them; the registration it waits for whole; the neutral answer every hook
+      # gives inside the shortest timeout a registration names. And an integrated invocation's launcher
+      # against the worker's own command backends, on this platform's pipe: the launcher creates its
+      # program suspended and the backend names that program and not the launcher: it is the launcher's
+      # child, started after the backend was established, created from the file the backend hashed, and
+      # held by a job of its own before it runs. A program the backend refuses, one the launcher
+      # declines and one never started leave nothing running, and so does one whose launcher stops
+      # before the backend has looked at the program, while a program that was started outlives its
+      # launcher; the program's whole exit code is the launcher's; and the directory the program
+      # inherits is granted only where the path was held from the drive's root, nothing in it can be
+      # renamed meanwhile, and a directory converted to a link before the commit is granted nothing. The
+      # suites that place a program of their own take turns, because the system reads a fresh executable
+      # before it runs, and that read delays every other start while it lasts.
       - name: Test the forwarder
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-hook
