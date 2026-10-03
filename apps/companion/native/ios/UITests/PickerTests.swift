@@ -28,7 +28,7 @@ final class PickerTests: HarnessTestCase {
     /// camera. The Cancel button is looked for by identifier only; a system Cancel that has none leaves
     /// the leg open and the person at the phone cancels it by hand.
     private func openAndCancel(_ control: String, entry: String?) throws {
-        let label = app.staticTexts[control].firstMatch
+        let label = app.buttons[control].firstMatch
         XCTAssertTrue(label.waitForExistence(timeout: 10), "no \(control) control")
         label.tap()
         // The camera control opens the camera at once on a phone that has one; the others raise the
