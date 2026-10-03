@@ -107,18 +107,25 @@ struct Shell {
 
 impl Shell {
     fn new() -> Self {
-        Self::with_source(|source| source)
+        Self::build(|source| source, 0)
+    }
+
+    /// A shell whose program is `bytes` long, written new so that the system has not seen it: the
+    /// size of the largest agent this platform runs, whose first start is scanned as it is read.
+    fn large(bytes: u64) -> Self {
+        Self::build(|source| source, bytes)
     }
 
     /// A shell whose connector's installation is granted to read files as well.
     fn reading() -> Self {
-        Self::with_source(fixture::reading)
+        Self::build(fixture::reading, 0)
     }
 
-    fn with_source(
+    fn build(
         installed: impl FnOnce(
             kr_worker::broker::connectors::ConnectorSource,
         ) -> kr_worker::broker::connectors::ConnectorSource,
+        padding: u64,
     ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -129,6 +136,14 @@ impl Shell {
         let bin = placed.host.root().join("bin");
         let executable = bin.join("gemini.exe");
         kr_ipc::testing::place_program(&system_program("cmd.exe"), &executable);
+        if padding > 0 {
+            // Zeros after the image: the file still runs, and it is as large as an agent is.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&executable)
+                .and_then(|file| file.set_len(padding))
+                .expect("the program is made as large as an agent");
+        }
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
@@ -1041,5 +1056,36 @@ fn kr_req_12_16_a_directory_converted_to_a_link_before_the_commit_grants_nothing
     assert!(
         shell.broker.host_files(instance).is_none(),
         "and the grant was withdrawn at the commit"
+    );
+}
+
+/// KR-REQ-12.02: a launch of a program as large as the largest agent, written new and so not yet
+/// seen by the system, is committed within the launcher's deadlines and the worker's, which are
+/// measured together here: the backend hashes 300 MB while the launcher waits, the program is
+/// created from the file the worker holds, and the commit follows. The time each step takes is
+/// printed, so the evidence names what the deadlines were set against. Control: the launch of a
+/// small file is committed by the same run.
+#[test]
+fn kr_req_12_02_a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
+    let shell = Shell::large(300 * 1024 * 1024);
+    let answer = shell.establish();
+    let started = Instant::now();
+    let mut launcher = shell.launch(&answer, "cold", &[]);
+    let report = shell.report_from("cold", &mut launcher);
+    let program_ran = started.elapsed();
+    assert_eq!(
+        report["relaunch"], "true",
+        "the launch was committed and not run as typed"
+    );
+    eprintln!("cold 300 MB launch: the program ran {program_ran:?} after the launcher started");
+    let small = Shell::new();
+    let answer = small.establish();
+    let started = Instant::now();
+    let mut launcher = small.launch(&answer, "warm", &[]);
+    let report = small.report_from("warm", &mut launcher);
+    assert_eq!(report["relaunch"], "true");
+    eprintln!(
+        "small launch: the program ran {:?} after the launcher started",
+        started.elapsed()
     );
 }
