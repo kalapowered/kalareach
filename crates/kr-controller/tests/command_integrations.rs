@@ -531,6 +531,8 @@ async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_
     let daemon = daemon_declaring(Some(&["kalareach/gemini-cli"]), &flags).await;
     // A create request that one frame carries, with less room beside it than the integration takes.
     let mut request = create(daemon.environment_id, LaunchProfile::default());
+    // A session whose creator sends its environment is one its creator is shown.
+    request.presentation = Presentation::Attach;
     request.environment_snapshot = (0..245)
         .map(|index| kr_protocol::session::EnvironmentVariable {
             name: format!("FILLER_{index}"),

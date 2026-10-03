@@ -272,7 +272,7 @@ impl Host {
                 ActionTarget::environment(self.environment_id),
                 &SessionCreateParams {
                     environment_id: self.environment_id,
-                    presentation: Presentation::Invisible,
+                    presentation: Presentation::Attach,
                     shell: Nullable::some(self.root_program.display().to_string()),
                     shell_mode: ShellMode::NativeCompat,
                     cwd: Nullable::some(work.display().to_string()),
