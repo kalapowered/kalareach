@@ -52,6 +52,73 @@ const WAIT: Duration = Duration::from_secs(60);
 /// How long a deadline a test hands an action lasts, on the clock the test moves.
 const STANDING: Duration = Duration::from_secs(60);
 
+/// How long the whole test is given, its runtime's end included, before it fails naming the step it
+/// was at. Like [`WAIT`] it decides nothing: the test takes a second or two, and a test that has
+/// not finished by now is waiting for something that is not coming.
+const WHOLE: Duration = Duration::from_secs(180);
+
+/// The step the test has reached, kept where the deadline that runs out can say it.
+#[derive(Clone, Default)]
+struct Steps(Arc<std::sync::Mutex<&'static str>>);
+
+impl Steps {
+    fn at(&self, step: &'static str) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = step;
+    }
+
+    fn reached(&self) -> &'static str {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Runs a test's body on a multi-threaded runtime of sixteen threads, on a thread of its own, and
+/// fails the test when the body, and the end of the runtime it ran on, have not finished within
+/// [`WHOLE`].
+///
+/// The deadline is kept by the test's own thread, outside that runtime, so it holds whatever the
+/// runtime is stuck on: an await that never completes, a thread blocked on a lock, or the runtime's
+/// wait for a blocking thread that does not end. The failure names the step the body had reached.
+/// A body that panics fails the test with its own message.
+fn within_the_whole<Body, Test>(body: Body)
+where
+    Body: FnOnce(Steps) -> Test + Send + 'static,
+    Test: std::future::Future<Output = ()>,
+{
+    let steps = Steps::default();
+    let (finished, ended) = std::sync::mpsc::channel::<()>();
+    let running = {
+        let steps = steps.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(16)
+                .enable_all()
+                .build()
+                .expect("a runtime for the test");
+            runtime.block_on(body(steps.clone()));
+            steps.at("ending the test's runtime");
+            drop(runtime);
+            let _ = finished.send(());
+        })
+    };
+    match ended.recv_timeout(WHOLE) {
+        Ok(()) => running.join().expect("the test's thread ends"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match running.join() {
+            Err(panicked) => std::panic::resume_unwind(panicked),
+            Ok(()) => panic!("the test's thread ended without finishing"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the test had not finished within {WHOLE:?}; it was at this step: {}",
+            steps.reached()
+        ),
+    }
+}
+
 /// One daemon and one real worker on a clock the test moves.
 struct World {
     _daemon_tree: kr_ipc::testing::TempHost,
@@ -76,7 +143,8 @@ struct World {
 /// Starts the daemon and the worker on one manual clock, with the worker's serial boundary free
 /// and the daemon holding the worker's acknowledgement of the revision in force, its fence
 /// reported, as a worker that has answered an announcement is.
-async fn world() -> World {
+async fn world(steps: &Steps) -> World {
+    steps.at("starting the daemon");
     let clock = ManualClock::new();
     let daemon_tree = kr_ipc::testing::TempHost::create();
     let controller = Controller::start_on_clocks(
@@ -89,6 +157,7 @@ async fn world() -> World {
     .await
     .expect("the daemon starts");
 
+    steps.at("starting the worker's session");
     let worker_tree = kr_ipc::testing::TempHost::create();
     let environment = worker_tree.environment();
     let environment_id = worker_tree.environment_id();
@@ -151,6 +220,7 @@ async fn world() -> World {
         .enable_all()
         .build()
         .expect("a runtime of the worker's own");
+    steps.at("starting the worker's service");
     let service = {
         let runtime = Arc::clone(&runtime);
         let endpoint = endpoint.clone();
@@ -170,10 +240,12 @@ async fn world() -> World {
             .expect("the worker is started")
     };
 
+    steps.at("connecting to the worker");
     let mut link = LocalClient::connect(&endpoint, LocalClientKind::Controller, build)
         .await
         .expect("connects");
     let proving = Arc::clone(&controller_identity);
+    steps.at("presenting the daemon's generation to the worker");
     link.present_generation(move |nonce| {
         proving
             .generation_token(ControllerGeneration::new(1), &boot, nonce)
@@ -383,18 +455,29 @@ impl Shut {
 ///
 /// The control comes first, with no revocation: the same lapse leaves the next action its lease, and
 /// the worker runs it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed() {
-    let mut world = world().await;
+#[test]
+fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed() {
+    within_the_whole(|steps| async move {
+        the_lease_runs_out_and_is_not_renewed(&steps).await;
+    });
+}
+
+async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
+    let mut world = world(steps).await;
 
     // The control. An action holds its lease at the worker's shut serial boundary, the clock passes
     // the lease, and the worker refuses the action as expired: that much the lapse does by itself.
+    steps.at("the control: taking the action's lease");
     let deadline = world.lease().await.expect("the action is given its lease");
+    steps.at("the control: shutting the worker's serial boundary");
     let shut = Shut::hold(&world.runtime).await;
     let waiting = world.forward_in_the_background(deadline);
+    steps.at("the control: waiting for the worker to hold the action");
     world.until_the_worker_holds(1).await;
     world.clock.advance(Duration::from_secs(6));
+    steps.at("the control: opening the worker's serial boundary");
     shut.open().await;
+    steps.at("the control: waiting for the worker to refuse the action");
     let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     let refused = answer.expect_err("the lapse expires the action at the worker");
@@ -407,29 +490,36 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
     );
 
     // With no debt owed the next action is given a fresh lease, and the worker runs it.
+    steps.at("the control: taking the next action's lease");
     let deadline = world
         .lease()
         .await
         .expect("with no fence owed the next action is given a new lease");
     let waiting = world.forward_in_the_background(deadline);
+    steps.at("the control: waiting for the worker to run the next action");
     let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     answer.expect("the worker runs the action that holds a lease");
 
     // The revocation. An action holds a fresh lease at the shut serial boundary.
+    steps.at("the revocation: taking the action's lease");
     let deadline = world.lease().await.expect("the action is given its lease");
+    steps.at("the revocation: shutting the worker's serial boundary");
     let shut = Shut::hold(&world.runtime).await;
     let waiting = world.forward_in_the_background(deadline);
+    steps.at("the revocation: waiting for the worker to hold the action");
     world.until_the_worker_holds(3).await;
     let held_at = world.controller.leases.authority_revision();
 
     // A restriction is made and its barrier raised, with the worker out of the directory it would
     // be announced to: nothing it does can acknowledge the revision this advances to.
+    steps.at("the revocation: reading the fence owed before the restriction");
     assert_eq!(
         world.controller.fence_owed().await.0,
         None,
         "no fence is owed before the restriction"
     );
+    steps.at("the revocation: raising the barrier");
     let barrier = world
         .controller
         .revoke_authority()
@@ -444,7 +534,9 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
 
     // The clock passes the lease, and the worker refuses the action that held it.
     world.clock.advance(Duration::from_secs(6));
+    steps.at("the revocation: opening the worker's serial boundary");
     shut.open().await;
+    steps.at("the revocation: waiting for the worker to refuse the action");
     let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     let refused = answer.expect_err("the lease ran out before the action was dispatched");
@@ -457,6 +549,7 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
     );
 
     // Nothing renews it: the next action for this worker is given no lease.
+    steps.at("the revocation: asking for the next action's lease");
     let before = world.controller.leases.current_lease(world.session_id);
     let refused = world
         .controller
@@ -478,6 +571,7 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
         report.workers[0].state,
         kr_protocol::action::BarrierState::Pending
     );
+    steps.at("the revocation: reading the fence still owed");
     let (owed, unreadable) = world.controller.fence_owed().await;
     assert!(unreadable.is_none());
     assert_eq!(
