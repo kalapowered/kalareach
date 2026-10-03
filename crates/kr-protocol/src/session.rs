@@ -737,7 +737,9 @@ pub struct SessionEnvironmentSources {
     /// The other categories are not summarised, and a session on Windows reads these variables
     /// only where a program there does; this is not the culture a PowerShell session has.
     pub locale: EnvironmentSource,
-    /// Where the directory the shell started in came from.
+    /// Where the directory the shell was asked to start in came from. A directory the request
+    /// names that is not one is replaced by the home directory where the shell is launched, and
+    /// this still says the request named it.
     pub cwd: WorkingDirectorySource,
 }
 
@@ -777,7 +779,7 @@ impl EnvironmentSource {
 pub enum WorkingDirectorySource {
     /// The create request named it.
     CreateRequest,
-    /// The request named none and the worker started the shell in the root directory.
+    /// The request named none and the worker asked for the root directory.
     WorkerDefault,
 }
 
