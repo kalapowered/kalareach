@@ -344,7 +344,7 @@ impl Host {
                     actions: Nullable(actions.map(|actions| actions.iter().copied().collect())),
                 },
                 self.revision(),
-                2,
+                clock(),
                 &kr_voice::Unbounded,
             )
             .await
@@ -381,7 +381,7 @@ impl Host {
                     expected_rate_version: Nullable::some("2026-09".to_owned()),
                 },
                 self.revision(),
-                3,
+                clock(),
                 &kr_voice::Unbounded,
             )
             .await
@@ -391,6 +391,12 @@ impl Host {
         };
         session.voice_session_id
     }
+}
+
+/// The moment these calls are made at. The host decides whether a grant stands on its own clocks,
+/// so a grant written at a made-up small moment would already have run out.
+fn clock() -> u64 {
+    kr_ipc::now_ms().get()
 }
 
 fn delegation(name: &str) -> VoiceDelegationId {
@@ -658,7 +664,7 @@ async fn a_delegation_runs_under_the_grant_the_host_already_holds() {
                 turn_id: Nullable::null(),
                 confirmation: Nullable::null(),
             },
-            5,
+            clock(),
         )
         .await;
     // The session in this test has no worker, so the read this proposal becomes cannot complete.
@@ -710,7 +716,7 @@ async fn an_unlocked_screen_action_is_refused_without_a_signed_confirmation() {
                 turn_id: Nullable::null(),
                 confirmation: Nullable::null(),
             },
-            5,
+            clock(),
         )
         .await
         .expect("an answer");
@@ -766,7 +772,7 @@ async fn an_effect_this_host_does_not_dispatch_is_reported_as_admitted() {
                 turn_id: Nullable::null(),
                 confirmation: Nullable::null(),
             },
-            5,
+            clock(),
         )
         .await
         .expect("an answer");
