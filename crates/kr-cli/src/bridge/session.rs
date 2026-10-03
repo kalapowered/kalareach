@@ -404,8 +404,22 @@ mod tests {
         EnvironmentId::new(Uuid::from_bytes([3; 16]))
     }
 
-    /// A bridge whose helper answers the opening and then the frames given, one per request.
+    /// A bridge whose helper answers the opening and then the frames given, one per request, and
+    /// stays until the bridge is closed on it.
     fn answering(answers: &[Outcome]) -> (tempfile::TempDir, Opening) {
+        helper_of(answers, true)
+    }
+
+    /// A bridge whose helper answers the opening and then the frames given, and ends.
+    fn answering_then_ending(answers: &[Outcome]) -> (tempfile::TempDir, Opening) {
+        helper_of(answers, false)
+    }
+
+    /// A helper that has said all it will say stays for as long as the bridge to it is open, which
+    /// is what a helper does: it ends when its standard input does. A helper that ended after a
+    /// period of its own would end at a time the test does not control, and a test that was
+    /// delayed past it would read a bridge that had ended.
+    fn helper_of(answers: &[Outcome], stays: bool) -> (tempfile::TempDir, Opening) {
         let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
         let codec = FrameCodec::new(StreamKind::Control);
         let directory = tempfile::tempdir().expect("a temporary directory");
@@ -456,7 +470,12 @@ mod tests {
                 program: "/bin/sh".to_owned(),
                 arguments: vec![
                     "-c".to_owned(),
-                    "head -c 4 >/dev/null; cat \"$1\"; sleep 5".to_owned(),
+                    if stays {
+                        "head -c 4 >/dev/null; cat \"$1\"; cat >/dev/null"
+                    } else {
+                        "head -c 4 >/dev/null; cat \"$1\""
+                    }
+                    .to_owned(),
                     "sh".to_owned(),
                     file.to_str().expect("text").to_owned(),
                 ],
@@ -545,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_whose_bridge_ends_unanswered_says_why_it_ended() {
         // The helper answers the opening and then says nothing more and ends.
-        let (_directory, opening) = answering(&[]);
+        let (_directory, opening) = answering_then_ending(&[]);
         let mut link = linked(opening).await;
         let new = NewSession {
             presentation: Presentation::Invisible,
