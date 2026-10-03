@@ -1570,6 +1570,14 @@ pub mod configuration {
     /// holds for a variable, which a `PATH` there can come close to.
     pub const MAX_ENVIRONMENT_ADDITION_BYTES: usize = 32_767;
 
+    /// The most the names and values of one rung's `environment_additions` may come to together,
+    /// in bytes.
+    ///
+    /// The whole environment a session starts with travels to its worker in one control frame and
+    /// reaches the operating system in one `exec`, so a rung that every value could fill to its own
+    /// bound would be a document that validates and a session that never starts.
+    pub const MAX_ENVIRONMENT_ADDITIONS_TOTAL_BYTES: usize = 256 * 1024;
+
     /// The prefix of the variables a session's worker owns and sets itself.
     ///
     /// A creator's environment cannot preload one, and neither can an addition.
@@ -1644,9 +1652,9 @@ pub mod configuration {
 
     /// The name as this platform's environment holds it.
     ///
-    /// Windows compares the names of variables without regard to ASCII case and lists them in
-    /// capitals, so two names that differ only in case are one variable there. Everywhere else a
-    /// name is held exactly as it is written.
+    /// Windows keeps the case a variable was created with and compares names without regard to
+    /// ASCII case, so two names that differ only in case are one variable there; this host writes
+    /// them in capitals. Everywhere else a name is held exactly as it is written.
     #[must_use]
     pub fn platform_variable_name(name: &str) -> String {
         if cfg!(windows) {
@@ -1658,9 +1666,9 @@ pub mod configuration {
 
     /// The variables an owner has configured to add to a session, each with its value.
     ///
-    /// The values are the owner's own and go to a session's shell and nowhere else, so what a
-    /// debug print shows of this is the names: a print of the document, of the configuration in
-    /// force or of anything that holds either cannot carry a credential into a log.
+    // The values are the owner's own and go to a session's shell and nowhere else, so what a
+    // debug print shows of this is the names: a print of the document, of the configuration in
+    // force or of anything that holds either cannot carry a credential into a log.
     #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(transparent)]
     pub struct EnvironmentAdditions(BTreeMap<String, String>);
@@ -2805,6 +2813,19 @@ pub mod configuration {
                 );
             }
             let mut held_as = std::collections::BTreeSet::new();
+            if additions
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+                > MAX_ENVIRONMENT_ADDITIONS_TOTAL_BYTES
+            {
+                problems.push(
+                    rung()
+                        .stated(" holds names and values that come to more than ")
+                        .number(MAX_ENVIRONMENT_ADDITIONS_TOTAL_BYTES as u64)
+                        .stated(" bytes together"),
+                );
+            }
             for (name, value) in additions.iter() {
                 if !is_variable_name(name) {
                     problems.push(
@@ -2815,7 +2836,7 @@ pub mod configuration {
                     );
                 } else if host_owns_variable(&name.to_ascii_uppercase()) {
                     // In any case: a platform that folds case would give the session the host's
-                    // own variable, and the document means the same on every platform.
+                    // own variable, and which names the host owns does not depend on the platform.
                     problems.push(
                         rung()
                             .stated(" names ")
@@ -9048,6 +9069,10 @@ mod tests {
         }
 
         let too_long_value = "v".repeat(configuration::MAX_ENVIRONMENT_ADDITION_BYTES + 1);
+        let too_much_together: Vec<(String, String)> = (0
+            ..configuration::MAX_ENVIRONMENT_ADDITIONS)
+            .map(|index| (format!("ADDED_{index}"), "v".repeat(10_000)))
+            .collect();
         let too_many: Vec<(String, String)> = (0..=configuration::MAX_ENVIRONMENT_ADDITIONS)
             .map(|index| (format!("ADDED_{index}"), "x".to_owned()))
             .collect();
@@ -9070,8 +9095,8 @@ mod tests {
             vec![("COLORTERM", "truecolor")],
             vec![("SHELL", "/bin/zsh")],
             vec![("SSH_TTY", "/dev/pts/9")],
-            // The same names spelled in another case: a document means the same on every
-            // platform, and where the platform folds case the host's own copy would win.
+            // The same names spelled in another case: where the platform folds case the host's own
+            // copy would win, and which names the host owns does not depend on the platform.
             vec![("kr_session", "x")],
             vec![("Kr_Anything", "x")],
             vec![("Iterm_Session_Id", "x")],
@@ -9090,6 +9115,11 @@ mod tests {
             vec![("EDITOR", "vi\u{0}m")],
             vec![("EDITOR", too_long_value.as_str())],
             too_many,
+            // Each value inside its own bound and the rung's together beyond it.
+            too_much_together
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect(),
         ] {
             for document in [at_host(&refused), in_profile(&refused)] {
                 configuration::validate(&document)
