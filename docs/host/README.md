@@ -5173,11 +5173,11 @@ the registration, the transport's record and that job all name the program and n
 and the registration is published only at this point. The worker lets go of the hashed file when it
 commits, so a program that updates itself while it runs is not held to its old file, and the verdict
 it took stands for the process. When the backend says the launch is committed, the launcher starts
-the program, says that it has, and waits, and it then ends with the program's
-whole 32-bit exit code. A program that is committed and not started within four seconds, or whose
-launcher is gone before it can be told, is ended with everything in its job, and so is a program
-shown to the worker when the launch fails after it. If anything goes wrong before the commit, the
-program never ran: the launcher ends it and runs the command as typed. A launcher that cannot create its program says why
+the program, says that it has, and waits, and it then ends with the program's whole 32-bit exit
+code. A program that is committed and not started within four seconds, or whose launcher is gone
+before it can be told, is ended with everything in its job, and so is a program shown to the worker
+when the launch fails after it. If anything goes wrong before the commit, the program never ran: the
+launcher ends it and runs the command as typed. A launcher that cannot create its program says why
 in its frame, and the worker keeps the reason on the backend, because no instance exists to keep it.
 
 A program the integration did not launch is adopted, never given a gateway after the fact. Four

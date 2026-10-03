@@ -323,26 +323,36 @@ impl ManagedProcess {
         cfg!(any(unix, windows))
     }
 
-    /// Returns true when this platform's command backends run: an integrated invocation is given a
-    /// backend before it starts, and its launcher reaches it.
+    /// Returns why this platform's command backends do not run, or nothing where they do: an
+    /// integrated invocation is given a backend before it starts, and its launcher reaches it.
     ///
     /// It is a fact about the platform apart from [`Self::publishes_credential_file`]: a platform
     /// can prove a file closed to other accounts and still have no launcher that reaches a backend.
     /// Unix runs them. Windows runs them where the kernel's record of when a process started can be
     /// believed on this machine, which is what places a launcher and its program against the
-    /// backend: a machine whose record cannot be believed admits no launch, so it has no backend
-    /// that runs. The daemon's doctor reads this to say whether an enabled integration can launch
-    /// here.
+    /// backend: on a machine whose record cannot be believed no launch is admitted. The reason is
+    /// one fixed sentence, which the daemon's doctor can state as its own; what the record did is
+    /// in [`crate::windows::lineage::start_clock`]'s error. The doctor reads this to say whether an
+    /// enabled integration can launch here, and why not.
     #[must_use]
-    pub fn runs_command_backends() -> bool {
+    pub fn command_backends_failure() -> Option<&'static str> {
         #[cfg(windows)]
         {
-            crate::windows::lineage::start_clock().is_ok()
+            crate::windows::lineage::start_clock()
+                .is_err()
+                .then_some(START_RECORD_NOT_BELIEVED)
         }
         #[cfg(not(windows))]
         {
-            cfg!(unix)
+            (!cfg!(unix)).then_some("this platform has no command backend")
         }
+    }
+
+    /// Returns true when this platform's command backends run: see
+    /// [`Self::command_backends_failure`].
+    #[must_use]
+    pub fn runs_command_backends() -> bool {
+        Self::command_backends_failure().is_none()
     }
 
     /// Writes the registration file the launched process reads its credential from.
@@ -776,6 +786,12 @@ mod tests {
         }
     }
 }
+
+/// Why a Windows machine runs no command backend: the kernel's record of when a process started is
+/// what places a launcher and its program, and it cannot be believed here.
+#[cfg(windows)]
+const START_RECORD_NOT_BELIEVED: &str =
+    "the kernel's record of when a process started cannot be believed on this machine";
 
 /// How long a dedicated backend is given to stop before it is forced.
 ///

@@ -179,6 +179,7 @@ fn able(search_path: Vec<PathBuf>) -> Host {
     Host {
         search_path,
         backends: true,
+        backends_failure: None,
         launcher: true,
     }
 }
@@ -324,6 +325,37 @@ fn an_integration_on_where_no_backend_can_be_established_is_unavailable() {
     }
 }
 
+/// KR-REQ-07.45: a platform that says why its command backends do not run has the reason in the
+/// doctor's check, beside the count of integrations a new session cannot use. Control: the same
+/// host with no reason says no reason.
+#[test]
+fn a_platform_that_says_why_its_backends_do_not_run_has_the_reason_in_the_check() {
+    let store = Store::new("reason");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    let because =
+        "the kernel's record of when a process started cannot be believed on this machine";
+    let host = Host {
+        backends: false,
+        backends_failure: Some(because),
+        ..able(Vec::new())
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
+    let shown = check(&reported, &enabled(&["claude-code"]));
+    assert!(
+        shown.detail().contains(because),
+        "the reason is in the check: {}",
+        shown.detail()
+    );
+    let silent = Host {
+        backends_failure: None,
+        ..host
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &silent);
+    let shown = check(&reported, &enabled(&["claude-code"]));
+    assert!(!shown.detail().contains("do not run here"));
+}
+
 /// KR-REQ-07.45: where this platform's command backends run, which the daemon asks the worker for,
 /// an integration that is on and has a launcher beside the worker is reported as one a session
 /// created now can launch through, and is not reported as unavailable for the platform.
@@ -335,6 +367,7 @@ fn a_platform_whose_command_backends_run_reports_an_integration_with_a_launcher_
     let host = Host {
         search_path: Vec::new(),
         backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
+        backends_failure: kr_worker::broker::process::ManagedProcess::command_backends_failure(),
         launcher: true,
     };
     let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);

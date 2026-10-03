@@ -762,11 +762,21 @@ impl Controller {
     ) {
         let snapshot = self.current_snapshot(tokio::time::Instant::now()).await;
         let unread = snapshot.is_none();
+        // The first answer starts a process of its own to find out, which a thread of the runtime
+        // does not wait for.
+        let backends_failure = tokio::task::spawn_blocking(
+            kr_worker::broker::process::ManagedProcess::command_backends_failure,
+        )
+        .await
+        .unwrap_or(Some(
+            "whether command backends run here could not be checked",
+        ));
         let host = crate::catalogue::integrations::Host {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
-            backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
+            backends: backends_failure.is_none(),
+            backends_failure,
             // A worker runs an integrated invocation through the launcher beside it, held to the
             // rule the worker holds it to.
             launcher: self.worker_program.parent().is_some_and(|directory| {

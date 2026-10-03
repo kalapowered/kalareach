@@ -59,8 +59,10 @@ pub(crate) struct Uptime {
     pub padding: u32,
 }
 
-// `PROCESS_UPTIME_INFORMATION`: six 64-bit counters, then a 32-bit union of flags and counts, padded
-// to the structure's 8-byte alignment.
+// `PROCESS_UPTIME_INFORMATION`: six 64-bit counters, then a 32-bit union of flags and counts,
+// padded to the structure's 8-byte alignment. Checked where the kernel writes it, on the 64-bit
+// targets this host ships for.
+#[cfg(all(windows, target_pointer_width = "64"))]
 const _: () = {
     assert!(std::mem::size_of::<Uptime>() == 56);
     assert!(std::mem::align_of::<Uptime>() == 8);
