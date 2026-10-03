@@ -970,20 +970,31 @@ fn kr_req_12_02_a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_
         .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
         .expect("the launch arrives before its program is shown")
         .expect("and waits there");
-    let before = shell
+    // The program is the process of the shell's job that runs from the file the launcher was asked
+    // to run, which is what it has created and named.
+    let wanted = kr_worker::windows::file::object_of(
+        &std::fs::File::open(&shell.executable).expect("the program's file opens"),
+    )
+    .expect("the program's file has an id");
+    let program = shell
         .job
         .process_ids()
-        .expect("the shell's job lists its processes");
-    assert_eq!(
-        before.len(),
-        2,
-        "the shell's job holds the launcher and the program it created: {before:?}"
-    );
+        .expect("the shell's job lists its processes")
+        .into_iter()
+        .find(|member| {
+            kr_worker::windows::file::image_of(*member)
+                .and_then(|image| {
+                    kr_worker::windows::file::object_of(&image).map_err(|error| error.to_string())
+                })
+                .is_ok_and(|object| object == wanted)
+        })
+        .expect("the launcher has created its program, suspended, in the shell's job");
+    let identity = kr_ipc::identity::process_start_identity(program).expect("an identity");
     launcher.kill().expect("the launcher is ended");
     let _ = launcher.wait();
     eventually(
         "the program nobody can start is ended with the launcher",
-        || shell.job.process_ids().is_ok_and(|held| held.is_empty()),
+        || kr_ipc::identity::process_state(&identity) == kr_ipc::identity::ProcessState::Ended,
     );
     let _ = release.send(());
 }
