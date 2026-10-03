@@ -228,9 +228,9 @@ there is no setting that admits them.
 Project text — a repository name, a branch, an intent somebody typed — is carried as data. It goes
 inside a delimited section of the prompt that is labelled as data, and the output is constrained by
 a grammar, so an instruction inside a branch name cannot change the shape of the answer or the
-status shown beside it. A name that spells one of the model's control tokens, such as `<|im_end|>` or
-`/no_think`, reaches the model as the characters it is made of, never as the token. It can still
-mislead a model about what a session is doing, and nothing here claims otherwise.
+status shown beside it. Project text that spells one of the model's control tokens, such as `<|im_end|>`
+or `/no_think`, reaches the model as the characters it is made of, never as the token. Project text
+can still mislead a model about what a session is doing, and nothing here claims otherwise.
 
 ## What comes out
 
