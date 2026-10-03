@@ -691,15 +691,24 @@ impl Controller {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 // Each is performed once per actor's action: claimed first, and what it came to is
                 // kept under the claim before it is answered, so a retry is answered from that
-                // record rather than enrolling, forgetting or observing again. A connection that
-                // came over a process bridge has already crossed its one: the helper that made it
-                // refuses to carry a request that would open another, and this is the rule kept
+                // record rather than enrolling, forgetting or observing again. A retry that finds
+                // the record is answered under the same check as any retained answer. A connection
+                // that came over a process bridge has already crossed its one: the helper that made
+                // it refuses to carry a request that would open another, and this is the rule kept
                 // where only the destination can keep it.
                 return self
                     .claimed_action(
                         actor_id,
                         mutation,
-                        self.environment_record(&actor, origin.is_some(), mutation, method),
+                        connection_id,
+                        admitted,
+                        self.environment_record(
+                            &actor,
+                            origin.is_some(),
+                            mutation,
+                            method,
+                            carried,
+                        ),
                     )
                     .await;
             }
@@ -760,9 +769,13 @@ impl Controller {
                         outcome
                     }
                     Ok(crate::grants::ActionClaim::Recorded(_)) => {
-                        // What this action produced is given back only under authority that has
-                        // not been withdrawn, as it is by the retained lookup before a first
-                        // admission: a claim can be recorded between that lookup and this one.
+                        // A claim can be recorded between the retained lookup before a first
+                        // admission and this one. What the action produced is given back only
+                        // under authority that has not been withdrawn, and the answer is waited
+                        // for first: it is the check made with the answer in hand that decides.
+                        let answered = self.retained_authority_answer(actor_id, mutation).await;
+                        #[cfg(feature = "testing")]
+                        self.after_the_retained_lookup.wait().await;
                         if let Err(error) = self.check_retained_answer(connection_id, admitted) {
                             return error_reply(
                                 mutation.request_id,
@@ -770,17 +783,13 @@ impl Controller {
                                 error.to_string(),
                             );
                         }
-                        return self
-                            .retained_authority_answer(actor_id, mutation)
-                            .await
-                            .unwrap_or_else(|| {
-                                error_reply(
-                                    mutation.request_id,
-                                    ErrorCode::ResourceUnavailable,
-                                    "another attempt under this action identifier has not \
-                                     finished",
-                                )
-                            });
+                        return answered.unwrap_or_else(|| {
+                            error_reply(
+                                mutation.request_id,
+                                ErrorCode::ResourceUnavailable,
+                                "another attempt under this action identifier has not finished",
+                            )
+                        });
                     }
                     Err(error) => Err(error),
                 }
