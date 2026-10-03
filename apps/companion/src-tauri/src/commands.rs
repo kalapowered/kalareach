@@ -48,6 +48,14 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("session_read", Some(Method::SessionRead)),
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
+    // What a session is called and doing, for the rows that list sessions: an authorised read of
+    // filtered metadata, which takes a session and nothing else.
+    ("session_describe", Some(Method::SessionDescribe)),
+    // Session descriptions as the host offers them at setup: what they cost before anything is
+    // fetched, the two settings an owner has, and the fetch itself.
+    ("description_setup", Some(Method::DescriptionSetup)),
+    ("description_configure", Some(Method::DescriptionConfigure)),
+    ("description_download", Some(Method::DescriptionDownload)),
     // The raw terminal view. Its attachment is made on the session's own worker, from native
     // code: the page names a session, a size, the moves it makes and the person's input, never a
     // method.
@@ -221,6 +229,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         session_read,
         session_create,
         session_close,
+        session_describe,
+        description_setup,
+        description_configure,
+        description_download,
         terminal_view_open,
         terminal_view_resize,
         terminal_view_move,
@@ -496,6 +508,31 @@ read_command!(
     /// Reads one session.
     session_read, Method::SessionRead,
     kr_protocol::session::SessionReadParams => kr_protocol::session::SessionReadResult
+);
+read_command!(
+    /// Reads what one session is called and what it is doing: the title and where it came from,
+    /// the generated activity line when there is one, and how current it is.
+    ///
+    /// The parameters name a session and nothing else. There is no field that selects a model,
+    /// supplies a prompt or asks for a description to be produced now.
+    session_describe, Method::SessionDescribe,
+    kr_protocol::describe::SessionDescribeParams => kr_protocol::describe::SessionDescribeResult
+);
+read_command!(
+    /// Reads what description setup offers on this host: the exact size and sources before
+    /// anything is fetched, the two settings, how a fetch is going, and why nothing is offered
+    /// when nothing is.
+    description_setup, Method::DescriptionSetup, () => kr_protocol::describe::DescriptionSetup
+);
+mutate_command!(
+    /// Turns session descriptions on or off, and whether they may run on battery.
+    description_configure, Method::DescriptionConfigure,
+    kr_protocol::describe::DescriptionConfigureParams
+);
+mutate_command!(
+    /// Starts the fetch of the selected profile's files, or stops one that is running.
+    description_download, Method::DescriptionDownload,
+    kr_protocol::describe::DescriptionDownloadParams
 );
 read_command!(
     /// Reads the agent's questions.
@@ -1773,7 +1810,6 @@ mod tests {
             .filter_map(|(_, method)| method.map(Method::as_str))
             .collect();
         for forbidden in [
-            "session.describe",
             "session.rename",
             "project.clone",
             "workflow.run",
@@ -2044,6 +2080,10 @@ mod tests {
             session_read,
             session_create,
             session_close,
+            session_describe,
+            description_setup,
+            description_configure,
+            description_download,
             shell_launch,
             draft_create,
             draft_update,
@@ -2105,7 +2145,7 @@ mod tests {
                 continue;
             }
             let expected = match *command {
-                "host_info" | "environment_list" => "HOST_NOT_CONFIGURED",
+                "host_info" | "environment_list" | "description_setup" => "HOST_NOT_CONFIGURED",
                 "attachment_upload" => "PERMISSION_DENIED",
                 // A phone opens no call in this process, so a phone build refuses every start
                 // before it reads one.
@@ -2459,6 +2499,50 @@ mod tests {
                 kr_protocol::sharing::AuthorityNotice::AgentPermissions
             ]
         );
+    }
+
+    /// KR-REQ-10.01 and KR-REQ-22.01: the description commands take what their methods declare and
+    /// nothing else. A read of one session's description that also names a prompt, a model or a
+    /// sampler, and a fetch that names an address, are refused when the parameters are parsed, so
+    /// the page has no way to steer what the host runs or where it fetches from.
+    #[test]
+    fn the_description_commands_refuse_a_field_their_methods_do_not_declare() {
+        let session = "44444444-4444-4444-8444-444444444444";
+        let described: Result<kr_protocol::describe::SessionDescribeParams> =
+            decode(serde_json::json!({ "session_id": session }));
+        assert!(described.is_ok(), "the declared shape passes the parse");
+        for foreign in ["prompt", "model", "sampler", "temperature", "now"] {
+            let refused: Result<kr_protocol::describe::SessionDescribeParams> =
+                decode(serde_json::json!({ "session_id": session, foreign: "anything" }));
+            assert!(
+                refused.is_err(),
+                "{foreign} is not a field of session.describe"
+            );
+        }
+
+        let started: Result<kr_protocol::describe::DescriptionDownloadParams> =
+            decode(serde_json::json!({ "action": "start" }));
+        assert!(started.is_ok(), "the declared shape passes the parse");
+        for widened in [
+            serde_json::json!({ "action": "start", "url": "https://example.test/model" }),
+            serde_json::json!({ "action": "start", "profile_id": "another" }),
+            serde_json::json!({ "action": "delete" }),
+        ] {
+            let refused: Result<kr_protocol::describe::DescriptionDownloadParams> =
+                decode(widened.clone());
+            assert!(
+                refused.is_err(),
+                "{widened} is not a fetch this host offers"
+            );
+        }
+
+        let settings: Result<kr_protocol::describe::DescriptionConfigureParams> =
+            decode(serde_json::json!({ "enabled": true, "on_battery": null }));
+        assert!(settings.is_ok(), "the two settings pass the parse");
+        let widened: Result<kr_protocol::describe::DescriptionConfigureParams> = decode(
+            serde_json::json!({ "enabled": true, "on_battery": null, "profile_id": "another" }),
+        );
+        assert!(widened.is_err(), "a third setting is not one an owner has");
     }
 
     /// KR-REQ-10.01: an unknown field from the WebView is refused. Called the way the page calls it,
