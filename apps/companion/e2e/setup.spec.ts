@@ -212,10 +212,8 @@ test.describe('the first-start assistant', () => {
     await expect(page.getByTestId('setup-sleep')).toContainText(
       'Setting up KalaReach does not change it'
     )
-    await expect(page.getByTestId('setup-model-size')).toContainText('1.9 GB')
-    await expect(page.getByTestId('setup-model')).toContainText(
-      'Nothing is downloading while you read this'
-    )
+    await expect(page.getByTestId('setup-model-size')).toContainText('1.6 GB')
+    await expect(page.getByTestId('setup-model')).toContainText('Nothing is fetched until you ask')
     await capture(page, 'setup-host-03.28')
   })
 

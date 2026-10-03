@@ -354,3 +354,11 @@ html[data-input='keyboard'] .setup-evidence,
 html[data-input='keyboard'] .setup-evidence[data-open='true'] {
   transition-delay: 0ms;
 }
+
+/*
+ * The two settings of session descriptions. Each row is taller than a press target, so the press
+ * area around one switch does not reach the switch of the row beside it.
+ */
+.setup-model-settings .row {
+  min-block-size: calc(var(--target) + 4px);
+}

@@ -9,9 +9,10 @@
  *
  * The other two are offers and nothing more. Automatic sleep is the machine's own policy and
  * KalaReach does not change it quietly, so the setting is presented with what it would do and left
- * off; using battery power as well is a second, separate choice. And the default local model is a
- * download with a size on it, which the person can decline, cancel or turn off for good — and
- * declining it leaves setup working, because a download is not a permission.
+ * off; using battery power as well is a second, separate choice. And session descriptions are a
+ * download with a size on it, which the person starts, cancels or turns off for good, and each of
+ * those is the host's own action on request, shown from the host's own answer: leaving it alone
+ * leaves setup working, because a download is not a permission.
  */
 
 import type { ProfilePersistence } from '@kalareach/protocol'
@@ -108,25 +109,6 @@ export const SLEEP_OFFERS: readonly SleepOffer[] = [
 /** The command that changes the sleep setting, which the assistant shows rather than runs. */
 export const SLEEP_COMMAND = 'kr host power --set'
 
-/** The default local model, offered during setup. */
-export interface ModelPackage {
-  /** What it is called. */
-  readonly name: string
-  /** What it is for. */
-  readonly purpose: string
-  /** How big the download is, stated before it starts. */
-  readonly bytes: number
-}
-
-/** The package setup offers. */
-export const DEFAULT_MODEL: ModelPackage = {
-  name: 'The default local model',
-  purpose:
-    'Summaries, titles and suggestions run on this machine instead of somewhere else. Nothing ' +
-    'about KalaReach needs it.',
-  bytes: 1_880_000_000
-}
-
 /** A size in the units a person reads. */
 export function readableBytes(bytes: number): string {
   if (bytes < 1_000) return `${bytes} bytes`
@@ -138,23 +120,6 @@ export function readableBytes(bytes: number): string {
     unit += 1
   }
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
-}
-
-/**
- * What the person decided about the download.
- *
- * These are choices rather than progress. Nothing in the assistant downloads anything, so a state
- * called "downloading" would be the interface telling somebody something was happening that was
- * not.
- */
-export type DownloadState = 'offered' | 'chosen' | 'cancelled' | 'declined'
-
-/** What the person is told their choice is. */
-export const DOWNLOAD_LABEL: Readonly<Record<DownloadState, string>> = {
-  offered: 'Not chosen',
-  chosen: 'Chosen',
-  cancelled: 'Cancelled',
-  declined: 'Turned off'
 }
 
 /**
