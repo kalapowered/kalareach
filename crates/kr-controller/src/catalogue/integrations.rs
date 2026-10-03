@@ -214,6 +214,8 @@ pub struct Host {
     pub search_path: Vec<PathBuf>,
     /// Whether this platform establishes a command backend at all.
     pub backends: bool,
+    /// Why it does not, where the platform says: what the doctor's check then says beside it.
+    pub backends_failure: Option<&'static str>,
     /// Whether a launcher, `kr-hook`, is installed beside this host's worker.
     pub launcher: bool,
 }
@@ -261,6 +263,8 @@ pub struct Reported {
     pub reports: Vec<CommandIntegrationReport>,
     /// How many it leaves out, since one answer carries no more.
     pub omitted: usize,
+    /// Why this platform's command backends do not run, where it says.
+    pub backends_failure: Option<&'static str>,
 }
 
 /// Every command integration an admitted release declares, and every package the configuration
@@ -427,6 +431,7 @@ pub fn report(
     Reported {
         reports: carried,
         omitted,
+        backends_failure: host.backends_failure.filter(|_| !host.backends),
     }
 }
 
@@ -578,6 +583,11 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
             " more are not listed, since one answer carries no more, the packages the \
                  configuration names first",
         );
+    }
+    if let Some(why) = reported.backends_failure.filter(|_| blocked > 0) {
+        detail = detail
+            .stated("; command backends do not run here: ")
+            .stated(why);
     }
     DoctorCheck::new(
         ID,

@@ -382,8 +382,9 @@ mod platform {
                 let raw = self.shared.raw.load(Ordering::SeqCst);
                 if raw != 0 {
                     // SAFETY: the handle is not closed, because only a close closes it and this
-                    // is the one running; a null overlapped cancels every request on the handle. A handle with nothing pending answers
-                    // with a failure that is the outcome wanted.
+                    // is the one running; a null overlapped cancels every request on the handle.
+                    // A handle with nothing pending answers with a failure that is the outcome
+                    // wanted.
                     unsafe { CancelIoEx(raw as HANDLE, std::ptr::null()) };
                 }
                 if std::time::Instant::now() >= deadline {
