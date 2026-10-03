@@ -582,6 +582,14 @@ impl Controller {
             integrations: Arc::new(crate::catalogue::integrations::Integrations::new()),
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
+            // Read once, here: what a daemon holds changes with the login that started it and with
+            // nothing a person does afterwards, and a session started later must not depend on
+            // when it was asked for.
+            host_environment: std::sync::Mutex::new(super::create::host_context_variables(
+                std::env::vars_os().filter_map(|(name, value)| {
+                    Some((name.into_string().ok()?, value.into_string().ok()?))
+                }),
+            )),
             started,
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),

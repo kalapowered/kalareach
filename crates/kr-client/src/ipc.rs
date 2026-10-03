@@ -87,7 +87,29 @@ impl IpcTransport {
     pub async fn connect(endpoint: &Endpoint, build_id: BuildId) -> Result<Self> {
         // A client, not a controller: a controller connection is the one that speaks for a
         // generation, and this library is what an attachment and a command line use.
-        let client = LocalClient::connect(endpoint, LocalClientKind::Cli, build_id).await?;
+        Self::connect_as(endpoint, LocalClientKind::Cli, build_id).await
+    }
+
+    /// Connects to a host endpoint on this machine as the companion app, and negotiates the
+    /// protocol version.
+    ///
+    /// The host starts a session this connection creates with the environment of its own
+    /// execution context, because an app has no shell of its own to take one from. The command
+    /// line's [`Self::connect`] declares what it is, and so does this.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub async fn connect_app(endpoint: &Endpoint, build_id: BuildId) -> Result<Self> {
+        Self::connect_as(endpoint, LocalClientKind::App, build_id).await
+    }
+
+    async fn connect_as(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+    ) -> Result<Self> {
+        let client = LocalClient::connect(endpoint, kind, build_id).await?;
         Ok(Self::over(client))
     }
 
