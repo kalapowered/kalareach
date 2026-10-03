@@ -481,6 +481,36 @@ fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
     let _ = outside.wait();
 }
 
+/// A program in the system directory, which every Windows machine has.
+fn system_program(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+        .join("System32")
+        .join(name)
+}
+
+/// Starts a system program in `job` the way a launch does, with no streams of its own.
+fn start_in(
+    job: &kr_worker::windows::job::AgentJob,
+    name: &str,
+    arguments: &[&str],
+) -> kr_worker::windows::launch::Child {
+    let arguments: Vec<String> = arguments
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect();
+    kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+        program: &system_program(name),
+        arguments: &arguments,
+        directory: &std::env::temp_dir(),
+        environment: &[],
+        session: None,
+        agent: job,
+        pipe_input: false,
+        pipe_output: false,
+    })
+    .expect("the program starts in its job")
+}
+
 /// A process that waits far longer than any test takes, ended when the test ends however it ends:
 /// `ping` is on every Windows machine.
 struct Waiting(std::process::Child);
@@ -592,24 +622,20 @@ fn a_child_is_started_by_its_running_parent_and_by_no_other_process() {
 fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
     let job = kr_worker::windows::job::AgentJob::create().expect("a job");
     // `start /b` runs `ping` as a child of `cmd` and `cmd` ends without waiting for it.
-    let mut shell = job
-        .start(
-            std::process::Command::new("cmd.exe")
-                .args([
-                    "/d",
-                    "/c",
-                    "start",
-                    "/b",
-                    "ping.exe",
-                    "-n",
-                    "600",
-                    "127.0.0.1",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .expect("the shell starts");
+    let mut shell = start_in(
+        &job,
+        "cmd.exe",
+        &[
+            "/d",
+            "/c",
+            "start",
+            "/b",
+            "ping.exe",
+            "-n",
+            "600",
+            "127.0.0.1",
+        ],
+    );
     let shell_identity = kr_ipc::identity::started_process_identity(shell.id()).expect("identity");
     shell
         .wait()

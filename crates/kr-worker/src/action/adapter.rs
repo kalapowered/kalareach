@@ -477,10 +477,20 @@ mod unix {
 mod windows {
     /// Returns the service's report, or `None` when it could not be asked.
     pub fn query() -> Option<String> {
-        let output = std::process::Command::new("w32tm")
-            .args(["/query", "/status"])
-            .output()
-            .ok()?;
+        // Started under the lock every start of this worker's takes, while a launch's stream ends
+        // may be inheritable, and let go of as soon as the process exists: it is not held for as
+        // long as `w32tm` runs.
+        let child = {
+            let _inheriting = crate::windows::launch::inheriting();
+            std::process::Command::new("w32tm")
+                .args(["/query", "/status"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .ok()?
+        };
+        let output = child.wait_with_output().ok()?;
         if !output.status.success() {
             return None;
         }
