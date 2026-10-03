@@ -415,7 +415,10 @@ mod platform {
         let failed = |why: String| {
             format!("the kernel's record of when a process started cannot be believed here: {why}")
         };
-        let executable = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
+        // The process never runs, so any program does: one from the system directory, which every
+        // machine has.
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let executable = std::path::Path::new(&root).join("System32").join("cmd.exe");
         let before = own()?.query_interrupt_time;
         let mut child = {
             // Created under the lock every launch takes: a process started while a launch's
