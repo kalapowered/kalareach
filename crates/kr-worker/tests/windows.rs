@@ -662,6 +662,185 @@ fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
     job.terminate(1).expect("the job ends");
 }
 
+/// A backend this test launched as a launch does: held by a session's job and by a job of its own,
+/// which the broker keeps with the end of the backend's input it writes, so stopping it is stopping
+/// that job.
+struct Backend {
+    _session: kr_worker::windows::job::SessionJob,
+    job: std::sync::Arc<kr_worker::windows::job::AgentJob>,
+    child: kr_worker::windows::launch::Child,
+    identity: kr_protocol::identity::ProcessStartIdentity,
+}
+
+impl Backend {
+    fn launch(program: &str, arguments: &[&str]) -> Self {
+        let session = kr_worker::windows::job::SessionJob::create().expect("a session job");
+        let job = std::sync::Arc::new(kr_worker::windows::job::AgentJob::create().expect("a job"));
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        let child = kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+            program: &system_program(program),
+            arguments: &arguments,
+            directory: &std::env::temp_dir(),
+            environment: &[],
+            session: Some(&session),
+            agent: &job,
+            pipe_input: true,
+            pipe_output: true,
+        })
+        .expect("the backend starts");
+        let identity =
+            kr_ipc::identity::started_process_identity(child.id()).expect("its identity");
+        kr_worker::windows::job::keep_agent(
+            identity.clone(),
+            std::sync::Arc::clone(&job),
+            child.stdin.clone(),
+        );
+        Self {
+            _session: session,
+            job,
+            child,
+            identity,
+        }
+    }
+
+    /// Waits until the job holds at least `count` processes.
+    fn wait_for(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.job.process_ids().expect("the job lists").len() < count {
+            assert!(
+                Instant::now() < deadline,
+                "the backend started its processes"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.job.terminate(1);
+        let _ = self.child.wait();
+        kr_worker::windows::job::release_agent(&self.identity);
+    }
+}
+
+/// KR-REQ-07.67: a dedicated backend that ends when its input closes is stopped by closing it, and
+/// is not forced; the stop is complete only when its job lists nothing.
+#[tokio::test]
+async fn kr_req_07_67_a_backend_that_ends_when_its_input_closes_is_stopped_without_force() {
+    // `findstr` reads its input until the end and then ends.
+    let backend = Backend::launch("findstr.exe", &["kr-never-matches"]);
+    let stopped = kr_worker::broker::stop_backend(&backend.identity, Duration::from_secs(20)).await;
+    assert!(stopped.asked, "the backend was asked to stop");
+    assert!(stopped.ended, "and its job holds nothing");
+    assert!(
+        !stopped.forced,
+        "a backend that ends on its own is not forced"
+    );
+    assert!(!stopped.unresolved);
+    assert!(backend.job.process_ids().expect("the job lists").is_empty());
+}
+
+/// KR-REQ-07.67: a backend that ignores its input is ended with its whole job once the grace period
+/// has passed, and so is what it started. Control: the case above is not forced.
+#[tokio::test]
+async fn kr_req_07_67_a_backend_that_ignores_its_input_is_forced_with_what_it_started() {
+    let backend = Backend::launch("cmd.exe", &["/d", "/c", "ping -n 600 127.0.0.1 > NUL"]);
+    backend.wait_for(2);
+    let stopped = kr_worker::broker::stop_backend(&backend.identity, Duration::from_secs(1)).await;
+    assert!(stopped.asked && stopped.ended && !stopped.unresolved);
+    assert!(stopped.forced, "the grace period passed and the force ran");
+    assert!(
+        backend.job.process_ids().expect("the job lists").is_empty(),
+        "nothing of it is left"
+    );
+}
+
+/// KR-REQ-07.67: a backend whose root has gone while what it started has not is not stopped until
+/// the job is empty: completion is the job's, never the root's.
+#[tokio::test]
+async fn kr_req_07_67_a_root_that_is_gone_with_helpers_alive_is_not_a_complete_stop() {
+    // `start /b` runs `ping` as a child of `cmd`, and `cmd` ends without waiting for it.
+    let mut backend = Backend::launch(
+        "cmd.exe",
+        &[
+            "/d",
+            "/c",
+            "start",
+            "/b",
+            "ping.exe",
+            "-n",
+            "600",
+            "127.0.0.1",
+        ],
+    );
+    let _ = backend.child.wait();
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&backend.identity),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the root has ended"
+    );
+    backend.wait_for(1);
+    let stopped = kr_worker::broker::stop_backend(&backend.identity, Duration::from_secs(1)).await;
+    assert!(stopped.asked, "its helper was still there to stop");
+    assert!(stopped.forced && stopped.ended);
+    assert!(backend.job.process_ids().expect("the job lists").is_empty());
+}
+
+/// KR-REQ-07.67: a stop cancels a write to the backend's input that is blocked, so the stop is not
+/// held by a backend that never reads: the write fails and the backend is ended.
+#[tokio::test]
+async fn kr_req_07_67_a_stop_cancels_a_write_that_is_blocked() {
+    let mut backend = Backend::launch("ping.exe", &["-n", "600", "127.0.0.1"]);
+    let mut input = backend.child.stdin.take().expect("the backend's input");
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = std::sync::Arc::clone(&written);
+    let writing = std::thread::spawn(move || {
+        use std::io::Write as _;
+        // `ping` never reads, so the pipe fills and a write waits for room that never comes.
+        loop {
+            if let Err(error) = input.write_all(&[0_u8; 4096]) {
+                return error;
+            }
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while written.load(std::sync::atomic::Ordering::SeqCst) < 32 {
+        assert!(Instant::now() < deadline, "the pipe fills");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stopped = kr_worker::broker::stop_backend(&backend.identity, Duration::from_secs(1)).await;
+    assert!(stopped.asked && stopped.ended && !stopped.unresolved);
+    let error = writing.join().expect("the writer returns");
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::Other
+        ),
+        "the blocked write failed: {error}"
+    );
+}
+
+/// KR-REQ-07.67: two callers that stop one backend at once do one stop and get one answer.
+#[tokio::test]
+async fn kr_req_07_67_two_stops_at_once_are_one_stop() {
+    let backend = Backend::launch("cmd.exe", &["/d", "/c", "ping -n 600 127.0.0.1 > NUL"]);
+    backend.wait_for(2);
+    let identity = backend.identity.clone();
+    let (first, second) = tokio::join!(
+        kr_worker::broker::stop_backend(&identity, Duration::from_secs(1)),
+        kr_worker::broker::stop_backend(&identity, Duration::from_secs(1)),
+    );
+    assert_eq!(first, second, "one answer for one stop");
+    assert!(first.asked && first.forced && first.ended);
+}
+
 /// A scratch tree under the temporary directory, removed with the test: junctions in it are removed
 /// as links and never followed.
 struct Tree(std::path::PathBuf);

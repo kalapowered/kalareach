@@ -2218,9 +2218,14 @@ impl ServedChannel {
             .expect("the launched instance is registered");
         let root = std::env::temp_dir().join(format!("kr-channel-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&root).expect("the store's directory");
+        // The package names an absolute path to its forwarder, which is not read here.
+        let forwarder = if cfg!(windows) {
+            root.join("kr-hook.exe")
+        } else {
+            std::path::PathBuf::from("/opt/kalareach/bin/kr-hook")
+        };
         let source =
-            fixture::claude_code_package(&root, std::path::Path::new("/opt/kalareach/bin/kr-hook"))
-                .expect("the package is written");
+            fixture::claude_code_package(&root, &forwarder).expect("the package is written");
         let connector =
             Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
         let package_binding = BrokerBindingId::new(Uuid::from_bytes([0x33; 16]));
