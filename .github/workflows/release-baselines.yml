@@ -7,7 +7,9 @@ name: release-baselines
 # does not match its baseline fails the job: a macOS executable that is not built for 14.0, a Linux
 # one that needs a newer glibc than Ubuntu 22.04's, or a Windows one that asks for a newer Windows
 # than 11. Each executable is then started where it was built, and the Linux ones are also started
-# in the distributions the release supports.
+# in the distributions the release supports. On the x86-64 targets the description process's llama.cpp
+# archives are also disassembled, and an AVX-512, AVX-VNNI or AMX instruction in them fails the job:
+# the process is built for the x86-64-v3 baseline, and a host checks its processor against that.
 #
 # `scripts/check-release-floors.py` reads the floors, and `docs/releases/platforms.md` says what each
 # baseline is and why. This runs by hand and every night; the landing gate is core-ci, which builds
@@ -157,6 +159,134 @@ jobs:
           for executable in $EXECUTABLES; do
             cargo build --locked --release --target "$TARGET" -p "${executable%/*}" --bin "${executable#*/}"
           done
+
+      # The description process runs on every x86-64 processor that has the baseline in
+      # `.cargo/config.toml` (x86-64-v3), so the llama.cpp archives it links must hold no AVX-512,
+      # AVX-VNNI or AMX instruction. The pins and the build guard keep them out of a build made here;
+      # this reads what was compiled, which is what a compiler flag in the environment
+      # (`CFLAGS=-march=native`) would change without either of them seeing it.
+      #
+      # The check is put through archives whose contents are known before it is trusted with the
+      # release's: one planted with each of the three kinds of instruction, which it has to refuse,
+      # and one that holds none, which it has to pass. Each is a Rust static library, so it carries
+      # a runtime's worth of ordinary code beside the planted instruction. The disassembler is the
+      # platform's own: `objdump` on Linux and macOS, `dumpbin /disasm` from Visual Studio on
+      # Windows.
+      - name: Refuse instructions past the baseline in the description process
+        if: startsWith(matrix.target, 'x86_64-')
+        run: |
+          release="target/$TARGET/release"
+          scratch="$release/instruction-check"
+          rm -rf "$scratch"
+          mkdir -p "$scratch"
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            vswhere="C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            install=$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
+            dumpbin=$(find "$(cygpath -u "$install")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/dumpbin.exe' | sort -V | tail -1)
+            echo "dumpbin: $dumpbin"
+            archive_extension=lib
+          else
+            archive_extension=a
+          fi
+
+          # Writes the disassembly of one archive, lower case and without symbol names or comments,
+          # to a text file.
+          disassemble() {
+            if [ "$RUNNER_OS" = Windows ]; then
+              "$dumpbin" -nologo -disasm:nobytes "$1"
+            else
+              objdump -d --no-show-raw-insn "$1"
+            fi | tr -d '\r' | sed -E 's/<[^>]*>//g; s/#.*$//' | tr '[:upper:]' '[:lower:]' > "$2"
+          }
+
+          avx512='\b(zmm[0-9]+|zmmword|[xy]mm(1[6-9]|2[0-9]|3[01])|k[0-7])\b'
+          vnni='\bvpdp(b(us|ss|su|uu)|w(ss|su|us|uu))d(s)?\b'
+          amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
+
+          # Prints how many instructions of each kind a disassembly holds, and fails when any does.
+          past_baseline() {
+            local found_avx512 found_vnni found_amx
+            found_avx512=$(grep -c -E "$avx512" "$1" || true)
+            found_vnni=$(grep -c -E "$vnni" "$1" || true)
+            found_amx=$(grep -c -E "$amx" "$1" || true)
+            echo "avx512=$found_avx512 avx-vnni=$found_vnni amx=$found_amx"
+            [ "$found_avx512$found_vnni$found_amx" = 000 ]
+          }
+
+          cat > "$scratch/planted.rs" <<'RUST'
+          #![no_std]
+          #![allow(unexpected_cfgs)]
+          use core::arch::asm;
+
+          #[unsafe(no_mangle)]
+          pub unsafe extern "C" fn planted() {
+              #[cfg(avx512)]
+              unsafe { asm!("vpaddd zmm0, zmm1, zmm2") };
+              #[cfg(vnni)]
+              unsafe { asm!("vpdpbusd ymm0, ymm1, ymm2") };
+              #[cfg(amx)]
+              unsafe { asm!("tilezero tmm0") };
+              #[cfg(baseline)]
+              unsafe { asm!("vpaddd ymm0, ymm1, ymm2", "vfmadd231ps ymm0, ymm1, ymm2") };
+          }
+
+          #[panic_handler]
+          fn panic(_: &core::panic::PanicInfo) -> ! {
+              loop {}
+          }
+          RUST
+
+          bad=0
+          for plant in avx512:+avx512f vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma; do
+            name=${plant%%:*}
+            rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
+              -C target-feature="${plant#*:}" --cfg "$name" -o "$scratch/$name.$archive_extension" "$scratch/planted.rs"
+            disassemble "$scratch/$name.$archive_extension" "$scratch/$name.txt"
+            # A disassembler that read nothing would accept everything.
+            [ "$(wc -l < "$scratch/$name.txt")" -ge 1000 ] || { echo "::error::the disassembly of $name holds no code"; exit 1; }
+            counts=$(past_baseline "$scratch/$name.txt" || true)
+            if [ "$name" = baseline ]; then
+              verdict=accepted
+              [ "$counts" = "avx512=0 avx-vnni=0 amx=0" ] || verdict=WRONGLY-REFUSED
+            else
+              verdict=refused
+              [ "$counts" != "avx512=0 avx-vnni=0 amx=0" ] || verdict=WRONGLY-ACCEPTED
+            fi
+            echo "planted $name: $verdict ($counts)"
+            case "$verdict" in WRONGLY-*) bad=1 ;; esac
+          done
+          [ "$bad" = 0 ] || { echo "::error::the instruction check does not tell the planted archives apart"; exit 1; }
+
+          shopt -s nullglob
+          archives=("$release"/build/llama-cpp-sys-2-*/out/lib*/*."$archive_extension")
+          [ "${#archives[@]}" -gt 0 ] || { echo "::error::no llama.cpp archive was built"; exit 1; }
+          cpu=0
+          : > "$scratch/report.txt"
+          for archive in "${archives[@]}"; do
+            text="$scratch/$(basename "$archive").txt"
+            disassemble "$archive" "$text"
+            counts=$(past_baseline "$text") || bad=1
+            echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
+            if [ "$bad" = 1 ]; then
+              grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+            fi
+            case "$(basename "$archive")" in
+              ggml-cpu.*|libggml-cpu.*)
+                cpu=1
+                # The backend that holds the kernels was built for the baseline, not for less, and
+                # the disassembly shows its code.
+                [ "$(grep -c -E '\bymm[0-9]+\b' "$text" || true)" -gt 0 ] || { echo "$archive: no AVX2 code" >> "$scratch/report.txt"; bad=1; } ;;
+            esac
+          done
+          {
+            echo "### $TARGET: instructions past the x86-64-v3 baseline in the description process"
+            echo '```'
+            cat "$scratch/report.txt"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$cpu" = 1 ] || { echo "::error::no ggml CPU archive was built"; exit 1; }
+          [ "$bad" = 0 ] || { echo "::error::the description process holds instructions past the baseline"; exit 1; }
 
       - name: Read each floor back
         run: |
