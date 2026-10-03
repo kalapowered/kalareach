@@ -1565,8 +1565,9 @@ pub mod configuration {
     /// How many variables one rung's `environment_additions` may name.
     pub const MAX_ENVIRONMENT_ADDITIONS: usize = 64;
 
-    /// The longest value one environment addition may have, in bytes.
-    pub const MAX_ENVIRONMENT_ADDITION_BYTES: usize = 4096;
+    /// The longest value one environment addition may have, in bytes: the longest value Windows
+    /// holds for a variable, which a `PATH` there can come close to.
+    pub const MAX_ENVIRONMENT_ADDITION_BYTES: usize = 32_767;
 
     /// The prefix of the variables a session's worker owns and sets itself.
     ///
@@ -1638,6 +1639,58 @@ pub mod configuration {
             && bytes
                 .iter()
                 .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    }
+
+    /// The name as this platform's environment holds it.
+    ///
+    /// Windows compares the names of variables without regard to ASCII case and lists them in
+    /// capitals, so two names that differ only in case are one variable there. Everywhere else a
+    /// name is held exactly as it is written.
+    #[must_use]
+    pub fn platform_variable_name(name: &str) -> String {
+        if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// The variables an owner has configured to add to a session, each with its value.
+    ///
+    /// The values are the owner's own and go to a session's shell and nowhere else, so what a
+    /// debug print shows of this is the names: a print of the document, of the configuration in
+    /// force or of anything that holds either cannot carry a credential into a log.
+    #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(transparent)]
+    pub struct EnvironmentAdditions(BTreeMap<String, String>);
+
+    impl std::fmt::Debug for EnvironmentAdditions {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_set().entries(self.0.keys()).finish()
+        }
+    }
+
+    impl std::ops::Deref for EnvironmentAdditions {
+        type Target = BTreeMap<String, String>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl FromIterator<(String, String)> for EnvironmentAdditions {
+        fn from_iter<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Self {
+            Self(pairs.into_iter().collect())
+        }
+    }
+
+    impl IntoIterator for EnvironmentAdditions {
+        type Item = (String, String);
+        type IntoIter = std::collections::btree_map::IntoIter<String, String>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.into_iter()
+        }
     }
 
     /// The largest session ceiling this host can record.
@@ -1798,12 +1851,13 @@ pub mod configuration {
         ///
         /// A session no person's shell stands behind (one an app creates, one created invisibly,
         /// one a paired device asks for) is started with this host's environment, and these are
-        /// the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH` that puts a
-        /// tool first. An addition wins over the host's own value of the same name. Absent leaves
-        /// the choice to the rung below; an empty set adds nothing at this rung; a set replaces
-        /// the one below it rather than adding to it. The values stay in this document and are
-        /// printed by nothing: a report names the variables and no value.
-        pub environment_additions: Nullable<BTreeMap<String, String>>,
+        /// the owner's additions to it: their own `GOPATH`, an `EDITOR`, a `PATH`. An addition
+        /// wins over the host's own value of the same name, and takes its place whole: a `PATH`
+        /// given here is the session's `PATH`, and nothing in it is expanded or joined to the
+        /// host's. Absent leaves the choice to the rung below; an empty set adds nothing at this
+        /// rung; a set replaces the one below it rather than adding to it. The values stay in this
+        /// document and are printed by nothing: a report names the variables and no value.
+        pub environment_additions: Nullable<EnvironmentAdditions>,
     }
 
     impl Default for PreferenceSet {
@@ -2749,7 +2803,8 @@ pub mod configuration {
                         .stated(" one rung may name"),
                 );
             }
-            for (name, value) in additions {
+            let mut held_as = std::collections::BTreeSet::new();
+            for (name, value) in additions.iter() {
                 if !is_variable_name(name) {
                     problems.push(
                         rung()
@@ -2757,12 +2812,21 @@ pub mod configuration {
                             .withheld(Name, name)
                             .stated(", which is not a name an environment variable has"),
                     );
-                } else if host_owns_variable(name) {
+                } else if host_owns_variable(&name.to_ascii_uppercase()) {
+                    // In any case: a platform that folds case would give the session the host's
+                    // own variable, and the document means the same on every platform.
                     problems.push(
                         rung()
                             .stated(" names ")
                             .withheld(Name, name)
                             .stated(", which this host sets for a session itself"),
+                    );
+                } else if !held_as.insert(platform_variable_name(name)) {
+                    problems.push(
+                        rung()
+                            .stated(" names ")
+                            .withheld(Name, name)
+                            .stated(", which this platform holds as the same variable as another"),
                     );
                 }
                 if value.contains('\0') || value.len() > MAX_ENVIRONMENT_ADDITION_BYTES {
@@ -9049,19 +9113,11 @@ mod tests {
         }
 
         // A refusal names the name by its class and its length, and never the value.
-        let mut document = at_host(&[
+        let document = at_host(&[
             ("sk-live-abc123", "a-credential-value"),
             ("KR_X", "also-secret"),
+            ("DISPLAY", "a-display-value"),
         ]);
-        document.preferences.environment_additions = document
-            .preferences
-            .environment_additions
-            .0
-            .map(|mut additions| {
-                additions.insert("DISPLAY".to_owned(), "a-display-value".to_owned());
-                additions
-            })
-            .into();
         let problems = configuration::validate(&document).expect_err("names the host owns");
         let said = problems
             .iter()

@@ -240,9 +240,11 @@ impl Controller {
     /// allowed when the daemon started, with the variables the host's owner has configured over
     /// it by name.
     ///
-    /// The additions are read now, from the configuration in force, so an edit reaches the sessions
-    /// started after it. Their values are the owner's own and go to the worker beside the rest and
-    /// nowhere else.
+    /// The additions are read now, from the configuration in force. A document the owner edited
+    /// by hand is in force once the daemon accepts it, which it does when anything asks for the
+    /// configuration (the doctor, a setting change) and at each start, so a session created before
+    /// that is given the additions the daemon last accepted. Their values are the owner's own and
+    /// go to the worker beside the rest and nowhere else.
     pub(super) fn host_context_environment(&self) -> Vec<EnvironmentVariable> {
         let mut variables: std::collections::BTreeMap<String, String> = self
             .host_environment
@@ -253,12 +255,10 @@ impl Controller {
             .collect();
         for (name, value) in self.in_force().environment_additions {
             // Named as the platform names them, as the daemon's own are.
-            let name = if cfg!(windows) {
-                name.to_ascii_uppercase()
-            } else {
-                name
-            };
-            variables.insert(name, value);
+            variables.insert(
+                kr_protocol::hostinfo::configuration::platform_variable_name(&name),
+                value,
+            );
         }
         variables
             .into_iter()

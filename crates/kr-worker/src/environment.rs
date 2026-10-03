@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use kr_protocol::hostinfo::configuration::{host_owns_variable, platform_variable_name};
 use kr_protocol::session::EnvironmentVariable;
 
 /// The terminal identity every KalaReach session declares.
@@ -49,11 +50,6 @@ pub const SESSION_VARIABLE: &str = "KR_SESSION";
 /// validates the caller's local peer and its session binding.
 pub const WORKER_ENDPOINT_VARIABLE: &str = "KR_WORKER_ENDPOINT";
 
-/// The prefix reserved for KalaReach's own bootstrap values.
-///
-/// A creator's snapshot cannot set one of these. They come from the worker or not at all.
-pub const RESERVED_PREFIX: &str = kr_protocol::hostinfo::configuration::RESERVED_VARIABLE_PREFIX;
-
 /// Physical-terminal identity variables that are removed from an inherited environment.
 ///
 /// Each one names a terminal emulator the session is not. Passing them through would let a shell
@@ -63,10 +59,6 @@ pub const RESERVED_PREFIX: &str = kr_protocol::hostinfo::configuration::RESERVED
 /// additions by: one list of the names this host owns.
 pub const TERMINAL_IDENTITY_VARIABLES: &[&str] =
     kr_protocol::hostinfo::configuration::TERMINAL_IDENTITY_VARIABLES;
-
-/// Prefixes of physical-terminal identity variables that are removed.
-pub const TERMINAL_IDENTITY_PREFIXES: &[&str] =
-    kr_protocol::hostinfo::configuration::TERMINAL_IDENTITY_PREFIXES;
 
 /// Variables that describe the creator's own terminal device rather than the new session's.
 pub const CREATOR_TERMINAL_VARIABLES: &[&str] =
@@ -93,7 +85,7 @@ pub struct EnvironmentSources {
 /// name the terminals the private database has no entry for, and they are recorded here as what
 /// they were. When no private database could be supplied they are recorded too, and stay exactly
 /// where the creator put them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TerminfoSelection {
     /// The private database directory `TERMINFO` names, or none when this session reads whatever
     /// database its host has.
@@ -106,6 +98,25 @@ pub struct TerminfoSelection {
     pub creator_terminfo_dirs: Option<String>,
 }
 
+/// What a print of the selection says is which variables the creator supplied, never their text: a
+/// database directory is a path the creator or an owner's configuration chose, and a path can
+/// carry what its owner would not have written in a log.
+impl std::fmt::Debug for TerminfoSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let supplied = |held: &Option<String>| held.as_ref().map(|_| "supplied");
+        formatter
+            .debug_struct("TerminfoSelection")
+            .field("directory", &self.directory)
+            .field("unavailable", &self.unavailable)
+            .field("creator_terminfo", &supplied(&self.creator_terminfo))
+            .field(
+                "creator_terminfo_dirs",
+                &supplied(&self.creator_terminfo_dirs),
+            )
+            .finish()
+    }
+}
+
 impl TerminfoSelection {
     /// Whether the creator supplied a database directory of its own.
     #[must_use]
@@ -115,8 +126,9 @@ impl TerminfoSelection {
 
     /// The selection as one line of text, for the worker's own log.
     ///
-    /// What the creator supplied is the creator's text, so a control character in it, a line break
-    /// above all, is written as its escape: a value cannot end the line and begin another that
+    /// The creator's own database directories are named and never quoted. A reason this worker
+    /// has no private database is text of the host's own, so a control character in it, a line
+    /// break above all, is written as its escape: it cannot end the line and begin another that
     /// reads as the worker's.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -128,19 +140,23 @@ impl TerminfoSelection {
             ),
             (None, None) => "terminfo: no private database; the host's own applies".to_owned(),
         };
-        if self.overridden() {
-            line.push_str("; the creator's");
-            if let Some(directory) = &self.creator_terminfo {
-                line.push_str(&format!(" TERMINFO={}", one_line(directory)));
-            }
-            if let Some(directories) = &self.creator_terminfo_dirs {
-                line.push_str(&format!(" TERMINFO_DIRS={}", one_line(directories)));
-            }
-            line.push_str(if self.directory.is_some() {
-                " follow it"
-            } else {
-                " stay as they were"
-            });
+        let supplied: Vec<&str> = [
+            (&self.creator_terminfo, TERMINFO_VARIABLE),
+            (&self.creator_terminfo_dirs, TERMINFO_DIRS_VARIABLE),
+        ]
+        .into_iter()
+        .filter_map(|(held, name)| held.as_ref().map(|_| name))
+        .collect();
+        if !supplied.is_empty() {
+            line.push_str(&format!(
+                "; the creator's database directories ({}) {}",
+                supplied.join(", "),
+                if self.directory.is_some() {
+                    "follow it"
+                } else {
+                    "stay as they were"
+                }
+            ));
         }
         line
     }
@@ -319,20 +335,13 @@ pub fn build(
                 continue;
             }
         }
-        if is_terminal_identity(&variable.name) || is_creator_terminal(&variable.name) {
-            removed.push(variable.name.clone());
-            continue;
-        }
-        if variable.name.starts_with(RESERVED_PREFIX) {
-            // Reserved bootstrap values come from the worker. A creator cannot preload one.
-            removed.push(variable.name.clone());
-            continue;
-        }
-        if DESKTOP_VARIABLES.contains(&variable.name.as_str()) {
-            // The desktop belongs to the execution context, not to whoever asked for the session.
-            // A headless worker supplies none of these on purpose, and letting the creator's copy
-            // survive would give it a display, a message bus and a runtime directory belonging to a
-            // login it is not in and that may already have ended.
+        // The names this host owns, as the platform compares them: a terminal's identity and the
+        // creator's own device, the reserved bootstrap values (a creator cannot preload one), and
+        // the desktop's. The desktop belongs to the execution context, not to whoever asked for the
+        // session: a headless worker supplies none of its variables on purpose, and letting the
+        // creator's copy survive would give the session a display, a message bus and a runtime
+        // directory belonging to a login it is not in and that may already have ended.
+        if host_owns_variable(&platform_variable_name(&variable.name)) {
             removed.push(variable.name.clone());
             continue;
         }
@@ -409,17 +418,6 @@ pub fn build(
         },
         removed,
     }
-}
-
-fn is_terminal_identity(name: &str) -> bool {
-    TERMINAL_IDENTITY_VARIABLES.contains(&name)
-        || TERMINAL_IDENTITY_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-}
-
-fn is_creator_terminal(name: &str) -> bool {
-    CREATOR_TERMINAL_VARIABLES.contains(&name)
 }
 
 fn is_terminfo_search(name: &str) -> bool {
@@ -623,6 +621,21 @@ mod tests {
                 built.variables.get(name).map(String::as_str),
                 Some("from-a-creator"),
                 "{name} is kept"
+            );
+        }
+    }
+
+    /// KR-REQ-07.25: a platform that compares variable names without regard to case holds
+    /// `Kr_Session` and `Display` as the host's own, and removes them from a creator's
+    /// environment; one that does not holds them as the creator's own variables.
+    #[test]
+    fn an_owned_name_is_compared_as_the_platform_compares_it() {
+        for name in ["Kr_Session", "Display", "Term", "Iterm_Session_Id"] {
+            let built = built_with(&[(name, "from-a-creator")], &ExecutionContext::default());
+            assert_eq!(
+                built.removed.iter().any(|removed| removed == name),
+                cfg!(windows),
+                "{name}"
             );
         }
     }
