@@ -187,23 +187,22 @@ generation number. It is a figure rather than a guarantee: a wrap grows with the
 integer width, so an archive at generation 65 536 fits fewer. `seal_archive` enforces the *encoded
 size*, which is the quantity section 20 bounds, and names the limit it hit;
 `a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` and
-`a_larger_generation_number_fits_fewer_recipients` keep the figure honest.
+`a_larger_generation_number_fits_fewer_recipients` check the figure.
 
 ### Revocation, rotation and the checkpoint
 
 Revoking recipients removes them from every future wrap, and for a mutable shared collection it
 rotates the keys as well. `ArchiveRecipients::revoke` takes every recipient that leaves in one step
-and advances the rotation once for all of them. The rotation is a rule rather than a report: revoking advances
-`ArchiveRecipients::rotation`, every staged object carries the rotation it was made under, and
-`seal_archive` refuses one from before the current rotation. Resuming it makes it again under a new
-key. `StagedObject`'s fields are private for that reason - the only ways to obtain one are
-`stage_object` and `resume_object`, both of which take the rotation as an argument - so a caller
-cannot revoke and then relabel and seal the ciphertext that revocation invalidated, whatever it
-does with `Revocation::may_reuse_staged_ciphertext`. A device that kept reading what the others
+and advances the rotation once for all of them. The rotation is a rule rather than a report:
+revoking advances `ArchiveRecipients::rotation`, every staged object carries the rotation it was
+made under, and `seal_archive` refuses one from before the current rotation. Resuming it makes it
+again under a new key. `StagedObject`'s fields are private for that reason: the only ways to obtain
+one are `stage_object` and `resume_object`, both of which take the rotation as an argument, so a
+caller cannot revoke and then relabel and seal the ciphertext that revocation invalidated, whatever
+it does with `Revocation::may_reuse_staged_ciphertext`. A device that kept reading what the others
 wrote after it left would have lost nothing by being removed. Nothing here claims retroactive
-secrecy.
-`still_readable_after_revocation` computes what the removed device keeps - every generation
-published before the revocation - so a host shows a person that rather than implying otherwise, and
+secrecy. `still_readable_after_revocation` computes what the removed device keeps, every generation
+published before the revocation, so a host shows a person that rather than implying otherwise, and
 `Revocation::describe` says it in a sentence.
 
 Old object keys are held against the retained backup that needs them. `RetainedObjectKeys::
@@ -368,9 +367,9 @@ check is a required argument rather than a later step a caller can forget, and
 
 The identifier the object carries must be that resolved key's own identifier, so an object signed by
 one recorded key cannot name another device or another role and be accepted. The signature is then
-verified over the object's own domain-separated transcript. A host satisfies the seam from its
-paired-device directory and its grant directory together; a test satisfies it from a map; nothing
-satisfies it from an envelope.
+verified over the object's own domain-separated transcript. A host answers those two questions from
+its paired-device directory and its grant directory together; a test answers them from a map;
+nothing answers them from an envelope.
 
 `ForwardedAuthority` is the closed set of objects this path carries: a signed revocation request and
 a host's ordered authority revision record. Those are the two objects the protocol gives a signature

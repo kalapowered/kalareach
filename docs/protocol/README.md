@@ -17,9 +17,9 @@ Four pieces make it up:
   bytes.
 - `fixtures/` holds the vectors both languages are tested against.
 
-Rust is canonical. The JSON Schema comes from the Rust types, and the TypeScript types come from
-the schema. Both steps have a check mode, so a change on one side that is not carried to the other
-fails the build rather than drifting quietly.
+Rust is canonical. The JSON Schema comes from the Rust types, and the TypeScript types come from the
+schema. Both steps have a check mode, so a change on one side that is not carried to the other fails
+the build rather than drifting unnoticed.
 
 ## KR-CBOR-1
 
@@ -658,12 +658,12 @@ verify anything against, given the revision it pinned: the pin and everything af
 naming a revision from before the pin is refused rather than checked against a key nothing the host
 holds authenticates.
 
-What that proves has a boundary worth stating. A head expires, so a captured head stops being
-usable, and a host that has accepted a later revision refuses one naming an earlier revision.
-Neither fact proves that the private key of a retired revision is gone: a host that never saw the
-rotation cannot tell a fresh revision-1 head signed by a retained revision-1 key from a legitimate
-one. Rotation therefore destroys the private half of the revision it retires, and a host that must
-detect a compromised predecessor needs evidence from outside this chain.
+What that proves has a limit. A head expires, so a captured head stops being usable, and a host that
+has accepted a later revision refuses one naming an earlier revision. Neither fact proves that the
+private key of a retired revision is gone: a host that never saw the rotation cannot tell a fresh
+revision-1 head signed by a retained revision-1 key from a legitimate one. Rotation therefore
+destroys the private half of the revision it retires, and a host that must detect a compromised
+predecessor needs evidence from outside this chain.
 
 ## The service credential
 
@@ -750,12 +750,12 @@ comparison of one digest rather than a list of fields somebody has to remember t
 
 The authorisation and the credential have different lifetimes on purpose. The authorisation is the
 installation's decision and lasts until it is revoked. The credential is a bearer a host keeps on
-disk, so it expires in thirty days and is renewed by the host signing `kr-push-sender-renewal/1` over
-a nonce the gateway issued. Renewal opens seven days before expiry and does not close at expiry: a
-host that was offline for a month renews on reconnect, because its credential lapsed and the
-authorisation behind it did not. A revoked record renews never. The gateway stores the SHA-256 of the
-bearer under `kr-push-credential/1`, never the bearer, so a copy of the database is not a set of
-working credentials.
+disk, so it expires in thirty days and is renewed by the host signing `kr-push-sender-renewal/1`
+over a nonce the gateway issued. Renewal opens seven days before expiry and does not close at
+expiry: a host that was offline for a month renews on reconnect, because its credential lapsed and
+the authorisation behind it did not. A revoked record is never renewed. The gateway stores the
+SHA-256 of the bearer under `kr-push-credential/1`, never the bearer, so a copy of the database is
+not a set of working credentials.
 
 **Delivery.** A `PushDeliveryRequest` carries a notification identifier, a collapse label, an
 expiry, the sealed preview and a choice from a closed alert vocabulary. There is no field for text a

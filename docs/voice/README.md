@@ -28,8 +28,9 @@ not pass through the managed service.
 
 ## What the coordinator may read
 
-One thing: content the host has already passed through its shared host-side history filter at the
-voice-context surface, under a viewer scope built from the **requesting device's** grant.
+The coordinator may read one thing: content the host has already passed through its shared host-side
+history filter at the voice-context surface, under a viewer scope built from the **requesting
+device's** grant.
 
 - The filter is the one section 10 requires, and voice context is one of its named callers. It is
   applied once, on the host side, before anything reaches the coordinator.
@@ -46,8 +47,9 @@ voice-context surface, under a viewer scope built from the **requesting device's
 
 ## What the coordinator may send back
 
-The bounded selection the specification states, and nothing else. It is an upper limit, and this
-daemon supplies less of it, as the section on what this daemon performs and supplies says:
+The coordinator sends back the bounded selection the specification states, and nothing else. It is
+an upper limit, and this daemon supplies less of it, as the section on what this daemon performs and
+supplies says:
 
 - the session description, the current working directory, the active application, the summaries of
   decisions waiting on a person, and the last twenty semantic messages;
