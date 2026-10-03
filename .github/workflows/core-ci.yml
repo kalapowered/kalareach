@@ -488,11 +488,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --lib
 
-      # The forwarder's own library: the registration it reads, the named pipe it connects to, and
-      # the credential file it presents only when that file's own access list is its owner's.
-      - name: Test the forwarder's library
+      # The forwarder, all of it. Its own library: the registration it reads, the named pipe it
+      # connects to, and the credential file it presents only when that file's own access list is its
+      # owner's. Every hook and the channel against the worker's own listener, with a copy of
+      # `cmd.exe` as the application that starts them; the registration it waits for whole; the
+      # neutral answer every hook gives inside the shortest timeout a registration names. And an
+      # integrated invocation's launcher against the worker's own command backends, on this
+      # platform's pipe: the launcher creates its program suspended and the backend names that
+      # program and not the launcher: it is the launcher's child, started after the backend was
+      # established, created from the file the backend hashed, and held by a job of its own before it
+      # runs. A program the backend refuses, one the launcher declines and one never started leave
+      # nothing running; the program's whole exit code is the launcher's; and the directory the
+      # program inherits is granted only where the path was held from the drive's root, nothing in
+      # it can be renamed meanwhile, and a directory converted to a link before the commit is
+      # granted nothing. The suites that place a program of their own take turns, because the system
+      # reads a fresh executable before it runs, and that read delays every other start while it
+      # lasts.
+      - name: Test the forwarder
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-hook --lib
+        run: cargo test --locked -p kr-hook
 
       # The broker's endpoint on this platform and what it rests on. A launch binds a named pipe
       # that carries its owner's own access list; the kernel names the process on the other end; a
@@ -525,18 +539,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows_inheritance
 
-      # An integrated invocation's launcher against the worker's own command backends, on this
-      # platform's pipe. The launcher creates its program suspended and the backend names that
-      # program and not the launcher: it is the launcher's child, started after the backend was
-      # established, created from the file the backend hashed, and held by a job of its own before it
-      # runs. A program the backend refuses, one the launcher declines and one never started leave
-      # nothing running; the program's whole exit code is the launcher's; and the directory the
-      # program inherits is granted only where the path was held from the drive's root, nothing in
-      # it can be renamed meanwhile, and a directory converted to a link before the commit is
-      # granted nothing.
-      - name: Test the forwarder's launcher against the command backends
+      # The backends an integrated invocation is given before it runs, on this platform: a launch's
+      # endpoint and credential exist before the answer, a bypass creates nothing, and each session
+      # has a root of its own. The launcher against them is run by the forwarder's suite, above.
+      - name: Test the command backends
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-hook --test launch_windows
+        run: cargo test --locked -p kr-worker --test command_backends
 
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.
