@@ -13279,6 +13279,21 @@
       "type": "object",
       "x-kalareach-read-only-metadata": true
     },
+    "EnvironmentOrigin": {
+      "description": "Whose environment a session's variables are, which decides how the worker labels where they\ncame from.",
+      "oneOf": [
+        {
+          "const": "creator_snapshot",
+          "description": "The command line's own environment, which it sends with a session it creates for a person\nto see: filtered for the terminal's identity and for reserved variables by the worker.",
+          "type": "string"
+        },
+        {
+          "const": "host_context",
+          "description": "The environment of the execution context this host runs in, which is what a session no\nperson's shell stands behind is started with: one an app creates, one created invisibly,\nand one a paired device asks for, whose own environment is never used.",
+          "type": "string"
+        }
+      ]
+    },
     "EnvironmentPresence": {
       "description": "What this host last observed about an enrolled environment.\n\nSection 3: a listing carries an explicit `stale` or `environment_stopped` status, and a cached\nrow is not evidence that a process is currently live.",
       "oneOf": [
@@ -13412,6 +13427,36 @@
             "these"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "EnvironmentSource": {
+      "description": "Where one variable of a session's environment came from.",
+      "oneOf": [
+        {
+          "const": "creator_snapshot",
+          "description": "The environment of the command line that created the session, filtered.",
+          "type": "string"
+        },
+        {
+          "const": "host_context",
+          "description": "The host's own environment, as the execution context it runs in has it.",
+          "type": "string"
+        },
+        {
+          "const": "configured_addition",
+          "description": "A variable its owner has written into this host's configuration.",
+          "type": "string"
+        },
+        {
+          "const": "execution_context",
+          "description": "A value the selected execution context supplied in place of the creator's.",
+          "type": "string"
+        },
+        {
+          "const": "unset",
+          "description": "Nothing supplied it: the shell started without the variable.",
+          "type": "string"
         }
       ]
     },
@@ -31934,6 +31979,30 @@
       ],
       "type": "object"
     },
+    "SessionEnvironmentSources": {
+      "additionalProperties": false,
+      "description": "Where each of the three things a shell reads first came from, as the worker built its\nenvironment.\n\nClosed words and nothing a person typed: no value, no name and no path is in one, so a report\nof it can be shown, exported and kept as it is. They describe what the session was started\nwith; a startup file changes the shell's own environment afterwards, as it does for any shell.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/$defs/WorkingDirectorySource",
+          "description": "Where the directory the shell started in came from."
+        },
+        "locale": {
+          "$ref": "#/$defs/EnvironmentSource",
+          "description": "Where the setting that decides the shell's character set came from: the first of\n`LC_ALL`, `LC_CTYPE` and `LANG` that is not empty, as a POSIX shell chooses it.\n\nThe other categories are not summarised, and a session on Windows reads these variables\nonly where a program there does; this is not the culture a PowerShell session has."
+        },
+        "path": {
+          "$ref": "#/$defs/EnvironmentSource",
+          "description": "Where the shell's `PATH` came from."
+        }
+      },
+      "required": [
+        "path",
+        "locale",
+        "cwd"
+      ],
+      "type": "object"
+    },
     "SessionEpoch": {
       "description": "The session epoch, fixed at 1 in protocol version 1.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -32283,6 +32352,17 @@
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment that owns it."
+        },
+        "environment_sources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionEnvironmentSources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the variables its root shell was started with came from, when its worker said.\n\nAbsent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for\na summary this host composes without its worker (a closure with no worker record to read,\nor a worker whose end could not be established) because no worker said anything about the\nenvironment, and for one a worker of an earlier release described, which wrote no such\nmember. Only that second reason ends: it goes when no worker of a release that wrote none\ncan still be running and no journal row of one is still read."
         },
         "root_process": {
           "anyOf": [
@@ -35930,9 +36010,20 @@
           "$ref": "#/$defs/DisplayNumber",
           "description": "The local alias, which also names the worker's endpoint."
         },
+        "environment_additions": {
+          "description": "The names, and never the values, of the configured variables among those the host gave a\nsession started with its own environment.\n\nEmpty for a session started with its creator's environment. The worker reads them to say\nwhere each variable came from; the values are already among the create request's.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment the session belongs to."
+        },
+        "environment_origin": {
+          "$ref": "#/$defs/EnvironmentOrigin",
+          "description": "Whose environment the variables in the create request are."
         },
         "plugins": {
           "$ref": "#/$defs/AdmissionsHeader",
@@ -35977,7 +36068,9 @@
         "controller_generation",
         "release",
         "plugins",
-        "privacy"
+        "privacy",
+        "environment_origin",
+        "environment_additions"
       ],
       "type": "object"
     },
@@ -37010,6 +37103,21 @@
         "event_type"
       ],
       "type": "object"
+    },
+    "WorkingDirectorySource": {
+      "description": "Where the directory a session's shell started in came from.",
+      "oneOf": [
+        {
+          "const": "create_request",
+          "description": "The create request named it.",
+          "type": "string"
+        },
+        {
+          "const": "worker_default",
+          "description": "The request named none and the worker started the shell in the root directory.",
+          "type": "string"
+        }
+      ]
     },
     "WorkspaceCreateParams": {
       "additionalProperties": false,

@@ -1447,10 +1447,12 @@ async fn a_create_dropped_while_it_ends_its_wait_leaves_nothing_registered() {
     let mut hold = super::create::CreateHold::open(
         &controller,
         reservation_id,
-        vec![kr_protocol::session::EnvironmentVariable {
-            name: "SECRET_NAME".to_owned(),
-            value: "secret-value".to_owned(),
-        }],
+        super::create::SessionEnvironment::of_creator(vec![
+            kr_protocol::session::EnvironmentVariable {
+                name: "SECRET_NAME".to_owned(),
+                value: "secret-value".to_owned(),
+            },
+        ]),
         sender,
     )
     .await;
@@ -2560,8 +2562,9 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
 #[test]
 fn the_origin_of_a_sessions_environment_is_the_door_and_what_the_session_is_for() {
     use super::admission::Door;
-    use super::create::CreateOrigin;
+    use super::create::decide_origin;
     use kr_protocol::local::LocalClientKind;
+    use kr_protocol::worker::EnvironmentOrigin;
 
     let environment_id =
         kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
@@ -2570,12 +2573,12 @@ fn the_origin_of_a_sessions_environment_is_the_door_and_what_the_session_is_for(
         ..create_params(environment_id)
     };
     let origin =
-        |door: Door, presentation: Presentation| CreateOrigin::decide(door, &create(presentation));
+        |door: Door, presentation: Presentation| decide_origin(door, &create(presentation));
     // The command line's own environment is for the sessions its person is shown.
     for presentation in [Presentation::Attach, Presentation::Terminal] {
         assert_eq!(
             origin(Door::Local(LocalClientKind::Cli), presentation).expect("decided"),
-            CreateOrigin::CliSnapshot,
+            EnvironmentOrigin::CreatorSnapshot,
             "{presentation:?}"
         );
     }
@@ -2587,18 +2590,18 @@ fn the_origin_of_a_sessions_environment_is_the_door_and_what_the_session_is_for(
     ] {
         assert_eq!(
             origin(Door::Local(LocalClientKind::App), presentation).expect("decided"),
-            CreateOrigin::HostContext,
+            EnvironmentOrigin::HostContext,
             "{presentation:?}"
         );
         assert_eq!(
             origin(Door::Network, presentation).expect("decided"),
-            CreateOrigin::HostContext,
+            EnvironmentOrigin::HostContext,
             "{presentation:?}"
         );
     }
     assert_eq!(
         origin(Door::Local(LocalClientKind::Cli), Presentation::Invisible).expect("decided"),
-        CreateOrigin::HostContext
+        EnvironmentOrigin::HostContext
     );
     // A connection that declared itself the control daemon or a worker is no source at all.
     for kind in [LocalClientKind::Controller, LocalClientKind::Worker] {
@@ -2749,7 +2752,7 @@ async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it(
                 .collect()
         };
     assert_eq!(
-        names(controller.host_context_environment()),
+        names(controller.host_context_environment().variables),
         [
             ("HOME".to_owned(), "/home/a".to_owned()),
             ("PATH".to_owned(), "/usr/bin".to_owned())
@@ -2772,7 +2775,7 @@ async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it(
     // Accepted the way a person's edit outside the daemon is: when anything asks for it.
     let _ = controller.effective_configuration().await;
     assert_eq!(
-        names(controller.host_context_environment()),
+        names(controller.host_context_environment().variables),
         [
             ("EDITOR".to_owned(), "hx".to_owned()),
             ("HOME".to_owned(), "/home/a".to_owned()),

@@ -708,6 +708,88 @@ pub struct SessionSummary {
     pub root_process: Nullable<ProcessStartIdentity>,
     /// The final record, once the session has closed.
     pub closure: Nullable<ClosureRecord>,
+    /// Where the variables its root shell was started with came from, when its worker said.
+    ///
+    /// Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+    /// a summary this host composes without its worker (a closure with no worker record to read,
+    /// or a worker whose end could not be established) because no worker said anything about the
+    /// environment, and for one a worker of an earlier release described, which wrote no such
+    /// member. Only that second reason ends: it goes when no worker of a release that wrote none
+    /// can still be running and no journal row of one is still read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_sources: Option<SessionEnvironmentSources>,
+}
+
+/// Where each of the three things a shell reads first came from, as the worker built its
+/// environment.
+///
+/// Closed words and nothing a person typed: no value, no name and no path is in one, so a report
+/// of it can be shown, exported and kept as it is. They describe what the session was started
+/// with; a startup file changes the shell's own environment afterwards, as it does for any shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEnvironmentSources {
+    /// Where the shell's `PATH` came from.
+    pub path: EnvironmentSource,
+    /// Where the setting that decides the shell's character set came from: the first of
+    /// `LC_ALL`, `LC_CTYPE` and `LANG` that is not empty, as a POSIX shell chooses it.
+    ///
+    /// The other categories are not summarised, and a session on Windows reads these variables
+    /// only where a program there does; this is not the culture a PowerShell session has.
+    pub locale: EnvironmentSource,
+    /// Where the directory the shell started in came from.
+    pub cwd: WorkingDirectorySource,
+}
+
+/// Where one variable of a session's environment came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentSource {
+    /// The environment of the command line that created the session, filtered.
+    CreatorSnapshot,
+    /// The host's own environment, as the execution context it runs in has it.
+    HostContext,
+    /// A variable its owner has written into this host's configuration.
+    ConfiguredAddition,
+    /// A value the selected execution context supplied in place of the creator's.
+    ExecutionContext,
+    /// Nothing supplied it: the shell started without the variable.
+    Unset,
+}
+
+impl EnvironmentSource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreatorSnapshot => "creator_snapshot",
+            Self::HostContext => "host_context",
+            Self::ConfiguredAddition => "configured_addition",
+            Self::ExecutionContext => "execution_context",
+            Self::Unset => "unset",
+        }
+    }
+}
+
+/// Where the directory a session's shell started in came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectorySource {
+    /// The create request named it.
+    CreateRequest,
+    /// The request named none and the worker started the shell in the root directory.
+    WorkerDefault,
+}
+
+impl WorkingDirectorySource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateRequest => "create_request",
+            Self::WorkerDefault => "worker_default",
+        }
+    }
 }
 
 /// A palette a session can be started with, chosen before the shell has produced anything.
@@ -1238,6 +1320,46 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.25: a summary a worker wrote before the environment's sources were a member of
+    /// it is read as it is written, and says the sources were not said; one that carries them
+    /// writes the member and reads back.
+    #[test]
+    fn a_summary_written_before_the_environment_sources_are_a_member_is_still_read() {
+        // The summary `closing` builds for the session of sixteen bytes of nine, as the release
+        // before this member wrote it.
+        const EARLIER: &str = concat!(
+            "b063637764652f776f726b65737461746567636c6f73696e6767636c6f73757265f6676465736b746f70a2706c6f6769",
+            "6e5f67656e65726174696f6ef6726465736b746f705f73657373696f6e5f6964f66a64696d656e73696f6e73a264726f",
+            "7773181867636f6c756d6e7318506a73657373696f6e5f696450090909090909090909090909090909096a7368656c6c",
+            "5f6d6f64656d6e61746976655f636f6d7061746a7368656c6c5f70617468672f62696e2f73686c726f6f745f70726f63",
+            "657373f66d637265617465645f61745f6d73016d73657373696f6e5f65706f6368016e646973706c61795f6e756d6265",
+            "72016e656e7669726f6e6d656e745f696450080808080808080808080808080808086e776f726b65725f70726f66696c",
+            "656d686561646c6573735f75736572706174746163686d656e745f636f756e7400716170706c69636174696f6e5f7374",
+            "617465f6",
+        );
+        let earlier = hex::decode(EARLIER).expect("hexadecimal");
+        let session_id = SessionId::new(crate::scalars::Uuid::from_bytes([9; 16]));
+        let read: SessionSummary =
+            kr_cbor::from_canonical_slice(&earlier, &kr_cbor::Limits::DEFAULT)
+                .expect("a summary an earlier release wrote is read");
+        assert_eq!(read, closing(session_id));
+        assert_eq!(read.environment_sources, None);
+
+        let said = SessionSummary {
+            environment_sources: Some(SessionEnvironmentSources {
+                path: EnvironmentSource::ConfiguredAddition,
+                locale: EnvironmentSource::Unset,
+                cwd: WorkingDirectorySource::WorkerDefault,
+            }),
+            ..read
+        };
+        let written = kr_cbor::to_canonical_vec(&said).expect("encodes");
+        let again: SessionSummary =
+            kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT)
+                .expect("a summary that carries its sources is read");
+        assert_eq!(again, said);
+    }
+
     /// `session_id` as its worker describes it once a close has been admitted.
     fn closing(session_id: SessionId) -> SessionSummary {
         SessionSummary {
@@ -1257,6 +1379,7 @@ mod tests {
             application_state: Nullable::null(),
             root_process: Nullable::null(),
             closure: Nullable::null(),
+            environment_sources: None,
         }
     }
 

@@ -31,6 +31,7 @@ fn listed(token: u8) -> SessionSummary {
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::null(),
+        environment_sources: None,
     }
 }
 
@@ -341,6 +342,7 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
             "created_at_ms",
             "cwd",
             "display_number",
+            "environment_sources",
             "session_id",
             "shell",
             "shell_mode",

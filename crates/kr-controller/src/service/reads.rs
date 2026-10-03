@@ -517,6 +517,8 @@ fn unresolved_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::null(),
+        // Nothing says where its environment came from without its worker.
+        environment_sources: None,
     }
 }
 
@@ -542,6 +544,7 @@ fn closed_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::some(closure.clone()),
+        environment_sources: None,
     }
 }
 

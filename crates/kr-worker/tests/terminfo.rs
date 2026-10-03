@@ -74,6 +74,8 @@ fn launch_environment(
     };
     build(
         snapshot,
+        kr_protocol::worker::EnvironmentOrigin::CreatorSnapshot,
+        &[],
         &context,
         &kr_worker::testing::posix_shell(),
         "0",

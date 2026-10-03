@@ -590,6 +590,61 @@ async fn a_bundle_asked_for_without_content_carries_no_content_entry() {
     );
 }
 
+/// KR-REQ-07.25: `kr doctor` says where a live session's `PATH`, locale and working directory came
+/// from, in closed words, and so does the content export's record of it. The session is one the
+/// command line creates for nobody to see, so it is started with the host's environment, and its
+/// request names the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_says_where_a_sessions_environment_came_from() {
+    let host = Host::start().await;
+    let session = host.create();
+
+    let printed = host.kr(&["doctor"]);
+    let said = String::from_utf8_lossy(&printed.stdout).into_owned();
+    let line = said
+        .lines()
+        .find(|line| line.starts_with("session "))
+        .unwrap_or_else(|| panic!("no line about the session's environment: {said}"));
+    assert!(
+        line.contains("path=host_context") && line.contains("directory=create_request"),
+        "{line}"
+    );
+    let (_, document) = host.json(&["doctor"]);
+    let reported = &document["session_environments"];
+    assert_eq!(reported["read"], Value::Bool(true), "{document}");
+    assert_eq!(reported["unlisted"], 0, "{document}");
+    assert_eq!(
+        reported["sessions"][0]["path"], "host_context",
+        "{document}"
+    );
+    assert_eq!(
+        reported["sessions"][0]["directory"], "create_request",
+        "{document}"
+    );
+
+    let bundle = host.bundle("sources.tar");
+    let record: Value = serde_json::from_str(
+        &bundle
+            .entry("content/sessions.json")
+            .expect("a content entry"),
+    )
+    .expect("the entry is JSON");
+    let recorded = record["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|recorded| recorded["session_id"].as_str() == Some(session.as_str()))
+        })
+        .unwrap_or_else(|| panic!("the session is in the content: {record}"));
+    assert_eq!(recorded["environment_sources"]["path"], "host_context");
+    assert_eq!(
+        recorded["environment_sources"]["cwd"], "create_request",
+        "{recorded}"
+    );
+    host.close(&session);
+}
+
 /// KR-REQ-29.04: with privacy mode on and two sessions live, the content export names neither, and
 /// the preview, the manifest and the bundle document say why; the command still writes the bundle
 /// and exits as the diagnostics alone would have. The control is the same host with privacy mode

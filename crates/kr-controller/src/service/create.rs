@@ -12,7 +12,7 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
     EnvironmentVariable, Presentation, SessionCreateParams, SessionCreateResult,
 };
-use kr_protocol::worker::{ReservationId, WorkerReady};
+use kr_protocol::worker::{EnvironmentOrigin, ReservationId, WorkerReady};
 use tokio::sync::oneshot;
 
 use crate::error::{ControllerError, Result};
@@ -29,46 +29,32 @@ const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bi
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Whose environment a session is started with.
+/// Decides whose environment a session is started with, for a create that came through `door`.
 ///
 /// Decided by where the create came through, what the client says it is and what the session is
 /// for, and never by whether the request carries variables: a client that sends none is not
 /// asking for the host's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CreateOrigin {
-    /// The command line's own environment, which it sends with a session it creates for a person
-    /// to see: filtered for the terminal's identity and for reserved variables by the worker.
-    CliSnapshot,
-    /// The environment of the execution context this host runs in, which is what a session no
-    /// person's shell stands behind is started with: one an app creates, one created invisibly,
-    /// and one a paired device asks for, whose own environment is never used.
-    HostContext,
-}
-
-impl CreateOrigin {
-    /// Decides the origin of a create that came through `door`.
-    ///
-    /// # Errors
-    ///
-    /// A connection that declared itself the control daemon or a worker is not a source of
-    /// sessions, and is refused.
-    pub(super) fn decide(door: Door, create: &SessionCreateParams) -> Result<Self> {
-        match door {
-            Door::Local(LocalClientKind::Controller | LocalClientKind::Worker) => {
-                Err(ControllerError::PermissionDenied {
-                    detail: "a connection that declared itself the control daemon or a worker \
-                             creates no session"
-                        .to_owned(),
-                })
-            }
-            // A session nobody sees takes the host's environment even from the command line: the
-            // command line's own is the person's, for the sessions the person is shown.
-            Door::Local(LocalClientKind::Cli) if create.presentation != Presentation::Invisible => {
-                Ok(Self::CliSnapshot)
-            }
-            Door::Local(LocalClientKind::Cli | LocalClientKind::App) | Door::Network => {
-                Ok(Self::HostContext)
-            }
+///
+/// # Errors
+///
+/// A connection that declared itself the control daemon or a worker is not a source of sessions,
+/// and is refused.
+pub(super) fn decide_origin(door: Door, create: &SessionCreateParams) -> Result<EnvironmentOrigin> {
+    match door {
+        Door::Local(LocalClientKind::Controller | LocalClientKind::Worker) => {
+            Err(ControllerError::PermissionDenied {
+                detail: "a connection that declared itself the control daemon or a worker \
+                         creates no session"
+                    .to_owned(),
+            })
+        }
+        // A session nobody sees takes the host's environment even from the command line: the
+        // command line's own is the person's, for the sessions the person is shown.
+        Door::Local(LocalClientKind::Cli) if create.presentation != Presentation::Invisible => {
+            Ok(EnvironmentOrigin::CreatorSnapshot)
+        }
+        Door::Local(LocalClientKind::Cli | LocalClientKind::App) | Door::Network => {
+            Ok(EnvironmentOrigin::HostContext)
         }
     }
 }
@@ -123,25 +109,50 @@ pub(super) fn host_context_variables(
         .collect()
 }
 
-/// The environment variables a session's creator sent, from the reservation to the worker's claim.
+/// The environment a session is started with, from the reservation to the worker's claim: its
+/// variables, whose they are, and the names of those the host's owner configured.
 ///
-/// They are in this memory and nowhere else: the record of the request leaves them out, so a
-/// credential among them is not on disk after the launch, or at all. The worker's claim takes them
-/// once, to put them into its launch specification, and the create withdraws them when it stops
-/// waiting for the worker; whichever takes them first decides which of the two has them.
-pub(super) type CreatorEnvironment = Arc<std::sync::Mutex<Option<Vec<EnvironmentVariable>>>>;
+/// It is in this memory and nowhere else: the record of the request leaves the variables out, so a
+/// credential among them is not on disk after the launch, or at all. It has no `Debug` for the same
+/// reason.
+pub(super) struct SessionEnvironment {
+    /// The variables the shell is started with, before the worker filters and completes them.
+    pub(super) variables: Vec<EnvironmentVariable>,
+    /// Whose environment they are.
+    pub(super) origin: EnvironmentOrigin,
+    /// The names, never the values, of the configured variables among them. None for a creator's.
+    pub(super) additions: Vec<String>,
+}
+
+impl SessionEnvironment {
+    /// A creator's own variables, which no configured variable is among.
+    pub(super) const fn of_creator(variables: Vec<EnvironmentVariable>) -> Self {
+        Self {
+            variables,
+            origin: EnvironmentOrigin::CreatorSnapshot,
+            additions: Vec::new(),
+        }
+    }
+}
+
+/// Where a create's [`SessionEnvironment`] waits for its worker's claim.
+///
+/// The worker's claim takes it once, to put it into its launch specification, and the create
+/// withdraws it when it stops waiting for the worker; whichever takes it first decides which of the
+/// two has it.
+pub(super) type HeldEnvironment = Arc<std::sync::Mutex<Option<SessionEnvironment>>>;
 
 /// A create that is waiting for its worker.
 pub(super) struct PendingCreate {
     pub(super) ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
-    /// The creator's variables, until the claim of this create's worker takes them.
-    pub(super) environment: CreatorEnvironment,
+    /// The session's environment, until the claim of this create's worker takes it.
+    pub(super) environment: HeldEnvironment,
 }
 
 /// Takes what is in `slot`, and says whether the other party had already taken it.
 ///
 /// It never waits for anything but the slot's own lock, which nobody holds across an await.
-fn withdraw(slot: &CreatorEnvironment) -> bool {
+fn withdraw(slot: &HeldEnvironment) -> bool {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
@@ -156,20 +167,20 @@ fn withdraw(slot: &CreatorEnvironment) -> bool {
 pub(super) struct CreateHold {
     controller: Arc<Controller>,
     reservation_id: ReservationId,
-    environment: CreatorEnvironment,
+    environment: HeldEnvironment,
     /// Whether the wait has been ended and its entry removed.
     ended: bool,
 }
 
 impl CreateHold {
-    /// Registers the wait for `reservation_id`'s worker and the variables its claim may take.
+    /// Registers the wait for `reservation_id`'s worker and the environment its claim may take.
     pub(super) async fn open(
         controller: &Arc<Controller>,
         reservation_id: ReservationId,
-        environment: Vec<EnvironmentVariable>,
+        environment: SessionEnvironment,
         ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
     ) -> Self {
-        let environment: CreatorEnvironment = Arc::new(std::sync::Mutex::new(Some(environment)));
+        let environment: HeldEnvironment = Arc::new(std::sync::Mutex::new(Some(environment)));
         controller.pending.lock().await.insert(
             reservation_id,
             PendingCreate {
@@ -185,10 +196,10 @@ impl CreateHold {
         }
     }
 
-    /// Ends this create's wait, and says whether a worker's claim had already taken the variables.
+    /// Ends this create's wait, and says whether a worker's claim had already taken the environment.
     ///
-    /// The variables are withdrawn first, before anything is awaited, so no claim can take them
-    /// once the create has stopped waiting; only then is the entry removed. A claim that took them
+    /// The environment is withdrawn first, before anything is awaited, so no claim can take it
+    /// once the create has stopped waiting; only then is the entry removed. A claim that took it
     /// means a launch that may still complete, which the create's caller is told is not known.
     pub(super) async fn end_wait(&mut self) -> bool {
         let taken = withdraw(&self.environment);
@@ -241,7 +252,7 @@ impl Controller {
     /// configuration (the doctor, a setting change) and at each start, so a session created before
     /// that is given the additions the daemon last accepted. Their values are the owner's own and
     /// go to the worker beside the rest and nowhere else.
-    pub(super) fn host_context_environment(&self) -> Vec<EnvironmentVariable> {
+    pub(super) fn host_context_environment(&self) -> SessionEnvironment {
         let mut variables: std::collections::BTreeMap<String, String> = self
             .host_environment
             .lock()
@@ -249,17 +260,22 @@ impl Controller {
             .iter()
             .map(|variable| (variable.name.clone(), variable.value.clone()))
             .collect();
+        // One reading of the configuration supplies the values and the names the worker is told.
+        let mut additions = Vec::new();
         for (name, value) in self.in_force().environment_additions {
             // Named as the platform names them, as the daemon's own are.
-            variables.insert(
-                kr_protocol::hostinfo::configuration::platform_variable_name(&name),
-                value,
-            );
+            let name = kr_protocol::hostinfo::configuration::platform_variable_name(&name);
+            additions.push(name.clone());
+            variables.insert(name, value);
         }
-        variables
-            .into_iter()
-            .map(|(name, value)| EnvironmentVariable { name, value })
-            .collect()
+        SessionEnvironment {
+            variables: variables
+                .into_iter()
+                .map(|(name, value)| EnvironmentVariable { name, value })
+                .collect(),
+            origin: EnvironmentOrigin::HostContext,
+            additions,
+        }
     }
 
     /// Refuses a managed create whose shell no installed package qualifies.
@@ -308,8 +324,8 @@ impl Controller {
                     .to_owned(),
             }
         })?;
-        let origin = CreateOrigin::decide(door, &create)?;
-        if origin == CreateOrigin::HostContext && !create.environment_snapshot.is_empty() {
+        let origin = decide_origin(door, &create)?;
+        if origin == EnvironmentOrigin::HostContext && !create.environment_snapshot.is_empty() {
             // Said, and not ignored: a client that sends variables to a session that takes none of
             // them would think they had been used. Nothing of them is repeated here.
             return Err(ControllerError::InvalidArgument(
@@ -325,8 +341,10 @@ impl Controller {
         // sends its own has it taken out of the request here, and the digest above covers it, as a
         // hash; any other takes the host's.
         let environment = match origin {
-            CreateOrigin::CliSnapshot => std::mem::take(&mut create.environment_snapshot),
-            CreateOrigin::HostContext => self.host_context_environment(),
+            EnvironmentOrigin::CreatorSnapshot => {
+                SessionEnvironment::of_creator(std::mem::take(&mut create.environment_snapshot))
+            }
+            EnvironmentOrigin::HostContext => self.host_context_environment(),
         };
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can

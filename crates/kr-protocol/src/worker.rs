@@ -329,6 +329,28 @@ pub struct WorkerLaunchSpec {
     /// on therefore keeps none of its output in the history it retains, from its first byte, and
     /// does not wait for the daemon's next notice to learn that it is private.
     pub privacy: PrivacyLaunch,
+    /// Whose environment the variables in the create request are.
+    pub environment_origin: EnvironmentOrigin,
+    /// The names, and never the values, of the configured variables among those the host gave a
+    /// session started with its own environment.
+    ///
+    /// Empty for a session started with its creator's environment. The worker reads them to say
+    /// where each variable came from; the values are already among the create request's.
+    pub environment_additions: Vec<String>,
+}
+
+/// Whose environment a session's variables are, which decides how the worker labels where they
+/// came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentOrigin {
+    /// The command line's own environment, which it sends with a session it creates for a person
+    /// to see: filtered for the terminal's identity and for reserved variables by the worker.
+    CreatorSnapshot,
+    /// The environment of the execution context this host runs in, which is what a session no
+    /// person's shell stands behind is started with: one an app creates, one created invisibly,
+    /// and one a paired device asks for, whose own environment is never used.
+    HostContext,
 }
 
 /// The environment's privacy state, as a worker is told it when it is launched.
@@ -557,6 +579,7 @@ mod tests {
             application_state: Nullable::null(),
             root_process: Nullable::some(start()),
             closure: Nullable::null(),
+            environment_sources: None,
         };
         let report = |described: Option<&SessionSummary>| {
             let mut entries = vec![
@@ -626,6 +649,8 @@ mod tests {
                 parts: 1,
             },
             privacy,
+            environment_origin: EnvironmentOrigin::CreatorSnapshot,
+            environment_additions: Vec::new(),
         }
     }
 

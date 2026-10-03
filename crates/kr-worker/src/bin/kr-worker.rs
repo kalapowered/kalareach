@@ -30,7 +30,10 @@ use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
-use kr_protocol::session::{ClosureReason, DisplayNumber, SessionCreateParams, ShellMode};
+use kr_protocol::session::{
+    ClosureReason, DisplayNumber, SessionCreateParams, SessionEnvironmentSources, ShellMode,
+    WorkingDirectorySource,
+};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
@@ -239,7 +242,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let config = session_config(
+    let (config, environment_sources) = session_config(
         &specification,
         &environment,
         display_number,
@@ -258,6 +261,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let palette = kr_worker::snapshot::PaletteChoice::from_request(specification.create.palette.0);
     let runtime = match start_or_record(
         config,
+        environment_sources,
         palette,
         specification.privacy,
         std::sync::Arc::clone(&shared_clock),
@@ -545,7 +549,7 @@ fn session_config(
     bridge: Option<&HostEndpoint>,
     worker_endpoint: &kr_ipc::paths::Endpoint,
     floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
-) -> SessionConfig {
+) -> (SessionConfig, SessionEnvironmentSources) {
     let create: &SessionCreateParams = &specification.create;
     // A managed session launches the package's own binary. Everything else launches the shell the
     // request named, or the one this host is configured to use, or the platform's own. Nothing is
@@ -583,6 +587,8 @@ fn session_config(
         .unwrap_or_else(kr_protocol::identity::DesktopBinding::none);
     let launch_environment = build_environment(
         &create.environment_snapshot,
+        specification.environment_origin,
+        &specification.environment_additions,
         &context,
         &shell_path,
         &specification.release,
@@ -615,12 +621,18 @@ fn session_config(
         .as_ref()
         .copied()
         .unwrap_or(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS);
-    let cwd = create
-        .cwd
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| "/".to_owned());
-    SessionConfig {
+    // The directory the request named, or the root: where the shell started is said as one or the
+    // other and never as the path.
+    let (cwd, cwd_source) = create.cwd.as_ref().cloned().map_or_else(
+        || ("/".to_owned(), WorkingDirectorySource::WorkerDefault),
+        |named| (named, WorkingDirectorySource::CreateRequest),
+    );
+    let sources = SessionEnvironmentSources {
+        path: launch_environment.sources.path,
+        locale: launch_environment.sources.locale,
+        cwd: cwd_source,
+    };
+    let config = SessionConfig {
         session_id: specification.session_id,
         session_epoch: specification.session_epoch,
         environment_id: specification.environment_id,
@@ -650,7 +662,8 @@ fn session_config(
         time: floor.map_or_else(TimeSources::system, |floor| {
             TimeSources::system().with_floor(floor)
         }),
-    }
+    };
+    (config, sources)
 }
 
 /// Returns the startup a session's profile asks a packaged shell for.
