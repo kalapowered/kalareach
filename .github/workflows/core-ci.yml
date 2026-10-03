@@ -506,6 +506,32 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test listener --test transport --test broker --test gateway
 
+      # The agent mutations through the real dispatch path, over what a launch records and a
+      # launched agent's transport carries: a refusal is a rejection with a receipt, and an upstream
+      # slow to answer does not hold the session's lock.
+      - name: Test the agent mutations through the dispatch path
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test agent_service
+
+      # An integrated invocation's launcher against the worker's own command backends, on this
+      # platform's pipe. The launcher creates its program suspended and the backend names that
+      # program and not the launcher: it is the launcher's child, started after the backend was
+      # established, created from the file the backend hashed, and held by a job of its own before it
+      # runs. A program the backend refuses, one the launcher declines and one never started leave
+      # nothing running; the program's whole exit code is the launcher's; and the directory the
+      # program inherits is granted only where the path was held from the drive's root, nothing in
+      # it can be renamed meanwhile, and a directory converted to a link before the commit is
+      # granted nothing.
+      - name: Test the forwarder's launcher against the command backends
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-hook --test launch_windows
+
+      # What the doctor reads of this platform: the worker's own answer to whether its command
+      # backends run, which is a fact apart from whether it can publish a credential file.
+      - name: Test the doctor's reading of the platform's command backends
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib catalogue::integrations
+
       # The settings-sync store's locks on this platform. It takes an exclusive lock on the store
       # and one on each request, and a request one process is holding is refused to another, which
       # is the operating system's lock and not a compiled-in one. The suite proves that by starting
