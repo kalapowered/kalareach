@@ -93,10 +93,11 @@ channel server relies on Claude Code passing the same variable to the MCP server
 `KR_SESSION` in the environment goes into the hello as a diagnostic and decides nothing: a process
 whose environment names no registration is outside any launch, whatever else it carries.
 
-The forwarder reads the endpoint as a socket path or a loopback address, and refuses anything
-else. It reads the credential only from a file in the registration's own directory, and refuses a
-credential file that another user could read, because the exchange in it would already belong to
-somebody else too.
+The forwarder reads the endpoint as the path of a private socket or the name of a local named pipe,
+and refuses anything else, so nothing it connects to is reachable from another machine. It reads the
+credential only from a file in the registration's own directory, and refuses a credential file that
+another user could read, because the exchange in it would already belong to somebody else too. On
+Windows that is a file whose access list names an account the machine does not already trust.
 
 ## Launching from the shell
 
@@ -201,10 +202,10 @@ The forwarder connects to the endpoint, then writes a single line before anythin
 The worker reads that line under a five-second deadline and nothing past it until it has decided.
 It refuses the connection, without a word, unless every one of these holds:
 
-1. The connection comes from the user who owns the session, and on a private socket the kernel
-   names the connecting process.
+1. The connection comes from the user who owns the session, and the kernel names the connecting
+   process.
 2. The process the hello presents is the one the operating system reports for that identifier, and
-   on a private socket it is the process the kernel named.
+   it is the process the kernel named.
 3. The launched application started it. The worker walks the kernel's parent chain from the
    connecting process to the process it launched, and checks every link by its start identity, so
    an identifier recycled since the application started does not complete the chain. Each parent is
@@ -212,6 +213,10 @@ It refuses the connection, without a word, unless every one of these holds:
    that parent exits and never changes back, so the process read was still its parent. No wall-clock
    start is compared, so setting the clock back cannot break a real chain. A bridge whose start the
    platform records on a clock that only moves forward is refused when that record cannot be read.
+   On Windows a process keeps naming its parent after that parent has exited, so a recorded parent
+   proves nothing there. The launch binding of a bridge is then the job the launched application was
+   started in: the connecting process must be one that job holds. On every platform the kernel names
+   the connecting process, and the connection must come from the user who owns the session.
 4. It is the installation. The worker recorded, for the launch, which package's bridge is installed,
    the application name its registration invokes the forwarder for, the surfaces it registered and
    the forwarder executable it points Claude Code at. The hello's declaration must name that
@@ -376,12 +381,13 @@ and exits 1. When Claude Code closes its end, the channel exits 0.
 
 ## Platforms
 
-Where the platform has a private socket, the endpoint is one inside the worker's owner-only
-runtime directory, and the kernel names every connecting process. Elsewhere the endpoint is
-loopback, and the credential is the whole authentication. On a platform where the host cannot prove
-that a file is closed to other accounts, it writes neither the credential file nor the registration
-that names it, so no bridge is admitted there, and a command the shell asks about gets no backend
-and runs as typed. A forwarder whose environment names a registration it cannot read answers its
+The endpoint is a socket inside the worker's owner-only runtime directory on Unix, and on Windows a
+named pipe whose access list is the owner's alone. On both the kernel names every connecting
+process. On a platform where the host cannot prove that a file is closed to other accounts, it
+writes neither the credential file nor the registration that names it, so no bridge is admitted
+there, and a command the shell asks about gets no backend and runs as typed.
+
+A forwarder whose environment names a registration it cannot read answers its
 hooks with `{}` and ends its channel with a failure before the handshake, which Claude Code shows as
 a failed server.
 
