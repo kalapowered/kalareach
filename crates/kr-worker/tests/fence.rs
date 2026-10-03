@@ -5217,9 +5217,13 @@ async fn an_interrupt_delivers_what_its_own_sweep_released() {
 }
 
 /// KR-REQ-07.79: a retry happens at the reader's next idle callback, and waits for a drain.
+///
+/// The machine's own deadlines pass only when the test moves its clock, so the fence the reader is
+/// asked for cannot time out before this test has answered it, however long that takes here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withheld_fence_is_retried_at_the_next_idle_callback() {
-    let mut wired = wired().await;
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_holding_fences(&clock, None).await;
     let _holder = wired.holder();
     wired
         .bridge
