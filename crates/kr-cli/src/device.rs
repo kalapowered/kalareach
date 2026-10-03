@@ -323,8 +323,23 @@ fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
             if grants == 1 { "" } else { "s" }
         )
     }];
+    let workers_left_out = barrier
+        .workers_total
+        .get()
+        .saturating_sub(barrier.workers.len() as u64);
     if barrier.workers.is_empty() {
-        lines.push(stdout_line!("No session's worker was affected."));
+        // The host counts the workers it affected before it cuts the list, so an empty list is not
+        // always an empty count: it can be a count it kept no names for.
+        lines.push(if workers_left_out == 0 {
+            stdout_line!("No session's worker was affected.")
+        } else {
+            stdout_line!(
+                "{} session worker{} {} affected, and none is listed here.",
+                workers_left_out,
+                if workers_left_out == 1 { "" } else { "s" },
+                if workers_left_out == 1 { "was" } else { "were" }
+            )
+        });
     } else if barrier.holds() {
         lines.push(stdout_line!(
             "Every affected session's worker has fenced it."
@@ -386,11 +401,7 @@ fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
             ));
         }
     }
-    let workers_left_out = barrier
-        .workers_total
-        .get()
-        .saturating_sub(barrier.workers.len() as u64);
-    if workers_left_out > 0 {
+    if workers_left_out > 0 && !barrier.workers.is_empty() {
         lines.push(stdout_line!(
             "{} more session worker{} {} not listed here.",
             workers_left_out,
@@ -679,5 +690,31 @@ mod tests {
         );
         let text = written(revocation(device, &revoked(Vec::new())));
         assert!(text.contains("No session's worker was affected."), "{text}");
+    }
+
+    /// KR-REQ-09.12: a host that counted workers and listed none of them (ended workers it keeps
+    /// no names for) does not say that none was affected: it says how many were.
+    #[test]
+    fn a_revocation_whose_workers_the_host_did_not_list_says_how_many_were_affected() {
+        let device = DeviceId::new(Uuid::from_bytes([1; 16]));
+        let mut unlisted = revoked(Vec::new());
+        unlisted.barrier.workers_total = U64::new(3);
+        let text = written(revocation(device, &unlisted));
+        assert!(
+            !text.contains("No session's worker was affected."),
+            "{text}"
+        );
+        assert!(
+            text.contains("3 session workers were affected, and none is listed here."),
+            "{text}"
+        );
+        assert!(!text.contains("more session worker"), "{text}");
+
+        unlisted.barrier.workers_total = U64::new(1);
+        let text = written(revocation(device, &unlisted));
+        assert!(
+            text.contains("1 session worker was affected, and none is listed here."),
+            "{text}"
+        );
     }
 }
