@@ -310,6 +310,9 @@ pub struct Session {
     application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
+    /// Where the variables the root shell is started with came from, which the worker that built
+    /// them says before it starts the shell.
+    environment_sources: Option<kr_protocol::session::SessionEnvironmentSources>,
     /// What is queued for the pseudo-terminal and not yet handed to its writer, in order.
     ///
     /// Only [`Session::take_pending_input`] takes from it, and it stops at a published fence the
@@ -676,6 +679,7 @@ impl Session {
             application_state: None,
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
+            environment_sources: None,
             pending_input: std::collections::VecDeque::new(),
             owned: None,
             root_exit: None,
@@ -1404,6 +1408,7 @@ impl Session {
             application_state: Nullable(self.application_state),
             root_process: Nullable(self.root_identity()),
             closure: Nullable(self.closure.clone()),
+            environment_sources: self.environment_sources,
         }
     }
 
@@ -1810,6 +1815,15 @@ impl Session {
     /// Returns an error once the session has produced output.
     pub fn set_initial_palette(&mut self, choice: crate::snapshot::PaletteChoice) -> Result<()> {
         self.engine.set_initial_palette(choice)
+    }
+
+    /// Says where the variables the root shell is started with came from, which a summary of the
+    /// session then carries, the one written when the shell starts included.
+    pub const fn set_environment_sources(
+        &mut self,
+        sources: kr_protocol::session::SessionEnvironmentSources,
+    ) {
+        self.environment_sources = Some(sources);
     }
 
     /// Where the session's palette came from.

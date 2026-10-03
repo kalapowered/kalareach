@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kr_protocol::hostinfo::configuration::{host_owns_variable, platform_variable_name};
-use kr_protocol::session::EnvironmentVariable;
+use kr_protocol::session::{EnvironmentSource, EnvironmentVariable};
+use kr_protocol::worker::EnvironmentOrigin;
 
 /// The terminal identity every KalaReach session declares.
 pub const TERM: &str = "xterm-256color";
@@ -68,11 +69,10 @@ pub const CREATOR_TERMINAL_VARIABLES: &[&str] =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentSources {
     /// Where `PATH` came from.
-    pub path: &'static str,
-    /// Where the locale came from.
-    pub locale: &'static str,
-    /// Where the working directory came from.
-    pub cwd: &'static str,
+    pub path: EnvironmentSource,
+    /// Where the setting that decides the session's character set came from: the first of
+    /// `LC_ALL`, `LC_CTYPE` and `LANG` that is not empty, as a POSIX shell chooses it.
+    pub locale: EnvironmentSource,
     /// Which terminfo database the session reads `TERM` from, and what it was given instead.
     pub terminfo: TerminfoSelection,
 }
@@ -296,12 +296,18 @@ pub fn desktop_binding() -> kr_protocol::identity::DesktopBinding {
 
 /// Builds the environment for one root shell.
 ///
-/// The order is fixed: start from the creator's snapshot with terminal identity filtered out, let
-/// the execution context overwrite whatever it supplies, and finish with the values the worker
-/// owns outright. User startup files can change any of them afterwards, which is normal.
+/// The order is fixed: start from the variables the create request carried, which are the
+/// creator's or the host's by `origin`, with the names this host owns filtered out; let the
+/// execution context overwrite whatever it supplies; and finish with the values the worker owns
+/// outright. User startup files can change any of them afterwards, which is normal.
+///
+/// `additions` names the variables of the host's own environment that its owner configured, so
+/// that where one came from can be said. The names are compared as the platform compares them.
 #[must_use]
 pub fn build(
     snapshot: &[EnvironmentVariable],
+    origin: EnvironmentOrigin,
+    additions: &[String],
     context: &ExecutionContext,
     shell_path: &str,
     release: &str,
@@ -309,8 +315,9 @@ pub fn build(
 ) -> LaunchEnvironment {
     let mut variables = BTreeMap::new();
     let mut removed = Vec::new();
-    let mut path_from_snapshot = false;
-    let mut locale_from_snapshot = false;
+    // Where each variable kept came from, and whether its value says anything, by the name the
+    // platform compares it by.
+    let mut supplied: BTreeMap<String, (EnvironmentSource, bool)> = BTreeMap::new();
     let mut terminfo = TerminfoSelection {
         directory: context
             .terminfo
@@ -341,37 +348,31 @@ pub fn build(
         // session: a headless worker supplies none of its variables on purpose, and letting the
         // creator's copy survive would give the session a display, a message bus and a runtime
         // directory belonging to a login it is not in and that may already have ended.
-        if host_owns_variable(&platform_variable_name(&variable.name)) {
+        let folded = platform_variable_name(&variable.name);
+        if host_owns_variable(&folded) {
             removed.push(variable.name.clone());
             continue;
         }
-        if variable.name == "PATH" {
-            path_from_snapshot = true;
-        }
-        if variable.name == "LANG" || variable.name.starts_with("LC_") {
-            locale_from_snapshot = true;
-        }
+        let source = match origin {
+            EnvironmentOrigin::CreatorSnapshot => EnvironmentSource::CreatorSnapshot,
+            EnvironmentOrigin::HostContext
+                if additions
+                    .iter()
+                    .any(|added| platform_variable_name(added) == folded) =>
+            {
+                EnvironmentSource::ConfiguredAddition
+            }
+            EnvironmentOrigin::HostContext => EnvironmentSource::HostContext,
+        };
+        supplied.insert(folded, (source, !variable.value.is_empty()));
         variables.insert(variable.name.clone(), variable.value.clone());
     }
 
-    let mut path_source = if path_from_snapshot {
-        "creator snapshot"
-    } else {
-        "execution context"
-    };
-    let mut locale_source = if locale_from_snapshot {
-        "creator snapshot"
-    } else {
-        "execution context"
-    };
-
     for (name, value) in &context.variables {
-        if name == "PATH" {
-            path_source = "execution context";
-        }
-        if name == "LANG" || name.starts_with("LC_") {
-            locale_source = "execution context";
-        }
+        supplied.insert(
+            platform_variable_name(name),
+            (EnvironmentSource::ExecutionContext, !value.is_empty()),
+        );
         variables.insert(name.clone(), value.clone());
     }
 
@@ -411,9 +412,18 @@ pub fn build(
     LaunchEnvironment {
         variables,
         sources: EnvironmentSources {
-            path: path_source,
-            locale: locale_source,
-            cwd: "create request",
+            path: supplied
+                .get("PATH")
+                .map_or(EnvironmentSource::Unset, |(source, _)| *source),
+            // The category a POSIX shell takes its character set from: `LC_ALL` when it says
+            // anything, else `LC_CTYPE`, else `LANG`. An empty one is as good as none.
+            locale: ["LC_ALL", "LC_CTYPE", "LANG"]
+                .into_iter()
+                .find_map(|name| match supplied.get(name) {
+                    Some((source, true)) => Some(*source),
+                    _ => None,
+                })
+                .unwrap_or(EnvironmentSource::Unset),
             terminfo,
         },
         removed,
@@ -505,6 +515,8 @@ mod tests {
                 ("SSH_TTY", "/dev/ttys004"),
                 ("PATH", "/usr/bin"),
             ]),
+            EnvironmentOrigin::CreatorSnapshot,
+            &[],
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
@@ -535,7 +547,7 @@ mod tests {
             built.variables.get("SHELL").map(String::as_str),
             Some("/bin/zsh")
         );
-        assert_eq!(built.sources.path, "creator snapshot");
+        assert_eq!(built.sources.path, EnvironmentSource::CreatorSnapshot);
     }
 
     #[test]
@@ -545,6 +557,8 @@ mod tests {
                 ("SSH_CONNECTION", "10.0.0.1 52000 10.0.0.2 22"),
                 ("SSH_CLIENT", "10.0.0.1 52000 22"),
             ]),
+            EnvironmentOrigin::CreatorSnapshot,
+            &[],
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
@@ -565,6 +579,8 @@ mod tests {
             .insert("PATH".to_owned(), "/opt/bin".to_owned());
         let built = build(
             &snapshot(&[("PATH", "/usr/bin"), ("DISPLAY", ":99")]),
+            EnvironmentOrigin::CreatorSnapshot,
+            &[],
             &context,
             "/bin/zsh",
             "0.1.0",
@@ -578,7 +594,7 @@ mod tests {
             built.variables.get("DISPLAY").map(String::as_str),
             Some(":0")
         );
-        assert_eq!(built.sources.path, "execution context");
+        assert_eq!(built.sources.path, EnvironmentSource::ExecutionContext);
     }
 
     /// KR-REQ-07.25: one list of the names this host owns. What the worker removes from a
@@ -640,10 +656,92 @@ mod tests {
         }
     }
 
+    /// KR-REQ-07.25: the locale a session reports is the setting a POSIX shell takes its character
+    /// set from: `LC_ALL`, else `LC_CTYPE`, else `LANG`, one that is empty deciding nothing.
+    #[test]
+    fn the_locale_is_said_to_come_from_the_variable_a_shell_reads_first() {
+        let locale = |origin, additions: &[&str], variables: &[(&str, &str)]| {
+            build(
+                &snapshot(variables),
+                origin,
+                &additions
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>(),
+                &ExecutionContext::default(),
+                "/bin/zsh",
+                "0.1.0",
+                test_session(),
+            )
+            .sources
+            .locale
+        };
+        let host = EnvironmentOrigin::HostContext;
+        // The owner's `LC_CTYPE` is over the host's `LANG`, and the host's `LC_ALL` is over both.
+        assert_eq!(
+            locale(host, &["LC_CTYPE"], &[("LC_CTYPE", "C"), ("LANG", "en")]),
+            EnvironmentSource::ConfiguredAddition
+        );
+        assert_eq!(
+            locale(
+                host,
+                &["LC_CTYPE"],
+                &[("LC_ALL", "C"), ("LC_CTYPE", "C"), ("LANG", "en")]
+            ),
+            EnvironmentSource::HostContext
+        );
+        // An empty `LC_ALL` decides nothing, and nor does a category this label does not follow.
+        assert_eq!(
+            locale(host, &[], &[("LC_ALL", ""), ("LANG", "en")]),
+            EnvironmentSource::HostContext
+        );
+        assert_eq!(
+            locale(
+                host,
+                &["LC_MESSAGES"],
+                &[("LC_MESSAGES", "C"), ("LANG", "en")]
+            ),
+            EnvironmentSource::HostContext
+        );
+        assert_eq!(
+            locale(host, &[], &[("LC_ALL", ""), ("LANG", "")]),
+            EnvironmentSource::Unset
+        );
+        assert_eq!(
+            locale(host, &[], &[("PATH", "/usr/bin")]),
+            EnvironmentSource::Unset
+        );
+    }
+
+    /// KR-REQ-07.25: a `PATH` that is empty is still its supplier's, one nobody supplied is unset,
+    /// and a name is looked up as the platform compares it.
+    #[test]
+    fn an_empty_path_is_its_suppliers_and_a_missing_one_is_unset() {
+        let path = |variables: &[(&str, &str)]| {
+            built_with(variables, &ExecutionContext::default())
+                .sources
+                .path
+        };
+        assert_eq!(path(&[("PATH", "")]), EnvironmentSource::CreatorSnapshot);
+        assert_eq!(path(&[("HOME", "/h")]), EnvironmentSource::Unset);
+        // Windows keeps a name's case and compares without regard to it; elsewhere `Path` is a
+        // variable of its own that no shell reads as `PATH`.
+        assert_eq!(
+            path(&[("Path", "/usr/bin")]),
+            if cfg!(windows) {
+                EnvironmentSource::CreatorSnapshot
+            } else {
+                EnvironmentSource::Unset
+            }
+        );
+    }
+
     #[test]
     fn a_creator_cannot_preload_a_reserved_value() {
         let built = build(
             &snapshot(&[("KR_SESSION_TOKEN", "forged")]),
+            EnvironmentOrigin::CreatorSnapshot,
+            &[],
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
@@ -663,6 +761,8 @@ mod tests {
     fn built_with(creator: &[(&str, &str)], context: &ExecutionContext) -> LaunchEnvironment {
         build(
             &snapshot(creator),
+            EnvironmentOrigin::CreatorSnapshot,
+            &[],
             context,
             "/bin/zsh",
             "0.1.0",

@@ -6752,9 +6752,21 @@ export interface WorkerLaunchSpec {
    */
   display_number: string
   /**
+   * The names, and never the values, of the configured variables among those the host gave a
+   * session started with its own environment.
+   *
+   * Empty for a session started with its creator's environment. The worker reads them to say
+   * where each variable came from; the values are already among the create request's.
+   */
+  environment_additions: string[]
+  /**
    * The environment the session belongs to.
    */
   environment_id: string
+  /**
+   * Whose environment the variables in the create request are.
+   */
+  environment_origin: 'creator_snapshot' | 'host_context'
   plugins: AdmissionsHeader
   privacy: PrivacyLaunch
   /**
@@ -7086,6 +7098,17 @@ export interface SessionSummary {
    */
   environment_id: string
   /**
+   * Where the variables its root shell was started with came from, when its worker said.
+   *
+   * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+   * a summary this host composes without its worker (a closure with no worker record to read,
+   * or a worker whose end could not be established) because no worker said anything about the
+   * environment, and for one a worker of an earlier release described, which wrote no such
+   * member. Only that second reason ends: it goes when no worker of a release that wrote none
+   * can still be running and no journal row of one is still read.
+   */
+  environment_sources?: SessionEnvironmentSources | null
+  /**
    * The root shell's process identity while the session is running.
    */
   root_process: ProcessStartIdentity4 | null
@@ -7250,6 +7273,33 @@ export interface Dimensions4 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
+}
+/**
+ * Where each of the three things a shell reads first came from, as the worker built its
+ * environment.
+ *
+ * Closed words and nothing a person typed: no value, no name and no path is in one, so a report
+ * of it can be shown, exported and kept as it is. They describe what the session was started
+ * with; a startup file changes the shell's own environment afterwards, as it does for any shell.
+ */
+export interface SessionEnvironmentSources {
+  /**
+   * Where the directory the shell started in came from.
+   */
+  cwd: 'create_request' | 'worker_default'
+  /**
+   * Where the setting that decides the shell's character set came from: the first of
+   * `LC_ALL`, `LC_CTYPE` and `LANG` that is not empty, as a POSIX shell chooses it.
+   *
+   * The other categories are not summarised, and a session on Windows reads these variables
+   * only where a program there does; this is not the culture a PowerShell session has.
+   */
+  locale:
+    'creator_snapshot' | 'host_context' | 'configured_addition' | 'execution_context' | 'unset'
+  /**
+   * Where the shell's `PATH` came from.
+   */
+  path: 'creator_snapshot' | 'host_context' | 'configured_addition' | 'execution_context' | 'unset'
 }
 /**
  * A process and the kernel's record of when it started.
@@ -13381,6 +13431,17 @@ export interface SessionSummary1 {
    * The environment that owns it.
    */
   environment_id: string
+  /**
+   * Where the variables its root shell was started with came from, when its worker said.
+   *
+   * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+   * a summary this host composes without its worker (a closure with no worker record to read,
+   * or a worker whose end could not be established) because no worker said anything about the
+   * environment, and for one a worker of an earlier release described, which wrote no such
+   * member. Only that second reason ends: it goes when no worker of a release that wrote none
+   * can still be running and no journal row of one is still read.
+   */
+  environment_sources?: SessionEnvironmentSources | null
   /**
    * The root shell's process identity while the session is running.
    */
@@ -24415,6 +24476,17 @@ export interface SessionSummary2 {
    */
   environment_id: string
   /**
+   * Where the variables its root shell was started with came from, when its worker said.
+   *
+   * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+   * a summary this host composes without its worker (a closure with no worker record to read,
+   * or a worker whose end could not be established) because no worker said anything about the
+   * environment, and for one a worker of an earlier release described, which wrote no such
+   * member. Only that second reason ends: it goes when no worker of a release that wrote none
+   * can still be running and no journal row of one is still read.
+   */
+  environment_sources?: SessionEnvironmentSources | null
+  /**
    * The root shell's process identity while the session is running.
    */
   root_process: ProcessStartIdentity4 | null
@@ -24554,6 +24626,17 @@ export interface SessionSummary3 {
    * The environment that owns it.
    */
   environment_id: string
+  /**
+   * Where the variables its root shell was started with came from, when its worker said.
+   *
+   * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+   * a summary this host composes without its worker (a closure with no worker record to read,
+   * or a worker whose end could not be established) because no worker said anything about the
+   * environment, and for one a worker of an earlier release described, which wrote no such
+   * member. Only that second reason ends: it goes when no worker of a release that wrote none
+   * can still be running and no journal row of one is still read.
+   */
+  environment_sources?: SessionEnvironmentSources | null
   /**
    * The root shell's process identity while the session is running.
    */
@@ -24938,6 +25021,17 @@ export interface SessionSummary4 {
    * The environment that owns it.
    */
   environment_id: string
+  /**
+   * Where the variables its root shell was started with came from, when its worker said.
+   *
+   * Absent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for
+   * a summary this host composes without its worker (a closure with no worker record to read,
+   * or a worker whose end could not be established) because no worker said anything about the
+   * environment, and for one a worker of an earlier release described, which wrote no such
+   * member. Only that second reason ends: it goes when no worker of a release that wrote none
+   * can still be running and no journal row of one is still read.
+   */
+  environment_sources?: SessionEnvironmentSources | null
   /**
    * The root shell's process identity while the session is running.
    */

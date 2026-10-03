@@ -448,6 +448,8 @@ fn specification(entries: Vec<CommandIntegration>) -> kr_protocol::worker::Worke
             generation: U64::ZERO,
             enabled: false,
         },
+        environment_origin: kr_protocol::worker::EnvironmentOrigin::CreatorSnapshot,
+        environment_additions: Vec::new(),
     }
 }
 

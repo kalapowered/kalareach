@@ -552,6 +552,7 @@ fn snapshot_page(
             application_state: Nullable::null(),
             root_process: Nullable::null(),
             closure: Nullable::null(),
+            environment_sources: None,
         },
         geometry: GeometryState {
             owner: Nullable::null(),

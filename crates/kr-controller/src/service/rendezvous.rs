@@ -206,11 +206,11 @@ impl Controller {
             ));
         }
 
-        // The environment its creator sent is taken here, once, by the claim of the create that is
-        // still waiting for this worker. Nothing else holds it: a claim that finds none belongs to
+        // The environment the session is started with is taken here, once, by the claim of the
+        // create that is still waiting for this worker. Nothing else holds it: a claim that finds none belongs to
         // a create that has stopped waiting, or to one a daemon that has since ended was making,
         // and is refused rather than launched with an environment it was not sent.
-        let environment = self.take_creator_environment(claim.reservation_id).await;
+        let environment = self.take_session_environment(claim.reservation_id).await;
 
         // Admission is consumed here, in one transaction, together with the key that authenticates
         // this worker from now on. Everything above is a check; this is the commitment.
@@ -258,9 +258,10 @@ impl Controller {
             ))
         })?;
         // Before the specification is measured: the variables are part of what the frame carries.
-        create.environment_snapshot = environment.ok_or_else(|| {
+        let environment = environment.ok_or_else(|| {
             ControllerError::rendezvous("this claim found no environment to launch with")
         })?;
+        create.environment_snapshot = environment.variables;
 
         // The package this worker will launch is resolved here, by the daemon, against the
         // package root the daemon is configured with. The worker is told which directory to read
@@ -320,6 +321,8 @@ impl Controller {
             release: self.release.clone(),
             plugins,
             privacy: launched_under.to_launch(),
+            environment_origin: environment.origin,
+            environment_additions: environment.additions,
         };
         // The specification is one control frame. Beside a create request that leaves too little
         // room, the largest integrations are left out as well. The session starts without them,
@@ -371,15 +374,15 @@ impl Controller {
         }
     }
 
-    /// Takes the environment variables the creator of this reservation's session sent, when its
-    /// create is still waiting for the worker, and says nothing of them otherwise.
+    /// Takes the environment this reservation's session is started with, when its create is still
+    /// waiting for the worker, and says nothing of it otherwise.
     ///
-    /// The variables leave the create's own slot, so the create cannot also have them. The list of
+    /// It leaves the create's own slot, so the create cannot also have it. The list of
     /// waiting creates is released before anything else is awaited.
-    async fn take_creator_environment(
+    async fn take_session_environment(
         &self,
         reservation_id: ReservationId,
-    ) -> Option<Vec<kr_protocol::session::EnvironmentVariable>> {
+    ) -> Option<super::create::SessionEnvironment> {
         let slot = self
             .pending
             .lock()
