@@ -1244,9 +1244,10 @@ fn enrolment_of(byte: u8) -> kr_protocol::identity::EnvironmentEnrolment {
     }
 }
 
-/// Runs `call` and stops it at the place it is about to wait for this host's record of its
-/// environments, lets `meanwhile` happen there, and lets it go on: what lands while it is stopped
-/// there is what the call is asked about when it gets the record.
+/// Runs `call` and stops it once it holds this host's record of its environments and before it
+/// asks the admission again, lets `meanwhile` happen there, and lets it go on: what lands while it
+/// is stopped there is what the call is asked about, so a check made before the call had the record
+/// cannot have seen it.
 async fn stopped_before_the_environment_record<T: Send + 'static>(
     controller: &Controller,
     call: impl std::future::Future<Output = T> + Send + 'static,
@@ -1261,10 +1262,10 @@ async fn stopped_before_the_environment_record<T: Send + 'static>(
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: a fence this host owes that lands after an environment record
-/// change has everything it needs, and before it gets the record, stops it, so the record is not
-/// changed. The control: with nothing owed, the same changes are made.
+/// change holds the record stops it, so the record is not changed. The control: with nothing owed,
+/// the same changes are made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fence_that_lands_before_an_environment_change_gets_the_record_stops_it() {
+async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it() {
     use kr_protocol::identity::{
         EnvironmentEnrolParams, EnvironmentForgetParams, EnvironmentRefreshParams,
     };
