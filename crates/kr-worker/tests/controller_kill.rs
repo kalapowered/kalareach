@@ -493,7 +493,7 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
             ActionTarget::environment(environment_id),
             &SessionCreateParams {
                 environment_id,
-                presentation: Presentation::Invisible,
+                presentation: Presentation::Attach,
                 shell: Nullable::some(kr_worker::testing::posix_shell()),
                 shell_mode: ShellMode::NativeCompat,
                 cwd: Nullable::some(host.root().display().to_string()),

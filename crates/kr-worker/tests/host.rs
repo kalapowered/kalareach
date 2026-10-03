@@ -478,7 +478,7 @@ fn build() -> BuildId {
 fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreateParams {
     SessionCreateParams {
         environment_id,
-        presentation: Presentation::Invisible,
+        presentation: Presentation::Attach,
         shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some(cwd.display().to_string()),
