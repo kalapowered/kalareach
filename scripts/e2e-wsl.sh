@@ -24,7 +24,10 @@
 #      the distribution's own startup start the control daemon inside it, and so does attaching to
 #      a session there, which is told by the distribution that the session has closed.
 #   6. The bridge behaves the same in NAT and in mirrored networking, which is what decides
-#      whether any automatic behaviour is needed.
+#      whether any automatic behaviour is needed. In each mode every distribution also has its own
+#      paired endpoint: a viewer paired with one distribution is let in there and refused by the
+#      other, which holds no record of it, and joining, splitting and merging the two machine groups
+#      from Windows changes neither distribution's devices and grants.
 #   7. The helper refuses what may not cross: input that is not a frame, and a handshake that
 #      declares a network origin, which the bridge suite checks inside the distribution.
 #
@@ -33,7 +36,11 @@
 # networking mode in step 6, and restores `.wslconfig` when it ends.
 #
 # Every artefact is written under ${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}. The Windows
-# daemon this starts keeps its keys in its own run directory (never the Credential Manager).
+# daemon this starts keeps its keys in its own run directory (never the Credential Manager). The
+# pairing in step 6 selects the loopback network in each distribution's configuration, makes the
+# distribution's first owner when it has none, and keeps the owner's and the viewer's keys under
+# /var/tmp/kr-acc-pairing in that distribution, so a distribution that already has its owner from an
+# earlier run is paired through it.
 #
 # Knobs, all optional:
 #   KR_WSL_HELPER     absolute path of the helper inside a distribution (default /usr/local/bin/kr)
@@ -1069,11 +1076,16 @@ helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
 # that binds the whole installed set to the commit it was built from. Both are this acceptance's
 # own artefacts rather than programs the product installs, so they live together outside the path.
 suite_path=/usr/local/lib/kalareach-acc-bridge-suite
+# The suite that pairs a device with each distribution's own endpoint, installed and run the same
+# way, and the directory it keeps its keys in between runs.
+pairing_suite_path=/usr/local/lib/kalareach-acc-pairing-suite
+pairing_directory=/var/tmp/kr-acc-pairing
 manifest_path=/usr/local/lib/kalareach-acc-commit
 # The same set of paths relative to the root, which is the form the manifest carries so that both
 # writing it and checking it work from one directory.
 helper_relative="${helper_path#/}"
 suite_relative="${suite_path#/}"
+pairing_suite_relative="${pairing_suite_path#/}"
 linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
@@ -1287,8 +1299,8 @@ build_inside() {
   # installed file, and this reads all of it. A set built elsewhere and installed here carries the
   # manifest its builder wrote, so an incomplete copy fails this rather than passing it.
   if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
-    "cd / && test \"\$(head -n 1 '$manifest_path' 2>/dev/null)\" = '$commit' && tail -n +2 '$manifest_path' | awk '{ print \$2 }' | sort >/tmp/kr-acc-manifest-carries && printf '%s\n' '$helper_relative' '$(dirname "$helper_relative")/kr-controller' '$(dirname "$helper_relative")/kr-worker' '$suite_relative' | sort >/tmp/kr-acc-manifest-wanted && cmp -s /tmp/kr-acc-manifest-carries /tmp/kr-acc-manifest-wanted && tail -n +2 '$manifest_path' | sha256sum -c --quiet" 2>/dev/null; then
-    echo "  $distribution: the helper at $helper_path and its bridge suite were built from this commit"
+    "cd / && test \"\$(head -n 1 '$manifest_path' 2>/dev/null)\" = '$commit' && tail -n +2 '$manifest_path' | awk '{ print \$2 }' | sort >/tmp/kr-acc-manifest-carries && printf '%s\n' '$helper_relative' '$(dirname "$helper_relative")/kr-controller' '$(dirname "$helper_relative")/kr-worker' '$suite_relative' '$pairing_suite_relative' | sort >/tmp/kr-acc-manifest-wanted && cmp -s /tmp/kr-acc-manifest-carries /tmp/kr-acc-manifest-wanted && tail -n +2 '$manifest_path' | sha256sum -c --quiet" 2>/dev/null; then
+    echo "  $distribution: the helper at $helper_path and its two suites were built from this commit"
     return 0
   fi
   echo "  $distribution: building the helper inside the distribution (this takes a few minutes)"
@@ -1317,12 +1329,21 @@ build_inside() {
     }
     mkdir -p /usr/local/lib
     install -m 0755 \"\$suite\" '$suite_path'
+    # The suite that pairs a device with each distribution's own endpoint is built and installed
+    # the same way.
+    pairing=\"\$(cargo test -p kr-controller --test distribution_endpoints --no-run --message-format=json |
+      sed -n 's/.*\"kind\":\\[\"test\"\\].*\"executable\":\"\\([^\"]*\\)\".*/\\1/p' | tail -n 1)\"
+    test -n \"\$pairing\" || {
+      echo 'the build produced no pairing suite executable' >&2
+      exit 1
+    }
+    install -m 0755 \"\$pairing\" '$pairing_suite_path'
     # The manifest is written last and covers the whole set, so a half-installed set never looks
     # like a set built from this commit.
     cd /
     { echo '$commit'
       sha256sum '$helper_relative' '$(dirname "$helper_relative")/kr-controller' \
-        '$(dirname "$helper_relative")/kr-worker' '$suite_relative'
+        '$(dirname "$helper_relative")/kr-worker' '$suite_relative' '$pairing_suite_relative'
     } >'$manifest_path.partial'
     mv '$manifest_path.partial' '$manifest_path'
   " || fail "$distribution could not build the Linux helper"
@@ -1340,8 +1361,8 @@ clear_inherited_installation() {
     fail "$distribution could not be given an installation of its own"
   # The leftovers this acceptance itself put in the distribution that was copied. The file it
   # writes a daemon identifier into would otherwise name a process in that other distribution.
-  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/rm -f \
-    /tmp/kr-acc-controller.pid /tmp/kr-controller.log ||
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/rm -rf \
+    /tmp/kr-acc-controller.pid /tmp/kr-controller.log "${pairing_directory:?}" ||
     fail "$distribution kept what this acceptance left in the distribution it was copied from"
 }
 
@@ -1788,7 +1809,7 @@ refresh_and_check second "$second_id"
 pass "the bridge reaches the distribution that was started again"
 
 # ---------------------------------------------------------------------------------------------
-step "6. NAT and mirrored networking"
+step "6. NAT and mirrored networking, and the paired endpoints"
 
 # USERPROFILE is a Windows path. The redirection below is this shell's, so it needs the form this
 # shell opens files by.
@@ -1845,6 +1866,174 @@ set_mode() {
   done
 }
 
+# ---- The paired endpoint of each distribution ----------------------------------------------
+#
+# Each distribution is its own environment authority, with an endpoint of its own on the network
+# and grants of its own, and a machine group grants nothing by itself. What that needs inside a
+# distribution is the pairing suite: it pairs a device that may view sessions with the distribution's
+# own endpoint, through the owner the way a person pairs one, and then connects it. The device is
+# let in where it was paired. The other distribution's endpoint, reached from here over the network
+# the two distributions share, answers an unpaired device, which shows the address leads to it, and
+# refuses this one. Neither is a statement about the bridge, which opens no socket: both are about
+# the endpoints, so they are measured in each networking mode.
+#
+# One case of the suite inside one distribution, with the endpoint of the other where it needs it.
+# What it printed is kept as a log in the run's directory, and the lines it wrote for this script
+# are read from there.
+pairing_runs=0
+pairing_log=""
+pairing_case() {
+  local distribution="$1" name="$2" other="${3:-}"
+  pairing_runs=$((pairing_runs + 1))
+  pairing_log="$run_dir/pairing-$pairing_runs-$name.log"
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc \
+    "KR_ACC_DIR='$pairing_directory' KR_ACC_OTHER='$other' '$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name" \
+    >"$pairing_log" 2>&1 ||
+    fail "the pairing suite's $name failed inside $distribution: $(tr -d '\r' <"$pairing_log" | tail -n 30)"
+  tr -d '\r' <"$pairing_log" >"$pairing_log.text"
+  mv "$pairing_log.text" "$pairing_log"
+  grep -q 'test result: ok. 1 passed' "$pairing_log" ||
+    fail "the pairing suite ran no $name inside $distribution: $(tail -n 30 "$pairing_log")"
+}
+
+# The JSON a case printed on a line of one kind, which is the first such line.
+pairing_line() { sed -n "s/.*KR-ACC $1 //p" "$pairing_log" | head -n 1; }
+
+# What each distribution's daemon holds of devices and grants, as the suite reports it.
+first_held=""
+second_held=""
+held_in_both() {
+  pairing_case "$first" report_the_devices_and_grants
+  first_held="$(pairing_line held)"
+  pairing_case "$second" report_the_devices_and_grants
+  second_held="$(pairing_line held)"
+  [ -n "$first_held" ] && [ -n "$second_held" ] ||
+    fail "a distribution reported nothing of its devices and grants"
+}
+
+# Each distribution's viewer reaches the distribution it was paired with and is refused by the
+# other one.
+first_endpoint=""
+second_endpoint=""
+viewers_reach_only_their_own() {
+  pairing_case "$first" a_viewer_reaches_only_the_distribution_it_was_paired_with "$second_endpoint"
+  pairing_case "$second" a_viewer_reaches_only_the_distribution_it_was_paired_with "$first_endpoint"
+}
+
+# The group an environment reports of itself, read from Windows through its bridge.
+group_id=""
+group_revision=""
+group_of() {
+  local label="$1" file text
+  pairing_runs=$((pairing_runs + 1))
+  file="$run_dir/machine-$pairing_runs-$label.json"
+  "$kr_exe" --json host machine --environment "$label" >"$file" 2>&1 ||
+    fail "reading the machine group of $label over its bridge failed: $(cat "$file")"
+  text="$(compact <"$file")"
+  group_id="$(printf '%s' "$text" | json_string machine_id)"
+  group_revision="$(printf '%s' "$text" | json_string revision)"
+  [ -n "$group_id" ] && [ -n "$group_revision" ] ||
+    fail "$label reported no machine group: $text"
+}
+
+# One step on one environment, taken as the owner at this machine over that environment's bridge.
+machine_step() {
+  local label="$1" file
+  shift
+  pairing_runs=$((pairing_runs + 1))
+  file="$run_dir/machine-$pairing_runs-$label-$1.json"
+  "$kr_exe" --json host machine --environment "$label" "$@" >"$file" 2>&1 ||
+    fail "the step '$*' on $label failed: $(cat "$file")"
+}
+
+# A change of machine group has been made, and nothing a group could grant has come of it: each
+# distribution holds the devices and grants it held before, and each viewer still reaches only the
+# distribution it was paired with.
+unchanged_by() {
+  local what="$1" before_first="$first_held" before_second="$second_held"
+  viewers_reach_only_their_own
+  held_in_both
+  [ "$first_held" = "$before_first" ] ||
+    fail "$what changed what $first holds of devices and grants: $before_first -> $first_held"
+  [ "$second_held" = "$before_second" ] ||
+    fail "$what changed what $second holds of devices and grants: $before_second -> $second_held"
+}
+
+paired_endpoints() {
+  local mode="$1" first_device second_device first_group second_group
+  pairing_case "$first" pair_a_viewer_with_this_distribution
+  first_endpoint="$(pairing_line endpoint | compact)"
+  first_device="$(pairing_line viewer | compact | json_string device_id)"
+  pairing_case "$second" pair_a_viewer_with_this_distribution
+  second_endpoint="$(pairing_line endpoint | compact)"
+  second_device="$(pairing_line viewer | compact | json_string device_id)"
+  [ -n "$first_endpoint" ] && [ -n "$second_endpoint" ] && [ -n "$first_device" ] && [ -n "$second_device" ] ||
+    fail "$mode: a distribution paired a viewer and reported no endpoint or device"
+  # Each endpoint answers as the environment its distribution enrolled, and the two are two.
+  [ "$(printf '%s' "$first_endpoint" | json_string environment_id)" = "$first_id" ] ||
+    fail "$mode: $first's endpoint does not answer as the environment enrolled for it: $first_endpoint"
+  [ "$(printf '%s' "$second_endpoint" | json_string environment_id)" = "$second_id" ] ||
+    fail "$mode: $second's endpoint does not answer as the environment enrolled for it: $second_endpoint"
+  [ "$(printf '%s' "$first_endpoint" | json_string endpoint_id)" != "$(printf '%s' "$second_endpoint" | json_string endpoint_id)" ] ||
+    fail "$mode: two distributions answered with one endpoint identity"
+  [ "$first_device" != "$second_device" ] ||
+    fail "$mode: two distributions gave their viewers one device identity"
+  pass "$mode: each distribution paired a viewer with its own endpoint, and the two endpoints are two identities"
+
+  viewers_reach_only_their_own
+  held_in_both
+  # A grant made here is a grant here: the other distribution holds no record of this viewer.
+  case "$second_held" in
+    *"$first_device"*) fail "$mode: $second holds a record of the device paired with $first" ;;
+  esac
+  case "$first_held" in
+    *"$second_device"*) fail "$mode: $first holds a record of the device paired with $second" ;;
+  esac
+  pass "$mode: a viewer is let in by the distribution it was paired with and refused by the other, and the other holds no record of it"
+
+  # Their machine groups are the owner's to change. Joining, splitting and merging them moves
+  # each environment's own record and nothing else.
+  group_of first
+  first_group="$group_id"
+  group_of second
+  second_group="$group_id"
+  [ "$first_group" != "$second_group" ] ||
+    fail "$mode: the two distributions start in one machine group, so a join would prove nothing"
+  machine_step second join "$first_group" --expect "$second_group@$group_revision"
+  group_of second
+  [ "$group_id" = "$first_group" ] ||
+    fail "$mode: $second did not join the group of $first: $group_id"
+  unchanged_by "joining $second into the machine group of $first"
+
+  machine_step second split --expect "$group_id@$group_revision"
+  group_of second
+  [ "$group_id" != "$first_group" ] ||
+    fail "$mode: $second is still in the machine group of $first after a split"
+  second_group="$group_id"
+  unchanged_by "splitting $second from the machine group of $first"
+
+  group_of first
+  machine_step first merge "$second_group" --expect "$group_id@$group_revision"
+  group_of first
+  [ "$group_id" = "$second_group" ] ||
+    fail "$mode: $first did not merge into the group of $second: $group_id"
+  unchanged_by "merging the machine group of $first into the one of $second"
+
+  # Each ends in a group of its own, as each began.
+  machine_step first split --expect "$group_id@$group_revision"
+  group_of first
+  [ "$group_id" != "$second_group" ] ||
+    fail "$mode: $first is still in the machine group of $second after a split"
+  unchanged_by "splitting $first from the machine group of $second"
+  pass "$mode: joining, splitting and merging the machine groups of the two distributions changed neither distribution's devices and grants"
+}
+
+# Selecting the loopback network in each distribution's configuration is a document the daemon
+# reads when it starts, so the daemons that the first mode starts below have it.
+for distribution in "$first" "$second"; do
+  pairing_case "$distribution" prepare_the_network
+done
+
 for mode in $network_modes; do
   set_mode "$mode"
   networking_facts "$mode" "$first"
@@ -1852,6 +2041,7 @@ for mode in $network_modes; do
   # that decides whether any automatic behaviour is needed, rather than assuming one.
   refresh_and_check first "$first_id"
   pass "$mode: the process bridge opened and carried a read unchanged"
+  paired_endpoints "$mode"
 done
 
 # ---------------------------------------------------------------------------------------------
