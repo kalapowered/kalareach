@@ -85,7 +85,7 @@ impl Launch {
         within: Duration,
     ) -> Option<kr_ipc::endpoint::Connection> {
         self.runtime
-            .block_on(tokio::time::timeout(within, listener.listener.accept()))
+            .block_on(async { tokio::time::timeout(within, listener.listener.accept()).await })
             .ok()
             .map(|accepted| accepted.expect("the listener serves").0)
     }

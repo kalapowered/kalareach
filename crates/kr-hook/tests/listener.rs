@@ -265,6 +265,8 @@ async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused(
     let outcome = launched::outcome(&request);
     assert_eq!((outcome.code, outcome.stdout.as_slice()), (0, &b"{}\n"[..]));
     drop(launch);
+    // One placed program is held at a time, so this one is let go of before the next is placed.
+    drop(placed);
 
     let placed = Placed::new();
     let mut launch = launched::Launch::start(

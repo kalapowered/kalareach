@@ -43,6 +43,12 @@ pub const FIRST_START_WITHIN: Duration = Duration::from_secs(300);
 static HOLDING: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
+#[cfg(windows)]
+thread_local! {
+    /// Whether the test this thread runs holds a placed program already.
+    static HOLDING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The hold on [`HOLDING`] one [`Placed`] keeps for its life. It is nothing where programs placed
 /// in parallel delay nobody.
 pub struct Hold {
@@ -53,6 +59,11 @@ pub struct Hold {
 impl Hold {
     #[cfg(windows)]
     fn take() -> Self {
+        assert!(
+            !HOLDING_HERE.replace(true),
+            "this test holds a placed program already, and a second would wait for it for ever: \
+             drop the first before placing another"
+        );
         let (held, released) = &HOLDING;
         let mut held = held
             .lock()
@@ -75,6 +86,7 @@ impl Hold {
 #[cfg(windows)]
 impl Drop for Hold {
     fn drop(&mut self) {
+        HOLDING_HERE.set(false);
         let (held, released) = &HOLDING;
         *held
             .lock()
