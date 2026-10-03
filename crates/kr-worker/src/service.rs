@@ -232,6 +232,11 @@ pub struct WorkerService {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     replacement_pause: Mutex<Option<ArmedReplacement>>,
+    /// Whether the next delivery a connection starts is held back until a newer subscription
+    /// replaces it, which this host's own tests arm to have a delivery that has written nothing
+    /// replaced. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    hold_next_delivery: std::sync::atomic::AtomicBool,
     /// The method and parameters of every request and mutation this service has been sent, in
     /// the order they arrived, which this host's own tests read to count what a client asked for.
     /// A helper renewing one long poll sends requests that nothing outside the worker sees. It is
@@ -458,6 +463,8 @@ impl WorkerService {
             admission_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             replacement_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            hold_next_delivery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             received: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
@@ -838,6 +845,22 @@ impl WorkerService {
             release,
             replaced: replacement,
         }
+    }
+
+    /// Holds the next delivery a connection starts until a newer subscription replaces it, for this
+    /// host's own tests.
+    ///
+    /// A delivery begins as soon as the one it replaced has stopped, and nothing orders that
+    /// against the connection getting to the next request: a test cannot otherwise say that a
+    /// subscription was replaced before it wrote anything. A delivery held here does not begin
+    /// until the word that it was replaced has been given, so it finds that word and writes none of
+    /// its stream, and whatever is owed to it is settled as it is for a delivery that never began.
+    ///
+    /// The hold applies to one delivery, the next one a connection starts.
+    #[cfg(feature = "testing")]
+    pub fn hold_next_delivery_until_replaced(&self) {
+        self.hold_next_delivery
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Waits at the pause above, where one is armed, and returns what says the replacement has
@@ -1673,8 +1696,26 @@ impl WorkerService {
                     }
                     admitted
                 };
-                if still_admitted && start.send(()).is_ok() {
-                    state.delivery = Some(Delivery { task, replacement });
+                // The permit is sent now, or, where a test holds this delivery back, kept until the
+                // delivery is replaced.
+                #[cfg(feature = "testing")]
+                let (start, held_start) = if self
+                    .hold_next_delivery
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    (None, Some(start))
+                } else {
+                    (Some(start), None)
+                };
+                #[cfg(not(feature = "testing"))]
+                let start = Some(start);
+                if still_admitted && start.is_none_or(|start| start.send(()).is_ok()) {
+                    state.delivery = Some(Delivery {
+                        task,
+                        replacement,
+                        #[cfg(feature = "testing")]
+                        held_start,
+                    });
                 } else {
                     task.abort();
                 }
@@ -7152,6 +7193,10 @@ struct Delivery {
     task: tokio::task::JoinHandle<()>,
     /// Dropped when a newer subscription replaces this one.
     replacement: tokio::sync::oneshot::Sender<()>,
+    /// The permit a test held back from the task, sent once the task has been told it was
+    /// replaced. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    held_start: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Delivery {
@@ -7170,6 +7215,10 @@ impl Delivery {
                 .lock()
                 .expect("the connection writer is not poisoned");
             drop(self.replacement);
+        }
+        #[cfg(feature = "testing")]
+        if let Some(start) = self.held_start {
+            let _ = start.send(());
         }
         Predecessor(self.task)
     }

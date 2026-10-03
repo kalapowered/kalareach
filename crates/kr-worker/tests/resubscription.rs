@@ -621,6 +621,12 @@ async fn a_side_effect_of_several_frames_is_written_whole_when_it_is_replaced_pa
 /// part way through a frame; the second delivery is made to wait for it, and a third subscription
 /// replaces the second before it has written anything. A bell is rung in between, and is owed to
 /// the holder. Returns once the third subscription has begun.
+///
+/// The second delivery is held from the start, and begins only when the third subscription
+/// replaces it: it would otherwise begin as soon as the first delivery's frame is read, and
+/// nothing orders that against the connection answering the third subscription, so a delivery that
+/// is not replaced first writes its screen, its output and the bell it is owed, which is what a
+/// delivery that has begun is right to do.
 async fn replaced_before_it_wrote_anything(holder_dimensions: Dimensions) {
     let host = host().await;
     let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
@@ -650,7 +656,9 @@ async fn replaced_before_it_wrote_anything(holder_dimensions: Dimensions) {
     }
 
     // The second subscription is answered and the connection stops before it replaces the first.
+    // The delivery it starts is held until the third replaces it.
     let pause = host.service.pause_before_replacing_delivery();
+    host.service.hold_next_delivery_until_replaced();
     for (request, attachment) in [(REPLACING, holder), (REPLACING + 1, watcher)] {
         let params = ParamsValue::from_typed(&subscription(&host, attachment)).expect("encodes");
         client
