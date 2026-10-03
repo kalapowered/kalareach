@@ -1811,6 +1811,71 @@ async fn a_processor_without_an_instruction_set_the_process_uses_is_named_and_st
     environment.stop().await;
 }
 
+/// KR-REQ-22.01, KR-REQ-22.03: a host built for a target that no profile lists, such as Windows on
+/// Arm, offers no model and starts no process, and says that is why: setup, the refusal of a fetch
+/// and `kr doctor` each name the target as the reason, and `kr doctor` reports the check as not
+/// applicable rather than as a pause that resumes by itself. The session keeps its title.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_target_no_profile_lists_is_named_and_starts_no_process() {
+    let target = "aarch64-pc-windows-msvc";
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_for("x86_64-unknown-linux-gnu")),
+        machine: Some((target.to_owned(), Features::of([]))),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    until("the host tracks the session", || {
+        environment.figures().sessions >= 1
+    })
+    .await;
+
+    let shown = environment
+        .setup_until("the reason", |shown| shown.unavailable.0.is_some())
+        .await;
+    assert!(!shown.offered);
+    assert_eq!(shown.profile_id.0, None);
+    assert!(
+        shown
+            .unavailable
+            .0
+            .as_deref()
+            .is_some_and(|why| why.contains(target)),
+        "{:?}",
+        shown.unavailable
+    );
+
+    let refused = environment
+        .download_refused(DescriptionDownloadAction::Start)
+        .await;
+    assert!(refused.contains(target), "{refused}");
+
+    let check = environment.descriptions_check().await;
+    assert_eq!(
+        check.status,
+        kr_protocol::hostinfo::DoctorStatus::NotApplicable,
+        "{}",
+        check.detail()
+    );
+    assert!(
+        check.detail().contains("platform"),
+        "the check says why: {}",
+        check.detail()
+    );
+
+    let described = environment
+        .describe_until("the pause", session_id, |described| {
+            described.paused.0 == Some(DescriptionPause::NoModelHere)
+        })
+        .await;
+    assert_eq!(described.source, LabelSource::Metadata);
+
+    assert_eq!(environment.figures().started, 0, "no process was started");
+    assert_eq!(environment.stubs_started(), 0);
+    environment.stop().await;
+}
+
 /// KR-REQ-22.03: across a daemon replacement while the old description process still lives, a
 /// session described before it is shown as stale at once, and described again after it; the new
 /// process loads nothing until the old one has gone, so there is never a second mapping, and when
