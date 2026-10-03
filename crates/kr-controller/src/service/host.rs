@@ -344,6 +344,10 @@ impl Controller {
                 // once who it is, which is how the host registers an identity and the channel the
                 // helper holds there.
                 if cached.enrolment.access == kr_protocol::identity::EnvironmentAccess::SshHost {
+                    // The helper is run and waited for: a fence this host owes, or the registration
+                    // this was admitted under withdrawn, while the record's lock was waited for
+                    // stops it, as it stops the platform command and the bridge.
+                    self.check_registration(&carried)?;
                     return self
                         .register_ssh(actor, bridged, cached, approved, environment_id, now_ms)
                         .await;

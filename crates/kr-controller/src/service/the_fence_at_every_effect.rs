@@ -1591,3 +1591,62 @@ async fn a_refresh_refused_for_the_bridge_it_came_over_is_not_given_back_while_a
     controller.hold_fence(false);
     refused_for_the_bridge(&attempt(Arc::clone(&controller)).await);
 }
+
+/// KR-REQ-09.09, 09.12 and 26.16: a refresh of an ssh host asks its helper who it is by running
+/// ssh, and a fence this host owes stops that, as it stops the platform command and the bridge of
+/// the other access classes. The refusal is the fence's, and nothing is registered for the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_this_host_owes_stops_an_ssh_hosts_refresh_before_its_helper_is_run() {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+    };
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: None,
+    };
+    let mut enrolment = enrolment_of(3);
+    enrolment.access = EnvironmentAccess::SshHost;
+    enrolment.target = "build.example".to_owned();
+    let environment_id = enrolment.environment_id;
+    let actor = super::routes::local_actor(actor_id, connection_id, controller.generation);
+    controller
+        .environment_record(
+            &actor,
+            false,
+            &mutation_of(
+                &temp,
+                Method::EnvironmentEnrol,
+                ParamsValue::from_typed(&EnvironmentEnrolParams { enrolment }).expect("encodes"),
+            ),
+            Method::EnvironmentEnrol,
+            carried,
+        )
+        .await
+        .expect("the ssh host is enrolled");
+
+    controller.hold_fence(true);
+    let refused = controller
+        .environment_record(
+            &actor,
+            false,
+            &mutation_of(
+                &temp,
+                Method::EnvironmentRefresh,
+                ParamsValue::from_typed(&EnvironmentRefreshParams {
+                    environment_id,
+                    start: false,
+                })
+                .expect("encodes"),
+            ),
+            Method::EnvironmentRefresh,
+            carried,
+        )
+        .await
+        .expect_err("a refresh is stopped while a fence is owed");
+    refused_for_a_fence(&refused.to_protocol_error());
+}
