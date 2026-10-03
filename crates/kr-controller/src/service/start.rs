@@ -597,7 +597,7 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
-            before_the_environment_record: crate::attention::Pause::default(),
+            after_the_environment_record_is_taken: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             local_pace: std::sync::Mutex::new(super::local::LocalPace::default()),
             #[cfg(feature = "testing")]
