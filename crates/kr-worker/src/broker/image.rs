@@ -631,11 +631,13 @@ pub fn verify_image(
             Ok(())
         }
         Some(_) => Err(format!(
-            "process {} is not the program this launch was shown to be created from the hashed              file",
+            "process {} is not the program this launch was shown to be created from the hashed \
+             file",
             process.pid
         )),
         None => Err(format!(
-            "no program of this launch was shown to be created from the hashed file, so process              {} is not",
+            "no program of this launch was shown to be created from the hashed file, so process {} \
+             is not",
             process.pid
         )),
     }
