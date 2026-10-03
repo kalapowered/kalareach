@@ -30,18 +30,7 @@ use kr_describe::wire::{
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::{U64, Uuid};
 
-/// Where the benchmark keeps the weights on this platform, or where this run is told they are.
-fn cache_directory() -> Option<PathBuf> {
-    if let Some(given) = std::env::var_os("KR_DESCRIBE_MODEL_CACHE") {
-        return Some(PathBuf::from(given));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(if cfg!(target_os = "macos") {
-        home.join("Library/Caches/kalareach-describe")
-    } else {
-        home.join(".cache/kalareach-describe")
-    })
-}
+mod support;
 
 fn session(seed: u8) -> SessionId {
     SessionId::new(Uuid::from_bytes([seed; 16]))
@@ -95,27 +84,9 @@ struct Placed {
 }
 
 impl Placed {
-    /// Places the process and the weights, or says why this host cannot and returns nothing.
-    fn real_weights() -> Option<Self> {
-        let catalogue = Catalogue::builtin().expect("this build's profiles");
-        let profile = catalogue.default_profile().clone();
-        let weights = profile
-            .assets()
-            .iter()
-            .find(|asset| asset.role == "weights")
-            .expect("the profile names its weights")
-            .clone();
-        let Some(cached) = cache_directory().map(|cache| cache.join(&weights.file_name)) else {
-            eprintln!("the real-weights test did not run: this host has no home directory");
-            return None;
-        };
-        if std::fs::metadata(&cached).map(|about| about.len()).ok() != Some(weights.bytes) {
-            eprintln!(
-                "the real-weights test did not run: {} is not on this host",
-                cached.display()
-            );
-            return None;
-        }
+    /// Places the process and the weights, or says that `test` did not run and returns nothing.
+    fn real_weights(test: &str) -> Option<Self> {
+        let support::Weights { path: cached, .. } = support::weights(test)?;
         Some(Self::with_weights(|placed| {
             #[cfg(unix)]
             std::os::unix::fs::symlink(&cached, placed).expect("the weights");
@@ -177,7 +148,7 @@ impl Placed {
 /// a job it is told to cancel; the process is never ended to do any of it.
 #[test]
 fn the_description_process_runs_the_real_model() {
-    let Some(placed) = Placed::real_weights() else {
+    let Some(placed) = Placed::real_weights("the_description_process_runs_the_real_model") else {
         return;
     };
     let catalogue = Catalogue::builtin().expect("this build's profiles");
@@ -286,7 +257,8 @@ fn the_description_process_runs_the_real_model() {
 /// over its own pipes, as the daemon's driver speaks to it.
 #[test]
 fn the_real_model_stops_a_job_it_is_told_to_cancel() {
-    let Some(placed) = Placed::real_weights() else {
+    let Some(placed) = Placed::real_weights("the_real_model_stops_a_job_it_is_told_to_cancel")
+    else {
         return;
     };
     let mut child = Command::new(&placed.program)
