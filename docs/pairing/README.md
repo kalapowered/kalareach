@@ -15,13 +15,13 @@ the first 24 characters of the alphabet half again as likely as the rest and cos
 the entropy the bound below assumes.
 
 Six characters carry about 35.15 bits, so five guesses against the host succeed with probability at
-most `5 / 58^6`, about 1.3e-10 — and only because the PAKE prevents an offline guess. The locator
+most `5 / 58^6`, about 1.3e-10, and only because the PAKE prevents an offline guess. The locator
 adds no secret entropy, and the bound is per host, not an aggregate across clients.
 
 Parsing removes ASCII spaces and hyphens, preserves case and requires exactly ten valid characters.
-Case matters: folding it would throw away entropy. The six secret characters never enter a service
-request, a URL, a log or an analytics event; `ShortCode`, `CodeSecret`, `GeneratedCode` and
-`EnteredCode` all redact themselves in debug output and clear their buffers when dropped.
+Folding case would throw away entropy. The six secret characters never enter a service request, a
+URL, a log or an analytics event; `ShortCode`, `CodeSecret`, `GeneratedCode` and `EnteredCode` all
+redact themselves in debug output and clear their buffers when dropped.
 
 ### The exchange
 
@@ -56,7 +56,7 @@ that candidate and cancels the others before the host answers. Leaving it open u
 let a second candidate keep guessing against an invitation someone had already proved. Denial,
 expiry, cancellation and five failures each consume it; a new invitation needs another owner action.
 A host restart cancels every unfinished invitation, a locked one included, because a candidate's
-attempt state lives only in memory and nothing can resume it — consumed records and failure counts
+attempt state lives only in memory and nothing can resume it; consumed records and failure counts
 survive.
 
 Each candidate also has ten seconds to finish its handshake, and holding the invitation does not
@@ -226,7 +226,7 @@ for a confirmation of something that never needed one.
 The ceremony is platform code. What this crate checks is that the proof answers *that* challenge
 byte for byte, that the channel can carry a confirmation at all, that the challenge has not expired,
 that the signer is the enrolled one, and that the signature covers the request **and the channel**
-together — a channel beside an unsigned signature would be the signer's unauthenticated claim about
+together: a channel beside an unsigned signature would be the signer's unauthenticated claim about
 how the confirmation was obtained.
 
 A session, plugin or contact-tool channel is refused outright. The interactive controlling terminal
@@ -362,7 +362,7 @@ while the transport stays connected, and the bounded offline-validity policy an 
 Those are rules the control daemon implements and decides with `grants::decide`; a paired device's
 session request is decided at the network boundary, against the grant its pairing recorded.
 
-Two rules cross the boundary and are worth stating on both sides.
+Two rules cross the boundary and are stated on both sides.
 
 **Only the host issues revisions.** A revocation request carries none, and a host rejects a revision
 record that does not follow the one it last accepted. The daemon keeps the highest revision it has
@@ -371,9 +371,9 @@ withdrawn.
 
 **Owner confirmation is for persistent enlargement.** Both halves of that phrase are checked: the
 grant never expires, *and* no live grant the recipient already holds reaches everything it would.
-Comparing the rights by name alone would miss the case that matters most, where a device with a
-one-hour view of one session is handed a permanent view of every session. A bounded session
-invitation is not a persistent enlargement however wide it is.
+Comparing the rights by name alone would miss the most serious case, where a device with a one-hour
+view of one session is handed a permanent view of every session. A bounded session invitation is not
+a persistent enlargement however wide it is.
 
 Transfer of control is separate, because it changes who holds authority rather than adding to what
 somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, both
