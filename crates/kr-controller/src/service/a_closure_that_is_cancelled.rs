@@ -53,6 +53,35 @@ fn on_disk(world: &Silent) -> bool {
         > 0
 }
 
+/// Whether the closure has recorded and has done everything it does before the wait at `parked`,
+/// which is what makes that wait the one it is at: the worker is out of the directory before the
+/// wait for the connection table, and its connection is out of the table before the wait for the
+/// presentations. Read with `try_lock`, because this test may be holding a lock and another task of
+/// the daemon may be holding the one it asks for.
+fn reached(parked: Parked, world: &Silent) -> bool {
+    let out_of_the_directory = || {
+        world
+            .controller
+            .directory
+            .try_lock()
+            .is_ok_and(|directory| directory.get(world.session_id).is_none())
+    };
+    let out_of_the_table = || {
+        world
+            .controller
+            .connections
+            .try_lock()
+            .is_ok_and(|table| !table.contains_key(&world.session_id))
+    };
+    match parked {
+        // Nothing is recorded while the registry is held, and the test holds it for the whole case.
+        Parked::Registry => true,
+        Parked::Directory => on_disk(world),
+        Parked::Connections => on_disk(world) && out_of_the_directory(),
+        Parked::Presentations => on_disk(world) && out_of_the_directory() && out_of_the_table(),
+    }
+}
+
 /// How many times a test polls a closure that has not yet reached the lock it is held at before it
 /// calls that a failure: a bound on a count of polls, never a wait for a time to pass.
 const POLLS: usize = 10_000;
@@ -60,10 +89,8 @@ const POLLS: usize = 10_000;
 /// Records a closure and drops the future that records it while it waits at `parked`, and answers
 /// whether the closure was recorded and what the barrier says about the worker afterwards.
 ///
-/// The future is polled by hand until it has recorded the closure, and dropped at the wait it is
-/// then at: the lock the test holds, unless another task of the daemon holds a lock the closure
-/// needs for a moment, in which case it is an earlier wait after the record. Either way it is a wait
-/// between the record and what is done once the closure is out.
+/// The future is polled by hand until it has done everything it does before the wait at `parked`
+/// ([`reached`]), so it is at that wait and no earlier one, and then dropped.
 async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     let script = Scripted::new();
     let world = scripted(&script).await;
@@ -71,6 +98,11 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     let revision = world.controller.leases.authority_revision();
     // A round that began while the worker ran, which is what holds an ended worker for it to report.
     let round = world.controller.leases.begin_round();
+    // A link to the worker, so that its removal from the table is something to wait for.
+    world.controller.connections.lock().await.insert(
+        world.session_id,
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+    );
     let held: Box<dyn Send + '_> = match parked {
         Parked::Registry => Box::new(world.controller.registry.lock().await),
         Parked::Directory => Box::new(world.controller.directory.lock().await),
@@ -85,9 +117,7 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
             polled.is_pending(),
             "the closure waits at the {parked:?} lock the test holds"
         );
-        // Nothing is recorded while the registry is held, and it is held for the whole of this
-        // case, so the one poll is the whole of it.
-        if matches!(parked, Parked::Registry) || on_disk(&world) {
+        if reached(parked, &world) {
             break;
         }
         tokio::task::yield_now().await;
