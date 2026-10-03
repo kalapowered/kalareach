@@ -996,6 +996,7 @@ fn a_helper_exits_without_hanging_when_input_remains_open_after_refusal() {
 }
 
 /// The user this process runs as, by the account's own name.
+#[cfg(unix)]
 fn own_account() -> String {
     let named = Command::new("/usr/bin/id")
         .arg("-un")
@@ -1005,6 +1006,13 @@ fn own_account() -> String {
         .expect("a name")
         .trim()
         .to_owned()
+}
+
+/// The user this process runs as, as the helper names it where the system has no account database
+/// to ask, which a Windows host has not: by its number.
+#[cfg(not(unix))]
+fn own_account() -> String {
+    format!("uid {}", kr_ipc::paths::current_uid())
 }
 
 /// KR-REQ-03.14, 03.15: what the destination says it is, and where a session created through this
