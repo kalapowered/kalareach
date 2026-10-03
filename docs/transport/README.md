@@ -228,15 +228,15 @@ configuration the failure does not carry:
 
 The first bidirectional stream carries four frames, in this order:
 
-1. `ClientOffer` — offered protocol versions, build identity, device identity and key revision,
+1. `ClientOffer`: offered protocol versions, build identity, device identity and key revision,
    capabilities, the client's receive limits, and a fresh 256-bit client nonce.
-2. `HelloReply` — either `Selected(HostSelection)` carrying a fresh host nonce, the connection
+2. `HelloReply`: either `Selected(HostSelection)` carrying a fresh host nonce, the connection
    identity, the selected version, the selected capabilities, the negotiated limits, the host's
    endpoint and device identity and its boot and clock epochs; or `Refused(ProtocolError)`. A major
    mismatch is refused here with `UNSUPPORTED_SCHEMA`, before any session data.
-3. `ConnectProof` — the client's signature over
+3. `ConnectProof`: the client's signature over
    `CBOR(["kr-connect/1", offer, selection, client_endpoint_id, host_endpoint_id])`.
-4. `ConnectReply` — either `Accepted` with the host's proof over the same transcript and this
+4. `ConnectReply`: either `Accepted` with the host's proof over the same transcript and this
    connection's first action window, or `Refused`.
 
 A `Refused` reply, and an error answer on the unpaired pairing surface, reach the caller as
@@ -284,8 +284,8 @@ candidate-authenticated `pair.status`, and nothing else. The surface is narrow o
 What the transport hands the ceremony is `kr-pairing`'s own `LivePeer`: the endpoint identity iroh
 authenticated, and whether this step arrived as early data. Those are the two facts a pairing state
 machine cannot see for itself, and they are what it checks the authenticated bundle and the 0-RTT
-rule against. Everything else — the budgets, the phase rules, the PAKE, the transcripts and the
-owner confirmation — belongs to `kr-pairing`.
+rule against. Everything else (the budgets, the phase rules, the PAKE, the transcripts and the owner
+confirmation) belongs to `kr-pairing`.
 
 Three host-wide bounds sit above the per-connection ones, because a per-connection budget resets
 when a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
@@ -296,14 +296,14 @@ charged against the connection's budget, refused or not, and a connection that s
 budget is answered once and then ended.
 
 Pairing's own budgets, phase rules and proofs belong to the pairing crate, which implements the
-surface's trait. The transport is the door, not the ceremony behind it.
+surface's trait.
 
 ### 0-RTT
 
-Version 1 accepts no application mutation in QUIC 0-RTT — not just no pairing mutation. Three rules
-enforce it, and the order matters because the first one is what makes the others truthful. The first
-rule is also the one place the build does not reach the guarantee absolutely, and the residual case
-is named rather than glossed.
+Version 1 accepts no application mutation in QUIC 0-RTT, not just no pairing mutation. Three rules
+enforce it, and the order is not arbitrary, because the first one is what makes the others truthful.
+The first rule is also the one place the build does not reach the guarantee absolutely, and the
+residual case is named rather than glossed.
 
 * **The host asks whether a stream carried early data.** QUIC marks a stream as early data only when
   it is accepted while the handshake is still running, so the listener accepts the first
@@ -326,7 +326,7 @@ is named rather than glossed.
 * **The pairing surface refuses its own mutations in early data.** `pair.status` is a read and is
   served; `pair.redeem` and `pair.finish` are writes and are refused. Pairing is the one surface
   section 23 lets a 0-RTT connection reach at all, and within it everything that changes state is
-  closed — for every frame the first rule classified correctly.
+  closed, for every frame the first rule classified correctly.
 
 Authorisation could not complete in 0-RTT in any case: the proof covers the host's fresh challenge,
 which the client learns only after the handshake.
@@ -351,9 +351,9 @@ the bound is a property of the kind rather than of a frame.
 Each stream after the control stream begins with a bounded 1 KiB header naming its kind, the
 connection it belongs to, the event stream it corresponds to where one applies, and its authorised
 resource. The header is validated against the established control connection: a header naming
-another connection is refused, and so is one whose resource does not fit its kind — a terminal
-stream without a session and attachment, a semantic stream without a session, an attachment stream
-without a transfer.
+another connection is refused, and so is one whose resource does not fit its kind: a terminal stream
+without a session and attachment, a semantic stream without a session, an attachment stream without
+a transfer.
 
 The connection's own QUIC send window is 8 MiB, which is section 9's bounded send queue per peer
 enforced by the transport rather than only by the application's accounting. Inside that window the
@@ -475,7 +475,7 @@ a position until one is installed.
 
 Receipts are carried across, and so are the actions that were sent without any receipt arriving,
 which is the one case a receipt tracker cannot name. Each of those carries the intent it was
-submitted for — the method and the exact subject — so a person can be told which operation is
+submitted for (the method and the exact subject), so a person can be told which operation is
 uncertain rather than which identifier is. A client reports both as unresolved and asks the host
 what became of them; it never redispatches an action whose receipt is incomplete. It stops
 submitting once 1,024 actions are unresolved, because an unresolved action is never forgotten and a
@@ -500,9 +500,8 @@ A request names the grant it claims; it cannot name its own device, its ingress 
 that admitted it. A local caller carries no device identity: local IPC uses its authenticated OS
 caller and a host-stamped freshness context rather than pretending to be a paired device.
 
-Admission resolves the method against the registry first — an unlisted method, an unsupported
-version or a forbidden ingress is denied whatever rights the caller holds — and then applies the
-0-RTT rule.
+Admission resolves the method against the registry first (an unlisted method, an unsupported version
+or a forbidden ingress is denied whatever rights the caller holds) and then applies the 0-RTT rule.
 
 ## Action windows
 
@@ -528,8 +527,8 @@ source is, and on Linux that excludes suspended time, so a five-second lease wou
 suspension of any length; `SystemTime` keeps running across a suspension but can be stepped in
 either direction, so it can be stopped by anything that can step it.
 
-The default implementation therefore reads the operating system's own continuous clock —
-`CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time` on Apple platforms —
+The default implementation therefore reads the operating system's own continuous clock
+(`CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time` on Apple platforms),
 which is monotonic *and* includes suspended time. No arithmetic of ours stands between the kernel's
 answer and a deadline. On platforms the crate does not name it falls back to `Instant`, and whether
 that includes suspended time is the platform's answer rather than this crate's; a host there
@@ -626,15 +625,14 @@ neither suppresses anything: lateness cannot tell a busy neighbour from a slow p
 one-minute average carries the build that just finished.
 
 KR-PERF-005 is asserted where the host meets every condition it can be shown against, and recorded
-with the shortfall named where it does not. The reason is in the shape of the figure: it is a
+with the shortfall named where it does not. The reason lies in how the figure is built: it is a
 difference between two percentiles taken on the same host, so noise enters it twice and does not
 cancel. On a host the hypervisor kept taking the processor from, the figure alone cannot separate
 what the application added from what the host took. It does not follow that contention caused the
 whole difference, and nothing here claims it did: what a shortfall withdraws is the assertion, not
-the figure. Where a run cannot
-assert the target it prints its figure, names what was missing and asserts nothing about the
-number; the evidence for the target is then the reference-host run in the release acceptance
-record.
+the figure. Where a run cannot assert the target it prints its figure, names what was missing and
+asserts nothing about the number; the evidence for the target is then the reference-host run in the
+release acceptance record.
 
 KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host this
 has run on by three orders of magnitude, which is why it is asserted unconditionally: that is a
@@ -647,13 +645,14 @@ measuring an idle connection twice.
 ### The property behind the figure
 
 `crates/kr-transport/tests/priority.rs` holds what KR-PERF-005 is about, with nothing timed in it,
-so it is asserted on every run: optimised or not, shared runner or reference host. Three things.
-The one deadline in that file turns a peer that has stopped answering into a named failure instead
-of a job that runs until CI kills it, and it decides nothing about the property.
+so it is asserted on every run: optimised or not, shared runner or reference host. The one deadline
+in that file turns a peer that has stopped answering into a named failure instead of a job that runs
+until CI kills it, and it decides nothing about the property. What KR-PERF-005 is about is three
+things:
 
 **Admission.** At the connection's own default limits, a transfer holding every byte its ceiling
 allows still leaves the control reserve: one more transfer frame is refused, and a keystroke the
-size of the whole reserve is admitted. Exact arithmetic rather than a timing.
+size of the whole reserve is admitted. The check is exact arithmetic rather than a timing.
 
 **The priority the connection is using.** The connection's own control stream, the one the
 handshake opens and the receipts section 23 names travel on, is read back on both sides of it. So
@@ -688,8 +687,8 @@ about 2.4% of one core.
 Because that poll makes progress only when the peer reads, every caller bounds its own wait rather
 than relying on the pipe to end it: the worker's delivery ends on a withdrawal or a send deadline,
 the controller's attention delivery on its release ticket's own expiry. `FrameWriter::write_frame`,
-which waits with no bound of its own, is used only where the peer reads what it is sent — a control
-reply, a handshake, a request whose answer the peer awaits — and a path whose peer may stop reading
+which waits with no bound of its own, is used only where the peer reads what it is sent (a control
+reply, a handshake, a request whose answer the peer awaits) and a path whose peer may stop reading
 uses the checked writes under a deadline instead.
 
 ## Wiring a host
@@ -716,10 +715,10 @@ let listener = kr_transport::listener::register(config, identity, &transport_key
 
 `HostHandler` is the host's half: where a paired record comes from, what principal a device acts
 under, whether pairing is open, what to do with an authorised connection, and what to do when a
-control stream ends. Everything between an incoming QUIC connection and an authorised control
-stream — the handshake, the pairing surface, the keepalive, the window renewal and the revocation
-that follows a lost control stream — happens inside the call. A host that owns a qualified platform
-time adapter uses `register_with_clock` and supplies it.
+control stream ends. Everything between an incoming QUIC connection and an authorised control stream
+(the handshake, the pairing surface, the keepalive, the window renewal and the revocation that
+follows a lost control stream) happens inside the call. A host that owns a qualified platform time
+adapter uses `register_with_clock` and supplies it.
 
 ### How the control daemon keeps them
 
@@ -736,13 +735,13 @@ makes no call and serves its local endpoint alone.
 | `serve` | `net::dispatch`, one authorised connection at a time |
 | `control_stream_lost` | the connection's registration is withdrawn, which is what stops its lease being renewed |
 
-**Admission atomic with registration.** The daemon reads the device record and writes the
-connection into its authority store in one critical section, taking the registry lock and then the
-connection table — the order a revocation takes. The store is the same one its local callers are
-registered in, so a revocation fences both ingresses through one table, and every read, every
-subscription batch and every dispatch checks it. Revoking a device writes the record's revocation
-and advances the authority revision inside that one critical section too, so no connection can be
-admitted between the record being withdrawn and the revision that fences the live ones.
+**Admission atomic with registration.** The daemon reads the device record and writes the connection
+into its authority store in one critical section, taking the registry lock and then the connection
+table, the order a revocation takes. The store is the same one its local callers are registered in,
+so a revocation fences both ingresses through one table, and every read, every subscription batch
+and every dispatch checks it. Revoking a device writes the record's revocation and advances the
+authority revision inside that one critical section too, so no connection can be admitted between
+the record being withdrawn and the revision that fences the live ones.
 
 **Work that must complete.** A mutation's effect runs on its own task, and the release of what a
 connection owned at its worker runs on another, after the handler has been dropped.

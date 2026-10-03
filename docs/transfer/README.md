@@ -17,8 +17,8 @@ upload.begin ─▶ upload.chunk ─▶ upload.finish ─▶ attachment handle
        └─────────────┴── upload.status ─── resume, or resolve a lost reply
 ```
 
-There are four stages and four records. Transfer moves bytes. Storage publishes them as an
-attachment. Insertion offers that attachment to an agent through its adapter. Submission is a
+There are four stages and four records: transfer moves bytes, storage publishes them as an
+attachment, insertion offers that attachment to an agent through its adapter, and submission is a
 further action again. A failed insertion loses none of the three stages before it.
 
 ## The seven methods
@@ -277,7 +277,7 @@ Section 14 paragraph 5 asks for opened directory and object handles rather than 
 strings, and that is what `AuthorisedDirectory` is: an open directory descriptor, with every
 descendant opened relative to it, one component at a time.
 
-The no-escape policy, qualified:
+The no-escape policy is qualified as follows:
 
 - A name is relative in this crate's accepted form. No root, no drive prefix, no `..`, no `.`, no
   empty component, no NUL or other control byte, no separator other than `/`, none of the
@@ -311,7 +311,7 @@ which resolves a whole accumulated path in one syscall, component-wise `openat` 
 beneath the same start directory on other Unix systems, and relative `NtCreateFile` opens on
 Windows. This crate is the policy, not the syscalls.
 
-One thing the delegation does not cover. `cap-std`'s Windows no-follow test recognises
+There is one thing the delegation does not cover. `cap-std`'s Windows no-follow test recognises
 name-surrogate reparse tags, which covers junctions and symbolic links and not every reparse point,
 so this crate reads `FILE_ATTRIBUTE_REPARSE_POINT` from each opened handle itself and refuses any
 tag.
@@ -367,9 +367,9 @@ current entries; writing the destination's would put a second copy of them on th
 Where the two differ, the published file carries what the directory says today rather than what the
 destination picked up wherever it was made.
 
-Five things this host states rather than hides on Windows. An audit list is not carried: reading one
-needs `SeSecurityPrivilege`, which this service neither holds nor asks for, so a read asks for the
-owner and the discretionary list alone. Giving an object to another account needs
+On Windows this host states five things rather than hiding them. An audit list is not carried:
+reading one needs `SeSecurityPrivilege`, which this service neither holds nor asks for, so a read
+asks for the owner and the discretionary list alone. Giving an object to another account needs
 `SeRestorePrivilege`, which it does not hold either, so a destination belonging to another account
 is left exactly as it was. An object reporting no list at all grants every account full access, and
 that is not something a replacement can reproduce by writing entries, so such a destination is left
@@ -410,7 +410,7 @@ on a filesystem without one coordinates with the writer or copies the file itsel
 
 ### What this does not promise
 
-Three residuals, stated rather than implied.
+Three residuals follow, stated rather than implied.
 
 Handle-based resolution removes path-resolution races. It does not make an authorised file private
 from another process running as the same operating-system user: such a process can open and write a

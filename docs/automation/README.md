@@ -342,14 +342,14 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
 
 ## The event stream and its consumers
 
-The journal commits a small event with every transition that matters outside it, in the same
-transaction as the transition: an accepted trigger and the run it started, a node's settled
+The journal commits a small event with every transition a consumer outside it has to know about, in
+the same transaction as the transition: an accepted trigger and the run it started, a node's settled
 outcome, a run's stop (completed, failed, paused or cancelled), an exhausted chain, and a workflow
-paused by one of its own limits or enabled again. Every event carries an envelope: the subsystem
-it comes from (`automation`), the verified actor whose action caused it or `host` for the host's
-own transitions, and its content class (`identifiers`). Inside, it carries the identifiers a
-consumer needs, the run's causal root, generation, depth and parent, and nothing a node produced:
-no output, no terminal text.
+paused by one of its own limits or enabled again. Every event carries an envelope: the subsystem it
+comes from (`automation`), the verified actor whose action caused it or `host` for the host's own
+transitions, and its content class (`identifiers`). Inside, it carries the identifiers a consumer
+needs, the run's causal root, generation, depth and parent, and nothing a node produced: no output,
+no terminal text.
 
 The contract with every consumer:
 
