@@ -198,8 +198,16 @@ struct Backend {
     /// Why a bridge of this instance was refused for the image its process runs, once one was:
     /// every later bridge is refused too.
     image_refused: Mutex<Option<String>>,
-    /// The executables already shown to hold the digest that was hashed.
+    /// The executables already shown to hold the digest that was hashed, or, on Windows, the one
+    /// process shown to have been created from it.
     image_verified: crate::broker::image::VerifiedFiles,
+    /// The file the program was read through, opened for readers only and kept until the process
+    /// made from it has been shown to be created from it.
+    ///
+    /// While it is held nothing can rename, delete, write or copy over the file, so the path the
+    /// launcher runs is the file that was hashed. It is given up when the verdict is taken.
+    #[cfg(windows)]
+    held_image: Arc<Mutex<Option<std::fs::File>>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -888,6 +896,8 @@ impl CommandBackends {
             image_refused: Mutex::new(None),
             announced: Mutex::new(Announced::default()),
             image_verified: crate::broker::image::VerifiedFiles::default(),
+            #[cfg(windows)]
+            held_image: Arc::new(Mutex::new(None)),
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             os_user: self.os_user.clone(),
@@ -906,6 +916,8 @@ impl CommandBackends {
             let hashed = Arc::clone(&self.hashed);
             let connector = Arc::clone(&backend.connector);
             let stopped = Arc::clone(&backend.stopped);
+            #[cfg(windows)]
+            let holding = Arc::clone(&backend.held_image);
             let granted = Arc::clone(&backend.host_directory);
             let cwd = reads_files.then(|| PathBuf::from(request.cwd));
             let environment_id = self.environment_id;
@@ -935,13 +947,24 @@ impl CommandBackends {
                         let _ = granted.set(opened);
                     }
                 }
-                let read =
-                    crate::broker::image::read_identity(&path, &hashed, &stopped).map(|hashed| {
+                let read = crate::broker::image::read_holding(&path, &hashed, &stopped).map(
+                    |(hashed, held)| {
+                        // Kept where the launch can be held to it; elsewhere the file is let go
+                        // as soon as it has been read.
+                        #[cfg(windows)]
+                        {
+                            *holding
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(held);
+                        }
+                        #[cfg(not(windows))]
+                        drop(held);
                         let version = connector
                             .qualified_version(&hashed.digest)
                             .map(str::to_owned);
                         ExecutableIdentity { hashed, version }
-                    });
+                    },
+                );
                 let _ = identity_sender.send(Some(read));
             })
         };
@@ -1308,6 +1331,30 @@ fn verify(backend: &Backend, registration: &Registration) -> std::result::Result
     verified
 }
 
+/// Reads the identity of the file a launch presented as its executable.
+///
+/// A path is read where a path is all there is. Windows holds the file this backend hashed, and the
+/// file the path names cannot have moved while it is held, so the identity is the held file's own.
+#[cfg(not(windows))]
+fn presented_identity(_backend: &Backend, executable: &str) -> std::io::Result<FileIdentity> {
+    std::fs::metadata(executable).map(|metadata| FileIdentity::of(&metadata))
+}
+
+/// Reads the identity of the file a launch presented as its executable, through the file this
+/// backend holds, which cannot have been renamed, replaced or written since it was hashed.
+#[cfg(windows)]
+fn presented_identity(backend: &Backend, _executable: &str) -> std::io::Result<FileIdentity> {
+    let held = backend
+        .held_image
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.as_ref()
+        .ok_or_else(|| {
+            std::io::Error::other("the file this backend was established for is not held")
+        })
+        .and_then(FileIdentity::of_file)
+}
+
 /// Answers one launch that presented itself: admitted, or closed without a word.
 async fn admit_launch(
     backend: &Arc<Backend>,
@@ -1363,11 +1410,9 @@ async fn admit_launch(
         .identity(IDENTITY_WAIT)
         .await
         .map_err(BrokerError::denied)?;
-    let presented_file = std::fs::metadata(&launch.executable)
-        .map(|metadata| FileIdentity::of(&metadata))
-        .map_err(|error| {
-            BrokerError::denied(format!("the executable presented cannot be read: {error}"))
-        })?;
+    let presented_file = presented_identity(backend, &launch.executable).map_err(|error| {
+        BrokerError::denied(format!("the executable presented cannot be read: {error}"))
+    })?;
     if launch.executable != backend.invocation.executable || presented_file != identity.hashed.file
     {
         return Err(BrokerError::denied(
