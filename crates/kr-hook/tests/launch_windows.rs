@@ -14,7 +14,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole; a launch the backend refuses or does not commit, one a launcher declines, one whose launcher goes before it is confirmed and one that is never started leave nothing running |
+//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole, whether the launch was committed or the program ran as typed; a launch the backend refuses or does not commit, one a launcher declines, one whose launcher goes before the program is shown and one before it is confirmed, and one that is never started leave nothing running; a program that was started outlives the launcher |
 //! | KR-REQ-12.07 | a refused invocation runs as typed |
 //! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; the hold on the hashed file ends with the commit; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
 //! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
@@ -1010,6 +1010,7 @@ fn kr_req_12_02_a_program_that_is_started_outlives_the_launcher_that_started_it(
     let answer = shell.establish();
     let gone = shell.reports.join("launcher.gone");
     let survived = shell.reports.join("survived");
+    let started = shell.backends.notify_when_started();
     let mut launcher = shell.launch(
         &answer,
         "outlives",
@@ -1020,8 +1021,13 @@ fn kr_req_12_02_a_program_that_is_started_outlives_the_launcher_that_started_it(
     );
     let report = shell.report_from("outlives", &mut launcher);
     assert_eq!(report["relaunch"], "true", "the launch was committed");
-    // The launcher lets the program's job go before it starts the program, so a program that has
-    // reported is one the launcher's end no longer ends.
+    // The launch is complete once the worker has read that the launcher started the program. A
+    // launcher ended before that is one whose program the worker ends, which is another case.
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, started).await })
+        .expect("the launcher says it started the program")
+        .expect("and the worker reads it");
     launcher.kill().expect("the launcher is ended");
     let _ = launcher.wait();
     std::fs::write(&gone, b"gone").expect("the program is told the launcher is gone");

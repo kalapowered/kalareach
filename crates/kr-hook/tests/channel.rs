@@ -304,6 +304,15 @@ async fn a_launch_that_goes_ends_the_channel_it_started() {
     let application =
         process_start_identity(launch.application.id()).expect("the application is running");
     let input = launch.requests.take();
+    // The control of the check `a_launch_that_goes_at_once_leaves_nothing_it_started` makes on
+    // Windows: while the channel runs, the system's list of the processes that run this forwarder
+    // names it.
+    #[cfg(windows)]
+    assert!(
+        running_forwarders(&placed.forwarder)
+            .contains(&u32::try_from(channel.pid.get()).expect("a process identifier")),
+        "the check finds the channel while it runs"
+    );
 
     drop(launch);
     gone(&application, "the application").await;
@@ -436,6 +445,38 @@ async fn nothing_left(application: u32, forwarder: &std::path::Path) {
     }
 }
 
+/// The processes that run the forwarder `forwarder` names, as the system lists them by the file each
+/// runs.
+///
+/// The path is compared as the system writes it, which is the full one: a temporary directory's
+/// short names are expanded first.
+#[cfg(windows)]
+fn running_forwarders(forwarder: &std::path::Path) -> Vec<u32> {
+    let full = std::fs::canonicalize(forwarder).expect("the forwarder's full path");
+    let full = full.to_string_lossy();
+    let listed = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Process -Name kr-hook -ErrorAction SilentlyContinue | \
+             Where-Object { $_.Path -eq $env:KR_FORWARDER } | \
+             ForEach-Object { $_.Id }; exit 0",
+        ])
+        .env("KR_FORWARDER", full.strip_prefix(r"\\?\").unwrap_or(&full))
+        .output()
+        .expect("powershell runs");
+    assert!(
+        listed.status.success(),
+        "the processes are listed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .map(|id| id.parse().expect("a process identifier"))
+        .collect()
+}
+
 /// Waits, within the liveness bound, until no process runs the forwarder `forwarder` names.
 ///
 /// A launch on Windows holds what it starts in a job, which its launch has ended and found empty
@@ -445,30 +486,13 @@ async fn nothing_left(application: u32, forwarder: &std::path::Path) {
 async fn nothing_left(_application: u32, forwarder: &std::path::Path) {
     let deadline = std::time::Instant::now() + LIVENESS;
     loop {
-        let listed = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-Process -Name kr-hook -ErrorAction SilentlyContinue | \
-                 Where-Object { $_.Path -eq $env:KR_FORWARDER } | \
-                 ForEach-Object { $_.Id }; exit 0",
-            ])
-            .env("KR_FORWARDER", forwarder)
-            .output()
-            .expect("powershell runs");
-        assert!(
-            listed.status.success(),
-            "the processes are listed: {}",
-            String::from_utf8_lossy(&listed.stderr)
-        );
-        let running = String::from_utf8_lossy(&listed.stdout).trim().to_owned();
+        let running = running_forwarders(forwarder);
         if running.is_empty() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "running the forwarder: [{running}]"
+            "running the forwarder: {running:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
