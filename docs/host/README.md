@@ -1557,16 +1557,18 @@ no right inside it, and the keys, grants and session identifiers a standalone di
 had are kept. Every row in a grouped listing names its own environment, and none of them is this
 host's.
 
-A distribution whose configuration selects the network has an endpoint of its own on it, so pairing
-a device with that distribution pairs it with no other. Another distribution holds no record of the
-device and ends its connection. The networking mode does not change that, because the distributions
-share one loopback: the check is about the endpoints and not about the bridge. Machine groups follow
-the same rule. Joining, splitting or merging the groups of two distributions changes the record each
-environment keeps of its own group, and the receipt of the step, and nothing else. The devices each
-distribution lists and the grants it lists stay as they were, and each device still reaches only the
-distribution it was paired with. The acceptance checks this inside two distributions, once in each
-networking mode: it pairs a viewer with each one through that distribution's own owner, connects
-each viewer to both, and takes the group steps from Windows over the process bridge.
+A distribution whose configuration selects the network has an endpoint of its own on it, and each
+installation keeps its own keys and records, so pairing a device with that distribution pairs it
+with no other. Unless the device was also paired with another distribution, that distribution holds
+no record of it and ends its connection. The networking mode does not change this. The distributions
+share one loopback in both modes, so the check is about the endpoints and not about the bridge.
+Machine groups follow the same rule. Joining, splitting or merging the groups of two distributions
+changes the record each environment keeps of its own group, and the receipt of the step, and nothing
+else. The devices each distribution lists and the grants it lists stay as they were, and each device
+still reaches only the distribution it was paired with. The acceptance checks this inside two
+distributions, once in each networking mode: it pairs a viewer with each one through that
+distribution's own owner, connects each viewer to both, and takes the group steps from Windows over
+the process bridge.
 
 ### The two networking modes, and what they change
 
@@ -1591,13 +1593,12 @@ a remote client connects to that environment's own paired endpoint.
 distributions, each with its own daemon, worker, Linux paths and process identifiers; argument
 vectors across `wsl.exe --exec`; the bridge from Windows to each; the cached listing of a stopped
 distribution; and the bridge in NAT and in mirrored networking, with a viewer paired with each
-distribution's own endpoint in each mode. With only one distribution
-registered, it makes a second by exporting and importing the first, removes the installation the
-copy inherited before anything starts in it, and removes the copy at the end. In each distribution
-it keeps, the pairing leaves the loopback network selected, the installation's first owner, and
-one viewer for each mode. A prerequisite it
-cannot meet is a failure, because a run that could not establish these results has not established
-them.
+distribution's own endpoint in each mode. With only one distribution registered, it makes a second
+by exporting and importing the first, removes the installation the copy inherited before anything
+starts in it, and removes the copy at the end. In each distribution it keeps, the pairing leaves the
+loopback network selected, the installation's first owner, and one viewer for each mode. A
+prerequisite it cannot meet is a failure, because a run that could not establish these results has
+not established them.
 
 The acceptance also runs on a GitHub-hosted Windows runner. `.github/workflows/wsl-acceptance.yml`
 builds the Linux set on Ubuntu 24.04, whose C library matches the Ubuntu 24.04 root file system it

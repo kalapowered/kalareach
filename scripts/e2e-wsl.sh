@@ -45,7 +45,8 @@
 # viewer's keys under ~/.local/state/kr-acc-pairing of the Linux user, which is how a later run
 # pairs through the owner an earlier one made. A distribution whose installation already has an
 # owner this acceptance did not make fails at its first pairing, and says so. The machine groups
-# end as they began, each environment in a group of its own, under new identifiers.
+# end apart, each environment in a group of its own under a new identifier; a run that finds the
+# two in one group separates them first.
 #
 # Knobs, all optional:
 #   KR_WSL_HELPER     absolute path of the helper inside a distribution (default /usr/local/bin/kr)
@@ -1154,12 +1155,27 @@ groups_changed=0
 cleanup() {
   local status=$?
   # A run that stops between a join and the split that undoes it leaves two environments in one
-  # machine group, which the next run would refuse to start from. The Windows daemon and the
-  # distributions are still up here, so they are put back first; a failure to do so is said, and
-  # does not stop the rest of the cleanup.
+  # machine group. The next run separates them first, but a pair left joined is a change this run
+  # made and did not undo, so it is undone here. The Windows daemon and the distributions are still
+  # up, so it comes first. It runs in a subshell of its own, so that a failure in it ends only it,
+  # and it is given five minutes: a daemon that answers nothing must not keep the rest of the
+  # cleanup from removing what this run made. What it has not finished then ends with the Windows
+  # daemon below.
   if [ "$groups_changed" = "1" ] && [ -n "$windows_daemon" ]; then
     echo "putting the two environments back in groups of their own"
-    (separate_groups) || echo "the two environments could not be put back in groups of their own"
+    (separate_groups) &
+    restoring=$!
+    waited=0
+    while kill -0 "$restoring" 2>/dev/null && [ "$waited" -lt 300 ]; do
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if kill -0 "$restoring" 2>/dev/null; then
+      kill "$restoring" 2>/dev/null || true
+      echo "the two environments were not put back in groups of their own within five minutes"
+    elif ! wait "$restoring"; then
+      echo "the two environments could not be put back in groups of their own"
+    fi
   fi
   if [ -n "$windows_daemon" ]; then
     kill "$windows_daemon" 2>/dev/null || true
@@ -1975,6 +1991,7 @@ separate_groups() {
   together="$group_id"
   group_of second
   if [ "$group_id" = "$together" ]; then
+    echo "  the two environments are in one machine group: separating them"
     machine_step second split --expect "$group_id@$group_revision"
   fi
 }
@@ -2017,7 +2034,16 @@ paired_endpoints() {
   viewers_reach_only_their_own
   held_in_both
   # A pairing made here is a pairing here: the other distribution holds no record of this viewer,
-  # by its identity or by its keys.
+  # by its identity or by its keys. The search can only find a record that the report carries, so
+  # each report is first shown to carry its own viewer's.
+  case "$first_held" in
+    *"$first_device"*"$first_transport"* | *"$first_transport"*"$first_device"*) : ;;
+    *) fail "$mode: $first's report holds no record of the viewer paired with it: $first_held" ;;
+  esac
+  case "$second_held" in
+    *"$second_device"*"$second_transport"* | *"$second_transport"*"$second_device"*) : ;;
+    *) fail "$mode: $second's report holds no record of the viewer paired with it: $second_held" ;;
+  esac
   case "$second_held" in
     *"$first_device"* | *"$first_transport"*) fail "$mode: $second holds a record of the viewer paired with $first" ;;
   esac
