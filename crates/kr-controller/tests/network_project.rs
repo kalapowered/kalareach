@@ -2848,6 +2848,7 @@ async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
             held.device_id,
             kr_protocol::scalars::NotificationPreviewKey::from_bytes([0x9c; 32]),
             kr_protocol::ids::DeviceKeyRevision::new(held.device_key_revision.get() + 1),
+            || Ok(()),
         )
         .expect("the device rotates its preview key");
     assert!(matches!(
@@ -2937,6 +2938,7 @@ async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_hold
             held.device_id,
             kr_protocol::scalars::NotificationPreviewKey::from_bytes([0x9d; 32]),
             kr_protocol::ids::DeviceKeyRevision::new(held.device_key_revision.get() + 1),
+            || Ok(()),
         )
         .expect("the device rotates its preview key");
     assert!(matches!(
