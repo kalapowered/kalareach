@@ -513,6 +513,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test agent_service
 
+      # What a process the worker starts holds of the worker's own handles. A launch's agent holds
+      # the handles it lists and no other; a launch and every other start the worker makes (the
+      # desktop reading, the time reading) take one lock, so none starts in the window in which a
+      # launch's pipe ends are inheritable and holds one open after the agent has let go.
+      - name: Test which handles a started process holds
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test windows_inheritance
+
       # An integrated invocation's launcher against the worker's own command backends, on this
       # platform's pipe. The launcher creates its program suspended and the backend names that
       # program and not the launcher: it is the launcher's child, started after the backend was
