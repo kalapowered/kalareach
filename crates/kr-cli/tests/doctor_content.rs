@@ -604,23 +604,36 @@ async fn the_doctor_says_where_a_sessions_environment_came_from() {
         line.contains("path=host_context") && line.contains("directory=create_request"),
         "{line}"
     );
-    // Closed words and the session's number, and nothing else on the line.
+    // The session's number and closed words, and nothing else on the line.
+    let sources = [
+        "creator_snapshot",
+        "host_context",
+        "configured_addition",
+        "execution_context",
+        "unset",
+    ];
     let words: Vec<&str> = line.split(' ').collect();
     assert_eq!(words.len(), 6, "{line}");
     assert!(
-        words[1].trim_end_matches(':').parse::<u64>().is_ok()
-            && words[2] == "environment"
-            && ["path", "locale", "directory"]
-                .iter()
-                .zip(&words[3..])
-                .all(
-                    |(key, pair)| pair.strip_prefix(&format!("{key}=")).is_some_and(|word| {
-                        word.chars()
-                            .all(|letter| letter.is_ascii_lowercase() || letter == '_')
-                    })
-                ),
+        words[1].trim_end_matches(':').parse::<u64>().is_ok() && words[2] == "environment",
         "{line}"
     );
+    for (key, allowed) in [
+        ("path", &sources[..]),
+        ("locale", &sources[..]),
+        ("directory", &["create_request", "worker_default"][..]),
+    ] {
+        assert!(
+            words[3..]
+                .iter()
+                .filter_map(|pair| pair.strip_prefix(&format!("{key}=")))
+                .all(|word| allowed.contains(&word))
+                && words[3..]
+                    .iter()
+                    .any(|pair| pair.starts_with(&format!("{key}="))),
+            "{key} in {line}"
+        );
+    }
     let (_, document) = host.json(&["doctor"]);
     let reported = &document["session_environments"];
     assert_eq!(reported["read"], Value::Bool(true), "{document}");

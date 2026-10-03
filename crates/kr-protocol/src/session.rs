@@ -738,8 +738,9 @@ pub struct SessionEnvironmentSources {
     /// only where a program there does; this is not the culture a PowerShell session has.
     pub locale: EnvironmentSource,
     /// Where the directory the shell was asked to start in came from. A directory the request
-    /// names that is not one is replaced by the home directory where the shell is launched, and
-    /// this still says the request named it.
+    /// names that is not one cannot be used as it is: the launch library starts the shell
+    /// elsewhere or the launch fails, depending on the platform, and this still says the request
+    /// named it.
     pub cwd: WorkingDirectorySource,
 }
 
