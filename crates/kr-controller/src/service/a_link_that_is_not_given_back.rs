@@ -57,6 +57,14 @@ impl Heard {
 fn stalling(
     heard: Arc<Heard>,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
+    stalling_with(heard, |_| None)
+}
+
+/// [`stalling`], except that it answers what `reply` has an answer for.
+fn stalling_with(
+    heard: Arc<Heard>,
+    reply: impl Fn(&ControlFrame) -> Option<ControlFrame> + Clone + Send + 'static,
+) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
     move |listener, identity, endpoint_text| {
         tokio::spawn(async move {
             loop {
@@ -67,6 +75,7 @@ fn stalling(
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
                 let heard = Arc::clone(&heard);
+                let reply = reply.clone();
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -87,11 +96,19 @@ fn stalling(
                                     }
                                 }
                             }
-                            None => heard
-                                .frames
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(frame),
+                            None => {
+                                let answer = reply(&frame);
+                                heard
+                                    .frames
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(frame);
+                                if let Some(answer) = answer
+                                    && writer.write_message(&answer).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                 });
@@ -439,6 +456,46 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
         slot_holds_a_link(controller, silent.session_id).await,
         "the link is kept for the next caller"
     );
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a worker's refusal of the connection itself, because it no longer speaks for the
+/// generation that holds the worker, is a complete answer and still a failure of the link: the link
+/// is closed and not put back, and the lease stops renewing, where an ordinary refusal
+/// ([`a_refusal_the_worker_gives_leaves_its_link_and_the_lease`]) leaves both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_of_the_link_itself_gives_up_its_link_and_the_lease() {
+    let heard = Arc::new(Heard::default());
+    let silent = world::fake_world(stalling_with(Arc::clone(&heard), |frame| match frame {
+        ControlFrame::Request(request) => {
+            Some(ControlFrame::Response(kr_protocol::envelope::Response {
+                request_id: request.request_id,
+                outcome: kr_protocol::envelope::Outcome::Error(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::PermissionDenied,
+                        "a later controller connection holds this environment's authority",
+                    )
+                    .for_a_fenced_link(),
+                ),
+            }))
+        }
+        _ => None,
+    }))
+    .await;
+    world::acknowledged(&silent.controller, silent.session_id);
+    let controller = &silent.controller;
+    assert!(leases(controller, silent.session_id), "the lease renews");
+
+    let refused = controller
+        .read_from_worker(&silent.worker)
+        .await
+        .expect_err("the worker refuses the link");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+    the_link_was_given_up(&silent, &heard, 1).await;
     silent.serving.abort();
 }
 
