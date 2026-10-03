@@ -258,8 +258,19 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# The host hashes every program it launches before it admits the launch, under a deadline set for an
-# optimised hash, and a debug build hashes about seventeen times slower than that. The package that
-# does the hashing is optimised in debug and test builds too; the rest of them are not.
+# Digests and compression run over whole files in debug and test builds, where they are slow. The
+# host hashes every program it launches before it admits the launch, under a deadline set for an
+# optimised hash, and a debug build hashes about seventeen times slower than that. The update tests
+# hash, pack and unpack whole release trees of debug programs, hundreds of megabytes each, and the
+# digest, the compressor and its checksum are the larger part of what they spend on a release. So
+# these three packages are optimised in debug and test builds too; the rest of them are not. The
+# compressor and checksum entries are for flate2's Rust backend, which is the one `kr` and the tests
+# use.
 [profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
 opt-level = 3
