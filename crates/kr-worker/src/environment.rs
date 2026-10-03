@@ -378,10 +378,13 @@ pub fn build(
 
     // Read as the shell is given them: in the order of their names, where a platform that
     // compares names without regard to case takes the later of two spellings of one name.
-    let supplied: BTreeMap<String, (EnvironmentSource, bool)> = supplied
-        .into_iter()
-        .map(|(name, supplier)| (platform_variable_name(&name), supplier))
-        .collect();
+    let supplied = {
+        let mut folded: BTreeMap<String, (EnvironmentSource, bool)> = BTreeMap::new();
+        for (name, supplier) in supplied {
+            folded.insert(platform_variable_name(&name), supplier);
+        }
+        folded
+    };
 
     // The worker owns these outright. They are the session's declared identity, and changing them
     // is the intentional part of the policy rather than an oversight.

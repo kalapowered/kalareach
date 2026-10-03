@@ -31985,7 +31985,7 @@
       "properties": {
         "cwd": {
           "$ref": "#/$defs/WorkingDirectorySource",
-          "description": "Where the directory the shell was asked to start in came from. A directory the request\nnames that is not one is replaced by the home directory where the shell is launched, and\nthis still says the request named it."
+          "description": "Where the directory the shell was asked to start in came from. A directory the request\nnames that is not one cannot be used as it is: the launch library starts the shell\nelsewhere or the launch fails, depending on the platform, and this still says the request\nnamed it."
         },
         "locale": {
           "$ref": "#/$defs/EnvironmentSource",
