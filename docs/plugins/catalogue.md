@@ -118,7 +118,7 @@ has, which is the difference between a repository going quiet and a host breakin
 
 ## When a payload is fetched
 
-Three reasons, and no others:
+A payload is fetched for three reasons, and no others:
 
 - an explicit install;
 - an explicit enable;
