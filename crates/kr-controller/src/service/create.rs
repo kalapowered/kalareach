@@ -112,11 +112,7 @@ pub(super) fn host_context_variables(
 ) -> Vec<EnvironmentVariable> {
     let mut taken: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (name, value) in environment {
-        let name = if cfg!(windows) {
-            name.to_ascii_uppercase()
-        } else {
-            name
-        };
+        let name = kr_protocol::hostinfo::configuration::platform_variable_name(&name);
         if HOST_CONTEXT_NAMES.contains(&name.as_str()) || name.starts_with(LOCALE_PREFIX) {
             taken.insert(name, value);
         }
