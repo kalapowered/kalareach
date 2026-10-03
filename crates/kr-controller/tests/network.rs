@@ -4085,8 +4085,12 @@ async fn each_session_method_needs_its_own_right_at_both_doors() {
         assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     }
 
-    // Creating is the create's right.
-    let parameters = create_params(environment_id, host.tree().root());
+    // Creating is the create's right. A paired device's own environment is never the session's, so
+    // its create sends none.
+    let parameters = SessionCreateParams {
+        environment_snapshot: Vec::new(),
+        ..create_params(environment_id, host.tree().root())
+    };
     for other in [&viewer, &closer] {
         let refused = other
             .mutate(
