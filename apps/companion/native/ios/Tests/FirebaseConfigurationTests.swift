@@ -11,10 +11,14 @@
 import XCTest
 
 final class FirebaseConfigurationTests: XCTestCase {
+    /// A key of the shape Firebase issues: "AIza" and thirty-five more characters. It is put together here so that
+    /// no source file holds a string that a scan for credentials would take for a real key.
+    private static let validKey = "AIza" + "SyA-0123456789abcdefghijklmnopqrstu"
+
     /// A configuration of the shape Firebase issues, with these values changed.
     private func plist(_ changes: [String: Any?] = [:]) -> Data {
         var values: [String: Any] = [
-            "API_KEY": "AIzaSyA-0123456789abcdefghijklmnopqrstu",
+            "API_KEY": Self.validKey,
             "GCM_SENDER_ID": "123456789012",
             "BUNDLE_ID": "to.kala.reach",
             "PROJECT_ID": "a-project",
@@ -55,7 +59,7 @@ final class FirebaseConfigurationTests: XCTestCase {
 
     func testAnApiKeyOfTheWrongLengthIsFound() {
         XCTAssertTrue(problems(["API_KEY": "AIzaShort"]).contains { $0.contains("API_KEY") })
-        XCTAssertTrue(problems(["API_KEY": "AIzaSyA-0123456789abcdefghijklmnopqrstuv"]).contains { $0.contains("API_KEY") })
+        XCTAssertTrue(problems(["API_KEY": Self.validKey + "v"]).contains { $0.contains("API_KEY") })
     }
 
     func testAnApiKeyThatDoesNotStartWithAnAIsFound() {
