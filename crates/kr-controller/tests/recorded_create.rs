@@ -1173,7 +1173,7 @@ fn seed_reservation(
         .expect("opens the registry");
     let intent = kr_cbor::to_canonical_vec(&SessionCreateParams {
         environment_id,
-        presentation: Presentation::Attach,
+        presentation: Presentation::Invisible,
         shell: Nullable::some("/bin/sh".to_owned()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some("/".to_owned()),
