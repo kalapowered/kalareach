@@ -267,6 +267,7 @@ impl Receipt {
             ),
             retry: error.retry,
             diagnostic_id: error.diagnostic_id.clone(),
+            link_fenced: error.link_fenced,
         });
         shown.error_withheld = true;
         shown
