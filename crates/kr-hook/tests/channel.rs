@@ -448,22 +448,19 @@ async fn nothing_left(application: u32, forwarder: &std::path::Path) {
 /// The processes that run the forwarder `forwarder` names, as the system lists them by the file each
 /// runs.
 ///
-/// The path is compared as the system writes it, which is the full one: a temporary directory's
-/// short names are expanded first.
+/// Both paths are made full by the file system before they are compared, so a temporary directory's
+/// short names and the case of a name decide nothing.
 #[cfg(windows)]
 fn running_forwarders(forwarder: &std::path::Path) -> Vec<u32> {
     let full = std::fs::canonicalize(forwarder).expect("the forwarder's full path");
-    let full = full.to_string_lossy();
     let listed = std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             "Get-Process -Name kr-hook -ErrorAction SilentlyContinue | \
-             Where-Object { $_.Path -eq $env:KR_FORWARDER } | \
-             ForEach-Object { $_.Id }; exit 0",
+             ForEach-Object { \"$($_.Id)`t$($_.Path)\" }; exit 0",
         ])
-        .env("KR_FORWARDER", full.strip_prefix(r"\\?\").unwrap_or(&full))
         .output()
         .expect("powershell runs");
     assert!(
@@ -472,8 +469,10 @@ fn running_forwarders(forwarder: &std::path::Path) -> Vec<u32> {
         String::from_utf8_lossy(&listed.stderr)
     );
     String::from_utf8_lossy(&listed.stdout)
-        .split_whitespace()
-        .map(|id| id.parse().expect("a process identifier"))
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, path)| std::fs::canonicalize(path.trim()).is_ok_and(|path| path == full))
+        .map(|(id, _)| id.trim().parse().expect("a process identifier"))
         .collect()
 }
 
