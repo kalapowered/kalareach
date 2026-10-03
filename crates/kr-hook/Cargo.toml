@@ -35,6 +35,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "sync", "time"] }
 
+[target.'cfg(windows)'.dependencies]
+# The launcher on Windows creates its program itself, suspended, starts it once the backend has
+# committed, and waits for it: a process cannot be replaced in place there.
+windows-sys.workspace = true
+
 [dev-dependencies]
 # The tests put a copy of this binary on the internal disk and start it from there.
 kr-ipc = { workspace = true, features = ["testing"] }
@@ -54,5 +59,11 @@ kr-plugin-sdk.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code, which a launcher that creates and starts a process cannot
+# honour. This crate denies it instead and allows it in the launcher's Windows module alone.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

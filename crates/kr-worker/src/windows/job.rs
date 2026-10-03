@@ -52,11 +52,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use kr_protocol::identity::ProcessStartIdentity;
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 
 /// How many process identifiers one query asks the job for before it asks again with more room.
@@ -200,6 +203,48 @@ impl AgentJob {
     /// Returns the operating system's failure when it will not say.
     pub(super) fn holds_process(&self, process: &OwnedHandle) -> std::io::Result<bool> {
         self.job.holds(process.as_raw_handle().cast())
+    }
+
+    /// Puts a process this worker did not create into this job, and asks the kernel whether the
+    /// job holds it.
+    ///
+    /// It is for a process another of the session's own processes created suspended, which this
+    /// worker places before it is allowed to run: the process is already in the session's job, and
+    /// a job nests inside the one it is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the process cannot be opened, cannot be put in the job, or is not held by it
+    /// afterwards.
+    pub fn assign(&self, pid: u32) -> std::io::Result<()> {
+        // SAFETY: the rights and the identifier are values; the call returns a handle this process
+        // owns, or null.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the call reported a handle this process owns and nothing else holds.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        // SAFETY: both handles are open for the call: the job's is this object's own, and the
+        // process's is the local above.
+        let assigned =
+            unsafe { AssignProcessToJobObject(self.job.raw(), process.as_raw_handle().cast()) };
+        if assigned == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if self.job.holds(process.as_raw_handle().cast())? {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "the job does not hold the process it was given",
+            ))
+        }
     }
 
     /// Returns whether this job holds `child`.
