@@ -340,7 +340,7 @@ pub struct Controller {
     /// between. The pause holds the thread, not the task, and the lock with it. Compiled away in
     /// every shipped build.
     #[cfg(feature = "testing")]
-    before_the_environment_record: crate::attention::Pause,
+    after_the_environment_record_is_taken: crate::attention::Pause,
     /// Where this host's own tests stop a retry that has found its retained answer, before the
     /// admission it arrived under is asked again, so that a withdrawal can land in between.
     /// Compiled away in every shipped build.
