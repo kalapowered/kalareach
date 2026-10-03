@@ -328,11 +328,21 @@ impl ManagedProcess {
     ///
     /// It is a fact about the platform apart from [`Self::publishes_credential_file`]: a platform
     /// can prove a file closed to other accounts and still have no launcher that reaches a backend.
-    /// Unix and Windows run them. The daemon's doctor reads this to say whether an enabled
-    /// integration can launch here.
+    /// Unix runs them. Windows runs them where the kernel's record of when a process started can be
+    /// believed on this machine, which is what places a launcher and its program against the
+    /// backend: a machine whose record cannot be believed admits no launch, so it has no backend
+    /// that runs. The daemon's doctor reads this to say whether an enabled integration can launch
+    /// here.
     #[must_use]
-    pub const fn runs_command_backends() -> bool {
-        cfg!(any(unix, windows))
+    pub fn runs_command_backends() -> bool {
+        #[cfg(windows)]
+        {
+            crate::windows::lineage::start_clock().is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            cfg!(unix)
+        }
     }
 
     /// Writes the registration file the launched process reads its credential from.
