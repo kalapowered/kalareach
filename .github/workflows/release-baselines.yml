@@ -9,7 +9,9 @@ name: release-baselines
 # than 11. Each executable is then started where it was built, and the Linux ones are also started
 # in the distributions the release supports. On the x86-64 targets the description process's llama.cpp
 # archives are also disassembled, and an AVX-512, AVX-VNNI or AMX instruction in them fails the job:
-# the process is built for the x86-64-v3 baseline, and a host checks its processor against that.
+# the process is built for the x86-64-v3 baseline, and a host checks its processor against that. The
+# one thing let through is AVX-512 code that MSVC's own runtime reaches only after it has found,
+# with `__isa_available`, that the processor has AVX-512 (see the step).
 #
 # `scripts/check-release-floors.py` reads the floors, and `docs/releases/platforms.md` says what each
 # baseline is and why. This runs by hand and every night; the landing gate is core-ci, which builds
@@ -170,10 +172,12 @@ jobs:
       # release's: one planted with each kind of instruction (AVX-512 on a wide register, AVX-512 on
       # a narrow one, with and without an address-size or segment prefix before it, AVX-VNNI and
       # AMX), which it has to refuse, and two that hold none, one of them with bytes that only look
-      # like an instruction, which it has to pass. Each is a Rust static library, so it carries a
-      # runtime's worth of ordinary code beside the planted instruction. The disassembler is the
-      # platform's own: `objdump` on Linux and macOS, `dumpbin /disasm` from Visual Studio on
-      # Windows.
+      # like an instruction, which it has to pass. On Windows there are also a function that tests
+      # `__isa_available` before its AVX-512 instruction, which it has to let through and count, and
+      # five that do not test it in a way that guards the instruction, which it has to refuse. Each
+      # is a Rust static library, so it carries a runtime's worth of ordinary code beside the planted
+      # instruction. The disassembler is the platform's own: `objdump` on Linux and macOS,
+      # `dumpbin /disasm` from Visual Studio on Windows.
       - name: Refuse instructions past the baseline in the description process
         if: startsWith(matrix.target, 'x86_64-')
         run: |
@@ -220,37 +224,108 @@ jobs:
           vnni='\bvpdp(b(us|ss|su|uu)|w(ss|su|us|uu))d(s)?\b'
           amx='\b(tmm[0-7]|ldtilecfg|sttilecfg|tilerelease|tile(zero|loadd|loaddt1|stored)|tdp[a-z0-9]+)\b'
 
-          # Prints how many instructions of each kind a disassembly holds, and fails when any does.
-          #
           # On Windows, MSVC compiles some standard-library code, such as a population count over a
           # bit set, with a path for processors that have AVX-512 and another for those that do not,
-          # and chooses at run time from the C runtime's `__isa_available`. A function that compares
-          # it with 6 (AVX-512) or more before its AVX-512 instructions never runs them on a
-          # processor without them, so it is counted apart, as `guarded`, and does not fail the
-          # check. Every other AVX-512 instruction, and every AVX-VNNI and AMX one, still does.
-          # The disassembly lists one function at a time, with a blank line between them.
+          # and chooses between them at run time from the C runtime's `__isa_available`: the function
+          # compares it with 6 (AVX-512), jumps over the AVX-512 path when it is lower, and so never
+          # runs that path on a processor without AVX-512. The disassembly is split by function (a
+          # blank line between functions), and the instructions of a function that has that shape,
+          # between the conditional jump and its target, are counted apart, as `guarded`, and do not
+          # fail the check. The shape is exact: the compare, then the first conditional jump after
+          # it, which is `jl`, to a plain address; the instructions between the jump and its target;
+          # no other jump of the function that is not a plain address, and none from outside those
+          # instructions into them. AVX-512 anywhere else, and every AVX-VNNI and AMX instruction,
+          # still fails.
+          cat > "$scratch/split.awk" <<'AWK'
+          # Splits a dumpbin disassembly, one function per blank-line-separated block, into the lines that
+          # only run behind the C runtime's AVX-512 test and all the others.
+          function hex(text,   position, number, digit) {
+              number = 0
+              for (position = 1; position <= length(text); position++) {
+                  digit = index("0123456789abcdef", substr(text, position, 1)) - 1
+                  if (digit < 0) return -1
+                  number = number * 16 + digit
+              }
+              return number
+          }
+          function flush(   index_, jump, target, held_any, inside, last) {
+              if (lines == 0) return
+              compare = 0; jump = 0
+              for (index_ = 1; index_ <= lines; index_++) {
+                  parse(text[index_])
+                  address[index_] = parsed_address
+                  mnemonic[index_] = parsed_mnemonic
+                  operand[index_] = parsed_operand
+                  if (!compare && parsed_mnemonic == "cmp" && text[index_] ~ /\[__isa_available[^]]*\],6$/) compare = index_
+              }
+              qualifies = 0
+              if (compare) {
+                  for (index_ = compare + 1; index_ <= lines && !jump; index_++) {
+                      if (mnemonic[index_] ~ /^j/ && mnemonic[index_] != "jmp") jump = index_
+                  }
+                  if (jump && mnemonic[jump] == "jl" && operand[jump] ~ /^[0-9a-f]+$/) {
+                      low = address[jump]; high = hex(operand[jump])
+                      qualifies = (low >= 0 && high > low)
+                  }
+              }
+              if (qualifies) {
+                  # Every jump of the function must be a plain one, and none may enter the guarded stretch
+                  # from outside it, or the stretch could run without the test.
+                  for (index_ = 1; index_ <= lines; index_++) {
+                      if (mnemonic[index_] !~ /^j/) continue
+                      if (operand[index_] !~ /^[0-9a-f]+$/) { qualifies = 0; break }
+                      target = hex(operand[index_])
+                      inside = (address[index_] > low && address[index_] < high)
+                      if (target > low && target < high && !inside) { qualifies = 0; break }
+                  }
+              }
+              held_any = 0; last = 0
+              for (index_ = 1; index_ <= lines; index_++) {
+                  if (address[index_] >= 0) {
+                      last = (qualifies && address[index_] > low && address[index_] < high)
+                  } else if (text[index_] !~ /^ +[0-9a-f][0-9a-f]( [0-9a-f][0-9a-f])*$/) {
+                      last = 0
+                  }
+                  if (last) { print text[index_] > held; held_any = 1 }
+                  else print text[index_] > kept
+              }
+              print "" > kept
+              if (held_any) print "" > held
+              lines = 0
+          }
+          # One instruction line: `   0000000000000010: 0f 8c ca 00 00 00  jl          00000000000000de`.
+          function parse(line,   rest, count, field, position) {
+              parsed_address = -1; parsed_mnemonic = ""; parsed_operand = ""
+              if (line !~ /^ +[0-9a-f]+: [0-9a-f][0-9a-f] /) return
+              position = match(line, /[0-9a-f]+:/)
+              parsed_address = hex(substr(line, position, RLENGTH - 1))
+              rest = substr(line, index(line, ":") + 1)
+              count = split(rest, field, " +")
+              for (position = 1; position <= count; position++) {
+                  if (field[position] == "") continue
+                  if (field[position] ~ /^[0-9a-f][0-9a-f]$/) continue
+                  parsed_mnemonic = field[position]
+                  parsed_operand = field[position + 1]
+                  return
+              }
+          }
+          /^[[:space:]]*$/ { flush(); next }
+          { text[++lines] = $0 }
+          END { flush() }
+          AWK
+
+          # Prints how many instructions of each kind a disassembly holds, and fails when any does.
+          # `$1` is the disassembly; on Windows the part of it that is not guarded is `$1.unguarded`.
           past_baseline() {
             local found_avx512 found_vnni found_amx found_guarded=0 unguarded="$1" result
             if [ "$RUNNER_OS" = Windows ]; then
               unguarded="$1.unguarded"
-              awk -v kept="$unguarded" -v held="$1.guarded" '
-                function flush(   i, destination) {
-                  if (lines == 0) return
-                  destination = guard ? held : kept
-                  for (i = 1; i <= lines; i++) print text[i] > destination
-                  print "" > destination
-                  lines = 0
-                  guard = 0
-                }
-                /^[[:space:]]*$/ { flush(); next }
-                {
-                  text[++lines] = $0
-                  if ($0 ~ /cmp .*\[__isa_available[^]]*\],[6-9]/) guard = 1
-                }
-                END { flush() }
-              ' "$1"
-              : >> "$unguarded"
-              : >> "$1.guarded"
+              : > "$unguarded"
+              : > "$1.guarded"
+              # The step runs this inside a condition, where a failure does not stop it, so a split
+              # that failed is a refusal here and not an archive with nothing in it.
+              awk -v kept="$unguarded" -v held="$1.guarded" -f "$scratch/split.awk" "$1" \
+                || { echo "the disassembly could not be split by function"; return 1; }
               found_guarded=$(grep -c -E "$avx512" "$1.guarded" || true)
             fi
             found_avx512=$(grep -c -E "$avx512" "$unguarded" || true)
@@ -287,7 +362,7 @@ jobs:
               unsafe { asm!("vpaddd ymm0, ymm1, ymm2", "vfmadd231ps ymm0, ymm1, ymm2") };
               #[cfg(data)]
               unsafe { asm!(".byte 0x64, 0x62, 0xff, 0xff, 0xff, 0xff, 0x67, 0x62, 0xff, 0xff, 0xff") };
-              #[cfg(guarded)]
+              #[cfg(any(guarded, guardedneighbour))]
               unsafe {
                   asm!(
                       "cmp dword ptr [rip + __isa_available], 6",
@@ -296,6 +371,48 @@ jobs:
                       "2:"
                   )
               };
+              #[cfg(guardednone)]
+              unsafe {
+                  asm!("cmp dword ptr [rip + __isa_available], 6", "vpaddd zmm0, zmm1, zmm2")
+              };
+              #[cfg(guardedbefore)]
+              unsafe {
+                  asm!(
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "jl 2f",
+                      "nop",
+                      "2:"
+                  )
+              };
+              #[cfg(guardedjoined)]
+              unsafe {
+                  asm!(
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "jl 2f",
+                      "nop",
+                      "2:",
+                      "vpaddd zmm0, zmm1, zmm2"
+                  )
+              };
+              #[cfg(guardedjumpin)]
+              unsafe {
+                  asm!(
+                      "jmp 3f",
+                      "cmp dword ptr [rip + __isa_available], 6",
+                      "jl 2f",
+                      "nop",
+                      "3:",
+                      "vpaddd zmm0, zmm1, zmm2",
+                      "2:"
+                  )
+              };
+          }
+
+          #[cfg(guardedneighbour)]
+          #[unsafe(no_mangle)]
+          pub unsafe extern "C" fn neighbour() {
+              unsafe { asm!("vpaddd zmm0, zmm1, zmm2") };
           }
 
           #[panic_handler]
@@ -307,7 +424,9 @@ jobs:
           bad=0
           plants="avx512:+avx512f evex:+avx512f,+avx512vl evexaddress:+avx2 evexsegment:+avx2 evexpair:+avx2 vnni:+avxvnni amx:+amx-tile baseline:+avx2,+fma data:+avx2"
           # The run-time choice by `__isa_available` exists only where MSVC's runtime does.
-          if [ "$RUNNER_OS" = Windows ]; then plants="$plants guarded:+avx512f"; fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            plants="$plants guarded:+avx512f guardednone:+avx512f guardedbefore:+avx512f guardedjoined:+avx512f guardedjumpin:+avx512f guardedneighbour:+avx512f"
+          fi
           for plant in $plants; do
             name=${plant%%:*}
             rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
@@ -326,7 +445,11 @@ jobs:
                 fi ;;
               *)
                 verdict=refused
-                [ "$clean" = 0 ] || verdict=WRONGLY-ACCEPTED ;;
+                [ "$clean" = 0 ] || verdict=WRONGLY-ACCEPTED
+                # A guarded function beside an unguarded one: the guard must not spread.
+                if [ "$name" = guardedneighbour ]; then
+                  case "$counts" in *guarded=1) ;; *) verdict=WRONGLY-UNSEEN ;; esac
+                fi ;;
             esac
             echo "planted $name: $verdict ($counts)"
             case "$verdict" in WRONGLY-*) bad=1 ;; esac
@@ -368,7 +491,12 @@ jobs:
             else
               bad=1
               echo "$archive: $(wc -l < "$text" | tr -d ' ') lines, $counts" >> "$scratch/report.txt"
-              grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+              if [ "$RUNNER_OS" = Windows ]; then
+                grep -n -m 5 -E "$avx512" "$text.unguarded" >> "$scratch/report.txt" || true
+                grep -n -m 5 -E "$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+              else
+                grep -n -m 5 -E "$avx512|$vnni|$amx" "$text" >> "$scratch/report.txt" || true
+              fi
             fi
             case "${archive##*/}" in
               ggml-cpu.*|libggml-cpu.*)
