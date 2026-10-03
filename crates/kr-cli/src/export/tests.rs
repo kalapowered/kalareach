@@ -161,6 +161,8 @@ fn closed(display: u64) -> SessionSummary {
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::some(closure(session_id())),
+        // An export does not read where the environment came from.
+        environment_sources: None,
     }
 }
 
