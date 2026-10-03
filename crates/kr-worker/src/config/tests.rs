@@ -280,7 +280,7 @@ fn environment_additions_resolve_on_the_ladder() {
     assert_eq!(absent.source, ValueSource::Default);
     assert_eq!(absent.preference.effect, ValueEffect::NewSessionsOnly);
 
-    let added = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+    let added = |pairs: &[(&str, &str)]| -> configuration::EnvironmentAdditions {
         pairs
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
