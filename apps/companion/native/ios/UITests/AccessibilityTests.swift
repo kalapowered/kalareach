@@ -72,8 +72,8 @@ final class AccessibilityTests: HarnessTestCase {
         launchHarness(arguments)
     }
 
-    /// The three ways to attach something to a draft, each a label over a file input the page keeps
-    /// hidden. The label is what a finger meets, so the label is measured.
+    /// The three ways to attach something to a draft, each a button over a file input the page keeps
+    /// hidden. The button is what a finger meets, so the button is measured.
     private static let attachmentLabels = ["Photo library", "Take a photo", "Files"]
 
     // MARK: Target sizes
@@ -101,14 +101,14 @@ final class AccessibilityTests: HarnessTestCase {
             }
             if screen == .conversation {
                 for name in Self.attachmentLabels {
-                    // The label the finger meets is the element that carries the control's name and holds
-                    // its text; the static text inside it is only the text's own box.
-                    let label = app.otherElements.matching(NSPredicate(format: "label == %@", name)).firstMatch
-                    guard label.exists else {
+                    // The button the finger meets carries the control's name; the file input behind it is
+                    // hidden and one point wide.
+                    let button = app.buttons[name].firstMatch
+                    guard button.exists else {
                         XCTFail("the \(name) control is not on the conversation")
                         continue
                     }
-                    let frame = label.frame
+                    let frame = button.frame
                     if frame.width < 44 || frame.height < 44 {
                         say("A11Y \(screen.rawValue): the \(name) control is \(Int(frame.width)) by \(Int(frame.height))")
                         XCTFail("the \(name) control on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
