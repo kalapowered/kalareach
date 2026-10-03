@@ -146,28 +146,33 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
 /// intersects at decision time; it keeps no authority of its own and holds no second store.
 ///
 /// These calls are synchronous because the host's grant store is: a decision that took a future
-/// would be a decision a subject could move underneath. Each takes the moment the decision is
-/// being taken at, so the store and the coordinator read one clock rather than two: a record is
-/// live only when it is redeemed, unrevoked and unexpired **at that moment**.
+/// would be a decision a subject could move underneath. None of them takes a moment to decide at.
+/// A grant is live only when it is redeemed, unrevoked and unexpired, and whether it has expired is
+/// the host's to say: on its own continuous clock and its own reading of UTC through the clock
+/// floor it has written down, which a wall clock wound back does not move. A host that cannot
+/// say, because the floor an end was found on is not on record yet, answers with a refusal that
+/// gives its reason. An expiry this crate read from a moment the caller passed in would be a
+/// decision on raw UTC.
 pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     /// Returns the ordinary grant this device holds for `session_id`, when it holds one.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read.
+    /// Returns an error when the store cannot be read, and the host's own refusal when no grant
+    /// stands and an end that decides it is not on record.
     fn device_grant(
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
-        now_ms: u64,
     ) -> Result<Option<Grant>>;
 
-    /// Returns the live grant with this identity, when it is live.
+    /// Returns the grant with this identity, when it stands.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read.
-    fn grant(&self, grant_id: GrantId, now_ms: u64) -> Result<Option<Grant>>;
+    /// Returns an error when the store cannot be read, and the host's own refusal when the grant
+    /// has no standing the host can state because an end that decides it is not on record.
+    fn grant(&self, grant_id: GrantId) -> Result<Option<Grant>>;
 
     /// Returns this device's standing voice grant, when it has one.
     ///
@@ -177,8 +182,9 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read.
-    fn standing_voice_grant(&self, device_id: DeviceId, now_ms: u64) -> Result<Option<Grant>>;
+    /// Returns an error when the store cannot be read, and the host's own refusal when none stands
+    /// and an end that decides it is not on record.
+    fn standing_voice_grant(&self, device_id: DeviceId) -> Result<Option<Grant>>;
 
     /// Writes a grant the coordinator planned.
     ///
@@ -223,14 +229,6 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     ///
     /// Returns an error when the revocation cannot be written, or the admission has run out.
     fn revoke(&self, grant_id: GrantId, now_ms: u64, admission: &dyn Admission) -> Result<u64>;
-
-    /// This host's clock, in UTC milliseconds.
-    ///
-    /// A decision taken after a wait is taken at the moment it is taken, not at the moment the
-    /// request arrived: a grant that ran out while the host was reading must not authorise what
-    /// the read produced. The host owns the clock, so the coordinator asks it rather than keeping
-    /// one of its own.
-    fn now_ms(&self) -> u64;
 
     /// The device identity key that signs this device's authority-bearing requests.
     ///

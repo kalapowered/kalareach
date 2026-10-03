@@ -217,12 +217,7 @@ impl VoiceModule {
     ///
     /// `voice.prepare` describes a call before one exists and creates nothing; `voice.context`
     /// selects what a running call may be told. Both are this device's, under its own grants.
-    pub async fn read_frame(
-        &self,
-        device_id: DeviceId,
-        request: &Request,
-        now_ms: u64,
-    ) -> ControlFrame {
+    pub async fn read_frame(&self, device_id: DeviceId, request: &Request) -> ControlFrame {
         let outcome = async {
             match request.method.method() {
                 Some(Method::VoicePrepare) => {
@@ -230,7 +225,7 @@ impl VoiceModule {
                     value(
                         &self
                             .coordinator
-                            .prepare(device_id, &params, now_ms)
+                            .prepare(device_id, &params)
                             .await
                             .map_err(voice_error)?,
                     )
@@ -240,7 +235,7 @@ impl VoiceModule {
                     value(
                         &self
                             .coordinator
-                            .context(device_id, &params, now_ms)
+                            .context(device_id, &params)
                             .await
                             .map_err(voice_error)?,
                     )
