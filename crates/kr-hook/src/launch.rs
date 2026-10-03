@@ -38,8 +38,9 @@ mod windows;
 /// How long the launcher gives the backend to admit it, from the launcher's start: the connect,
 /// every write and every read, together.
 ///
-/// On Windows the backend hashes the program's executable while the launcher waits, and a program
-/// the system has not run costs it up to two seconds there, so the launcher has six.
+/// On Windows the backend reads and hashes the program's executable while the launcher waits, and a
+/// program the system has not run costs it up to four and a half seconds there, so the launcher has
+/// six.
 pub const ADMISSION_DEADLINE: Duration = Duration::from_secs(if cfg!(windows) { 6 } else { 2 });
 
 /// How long the launcher gives the backend to commit the launch once it has said it is going.
