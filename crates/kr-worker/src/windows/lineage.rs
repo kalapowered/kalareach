@@ -35,7 +35,11 @@ fn pid_of(identity: &ProcessStartIdentity) -> Option<u32> {
 }
 
 /// What the interrupt clock answered for one process, as the kernel's class 88 lays it out.
+///
+/// The kernel writes this structure through a pointer, so its layout is the C one and its size and
+/// the offset of each field the kernel's are checked at compile time below.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub(crate) struct Uptime {
     /// The interrupt time now, in hundreds of nanoseconds.
     pub query_interrupt_time: u64,
@@ -54,6 +58,20 @@ pub(crate) struct Uptime {
     /// Padding the kernel writes.
     pub padding: u32,
 }
+
+// `PROCESS_UPTIME_INFORMATION`: six 64-bit counters, then a 32-bit union of flags and counts, padded
+// to the structure's 8-byte alignment.
+const _: () = {
+    assert!(std::mem::size_of::<Uptime>() == 56);
+    assert!(std::mem::align_of::<Uptime>() == 8);
+    assert!(std::mem::offset_of!(Uptime, query_interrupt_time) == 0);
+    assert!(std::mem::offset_of!(Uptime, query_unbiased_time) == 8);
+    assert!(std::mem::offset_of!(Uptime, end_interrupt_time) == 16);
+    assert!(std::mem::offset_of!(Uptime, time_since_creation) == 24);
+    assert!(std::mem::offset_of!(Uptime, uptime) == 32);
+    assert!(std::mem::offset_of!(Uptime, suspended_time) == 40);
+    assert!(std::mem::offset_of!(Uptime, flags) == 48);
+};
 
 /// What one reading of a process said about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,11 +450,13 @@ mod platform {
                 .spawn()
                 .map_err(|error| failed(format!("a process could not be created: {error}")))?
         };
-        let after = own()?.query_interrupt_time;
+        let after = own();
         let read = uptime(child.as_raw_handle().cast());
-        // Ended whatever was read: it never ran and nothing may leave it behind.
+        // Ended whatever was read, and before any reading that failed is returned: it never ran
+        // and nothing may leave it behind, and dropping a child does not end it.
         let _ = child.kill();
         let _ = child.wait();
+        let after = after?.query_interrupt_time;
         let started = start_in(&read.map_err(&failed)?)
             .map_err(&failed)?
             .ok_or_else(|| failed("a process that never ran says it ended".to_owned()))?;
