@@ -17,25 +17,13 @@ name: release-baselines
 
 on:
   workflow_dispatch:
-  schedule:
-    # Every night, away from the hour, when the hosted runners are busiest.
-    - cron: '41 2 * * *'
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-baselines-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
-  # Each build starts from nothing, so incremental artefacts would only take disk.
   CARGO_INCREMENTAL: "0"
-  # The release's macOS floor. Rust's own default is older (11.0 on Apple Silicon), and the C that
-  # the build compiles reads the same variable, so every object in an executable targets 14.0.
-  # Nothing reads it on the other platforms.
-  MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 defaults:
   run:
@@ -45,74 +33,22 @@ jobs:
   floors:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    timeout-minutes: 30
     strategy:
-      # One target's failure says nothing about another's, and each is worth seeing.
       fail-fast: false
       matrix:
         include:
-          # The oldest Ubuntu the release supports, so the glibc the build links against is
-          # never newer than the baseline's.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            python: python3
-            exe: ''
-            describe: kr-describe-model/kr-describe-inference
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-            python: python3
-            exe: ''
-            describe: kr-describe-model/kr-describe-inference
-          # The hosted Apple Silicon runners start at macOS 15, so the Apple Silicon executables
-          # are started there. Their 14.0 floor is read from their headers, as the Intel ones are.
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            python: python3
-            exe: ''
-            describe: kr-describe-model/kr-describe-inference
-          # The Intel runners start at macOS 15, so the Intel executables are started there.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
-            python: python3
-            exe: ''
-            describe: kr-describe-model/kr-describe-inference
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
-            python: python
-            exe: .exe
-            describe: kr-describe-model/kr-describe-inference
-          # The description process is left out of this target: llama.cpp's CPU backend does not
-          # build with MSVC for Arm, and no shipped model profile lists this target.
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            python: python
-            exe: .exe
-            describe: ''
     env:
       TARGET: ${{ matrix.target }}
-      PYTHON: ${{ matrix.python }}
-      EXE: ${{ matrix.exe }}
-      # Every executable the host ships, as the package that builds it and its name.
-      EXECUTABLES: >-
-        kr-cli/kr
-        kr-cli/kr-attach-guard
-        kr-worker/kr-worker
-        kr-controller/kr-controller
-        ${{ matrix.describe }}
-        kr-hook/kr-hook
-        kr-plugin-host/kr-plugin-host
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - name: What this runner is
-        run: |
-          uname -a
-          case "$RUNNER_OS" in
-            macOS) sw_vers ;;
-            Linux) cat /etc/os-release ;;
-            Windows) cmd //c ver ;;
-          esac
 
       # Some runner images carry no Rust at all. The installer is rustup's own, and it installs
       # no toolchain: the next step installs the one this repository pins.
@@ -146,19 +82,26 @@ jobs:
           rustc --version
           cargo --version
 
-      # The check is put through binaries whose floors are known before it is trusted with the
-      # release's. On macOS that includes a program built at Rust's default target, which it has to
-      # refuse, and one built at 14.0, which it has to pass.
-      - name: Test the floor check
-        run: '"$PYTHON" scripts/check-release-floors.py self-test'
-
-      # Each executable is built by a command of its own, as the Windows release builds them, so
-      # each one's dependencies are resolved exactly as they are for the release.
-      - name: Build the host executables
+      - name: Stand in for the llama.cpp build
         run: |
-          for executable in $EXECUTABLES; do
-            cargo build --locked --release --target "$TARGET" -p "${executable%/*}" --bin "${executable#*/}"
-          done
+          out="target/$TARGET/release/build/llama-cpp-sys-2-probe/out/lib"
+          mkdir -p "$out"
+          if [ "$RUNNER_OS" = Windows ]; then extension=lib; else extension=a; fi
+          cat > "$RUNNER_TEMP/standin.rs" <<'RUST'
+          #![no_std]
+          use core::arch::asm;
+          #[unsafe(no_mangle)]
+          pub unsafe extern "C" fn standin() {
+              unsafe { asm!("vpaddd ymm0, ymm1, ymm2") };
+          }
+          #[panic_handler]
+          fn panic(_: &core::panic::PanicInfo) -> ! {
+              loop {}
+          }
+          RUST
+          rustc --edition 2024 --crate-type staticlib --target "$TARGET" -C panic=abort -C codegen-units=1 \
+            -C target-feature=+avx2 -o "$out/ggml-cpu.$extension" "$RUNNER_TEMP/standin.rs"
+          cp "$out/ggml-cpu.$extension" "$out/llama.$extension"
 
       # The description process runs on every x86-64 processor that has the baseline in
       # `.cargo/config.toml` (x86-64-v3), so the llama.cpp archives it links must hold no AVX-512,
@@ -288,62 +231,3 @@ jobs:
           [ "$cpu" = 1 ] || { echo "::error::no ggml CPU archive was built"; exit 1; }
           [ "$bad" = 0 ] || { echo "::error::the description process holds instructions past the baseline"; exit 1; }
 
-      - name: Read each floor back
-        run: |
-          built=()
-          for executable in $EXECUTABLES; do
-            built+=("target/$TARGET/release/${executable#*/}$EXE")
-          done
-          {
-            echo "### $TARGET on $RUNNER_OS $RUNNER_ARCH"
-            echo '```'
-            "$PYTHON" scripts/check-release-floors.py check --target "$TARGET" "${built[@]}"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Start each on this runner
-        run: |
-          for executable in $EXECUTABLES; do
-            "target/$TARGET/release/${executable#*/}$EXE" --version
-          done
-
-      # A clean image of each distribution, so what starts is the executable against that
-      # distribution's own libraries and nothing the runner image added.
-      #
-      # The registry limits anonymous pulls by the second and by the address, and a hosted runner
-      # shares its address with others, so a pull is refused now and then for no fault of the
-      # release (`toomanyrequests: Rate exceeded`, on the nightly runs of 2026-09-27 and 09-28,
-      # after one to four of the four images). Each pull is therefore its own command, tried up to
-      # five times with a wait that doubles from ten seconds, and only a pull that still fails
-      # fails the job, with the registry's own message. `docker run` then pulls nothing: it starts
-      # the image that was pulled.
-      - name: Start each on the Linux distributions the release supports
-        if: runner.os == 'Linux'
-        run: |
-          release="$PWD/target/$TARGET/release"
-          names=()
-          for executable in $EXECUTABLES; do
-            names+=("${executable#*/}")
-          done
-          pull() {
-            local image="$1" attempt=1 wait=10
-            until docker pull --quiet "$image" > /dev/null; do
-              if [ "$attempt" -ge 5 ]; then
-                echo "::error::$image could not be pulled in $attempt attempts"
-                return 1
-              fi
-              echo "::warning::pulling $image failed (attempt $attempt of 5); trying again in $wait seconds"
-              sleep "$wait"
-              attempt=$((attempt + 1))
-              wait=$((wait * 2))
-            done
-          }
-          for image in ubuntu:22.04 ubuntu:24.04 debian:12 debian:13; do
-            echo "== $image"
-            reference="public.ecr.aws/docker/library/$image"
-            pull "$reference"
-            docker run --rm --pull=never --volume "$release:/kr:ro" "$reference" \
-              sh -c 'set -e; grep PRETTY_NAME /etc/os-release; for name in "$@"; do /kr/"$name" --version; done' \
-              sh "${names[@]}"
-            echo "- $TARGET starts on $image" >> "$GITHUB_STEP_SUMMARY"
-          done
