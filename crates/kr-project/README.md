@@ -6,8 +6,8 @@ staged publication and the credential rule. This file describes one thing: the b
 invocation runs inside, and exactly which mechanism holds which guarantee on each platform.
 
 The Git that runs outside all of this is the one that says which Git this host has. Resolving the
-program starts it two to four times at startup — for its version and its own helper directory, and
-again for the copy under that directory — each with an environment of nothing and no repository
+program starts it two to four times at startup (for its version and its own helper directory, and
+again for the copy under that directory), each with an environment of nothing and no repository
 named, and none of them under a boundary.
 
 ## Why there is one
@@ -26,38 +26,39 @@ the invocation ends.
 
 ## What it holds
 
-Three guarantees, on the platforms that can hold them. macOS and Linux can; Windows cannot, and the
-service refuses there rather than claiming them, which the table and the section after it explain.
+The boundary gives three guarantees, on the platforms that can hold them. macOS and Linux can;
+Windows cannot, and the service refuses there rather than claiming them, which the table and the
+section after it explain.
 
-**Only Git executes.** The Git program, the helpers under Git's own `--exec-path`, and the approved
+**Only Git executes:** the Git program, the helpers under Git's own `--exec-path`, and the approved
 credential broker's ssh program for a remote that needs one. A driver, filter, hook, credential
-helper, pager, filesystem monitor or `core.sshCommand` planted anywhere else — in the repository, in
-the staging directory, in the invocation's own temporary directory — cannot be executed, whenever it
+helper, pager, filesystem monitor or `core.sshCommand` planted anywhere else (in the repository, in
+the staging directory, in the invocation's own temporary directory) cannot be executed, whenever it
 was planted.
 
 One addition, and it is exactly bounded. Git builds two things as command strings and starts them
 through the system shell: its connection to a repository over its own transport, and its call to a
-credential helper. So an invocation that clones — from a local path, over ssh or over https — has
-that shell in its execution list as well. Every such invocation is a clone that checks nothing out:
-no attribute is consulted, so no driver, filter or text conversion is looked for, and a hook is
-looked for in a directory this service owns and keeps empty, which is a fixed override rather than
-anything the clone decides. The checkout that follows is a separate invocation whose execution list
-holds no shell at all, and it is the one that consults the repository's attributes.
+credential helper. So an invocation that clones (from a local path, over ssh or over https) has that
+shell in its execution list as well. Every such invocation is a clone that checks nothing out: no
+attribute is consulted, so no driver, filter or text conversion is looked for, and a hook is looked
+for in a directory this service owns and keeps empty, which is a fixed override rather than anything
+the clone decides. The checkout that follows is a separate invocation whose execution list holds no
+shell at all, and it is the one that consults the repository's attributes.
 
 **Only this operation's network.** A local operation reaches no address and nothing may listen. An
-operation that reaches a remote may open outbound connections on the ports its transport uses — 443
-and 80 for https, 22 for ssh, and the port the validated remote URL named where it named one — and
+operation that reaches a remote may open outbound connections on the ports its transport uses (443
+and 80 for https, 22 for ssh, and the port the validated remote URL named where it named one) and
 resolve the remote's name over the same kind of connection. Nothing may listen there either.
 
-**Only this operation's directories are written.** The repository's working tree and its Git common
+**Only this operation's directories are written:** the repository's working tree and its Git common
 directory, the destination the operation reserved, and one temporary directory created for this
 invocation. An invocation is granted the directories its own work needs and no more: the one that
 moves a reference with its expected old value is granted the Git common directory alone, and the
-working tree is not writable by it. Git's temporary files go in that directory rather than in one shared with everything
-else on the machine. When the invocation ends the directory is taken away by the record this service
-wrote before it made it, and only if it is empty but for this service's own mark; what is not is
-left where it is, with a line saying so. The paragraph on it below says what that does and does not
-establish.
+working tree is not writable by it. Git's temporary files go in that directory rather than in one
+shared with everything else on the machine. When the invocation ends the directory is taken away by
+the record this service wrote before it made it, and only if it is empty but for this service's own
+mark; what is not is left where it is, with a line saying so. The paragraph on it below says what
+that does and does not establish.
 
 **Directories, not names.** Every directory the boundary is built from is opened first and required
 to be the object its record names: the working tree by the identity the repository's record carries,
@@ -99,7 +100,7 @@ two and why. The table below describes what is written for that platform, not wh
 | | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports (one of the two reasons the service refuses here) |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Reads | Not confined, so an operation for a caller bounded by a grant is refused | The whole filesystem for the owner. For a caller bounded by a grant, Landlock with no rule on the whole filesystem: read rights only on the objects the invocation is granted and on the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory | The container's grants on those directories, and read grants by name on what it is lent |
 | Inherited descriptors | Every descriptor the service opens is closed when a child executes | The same, and after the rules are applied the child marks every descriptor from the fourth on to close when it executes Git; a kernel that cannot mark them fails the spawn | An explicit list of the three standard handles, and no other |
@@ -126,21 +127,22 @@ of these falls back to reading the configuration and hoping.
   profile tried confined reads and still let the system's loader start Git, and Windows runs no Git
   at all. Such a caller's invocation is refused with that reason rather than run with the owner's
   reach.
-* **A caller bounded by a grant, on a Linux host that cannot name the support set**: a program in
-  Git's helper directory whose loader, or a library its loader resolves, cannot be named, or lies in
-  a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that finds a support
-  object gone when it starts. Each refusal names the object.
+* **A caller bounded by a grant, on a Linux host that cannot name the support set** is refused when
+  a program in Git's helper directory has a loader, or a library its loader resolves, that cannot be
+  named or lies in a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that
+  finds a support object gone when it starts. Each refusal names the object.
 * **A caller bounded by a grant, over a directory with another filesystem mounted beneath it**, or
-  with an operation that would reach a remote. A location says nothing about which providers this
-  host may reach for such a caller, and its reads name no certificate store and no resolver file.
+  with an operation that would reach a remote, is refused. A location says nothing about which
+  providers this host may reach for such a caller, and its reads name no certificate store and no
+  resolver file.
 * **Windows, every invocation.** Two of the three guarantees are not things an application container
   can hold: a permission written on a file itself beats the refusal this service writes on the
   directory above it, and a container's capability permits reaching the network or nothing without
   bounding which ports. So the service refuses there, says which guarantee it cannot make, and the
   platform task that qualifies this host on Windows is what changes the mechanism. A third limit
-  would have mattered had the first two not: on an ordinary installation Git lives somewhere only an
-  administrator may change the permissions of, so the container could not have been granted read and
-  execute on it either.
+  would have been decisive had the first two not applied: on an ordinary installation Git lives
+  somewhere only an administrator may change the permissions of, so the container could not have
+  been granted read and execute on it either.
 * **A platform with none of these mechanisms** runs no Git at all.
 
 ## What a caller bounded by a grant is promised
@@ -191,7 +193,7 @@ a granted directory.
 
 ## What is left
 
-Stated rather than implied.
+What is left is stated rather than implied.
 
 **On macOS nothing marks the descriptors the service did not open itself.** Every descriptor this
 service opens is closed when a child executes, on every platform. On Linux the child also marks
@@ -202,15 +204,16 @@ such a descriptor.
 
 **A substitution inside a granted subtree is outside the guarantee.** The tree Git works in is the
 object this service opened, so nothing can redirect that. What a substitution can still reach is a
-directory Git was *given by name* — a reserved worktree destination, which on macOS the path rules
+directory Git was *given by name* (a reserved worktree destination, which on macOS the path rules
 still permit and which on Linux does not arise, because the rules there are attached to the opened
-objects — and a directory put at an unrecorded name *inside* a tree the operation owns, which no
-confinement that grants a tree can refuse part of. The first ends the run with the declared honest
-result, because the destination is a granted root and its identity is read again. The second is a
-limit rather than a guarantee: the only writer who could put a directory there is a writer under
-this same account, who could write those files directly and needs no substitution to do it. What
-that writer still cannot get is anything executed, or any address the operation was not given.
-Waiting for Git establishes that Git has gone rather than that everything it started has.
+objects) and a directory put at an unrecorded name *inside* a tree the operation owns, which no
+confinement that grants a tree can refuse part of. The first ends the run with the result the
+service declares for a changed root, because the destination is a granted root and its identity is
+read again. The second is a limit rather than a guarantee: the only writer who could put a directory
+there is a writer under this same account, who could write those files directly and needs no
+substitution to do it. What that writer still cannot get is anything executed, or any address the
+operation was not given. Waiting for Git establishes that Git has gone rather than that everything
+it started has.
 
 **On Windows the execution refusal would rest on permissions a repository can carry its own.** The
 container is refused the execute right on the directories the operation owns, and that refusal beats
@@ -223,7 +226,7 @@ TCP, and a system-call filter reads scalar arguments while an address is behind 
 nothing there could bound where a datagram goes. Rather than permit one, the boundary refuses it,
 and it refuses by naming what may be made rather than what may not: a filter written the other way
 round would permit everything it had not heard of, the sockets that reach the machine this one runs
-inside among them. What may be made is short.
+inside among them. What may be made is short:
 
 * A **connected pair of local sockets**, for either kind of operation, of the stream kind and of no
   protocol besides. Such a pair is joined to its own other half, cannot be connected again and
@@ -242,11 +245,11 @@ socket of that family reaches another program rather than the kernel.
 
 What that costs is what a C library asks over a local socket or over that family: its name service
 cache, a resolver's own interface, and the kernel's list of this machine's addresses. Each is a step
-a C library falls back from — to the files, to the resolver itself over TCP, and to asking about
-both kinds of address — and the child is told to use that connection (`RES_OPTIONS=use-vc`), with
-the port a resolver answers on added to the rules on any address, because which machine answers a
-name is not this service's to decide. **A host whose name service has no fallback to the resolver,
-or whose resolver will not take that instruction, cannot turn a name that needs the resolver into an
+a C library falls back from (to the files, to the resolver itself over TCP, and to asking about both
+kinds of address), and the child is told to use that connection (`RES_OPTIONS=use-vc`), with the
+port a resolver answers on added to the rules on any address, because which machine answers a name
+is not this service's to decide. **A host whose name service has no fallback to the resolver, or
+whose resolver will not take that instruction, cannot turn a name that needs the resolver into an
 address inside this boundary**, and the operation fails saying so.
 
 **An https remote named rather than numbered is looked up over IPv4.** The library Git fetches with
@@ -275,10 +278,10 @@ directory above it, under a name of thirty-two random characters; a *second empt
 another such name is created inside it as a mark, which fails outright if anything is at that name
 already; and the outer directory is then opened and required to hold that mark and nothing else and
 to be one object across two opens. What that establishes is that the directory the invocation gets
-is one object carrying this service's own mark — not that this service created it, because a
+is one object carrying this service's own mark, not that this service created it, because a
 directory put at the name before the mark was made would be marked as readily. The directory they
-are all made in is the service's own, open to the account the service runs as and to nobody else,
-so putting anything at a name in there is already that account's own doing.
+are all made in is the service's own, open to the account the service runs as and to nobody else, so
+putting anything at a name in there is already that account's own doing.
 
 **Nothing in there is removed unless the record names both objects, nothing is removed by
 descending, and no file and no directory with anything in it is removed at all.** When an invocation
