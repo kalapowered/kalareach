@@ -1,13 +1,14 @@
 //! The forwarder against the worker's own listener.
 //!
-//! On Unix every case here runs the real composition: the worker's gateway binds the endpoint,
+//! Every case here but the last runs the real composition: the worker's gateway binds the endpoint,
 //! launches a stand-in application through the same launch path production uses, and writes the
 //! registration and the owner-only credential file into that application's environment. The
 //! application then starts `kr-hook claude-code hook` itself, as Claude Code starts a hook, so the
 //! process the kernel names on the accepted socket is a process the launched application started.
 //!
-//! The last case stands in for the worker's listener on every platform, on the private endpoint the
-//! platform gives a launch: a socket on Unix, a named pipe on Windows.
+//! The last case stands in for the worker's listener, on the private endpoint the platform gives a
+//! launch: a socket on Unix, a named pipe on Windows. The application it launches is a shell of its
+//! own, `/bin/sh` or a copy of `cmd.exe`.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -19,9 +20,7 @@ mod common;
 
 use tokio::io::AsyncWriteExt as _;
 
-#[cfg(unix)]
-use common::launched;
-use common::{LIVENESS, Placed, StandIn, read_line, run_with_input};
+use common::{LIVENESS, Placed, StandIn, launched, read_line, run_with_input};
 
 /// A `SessionStart` payload as Claude Code writes it on a hook's standard input.
 const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"SessionStart","source":"startup"}"#;
@@ -30,7 +29,6 @@ const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b
 /// the registration names, presents the launch's private exchange and its own process, and is
 /// admitted as the installed bridge's hook; the process the kernel named is that hook, not the
 /// application. The hook still answers exactly `{}` and exits 0.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
     let placed = Placed::new();
@@ -50,8 +48,12 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
             .gateway
             .registration()
             .expect("the launch publishes a registration")
-            .contains("endpoint=/"),
-        "the registration names a private socket"
+            .contains(if cfg!(windows) {
+                r"endpoint=\\.\pipe\"
+            } else {
+                "endpoint=/"
+            }),
+        "the registration names the private endpoint the platform gives a launch"
     );
     assert_eq!(
         launch
@@ -103,7 +105,6 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
 /// presents a credential other than the launch's is refused, and so is the forwarder with the right
 /// files when the launched application did not start it. Each still answers `{}` and exits 0, so a
 /// refusal changes nothing about what the application does.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_43_the_wrong_exchange_or_a_process_the_application_did_not_start_is_refused() {
     let placed = Placed::new();
@@ -174,7 +175,6 @@ async fn kr_req_11_43_the_wrong_exchange_or_a_process_the_application_did_not_st
 /// KR-REQ-11.43, KR-REQ-12.14: a connection that presents only an environment session
 /// identifier, or presents another process's identity with the right exchange, is refused: the
 /// kernel's naming of the peer and the private exchange decide, never what the environment says.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_43_a_session_identifier_alone_or_a_borrowed_identity_is_refused() {
     use tokio::io::AsyncWriteExt as _;
@@ -213,11 +213,9 @@ async fn kr_req_11_43_a_session_identifier_alone_or_a_borrowed_identity_is_refus
         ),
     ];
     for (case, hello) in cases {
-        let path = endpoint.clone();
+        let address = endpoint.clone();
         let connecting = tokio::spawn(async move {
-            let mut stream = tokio::net::UnixStream::connect(path)
-                .await
-                .expect("the endpoint is reachable");
+            let mut stream = common::connect(&address).await;
             let mut line = hello.to_string().into_bytes();
             line.push(b'\n');
             stream.write_all(&line).await.expect("the hello is written");
@@ -237,7 +235,6 @@ async fn kr_req_11_43_a_session_identifier_alone_or_a_borrowed_identity_is_refus
 /// from it. The forwarder at a path the installation did not put in place is refused, and so is a
 /// hook when the installed recipe registered no hooks, although the launch binding and the
 /// private exchange are both right.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused() {
     let placed = Placed::new();

@@ -1,6 +1,7 @@
 //! Claude Code's Channels server through the forwarder and the worker's own listener.
 //!
-//! The worker's gateway launches a stand-in application, which starts `kr-hook claude-code
+//! The worker's gateway launches a stand-in application (a shell: `/bin/sh` on Unix and a copy of
+//! `cmd.exe` on Windows), which starts `kr-hook claude-code
 //! channel` over its own standard input and output, as Claude Code starts a channel server. This
 //! test speaks MCP to it as Claude Code does, and speaks the private exchange to it as the worker
 //! does, through the connection the worker admitted.
@@ -10,8 +11,6 @@
 //! | KR-REQ-11.42 | every case: the channel registration's own invocation, admitted by the worker |
 //! | KR-REQ-12.18 | `kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_nothing_else` |
 //! | KR-REQ-11.34 | `kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_nothing_else`: core code alone carries the frames, beside the unchanged terminal |
-
-#![cfg(unix)]
 
 mod common;
 
@@ -312,27 +311,19 @@ async fn a_launch_that_goes_ends_the_channel_it_started() {
     drop((input, admitted));
 }
 
-/// A launch whose application was ended from outside before the launch went, leaving the channel
-/// it started to another parent, still ends that channel when it goes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_launch_ends_its_channel_after_its_application_was_ended_from_outside() {
-    use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
-
-    let placed = Placed::new();
-    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
-    let admitted = launch.accept().await.expect("the channel is admitted");
-    let channel = admitted.process.identity.clone();
-    let application =
-        process_start_identity(launch.application.id()).expect("the application is running");
-    let input = launch.requests.take();
-
-    let pid = launch.application.id().to_string();
+/// Ends the application of a launch from outside the launch, as a person or another program may,
+/// and waits until it has ended.
+///
+/// It has ended once it is waiting to be collected, which only its launch does.
+#[cfg(unix)]
+async fn end_from_outside(application: &kr_protocol::identity::ProcessStartIdentity, pid: u32) {
+    let pid = pid.to_string();
+    let _ = application;
     let ended = std::process::Command::new("kill")
         .args(["-KILL", &pid])
         .status()
         .expect("kill runs");
     assert!(ended.success(), "the application is ended from outside");
-    // It has ended once it is waiting to be collected, which only its launch does.
     let deadline = std::time::Instant::now() + LIVENESS;
     loop {
         let listed = std::process::Command::new("ps")
@@ -351,6 +342,48 @@ async fn a_launch_ends_its_channel_after_its_application_was_ended_from_outside(
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Ends the application of a launch from outside the launch, as a person or another program may,
+/// and waits until it has ended.
+#[cfg(windows)]
+async fn end_from_outside(application: &kr_protocol::identity::ProcessStartIdentity, pid: u32) {
+    use kr_ipc::identity::{ProcessState, process_state};
+
+    let ended = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output()
+        .expect("taskkill runs");
+    assert!(
+        ended.status.success(),
+        "the application is ended from outside: {}",
+        String::from_utf8_lossy(&ended.stdout)
+    );
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while process_state(application) != ProcessState::Ended {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the application ended from outside"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A launch whose application was ended from outside before the launch went, leaving the channel
+/// it started to another parent, still ends that channel when it goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_ends_its_channel_after_its_application_was_ended_from_outside() {
+    use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
+
+    let placed = Placed::new();
+    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let admitted = launch.accept().await.expect("the channel is admitted");
+    let channel = admitted.process.identity.clone();
+    let application =
+        process_start_identity(launch.application.id()).expect("the application is running");
+    let input = launch.requests.take();
+
+    end_from_outside(&application, launch.application.id()).await;
     assert_eq!(
         process_state(&channel),
         ProcessState::Running,
@@ -363,19 +396,15 @@ async fn a_launch_ends_its_channel_after_its_application_was_ended_from_outside(
     drop((input, admitted));
 }
 
-/// A launch that goes as soon as it has started, before or after its application has started the
-/// channel, leaves nothing it started: no process is left in the application's group, and none
-/// runs the forwarder this case placed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_launch_that_goes_at_once_leaves_nothing_it_started() {
-    let placed = Placed::new();
-    let launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
-    let group = launch.application.id().to_string();
-    let forwarder = placed.forwarder.to_string_lossy().into_owned();
-
-    drop(launch);
-    // What `pgrep` found: it says no process matched with its status, and anything else it says
-    // fails the case rather than reading as nothing left.
+/// Waits, within the liveness bound, until no process of the application's group runs and none
+/// runs the forwarder `forwarder` names.
+///
+/// What `pgrep` found: it says no process matched with its status, and anything else it says
+/// fails the case rather than reading as nothing left.
+#[cfg(unix)]
+async fn nothing_left(application: u32, forwarder: &std::path::Path) {
+    let group = application.to_string();
+    let forwarder = forwarder.to_string_lossy().into_owned();
     let listed = |arguments: [&str; 2]| {
         let listed = std::process::Command::new("pgrep")
             .args(arguments)
@@ -407,6 +436,57 @@ async fn a_launch_that_goes_at_once_leaves_nothing_it_started() {
     }
 }
 
+/// Waits, within the liveness bound, until no process runs the forwarder `forwarder` names.
+///
+/// A launch on Windows holds what it starts in a job, which its launch has ended and found empty
+/// when it goes; the processes that run this copy of the forwarder are asked the system for
+/// besides, by the file each runs, so a process the job did not hold would be found.
+#[cfg(windows)]
+async fn nothing_left(_application: u32, forwarder: &std::path::Path) {
+    let deadline = std::time::Instant::now() + LIVENESS;
+    loop {
+        let listed = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-Process -Name kr-hook -ErrorAction SilentlyContinue | \
+                 Where-Object { $_.Path -eq $env:KR_FORWARDER } | \
+                 ForEach-Object { $_.Id }",
+            ])
+            .env("KR_FORWARDER", forwarder)
+            .output()
+            .expect("powershell runs");
+        assert!(
+            listed.status.success(),
+            "the processes are listed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let running = String::from_utf8_lossy(&listed.stdout).trim().to_owned();
+        if running.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "running the forwarder: [{running}]"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A launch that goes as soon as it has started, before or after its application has started the
+/// channel, leaves nothing it started: no process is left in the application's group, and none
+/// runs the forwarder this case placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_that_goes_at_once_leaves_nothing_it_started() {
+    let placed = Placed::new();
+    let launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let application = launch.application.id();
+
+    drop(launch);
+    nothing_left(application, &placed.forwarder).await;
+}
+
 /// KR-REQ-05.09, KR-REQ-11.43: a channel the installation did not register is refused before
 /// Claude Code's handshake is answered, and the forwarder exits with a failure rather than serving
 /// a channel nothing stands behind.
@@ -435,9 +515,13 @@ async fn kr_req_05_09_a_channel_the_installation_does_not_have_is_refused() {
 /// A channel whose standard error is a named pipe this test holds, launched and admitted, with
 /// Claude Code's handshake done.
 ///
+/// The pipe is a FIFO, which only Unix has; the hook's own case of a standard error nobody reads,
+/// which runs on both platforms, is `neutral_answer`'s.
+///
 /// The launch runs the channel through a script of this test's own, which points standard error at
 /// the pipe and then becomes the installed forwarder, so the process the worker admits is the
 /// forwarder, started by the application, as it is in every other case here.
+#[cfg(unix)]
 struct Diagnosed {
     launch: Launch,
     lines: Receiver<serde_json::Value>,
@@ -450,6 +534,7 @@ struct Diagnosed {
     _placed: Placed,
 }
 
+#[cfg(unix)]
 impl Diagnosed {
     /// Starts a channel whose standard error is a pipe, full before the channel starts when `full`
     /// says so, and empty otherwise.
@@ -493,10 +578,10 @@ impl Diagnosed {
             ),
         )
         .expect("the script");
-        let script = Placed {
-            host: kr_ipc::testing::TempHost::create(),
-            forwarder: placed.host.root().join("bin").join("channel"),
-        };
+        let script = Placed::beside(
+            kr_ipc::testing::TempHost::create(),
+            placed.host.root().join("bin").join("channel"),
+        );
         kr_ipc::testing::place_program(&text, &script.forwarder);
 
         let mut launch = Launch::channel(&script, installed(&placed, &[BridgeSurface::Channel]));
@@ -528,11 +613,13 @@ impl Diagnosed {
 }
 
 /// A frame the channel refuses, which names `index`, so the report of it can be told apart.
+#[cfg(unix)]
 fn refused(index: usize) -> serde_json::Value {
     serde_json::json!({"method": format!("notifications/unknown/{index}"), "params": {}})
 }
 
 /// Fills a pipe until it takes nothing more, and leaves its writing end waiting again.
+#[cfg(unix)]
 fn fill(pipe: &std::fs::File) {
     rustix::io::ioctl_fionbio(pipe, true).expect("a pipe that says when it is full");
     let mut writer = pipe;
@@ -554,6 +641,7 @@ fn fill(pipe: &std::fs::File) {
 /// that is full before the channel starts and is never read, the worker sends more refused frames
 /// than any queue of reports could hold, and then a message: the message reaches Claude Code, and
 /// the channel still ends, with its failure, when the worker closes it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_18_a_standard_error_nobody_reads_cannot_stop_the_channel() {
     /// More refusals than any bounded queue of reports this channel keeps.
@@ -594,6 +682,7 @@ async fn kr_req_12_18_a_standard_error_nobody_reads_cannot_stop_the_channel() {
 
 /// KR-REQ-12.18, the control: while standard error is read, every refusal is reported, one line
 /// each, in the order the frames came, and the message after them still reaches Claude Code.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_18_every_refusal_is_reported_in_order_while_standard_error_is_read() {
     /// Fewer refusals than a queue of reports holds, so none can be dropped however slowly the
