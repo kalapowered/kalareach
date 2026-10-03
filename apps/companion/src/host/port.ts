@@ -39,6 +39,9 @@ import type {
   ChangesetReadParams,
   ChangesetReadResult,
   ClosureRecord,
+  DescriptionConfigureParams,
+  DescriptionDownloadParams,
+  DescriptionSetup,
   DeviceListParams,
   DeviceListResult,
   Dimensions,
@@ -63,6 +66,8 @@ import type {
   RoleSelection,
   SessionCreateParams,
   SessionCreateResult,
+  SessionDescribeParams,
+  SessionDescribeResult,
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
@@ -603,6 +608,30 @@ export interface HostPort {
     subject: SessionSubject
   ): Promise<Settled<SessionCreateResult>>
   sessionClose(params: unknown, subject: SessionSubject): Promise<Settled<ClosureRecord>>
+  /**
+   * What one session is called and what it is doing: the title and where it came from, the
+   * generated activity line when there is one, and how current it is.
+   *
+   * The parameters name a session and nothing else. A description cannot be asked for, chosen a
+   * model for or produced from here; this reads what the host has, filtered for this device.
+   */
+  sessionDescribe(params: SessionDescribeParams): Promise<SessionDescribeResult>
+  /**
+   * What session descriptions offer on this host: the exact size and the sources before anything
+   * is fetched, how a fetch is going, the two settings, and why nothing is offered when nothing
+   * is. A read: asking grants nothing and changes nothing.
+   */
+  descriptionSetup(): Promise<DescriptionSetup>
+  /**
+   * Turns descriptions on or off, or whether they may run on battery. A null leaves a setting as
+   * it is. Both apply at once on the host, which answers with its setup as it now stands.
+   */
+  descriptionConfigure(params: DescriptionConfigureParams): Promise<Settled<DescriptionSetup>>
+  /**
+   * Starts the fetch of the selected profile's files, or stops one that is running. The page names
+   * the action and nothing else: what is fetched and from where are the host's own.
+   */
+  descriptionDownload(params: DescriptionDownloadParams): Promise<Settled<DescriptionSetup>>
 
   /**
    * What the launch surface may draw right now.
