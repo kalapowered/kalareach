@@ -1697,6 +1697,10 @@ mod tests {
             u64::from(MAX_RETAINED_ENDED_WORKERS as u32 + over)
         );
         assert!(report.holds(), "every worker let go had ended");
+        // The cut an answer takes to fit one frame keeps the total the barrier supplied.
+        let answer = kr_protocol::sharing::RevocationResult::bounded(rev, [], report.clone());
+        assert_eq!(answer.barrier.workers_total, report.workers_total);
+        assert!(answer.barrier.holds());
         let listed: Vec<SessionId> = report
             .workers
             .iter()
