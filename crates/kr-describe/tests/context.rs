@@ -316,8 +316,6 @@ fn the_grammar_admits_one_object_with_four_fields_and_two_bounds() {
     assert!(DESCRIPTION_GRAMMAR.contains("\\\"context_revision\\\""));
     assert!(DESCRIPTION_GRAMMAR.contains("char{1,64}"));
     assert!(DESCRIPTION_GRAMMAR.contains("char{1,160}"));
-    // The character class excludes the control range and the two delimiters outright.
-    assert!(DESCRIPTION_GRAMMAR.contains(r#"char ::= [^"\\\x00-\x1F\x7F-\x9F]"#));
     // JSON integers, so a leading zero cannot be sampled either.
     assert!(DESCRIPTION_GRAMMAR.contains(r#"number ::= "0" | [1-9] [0-9]{0,18}"#));
 
@@ -541,4 +539,78 @@ fn a_closed_session_keeps_a_cleanup_it_could_not_finish() {
         kr_protocol::scalars::Uuid::from_bytes([1; 16]),
     ));
     assert!(debt.is_empty());
+}
+
+/// Reads one codepoint of a GBNF character class, which is a character or an escape: `\\`,
+/// `\x`, `\u` or `\U` and its hexadecimal digits.
+fn read_codepoint(chars: &[char], at: &mut usize) -> u32 {
+    let first = chars[*at];
+    *at += 1;
+    if first != '\\' {
+        return first as u32;
+    }
+    let kind = chars[*at];
+    *at += 1;
+    let digits = match kind {
+        'x' => 2,
+        'u' => 4,
+        'U' => 8,
+        other => return other as u32,
+    };
+    let hex: String = chars[*at..*at + digits].iter().collect();
+    *at += digits;
+    u32::from_str_radix(&hex, 16).expect("hexadecimal digits")
+}
+
+/// Reads the codepoints a GBNF character class names, as inclusive ranges: the text between `[` or
+/// `[^` and `]`, whose ranges are `a-b`.
+fn ranges_of(class: &str) -> Vec<(u32, u32)> {
+    let chars: Vec<char> = class.chars().collect();
+    let mut at = 0;
+    let mut ranges = Vec::new();
+    while at < chars.len() {
+        let from = read_codepoint(&chars, &mut at);
+        let to = if at < chars.len() && chars[at] == '-' {
+            at += 1;
+            read_codepoint(&chars, &mut at)
+        } else {
+            from
+        };
+        ranges.push((from, to));
+    }
+    ranges
+}
+
+/// KR-REQ-22.18: the grammar admits no character that validation refuses, and leaves out nothing
+/// else but the quote and the backslash a string cannot hold bare. Held over every codepoint, so a
+/// character added to one and not the other is a failure here.
+#[test]
+fn the_grammar_admits_exactly_the_characters_validation_accepts() {
+    let class = DESCRIPTION_GRAMMAR
+        .lines()
+        .find_map(|line| line.strip_prefix("char ::= ["))
+        .and_then(|class| class.strip_suffix(']'))
+        .expect("the grammar names its character class");
+    let (negated, listed) = class
+        .strip_prefix('^')
+        .map_or((false, class), |listed| (true, listed));
+    let ranges = ranges_of(listed);
+    for codepoint in 0..=0x0010_FFFF_u32 {
+        let Some(character) = char::from_u32(codepoint) else {
+            continue;
+        };
+        let named = ranges
+            .iter()
+            .any(|(from, to)| (*from..=*to).contains(&codepoint));
+        let admitted = named != negated;
+        let refused = kr_describe::metadata::is_forbidden_in_a_label(character);
+        assert!(
+            !(admitted && refused),
+            "the grammar admits {codepoint:#06x}, which validation refuses"
+        );
+        assert!(
+            admitted || refused || character == '"' || character == '\\',
+            "the grammar leaves out {codepoint:#06x}, which validation accepts"
+        );
+    }
 }
