@@ -76,9 +76,9 @@ The prebuilt version of libsodium that this workspace uses is built to use the s
 the Rust MSVC targets use the dynamic C runtime. Including both in a single executable leads to
 issues with having two different heap implementations, and the linker reports `LNK4098`. The
 workspace's `.cargo/config.toml` excludes the static C runtime from linking. The release job sets no
-`RUSTFLAGS`, since that variable would replace the flags that exclude the static C runtime. After
-the five builds, the job reads their logs and stops if any link reported `LNK4098`, before anything
-is staged or signed.
+`RUSTFLAGS`, since that variable would replace the flags that exclude the static C runtime, and a run
+that finds it set stops before it builds. After the five builds, the job reads their logs and stops
+if any link reported `LNK4098`, before anything is staged or signed.
 
 The archive holds a `signatures.txt` written by the verification step, not by the build. It records
 one line per artefact: the SHA-256 of the bytes that were verified, the certificate that signed
