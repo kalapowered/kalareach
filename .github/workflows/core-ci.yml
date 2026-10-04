@@ -546,6 +546,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test command_backends
 
+      # What a package writes where it runs the forwarder, and the host replaces with the installed
+      # forwarder's full path: written as the text of a JSON string and as one quoted word of a
+      # shell line, for paths that hold spaces, quotes, backslashes and non-ASCII text, and refused
+      # anywhere but at the start of a command.
+      - name: Test the forwarder's placeholder
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-plugin-sdk --lib forwarder
+
+      # What a typed command is looked up by on this platform: the name in lower case without a
+      # trailing .exe or .com, a path with either separator as the bypass, and the vector the shell
+      # runs keeping what was typed.
+      - name: Test the command a typed name is looked up by
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-shell-integration --lib host::command
+
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.
       - name: Test the doctor's reading of the platform's command backends
