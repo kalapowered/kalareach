@@ -137,9 +137,10 @@ npm token.
 
 It is possible to run the workflow on a branch to test the `check` job. In that case, it will not
 use an archive from a release, but will use the `scripts/release-packages.sh` script to pack the
-checked-out commit, and then run the same checks and the dry run. If npm does not already have the
-version, the `publish` job will fail, due to the deployment policy on the environment it uses, but
-it will not run any of its steps, so will not publish anything.
+checked-out commit, and then run the same checks, with the dry run if npm does not already have the
+version. A version npm does not have then reaches the `publish` job, which will fail, due to the
+deployment policy on the environment it uses, but it will not run any of its steps, so will not
+publish anything.
 
 ### The `npm-publish` environment
 
