@@ -36,6 +36,7 @@ use std::sync::{Arc, RwLock};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::connector::{ConnectorManifest, RouteDirection};
 use kr_plugin_sdk::effect::{ActionImplementation, ParameterKind};
+use kr_plugin_sdk::launch_probe::LaunchProbe;
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_protocol::broker::{DecodingTrust, OfferedDecision};
 use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
@@ -125,6 +126,7 @@ pub struct InstalledConnector {
     table: ConnectorManifest,
     package: PackageIdentity,
     integration: Option<ConnectorCommand>,
+    launch_probe: Option<LaunchProbe>,
 }
 
 impl InstalledConnector {
@@ -283,12 +285,20 @@ impl InstalledConnector {
                     })
                     .collect(),
             });
+        // As the integration: declared by the verified manifest, and run only while the
+        // installation holds the capability the owner confirmed it under.
+        let launch_probe = package
+            .manifest
+            .launch_probe
+            .clone()
+            .filter(|_| source.granted.contains(&PluginCapability::LaunchProbe));
         Ok(Self {
             source,
             manifest: package.manifest,
             table,
             package: identity,
             integration,
+            launch_probe,
         })
     }
 
@@ -329,6 +339,16 @@ impl InstalledConnector {
     #[must_use]
     pub const fn integration(&self) -> Option<&ConnectorCommand> {
         self.integration.as_ref()
+    }
+
+    /// Returns the launch probe the verified manifest declares, where it declares one and the
+    /// installation holds `launch.probe`.
+    ///
+    /// What an installation grants is read each time a connector is assembled, so a probe whose
+    /// capability was withdrawn is not run by the next launch.
+    #[must_use]
+    pub const fn launch_probe(&self) -> Option<&LaunchProbe> {
+        self.launch_probe.as_ref()
     }
 
     /// Returns true when the installation granted this capability.
@@ -838,6 +858,8 @@ pub mod fixture {
         pub directory: &'static [&'static str],
         /// The manifest's `command_integration` member, where it carries one.
         pub integration: Option<serde_json::Value>,
+        /// The manifest's `launch_probe` member, where it carries one.
+        pub launch_probe: Option<serde_json::Value>,
         /// Whether the package installs Claude Code's native bridge and the installation put it
         /// in place.
         pub native_bridge: bool,
@@ -856,6 +878,7 @@ pub mod fixture {
                 executable: COMMAND,
                 directory: &[],
                 integration: Some(released_integration(RELEASED_CLAUDE_CODE)),
+                launch_probe: None,
                 native_bridge: true,
                 component: false,
             }
@@ -874,6 +897,7 @@ pub mod fixture {
                 executable: "gemini",
                 directory: &[],
                 integration: Some(integration),
+                launch_probe: None,
                 native_bridge: false,
                 component: false,
             }
@@ -889,10 +913,41 @@ pub mod fixture {
                 executable: "qodercli",
                 directory: &[],
                 integration: Some(released_integration(RELEASED_QODER_CLI)),
+                launch_probe: None,
                 native_bridge: false,
                 component: false,
             }
         }
+    }
+
+    /// A package of an application that declares a launch probe and no command integration, as
+    /// Codex CLI's does: the application's own diagnostic, run with the launch's configuration
+    /// options, and the check of what it prints that holds the sandbox it will use.
+    #[must_use]
+    pub fn probing(probe: serde_json::Value) -> Shape {
+        Shape {
+            plugin_name: "codex",
+            display_name: "Codex CLI",
+            executable: "codex",
+            directory: &[],
+            integration: None,
+            launch_probe: Some(probe),
+            native_bridge: false,
+            component: false,
+        }
+    }
+
+    /// A manifest's `launch_probe` member that reads the sandbox backend from the diagnostic
+    /// Codex CLI prints, as the pinned build does.
+    #[must_use]
+    pub fn codex_probe(arguments: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "arguments": arguments,
+            "carried_options": ["-c", "--config", "--enable", "--disable"],
+            "mode": "/checks/sandbox.helpers/details/sandbox backend",
+            "refused_in_service_session": ["elevated"],
+            "grant_statement": "Reads which sandbox the application will use before a launch."
+        })
     }
 
     /// The two launch elements core pins for Qoder CLI: `--settings`, and its inline hooks.
@@ -1042,6 +1097,9 @@ pub mod fixture {
         if shape.integration.is_some() {
             capabilities.push(serde_json::json!({ "capability": "command_integration.launch", "reason": "Start the agent with the flags its bridge needs" }));
         }
+        if shape.launch_probe.is_some() {
+            capabilities.push(serde_json::json!({ "capability": "launch.probe", "reason": "Read which sandbox the application will use before a launch" }));
+        }
         let mut manifest = serde_json::json!({
             "manifest_version": 1,
             "publisher_id": "kalareach",
@@ -1134,6 +1192,10 @@ pub mod fixture {
         }
         if let Some(integration) = &shape.integration {
             manifest["command_integration"] = integration.clone();
+        }
+        if let Some(probe) = &shape.launch_probe {
+            manifest["sdk_range"] = serde_json::json!(">=0.1.4, <0.2.0");
+            manifest["launch_probe"] = probe.clone();
         }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
@@ -1249,6 +1311,9 @@ pub mod fixture {
         }
         if shape.integration.is_some() {
             granted.insert(PluginCapability::CommandIntegrationLaunch);
+        }
+        if shape.launch_probe.is_some() {
+            granted.insert(PluginCapability::LaunchProbe);
         }
         Ok(ConnectorSource {
             package_digest: Digest256::from_bytes(*digest.as_bytes()),
