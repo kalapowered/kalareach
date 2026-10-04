@@ -2636,7 +2636,20 @@ project store also adds any nullable column that a store at its current version 
 skill's installation records are still found under the name an earlier build gave a user record. A
 comment at each of these paths says what it serves and when it can be removed.
 
-Similarly, the registry will take its own set of steps to move through schema versions one-by-one. In this case, version 7 will rewrite all create request records to remove environment variables that the creator had sent (and which earlier versions of the registry recorded as part of the reservation). After it has done this, the registry will `VACUUM` and perform a truncating checkpoint to remove the old bytes (which are still in free pages and in the WAL). Only then will it move to the next version. A run that stops before then is made again from the start. If `VACUUM` cannot finish, the daemon does not start. The error says why, and when the disk is full it asks for free space in the registry's directory and in SQLite's temporary directory, then a new start. Any record that is not in the expected format for either version will be cleared as it cannot be proven that the record does not contain environment variables.
+Similarly, the registry moves through its schema versions one step at a time, in order. The step
+from version 6 to version 7 takes out of every recorded create request the environment variables its
+creator sent, which earlier versions of the registry recorded as part of the reservation, and a
+request that is already in the current shape and holds none is left as it is. A request in the shape
+that a build from before the launch profile was recorded wrote is rewritten in the current shape,
+and a request that is in neither shape cannot be shown to hold no variables, so it is cleared. After
+the rewrite the old bytes are still in free pages and in the write-ahead log, so the registry then
+runs `VACUUM` and a truncating checkpoint, and only then records version 7. A run that stops before
+then is made again from the start, because the step can be repeated. If `VACUUM` cannot finish, the
+daemon does not start. The error says why, and when the disk is full it asks for free space in the
+registry's directory and in SQLite's temporary directory, each up to the size of the registry file,
+and then for a new start. If the log cannot be taken in because another connection has the registry
+open, the daemon does not start either, and the error says to stop whatever else has it open and
+then start the daemon again.
 
 ## Retained output, and what eviction leaves behind
 
