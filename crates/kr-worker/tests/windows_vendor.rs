@@ -54,15 +54,19 @@ fn this_executable() -> PathBuf {
     std::env::current_exe().expect("this test's executable")
 }
 
-/// A private directory, made the way the host makes one, and removed by the caller.
-fn private_directory() -> PathBuf {
-    let name: String = kr_ipc::new_uuid()
+/// Eight hexadecimal digits that name a directory of a test's own.
+fn short_name() -> String {
+    kr_ipc::new_uuid()
         .to_string()
         .chars()
         .filter(char::is_ascii_hexdigit)
         .take(8)
-        .collect();
-    let directory = std::env::temp_dir().join(format!("kr-wv-{name}"));
+        .collect()
+}
+
+/// A private directory, made the way the host makes one, and removed by the caller.
+fn private_directory() -> PathBuf {
+    let directory = std::env::temp_dir().join(format!("kr-wv-{}", short_name()));
     kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
     directory
 }
@@ -119,6 +123,8 @@ struct Launch {
     child: Option<AgentChild>,
     process: ProcessStartIdentity,
     session: Arc<SessionJob>,
+    /// A directory of the launch's own beside the private one, removed with it.
+    work: Option<PathBuf>,
     /// Whether dropping this ends the agent's job: a test about what happens when the worker
     /// dies lets go of everything and watches the agent instead.
     end_on_drop: bool,
@@ -171,6 +177,7 @@ impl Launch {
                 child: Some(child),
                 process,
                 session: Arc::clone(session),
+                work: None,
                 end_on_drop: true,
             }),
             Err(error) => {
@@ -253,6 +260,9 @@ impl Drop for Launch {
         }
         kr_worker::windows::job::release_agent(&self.process);
         let _ = std::fs::remove_dir_all(&self.directory);
+        if let Some(work) = self.work.as_ref() {
+            let _ = std::fs::remove_dir_all(work);
+        }
     }
 }
 
@@ -662,7 +672,10 @@ fn start_native_codex(
     codex: &Path,
 ) -> Result<Launch, BrokerError> {
     let directory = private_directory();
-    let work = directory.join("work");
+    // An ordinary directory, because the sandbox gives its restricted token access to the
+    // working directory by an entry of its own on it, and a directory closed to every account but
+    // the owner is not one that entry can open.
+    let work = std::env::temp_dir().join(format!("kr-wv-work-{}", short_name()));
     std::fs::create_dir_all(&work).expect("the working directory");
     // The sandboxed command runs from the working directory, where the sandbox lets it write.
     let helper = work.join("vendor-helper.exe");
@@ -716,6 +729,7 @@ fn start_native_codex(
         child: Some(child),
         process,
         session: Arc::clone(session),
+        work: Some(work),
         end_on_drop: true,
     })
 }
