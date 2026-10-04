@@ -355,7 +355,14 @@ fn quoted_in(capture: &std::path::Path) -> Option<String> {
 }
 
 /// A helper that writes the frames of a bridge to a destination that answers as `pushed` says, and
-/// then ends two seconds after it has written them. Everything it is sent is kept in `captured`.
+/// then ends its shell two seconds after it has written them. Everything it is sent is kept in
+/// `captured`, until the connection closes the helper's input.
+///
+/// Like the destination's own, it reads the opening it is sent before it answers it. And like the
+/// peer of the local contract, it sends nothing more until it has been asked something: the frames
+/// after the acknowledgement wait for the first bytes of the first request. A helper that sent
+/// them unasked would let the connection show the renewed window to a caller that has not made a
+/// call yet, depending on which thread read first.
 fn bridge_helper() -> (tempfile::TempDir, Opening, std::path::PathBuf) {
     let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -375,14 +382,25 @@ fn bridge_helper() -> (tempfile::TempDir, Opening, std::path::PathBuf) {
     frames.push(BridgeFrame::Control(Box::new(mutation_answer())));
     written_frames(&rest, &frames);
     let captured = directory.path().join("captured");
-    let opening = bridge_opening(
-        // What the helper is sent is kept for the test to read. The answer's frames follow the
-        // acknowledgement at once, which a peer that answered a moment after the question would
-        // do no differently to a reader that is not waiting for them. Then it waits and ends.
-        // A background command reads nothing from the shell's input, so it is handed a copy of it.
-        "exec 9<&0; cat <&9 >\"$3\" & cat \"$1\"; cat \"$2\"; sleep 2".to_owned(),
+    let mut opening = bridge_opening(
+        // What the helper is sent is kept for the test to read: the opening, which is `$4` bytes
+        // and is answered, then the first four bytes of the first request, which is what the
+        // frames after the acknowledgement wait for, then the rest as it comes. `dd` with a block
+        // of one byte reads exactly the bytes it is asked for, which `head -c` does not on every
+        // platform: it can take more from a pipe than it writes, and what it took is lost to the
+        // next reader. A background command reads nothing from the shell's input, so it is handed
+        // a copy of it. The shell ends two seconds after the last of the frames; the copy goes on
+        // until the connection closes the helper's input.
+        "exec 9<&0; dd bs=1 count=\"$4\" <&9 >\"$3\" 2>/dev/null; cat \"$1\"; \
+         dd bs=1 count=4 <&9 >>\"$3\" 2>/dev/null; cat <&9 >>\"$3\" & cat \"$2\"; sleep 2"
+            .to_owned(),
         &[&first, &rest, &captured],
     );
+    let opening_length = FrameCodec::new(StreamKind::Control)
+        .encode_message(&BridgeFrame::Hello(Box::new(opening.hello.clone())))
+        .expect("encodes")
+        .len();
+    opening.command.arguments.push(opening_length.to_string());
     (directory, opening, captured)
 }
 
@@ -400,8 +418,10 @@ async fn a_bridged_connection_keeps_the_same_contract() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bridged_request_to_a_helper_that_has_gone_fails_instead_of_waiting() {
     let (_directory, mut opening, _captured) = bridge_helper();
-    // The same helper, without the frames that would answer: it writes its acknowledgement and goes.
-    opening.command.arguments[1] = "cat \"$1\"; exit 0".to_owned();
+    // The same helper, without the frames that would answer: it reads the opening, writes its
+    // acknowledgement and goes.
+    opening.command.arguments[1] =
+        "dd bs=1 count=\"$4\" >/dev/null 2>&1; cat \"$1\"; exit 0".to_owned();
     let invocation = opening.launch().await.expect("the helper answered");
     let mut link = BridgedLink::new(invocation.into_stream());
     let outcome =
