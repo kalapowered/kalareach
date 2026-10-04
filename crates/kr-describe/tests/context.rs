@@ -860,23 +860,24 @@ fn a_counter_that_is_not_steady_still_finds_the_run_that_fits() {
     let full = answer_with("Checks the code entry flow");
     let written = &full.as_bytes()[..full.find("flow").expect("a word") + 2];
     let unsteady = |text: &str| -> usize {
-        // The three longest runs count 129 tokens, and the next 128, as a merge would.
+        // Only the run of 14 characters counts within the bound, as a merge of its last letters
+        // into one token would make it; the shorter and the longer runs count one over.
         let activity = text
             .split("\"activity_text\": \"")
             .nth(1)
             .and_then(|rest| rest.split('"').next())
             .unwrap_or_default();
-        match activity.chars().count() {
-            0..=19 => 128,
-            _ => 129,
+        if activity.chars().count() == 14 {
+            128
+        } else {
+            129
         }
     };
     let ended = end_cut_answer(written, &prompt, 128, unsteady);
     let kept = validate(&ended, &produced_under(), &expectation(2))
         .expect("the run that fits is found")
         .activity;
-    assert!(kept.as_str().chars().count() <= 19);
-    assert!(kept.as_str().chars().count() >= 14, "{kept}");
+    assert_eq!(kept.as_str(), "Checks the cod");
     // Every run over the bound: refused.
     assert_eq!(end_cut_answer(written, &prompt, 100, unsteady), written);
 }
