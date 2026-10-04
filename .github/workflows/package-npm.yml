@@ -5,20 +5,21 @@ name: package-npm
 # A tag of the form `packages/v<version>+<short commit>` releases the two archives
 # (`package-release.yml`), and this workflow takes the SDK's archive from that release, holds it to
 # the release's own sums and to what `npm pack` makes of the same commit, and asks npm what it would
-# do with it. Publishing is a separate job behind the `release-signing` environment: it runs the
-# same archive through `npm publish --provenance`, authenticated by the workflow's own identity, so
-# no registry token exists anywhere in this repository. The registry side (the `@kalareach`
-# organisation, the package's trusted publisher for this workflow file) belongs to the person who
-# owns the organisation.
+# do with it. Publishing is a separate job behind the `npm-publish` environment: a required reviewer
+# approves each publish there, and its deployment policy admits `packages/v*` tags and nothing else.
+# The job runs the same archive through `npm publish --provenance`, authenticated by the workflow's
+# own identity, so no registry token exists anywhere in this repository. The registry side is the
+# package's trusted publisher, set in the package's own settings on npm for this workflow file and
+# this environment; `docs/releases/packages.md` gives its fields.
 #
 # The bytes are bound end to end: the check job records the sha512 of the archive it approved, and
 # the publish job downloads the release again after the approval and refuses any archive whose
 # sha512 is not that one. Both refuse a release that is not immutable, so an asset cannot be
 # replaced between the check and the publish.
 #
-# A run started by hand rehearses everything up to that gate: it packs the checked-out commit with
-# the release script, checks and dry-runs the result, and reaches the gated job, which refuses to
-# publish anything that is not a tagged release.
+# A run started by hand on a branch rehearses the check job: it packs the checked-out commit with
+# the release script, checks and dry-runs the result, and stops there, because the environment's
+# policy refuses the publish job a ref that is not a release tag before any step of it runs.
 on:
   push:
     tags:
@@ -146,12 +147,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # The gate. Nothing above needs the environment, and nothing below runs before it is approved.
-    environment: release-signing
+    environment: npm-publish
     permissions:
       contents: read
       # The workflow's identity is what npm authenticates and what the provenance statement names.
       id-token: write
     steps:
+      # The environment's policy already refuses every other ref; this keeps a loosened policy from
+      # publishing a branch.
       - name: Refuse anything that is not a tagged release
         if: github.ref_type != 'tag'
         run: |
