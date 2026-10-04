@@ -2704,6 +2704,66 @@ fn recovery_settles_an_open_finish_claim_on_an_ended_upload_as_a_retry_does() {
     }
 }
 
+/// KR-REQ-24.09: a finish whose action identifier another request took while its file was being
+/// verified refuses with the identifier conflict, and the upload it was for is left as it was.
+///
+/// A different payload under one identifier is refused before anything is moved. The staged file
+/// here does not match its declaration, so a finish that owned its identifier would end the upload
+/// and remove the payload; one that does not own it has no claim to do either.
+#[test]
+fn a_finish_does_not_end_an_upload_under_an_identifier_another_request_took() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "taken_id.bin")
+        .expect("reserves the upload");
+    let transfer_id = begun.transfer_id;
+    harness
+        .send_all(transfer_id, &bytes)
+        .expect("sends the chunks");
+    let finish = action(&harness, "upload.finish", &bytes);
+    let (staged, _) = payload_paths(&harness, transfer_id, "taken_id.bin");
+    rewrite_in_place(&staged, bytes.len());
+    let before = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads the status")
+        .state;
+
+    // The other request takes the identifier after the finish read it as free and before the file
+    // it is about to verify is opened.
+    let (actor_id, action_id) = (finish.actor_id.clone(), finish.action_id);
+    harness.service.set_staged_open_race_hook(move |store, _| {
+        store
+            .record_action(
+                &actor_id,
+                action_id,
+                &kr_transfer::store::ActionRecord {
+                    method: "upload.cancel".to_owned(),
+                    payload_digest: digest(b"another request"),
+                    result: None,
+                    error_code: None,
+                    error_detail: None,
+                    recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 2),
+                },
+            )
+            .expect("records the other request");
+    });
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&finish))
+        .expect_err("the identifier belongs to another request");
+    harness.service.clear_staged_open_race_hook();
+    assert_eq!(refusal.code(), ErrorCode::IdConflict);
+
+    let after = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads the status")
+        .state;
+    assert_eq!(after, before, "the upload was not ended");
+    assert!(staged.exists(), "and its payload was not removed");
+}
+
 /// KR-REQ-24.09: a copy of one action that finds the payload gone is answered by the row, not by
 /// the open that failed.
 ///
