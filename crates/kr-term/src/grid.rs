@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use wezterm_escape_parser::csi::{CSI, Mode, TerminalMode, TerminalModeCode};
+use wezterm_escape_parser::csi::{CSI, Edit, Mode, TerminalMode, TerminalModeCode};
 use wezterm_escape_parser::osc::OperatingSystemCommand;
 use wezterm_escape_parser::{Action, ControlCode};
 
@@ -544,6 +544,10 @@ pub struct CanonicalGrid {
     config: GridConfig,
     unrecognised: u64,
     tail: Option<TailCell>,
+    /// The last scalar with a width of its own that text printed, which a repeat request draws
+    /// again. Anything that is not printed text takes it away: a repeat follows a character and
+    /// nothing else.
+    last_graphic: Option<char>,
     dropped_marks: u64,
     /// Whether a resize left each buffer holding more than its geometry can, primary first.
     stale: [bool; 2],
@@ -635,6 +639,7 @@ impl CanonicalGrid {
             config,
             unrecognised: 0,
             tail: None,
+            last_graphic: None,
             dropped_marks: 0,
             stale: [false, false],
             history: HistoryAccount::default(),
@@ -713,14 +718,50 @@ impl CanonicalGrid {
             self.sync_history();
             return;
         }
+        if let Some(count) = repeat_count(&adapted.actions) {
+            // A repeat request draws the last character again through the same path text takes,
+            // so it wraps, scrolls and respects a wrap that is pending as text does. The library's
+            // own repeat copies the cell left of the cursor and does none of that.
+            adapted.actions.clear();
+            self.repeat_last_graphic(count);
+            self.sync_history();
+            return;
+        }
         // Anything that is not printed text ends the cell, exactly as it would have done inside one
         // read: the library flushes its own print buffer for the same reason.
         self.tail = None;
+        self.last_graphic = None;
         if !adapted.actions.is_empty() {
             self.terminal
                 .perform_actions(core::mem::take(&mut adapted.actions));
         }
+        // A replacement character is printed, so a repeat request that follows repeats it.
+        if matches!(&event.kind, EventKind::Replacement { .. }) {
+            self.last_graphic = Some(char::REPLACEMENT_CHARACTER);
+        }
         self.sync_history();
+    }
+
+    /// Draws the last character that was printed `count` times, when the request follows one.
+    ///
+    /// The scalars are drawn a bounded run at a time, so a count as large as the screen holds does
+    /// not build a string as large as the screen. What is drawn is the scalar, so a designated
+    /// character set maps it as it did the first time. A request that follows anything else draws
+    /// nothing, and a second request in a row draws nothing either, because the first one is not a
+    /// character.
+    fn repeat_last_graphic(&mut self, count: u32) {
+        const RUN: u32 = 1_024;
+        let Some(scalar) = self.last_graphic.take() else {
+            return;
+        };
+        let mut left = count;
+        while left > 0 {
+            let run = left.min(RUN);
+            let text: String = core::iter::repeat_n(scalar, run as usize).collect();
+            self.print(&text);
+            left -= run;
+        }
+        self.last_graphic = None;
     }
 
     /// Draws a text run as the profile's width model says it should look.
@@ -730,6 +771,13 @@ impl CanonicalGrid {
     /// scalars that this model gives a cell each. And the final cell is drawn on its own, so that
     /// its position is known and a combining mark in a later read can still reach it.
     fn print(&mut self, text: &str) {
+        if let Some(scalar) = text
+            .chars()
+            .rev()
+            .find(|scalar| !crate::unicode::is_zero_width(*scalar))
+        {
+            self.last_graphic = Some(scalar);
+        }
         let mut rest = text;
         let leading = crate::unicode::leading_zero_width(rest);
         if leading > 0 {
@@ -2119,6 +2167,14 @@ fn count_row_links(
         if let Some(link) = cell.attrs().hyperlink() {
             add_link_object(link, seen, links);
         }
+    }
+}
+
+/// The count a repeat request carries, when the actions are one.
+fn repeat_count(actions: &[Action]) -> Option<u32> {
+    match actions {
+        [Action::CSI(CSI::Edit(Edit::Repeat(count)))] => Some(*count),
+        _ => None,
     }
 }
 
