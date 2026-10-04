@@ -15,14 +15,20 @@
 //!
 //! The placeholder stands at the start of a JSON string and nowhere else: a package that writes it
 //! in the middle of a word, or after anything but an opening quotation mark, has written something
-//! the host cannot replace without guessing what it means, and the host refuses it. The same
-//! function serves a registration file and a flag whose value is a JSON document (Qoder CLI's
-//! inline settings), since in both the placeholder stands inside a JSON string.
+//! the host cannot replace without guessing what it means, and the host refuses it. So does a
+//! package that spells it with JSON escapes (`\u007bkr_hook}`): an application decodes the string
+//! to the placeholder and would start a program of that name, and the host replaces only what it
+//! finds written out. The same function serves a registration file and a flag whose value is a JSON
+//! document (Qoder CLI's inline settings), since in both the placeholder stands inside a JSON
+//! string.
 
 use std::path::Path;
 
 /// The text a package writes where it runs the forwarder.
 pub const PLACEHOLDER: &str = "{kr_hook}";
+
+/// The forwarder's own name, which the packages written before the placeholder start it by.
+const BARE_NAME: &str = "kr-hook";
 
 /// Why a text could not be written with the forwarder's path.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -42,12 +48,30 @@ pub enum ExpandError {
         /// Where the placeholder starts, in bytes.
         at: usize,
     },
+    /// A JSON string holds the placeholder only once its escapes are read.
+    #[error("{PLACEHOLDER} is written with JSON escapes, which the host does not replace")]
+    Escaped,
 }
 
-/// Returns true when `text` holds the placeholder.
+/// Returns true when `text` holds the placeholder, written out or, where `text` is JSON, in a key
+/// or a string it decodes to.
 #[must_use]
 pub fn mentions(text: &str) -> bool {
     text.contains(PLACEHOLDER)
+        || serde_json::from_str::<serde_json::Value>(text)
+            .is_ok_and(|document| decoded_mentions(&document))
+}
+
+/// Whether a key or a string of `document` holds the placeholder.
+fn decoded_mentions(document: &serde_json::Value) -> bool {
+    match document {
+        serde_json::Value::String(text) => text.contains(PLACEHOLDER),
+        serde_json::Value::Array(items) => items.iter().any(decoded_mentions),
+        serde_json::Value::Object(members) => members
+            .iter()
+            .any(|(key, member)| key.contains(PLACEHOLDER) || decoded_mentions(member)),
+        _ => false,
+    }
 }
 
 /// Returns `text` with every placeholder replaced by `forwarder`, quoted for where it stands.
@@ -56,9 +80,9 @@ pub fn mentions(text: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`ExpandError::NotText`] when `forwarder` is not text, and [`ExpandError::Misplaced`]
-/// for a placeholder that is not at the start of a JSON string, followed by the end of that string
-/// or a space.
+/// Returns [`ExpandError::NotText`] when `forwarder` is not text, [`ExpandError::Misplaced`] for a
+/// placeholder that is not at the start of a JSON string, followed by the end of that string or a
+/// space, and [`ExpandError::Escaped`] for one that is written with JSON escapes.
 pub fn expand(text: &str, forwarder: &Path) -> Result<String, ExpandError> {
     if !mentions(text) {
         return Ok(text.to_owned());
@@ -90,6 +114,11 @@ pub fn expand(text: &str, forwarder: &Path) -> Result<String, ExpandError> {
         consumed = at + PLACEHOLDER.len();
     }
     expanded.push_str(rest);
+    // What is left is read as the application reads it: a placeholder that was written out has been
+    // replaced, so one that a string holds now was spelt with escapes.
+    if mentions(&expanded) {
+        return Err(ExpandError::Escaped);
+    }
     Ok(expanded)
 }
 
@@ -128,6 +157,31 @@ pub fn expand_flags(
             expand(flag, forwarder.ok_or(ExpandError::NoForwarder)?)
         })
         .collect()
+}
+
+/// Returns true when a flag is a JSON document that starts the forwarder by its bare name, as the
+/// packages written before the placeholder do: `kr-hook` alone, or as the first word of a line.
+///
+/// A program that is started by a bare name is looked for in the application's own working directory
+/// first on Windows, so a program planted there would run in the forwarder's place.
+#[must_use]
+pub fn starts_by_bare_name(flags: &[String]) -> bool {
+    fn bare(document: &serde_json::Value) -> bool {
+        match document {
+            serde_json::Value::String(text) => {
+                text == BARE_NAME
+                    || text
+                        .strip_prefix(BARE_NAME)
+                        .is_some_and(|rest| rest.starts_with(' '))
+            }
+            serde_json::Value::Array(items) => items.iter().any(bare),
+            serde_json::Value::Object(members) => members.values().any(bare),
+            _ => false,
+        }
+    }
+    flags.iter().any(|flag| {
+        serde_json::from_str::<serde_json::Value>(flag).is_ok_and(|document| bare(&document))
+    })
 }
 
 /// Writes `text` as the inside of a JSON string.
@@ -190,24 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_line_decodes_to_the_path_as_one_word_and_the_rest_as_it_was() {
-        for path in PATHS {
-            let template = r#"{"command": "{kr_hook} gemini-cli hook", "timeout": 5000}"#;
-            let expanded = expand(template, Path::new(path)).expect("expands");
-            let line = decoded(&expanded)["command"]
-                .as_str()
-                .expect("a line")
-                .to_owned();
-            assert_eq!(
-                line,
-                format!("{} gemini-cli hook", posix_word(path)),
-                "{path}"
-            );
-            assert_eq!(decoded(&expanded)["timeout"], 5000);
-        }
-    }
-
-    #[test]
     fn a_flag_that_is_a_json_document_is_written_the_same_way() {
         let flag = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"{kr_hook}","args":["qoder-cli","hook"],"timeout":5}]}]}}"#;
         for path in PATHS {
@@ -244,6 +280,7 @@ mod tests {
             r#"{"command": "a {kr_hook}"}"#,
             r#"{"command": "{kr_hook}{kr_hook}"}"#,
             r#"{"command": "\"{kr_hook}\""}"#,
+            r#"{"command": "\"{kr_hook}"}"#,
             r#"{"command": "{kr_hook}\t"}"#,
             "{kr_hook}",
             r#"{"command": ["{kr_hook}", "hook"], "x": {kr_hook}}"#,
@@ -256,6 +293,51 @@ mod tests {
                 "{template}"
             );
         }
+    }
+
+    #[test]
+    fn a_placeholder_spelt_with_json_escapes_is_refused_wherever_it_stands() {
+        for template in [
+            r#"{"command": "\u007bkr_hook}"}"#,
+            r#"{"command": "\u007Bkr_hook}"}"#,
+            r#"{"command": "{kr_hook\u007d"}"#,
+            r#"{"command": "{\u006br_hook}"}"#,
+            r#"{"command": "\u007bkr_hook} gemini-cli hook"}"#,
+            r#"{"\u007bkr_hook}": 1}"#,
+            r#"{"a": "{kr_hook}", "b": "\u007bkr_hook}"}"#,
+        ] {
+            assert!(mentions(template), "{template}");
+            assert_eq!(
+                expand(template, Path::new("/opt/kr-hook")),
+                Err(ExpandError::Escaped),
+                "{template}"
+            );
+        }
+        assert_eq!(
+            expand_flags(
+                &[r#"{"command": "\u007bkr_hook}"}"#.to_owned()],
+                Some(Path::new("/opt/kr-hook"))
+            ),
+            Err(ExpandError::Escaped)
+        );
+    }
+
+    #[test]
+    fn flags_that_start_the_forwarder_by_its_bare_name_are_known() {
+        let bare = |text: &str| starts_by_bare_name(&[text.to_owned()]);
+        assert!(bare(
+            r#"{"hooks":[{"command":"kr-hook","args":["qoder-cli","hook"]}]}"#
+        ));
+        assert!(bare(r#"{"hooks":[{"command":"kr-hook qoder-cli hook"}]}"#));
+        assert!(!bare(
+            r#"{"hooks":[{"command":"{kr_hook}","args":["qoder-cli","hook"]}]}"#
+        ));
+        assert!(!bare(r#"{"hooks":[{"command":"/opt/kr-hook"}]}"#));
+        assert!(!bare("--settings"));
+        assert!(
+            !bare("kr-hook"),
+            "a flag that is not a document starts nothing"
+        );
     }
 
     #[test]

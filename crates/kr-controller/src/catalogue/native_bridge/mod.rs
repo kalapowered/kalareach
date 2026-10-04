@@ -2377,6 +2377,8 @@ fn invocations(
                 {
                     return Err(unaccepted());
                 }
+                // The bare name is what the packages written before the placeholder register; it
+                // is read until no catalogue holds one, and then only the placeholder is.
                 let surface = if command == "kr-hook" || command == forwarder::PLACEHOLDER {
                     let arguments = members.get("args").and_then(serde_json::Value::as_array);
                     let words: Vec<&str> = arguments

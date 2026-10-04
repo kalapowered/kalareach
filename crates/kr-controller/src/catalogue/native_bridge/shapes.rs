@@ -36,7 +36,7 @@ pub(super) fn check(application: &str, directory: &str, tail: &str, value: &Valu
             manifest(value, &["name", "version", "description"], directory)
         }
         ("Gemini CLI", ".gemini-extension-install.json") => record(value, directory),
-        (_, "hooks/hooks.json") => hooks(value),
+        (_, "hooks/hooks.json") => hooks(application, value),
         _ => Err("this host names no shape for it".to_owned()),
     }
 }
@@ -112,10 +112,43 @@ fn servers(value: &Value) -> Checked {
     Ok(())
 }
 
+/// Whether the application runs a command it is given as a line in a shell. Gemini CLI does: a
+/// handler's command is one line, and a program it starts is a word of that line. The others start
+/// the command as a program, with its arguments in a list beside it.
+fn runs_a_line(application: &str) -> bool {
+    application == "Gemini CLI"
+}
+
+/// Checks that a command that starts with the forwarder's placeholder is in the form its
+/// application starts a command in. The host writes the forwarder's path for the form the command
+/// is written in, one word in single quotes in a line and the plain path in a program's name, so a
+/// form the application does not start would hand a shell an unquoted path, or a program a name
+/// that is not one.
+fn placeholder_form(application: &str, command: &Value, arguments: Option<&Value>) -> Checked {
+    if !command
+        .as_str()
+        .is_some_and(|command| command.starts_with(kr_plugin_sdk::forwarder::PLACEHOLDER))
+    {
+        return Ok(());
+    }
+    let line = runs_a_line(application);
+    if line == arguments.is_some() {
+        let (written, started) = if line {
+            ("a program with its arguments in a list", "one line")
+        } else {
+            ("one line", "a program with its arguments in a list")
+        };
+        return Err(format!(
+            "the forwarder is written as {written}, and {application} starts a command as {started}"
+        ));
+    }
+    Ok(())
+}
+
 /// A hooks file: events, each a list of groups, each group an optional matcher and a list of
 /// handlers, each handler a command: the kind `command`, its command, and its name, arguments and
 /// time limit. A handler of another kind, which calls a tool or posts to an address, is not one.
-fn hooks(value: &Value) -> Checked {
+fn hooks(application: &str, value: &Value) -> Checked {
     let held = members(value, &["hooks"], "the hooks file")?;
     let Some(Value::Object(events)) = held.get("hooks") else {
         return Err("the hooks file has no hooks object".to_owned());
@@ -147,6 +180,9 @@ fn hooks(value: &Value) -> Checked {
                     && held.get("timeout").is_none_or(Value::is_number);
                 if !fits {
                     return Err("a handler is not a command this host names".to_owned());
+                }
+                if let Some(command) = held.get("command") {
+                    placeholder_form(application, command, held.get("args"))?;
                 }
             }
         }
