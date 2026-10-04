@@ -287,7 +287,9 @@ What a model wrote of a session is placed at the session's start, since it summa
 
 The directory and the program the host observed carry the moment it observed them. That is the first time the host saw each one as it now stands. A page that repeats what the host holds moves nothing, and a change starts the moment again for that field alone. Until the host has observed a directory, the working directory is the one the session started in, stamped when it started, and the foreground is reported as unavailable.
 
-While privacy mode is on none of this is read. The host keeps each observation under the privacy generation it was captured under, so a read after privacy mode ends finds nothing from before it.
+The host cannot date what it finds when it starts. A worker answers a restarted host with the facts it kept from before, which were produced at a moment nothing in the host knows. For a session that began before the host started, a directory or program found that way is not carried until the host sees it change. The program counts as the active application only while its command runs: once the worker records how the command ended, it does not.
+
+While privacy mode is on, nothing a model wrote and nothing the host observed is read. The host keeps each observation under the privacy generation it was captured under, so a read after privacy mode ends finds nothing from before it.
 
 ## Privacy mode
 
