@@ -30,9 +30,14 @@ use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::paths::Endpoint;
 use kr_ipc::peer::PeerIdentity;
 use kr_protocol::ids::{RequestId, SessionId};
-use kr_protocol::root::{DETACH_HINT, PromptGeneration};
+use kr_protocol::root::{
+    CommandBypassReason, DETACH_HINT, FenceState, PromptGeneration, RootCommandResolveResult,
+    WithheldReason,
+};
+use kr_protocol::scalars::{Nullable, Uuid};
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
 use kr_shell_integration::contract::qualification::QualificationReason;
+use kr_shell_integration::contract::requests::{LaunchRejectionReason, LaunchTransactionId};
 use kr_shell_integration::contract::transport::{
     ENDPOINT_VARIABLE, EventOutcome, SECRET_VARIABLE, WorkerExpectation,
 };
@@ -399,6 +404,117 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
         .await
         .expect_err("the client's end is closed");
     println!("the endpoint ended with: {error}");
+}
+
+/// KR-REQ-12.07
+///
+/// What a command waits for before it starts, over the pipe. The module's ask sends its question and
+/// takes only the answer to it out of what the pipe delivers: what the worker wrote ahead of the
+/// answer is still in the client's queue, in the order it came. A question the worker never answers
+/// ends the wait with nothing and leaves that answer owed, and while it is owed a third question
+/// sends nothing, so the next frame the worker reads after the second question is an event the
+/// client sends itself. Every step is decided by what the worker reads and the client reports, in
+/// order, and none by how long anything took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_question_takes_only_its_answer_and_is_not_asked_again_while_one_is_owed() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let session_id = a_session();
+    let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
+    let mut client = start_client(&endpoint, directory.path(), "wait", &[]);
+
+    let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
+    // The activation is not answered: an answer to it would be one more frame in the queue the
+    // case reads back.
+    let _activation = register(
+        &endpoint,
+        &mut reader,
+        &mut writer,
+        &peer,
+        worker_eof_byte(),
+    )
+    .await;
+
+    // The first question is answered after two frames that have nothing to do with it.
+    let FromBridge::Event { id: first, event } = within("the first question", reader.recv())
+        .await
+        .expect("an event")
+    else {
+        panic!("the client asks about a command");
+    };
+    let BridgeEvent::CommandResolve(asked) = *event else {
+        panic!("the first event after the activation is a question: {event:?}");
+    };
+    assert_eq!(asked.argv, ["kr-probe", "one"]);
+    within(
+        "an unrelated publication",
+        writer.send_publication(kr_protocol::root::FencePublication::Withheld {
+            reason: WithheldReason::ReaderMoved,
+            state: FenceState::Unfenced,
+        }),
+    )
+    .await
+    .expect("writes");
+    within(
+        "an unrelated revocation",
+        writer.send_revocation(
+            LaunchTransactionId::new(Uuid::from_bytes([0x44; 16])),
+            LaunchRejectionReason::EditorLeft,
+        ),
+    )
+    .await
+    .expect("writes");
+    within(
+        "the answer",
+        writer.send_event_result(
+            first,
+            EventOutcome::CommandResolved(Box::new(RootCommandResolveResult {
+                arguments: asked.argv.clone(),
+                added: Vec::new(),
+                bypass: Nullable::some(CommandBypassReason::NotIntegrated),
+                backend: Nullable::null(),
+            })),
+        ),
+    )
+    .await
+    .expect("answers the question");
+
+    // The second question is read and left unanswered.
+    let FromBridge::Event { event, .. } = within("the second question", reader.recv())
+        .await
+        .expect("an event")
+    else {
+        panic!("the client asks about a second command");
+    };
+    let BridgeEvent::CommandResolve(second) = *event else {
+        panic!("the next event is a question: {event:?}");
+    };
+    assert_eq!(second.argv, ["kr-probe", "two"]);
+
+    // The next frame after it is the client's own event, so the third question sent nothing.
+    let FromBridge::Event { event, .. } = within("the next event", reader.recv())
+        .await
+        .expect("an event")
+    else {
+        panic!("the client reports an event");
+    };
+    let BridgeEvent::HooksActivated(known) = *event else {
+        panic!("a question was asked while an answer was owed: {event:?}");
+    };
+    assert_eq!(known.prompt_generation, PromptGeneration::new(2));
+
+    let status = ends(&mut client, || report(directory.path(), "wait")).await;
+    let observed = report(directory.path(), "wait");
+    assert!(status.success(), "the client ended {status}:\n{observed}");
+    for line in [
+        "first answered=True\n",
+        "first bypass=not_integrated\n",
+        "queued fence_published,launch_revoked\n",
+        "second answered=False owed=True\n",
+        "third answered=False owed=True\n",
+        "known event sent\n",
+    ] {
+        assert!(observed.contains(line), "{line:?} is not in:\n{observed}");
+    }
 }
 
 /// KR-REQ-07.73, KR-REQ-07.74

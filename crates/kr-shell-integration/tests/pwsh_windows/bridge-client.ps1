@@ -22,8 +22,10 @@ param(
     # `exchange` collects the worker's answer to the event; `closed` waits for the worker to go;
     # `hello` sends the hello to a server that answers nothing and holds the connection until that
     # server lets go, or reports that the client refused the endpoint; `evaluate` runs the module's
-    # check of an endpoint's owner and list over the descriptors in `Fixtures`, with no endpoint.
-    [Parameter(Mandatory)][ValidateSet('exchange', 'closed', 'hello', 'evaluate')][string]$Mode,
+    # check of an endpoint's owner and list over the descriptors in `Fixtures`, with no endpoint;
+    # `wait` asks the worker about three commands through the module's own ask and reports what each
+    # ask did and what stayed in the queue.
+    [Parameter(Mandatory)][ValidateSet('exchange', 'closed', 'hello', 'evaluate', 'wait')][string]$Mode,
     # One case per line: a name, a tab, and a security descriptor in SDDL in which `{me}` stands for
     # this account.
     [string]$Fixtures,
@@ -152,6 +154,41 @@ Send-KrEvent 'hooks_activated' @{
 }
 if ($null -eq $script:Kr.Socket) { Stop-WithReason 'the event closed the endpoint' }
 Write-Report "event sent id=$($script:Kr.EventCounter)"
+
+if ($Mode -eq 'wait') {
+    # The module's own ask, with a short budget so that a withheld answer ends the wait quickly. It
+    # sends the question, takes only the answer to it out of what the pipe delivers and leaves
+    # everything else in the queue, in order.
+    function Ask-About {
+        param([string]$Word, [uint64]$BudgetMs)
+        Invoke-KrAskResolve @('kr-probe', $Word) 'C:\kr\kr-probe.exe' 'C:\kr' ([uint64]1) ([uint64]1) $BudgetMs
+    }
+    $first = Ask-About 'one' 20000
+    Write-Report ("first answered={0}" -f ($null -ne $first))
+    if ($null -ne $first) { Write-Report ("first bypass={0}" -f $first['bypass']) }
+    # What the worker wrote ahead of the answer is still there, in the order it came.
+    $queued = [System.Collections.Generic.List[string]]::new()
+    while ($true) {
+        $body = Read-KrFrame
+        if ($null -eq $body) { break }
+        $queued.Add((Get-KrVariant (ConvertFrom-KrCbor $body)).Name)
+    }
+    Write-Report ("queued {0}" -f ($queued -join ','))
+    # The second question is never answered, so the wait ends with nothing, and the answer is owed.
+    $second = Ask-About 'two' 1500
+    Write-Report ("second answered={0} owed={1}" -f ($null -ne $second), ($script:Kr.Owed -ne 0))
+    # While an answer is owed a question sends nothing.
+    $third = Ask-About 'three' 1500
+    Write-Report ("third answered={0} owed={1}" -f ($null -ne $third), ($script:Kr.Owed -ne 0))
+    # A known event, which has to be the next frame the worker reads after the second question.
+    Send-KrEvent 'hooks_activated' @{
+        modules           = @()
+        session_id        = $script:Kr.Session
+        prompt_generation = [uint64]2
+    }
+    Write-Report 'known event sent'
+    exit 0
+}
 
 # Neither branch waits on the endpoint: each one asks the module for what has already arrived,
 # exactly as a reader between operations does, and gives up on a deadline of its own.
