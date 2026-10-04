@@ -545,6 +545,18 @@ impl World {
         text[text.ceil_char_boundary(from)..].to_owned()
     }
 
+    /// Refreshes the enrolment `label` through `kr` and returns what it printed. A refusal of the
+    /// destination's answer is not a failed command: the row comes back with no verification.
+    fn refreshed(&self, label: &str) -> Value {
+        let refreshed = self.run(&["--json", "bridge", "refresh", label]);
+        assert!(
+            refreshed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&refreshed.stderr)
+        );
+        serde_json::from_slice(&refreshed.stdout).expect("kr printed JSON")
+    }
+
     /// Creates an invisible session in the destination through the bridge, and returns what `kr`
     /// printed of it.
     fn create_in_destination(&self) -> Value {
@@ -1351,6 +1363,421 @@ async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel(
         String::from_utf8_lossy(&wrong.stderr).contains("different environment"),
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// An SSH host over a real `ssh` and a real `sshd`.
+
+/// The program `name` on this host's search path, or `None` with the reason a test gives for
+/// standing down. A run that sets `KR_REQUIRE_SSHD` treats a missing program as a failure instead,
+/// so a host that should have them cannot pass without running.
+fn program(name: &str) -> Option<PathBuf> {
+    let found = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .chain(["/usr/sbin".into(), "/usr/local/sbin".into()])
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file());
+    if found.is_none() {
+        assert!(
+            std::env::var_os("KR_REQUIRE_SSHD").is_none(),
+            "KR_REQUIRE_SSHD is set and this host has no {name}"
+        );
+        eprintln!("skipped: this host has no {name}, which this test needs");
+    }
+    found
+}
+
+/// A private `sshd`, run as the current user on a loopback port, with a host key and an authorised
+/// key made for this test, and stopped when it is dropped. It reads and writes nothing of the
+/// account's `~/.ssh`: its keys are in the directory it is given, it runs none of the account's
+/// `~/.ssh/rc`, and the `ssh` that reaches it is given its own configuration, which names the
+/// server's port, the client key and the host keys this login trusts. The remote command still
+/// runs under the account's own shell, which reads whatever startup files that shell reads for a
+/// command it is given. Every session starts with `environment`, which is how the helper finds
+/// the environment it is the helper of.
+struct PrivateSshd {
+    child: std::process::Child,
+    port: u16,
+    directory: PathBuf,
+    ssh: PathBuf,
+    host_key: PathBuf,
+}
+
+impl Drop for PrivateSshd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl PrivateSshd {
+    /// Starts one, or says why this host cannot: no `sshd` to run, no `ssh-keygen` to make keys
+    /// with, or no `ssh` to reach it.
+    fn start(directory: &Path, environment: &str) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sshd = program("sshd")?;
+        let keygen = program("ssh-keygen")?;
+        let ssh = program("ssh")?;
+        std::fs::create_dir_all(directory).expect("a directory for the server's keys");
+        let make = |name: &str| {
+            let path = directory.join(name);
+            let made = std::process::Command::new(&keygen)
+                .current_dir(directory)
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&path)
+                .status()
+                .expect("ssh-keygen runs");
+            assert!(made.success(), "ssh-keygen makes a {name}");
+            path
+        };
+        let host_key = make("hostkey");
+        let client_key = make("clientkey");
+        let authorised = directory.join("authorized_keys");
+        std::fs::copy(client_key.with_extension("pub"), &authorised).expect("an authorised key");
+        for path in [&authorised, &host_key, &client_key] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("owner-only keys");
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free loopback port")
+            .port();
+        let log = std::fs::File::create(directory.join("sshd.log")).expect("a log");
+        let child = std::process::Command::new(sshd)
+            .current_dir(directory)
+            .args(["-D", "-e", "-f", "/dev/null", "-h"])
+            .arg(&host_key)
+            .arg("-p")
+            .arg(port.to_string())
+            .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
+            .args([
+                "-o",
+                "UsePAM=no",
+                "-o",
+                "StrictModes=no",
+                "-o",
+                "PermitUserRC=no",
+            ])
+            .arg("-o")
+            .arg(format!("AuthorizedKeysFile={}", authorised.display()))
+            .args(["-o", "PasswordAuthentication=no"])
+            .args(["-o", "KbdInteractiveAuthentication=no"])
+            .arg("-o")
+            .arg(format!("SetEnv {environment}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("a log handle"))
+            .stderr(log)
+            .spawn()
+            .expect("sshd starts");
+        let server = Self {
+            child,
+            port,
+            directory: directory.to_path_buf(),
+            ssh,
+            host_key,
+        };
+        // Ready is a connection that is accepted, not a moment that has passed.
+        let started = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "sshd never accepted a connection: {}",
+                server.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(server)
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.directory.join("sshd.log")).unwrap_or_default()
+    }
+
+    /// Makes the program the daemon runs as `ssh` in `tools`: the real `ssh`, given a
+    /// configuration file of this test's own, because `ssh` finds the account's `~/.ssh/config`
+    /// from the account database and no variable moves it. Every argument the daemon passes
+    /// follows the configuration unchanged, and each run is written to `ssh-invocations`. The
+    /// host `kr-test-sshd` is this server, and `public` is the host key this login trusts for it.
+    fn reached_through(&self, tools: &Path, public: &Path) {
+        let key = self.directory.join("clientkey");
+        std::fs::write(
+            self.directory.join("ssh_config"),
+            format!(
+                "Host kr-test-sshd\n  HostName 127.0.0.1\n  Port {port}\n  IdentityFile {key}\n  \
+                 IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {known}\n  \
+                 GlobalKnownHostsFile /dev/null\n  LogLevel ERROR\n",
+                port = self.port,
+                key = key.display(),
+                known = self.directory.join("known_hosts").display()
+            ),
+        )
+        .expect("the configuration of this test's own");
+        self.trust(public);
+        let text = tools.join("ssh.real.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{tools}/ssh-invocations'\n\
+                 exec '{ssh}' -F '{config}' \"$@\"\n",
+                tools = tools.display(),
+                ssh = self.ssh.display(),
+                config = self.directory.join("ssh_config").display()
+            ),
+        )
+        .expect("the program that runs ssh");
+        kr_ipc::testing::place_program(&text, &tools.join("ssh"));
+    }
+
+    /// Makes `public`, a public key file, the one host key this login trusts for the server.
+    fn trust(&self, public: &Path) {
+        let key = std::fs::read_to_string(public).expect("a public key");
+        let mut fields = key.split_whitespace();
+        let (kind, material) = (
+            fields.next().expect("a type"),
+            fields.next().expect("a key"),
+        );
+        std::fs::write(
+            self.directory.join("known_hosts"),
+            format!("[127.0.0.1]:{} {kind} {material}\n", self.port),
+        )
+        .expect("the host keys this login trusts");
+    }
+
+    /// The server's own host key, public half.
+    fn host_public(&self) -> PathBuf {
+        self.host_key.with_extension("pub")
+    }
+}
+
+/// KR-REQ-25.26: an SSH host registers its identity and its scoped channel through a real `ssh` to
+/// a real `sshd`. The daemon runs the `ssh` of this host, the `sshd` is a private one on a loopback
+/// port whose helper is the destination's own `kr bridge --stdio`, and what registers is what the
+/// helper answers: the enrolment learns the destination's identity from it and a refresh records
+/// the channel for that record. An identity the person did not give is refused and recorded
+/// nowhere, and a host whose key this login does not trust registers nothing and takes back what
+/// an earlier answer had registered, which the same host's key puts right again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ssh_host_registers_its_identity_and_channel_through_a_real_ssh_to_a_real_sshd() {
+    let world = World::start().await;
+    // The destination's daemon is started by a create, as for any environment that is running.
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+    let environment = format!(
+        "KR_RUNTIME_DIR={} KR_STATE_DIR={} HOME={}",
+        world.destination.root().join("r").display(),
+        world.destination.root().join("s").display(),
+        world.home.display()
+    );
+    let Some(server) = PrivateSshd::start(&world.source.root().join("sshd"), &environment) else {
+        return;
+    };
+    server.reached_through(&world.tools, &server.host_public());
+
+    let helper = support::kr().display().to_string();
+    let account = String::from_utf8(
+        std::process::Command::new("/usr/bin/id")
+            .current_dir("/")
+            .arg("-un")
+            .output()
+            .expect("id runs")
+            .stdout,
+    )
+    .expect("a name")
+    .trim()
+    .to_owned();
+    // The rows `kr bridge list` prints, from a command that succeeded.
+    let rows = || -> Vec<Value> {
+        let listed = world.run(&["--json", "bridge", "list"]);
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
+        listed["rows"].as_array().expect("rows").clone()
+    };
+    let channel_scoped = |label: &str| -> bool {
+        rows()
+            .iter()
+            .find(|row| row["enrolment"]["label"] == label)
+            .unwrap_or_else(|| panic!("no row for {label}"))["readiness"]["channel_scoped"]
+            .as_bool()
+            .expect("a flag")
+    };
+    let accepted = || server.log().matches("Accepted publickey for").count();
+    let enrolled = world.run(&[
+        "--json",
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "sshdest",
+        "--target",
+        "kr-test-sshd",
+        "--user",
+        &account,
+        "--helper",
+        &helper,
+        "--probe",
+    ]);
+    assert!(
+        enrolled.status.success(),
+        "{}; it said {}; sshd logged {}",
+        String::from_utf8_lossy(&enrolled.stdout),
+        String::from_utf8_lossy(&enrolled.stderr),
+        server.log()
+    );
+    let row: Value = serde_json::from_slice(&enrolled.stdout).expect("kr printed JSON");
+    assert_eq!(
+        row["row"]["enrolment"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "the identity is the destination's own, learned from its helper over ssh: {row}"
+    );
+    assert_eq!(row["row"]["readiness"]["channel_scoped"], false, "{row}");
+
+    let refreshed = world.run(&["--json", "bridge", "refresh", "sshdest"]);
+    assert!(
+        refreshed.status.success(),
+        "{}; sshd logged {}",
+        String::from_utf8_lossy(&refreshed.stderr),
+        server.log()
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        refreshed["verification"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["verification"]["os_user"], account, "{refreshed}");
+    assert_eq!(
+        refreshed["row"]["readiness"]["channel_scoped"], true,
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["started"], false, "{refreshed}");
+    assert!(
+        server.log().contains("Accepted publickey for"),
+        "the server authenticated the key this test made: {}",
+        server.log()
+    );
+    // An identity the person did not give is refused, and nothing is recorded for it.
+    let wrong = world.run(&[
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "other",
+        "--target",
+        "kr-test-sshd",
+        "--user",
+        &account,
+        "--helper",
+        &helper,
+        "--environment-id",
+        "66666666-6666-4666-8666-666666666666",
+        "--probe",
+    ]);
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("different environment"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+    assert!(
+        rows()
+            .iter()
+            .all(|row| row["enrolment"]["label"] != "other"),
+        "nothing was recorded for it"
+    );
+
+    // A record that names an identity the destination's helper does not answer with registers
+    // nothing: the helper is reached and answers, and the daemon refuses an answer that is not the
+    // record's.
+    let named = world.run(&[
+        "--json",
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "mismatch",
+        "--target",
+        "kr-test-sshd",
+        "--user",
+        &account,
+        "--helper",
+        &helper,
+        "--environment-id",
+        "66666666-6666-4666-8666-666666666666",
+    ]);
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+    let refused = world.refreshed("mismatch");
+    assert!(refused["verification"].is_null(), "{refused}");
+    assert_eq!(
+        refused["row"]["readiness"]["channel_scoped"], false,
+        "{refused}"
+    );
+    assert!(
+        !channel_scoped("mismatch"),
+        "no channel for another identity"
+    );
+    assert!(
+        channel_scoped("sshdest"),
+        "and the record whose identity the helper answered with keeps its own"
+    );
+
+    // A server whose host key this login does not trust is not asked anything: ssh refuses it
+    // before the helper starts, and the channel an earlier answer had registered is taken back.
+    // Trusting the server's own key again registers it again.
+    let stranger = server.directory.join("stranger");
+    let made = std::process::Command::new(program("ssh-keygen").expect("ssh-keygen"))
+        .current_dir(&server.directory)
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&stranger)
+        .status()
+        .expect("ssh-keygen runs");
+    assert!(made.success());
+    server.trust(&stranger.with_extension("pub"));
+    let accepted_before = accepted();
+    let untrusted = world.refreshed("sshdest");
+    assert!(untrusted["verification"].is_null(), "{untrusted}");
+    assert_eq!(
+        untrusted["row"]["readiness"]["channel_scoped"], false,
+        "{untrusted}"
+    );
+    assert_eq!(
+        accepted(),
+        accepted_before,
+        "ssh refused the server before it authenticated: {}",
+        server.log()
+    );
+    assert!(
+        !channel_scoped("sshdest"),
+        "a host this login does not trust holds no channel"
+    );
+    server.trust(&server.host_public());
+    let again = world.refreshed("sshdest");
+    assert_eq!(again["row"]["readiness"]["channel_scoped"], true, "{again}");
+    assert!(
+        channel_scoped("sshdest"),
+        "the trusted host registers again"
+    );
+
+    let invoked = std::fs::read_to_string(world.tools.join("ssh-invocations"))
+        .expect("the ssh of this host was run");
+    assert!(
+        invoked
+            .lines()
+            .all(|line| line.ends_with(&format!("-- kr-test-sshd {helper} bridge --stdio"))),
+        "every ssh run asked the helper for its bridge and nothing else: {invoked}"
     );
 }
 
