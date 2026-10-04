@@ -446,6 +446,21 @@ impl core::fmt::Debug for RaceHook {
     }
 }
 
+/// What a test does with the result a call is about to record on its claim.
+#[cfg(feature = "testing")]
+pub(crate) type CompletionHookCallback = dyn Fn(&Store, &Action, &[u8]) + Send + Sync;
+
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+pub(crate) struct CompletionHook(pub(crate) Arc<CompletionHookCallback>);
+
+#[cfg(feature = "testing")]
+impl core::fmt::Debug for CompletionHook {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CompletionHook(..)")
+    }
+}
+
 /// Where a test can stop a finish to do what another request could do at that point.
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug)]
@@ -470,6 +485,7 @@ pub(crate) struct RaceHooks {
     finish: std::sync::RwLock<Option<RaceHook>>,
     staged_open: std::sync::RwLock<Option<RaceHook>>,
     post_verification: std::sync::RwLock<Option<RaceHook>>,
+    completion: std::sync::RwLock<Option<CompletionHook>>,
 }
 
 /// The transfer service of one environment.
@@ -592,6 +608,25 @@ impl TransferService {
             .post_verification
             .write()
             .expect("not poisoned") = None;
+    }
+
+    /// Stops a call that is about to record the result of its claim, and runs `hook` with the
+    /// encoded result it was going to record.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn set_completion_hook<F>(&self, hook: F)
+    where
+        F: Fn(&Store, &Action, &[u8]) + Send + Sync + 'static,
+    {
+        *self.race_hooks.completion.write().expect("not poisoned") =
+            Some(CompletionHook(Arc::new(hook)));
+    }
+
+    /// Removes the hook [`Self::set_completion_hook`] set.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn clear_completion_hook(&self) {
+        *self.race_hooks.completion.write().expect("not poisoned") = None;
     }
 
     /// Runs the hook a test set for `point`, if it set one, with the journal held.
@@ -1313,8 +1348,7 @@ impl TransferService {
         // The claim carried no result, because the handle did not exist yet. It does now, so the
         // record is completed with it and a later repeat is answered with this handle rather than
         // told the outcome is unknown. Nothing replaces a result already recorded.
-        self.complete_claim(action, &result)?;
-        Ok(result)
+        self.complete_claim(action, result)
     }
 
     fn finish_published(
@@ -1334,8 +1368,7 @@ impl TransferService {
             already_published: !mine,
             preview_unavailable: Nullable(row.preview_unavailable.clone()),
         };
-        self.complete_claim(action, &result)?;
-        Ok(result)
+        self.complete_claim(action, result)
     }
 
     fn finish_publishing(
@@ -1376,8 +1409,7 @@ impl TransferService {
                     already_published: !mine,
                     preview_unavailable: Nullable(published_at),
                 };
-                self.complete_claim(action, &result)?;
-                Ok(result)
+                self.complete_claim(action, result)
             }
             _ => {
                 drop(store);
@@ -1638,8 +1670,7 @@ impl TransferService {
                             // answer from there.
                             released_byte_len: U64::new(row.declared_byte_len),
                         };
-                        self.complete_claim(action, &result)?;
-                        return Ok(result);
+                        return self.complete_claim(action, result);
                     }
                     Recorded::Absent => {
                         drop(payloads);
@@ -1692,8 +1723,7 @@ impl TransferService {
             released_byte_len: U64::new(row.declared_byte_len),
         };
         // Recorded now, because now it is true.
-        self.complete_claim(action, &result)?;
-        Ok(result)
+        self.complete_claim(action, result)
     }
 
     /// Returns one published attachment's handle, for the principal that owns it.
@@ -2676,32 +2706,57 @@ impl TransferService {
         recorded_with(&store, action)
     }
 
-    /// Records the result of an action that was claimed without one.
+    /// Records the result of an action that was claimed without one, and returns the answer the
+    /// action stands answered with.
     ///
     /// A two-commit effect claims its action with the first commit; this is the second half. It
-    /// replaces nothing: the first result recorded for an identifier is the one that stands.
-    fn complete_claim<T: serde::Serialize>(
-        &self,
-        action: Option<&Action>,
-        result: &T,
-    ) -> Result<()> {
+    /// replaces nothing: the first result recorded for an identifier is the one that stands. That is
+    /// the answer every copy of the action is owed, so a call whose own completion lost, because a
+    /// copy or a recovery pass settled the claim after this call computed its result, returns what
+    /// was recorded and not what it computed: the two can differ, for instance in the session a
+    /// draft bound the attachment to in between.
+    fn complete_claim<T>(&self, action: Option<&Action>, result: T) -> Result<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
         let Some(action) = action else {
-            return Ok(());
+            return Ok(result);
         };
-        let encoded = kr_cbor::to_canonical_vec(result).map_err(TransferError::store)?;
+        let encoded = kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?;
+        let store = self.locked()?;
+        #[cfg(feature = "testing")]
+        {
+            let hook = self
+                .race_hooks
+                .completion
+                .read()
+                .expect("not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                (hook.0)(&store, action, &encoded);
+            }
+        }
         // The completion names the claim it completes: the identifier alone is not enough, because
         // an identifier can be claimed by a different request between reading the record and
-        // writing to it. A completion that matches nothing changes nothing, which is the right
-        // answer for a caller whose claim is no longer there.
-        self.locked()?
-            .complete_action(
-                &action.actor_id,
-                action.action_id,
-                &action.method,
-                action.payload_digest,
-                &encoded,
-            )
-            .map(|_| ())
+        // writing to it. A completion that matches nothing changes nothing.
+        let completed = store.complete_action(
+            &action.actor_id,
+            action.action_id,
+            &action.method,
+            action.payload_digest,
+            &encoded,
+        )?;
+        if completed {
+            return Ok(result);
+        }
+        // Something settled the claim first. What it recorded is the answer, and an identifier now
+        // carrying a different payload is a reused identifier.
+        match recorded_with(&store, Some(action))? {
+            Recorded::Answered(settled) => Ok(settled),
+            // No answer to give in its place: the record is gone, or still open under a claim this
+            // call could not complete. The result this call computed is all there is.
+            Recorded::Claimed | Recorded::Absent => Ok(result),
+        }
     }
 
     /// Answers a publication that did not complete, recording the refusal on its own claim.
