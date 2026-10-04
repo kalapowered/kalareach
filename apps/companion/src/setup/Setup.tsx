@@ -940,10 +940,16 @@ function useKeepFocusInCard(card: RefObject<HTMLElement | null>): void {
   useEffect(() => {
     const track = (event: Event): void => {
       const target = event.target as Node | null
-      focused.current =
-        event.type === 'focusin' && target !== null && card.current?.contains(target) === true
-          ? (target as Element)
-          : null
+      if (event.type === 'focusin') {
+        if (target !== null && card.current?.contains(target) === true) focused.current = target as Element
+        // Focus that falls to a container of the card is not the person going anywhere: WebKit
+        // gives it to the page's main region when a button that takes no focus is pressed.
+        else if (target === null || !target.contains(card.current)) focused.current = null
+      } else if (focused.current?.contains(target) !== true) {
+        // A press somewhere else takes the person's place. A press on the control they are already
+        // on does not move focus, and so says nothing new.
+        focused.current = null
+      }
     }
     document.addEventListener('focusin', track)
     document.addEventListener('pointerdown', track)
@@ -955,9 +961,21 @@ function useKeepFocusInCard(card: RefObject<HTMLElement | null>): void {
   // After each answer the card is drawn from.
   useEffect(() => {
     const gone = focused.current
-    if (gone === null || gone.isConnected || document.activeElement !== document.body) return
+    if (gone === null || gone.isConnected) return
+    // Focus has fallen to the page, or to a container of the card (a press on a button that takes
+    // no focus, in WebKit, focuses the nearest ancestor that does). A control the person went to
+    // themselves is theirs, and is left alone.
+    const active = document.activeElement
+    const inCard = card.current
+    if (inCard === null) return
+    if (active !== null && active !== document.body && !active.contains(inCard)) return
     focused.current = null
-    card.current?.querySelector<HTMLElement>('[role="switch"], button')?.focus()
+    // The first control the card has, or its heading where it has none (a host that offers
+    // nothing): the person stays in the card, and the view is not moved to find it.
+    const next =
+      inCard.querySelector<HTMLElement>('[role="switch"], button') ??
+      inCard.querySelector<HTMLElement>('h2')
+    next?.focus({ preventScroll: true })
   })
 }
 
@@ -997,7 +1015,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
   return (
     <Card ref={card} data-testid="setup-model">
       <header className="card-header">
-        <h2>Session descriptions</h2>
+        <h2 tabIndex={-1}>Session descriptions</h2>
         {status ? (
           <Badge
             tone={status === 'on' ? 'success' : status === 'failed' || status === 'paused' ? 'warning' : 'neutral'}

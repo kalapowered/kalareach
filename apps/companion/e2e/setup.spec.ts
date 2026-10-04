@@ -310,13 +310,32 @@ test.describe('the first-start assistant', () => {
     const again = card.getByRole('button', { name: 'Ask again' })
     await expect(again).toBeFocused()
 
-    // A retry that succeeds, from the keyboard.
+    // A retry that succeeds, pressed with the pointer on the button that already has focus: the
+    // press moves no focus, and the repair still knows where the person is.
     await page.evaluate(() => {
       window.krTestHost?.setConnected(true)
     })
-    await page.keyboard.press('Enter')
+    await again.click()
     await expect(again).toHaveCount(0)
     await expect(enable).toBeFocused()
+
+    // A retry from the keyboard that finds the host offers nothing: the card has no control left,
+    // and focus goes to the card's heading, not to the page.
+    await page.evaluate(() => {
+      window.krTestHost?.setConnected(false)
+    })
+    await page.keyboard.press('Space')
+    await expect(again).toBeFocused()
+    await page.evaluate(() => {
+      window.krTestHost?.setConnected(true)
+      window.krTestHost?.changeDescriptionSetup({
+        offered: false,
+        unavailable: 'this processor lacks AVX2 and BMI2'
+      })
+    })
+    await page.keyboard.press('Enter')
+    await expect(card.getByTestId('setup-model-unavailable')).toBeVisible()
+    await expect(card.getByRole('heading', { name: 'Session descriptions' })).toBeFocused()
   })
 
   // KR-REQ-13.19: a switch is drawn smaller than a finger, and a press anywhere across a target of
