@@ -44,6 +44,7 @@ import {
 import {
   costSentence,
   fetchedFraction,
+  PAUSE_WORDS,
   statusOf,
   STATUS_LABEL,
   useDescriptionSetup,
@@ -963,7 +964,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
         <h2>Session descriptions</h2>
         {status ? (
           <Badge
-            tone={status === 'on' ? 'success' : status === 'failed' ? 'warning' : 'neutral'}
+            tone={status === 'on' ? 'success' : status === 'failed' || status === 'paused' ? 'warning' : 'neutral'}
             data-testid="setup-model-status"
           >
             {STATUS_LABEL[status]}
@@ -1019,6 +1020,11 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             ) : null}
             {setup.download === 'verified' ? (
               <p className="faint small">The files are here, and each one was checked.</p>
+            ) : null}
+            {status === 'paused' && setup.paused !== null ? (
+              <p className="faint small" data-testid="setup-model-paused">
+                No description is being made right now: {PAUSE_WORDS[setup.paused]}.
+              </p>
             ) : null}
           </>
         ) : null}
@@ -1086,7 +1092,7 @@ function ReadyStep({
   const chosen = INSTALLABLES.filter((item) => install[item.id] === true)
   const described = descriptions.setup === null ? null : statusOf(descriptions.setup)
   // Descriptions count as chosen once the host is fetching the model or has them switched on.
-  const describing = described === 'downloading' || described === 'on'
+  const describing = described === 'downloading' || described === 'on' || described === 'paused'
   return (
     <>
       <Card data-testid="setup-summary">

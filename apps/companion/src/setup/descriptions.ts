@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { DescriptionSetup } from '@kalareach/protocol'
+import type { DescriptionPause, DescriptionSetup } from '@kalareach/protocol'
 
 import { failureMessage, type HostPort } from '../host/port'
 import { readableBytes } from './host'
@@ -25,6 +25,7 @@ export type DescriptionStatus =
   | 'downloading'
   | 'failed'
   | 'on'
+  | 'paused'
   | 'ready_off'
   | 'not_downloaded'
 
@@ -33,7 +34,10 @@ export function statusOf(setup: DescriptionSetup): DescriptionStatus {
   if (!setup.offered) return 'not_offered'
   if (setup.download === 'running') return 'downloading'
   if (setup.download === 'failed') return 'failed'
-  if (setup.download === 'verified') return setup.enabled ? 'on' : 'ready_off'
+  if (setup.download === 'verified') {
+    if (!setup.enabled) return 'ready_off'
+    return setup.paused === null ? 'on' : 'paused'
+  }
   return 'not_downloaded'
 }
 
@@ -43,8 +47,22 @@ export const STATUS_LABEL: Readonly<Record<DescriptionStatus, string>> = {
   downloading: 'Downloading',
   failed: 'Download failed',
   on: 'On',
+  paused: 'On, paused',
   ready_off: 'Downloaded, off',
   not_downloaded: 'Not downloaded'
+}
+
+/** What a pause says, in words: why no description is being made right now. */
+export const PAUSE_WORDS: Readonly<Record<DescriptionPause, string>> = {
+  memory_reserve: 'loading the model would leave too little memory',
+  memory_pressure: 'the host is short of memory',
+  thermal: 'the host is hot',
+  battery: 'the host is on battery',
+  signal_unqualified: 'the host cannot read a signal the decision needs',
+  disabled: 'descriptions are off',
+  no_model_here: 'this environment runs no model',
+  not_downloaded: "the model's files are not on this host",
+  inference_failed: 'the description process failed three times running, and is left alone for a while'
 }
 
 /** How much of the file has arrived, as a fraction, or null where the host gave no size. */

@@ -205,6 +205,31 @@ describe('the setup card for session descriptions', () => {
     expect(controls.descriptionDownloads).toEqual([])
   })
 
+  // Section 22: a description that is not being made is not implied by an "On" that says nothing
+  // else. A host that has paused inference says why, in words.
+  it('says why no description is being made while the host has paused inference, and says only On when it has not', async () => {
+    const { port, controls } = fakeHost()
+    controls.changeDescriptionSetup({
+      download: 'verified',
+      fetched_bytes: '1561318368',
+      enabled: true,
+      paused: 'battery'
+    })
+    open(port, { view: 'setup' })
+    await toHostStep()
+    expect(await screen.findByTestId('setup-model-status')).toHaveTextContent('On, paused')
+    expect(screen.getByTestId('setup-model-paused')).toHaveTextContent('the host is on battery')
+
+    act(() => {
+      controls.changeDescriptionSetup({ paused: null, state: 'resident' })
+    })
+    await userEvent.click(screen.getByRole('switch', { name: 'Keep going on battery power' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-model-status')).toHaveTextContent(/^On$/)
+    })
+    expect(screen.queryByTestId('setup-model-paused')).toBeNull()
+  })
+
   it('shows a host that refuses a device its setup in the host’s words', async () => {
     const { port, controls } = fakeHost()
     controls.setRights(['session.create'])
