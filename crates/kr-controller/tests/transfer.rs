@@ -17,7 +17,9 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
-use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+#[cfg(unix)]
+use kr_protocol::envelope::MutationRequest;
+use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionEpoch, SessionId, TransferId};
@@ -415,6 +417,7 @@ async fn a_lost_reply_to_finish_is_answered_from_the_retained_record() {
 }
 
 /// Begins an upload of `bytes`, sends its one chunk and composes the finish that would publish it.
+#[cfg(unix)]
 async fn upload_ready_to_finish(
     host: &Host,
     control: &mut LocalClient,
