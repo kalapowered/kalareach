@@ -347,7 +347,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             runtime_dir: environment.runtime_dir().to_path_buf(),
             sources,
             launcher: installed_launcher(),
-            registered_forwarder: registered_forwarder(),
+            // The path an update keeps current, which the control daemon writes where a package runs
+            // the forwarder too, so a session's flags are the same text on both sides.
+            registered_forwarder: kr_ipc::install::registered_forwarder(),
         });
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
 
@@ -526,16 +528,6 @@ fn installed_launcher() -> Option<std::path::PathBuf> {
         .ok()?
         .own(kr_ipc::install::Program::Hook);
     beside.is_file().then_some(beside)
-}
-
-/// Returns the forwarder a package registers, by the path an update keeps current: the path the
-/// control daemon writes where a package runs the forwarder, so that a session's flags are the same
-/// text on both sides.
-fn registered_forwarder() -> Option<std::path::PathBuf> {
-    let stable = kr_ipc::install::this_process()
-        .ok()?
-        .stable(kr_ipc::install::Program::Hook);
-    stable.is_file().then_some(stable)
 }
 
 /// Binds this session's root-integration endpoint inside its own owner-only directory.
