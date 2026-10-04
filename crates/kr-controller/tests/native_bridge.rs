@@ -707,7 +707,7 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
 /// stands.
 #[cfg(unix)]
 #[test]
-fn kr_req_11_42_the_text_of_an_escape_in_a_value_is_only_text() {
+fn kr_req_11_42_the_text_of_an_escape_in_a_value_or_a_key_is_only_text() {
     let handler = r#"{"hooks": [{"type": "command", "name": "\\u007bkr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}"#;
     let hooks =
         format!(r#"{{"hooks": {{"SessionStart": [{handler}], "\\u007bkr_hook}}": [{handler}]}}}}"#);

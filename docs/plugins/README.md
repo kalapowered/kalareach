@@ -153,8 +153,8 @@ uses the placeholder states `"sdk_range": ">=0.1.3, <0.2.0"`, because a host on 
 would write the text as it stands, and refuses a release it cannot read. A package written before
 the placeholder that registers the forwarder in its flags names it by its own name. An application
 may look in its working directory for a program started by a bare name before it searches (Qoder CLI
-does on Windows), so on Windows the host runs an invocation as typed when a flag holds the text
-`kr-hook` in any case, whatever it is there for.
+does on Windows), so on Windows the host runs an invocation as typed when a flag, as the package
+declares it, holds the text `kr-hook` in upper or lower case, whatever it is there for.
 
 The owner confirms `command_integration.launch` on every release, as for a native bridge, because
 the flags and variables are part of the release. The grant shows the package's `grant_statement`
@@ -177,6 +177,37 @@ hook by naming `kr-hook` as a bare command. Where a hook is registered and how i
 decide nothing: a bridge is admitted only when it says it is the package's own and runs this
 installation's own `kr-hook`, under the launch's registration and credential.
 
+### The launch probe
+
+A package can tell the host how to read the mode its application will run in. The `launch_probe`
+member of the manifest names the application's own diagnostic command, which the host runs before a
+launch.
+
+- `arguments` are what the host passes to the application's executable: one to eight, each one line
+  of 1 to 256 bytes, so the application is never started bare.
+- `carried_options` are up to eight option names of at most 32 bytes, each taking one value, that
+  change which configuration the diagnostic reads. The host copies each one found in the launch's
+  own arguments, with its value, in front of `arguments`. A short name (`-c`) is read as `-c v`,
+  `-cv` and `-c=v`, and a long one (`--config`) as `--config v` and `--config=v`. Options after a
+  bare `--` are not carried.
+- `mode` is an RFC 6901 JSON Pointer of at most 256 bytes into the JSON the diagnostic prints on
+  standard output. It has to reach a string of at most 128 printable bytes, and anything else
+  records no mode.
+- `refused_in_service_session` lists up to eight modes, each one line of at most 64 bytes, that the
+  application cannot run with in a Windows service session. A launch there whose mode is listed
+  fails by name before anything starts.
+
+The probe runs only while the installation holds `launch.probe`. The owner confirms it on every
+release, because it runs the application's own executable with arguments the package chose. The
+grant shows the package's `grant_statement` beside the exact list `LaunchProbe::statement` renders:
+each argument, each carried option, the pointer and each refused word, nothing shortened. A package
+that declares a probe states `"sdk_range": ">=0.1.4, <0.2.0"`, because a host on an earlier contract
+refuses a manifest member it does not know. The validator refuses a probe without the capability
+(`launch_probe_without_capability`) and a declaration outside these bounds (`launch_probe_invalid`).
+A declaration for Codex 0.155.1 passes `["doctor", "--json"]`, carries `-c`, `--config`, `--enable`
+and `--disable`, reads `/checks/sandbox.helpers/details/sandbox backend` and refuses `elevated` in a
+service session.
+
 ## Capabilities
 
 A package asks for capabilities from a closed vocabulary:
@@ -197,6 +228,7 @@ A package asks for capabilities from a closed vocabulary:
 | `approval.respond` | no | yes |
 | `native_bridge.install` | no | yes |
 | `command_integration.launch` | no | yes |
+| `launch.probe` | no | yes |
 
 Enrolling a repository sets a ceiling before anything is fetched. The default ceiling is the first
 three rows: metadata matching, declarative presentation and broker semantic events the actor is
@@ -206,8 +238,9 @@ grant.
 
 The last column is a floor rather than the whole rule. It marks the capabilities nobody gets under
 any repository ceiling: an executable bridge that runs under the application's own permissions, a
-command integration that changes how an application runs, anything that writes, and the trust to
-interpret or answer native requests. The owner confirms the first two on every release. Section 11
+command integration that changes how an application runs, a launch probe that runs the application's
+own executable, anything that writes, and the trust to interpret or answer native requests. The
+owner confirms the first three on every release. Section 11
 also requires an explicit grant for any increase over what was previously granted, which compares
 two capability sets rather than asking about one capability, so an upgrade that asks for more than
 the last one is a new decision even when every capability in it sits in an unmarked row.
@@ -621,6 +654,8 @@ report the same code for the same defect.
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 | `integration_without_capability` | A command integration without `command_integration.launch` |
 | `integration_invalid` | A command integration names another command, adds a flag it may not or sets a variable the contract does not permit |
+| `launch_probe_without_capability` | A launch probe without `launch.probe` |
+| `launch_probe_invalid` | A launch probe passes no argument or too many, carries an option that is not a name, or names a mode that is not a JSON Pointer |
 
 `kr-plugin-sandbox` walks the package through a handle on its directory rather than by path. Every
 file and subdirectory is opened from the handle of the directory that holds it, so a link, an
