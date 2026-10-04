@@ -872,6 +872,53 @@ async fn kr_req_12_07_a_command_is_looked_up_by_the_name_its_platform_gives_the_
     );
 }
 
+/// KR-REQ-12.07: two packages whose integrated commands the platform reads as one name are both left
+/// out, as two that spell it alike are, so a package cannot take a command another integrates by
+/// spelling it another way. The control is a pair of packages whose commands are two names, which
+/// both integrate.
+#[cfg(windows)]
+#[test]
+fn kr_req_12_07_two_packages_whose_commands_are_one_name_integrate_neither() {
+    let directory = private_directory("kcn");
+    let launcher = directory.join(executable_name("kr-hook"));
+    std::fs::copy(stand_in_program(), &launcher).expect("a launcher stands in");
+    let package = |pair: &str, name: &'static str, executable: &'static str, command: &str| {
+        let root = directory.join(pair).join(name);
+        std::fs::create_dir_all(&root).expect("a store");
+        fixture::package(
+            &root,
+            &launcher,
+            &fixture::Shape {
+                plugin_name: name,
+                executable,
+                integration: Some(fixture::declaration(command, &fixture::FLAGS, &[])),
+                native_bridge: false,
+                ..fixture::Shape::claude_code()
+            },
+        )
+        .expect("the package is written")
+    };
+
+    let two_names = ConnectorSources::new();
+    let refused = two_names.replace(vec![
+        package("two", "claude-code", "claude", "claude"),
+        package("two", "codex-cli", "codex", "codex"),
+    ]);
+    assert!(refused.is_empty(), "two commands integrate: {refused:?}");
+    assert!(two_names.for_command("Claude.EXE").is_some());
+    assert!(two_names.for_command("codex").is_some());
+
+    let one_name = ConnectorSources::new();
+    let refused = one_name.replace(vec![
+        package("one", "claude-code", "claude", "claude"),
+        package("one", "claude-shadow", "claude.exe", "claude.exe"),
+    ]);
+    assert_eq!(refused.len(), 2, "both packages are left out");
+    assert!(one_name.for_command("claude").is_none());
+    assert!(one_name.for_command("CLAUDE.exe").is_none());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-12.07: the integration's flags are added whole or not at all. A run that leaves one out,
 /// as the shell's answer does when the person typed that one, establishes nothing, so the command
 /// runs as typed; one the person typed whole establishes with nothing added.
