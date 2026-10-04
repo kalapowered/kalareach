@@ -14635,6 +14635,15 @@ export interface HostDoctorResult {
    * True when no check failed.
    */
   healthy: boolean
+  /**
+   * What each admitted package's launch probe reads of its application, as this daemon runs it.
+   *
+   * Section 7 has a launch record the mode its application runs in, and a package declares how
+   * that is read: the application's own diagnostic. The doctor runs the same declaration for
+   * the executable this daemon's own search path names, in this daemon's own environment, which
+   * a launch's may differ from, and says what it read, word for word.
+   */
+  launch_probes: LaunchProbeReport[]
 }
 /**
  * One diagnostic check.
@@ -14812,6 +14821,41 @@ export interface EffectiveConfiguration1 {
    * Every ordinary preference, with its source.
    */
   values: EffectiveValue[]
+}
+/**
+ * What a package's launch probe read of its application, as `kr doctor` reports it.
+ *
+ * The executable is this daemon's reading of it: the first its package's match rule names on the
+ * daemon's own search path. The probe runs in the daemon's own environment and directory, so a
+ * launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode, and
+ * each launch records the one it read.
+ */
+export interface LaunchProbeReport {
+  /**
+   * The executable the probe ran, where the daemon's search path named one.
+   */
+  executable: string | null
+  /**
+   * The word the application reported for its mode, exactly as it printed it, where the probe
+   * read one. The host interprets nothing: it names what the application said.
+   */
+  mode: string | null
+  /**
+   * The package, as `publisher/plugin`.
+   */
+  plugin_id: string
+  /**
+   * Why no mode was read, where none was.
+   */
+  reason: string | null
+  /**
+   * What the probe came to.
+   */
+  state: 'read' | 'not_read' | 'not_granted' | 'no_executable'
+  /**
+   * Its installed release.
+   */
+  version: string
 }
 /**
  * The result of `host.info`.
@@ -25933,6 +25977,15 @@ export interface HostDoctorResult1 {
    * True when no check failed.
    */
   healthy: boolean
+  /**
+   * What each admitted package's launch probe reads of its application, as this daemon runs it.
+   *
+   * Section 7 has a launch record the mode its application runs in, and a package declares how
+   * that is read: the application's own diagnostic. The doctor runs the same declaration for
+   * the executable this daemon's own search path names, in this daemon's own environment, which
+   * a launch's may differ from, and says what it read, word for word.
+   */
+  launch_probes: LaunchProbeReport[]
 }
 /**
  * One error a support bundle carries, already redacted.

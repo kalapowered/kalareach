@@ -694,7 +694,10 @@ impl Controller {
                 .native_bridges_check(tokio::time::Instant::now() + DOCTOR_READS)
                 .await,
         );
-        Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
+        let launch_probes = self.launch_probe_report().await;
+        Ok(HostDoctorResult::new(checks, effective)
+            .with_command_integrations(integrations)
+            .with_launch_probes(launch_probes))
     }
 
     /// The doctor's checks of what this host serves a paired device in repository operations:
@@ -790,6 +793,32 @@ impl Controller {
             ),
         ));
         checks
+    }
+
+    /// What each admitted package's launch probe reads of its application, run by this daemon
+    /// against the executable its own search path names.
+    ///
+    /// The probes run on a thread that may block, each under its own deadline, and not inside the
+    /// integration reading's time: a slow application must not cost the doctor its other answers.
+    /// Where the admissions cannot be computed, or the probes do not finish, there is nothing to
+    /// report.
+    async fn launch_probe_report(&self) -> Vec<kr_protocol::hostinfo::LaunchProbeReport> {
+        let Some(snapshot) = self.current_snapshot(tokio::time::Instant::now()).await else {
+            return Vec::new();
+        };
+        let integrations = Arc::clone(&self.integrations);
+        let search_path: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        let directory = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let probed = tokio::task::spawn_blocking(move || {
+            let reading = integrations.read(&snapshot.packages);
+            crate::catalogue::launch_probes::report(&reading, &search_path, &directory)
+        });
+        match tokio::time::timeout(DOCTOR_READS, probed).await {
+            Ok(Ok(reports)) => reports,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
     }
 
     /// Every command integration an admitted release declares, and every package the configuration

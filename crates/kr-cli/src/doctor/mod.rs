@@ -27,7 +27,7 @@ use kr_client::shown::Shown;
 use kr_protocol::hostinfo::configuration::ValueSource;
 use kr_protocol::hostinfo::{
     CommandIntegrationReport, CommandIntegrationUnavailable, DoctorCheck, DoctorStatus,
-    EffectiveConfiguration, HostDoctorResult, HostInfoResult,
+    EffectiveConfiguration, HostDoctorResult, HostInfoResult, LaunchProbeReport, LaunchProbeState,
 };
 
 use crate::output::{Asked, Document, Line, Request, configured, configured_field};
@@ -305,6 +305,123 @@ pub fn doctor(result: &HostDoctorResult) -> Document {
                 .map(integration)
                 .collect::<Vec<_>>(),
         )
+        .with(
+            "launch_probes",
+            result
+                .launch_probes
+                .iter()
+                .map(launch_probe)
+                .collect::<Vec<_>>(),
+        )
+}
+
+/// One package's launch probe, in the shape the protocol answers it.
+///
+/// Its package, release, executable and the word the application printed are what `kr doctor` is
+/// asked to show of it, so they are shown whole; why no mode was read is the host's text, said as
+/// its class and its length.
+#[must_use]
+pub fn launch_probe(report: &LaunchProbeReport) -> Document {
+    let asked = |text: &str| Asked::text(Request::Diagnostics, text);
+    Document::new()
+        .with("plugin_id", asked(&report.plugin_id))
+        .with("version", asked(&report.version))
+        .with("state", report.state.as_str())
+        .with(
+            "executable",
+            report
+                .executable
+                .as_ref()
+                .map(|executable| asked(executable)),
+        )
+        .with("mode", report.mode.as_ref().map(|mode| asked(mode)))
+        .with(
+            "reason",
+            report
+                .reason
+                .as_ref()
+                .map(|reason| crate::shown::exported("LaunchProbeReport", "reason", reason)),
+        )
+}
+
+/// One package's launch probe as the lines a person reads: the word the application printed for
+/// the mode it runs in and where the daemon read it from, or why nothing was read. The probe ran in
+/// the daemon's own environment, which a launch's may differ from, and a launch records the mode
+/// it read itself. `first` goes in front of the first line and `rest` in front of the others.
+#[must_use]
+pub fn launch_probe_lines(
+    report: &LaunchProbeReport,
+    first: &'static str,
+    rest: &'static str,
+) -> Vec<Line> {
+    let asked = |text: &str| Asked::text(Request::Diagnostics, text);
+    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
+    let head = |what: &'static str| {
+        stdout_line!(
+            "{}{} {}: {}",
+            first,
+            asked(&report.plugin_id),
+            asked(&report.version),
+            what
+        )
+    };
+    match (report.state, report.mode.as_ref()) {
+        (LaunchProbeState::Read, Some(mode)) => vec![
+            match report.executable.as_ref() {
+                Some(executable) => stdout_line!(
+                    "{}{} {}: mode {} read from {}",
+                    first,
+                    asked(&report.plugin_id),
+                    asked(&report.version),
+                    asked(&quoted(mode)),
+                    asked(executable)
+                ),
+                None => stdout_line!(
+                    "{}{} {}: mode {}",
+                    first,
+                    asked(&report.plugin_id),
+                    asked(&report.version),
+                    asked(&quoted(mode))
+                ),
+            },
+            stdout_line!(
+                "{}the daemon ran the package's probe in its own environment, which a launch's \
+                 may differ from; each launch records the mode it reads",
+                rest
+            ),
+        ],
+        (LaunchProbeState::Read | LaunchProbeState::NotRead, _) => {
+            let mut lines = vec![match report.executable.as_ref() {
+                Some(executable) => stdout_line!(
+                    "{}{} {}: no mode was read from {}",
+                    first,
+                    asked(&report.plugin_id),
+                    asked(&report.version),
+                    asked(executable)
+                ),
+                None => stdout_line!(
+                    "{}{} {}: no mode was read",
+                    first,
+                    asked(&report.plugin_id),
+                    asked(&report.version)
+                ),
+            }];
+            if let Some(reason) = report.reason.as_ref() {
+                lines.push(stdout_line!(
+                    "{}{}",
+                    rest,
+                    crate::shown::exported("LaunchProbeReport", "reason", reason)
+                ));
+            }
+            lines
+        }
+        (LaunchProbeState::NotGranted, _) => {
+            vec![head("not run, its installation does not hold launch.probe")]
+        }
+        (LaunchProbeState::NoExecutable, _) => vec![head(
+            "no executable of its application is on this daemon's search path",
+        )],
+    }
 }
 
 /// One command integration, in the shape the protocol answers it.
@@ -737,6 +854,13 @@ pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> Vec<Line> {
             "               ",
         ));
     }
+    for report in &result.launch_probes {
+        lines.extend(launch_probe_lines(
+            report,
+            "launch probe   ",
+            "               ",
+        ));
+    }
     lines.push(stdout_line!("{}", summary(result)));
     lines
 }
@@ -761,6 +885,16 @@ pub fn report_lines(result: &HostDoctorResult) -> Vec<Shown> {
                 || Shown::said(""),
                 |why| shown!(", unavailable: {}", why.as_str())
             )
+        ));
+    }
+    // The bundle is read by somebody else, so a probe is named by its state and nothing the
+    // application printed or the daemon ran.
+    for report in &result.launch_probes {
+        lines.push(shown!(
+            "{}{} {}",
+            "launch probe",
+            padding(14, "launch probe"),
+            report.state.as_str()
         ));
     }
     lines.push(summary(result));
