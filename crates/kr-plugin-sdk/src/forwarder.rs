@@ -30,6 +30,9 @@ pub enum ExpandError {
     /// The forwarder's path is not text, so it cannot be written into a document.
     #[error("the installed forwarder's path is not text")]
     NotText,
+    /// There is no installed forwarder to write.
+    #[error("this installation has no forwarder to write where the package runs it")]
+    NoForwarder,
     /// The placeholder stands somewhere the host cannot replace it.
     #[error(
         "{PLACEHOLDER} stands at byte {at}, which is not the start of a JSON string followed by \
@@ -100,6 +103,31 @@ fn escaped(before: &str) -> bool {
         .count()
         % 2
         == 1
+}
+
+/// Returns `flags` with every placeholder replaced by the forwarder's path, as [`expand`] does for
+/// each one.
+///
+/// A host that has no forwarder to write refuses a flag that names one; a flag that does not is
+/// returned as it is, so an integration that never needed the forwarder does not wait for one.
+///
+/// # Errors
+///
+/// Returns [`ExpandError::NoForwarder`] when a flag holds the placeholder and `forwarder` is
+/// `None`, and what [`expand`] returns otherwise.
+pub fn expand_flags(
+    flags: &[String],
+    forwarder: Option<&Path>,
+) -> Result<Vec<String>, ExpandError> {
+    flags
+        .iter()
+        .map(|flag| {
+            if !mentions(flag) {
+                return Ok(flag.clone());
+            }
+            expand(flag, forwarder.ok_or(ExpandError::NoForwarder)?)
+        })
+        .collect()
 }
 
 /// Writes `text` as the inside of a JSON string.
@@ -238,6 +266,29 @@ mod tests {
             Err(ExpandError::Misplaced {
                 at: template.rfind(PLACEHOLDER).expect("present")
             })
+        );
+    }
+
+    #[test]
+    fn flags_are_expanded_one_by_one_and_a_missing_forwarder_is_refused_only_where_one_is_named() {
+        let flags = vec![
+            "--settings".to_owned(),
+            r#"{"command":"{kr_hook}"}"#.to_owned(),
+            "--other".to_owned(),
+        ];
+        assert_eq!(
+            expand_flags(&flags, Some(Path::new("/opt/kr hook"))),
+            Ok(vec![
+                "--settings".to_owned(),
+                r#"{"command":"/opt/kr hook"}"#.to_owned(),
+                "--other".to_owned(),
+            ])
+        );
+        assert_eq!(expand_flags(&flags, None), Err(ExpandError::NoForwarder));
+        assert_eq!(
+            expand_flags(&flags[..1], None),
+            Ok(vec!["--settings".to_owned()]),
+            "flags that name no forwarder need none"
         );
     }
 
