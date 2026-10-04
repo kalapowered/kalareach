@@ -424,9 +424,12 @@ function Install-KrReadLineWrapper {
         $script:Hooks.InnerIsEditors = Test-KrEditorsReadLine $existing.ScriptBlock
     }
     # `$?` is the status of the command the person just ran, and this editor shows it. It is read
-    # here, as the host's own entry point does, because anything else run first would replace it.
+    # here, as the host's own entry point does, because anything else run first would replace it:
+    # a command lookup handler runs before the arguments of the command it looks up are evaluated,
+    # so the status is taken by a statement that looks nothing up.
     $wrapper = {
-        Invoke-KalaReachReadLine -LastStatus $?
+        $krLastStatus = $?
+        Invoke-KalaReachReadLine -LastStatus $krLastStatus
     }
     Set-Item -Path function:global:PSConsoleHostReadLine -Value $wrapper
     $script:Hooks.Wrapper = $wrapper
@@ -815,12 +818,21 @@ function Invoke-KalaReachReadLine {
     [CmdletBinding()]
     param([bool]$LastStatus = $true)
 
+    # What the line that has just run left is read before anything else is run: it is the status the
+    # editor shows, and everything this function does from here on could replace it. A prompt a
+    # running line opened itself is not the end of that line.
+    $nested = Test-KrNestedPrompt
+    if (-not $nested) { Complete-KrLine (Get-KrLineStatus $LastStatus) }
+    $script:State.Nested = $nested
+
     $script:State.LastStatus = $LastStatus
     if (-not $script:Hooks.Activated) {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
     }
-    $script:State.PromptGeneration++
+    # A reader a running line starts is not a new prompt: the generation the worker holds the line
+    # under stays the line's.
+    if (-not $nested) { $script:State.PromptGeneration++ }
     $script:State.ReaderRevision++
     $script:State.InsideReader++
     $script:State.Installed = ''
@@ -859,11 +871,300 @@ function Invoke-KalaReachReadLine {
                 # invalidates it.
                 Send-KrCommandAccepted
                 Send-KrEditorLeave 'command_accepted'
+                if (-not $nested) { Start-KrLine $line }
             } else {
                 Send-KrEditorLeave 'cancellation'
             }
         }
         $script:Kr.Hinted = $false
+    }
+}
+
+# ---- the line the root shell runs ----------------------------------------------------------------
+
+# Whether the reader about to read is one a running line opened itself.
+function Test-KrNestedPrompt {
+    $level = $ExecutionContext.SessionState.PSVariable.GetValue('NestedPromptLevel')
+    ($level -is [int]) -and $level -gt 0
+}
+
+# The directory a native command starts in: the file system location, which is not `$PWD` when the
+# current location belongs to another provider.
+function Get-KrFileSystemDirectory {
+    try { $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath } catch { '' }
+}
+
+# The first of what the session holds in `$Error`, without adding a record of its own.
+function Get-KrFirstError {
+    # The session's own list: this module's scope reads an empty one of its own.
+    $errors = $global:Error
+    if ($errors -is [System.Collections.IList] -and $errors.Count -gt 0) { return $errors[0] }
+    $null
+}
+
+# Puts the capability in the environment of this line's commands, or takes whatever is there out.
+#
+# A variable is removed with a null that is a null string: the shell passes a plain `$null` on as
+# an empty string, which on Unix leaves the variable there with no value. Neither way adds an
+# `$Error` record, which removing it as a variable of the `Env:` drive would when it is absent.
+function Set-KrToken {
+    param($Token)
+    $value = if ([string]::IsNullOrEmpty($Token)) { [NullString]::Value } else { [string]$Token }
+    [Environment]::SetEnvironmentVariable('KR_DETACH_TOKEN', $value)
+}
+
+# The line the person accepted is about to run. It is reported to the worker, which answers with the
+# capability minted for it, and that is exported for the commands of this line and no other. The
+# next prompt reads it back out, whether the bridge is still there or not.
+function Start-KrLine {
+    param([string]$Text)
+    $line = $script:Line
+    if (-not $script:Kr.Registered -or [string]::IsNullOrWhiteSpace($Text)) { return }
+    Update-KrRevisions $script:State
+    $line.Running = $true
+    $line.Text = $Text
+    $line.Cwd = Get-KrFileSystemDirectory
+    $line.CwdRevision = [uint64]$script:State.CwdRevision
+    $line.PromptGeneration = [uint64]$script:State.PromptGeneration
+    $line.StartedMs = Get-KrNowMs
+    $line.StartedTick = Get-KrTickMs
+    $line.Asked = $false
+    $line.Called = $false
+    $line.Active = $false
+    $line.Route = $null
+    $line.RouteRead = $false
+    Send-KrCommandBlock $line $null $null
+    # A capability an earlier line left, or one the environment held, is not this line's.
+    $token = Get-KrLineToken
+    Set-KrToken $token
+    # What `$Error` holds once the work above is done is the baseline an error of the line's own is
+    # told from.
+    $line.ErrorFirst = Get-KrFirstError
+}
+
+# The status the line that has just run leaves.
+#
+# `$LastStatus` is the editor's own `$?`, read first. A line a lookup handler substituted a script
+# block for sets `$?` from errors rather than from the program, so the program's exit code is what
+# it left. Otherwise `$?` decides success, and a failure reads the exit code only when the line's
+# own native command is what failed: nothing was added to `$Error`, or what was added is the
+# native command's own exit exception.
+function Get-KrLineStatus {
+    param([bool]$LastStatus)
+    $line = $script:Line
+    if (-not $line.Running) { return $null }
+    $variables = $ExecutionContext.SessionState.PSVariable
+    $code = $variables.GetValue('LASTEXITCODE')
+    if ($line.Called -and $code -is [int]) { return [uint64]([int64]$code -band 4294967295L) }
+    if ($LastStatus) { return [uint64]0 }
+    if ($code -is [int] -and $code -ne 0) {
+        $first = Get-KrFirstError
+        $own = [object]::ReferenceEquals($first, $line.ErrorFirst)
+        $exit = ($null -ne $first) -and ($first.Exception -is [System.Management.Automation.NativeCommandExitException]) -and
+                ($first.Exception.ExitCode -eq $code)
+        if ($own -or $exit) { return [uint64]([int64]$code -band 4294967295L) }
+    }
+    [uint64]1
+}
+
+# The line has finished: its block is reported with the status it left, and the capability goes.
+function Complete-KrLine {
+    param($Status)
+    $line = $script:Line
+    if (-not $line.Running) { return }
+    $line.Running = $false
+    Set-KrToken $null
+    if ($script:Kr.Registered) {
+        $duration = [uint64]((Get-KrTickMs) - $line.StartedTick)
+        Send-KrCommandBlock $line $Status $duration
+    }
+}
+
+# The one command a line is, as the module may ask the worker about it: the name of a single
+# command, as the line was typed, or nothing.
+#
+# The line has to be exactly one statement, a pipeline of one command, with no other command
+# anywhere in it (a script block, a subexpression and a nested pipeline all hide one), not run in
+# the background and without a redirection or `--%`, which lose the byte stream a native command is
+# given. The name has to be a constant: a variable's value is not what the person typed.
+function Get-KrRouteName {
+    param([string]$Text)
+    $language = [System.Management.Automation.Language.Parser]
+    $tokens = $null
+    $problems = $null
+    $tree = $language::ParseInput($Text, [ref]$tokens, [ref]$problems)
+    if ($problems.Count -ne 0) { return $null }
+    $block = $tree.EndBlock
+    if ($null -eq $block -or $null -ne $tree.BeginBlock -or $null -ne $tree.ProcessBlock -or
+        $null -ne $tree.DynamicParamBlock -or $null -ne $tree.ParamBlock -or $block.Statements.Count -ne 1) {
+        return $null
+    }
+    $statement = $block.Statements[0]
+    if ($statement -isnot [System.Management.Automation.Language.PipelineAst]) { return $null }
+    if ($statement.Background -or $statement.PipelineElements.Count -ne 1) { return $null }
+    $command = $statement.PipelineElements[0]
+    if ($command -isnot [System.Management.Automation.Language.CommandAst]) { return $null }
+    $commands = $tree.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+    if (@($commands).Count -ne 1) { return $null }
+    if ($command.Redirections.Count -ne 0) { return $null }
+    if ($command.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot) { return $null }
+    foreach ($token in $tokens) {
+        if ($token.Text -eq '--%') { return $null }
+    }
+    $first = $command.CommandElements[0]
+    if ($first -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $null }
+    $first.Value
+}
+
+# Whether the entry points may speak for the line that is running now, and the name of the one
+# command it is.
+function Get-KrRoute {
+    $line = $script:Line
+    if (-not $script:Kr.Registered -or -not $line.Running) { return $null }
+    # A prompt a running line opened is not the line the worker was told of.
+    if (Test-KrNestedPrompt) { return $null }
+    Read-KrAnswers
+    if ($script:Kr.Owed -ne 0) { return $null }
+    if (-not $line.RouteRead) {
+        $line.RouteRead = $true
+        $line.Route = try { Get-KrRouteName $line.Text } catch { $null }
+    }
+    $line.Route
+}
+
+# Whether `$Origin` is the one the entry points act at, which is a command typed at the prompt.
+function Test-KrRunspaceOrigin {
+    param($Origin)
+    ($null -ne $Origin) -and ("$Origin" -ceq 'Runspace')
+}
+
+# Whether a name can be asked about: a bare command name, never a path or a drive.
+function Test-KrCommandName {
+    param($Name)
+    ($Name -is [string]) -and $Name.Length -gt 0 -and
+        $Name.IndexOfAny([char[]]@('/', '\', ':', [char]0)) -lt 0
+}
+
+function Test-KalaReachCommand {
+    <#
+    .SYNOPSIS
+    Whether the command being looked up is one the module may ask the worker about.
+
+    .DESCRIPTION
+    True only for a command typed at the prompt, alone on the line that is running, whose name is
+    the one given. The lookup handler substitutes a script block for a command only when this is
+    true, because a substituted block changes `$?` and carries text rather than bytes.
+    #>
+    [CmdletBinding()]
+    param($Origin, $Name)
+    try {
+        if (-not (Test-KrRunspaceOrigin $Origin)) { return $false }
+        if (-not (Test-KrCommandName $Name)) { return $false }
+        $route = Get-KrRoute
+        if ($null -eq $route) { return $false }
+        return [string]::Equals($route, $Name, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+# The environment the answer adds to the one command's own: names without `=` or NUL, each once.
+function Get-KrLaunchEnvironmentOf {
+    param($Entries)
+    $comparer = if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }
+    $named = [System.Collections.Generic.Dictionary[string, string]]::new($comparer)
+    foreach ($entry in @($Entries)) {
+        if ($entry -isnot [hashtable]) { return $null }
+        $name = $entry['name']
+        $value = $entry['value']
+        if ($name -isnot [string] -or $value -isnot [string] -or $name.Length -eq 0 -or
+            $name.Contains('=') -or $name.Contains([char]0) -or $value.Contains([char]0)) {
+            return $null
+        }
+        if ($named.ContainsKey($name)) { return $null }
+        $named[$name] = $value
+    }
+    , $named
+}
+
+# What the answer runs the command as: the launcher, its vector and the variables it adds, or
+# nothing, which is the command as it was typed. The launcher is an absolute path to a program that
+# exists, and the vector keeps the command name the person typed.
+function Get-KrLaunch {
+    param([string]$Name, [string]$Executable, $Answer)
+    if ($null -eq $Answer) { return $null }
+    $backend = $Answer['backend']
+    if ($backend -isnot [hashtable]) { return $null }
+    $launcher = $backend['launcher']
+    if ($launcher -isnot [string] -or $launcher.Length -eq 0 -or $launcher.Contains([char]0)) { return $null }
+    if (-not [System.IO.Path]::IsPathFullyQualified($launcher)) { return $null }
+    if (-not [System.IO.File]::Exists($launcher)) { return $null }
+    if ($IsWindows) {
+        if (-not $launcher.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    } else {
+        $mode = try { [int][System.IO.File]::GetUnixFileMode($launcher) } catch { 0 }
+        if (($mode -band 73) -eq 0) { return $null }
+    }
+    $vector = $Answer['arguments']
+    if ($vector -isnot [object[]] -or $vector.Count -eq 0) { return $null }
+    foreach ($word in $vector) {
+        if ($word -isnot [string] -or $word.Contains([char]0)) { return $null }
+    }
+    # The integration adds flags; it never renames the command the person typed.
+    if (-not [string]::Equals([string]$vector[0], $Name, [System.StringComparison]::Ordinal)) { return $null }
+    $environment = Get-KrLaunchEnvironmentOf $backend['environment']
+    if ($null -eq $environment) { return $null }
+    [pscustomobject]@{
+        Launcher    = $launcher
+        Arguments   = [string[]](@('launch', '--', $Executable) + @($vector))
+        Environment = $environment
+    }
+}
+
+function Resolve-KalaReachCommand {
+    <#
+    .SYNOPSIS
+    Asks the worker what the command being started resolves to, and answers what to run.
+
+    .DESCRIPTION
+    Returns nothing when the command runs as typed, and otherwise the launcher, its argument vector
+    and the variables to add to the one child's environment. Nothing here changes the line: a
+    refusal, a bypass, a failure, the deadline and every check that does not hold all return
+    nothing, and the caller runs the command as it was typed.
+    #>
+    [CmdletBinding()]
+    param($Origin, $Name, $Arguments, $Executable)
+    $line = $script:Line
+    if ($line.Active) { return $null }
+    $line.Active = $true
+    try {
+        if (-not (Test-KalaReachCommand -Origin $Origin -Name $Name)) { return $null }
+        # From here the lookup handler's script block is what runs this line, whatever the answer.
+        $line.Called = $true
+        if ($line.Asked) { return $null }
+        if ($Executable -isnot [string] -or -not [System.IO.Path]::IsPathFullyQualified($Executable)) { return $null }
+        # The route never integrates a shim: on Windows a command that resolves to a script is run
+        # by the shell as typed.
+        if ($IsWindows -and -not ($Executable.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $Executable.EndsWith('.com', [System.StringComparison]::OrdinalIgnoreCase))) {
+            return $null
+        }
+        $words = [System.Collections.Generic.List[string]]::new()
+        $words.Add([string]$Name)
+        foreach ($argument in @($Arguments)) {
+            if ($argument -isnot [string]) { return $null }
+            $words.Add($argument)
+        }
+        $line.Asked = $true
+        Update-KrRevisions $script:State
+        $answer = Invoke-KrAskResolve $words.ToArray() $Executable (Get-KrFileSystemDirectory) `
+            ([uint64]$script:State.CwdRevision) ([uint64]$script:State.PromptGeneration)
+        Get-KrLaunch ([string]$Name) $Executable $answer
+    } catch {
+        Write-KrTrace "resolve failed: $($_.Exception.GetType().FullName)"
+        $null
+    } finally {
+        $line.Active = $false
     }
 }
 
@@ -1232,6 +1533,11 @@ function Remove-KalaReachHooks {
     param()
     Restore-KrGestureHandler
     Restore-KrObservedHandlers
+    # A capability belongs to the line that is running, and nothing runs once the bridge is gone.
+    if ($script:Line.Running) {
+        $script:Line.Running = $false
+        Set-KrToken $null
+    }
     if ($script:Hooks.ReadLineInstalled) {
         if ($null -ne $script:Hooks.InnerReadLine) {
             Set-Item -Path function:global:PSConsoleHostReadLine -Value $script:Hooks.InnerReadLine
@@ -1255,6 +1561,8 @@ Export-ModuleMember -Function @(
     'Invoke-KalaReachPending'
     'Invoke-KalaReachGesture'
     'Test-KalaReachBridge'
+    'Test-KalaReachCommand'
+    'Resolve-KalaReachCommand'
     'Write-KalaReachLoss'
     'Publish-KalaReachQualification'
     'Remove-KalaReachHooks'

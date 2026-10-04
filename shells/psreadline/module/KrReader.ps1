@@ -176,8 +176,9 @@ function Get-KrReaderState {
     @{
         prompt_generation = [uint64]$State.PromptGeneration
         reader_revision   = [uint64]$State.ReaderRevision
-        # The only other reader this host starts does not read through this editor at all.
-        reader_context    = 'primary'
+        # A prompt a running line opens itself (a debugger's, or `$Host.EnterNestedPrompt()`'s) is
+        # read through this editor too, and is not the root editor's: it is the line's own.
+        reader_context    = if ($State.Nested) { 'read_builtin' } else { 'primary' }
         buffer_revision   = [uint64]$State.BufferRevision
         buffer_empty      = [bool]($text.Length -eq 0)
         keymap            = Get-KrKeymap $State.EditMode

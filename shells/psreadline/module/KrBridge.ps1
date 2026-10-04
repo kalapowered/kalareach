@@ -23,6 +23,12 @@ $script:KR_MAX_FRAME = 1048576
 # What is left on the endpoint stays there, and the next step between operations takes it.
 $script:KR_READ_BUDGET = 65536
 $script:KR_REVOKED_MAX = 16
+# The longest a command waits for the worker to answer a resolve or an acceptance. A worker that is
+# there answers in well under a millisecond; one that has stopped answering costs this once, and
+# while an answer is owed nothing else waits.
+$script:KR_ANSWER_WAIT_MS = 1000
+$script:KR_TOKEN_MAX = 128
+$script:KR_DETACH_IDS_MAX = 16
 
 $script:Kr = @{
     Socket             = $null
@@ -55,6 +61,23 @@ $script:Kr = @{
     Revoked            = [System.Collections.Generic.List[string]]::new()
     FrameAtMs          = [uint64]0
     Servicing          = $false
+    # The identifier of the event sent last, which is the one an answer is looked for under.
+    LastEventId        = [uint64]0
+    # The detach events sent and not answered yet: a refusal is a detach's only when it answers one.
+    DetachIds          = [System.Collections.Generic.List[uint64]]::new()
+    # An event the worker did not answer inside the wait. It answers in the order it was asked, so
+    # an answer to this event or a later one is the owed one having come, and nothing waits again
+    # until then.
+    Owed               = [uint64]0
+    # The acceptance of the line last accepted, and the capability the worker answered it with.
+    AcceptId           = [uint64]0
+    AcceptAnswered     = $false
+    TokenPresent       = $false
+    Token              = ''
+    # The question last asked about a command, and the answer to it.
+    ResolveId          = [uint64]0
+    ResolveAnswered    = $false
+    ResolveAnswer      = $null
     # The one outstanding read on an asynchronous named pipe, and the array it fills. A pipe has
     # no readiness test of its own, so the read that answers "is anything there" is started before
     # anything is there and collected when it completes.
@@ -79,6 +102,35 @@ $script:State = @{
     Reading          = $false
     EditMode         = 'Emacs'
     ReaderThreadId   = 0
+    # True while the reader running is one a running line started itself, such as the prompt a
+    # debugger or `$Host.EnterNestedPrompt()` opens: it is not the root editor's, whatever it reads
+    # through.
+    Nested           = $false
+}
+
+# The line the root shell is running: the one the person accepted at the root editor's own prompt,
+# from its acceptance until the next prompt reads.
+$script:Line = @{
+    Running          = $false
+    Text             = ''
+    Cwd              = ''
+    CwdRevision      = [uint64]0
+    PromptGeneration = [uint64]0
+    StartedMs        = [uint64]0
+    StartedTick      = [uint64]0
+    # What `$Error` held when the line was accepted, so that an error the line added can be told
+    # from one that was already there.
+    ErrorFirst       = $null
+    # Whether the question in front of a command was asked for this line, and whether the entry
+    # point that asks it was called for it at all.
+    Asked            = $false
+    Called           = $false
+    # The re-entrancy guard of the entry point that asks.
+    Active           = $false
+    # The one command the line is, as the module may ask about it, or nothing: read from the text
+    # the first time it is wanted.
+    Route            = $null
+    RouteRead        = $false
 }
 
 # A line of diagnostics, when the session asked for them.
@@ -346,14 +398,17 @@ function Disconnect-KrEndpoint {
     # a later connection from collecting the previous one's completion.
     $script:Kr.PipeRead = $null
     $script:Kr.PipeBuffer = $null
+    # Nothing more will be answered, so nothing is owed and nothing is waited for.
+    $script:Kr.Owed = [uint64]0
+    $script:Kr.DetachIds.Clear()
 }
 
 function Send-KrBytes {
-    param([byte[]]$Bytes)
+    param([byte[]]$Bytes, [uint64]$BudgetMs = 2000)
     $socket = $script:Kr.Socket
     if ($null -eq $socket) { return $false }
     $sent = 0
-    $deadline = (Get-KrNowMs) + 2000
+    $deadline = (Get-KrNowMs) + $BudgetMs
     while ($sent -lt $Bytes.Length) {
         try {
             if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
@@ -381,7 +436,7 @@ function Send-KrBytes {
 }
 
 function Send-KrFrame {
-    param($Value)
+    param($Value, [uint64]$BudgetMs = 2000)
     $body = ConvertTo-KrCbor $Value
     if ($body.Length -gt $script:KR_MAX_FRAME) { return $false }
     $framed = [byte[]]::new($body.Length + 4)
@@ -390,7 +445,7 @@ function Send-KrFrame {
     $framed[2] = [byte](($body.Length -shr 8) -band 0xFF)
     $framed[3] = [byte]($body.Length -band 0xFF)
     [Array]::Copy($body, 0, $framed, 4, $body.Length)
-    Send-KrBytes $framed
+    Send-KrBytes $framed $BudgetMs
 }
 
 # Takes whatever the pipe has already delivered, and leaves one read outstanding for the next.
@@ -517,15 +572,16 @@ function New-KrGesture {
 }
 
 function Send-KrEvent {
-    param([string]$Name, [hashtable]$Payload)
+    param([string]$Name, [hashtable]$Payload, [uint64]$BudgetMs = 2000)
     if (-not $script:Kr.Registered) { return }
     $script:Kr.EventCounter++
+    $script:Kr.LastEventId = $script:Kr.EventCounter
     Send-KrFrame @{
         event = @{
             id    = $script:Kr.EventCounter
             event = @{ $Name = $Payload }
         }
-    } | Out-Null
+    } $BudgetMs | Out-Null
 }
 
 function Send-KrAnswer {
@@ -726,6 +782,32 @@ function Send-KrCommandAccepted {
         session_id        = $script:Kr.Session
         prompt_generation = $reader.prompt_generation
     }
+    # The answer carries the capability this line's own commands present. A line a running line's
+    # own reader accepts is no line of the root shell's: its answer is nobody's to wait for, and the
+    # line that is running keeps the acceptance it has.
+    if (-not $script:State.Nested) {
+        $script:Kr.AcceptId = $script:Kr.LastEventId
+        $script:Kr.AcceptAnswered = $false
+        $script:Kr.TokenPresent = $false
+        $script:Kr.Token = ''
+    }
+}
+
+# One report of the line's command block: running, or finished with `$ExitStatus` after
+# `$DurationMs`.
+function Send-KrCommandBlock {
+    param([hashtable]$Line, $ExitStatus, $DurationMs)
+    if (-not $script:Kr.Registered) { return }
+    Send-KrEvent 'command_block' @{
+        cwd               = $Line.Cwd
+        command           = $Line.Text
+        session_id        = $script:Kr.Session
+        duration_ms       = $DurationMs
+        exit_status       = $ExitStatus
+        cwd_revision      = [uint64]$Line.CwdRevision
+        started_at_ms     = [uint64]$Line.StartedMs
+        prompt_generation = [uint64]$Line.PromptGeneration
+    }
 }
 
 function Send-KrHooksActivated {
@@ -808,6 +890,10 @@ function Invoke-KrPreEof {
         session_id        = $script:Kr.Session
         input_epoch       = $script:Kr.FenceEpoch
         prompt_generation = $script:Kr.FencePrompt
+    }
+    if ($script:Kr.Registered) {
+        if ($script:Kr.DetachIds.Count -ge $script:KR_DETACH_IDS_MAX) { $script:Kr.DetachIds.RemoveAt(0) }
+        $script:Kr.DetachIds.Add($script:Kr.LastEventId)
     }
     'consume'
 }
@@ -1041,20 +1127,53 @@ function Read-KrPublication {
     $script:Kr.FenceLive = $false
 }
 
+# An answer belongs to the event its identifier names, never to whatever is in flight: a refusal is
+# a detach's only when it answers a detach, and the answers a command waits for are kept for the
+# event that asked.
 function Read-KrEventResult {
-    param($Result)
+    param([uint64]$Id, $Result)
+    # The worker answers in the order it was asked, so this answer, or a later one, is the owed one
+    # having come.
+    if ($script:Kr.Owed -ne 0 -and $Id -ge $script:Kr.Owed) { $script:Kr.Owed = [uint64]0 }
     $variant = Get-KrVariant $Result
     if ($null -eq $variant) { return }
-    if ($variant.Name -eq 'refused') {
-        # The one refusal every bridge must handle: the detach the gesture had already left the
-        # reader for.
-        Invoke-KrDetachRefused
+    $detach = $script:Kr.DetachIds.IndexOf($Id)
+    if ($detach -ge 0) {
+        $script:Kr.DetachIds.RemoveAt($detach)
+        if ($variant.Name -eq 'refused') {
+            # The one refusal every bridge must handle: the detach the gesture had already left the
+            # reader for.
+            Invoke-KrDetachRefused
+        } elseif ($variant.Name -eq 'detached') {
+            # After a successful detach the bridge drops its fence, so a repeated gesture cannot
+            # take on the next attachment's identity.
+            $script:Kr.FenceLive = $false
+        }
         return
     }
-    if ($variant.Name -eq 'detached') {
-        # After a successful detach the bridge drops its fence, so a repeated gesture cannot take
-        # on the next attachment's identity.
-        $script:Kr.FenceLive = $false
+    if ($Id -ne 0 -and $Id -eq $script:Kr.AcceptId -and -not $script:Kr.AcceptAnswered) {
+        $script:Kr.AcceptAnswered = $true
+        $script:Kr.TokenPresent = $false
+        $script:Kr.Token = ''
+        if ($variant.Name -eq 'command_recorded' -and $variant.Payload -is [hashtable]) {
+            $token = $variant.Payload['detach_token']
+            if ($token -is [string] -and $token.Length -gt 0 -and
+                [System.Text.Encoding]::UTF8.GetByteCount($token) -lt $script:KR_TOKEN_MAX -and
+                -not $token.Contains([char]0)) {
+                $script:Kr.Token = $token
+                $script:Kr.TokenPresent = $true
+            }
+        }
+        return
+    }
+    if ($Id -ne 0 -and $Id -eq $script:Kr.ResolveId -and -not $script:Kr.ResolveAnswered) {
+        $script:Kr.ResolveAnswered = $true
+        # Anything but a resolution, a refusal included, is no backend: the command runs as it was
+        # typed.
+        $script:Kr.ResolveAnswer = $null
+        if ($variant.Name -eq 'command_resolved' -and $variant.Payload -is [hashtable]) {
+            $script:Kr.ResolveAnswer = $variant.Payload
+        }
     }
 }
 
@@ -1107,6 +1226,147 @@ function Read-KrRevocation {
     }
 }
 
+# Takes the answer a command is waiting for out of what has already arrived.
+#
+# Only the answer to the acceptance or the question being waited for is taken, wherever it is among
+# the frames already read. Everything else stays where it is, in order, for the reader to take at
+# its next step: a request for the reader, a publication and a detach's answer all belong to a
+# reader, and none is running while a command starts.
+function Read-KrAnswers {
+    $at = 0
+    while ($script:Kr.Registered -and ($script:Kr.Incoming.Count - $at) -ge 4) {
+        $length = ([int]$script:Kr.Incoming[$at] -shl 24) -bor ([int]$script:Kr.Incoming[$at + 1] -shl 16) -bor
+                  ([int]$script:Kr.Incoming[$at + 2] -shl 8) -bor [int]$script:Kr.Incoming[$at + 3]
+        if ($length -le 0 -or $length -gt $script:KR_MAX_FRAME) { Disconnect-KrEndpoint; return }
+        if ($script:Kr.Incoming.Count - $at -lt 4 + $length) { return }
+        $body = [byte[]]::new($length)
+        $script:Kr.Incoming.CopyTo($at + 4, $body, 0, $length)
+        $value = try { ConvertFrom-KrCbor $body } catch { $null }
+        $variant = if ($null -eq $value) { $null } else { Get-KrVariant $value }
+        $taken = $false
+        if ($null -ne $variant -and $variant.Name -eq 'event_result' -and $variant.Payload -is [hashtable]) {
+            $id = [uint64]$variant.Payload['id']
+            if (($id -eq $script:Kr.AcceptId -and -not $script:Kr.AcceptAnswered) -or
+                ($id -eq $script:Kr.ResolveId -and -not $script:Kr.ResolveAnswered)) {
+                Read-KrEventResult $id $variant.Payload['result']
+                $taken = $true
+            } elseif ($script:Kr.Owed -ne 0 -and $id -ge $script:Kr.Owed) {
+                $script:Kr.Owed = [uint64]0
+            }
+        }
+        if ($taken) {
+            $script:Kr.Incoming.RemoveRange($at, 4 + $length)
+        } else {
+            $at += 4 + $length
+        }
+    }
+}
+
+# Waits until `$Answered` holds, the deadline passes or the endpoint has gone.
+#
+# Nothing but the answer is taken off the endpoint's buffer here. A deadline that passes leaves the
+# answer owed, and while it is owed nothing waits again.
+function Wait-KrAnswer {
+    param([uint64]$Id, [scriptblock]$Answered, [uint64]$DeadlineTick)
+    while ($true) {
+        Read-KrAnswers
+        if (& $Answered) { return $true }
+        if (-not $script:Kr.Registered -or $null -eq $script:Kr.Socket) { return $false }
+        $remaining = [int64]$DeadlineTick - [int64](Get-KrTickMs)
+        if ($remaining -le 0) { $script:Kr.Owed = $Id; return $false }
+        $wait = [int][Math]::Min($remaining, 25)
+        $socket = $script:Kr.Socket
+        if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
+            # The read in flight completes when something arrives, and the read's own fault, if it
+            # has one, is read by the step that takes what it delivered.
+            $pending = $script:Kr.PipeRead
+            if ($null -ne $pending -and -not $pending.IsCompleted) {
+                try { [void]$pending.Wait($wait) } catch { }
+            }
+        } else {
+            try {
+                [void]$socket.Poll($wait * 1000, [System.Net.Sockets.SelectMode]::SelectRead)
+            } catch {
+                Disconnect-KrEndpoint
+                return $false
+            }
+        }
+        if (-not (Receive-KrAvailable)) { return $false }
+    }
+}
+
+# The capability the worker minted for the line just accepted, or nothing.
+#
+# Waits at most the answer's budget for the answer to the acceptance this bridge last reported,
+# unless an answer is already owed. The shell exports it for the commands of that line and for
+# nothing else.
+function Get-KrLineToken {
+    if ($script:Kr.AcceptId -eq 0 -or -not $script:Kr.Registered) { return $null }
+    if (-not $script:Kr.AcceptAnswered) {
+        Read-KrAnswers
+        if (-not $script:Kr.AcceptAnswered -and $script:Kr.Owed -eq 0) {
+            $deadline = (Get-KrTickMs) + $script:KR_ANSWER_WAIT_MS
+            [void](Wait-KrAnswer $script:Kr.AcceptId { $script:Kr.AcceptAnswered } $deadline)
+        }
+    }
+    if (-not $script:Kr.AcceptAnswered) {
+        Write-KrTrace "line $($script:Kr.AcceptId): no answer, so no capability"
+        return $null
+    }
+    if (-not $script:Kr.TokenPresent) {
+        Write-KrTrace "line $($script:Kr.AcceptId): no capability for this line"
+        return $null
+    }
+    Write-KrTrace "line $($script:Kr.AcceptId): a capability for this line"
+    $script:Kr.Token
+}
+
+# Asks the worker what one invocation resolves to, and waits at most the answer's budget.
+#
+# Returns the worker's answer as it decoded, or nothing: a refusal, the deadline, a lost endpoint,
+# an answer still owed to an earlier question and a request that is not text all leave the command
+# to run as it was typed. Nothing a person typed is written to the diagnostics.
+function Invoke-KrAskResolve {
+    param([string[]]$Argv, [string]$Executable, [string]$Cwd, [uint64]$CwdRevision, [uint64]$PromptGeneration,
+          [uint64]$BudgetMs = $script:KR_ANSWER_WAIT_MS)
+    if (-not $script:Kr.Registered) { return $null }
+    # A name, a directory or an argument that cannot be written as text cannot be named exactly,
+    # so it is not asked about.
+    $strict = [System.Text.UTF8Encoding]::new($false, $true)
+    try {
+        foreach ($text in @($Argv) + @($Executable, $Cwd)) { [void]$strict.GetBytes([string]$text) }
+    } catch {
+        Write-KrTrace 'resolve: a request that is not text was not asked about'
+        return $null
+    }
+    Read-KrAnswers
+    if ($script:Kr.Owed -ne 0) {
+        Write-KrTrace "resolve: not asked about: event $($script:Kr.Owed) is still unanswered"
+        return $null
+    }
+    # One monotonic budget covers the send and the wait.
+    $deadline = (Get-KrTickMs) + $BudgetMs
+    Send-KrEvent 'command_resolve' @{
+        cwd               = $Cwd
+        argv              = [string[]]@($Argv)
+        executable        = $Executable
+        session_id        = $script:Kr.Session
+        interactive       = $true
+        cwd_revision      = $CwdRevision
+        prompt_generation = $PromptGeneration
+    } $BudgetMs
+    if (-not $script:Kr.Registered) { return $null }
+    $script:Kr.ResolveId = $script:Kr.LastEventId
+    $script:Kr.ResolveAnswered = $false
+    $script:Kr.ResolveAnswer = $null
+    Write-KrTrace "resolve $($script:Kr.ResolveId): asked"
+    if (-not (Wait-KrAnswer $script:Kr.ResolveId { $script:Kr.ResolveAnswered } $deadline)) {
+        Write-KrTrace "resolve $($script:Kr.ResolveId): no answer; runs as typed"
+        return $null
+    }
+    $script:Kr.ResolveAnswer
+}
+
 function Invoke-KrFrame {
     param([byte[]]$Body)
     $value = try { ConvertFrom-KrCbor $Body } catch { $null }
@@ -1116,7 +1376,7 @@ function Invoke-KrFrame {
     switch ($variant.Name) {
         'fence_published' { Read-KrPublication $variant.Payload; return }
         'launch_revoked' { Read-KrRevocation $variant.Payload; return }
-        'event_result' { Read-KrEventResult $variant.Payload['result']; return }
+        'event_result' { Read-KrEventResult ([uint64]$variant.Payload['id']) $variant.Payload['result']; return }
         'request' {
             $id = [uint64]$variant.Payload['id']
             $request = Get-KrVariant $variant.Payload['request']
