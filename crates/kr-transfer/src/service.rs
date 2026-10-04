@@ -479,8 +479,7 @@ enum RacePoint {
 ///
 /// Another request's step between two of a call's own cannot be produced on demand by running two
 /// threads, so a test stops the call at the point and does the step itself, with the journal held,
-/// and the call goes on from what it left. They exist only in a build that asks for the `testing`
-/// feature.
+/// and the call goes on from what it left. They exist only with the `testing` feature.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 pub(crate) struct RaceHooks {
@@ -1174,21 +1173,7 @@ impl TransferService {
                 // became of the payload, and this call is owed that rather than the open's
                 // failure, which would reach the caller as a refusal of a publication that
                 // succeeded. Every other failure is the storage failure it is.
-                let current = {
-                    let store = self.locked()?;
-                    upload_of(&store, params.transfer_id, actor)?
-                };
-                return match current.state {
-                    UploadState::Published => self.finish_published(&current, params, action),
-                    UploadState::Publishing => self.finish_publishing(actor, params, action, now),
-                    // An upload that ended took its payload with it, and the row says how it
-                    // ended. That is the answer every copy of this action is owed, rather than
-                    // one copy reading the state and another reading the absence of a file.
-                    UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired => {
-                        self.refuse_publication(action, publication_refusal(&current))
-                    }
-                    _ => Err(error),
-                };
+                return self.answer_from_row(actor, params, action, now, error);
             }
         };
         let payload_identity = file.identity();
@@ -1213,8 +1198,24 @@ impl TransferService {
             // So is the record: another request can have taken this action's identifier since the
             // check at the top of the call, and an identifier carrying a different payload is
             // refused before anything is moved. Under the lock, the record decides again.
-            if let Recorded::Answered(answered) = recorded_with(&store, action)? {
-                return Ok(answered);
+            match recorded_with(&store, action)? {
+                Recorded::Answered(answered) => return Ok(answered),
+                // A copy that has claimed the publication is deciding what became of this
+                // upload, and its answer is what this call is owed: not an integrity refusal that
+                // nothing records, which would leave two copies of one action told different
+                // things. The row says what the copy did.
+                Recorded::Claimed => {
+                    drop(store);
+                    drop(payloads);
+                    return self.answer_from_row(
+                        actor,
+                        params,
+                        action,
+                        now,
+                        TransferError::integrity(reason),
+                    );
+                }
+                Recorded::Absent => {}
             }
             ask_admission(action)?;
             let moved = commit_admitted(action, || {
@@ -1351,6 +1352,38 @@ impl TransferService {
         // record is completed with it and a later repeat is answered with this handle rather than
         // told the outcome is unknown. Nothing replaces a result already recorded.
         self.complete_claim(action, result)
+    }
+
+    /// Answers a finish from what became of its upload, for a call that found a copy of its own
+    /// action in the middle of deciding that.
+    ///
+    /// A published upload answers with its handle, a publication under way is finished and
+    /// answered, and an upload that ended answers with the refusal its state gives, recorded on
+    /// this action's claim. In any other state nothing has been decided about the upload, and the
+    /// failure this call came with is its answer.
+    fn answer_from_row(
+        &self,
+        actor: &ActorId,
+        params: &UploadFinishParams,
+        action: Option<&Action>,
+        now: TimestampMs,
+        otherwise: TransferError,
+    ) -> Result<UploadFinishResult> {
+        let current = {
+            let store = self.locked()?;
+            upload_of(&store, params.transfer_id, actor)?
+        };
+        match current.state {
+            UploadState::Published => self.finish_published(&current, params, action),
+            UploadState::Publishing => self.finish_publishing(actor, params, action, now),
+            // An upload that ended took its payload with it, and the row says how it ended. That
+            // is the answer every copy of this action is owed, rather than one copy reading the
+            // state and another reading the absence of a file.
+            UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired => {
+                self.refuse_publication(action, publication_refusal(&current))
+            }
+            _ => Err(otherwise),
+        }
     }
 
     fn finish_published(
@@ -2754,8 +2787,8 @@ impl TransferService {
     /// A two-commit effect claims its action with the first commit; this is the second half. It
     /// replaces nothing: the first result recorded for an identifier is the one that stands. That is
     /// the answer every copy of the action is owed, so a call whose own completion lost, because a
-    /// copy or a recovery pass settled the claim after this call computed its result, returns what
-    /// was recorded and not what it computed: the two can differ, for instance in the session a
+    /// copy of the action or the sweep that settles open claims recorded its answer after this call
+    /// computed its result, returns what was recorded and not what it computed: the two can differ, for instance in the session a
     /// draft bound the attachment to in between.
     fn complete_claim<T>(&self, action: Option<&Action>, result: T) -> Result<T>
     where
