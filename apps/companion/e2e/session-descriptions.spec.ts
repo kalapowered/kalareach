@@ -151,3 +151,51 @@ test.describe('the session rows ask the host about what is on the screen', () =>
     expect(over, 'lines that run past the first column').toEqual([])
   })
 })
+
+// KR-REQ-13.10: the session's own header names it as the list does, and what the host says can be
+// one long word.
+test("in a session's header, a long generated title and its label stay inside the window", async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    let held: Window['krTestHost']
+    Object.defineProperty(window, 'krTestHost', {
+      configurable: true,
+      get: () => held,
+      set: (controls: Window['krTestHost']) => {
+        held = controls
+        controls?.describe('8a7b6c50-22bb-4c3d-8e4f-000000000101', {
+          title: 'Pairingcodeentryandhostapprovalflowforanarrowcolumnonaphone',
+          source: 'generated',
+          freshness: 'current'
+        })
+      }
+    })
+  })
+  await page.setViewportSize({ width: 1100, height: 800 })
+  await page.goto('/harness.html')
+  await page.getByRole('button', { name: 'Sessions' }).click()
+  await page.getByTestId('session-row-1').click()
+  await page.getByTestId('conversation').waitFor()
+  await page.setViewportSize({ width: 320, height: 720 })
+
+  const header = page.locator('.session-header')
+  await expect(header.getByTestId('description-source')).toBeVisible()
+  const over = await header.evaluate((element) => {
+    const window_ = document.documentElement.clientWidth
+    const title = element.querySelector('h1')
+    return {
+      page: document.documentElement.scrollWidth - window_,
+      title: title === null ? Number.POSITIVE_INFINITY : title.scrollWidth - title.clientWidth,
+      past: [...element.querySelectorAll('h1, [data-testid="description-source"]')]
+        .filter((line) => {
+          const box = line.getBoundingClientRect()
+          return box.right > window_ + 0.5 || box.left < -0.5
+        })
+        .map((line) => line.textContent?.slice(0, 40) ?? '')
+    }
+  })
+  expect(over.page, 'the page runs wider than the window').toBeLessThanOrEqual(1)
+  expect(over.title, 'the title runs past its own box').toBeLessThanOrEqual(1)
+  expect(over.past, 'the title or its label runs past the window').toEqual([])
+})
