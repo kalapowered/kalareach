@@ -431,15 +431,45 @@ pub enum RetainedOutcome {
     },
 }
 
+/// What a test does at one of the points a call can be stopped at.
+#[cfg(feature = "testing")]
 pub(crate) type RaceHookCallback = dyn Fn(&mut Store, TransferId) + Send + Sync;
 
+#[cfg(feature = "testing")]
 #[derive(Clone)]
 pub(crate) struct RaceHook(pub(crate) Arc<RaceHookCallback>);
 
+#[cfg(feature = "testing")]
 impl core::fmt::Debug for RaceHook {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("RaceHook(..)")
     }
+}
+
+/// Where a test can stop a finish to do what another request could do at that point.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug)]
+enum RacePoint {
+    /// After the state was read and before the journal is taken to decide from it.
+    Finish,
+    /// After the checks and before the staged file is opened.
+    StagedOpen,
+    /// After the staged file was verified and before the publication is claimed.
+    PostVerification,
+}
+
+/// The hooks a test sets on a service.
+///
+/// Another request's step between two of a call's own cannot be produced on demand by running two
+/// threads, so a test stops the call at the point and does the step itself, with the journal held,
+/// and the call goes on from what it left. They exist only in a build that asks for the `testing`
+/// feature.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub(crate) struct RaceHooks {
+    finish: std::sync::RwLock<Option<RaceHook>>,
+    staged_open: std::sync::RwLock<Option<RaceHook>>,
+    post_verification: std::sync::RwLock<Option<RaceHook>>,
 }
 
 /// The transfer service of one environment.
@@ -459,9 +489,8 @@ pub struct TransferService {
     pub(crate) clock: Arc<dyn Clock>,
     /// Set to stage every snapshot by copying its bytes, even where the filesystem clones.
     pub(crate) copy_snapshots: std::sync::atomic::AtomicBool,
-    pub(crate) finish_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
-    pub(crate) staged_open_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
-    pub(crate) post_verification_race_hook: Arc<std::sync::RwLock<Option<RaceHook>>>,
+    #[cfg(feature = "testing")]
+    pub(crate) race_hooks: RaceHooks,
 }
 
 impl TransferService {
@@ -500,55 +529,86 @@ impl TransferService {
             payloads: Mutex::new(()),
             clock,
             copy_snapshots: std::sync::atomic::AtomicBool::new(false),
-            finish_race_hook: Arc::new(std::sync::RwLock::new(None)),
-            staged_open_race_hook: Arc::new(std::sync::RwLock::new(None)),
-            post_verification_race_hook: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "testing")]
+            race_hooks: RaceHooks::default(),
         })
     }
 
+    /// Stops a finish after it read the state and before it decides from it, and runs `hook`.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn set_finish_race_hook<F>(&self, hook: F)
     where
         F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
     {
-        *self.finish_race_hook.write().expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
+        *self.race_hooks.finish.write().expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
     }
 
+    /// Removes the hook [`Self::set_finish_race_hook`] set.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn clear_finish_race_hook(&self) {
-        *self.finish_race_hook.write().expect("not poisoned") = None;
+        *self.race_hooks.finish.write().expect("not poisoned") = None;
     }
 
+    /// Stops a finish before it opens the staged file, and runs `hook`.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn set_staged_open_race_hook<F>(&self, hook: F)
     where
         F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
     {
-        *self.staged_open_race_hook.write().expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
+        *self.race_hooks.staged_open.write().expect("not poisoned") =
+            Some(RaceHook(Arc::new(hook)));
     }
 
+    /// Removes the hook [`Self::set_staged_open_race_hook`] set.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn clear_staged_open_race_hook(&self) {
-        *self.staged_open_race_hook.write().expect("not poisoned") = None;
+        *self.race_hooks.staged_open.write().expect("not poisoned") = None;
     }
 
+    /// Stops a finish after it verified the staged file, and runs `hook`.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn set_post_verification_race_hook<F>(&self, hook: F)
     where
         F: Fn(&mut Store, TransferId) + Send + Sync + 'static,
     {
         *self
-            .post_verification_race_hook
+            .race_hooks
+            .post_verification
             .write()
             .expect("not poisoned") = Some(RaceHook(Arc::new(hook)));
     }
 
+    /// Removes the hook [`Self::set_post_verification_race_hook`] set.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn clear_post_verification_race_hook(&self) {
         *self
-            .post_verification_race_hook
+            .race_hooks
+            .post_verification
             .write()
             .expect("not poisoned") = None;
+    }
+
+    /// Runs the hook a test set for `point`, if it set one, with the journal held.
+    #[cfg(feature = "testing")]
+    fn race(&self, point: RacePoint, transfer_id: TransferId) -> Result<()> {
+        let hooks = &self.race_hooks;
+        let slot = match point {
+            RacePoint::Finish => &hooks.finish,
+            RacePoint::StagedOpen => &hooks.staged_open,
+            RacePoint::PostVerification => &hooks.post_verification,
+        };
+        let hook = slot.read().expect("not poisoned").clone();
+        if let Some(hook) = hook {
+            let mut store = self.locked()?;
+            (hook.0)(&mut store, transfer_id);
+        }
+        Ok(())
     }
 
     /// Stages every snapshot by copying its bytes, even where the filesystem offers a clone.
@@ -1002,13 +1062,8 @@ impl TransferService {
                 _ => {}
             }
         }
-        {
-            let hook = self.finish_race_hook.read().expect("not poisoned").clone();
-            if let Some(hook) = hook {
-                let mut store = self.locked()?;
-                (hook.0)(&mut store, params.transfer_id);
-            }
-        }
+        #[cfg(feature = "testing")]
+        self.race(RacePoint::Finish, params.transfer_id)?;
         let row = {
             let mut store = self.locked()?;
             let row = upload_of(&store, params.transfer_id, actor)?;
@@ -1064,17 +1119,8 @@ impl TransferService {
             }
             row
         };
-        {
-            let hook = self
-                .staged_open_race_hook
-                .read()
-                .expect("not poisoned")
-                .clone();
-            if let Some(hook) = hook {
-                let mut store = self.locked()?;
-                (hook.0)(&mut store, params.transfer_id);
-            }
-        }
+        #[cfg(feature = "testing")]
+        self.race(RacePoint::StagedOpen, params.transfer_id)?;
         // The whole-file verification and the preview happen without the store lock: they read the
         // payload, which for a large file takes long enough that holding the journal would stop
         // every other transfer in this environment.
@@ -1161,17 +1207,8 @@ impl TransferService {
             }
             None => None,
         };
-        {
-            let hook = self
-                .post_verification_race_hook
-                .read()
-                .expect("not poisoned")
-                .clone();
-            if let Some(hook) = hook {
-                let mut store = self.locked()?;
-                (hook.0)(&mut store, params.transfer_id);
-            }
-        }
+        #[cfg(feature = "testing")]
+        self.race(RacePoint::PostVerification, params.transfer_id)?;
         // Taken before the journal's lock, and held over both commits, so a cancellation, a
         // sweep or a recovery cannot act on this payload between them.
         let payloads = self.payloads.lock().map_err(|_| poisoned())?;
