@@ -2616,53 +2616,92 @@ fn upload_finish_transition_to_publishing_after_verification_resolves() {
     harness.service.clear_post_verification_race_hook();
 }
 
-/// KR-REQ-24.09: an expiry is answered as an expiry, whichever path settles it.
-///
-/// An upload that ran out of time is not an upload whose bytes were tampered with, and the claim
-/// recovery settles is owed the same code the live check and the refusal give it.
-#[test]
-fn an_expired_upload_claim_settled_by_recovery_unifies_as_resource_unavailable() {
+/// How a finish claim left open on an ended upload comes to be settled.
+#[derive(Clone, Copy)]
+enum Settling {
+    /// The next recovery pass settles it.
+    Recovery,
+    /// A retry of the finish settles it.
+    Retry,
+}
+
+/// Ends an upload under an open finish claim, settles the claim as asked, and returns what the
+/// claim then records: its result, its refusal's code and its refusal's words.
+fn settled_finish_claim(
+    ended: UploadState,
+    settling: Settling,
+) -> (Option<Vec<u8>>, Option<String>, Option<String>) {
     let harness = Harness::create();
     let bytes = pattern(64);
     let claim = action(&harness, "upload.finish", &bytes);
     let (transfer_id, _) =
-        interrupted_publication(&harness, &bytes, "expired_claim.bin", Some(&claim));
-
-    // Close the upload as Expired directly in the store, simulating expiry with claim still open.
-    {
-        let mut store = kr_transfer::Store::open(
+        interrupted_publication(&harness, &bytes, "ended_claim.bin", Some(&claim));
+    let open_store = || {
+        kr_transfer::Store::open(
             kr_transfer::StagingArea::store_path(&harness.host.environment()),
             harness.host.environment_id(),
         )
-        .expect("opens store");
-        store
-            .close_upload(
-                transfer_id,
-                UploadState::Expired,
-                Some("upload expired before finish completed"),
-                kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
-                None,
-            )
-            .expect("closes upload as expired");
+        .expect("opens the journal")
+    };
+    // The upload ends in the journal while its claim is still open.
+    open_store()
+        .close_upload(
+            transfer_id,
+            ended,
+            Some("the upload ended while its finish was open"),
+            kr_protocol::scalars::TimestampMs::new(support::START_MS + 5),
+            None,
+        )
+        .expect("ends the upload");
+    match settling {
+        Settling::Recovery => {
+            let recovery = harness.service.recover().expect("recovery runs");
+            assert_eq!(
+                recovery.resolved_claims, 1,
+                "an upload that ended as {ended:?} has its open finish claim settled"
+            );
+        }
+        Settling::Retry => {
+            harness
+                .finish_as(transfer_id, &bytes, Some(&claim))
+                .expect_err("a retry of the finish is refused");
+        }
     }
+    let record = open_store()
+        .retained_action(&claim.actor_id, claim.action_id)
+        .expect("reads the record")
+        .expect("the claim is still recorded");
+    // Each run has a transfer of its own, and the words name it.
+    let detail = record
+        .error_detail
+        .map(|detail| detail.replace(&transfer_id.to_string(), "<transfer>"));
+    (record.result, record.error_code, detail)
+}
 
-    // Run recovery which calls resolve_claims() to settle the open claim.
-    let recovery = harness.service.recover().expect("recovery runs");
-    assert_eq!(
-        recovery.resolved_claims, 1,
-        "the expired upload's claim was settled by recovery"
-    );
-
-    // Reading the settled claim via finish_as must return ErrorCode::ResourceUnavailable,
-    // unifying with check_live and publication_refusal.
-    let refusal = harness
-        .finish_as(transfer_id, &bytes, Some(&claim))
-        .expect_err("reading the settled expired claim returns refusal");
-    assert_eq!(
-        refusal.code(),
-        ErrorCode::ResourceUnavailable,
-        "expired claim settlement unifies to ResourceUnavailable"
-    );
+/// KR-REQ-24.09: a finish claim left open on an upload that ended without publishing is settled
+/// by recovery, with the answer a retry of that finish records.
+///
+/// A cancellation, an invalidation and an expiry each end an upload while its publication's claim
+/// has no result. The caller who never comes back is owed the same refusal, under the same code and
+/// the same words, whether recovery or a retry gets there first.
+#[test]
+fn recovery_settles_an_open_finish_claim_on_an_ended_upload_as_a_retry_does() {
+    for ended in [
+        UploadState::Cancelled,
+        UploadState::Invalidated,
+        UploadState::Expired,
+    ] {
+        let by_recovery = settled_finish_claim(ended, Settling::Recovery);
+        let by_retry = settled_finish_claim(ended, Settling::Retry);
+        assert!(
+            by_recovery.0.is_none() && by_recovery.1.is_some(),
+            "{ended:?}: recovery records a refusal and no handle"
+        );
+        assert_eq!(
+            by_recovery, by_retry,
+            "{ended:?}: recovery and a retry record the same answer"
+        );
+    }
 }
 
 /// KR-REQ-24.09: a copy of one action that finds the payload gone is answered by the row, not by
