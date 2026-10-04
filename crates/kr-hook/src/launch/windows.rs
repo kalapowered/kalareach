@@ -141,8 +141,9 @@ pub(super) fn environment_block(
 /// handle closes, so it is born held and no moment exists in which it is created and not held. The
 /// launcher holds the only handle and is not in the job. A launcher that stops for any reason after
 /// the creation, whatever the backend has or has not done, ends the program it created, which
-/// nothing could start. Once the backend has committed the launch, or the program has been ended,
-/// the setting is taken off, so the launcher's own end ends nothing the program started.
+/// nothing could start, and so does one that could not end the program itself. Once the backend has
+/// committed the launch the setting is taken off, so the launcher's own end ends nothing the
+/// program started.
 pub(super) struct Program {
     process: OwnedHandle,
     thread: OwnedHandle,
@@ -279,7 +280,10 @@ impl Program {
         if let Err(failure) = listed {
             // SAFETY: the list was initialised above and nothing else holds it.
             unsafe { DeleteProcThreadAttributeList(attributes) };
-            return Err(failure);
+            return Err(format!(
+                "{} could not be set up to be created in the job that holds it: {failure}",
+                executable.display()
+            ));
         }
         // SAFETY: all zeroes is the documented starting state of a structure of integers, pointers
         // and handles.
@@ -335,17 +339,16 @@ impl Program {
         })
     }
 
-    /// Ends the program, which has not run: nothing it could have started exists. The holder is let
-    /// go of, since this launcher goes on to run the typed command and what that starts is not the
-    /// holder's to end.
+    /// Ends the program, which has not run: nothing it could have started exists. A termination
+    /// that fails leaves the holder armed, so the program is ended with the launcher at the latest.
+    /// The typed command this launcher goes on to run is the launcher's child and not in the holder.
     fn end(&self) {
         // SAFETY: the handle is this value's own and open for the call.
         unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
-        let _ = ends_with_its_handle(&self.holder, false);
     }
 
     /// Lets the job that held the program until now go without ending what it holds, and starts the
-    /// program. The launcher stays a member of it, which ends nothing.
+    /// program.
     ///
     /// Called once the backend has committed the launch, which is after it has shown the program
     /// and taken it into a job of its own that ends it should the launcher go before it says the
@@ -651,6 +654,7 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     use super::*;
 
@@ -714,11 +718,31 @@ mod tests {
         }
     }
 
+    /// Whether this process is in `job`, directly or in a job nested in it.
+    fn this_process_is_in(job: &OwnedHandle) -> bool {
+        let mut inside = 0_i32;
+        // SAFETY: the handle is open for the call, the pseudo handle for this process needs no
+        // closing, and the answer is a local.
+        let asked = unsafe {
+            IsProcessInJob(
+                GetCurrentProcess(),
+                job.as_raw_handle().cast(),
+                &raw mut inside,
+            )
+        };
+        assert_ne!(
+            asked, 0,
+            "the system answers whether this process is in the job"
+        );
+        inside != 0
+    }
+
     /// A program the launcher creates is in the job that ends it with the launcher from the moment
-    /// the creation returns, and is let go of by every way out of an unstarted program: ended, and
-    /// started. One case, since a launcher is a member of every holder it makes.
+    /// the creation returns, and the launcher is not in that job. A program the launcher ends
+    /// leaves the job armed, so a termination that failed would not leave it running; one the
+    /// launcher starts is let go of first, so the launcher's end ends nothing it started.
     #[test]
-    fn a_program_is_born_in_the_job_that_ends_it_with_the_launcher_until_it_is_let_go() {
+    fn a_program_is_born_in_the_job_that_ends_it_with_the_launcher_until_it_is_started() {
         let (executable, vector) = quick();
 
         let ended =
@@ -728,16 +752,19 @@ mod tests {
             "the program is in the holder as soon as it exists"
         );
         assert!(armed(&ended.0.holder), "which ends it with the launcher");
-        ended.0.end();
         assert!(
-            !armed(&ended.0.holder),
-            "an ended program leaves the holder ending nothing, for the typed command that follows"
+            !this_process_is_in(&ended.0.holder),
+            "and the launcher is not in it, so nothing the launcher runs afterwards is"
         );
+        ended.0.end();
+        assert_eq!(ended.0.wait(), 1, "an ended program has not run");
+        assert!(armed(&ended.0.holder), "and its holder is still armed");
 
         let started =
             Ending(Program::create(&executable, &vector, &[]).expect("a program is created"));
         assert!(holds(&started.0.holder, &started.0.process));
         assert!(armed(&started.0.holder));
+        assert!(!this_process_is_in(&started.0.holder));
         started.0.resume().expect("the program is started");
         assert!(
             !armed(&started.0.holder),
