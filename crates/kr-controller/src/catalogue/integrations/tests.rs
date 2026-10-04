@@ -157,6 +157,56 @@ fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_t
         fixture::qoder_flags(),
         "with no forwarder installed the flags are as declared"
     );
+    let reported = report(
+        Some(&reading),
+        &[],
+        &enabled(&["qoder-cli"]),
+        &able(Vec::new()),
+    );
+    let qoder = reported
+        .reports
+        .iter()
+        .find(|report| report.plugin_id == "kalareach/qoder-cli")
+        .expect("reported");
+    assert!(
+        qoder
+            .reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("forwarder")),
+        "the doctor says why an invocation runs as typed: {:?}",
+        qoder.reason
+    );
+}
+
+/// KR-REQ-12.22: where a program started by a bare name is looked for in the application's own
+/// working directory first, as on Windows, the doctor says that an integration whose flags start the
+/// forwarder that way runs as typed. Elsewhere it says nothing of the kind.
+#[test]
+fn the_doctor_says_why_flags_that_start_the_forwarder_by_its_bare_name_run_as_typed_on_windows() {
+    let store = Store::new("bare");
+    let bare: Vec<String> = fixture::qoder_flags()
+        .iter()
+        .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, "kr-hook"))
+        .collect();
+    let mut shape = fixture::Shape::qoder_cli();
+    shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(bare);
+    let reading = Integrations::new().read(&[store.admitted(&shape, |_| {})]);
+    let reported = report(
+        Some(&reading),
+        &[],
+        &enabled(&["qoder-cli"]),
+        &able(Vec::new()),
+    );
+    let reason = reported.reports[0].reason.0.as_deref();
+    if cfg!(windows) {
+        assert!(
+            reason.is_some_and(|reason| reason.contains("bare name")),
+            "{reason:?}"
+        );
+    } else {
+        assert_eq!(reason, None);
+    }
 }
 
 /// KR-REQ-12.07: an integration whose grant the installation does not hold gives no entry, whatever

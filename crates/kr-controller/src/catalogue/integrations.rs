@@ -497,6 +497,30 @@ fn resolved(
             report.mode = IntegrationMode::NativeBridge;
         }
     }
+    // Flags that name the forwarder stay as declared where this host cannot write them, and a worker
+    // that cannot write them runs every invocation as typed: the report says so beside the state.
+    if report.state == CommandIntegrationState::On
+        && report.reason.0.is_none()
+        && let Err(error) =
+            kr_plugin_sdk::forwarder::expand_flags(&report.flags, host.forwarder.as_deref())
+    {
+        report.reason = Nullable::some(format!(
+            "its flags cannot be written with the installed forwarder, so an invocation runs as \
+             typed: {error}"
+        ));
+    }
+    if report.state == CommandIntegrationState::On
+        && report.reason.0.is_none()
+        && cfg!(windows)
+        && kr_plugin_sdk::forwarder::starts_by_bare_name(&report.flags)
+    {
+        report.reason = Nullable::some(
+            "its flags start the forwarder by its bare name, which Windows looks for in the \
+             application's working directory first, so an invocation runs as typed until the \
+             package names the forwarder by its path"
+                .to_owned(),
+        );
+    }
     if let Some(command) = report.command.0.as_deref()
         && let Some(executable) = resolve(command, &host.search_path)
     {

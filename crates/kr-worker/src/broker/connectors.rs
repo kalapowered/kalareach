@@ -355,7 +355,7 @@ impl InstalledConnector {
     /// none where the installation did not. A package that installs none gets, while its
     /// integration applies, its own hook on `launcher`, this installation's own `kr-hook`: such a
     /// package's hooks come from the launch itself, as Qoder CLI's inline settings register them,
-    /// naming the forwarder as a bare command the application finds on the launch's search path.
+    /// naming the forwarder by the path the installation keeps current.
     /// Whatever the flags say, a bridge is admitted only when it declares the package's own
     /// application and a surface this bridge has, and its process runs this bridge's forwarder.
     #[must_use]
@@ -405,7 +405,10 @@ impl InstalledConnector {
         let Some((directory, _)) = executable.rsplit_once('/') else {
             return false;
         };
+        // The name a command is looked up by, and as it was typed too: a rule's file stem may itself
+        // end in `.com`, which the lookup name takes off.
         self.matches_executable(&format!("{directory}/{}", lookup_name(command)))
+            || self.matches_executable(&format!("{directory}/{command}"))
     }
 
     /// Returns the decisions a declarative interpretation offers: the ones the table's decision
