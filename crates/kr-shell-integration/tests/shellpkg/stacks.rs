@@ -1216,6 +1216,8 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
+            idle_reports: 0,
+            last_idle_empty: false,
             reading_reader: None,
             pending: Vec::new(),
             events: Inbox::default(),
