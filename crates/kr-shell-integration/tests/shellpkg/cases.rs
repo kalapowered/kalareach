@@ -9,7 +9,7 @@ use std::time::Duration;
 use kr_protocol::root::{
     AcceptedOrigin, DETACH_HINT, EditorBufferRevision, EditorLeaveReason, FENCE_EXCHANGE_TIMEOUT,
     FenceCause, LAUNCH_READER_BUDGET, LaunchCommand, PromptGeneration, RootEditorFenceParams,
-    RootEditorFenceResult,
+    RootEditorFenceResult, WithheldReason,
 };
 use kr_protocol::scalars::{DurationMs, U64, Uuid};
 use kr_shell_integration::contract::events::{
@@ -1633,6 +1633,51 @@ pub fn the_reader_reports_itself_idle(kind: ShellKind) {
         idle.snapshot.queued_keys == U64::new(0) && idle.snapshot.pending_bytes == U64::new(0),
         "an idle reader reported input it has not read: {:?}",
         idle.snapshot
+    );
+}
+
+/// A reader that has already reported itself idle reports again once the worker has ended an
+/// exchange with no fence, because the worker retries at the reader's next idle report and drops
+/// one that arrives while its exchange is still open.
+///
+/// The worker's exchange for a prompt can still be open when the reader first reports idle (the
+/// terminal's answers to the prompt's own questions are what the reader reads first), and the
+/// acknowledgement that closes it is then withheld. The reader that does not report again leaves
+/// the editor unfenced for as long as it stays at that prompt.
+pub fn a_reader_reports_itself_idle_again_when_the_worker_withholds_a_fence(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let (_, event) = session.expect_event("reader_idle", |event| {
+        matches!(event, BridgeEvent::ReaderIdle(_))
+    });
+    let BridgeEvent::ReaderIdle(first) = event else {
+        unreachable!()
+    };
+    // Whatever else the first prompt's start-up reported is behind this point, so the report
+    // looked for below can only be one the withheld exchange asked for.
+    session.forget_events();
+
+    session.withhold(WithheldReason::QueuesNotDrained);
+    let (_, event) = session.expect_event(
+        "a second reader_idle after the withheld exchange",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == first.prompt_generation
+                        && idle.reader_revision == first.reader_revision
+            )
+        },
+    );
+    let BridgeEvent::ReaderIdle(again) = event else {
+        unreachable!()
+    };
+    assert!(
+        again.editor.buffer_empty
+            && again.snapshot.queued_keys == U64::new(0)
+            && again.snapshot.pending_bytes == U64::new(0),
+        "the report after a withheld exchange was not an idle reader's: {again:?}"
     );
 }
 

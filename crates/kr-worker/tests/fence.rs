@@ -2566,15 +2566,34 @@ impl RealShell {
             .expect("a home directory on the internal disk");
         let entry =
             std::fs::read_to_string(package.startup_entry()).expect("the package's own entry");
-        let startup = match package.kind() {
-            ShellKind::Zsh => home.path().join(".zshrc"),
-            _ => home.path().join(".bashrc"),
-        };
-        std::fs::write(
-            &startup,
-            format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{after_configuration}{entry}"),
-        )
-        .expect("the startup file");
+        if package.kind() == ShellKind::Fish {
+            // Files under `conf.d` run before the person's own `config.fish`, which is why the
+            // entry waits for the first prompt before it activates anything. A bare assignment is
+            // not fish, and a startup file with one would run nothing after it.
+            let configuration = home.path().join(".config").join("fish");
+            std::fs::create_dir_all(configuration.join("conf.d"))
+                .expect("a configuration directory");
+            std::fs::write(
+                configuration.join("config.fish"),
+                format!("set -g KR_TEST_USER_CONFIGURATION 1\n\n{after_configuration}"),
+            )
+            .expect("the startup file");
+            std::fs::write(
+                configuration.join("conf.d").join("kr-kalareach.fish"),
+                entry,
+            )
+            .expect("the startup entry");
+        } else {
+            let startup = match package.kind() {
+                ShellKind::Zsh => home.path().join(".zshrc"),
+                _ => home.path().join(".bashrc"),
+            };
+            std::fs::write(
+                &startup,
+                format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{after_configuration}{entry}"),
+            )
+            .expect("the startup file");
+        }
 
         let mut config = configuration(&temp, ShellMode::Managed);
         let session_id = config.session_id;
@@ -2702,7 +2721,12 @@ impl RealShell {
     #[cfg(unix)]
     fn keys(&self) -> RealKeys {
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
-        let params = terminal(self.runtime.session().config().session_id);
+        let mut params = terminal(self.runtime.session().config().session_id);
+        if self.qualified == Some(ShellKind::Fish) {
+            // This shell turns the Kitty keyboard protocol on, and the keys go to a terminal that
+            // can supply the encoding the application reads.
+            params.terminal_profile_id = Nullable::some("xterm-kitty".to_owned());
+        }
         let epoch = {
             let mut session = self.runtime.session();
             session
@@ -3033,8 +3057,8 @@ fn the_recording_program_works_where_its_directory_holds_an_apostrophe() {
 /// from the bridge's writer for [`PACKAGE_FENCE_HOLD`], as a writer on a loaded machine now and
 /// then keeps one. A line typed at the prompt goes through the fence either way.
 ///
-/// It needs the built Zsh and Bash packages, which only a run that built them has, so an ordinary
-/// run leaves it out; see [`package_root`].
+/// It needs the built Zsh, Bash and Fish packages, which only a run that built them has, so an
+/// ordinary run leaves it out; see [`package_root`].
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
@@ -3044,7 +3068,7 @@ async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypa
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
     for fence_hold in [None, Some(FenceHold::For(PACKAGE_FENCE_HOLD))] {
-        for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
             let package = set
                 .select(Some(kind.as_str()))
                 .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
@@ -3139,7 +3163,12 @@ async fn asks_the_real_worker_before_each_command(
         assert!(!environment.contains_key("KR_REGISTRATION"));
 
         // A sourced script and a script of its own ask nothing for what they run.
-        let sourced = format!(". {}", shell_quoted(&probes.script()));
+        let source = if package.kind() == ShellKind::Fish {
+            "source"
+        } else {
+            "."
+        };
+        let sourced = format!("{source} {}", shell_quoted(&probes.script()));
         keys.type_line(&shell, &sourced);
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
@@ -3279,8 +3308,146 @@ async fn asks_the_real_worker_before_each_command(
         assert_eq!(block.cwd, shell.home().display().to_string());
         assert!(block.duration_ms.0.is_some());
 
+        if package.kind() == ShellKind::Fish {
+            a_reader_the_line_starts_keeps_the_lines_capability(&shell, &probes, &mut keys).await;
+        }
+
         shell.close().await;
     }
+}
+
+/// Waits until `ready` holds of what the worker has recorded.
+///
+/// # Panics
+///
+/// Panics when it does not hold inside the case's own bound.
+#[cfg(unix)]
+async fn the_worker_reaches(what: &str, ready: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the worker did not reach: {what}"));
+}
+
+/// A line that starts a reader of its own (a breakpoint) goes on holding the capability and the
+/// block the worker has for it: the nested reader is not a new prompt, so the worker keeps the
+/// accepted line, and the command the line runs after the breakpoint presents the line's capability
+/// to the worker still.
+///
+/// The worker's own transitions decide each step rather than the probe the line runs at the end:
+/// the first prompt's fence is recorded, the worker holds a running block for the line, a fence
+/// with a later reader revision is published (which is the nested reader's, because both packages
+/// raise the revision at every entry), `exit` leaves it and the state is outside again, and only
+/// then does the probe the line runs afterwards show its capability.
+#[cfg(unix)]
+async fn a_reader_the_line_starts_keeps_the_lines_capability(
+    shell: &RealShell,
+    probes: &RealProbes,
+    keys: &mut RealKeys,
+) {
+    const LINE: &str = "begin; breakpoint; end; kr-probe hold";
+    back_at_the_prompt(shell, probes, "sh -c 'exit 7'").await;
+    // (1) The reader revision of the fence the first prompt published, and the generation of the
+    // block before this line's.
+    let first_revision = {
+        let session = shell.runtime.session();
+        session
+            .fence()
+            .and_then(|driver| driver.fence())
+            .map(|fence| fence.reader_revision)
+            .expect("the prompt's fence is published")
+    };
+    let earlier = shell
+        .runtime
+        .session()
+        .last_command_block()
+        .map(|block| block.prompt_generation.0.get());
+    probes.hold();
+    let before = probes.runs().len();
+    keys.type_line(shell, LINE);
+
+    // (2) The worker holds the line's running block, at a newer prompt than the line before.
+    the_worker_reaches("the running block of the line", || {
+        shell
+            .runtime
+            .session()
+            .last_command_block()
+            .is_some_and(|block| {
+                block.command == LINE
+                    && !block.finished()
+                    && earlier.is_none_or(|earlier| block.prompt_generation.0.get() > earlier)
+            })
+    })
+    .await;
+    let line_generation = shell
+        .runtime
+        .session()
+        .last_command_block()
+        .expect("the line's block")
+        .prompt_generation;
+    // (3) A fence with a later reader revision: the nested reader's.
+    the_worker_reaches("a published fence of a later reader", || {
+        shell
+            .runtime
+            .session()
+            .fence()
+            .and_then(|driver| driver.fence())
+            .is_some_and(|fence| fence.reader_revision > first_revision)
+    })
+    .await;
+    // (4) `exit` at the nested prompt leaves it, which follows the nested acceptance on the
+    // connection, so the worker has applied the acceptance once the state is outside again.
+    keys.type_line(shell, "exit");
+    the_worker_reaches("the state outside after the nested reader left", || {
+        shell
+            .runtime
+            .session()
+            .fence()
+            .is_some_and(|driver| driver.state() == FenceState::Outside)
+    })
+    .await;
+    // (5) The probe the line runs after the breakpoint, with the capability it presents.
+    the_worker_reaches("the probe the line runs after the breakpoint", || {
+        probes
+            .runs()
+            .iter()
+            .skip(before)
+            .any(|(arguments, _)| arguments.first().map(String::as_str) == Some("hold"))
+    })
+    .await;
+    let (_, environment) = probes
+        .runs()
+        .into_iter()
+        .skip(before)
+        .find(|(arguments, _)| arguments.first().map(String::as_str) == Some("hold"))
+        .expect("the probe ran");
+    let token = environment
+        .get("KR_DETACH_TOKEN")
+        .cloned()
+        .expect("the line's command carries the line's capability");
+    let session = shell.runtime.session();
+    assert_eq!(
+        session.fence().expect("a driver").detach_for_token(&token),
+        Some(keys.attachment_id),
+        "a reader the line started took the line's capability from the worker"
+    );
+    let block = session
+        .last_command_block()
+        .expect("the worker holds the line's block");
+    assert_eq!(block.command, LINE);
+    assert!(
+        !block.finished(),
+        "a reader the line started finished the line's block"
+    );
+    assert_eq!(
+        block.prompt_generation, line_generation,
+        "a reader the line started moved the line to another prompt"
+    );
+    drop(session);
+    probes.release();
 }
 
 /// Waits until the line `command` has finished and the reader is back at its prompt behind a valid
@@ -3309,8 +3476,14 @@ async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &st
     })
     .await
     .unwrap_or_else(|_| {
+        let session = shell.runtime.session();
+        let seen = retained(&session);
         panic!(
-            "the shell did not come back to its prompt after {command:?}: {}",
+            "the {:?} shell did not come back to its prompt after {command:?} ({:?}; its output \
+             ends {}): {}",
+            shell.qualified,
+            session.fence(),
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(600)..]).escape_debug(),
             probes.trace()
         )
     });

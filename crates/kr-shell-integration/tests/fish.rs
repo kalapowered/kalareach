@@ -116,6 +116,13 @@ fn the_reader_reports_itself_idle_so_a_withheld_fence_can_be_retried() {
 /// KR-REQ-07.36
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_reader_that_reported_idle_reports_again_when_its_fence_is_withheld() {
+    shellpkg::a_reader_reports_itself_idle_again_when_the_worker_withholds_a_fence(FISH);
+}
+
+/// KR-REQ-07.36
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_shell_whose_bridge_has_gone_still_consumes_an_eligible_gesture() {
     shellpkg::a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(FISH);
 }

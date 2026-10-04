@@ -1664,6 +1664,14 @@ impl Session {
         )));
     }
 
+    /// Tells the bridge the exchange it answered ended with no fence.
+    pub fn withhold(&mut self, reason: WithheldReason) {
+        self.write_frame(&BridgeFrame::FencePublished(FencePublication::Withheld {
+            reason,
+            state: FenceState::Unfenced,
+        }));
+    }
+
     /// Tells the bridge the fence it held has gone.
     pub fn invalidate(&mut self, fence_id: FenceId, reason: WithheldReason) {
         self.write_frame(&BridgeFrame::FencePublished(
