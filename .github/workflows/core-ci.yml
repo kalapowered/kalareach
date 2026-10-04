@@ -80,6 +80,22 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
+      # Two suites start a private sshd of their own on a loopback port and reach it with the real
+      # ssh: a remote shell's terminal database in the worker's tests, and an SSH host's
+      # registration in the command's. The runner image carries the client and, as a rule, the
+      # server; the server is installed when it does not, and the step fails if it is still not
+      # there, so the Test step below can require it.
+      - name: Install the SSH server and client
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if ! command -v ssh-keygen > /dev/null || ! command -v ssh > /dev/null || [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes openssh-server openssh-client
+          fi
+          ssh -V
+          test -x /usr/sbin/sshd
+
       # The test components are compiled to wasm32-wasip2 and are not committed: Rust embeds build
       # paths in a component's custom sections, so two machines produce different bytes for the same
       # source and a committed artefact could not be checked.
@@ -121,6 +137,11 @@ jobs:
       # the step is given twice its length and no more.
       - name: Test
         timeout-minutes: 110
+        env:
+          # The tests that start a private sshd stand down with a printed reason where there is none,
+          # which would let a runner without one pass them without running them. Here a missing
+          # sshd, ssh or ssh-keygen fails them.
+          KR_REQUIRE_SSHD: "1"
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
