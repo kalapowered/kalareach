@@ -5,7 +5,7 @@
  * start or stop the fetch and to change the two settings; it never chooses a model or an address.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -21,6 +21,10 @@ function open(port: HostPort, initialPlace: Place): void {
     </AppProvider>
   )
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 // KR-REQ-22.01: descriptions are offered during setup, with the asset's size, a way to cancel the
 // fetch and a way to turn them off, and no hosted account behind any of it.
@@ -224,6 +228,53 @@ describe('the setup card for session descriptions', () => {
       controls.changeDescriptionSetup({ paused: null, state: 'resident' })
     })
     await userEvent.click(screen.getByRole('switch', { name: 'Keep going on battery power' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-model-status')).toHaveTextContent(/^On$/)
+    })
+    expect(screen.queryByTestId('setup-model-paused')).toBeNull()
+  })
+
+  // A read the host has not answered does not hold the card's controls: a press goes to the host
+  // whether or not an earlier read is still on its way.
+  it('sends a press to the host while a read of the setup has not been answered', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.changeDescriptionSetup({ download: 'running', can_cancel: true, fetched_bytes: '100' })
+    open(port, { view: 'setup' })
+    await toHostStep()
+    const cancel = await screen.findByTestId('setup-model-cancel')
+    const held = controls.hold('descriptionSetup')
+    await person.click(cancel)
+    await waitFor(() => {
+      expect(controls.descriptionDownloads).toHaveLength(1)
+      expect(held.count).toBeGreaterThan(0)
+    })
+    await person.click(screen.getByTestId('setup-model-cancel'))
+    await waitFor(() => {
+      expect(controls.descriptionDownloads).toHaveLength(2)
+    })
+    held.release()
+  })
+
+  // The host's power, heat and memory change with no press: a pause that ends is shown within a few
+  // seconds on a card left open, and not only when a control is pressed.
+  it('shows that a pause has ended on a card left open while descriptions are on', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { port, controls } = fakeHost()
+    controls.changeDescriptionSetup({
+      download: 'verified',
+      fetched_bytes: '1561318368',
+      enabled: true,
+      paused: 'battery'
+    })
+    open(port, { view: 'setup' })
+    await toHostStep()
+    expect(await screen.findByTestId('setup-model-status')).toHaveTextContent('On, paused')
+
+    controls.changeDescriptionSetup({ paused: null, state: 'resident' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000)
+    })
     await waitFor(() => {
       expect(screen.getByTestId('setup-model-status')).toHaveTextContent(/^On$/)
     })

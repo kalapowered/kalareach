@@ -13,11 +13,19 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { DescriptionPause, DescriptionSetup } from '@kalareach/protocol'
 
+import { readOnCadence } from '../app/cadence'
 import { failureMessage, type HostPort } from '../host/port'
 import { readableBytes } from './host'
 
 /** How often a fetch that is running is asked about, in milliseconds. */
 export const PROGRESS_EVERY_MS = 1000
+
+/**
+ * How often the card asks again while descriptions are on and their files are here, in
+ * milliseconds. The host looks at its power, heat and memory every ten seconds, so a pause that
+ * ends, or begins, is shown within five.
+ */
+export const CONDITIONS_EVERY_MS = 5000
 
 /** What the card calls the state of descriptions on this host. */
 export type DescriptionStatus =
@@ -105,10 +113,9 @@ export interface DescriptionSetupState {
  *
  * Every write is followed by a read, because what a person is told is the host's answer and not the
  * request that was made. A read that answers after a newer one began, or after the screen has gone,
- * changes nothing. A write that is made while another is waiting for the host is ignored: the
- * second press would be made from a card that does not yet show the first. No control is disabled
- * while the host answers, so a person on the keyboard or with a screen reader is never moved off
- * the control they pressed or are on.
+ * changes nothing. A write that is made while another is waiting for the host is ignored: it would
+ * be a second press of the same control. No control is disabled while the host answers, so a person
+ * on the keyboard or with a screen reader is not made to leave the control they pressed.
  */
 export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
   const [setup, setSetup] = useState<DescriptionSetup | null>(null)
@@ -164,9 +171,11 @@ export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
         .catch((error: unknown) => {
           if (mounted.current) setRefusal(failureMessage(error))
         })
-        .then(read)
         .finally(() => {
+          // The next press is allowed once the host has answered this one; the read that shows what
+          // it did is its own, and a newer read supersedes it.
           writing.current = false
+          if (mounted.current) void read()
         })
     },
     [read]
@@ -191,17 +200,24 @@ export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
     [port, write]
   )
 
-  // A fetch that is running is asked about until it ends.
-  const running = setup?.download === 'running'
+  // A fetch that is running is asked about until it ends, and a host that has descriptions on is
+  // asked about now and then, because what pauses it, such as the power, changes without a press.
+  const following =
+    setup?.download === 'running'
+      ? PROGRESS_EVERY_MS
+      : setup?.download === 'verified' && setup.enabled
+        ? CONDITIONS_EVERY_MS
+        : null
   useEffect(() => {
-    if (!running) return undefined
-    const timer = setTimeout(() => {
-      void read()
-    }, PROGRESS_EVERY_MS)
+    if (following === null) return undefined
+    const cadence = readOnCadence(read, following)
+    // The answer that began this wait is the one on the screen: the next read is one cadence on.
+    const first = setTimeout(cadence.now, following)
     return () => {
-      clearTimeout(timer)
+      clearTimeout(first)
+      cadence.stop()
     }
-  }, [running, setup, read])
+  }, [following, read])
 
   return { setup, failure, refusal, reload, enable, onBattery, download }
 }
