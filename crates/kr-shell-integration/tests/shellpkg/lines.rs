@@ -194,8 +194,12 @@ pub fn the_capability_reaches_a_lines_commands_and_nothing_around_them(kind: She
         .cloned()
         .flatten()
         .expect("the line was answered with a capability");
+    // The handler that runs after the line starts a program of its own, so the line's is found by
+    // what it was given rather than by being the last.
+    let own = started(&probes, "the-lines-own");
+    assert_eq!(own.len(), 1, "the line's command ran {} times", own.len());
     assert_eq!(
-        last_run(&probes).environment.get("KR_DETACH_TOKEN"),
+        own[0].environment.get("KR_DETACH_TOKEN"),
         Some(&minted),
         "the line's own command did not carry its capability"
     );
