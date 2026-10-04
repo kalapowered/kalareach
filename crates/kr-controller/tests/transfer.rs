@@ -1191,9 +1191,9 @@ async fn each_endpoint_carries_only_the_methods_its_frame_bound_is_for() {
 /// replacement resumes from the verified chunk bitmap, with every byte counted exactly once.
 ///
 /// This one runs the daemon as a real process and ends it with `SIGKILL`: no unwinding, no
-/// destructors, no flush of anything the journal had not already committed. The binary is copied to
-/// the internal disk and every directory it touches is there too, so nothing it opens is on the
-/// removable volume this tree lives on.
+/// destructors, no flush of anything the journal had not already committed. The binary is copied
+/// out of the source tree and every directory it touches is a temporary one, so the daemon opens
+/// nothing in the tree.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
@@ -1571,8 +1571,8 @@ fn start_daemon_with(program: &std::path::Path, host: &teardown::Tree, relative:
         // and leave with the temporary host, rather than into the person's credential store.
         .arg("--secret-store")
         .arg("file")
-        // Never this test's own directory: the build tree can be on a removable volume, and a
-        // process holding one open is a volume the person at the machine cannot eject.
+        // Never this test's own directory: a process that holds a directory open keeps it from
+        // being unmounted or removed.
         .current_dir(host.root())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().expect("duplicates the log"))
@@ -1661,7 +1661,7 @@ fn workspace_root() -> std::path::PathBuf {
 /// How long a freshly started daemon is given to answer.
 ///
 /// A daemon coming up opens its journals, reads its secrets and binds both of its endpoints, and on
-/// a machine that is building something else at the same time that has taken over half a minute.
+/// a heavily loaded machine that has taken over half a minute.
 /// What the wait below asserts is that the daemon comes up at all, so its bound is generous: a run
 /// that reaches it is saying the daemon never answered, not that the machine was busy.
 #[cfg(unix)]

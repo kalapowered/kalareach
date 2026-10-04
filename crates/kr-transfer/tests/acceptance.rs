@@ -1,7 +1,7 @@
 //! KR-ACC-019: partial uploads, quota failure, environment boundaries, symbolic links and
 //! reparse points, and concurrent file changes, in one run.
 //!
-//! One test, five conditions, in the order a reviewer reads them from the acceptance table. Each
+//! One test, five conditions, in the order the acceptance row lists them. Each
 //! step asserts both what the host refused and what it kept: a refusal that lost the user's work
 //! would satisfy the letter of the row and none of its point.
 
