@@ -16,22 +16,14 @@
 
 use std::time::{Duration, Instant};
 
-use kr_describe::budget::Budgets;
-use kr_describe::context::{
-    ContextBinding, ContextBuilder, ContextRevision, DescriptionContext,
-    MAX_PROJECT_TEXT_CODEPOINTS, MAX_RECENT_EVENTS, SemanticEvent, SemanticEventKind,
-};
-use kr_describe::metadata::RepositoryFacts;
-use kr_describe::output::{
-    DESCRIPTION_GRAMMAR, Expectation, ProducedUnder, Rejection, prompt, validate,
-};
+use kr_describe::budget::{Budgets, JobBounds};
+use kr_describe::context::{DescriptionContext, SemanticEventKind};
+use kr_describe::output::{DESCRIPTION_GRAMMAR, Rejection};
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::ModelProfile;
 use kr_describe::serve::{Generating, Job, Model};
+use kr_describe_model::fixtures::{builder, event, largest_contexts, repository, validate_answer};
 use kr_describe_model::llama::Llama;
-use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
-use kr_protocol::scalars::Uuid;
-use kr_worker::privacy::PrivacyGeneration;
 
 /// Which set of sessions a fixture belongs to, since the two are read apart: an ordinary session
 /// is one the product describes in every script, and the largest contexts are the product's own
@@ -180,41 +172,6 @@ fn count_of<'a>(records: impl Iterator<Item = &'a Record>, deadline_ms: u64) -> 
         }
     }
     counts
-}
-
-fn environment() -> EnvironmentId {
-    EnvironmentId::new(Uuid::from_bytes([7; 16]))
-}
-
-fn session(seed: u8) -> SessionId {
-    SessionId::new(Uuid::from_bytes([seed; 16]))
-}
-
-fn builder(seed: u8, revision: u64) -> ContextBuilder {
-    ContextBuilder::new(
-        environment(),
-        session(seed),
-        SessionEpoch::V1,
-        ContextBinding::new("bench"),
-        ContextRevision::new(revision),
-    )
-}
-
-fn repository(name: &str, branch: &str) -> RepositoryFacts {
-    RepositoryFacts {
-        name: name.to_owned(),
-        branch: Some(branch.to_owned()),
-    }
-}
-
-/// An event whose summary is not empty once bounded, which is every summary this file writes.
-fn event(cursor: u64, kind: SemanticEventKind, summary: &str) -> SemanticEvent {
-    SemanticEvent {
-        cursor,
-        kind,
-        summary: kr_describe::context::ProjectText::new(summary)
-            .unwrap_or_else(|| unreachable!("the fixtures' summaries are not empty")),
-    }
 }
 
 /// The sessions every run describes.
@@ -447,14 +404,14 @@ pub fn fixtures() -> Vec<Fixture> {
             ))
             .build(),
     );
-    for (name, base) in [
-        ("largest context, latin", LATIN),
-        ("largest context, arabic", ARABIC),
-        ("largest context, hebrew", HEBREW),
-        ("largest context, emoji", EMOJI),
-    ] {
-        let (n, _) = next();
-        add(name, Set::Largest, largest_context(n, base));
+    for (script, context) in largest_contexts() {
+        let name = match script {
+            "latin" => "largest context, latin",
+            "arabic" => "largest context, arabic",
+            "hebrew" => "largest context, hebrew",
+            _ => "largest context, emoji",
+        };
+        add(name, Set::Largest, context);
     }
     all
 }
@@ -462,104 +419,11 @@ pub fn fixtures() -> Vec<Fixture> {
 /// An intent at the bound of what a person types about one task.
 const LONG_INTENT: &str = "update the pairing code entry screen so that a person who has typed six of the eight characters and then pauses for a long time sees the host approval prompt instead of an error, and keep the keyboard focus on the field";
 
-/// Text in four scripts, cycled to fill a field. Latin is the cheap case for a tokenizer; Arabic
-/// and Hebrew take about a token a codepoint; emoji take several.
-const LATIN: &str = "crates/kr-describe/src/context/semantic_events/long_directory_name/file_with_a_long_name_for_this_event.rs and the pairing code entry screen ";
-const ARABIC: &str =
-    "مراجعة شاشة موافقة المضيف وفحص مسار إدخال رمز الاقتران وتحديث ملف الإعدادات للمشروع ";
-const HEBREW: &str =
-    "בדיקת מסך אישור המארח ובדיקת מסלול הזנת קוד ההתאמה ועדכון קובץ ההגדרות של הפרויקט ";
-const EMOJI: &str = "🎂🎉🚀🔧🧪📦🛠🔍📝✅🌍🔑🧭🎯🪄🧵🎨📡🧱🔒";
-
-/// A field of exactly the bound's length once the product has bounded and trimmed it, from `base`
-/// repeated and started at or after `offset` codepoints in. The product removes controls and trims
-/// a field after it bounds it, so a field that begins or ends with a space reaches it one codepoint
-/// short; this asks the product's own constructor.
-///
-/// # Panics
-///
-/// Panics when no start of `base` gives such a field, which is a fault of the constant.
-fn field_of(base: &str, offset: usize) -> String {
-    let period = base.chars().count();
-    for start in offset..offset + period {
-        let field: String = base
-            .chars()
-            .cycle()
-            .skip(start)
-            .take(MAX_PROJECT_TEXT_CODEPOINTS)
-            .collect();
-        if kr_describe::context::ProjectText::new(&field)
-            .is_some_and(|text| text.as_str().chars().count() == MAX_PROJECT_TEXT_CODEPOINTS)
-        {
-            return field;
-        }
-    }
-    panic!("no start of {base:?} gives a field of {MAX_PROJECT_TEXT_CODEPOINTS} codepoints")
-}
-
-/// A cursor and a revision of nineteen digits, the longest the grammar admits.
-const LARGE_CURSOR: u64 = 4_000_000_000_000_000_100;
-
-/// A context with every field and every recent event at the bound the product admits: six fields
-/// and eight events of [`MAX_PROJECT_TEXT_CODEPOINTS`] codepoints each, in `base`'s script, with
-/// the longest event label and numbers of nineteen digits.
-fn largest_context(seed: u8, base: &str) -> DescriptionContext {
-    let mut context = builder(seed, LARGE_CURSOR + 50)
-        .directory(&field_of(base, 0))
-        .repository(&repository(&field_of(base, 7), &field_of(base, 13)))
-        .application(&field_of(base, 19))
-        .thread(&field_of(base, 29))
-        .intent(&field_of(base, 37));
-    for index in 0..MAX_RECENT_EVENTS {
-        context = context.event(event(
-            LARGE_CURSOR + index as u64,
-            SemanticEventKind::ApprovalRequested,
-            &field_of(base, 41 + 11 * index),
-        ));
-    }
-    context.build()
-}
-
-/// What a job is allowed, as the service sends it: the smaller of the product's budget and the
-/// profile's value for the window, the answer and the threads, and the budget's deadline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// The context window, in tokens.
-    pub context_tokens: u32,
-    /// The output bound, in tokens.
-    pub max_output_tokens: u32,
-    /// How many processor threads a job may use.
-    pub cpu_threads: u32,
-    /// The deadline, in milliseconds.
-    pub deadline_ms: u64,
-}
-
-impl Limits {
-    /// The limits a job of this profile runs under.
-    #[must_use]
-    pub fn of(profile: &ModelProfile) -> Self {
-        let budgets = Budgets::DEFAULTS;
-        let execution = profile.execution();
-        Self {
-            context_tokens: budgets.context_tokens.min(execution.context_tokens),
-            max_output_tokens: budgets.max_output_tokens.min(execution.max_output_tokens),
-            cpu_threads: budgets.cpu_threads.min(execution.cpu_threads),
-            deadline_ms: budgets.execution_deadline_ms,
-        }
-    }
-
-    /// How many tokens a prompt may be, beside the answer's bound.
-    #[must_use]
-    pub const fn room_tokens(self) -> u32 {
-        self.context_tokens.saturating_sub(self.max_output_tokens)
-    }
-}
-
 /// Runs every fixture `rounds` times and records each job.
 pub fn run(
     model: &mut Llama,
     profile: &ModelProfile,
-    limits: Limits,
+    bounds: JobBounds,
     fixtures: &[Fixture],
     rounds: u32,
     mut note: impl FnMut(&Record),
@@ -569,47 +433,31 @@ pub fn run(
     let mut records = Vec::new();
     for _ in 0..rounds {
         for fixture in fixtures {
-            let text = prompt(&fixture.context);
+            let prompt = fixture.context.prompt();
             // The smaller of the budget and what the profile was qualified with, as the service
             // sends a job.
             let job = Job {
-                prompt: &text,
+                prompt: &prompt,
                 grammar: DESCRIPTION_GRAMMAR,
-                context_tokens: limits.context_tokens,
-                max_output_tokens: limits.max_output_tokens,
-                cpu_threads: limits.cpu_threads,
+                context_tokens: bounds.context_tokens,
+                max_output_tokens: bounds.max_output_tokens,
+                prompt_tokens: bounds.prompt_tokens,
+                cpu_threads: bounds.cpu_threads,
                 sampler,
                 ceiling_bytes: budgets.process_memory_ceiling_bytes,
             };
+            // The whole prompt, before it is made to fit.
             let prompt_tokens_asked = model
                 .runtime()
-                .and_then(|runtime| runtime.prompt_tokens(&text).ok())
+                .and_then(|runtime| runtime.prompt_tokens(&prompt.text()).ok())
                 .map(|prompt| prompt.tokens.len());
             let started = Instant::now();
-            let deadline = started + Duration::from_millis(limits.deadline_ms);
+            let deadline = started + Duration::from_millis(bounds.deadline_ms);
             let generated = model.generate(&job, &Cancellation::new(), deadline);
             let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let ended = match generated {
                 Generating::Produced { bytes, phases, .. } => {
-                    let produced_under = ProducedUnder {
-                        session_epoch: fixture.context.session_epoch(),
-                        binding: fixture.context.binding().clone(),
-                        context_revision: fixture.context.revision(),
-                        cursor: fixture.context.cursor(),
-                        profile_id: profile.profile_id().to_owned(),
-                        profile_revision: profile.revision(),
-                        generation: PrivacyGeneration::INITIAL,
-                    };
-                    let expectation = Expectation {
-                        session_epoch: produced_under.session_epoch,
-                        revision: produced_under.context_revision,
-                        binding: produced_under.binding.clone(),
-                        profile_id: produced_under.profile_id.clone(),
-                        profile_revision: produced_under.profile_revision,
-                        generation: produced_under.generation,
-                        name_pinned: false,
-                    };
-                    let validated = validate(&bytes, &produced_under, &expectation).map(|_| ());
+                    let validated = validate_answer(&fixture.context, profile, &bytes).map(|_| ());
                     let grammar_takes = model.runtime().map_or_else(
                         || Err("no model is loaded".to_owned()),
                         |runtime| runtime.grammar_takes(DESCRIPTION_GRAMMAR, &bytes),
@@ -690,7 +538,7 @@ fn set_line(set: Set, records: &[Record], deadline_ms: u64, machine: &str) -> St
 pub fn report(
     records: &[Record],
     deadline_ms: u64,
-    room_tokens: u32,
+    prompt_budget: u32,
     machine: &str,
 ) -> Vec<String> {
     let counts = count(records, deadline_ms);
@@ -742,10 +590,17 @@ pub fn report(
         .iter()
         .filter_map(|record| record.prompt_tokens_asked)
         .max();
+    let largest_read = records
+        .iter()
+        .filter_map(|record| match &record.ended {
+            Ended::Produced { prompt_tokens, .. } => Some(*prompt_tokens),
+            Ended::Failed(_) => None,
+        })
+        .max();
     lines.push(format!(
-        "outputs: the largest prompt asked was {} tokens, of the {} a job has room for beside its answer [{machine}]",
+        "outputs: the largest prompt asked was {} tokens whole, and the largest read was {} of the {prompt_budget} a prompt may be [{machine}]",
         largest_asked.map_or_else(|| "not measured".to_owned(), |tokens| tokens.to_string()),
-        room_tokens
+        largest_read.map_or_else(|| "none".to_owned(), |tokens| tokens.to_string()),
     ));
     lines.push(format!(
         "outputs: time in the prompt {prompt_read} ms, in choosing tokens {sampling} ms and in producing them {decode} ms, over the answers [{machine}]"

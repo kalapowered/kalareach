@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | `hello`: the daemon's build and this wire's version | `ready`: its build, target, start identity, background class and how its memory ceiling is enforced |
 //! | `load`: a profile by identifier and revision, its asset files and a deadline | `loaded`, or `load_ended` with why |
-//! | `generate`: a prompt, the grammar, the limits, a deadline and the memory ceiling | `produced` with the bytes, or `ended` with why |
+//! | `generate`: a prompt in its parts, the grammar, the limits, a deadline and the memory ceiling | `produced` with the bytes, or `ended` with why |
 //! | `verify`: a profile's asset by name, the file to check and a deadline | `verified` with the result |
 //! | `cancel`: the work with this identifier | `cancelling` at once, then that work's own answer, sooner |
 //!
@@ -36,12 +36,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::priority::Applied;
+use crate::prompt::Prompt;
 
 /// This wire's version. A daemon and a process that disagree about it do not talk.
 ///
 /// The second version added `verify` and `verified`, `cancelling`, and the way `ready` says its
-/// memory ceiling is enforced.
-pub const WIRE_VERSION: u64 = 2;
+/// memory ceiling is enforced. The third sends the prompt in its parts and the number of tokens it
+/// may be, so the process, which holds the tokenizer, makes it fit.
+pub const WIRE_VERSION: u64 = 3;
 
 /// This build's release, which the daemon and the process it starts share.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -85,8 +87,8 @@ pub enum Request {
     Generate {
         /// The request's identifier, repeated by its answer.
         id: U64,
-        /// The prompt, whose data section holds every piece of project text.
-        prompt: String,
+        /// The prompt, in its parts, which hold every piece of project text.
+        prompt: Prompt,
         /// The grammar the sampler is held to.
         grammar: String,
         /// The job's bounds.
@@ -142,6 +144,8 @@ pub struct JobLimits {
     pub context_tokens: U64,
     /// The output bound, in tokens.
     pub max_output_tokens: U64,
+    /// How many tokens the prompt may be, beside the answer's bound.
+    pub prompt_tokens: U64,
     /// How many processor threads the job may use.
     pub cpu_threads: U64,
 }

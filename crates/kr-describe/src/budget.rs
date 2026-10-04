@@ -85,6 +85,77 @@ impl Default for Budgets {
     }
 }
 
+/// How fast the reference measurement read a prompt, in tokens a second.
+///
+/// The measurement is the selected profile on the build box at four threads, under a load average
+/// of 20 to 40 from other work: 708 tokens in 11.6 s is 61 a second, and 206 in 3.0 s is 69. The
+/// figure used is below the slowest of them.
+pub const REFERENCE_PROMPT_TOKENS_PER_SECOND: u64 = 55;
+
+/// How long the same measurement took to write one token of the answer under the grammar, in
+/// milliseconds: 70 to 85 on the box. The figure used is above that.
+pub const REFERENCE_OUTPUT_MS_PER_TOKEN: u64 = 100;
+
+/// What a job costs before the prompt is read, in milliseconds: the context, the grammar and the
+/// sampler. The measurement found 0.5 to 0.75 s.
+pub const REFERENCE_JOB_OVERHEAD_MS: u64 = 1_000;
+
+/// Returns how many tokens a job's prompt may be.
+///
+/// Two limits hold, and the smaller is the bound. The prompt and the answer's bound have to fit the
+/// context window. And the whole job has to finish inside its deadline at the reference rates: the
+/// time left once the job's own cost and an answer of the full output bound are taken out of the
+/// deadline is what the prompt may take to read. With section 22's defaults the window leaves room
+/// for 3,968 tokens and the deadline for 891, so the deadline decides: 30 s, less 1 s of cost and
+/// 12.8 s for 128 tokens of answer, is 16.2 s, and at 55 tokens a second that is 891 tokens.
+#[must_use]
+pub fn prompt_tokens(context_tokens: u32, max_output_tokens: u32, deadline_ms: u64) -> u32 {
+    let room = context_tokens.saturating_sub(max_output_tokens);
+    let reading_ms = deadline_ms
+        .saturating_sub(REFERENCE_JOB_OVERHEAD_MS)
+        .saturating_sub(u64::from(max_output_tokens) * REFERENCE_OUTPUT_MS_PER_TOKEN);
+    let by_deadline =
+        u32::try_from(reading_ms * REFERENCE_PROMPT_TOKENS_PER_SECOND / 1_000).unwrap_or(u32::MAX);
+    room.min(by_deadline)
+}
+
+/// What one job is allowed: section 22's budgets, bounded again by what the selected profile asks
+/// for. A profile that wants a longer answer or more threads than the budget allows gets the
+/// budget; one that wants less gets what it asked for, because that is what it was qualified with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobBounds {
+    /// The context window, in tokens.
+    pub context_tokens: u32,
+    /// The output bound, in tokens.
+    pub max_output_tokens: u32,
+    /// How many tokens the prompt may be, beside the answer's bound.
+    pub prompt_tokens: u32,
+    /// How many processor threads the job may use.
+    pub cpu_threads: u32,
+    /// The deadline, from dequeue, in milliseconds.
+    pub deadline_ms: u64,
+}
+
+impl Budgets {
+    /// Returns what a job of a profile with these settings is allowed.
+    #[must_use]
+    pub fn bounds(&self, execution: &crate::profile::ExecutionSettings) -> JobBounds {
+        let context_tokens = self.context_tokens.min(execution.context_tokens);
+        let max_output_tokens = self.max_output_tokens.min(execution.max_output_tokens);
+        JobBounds {
+            context_tokens,
+            max_output_tokens,
+            prompt_tokens: prompt_tokens(
+                context_tokens,
+                max_output_tokens,
+                self.execution_deadline_ms,
+            ),
+            cpu_threads: self.cpu_threads.min(execution.cpu_threads),
+            deadline_ms: self.execution_deadline_ms,
+        }
+    }
+}
+
 /// What a resident model costs, itemised.
 ///
 /// A profile records this as its declared estimate; a benchmark records it again as a measurement.

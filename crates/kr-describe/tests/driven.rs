@@ -12,6 +12,7 @@ use kr_describe::context::{
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::output::Rejection;
 use kr_describe::profile::catalogue::MetGates;
+use kr_describe::prompt::Prompt;
 use kr_describe::queue::Priority;
 use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
@@ -80,7 +81,7 @@ fn loaded(service: &mut DescriptionService, now: Reading) -> Instruction {
 }
 
 /// The answer a job gets from a model that produced a description of its prompt.
-fn produced(prompt: &str, peak_rss_bytes: u64) -> Answered {
+fn produced(prompt: &Prompt, peak_rss_bytes: u64) -> Answered {
     Answered::Produced {
         bytes: answer_of(prompt, &Output::WellFormed),
         phases: Phases::default(),
@@ -785,7 +786,7 @@ fn active_turn(job_ms: u64, changing: bool) -> (u32, u32) {
     service.session_opened(session(1), SessionEpoch::V1, binding());
     // The job in the process: its identifier, when it was sent, its prompt, and whether it was
     // told to cancel.
-    let mut running: Option<(u64, u64, String, bool)> = None;
+    let mut running: Option<(u64, u64, Prompt, bool)> = None;
     let (mut published, mut superseded) = (0, 0);
     for step in 0..2_400_u64 {
         let now = at(step * 100);
@@ -1563,15 +1564,13 @@ fn a_session_opened_again_carries_no_earlier_events() {
                 .is_some()
         );
         let (_, _, request) = next_job(&mut service, at(3_000));
+        let prompt = request.prompt.text();
         assert_eq!(
-            request
-                .prompt
-                .contains("cargo publish from the earlier session"),
+            prompt.contains("cargo publish from the earlier session"),
             !reopened,
-            "reopened {reopened}: {}",
-            request.prompt
+            "reopened {reopened}: {prompt}"
         );
-        assert!(request.prompt.contains("docs"), "{}", request.prompt);
+        assert!(prompt.contains("docs"), "{prompt}");
     }
 }
 

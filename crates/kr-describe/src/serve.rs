@@ -45,6 +45,7 @@ use crate::environment::build_target;
 use crate::priority::{Applied, Cancellation, background_current_thread};
 use crate::profile::catalogue::Catalogue;
 use crate::profile::{Asset, ModelProfile, SamplerSettings};
+use crate::prompt::Prompt;
 use crate::wire::{
     Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
     WIRE_VERSION, WireError, read_message, write_message,
@@ -155,14 +156,16 @@ pub enum Loading {
 /// One job, as the model thread hands it to a model.
 #[derive(Clone, Copy, Debug)]
 pub struct Job<'a> {
-    /// The prompt.
-    pub prompt: &'a str,
+    /// The prompt, in its parts, which the model makes fit [`Self::prompt_tokens`].
+    pub prompt: &'a Prompt,
     /// The grammar the sampler is held to.
     pub grammar: &'a str,
     /// The context window, in tokens.
     pub context_tokens: u32,
     /// The output bound, in tokens.
     pub max_output_tokens: u32,
+    /// How many tokens the prompt may be, beside the answer's bound.
+    pub prompt_tokens: u32,
     /// How many processor threads the job may use.
     pub cpu_threads: u32,
     /// The sampler, from the loaded profile.
@@ -597,7 +600,7 @@ enum Work {
     },
     Generate {
         id: u64,
-        prompt: String,
+        prompt: Prompt,
         grammar: String,
         limits: JobLimits,
         due: Instant,
@@ -741,6 +744,7 @@ fn model_thread<M: Model>(
                             grammar: &grammar,
                             context_tokens: bounded(limits.context_tokens),
                             max_output_tokens: bounded(limits.max_output_tokens),
+                            prompt_tokens: bounded(limits.prompt_tokens),
                             cpu_threads: bounded(limits.cpu_threads),
                             sampler: profile.sampler(),
                             ceiling_bytes,

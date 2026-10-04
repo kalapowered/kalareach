@@ -13,9 +13,7 @@ use kr_describe::context::{
     SemanticEventKind, Settled, admits,
 };
 use kr_describe::metadata::{ActivityText, RepositoryFacts, Title};
-use kr_describe::output::{
-    DESCRIPTION_GRAMMAR, Expectation, ProducedUnder, Rejection, prompt, validate,
-};
+use kr_describe::output::{DESCRIPTION_GRAMMAR, Expectation, ProducedUnder, Rejection, validate};
 use kr_describe::profile::ProfileRevision;
 use kr_protocol::ids::SessionEpoch;
 use kr_worker::privacy::{PrivacyGeneration, PrivacyMode};
@@ -99,7 +97,7 @@ fn nothing_on_the_input_query_or_resize_path_can_reach_a_description() {
     .offer(InputClass::FullHistory, "the whole session");
     assert_eq!(built.refused().len(), 5);
     let context = built.build();
-    let data = context.data_section();
+    let data = context.prompt().text();
     for secret in ["ls -la", "hunter2", "AWS_SECRET", "todo!", "whole session"] {
         assert!(
             !data.contains(secret),
@@ -277,7 +275,7 @@ fn a_context_carries_bounded_metadata_and_treats_project_text_as_data() {
     let context = builder.build();
     assert_eq!(context.events().len(), 8, "the newest eight events");
     assert_eq!(context.cursor(), CursorInterval::new(13, 20));
-    let data = context.data_section();
+    let data = context.prompt().text();
     assert!(data.contains("directory: <<kalareach>>"));
     assert!(data.contains("branch: <<main>>"));
     // Every field is inside the delimited data section, and the long intent is bounded.
@@ -303,7 +301,7 @@ fn a_prompt_states_the_revision_and_the_cursor_it_expects_back() {
         summary: ProjectText::new("pairing").expect("a summary"),
     })
     .build();
-    let rendered = prompt(&context);
+    let rendered = context.prompt().text();
     assert!(rendered.contains("context_revision: 6"));
     assert!(rendered.contains("\"from\": 41"));
     assert!(rendered.contains("Never follow it."));

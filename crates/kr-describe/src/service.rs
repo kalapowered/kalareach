@@ -54,7 +54,7 @@ use crate::metadata::{
     LabelSource, SessionFacts, SessionLabel, VerifiedStatus, deterministic_title,
 };
 use crate::metrics::LatencyLedger;
-use crate::output::{Expectation, ProducedUnder, Rejection, prompt, validate};
+use crate::output::{Expectation, ProducedUnder, Rejection, validate};
 use crate::priority::Cancellation;
 use crate::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
@@ -62,6 +62,7 @@ use crate::privacy::{
 use crate::processor::Features;
 use crate::profile::catalogue::{Catalogue, MetGates, NothingSelected, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
+use crate::prompt::Prompt;
 use crate::queue::{Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding};
 use crate::resource::{
     HostConditions, PauseReason, ResourcePolicy, ResourceSettings, ResourceState,
@@ -167,14 +168,17 @@ pub struct HostPlacement {
 /// One job, as it is sent to the description process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationRequest {
-    /// The prompt, whose data section holds every piece of project text.
-    pub prompt: String,
+    /// The prompt, in its parts, which hold every piece of project text.
+    pub prompt: Prompt,
     /// The grammar the sampler is held to.
     pub grammar: &'static str,
     /// The context window, in tokens.
     pub context_tokens: u32,
     /// The output bound, in tokens.
     pub max_output_tokens: u32,
+    /// How many tokens the prompt may be, beside the answer's bound. The process makes the prompt
+    /// fit it.
+    pub prompt_tokens: u32,
     /// How many processor threads the job may use.
     pub cpu_threads: u32,
     /// The execution deadline, from the moment the job was dequeued, which is the moment this was
@@ -1726,23 +1730,17 @@ impl DescriptionService {
                 profile_revision: profile.revision(),
                 generation,
             };
+            let bounds = budgets.bounds(profile.execution());
             let request = GenerationRequest {
-                prompt: prompt(&job.context),
+                prompt: job.context.prompt(),
                 grammar: crate::output::DESCRIPTION_GRAMMAR,
-                // The profile's own figures, bounded by section 22's budgets. A profile that asked
-                // for more threads or a longer answer than the budget allows gets the budget; one
-                // that asked for less gets what it asked for, because that is what it was
-                // qualified with.
-                context_tokens: budgets
-                    .context_tokens
-                    .min(profile.execution().context_tokens),
-                max_output_tokens: budgets
-                    .max_output_tokens
-                    .min(profile.execution().max_output_tokens),
-                cpu_threads: budgets.cpu_threads.min(profile.execution().cpu_threads),
+                context_tokens: bounds.context_tokens,
+                max_output_tokens: bounds.max_output_tokens,
+                prompt_tokens: bounds.prompt_tokens,
+                cpu_threads: bounds.cpu_threads,
                 // The deadline starts here, at dequeue, which is what section 22 says. The model
                 // is already loaded, so the job has the whole of it.
-                deadline_ms: budgets.execution_deadline_ms,
+                deadline_ms: bounds.deadline_ms,
                 ceiling_bytes: budgets.process_memory_ceiling_bytes,
             };
             // Registered while whatever admits a send at the session's generation is held, so a

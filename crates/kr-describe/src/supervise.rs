@@ -582,6 +582,7 @@ impl Driver {
                         limits: JobLimits {
                             context_tokens: U64::new(u64::from(request.context_tokens)),
                             max_output_tokens: U64::new(u64::from(request.max_output_tokens)),
+                            prompt_tokens: U64::new(u64::from(request.prompt_tokens)),
                             cpu_threads: U64::new(u64::from(request.cpu_threads)),
                         },
                         deadline_ms: U64::new(deadline_ms),
