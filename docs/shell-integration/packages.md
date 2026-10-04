@@ -174,7 +174,7 @@ launcher that cannot be started leaves the child running the command as it was t
 
 ## What fish changes
 
-There are three patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
+There are four patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
 of the bridge is Rust beside it and the shell-independent core is the same C the other packages
 compile, built into the shell by the build script that already compiles C for the shell's own
 probes.
@@ -184,6 +184,7 @@ probes.
 | `0001-fish-reader-event-bridge` | `src/input/input.rs`, `src/input/decode.rs`, `src/input/binding.rs`, `src/reader/input.rs`, `src/reader/mod.rs`, `src/reader/reader.rs` | The mailbox, the reader's boundaries, the named binding and the bridge's view of the reader |
 | `0002-fish-reader-state` | `src/input/binding.rs` | The states the detach condition needs that this reader keeps no flag for |
 | `0003-fish-bridge-activation` | `build.rs`, `src/bin/fish.rs`, `src/builtins/mod.rs`, `src/builtins/shared/misc.rs` | The core compiled in, the `kr-bridge` builtin, and the bridge loading before the startup files |
+| `0004-fish-command-resolve` | `src/exec.rs`, `src/reader/reader.rs` | The line the root shell runs as a command block with its capability, and the question in front of each command of that line, with the launcher its answer can name |
 
 The first patch does five things:
 
@@ -208,6 +209,43 @@ events a sequence has peeked and not resolved, an input function waiting for the
 it takes as an argument, `get-key` waiting for the literal key it reports, and where the character
 being judged came from.
 
+This is patch #4. It adds the two points of the command integration in fish: the interactive loop,
+which reports the line the person accepted, and `exec_external_command`, which asks before it forks
+an external command of that line.
+
+In the interactive loop, right before a line is going to be run (after checking for empty lines and
+wiping the line if need be - a skipped line will not leave anything in the next prompt). This is
+only done if this shell is registered as a root shell and if there is no currently running line. The
+worker is informed about the line returned from the editor, the current directory and the revision
+of the current directory. The shell waits at most one second for the answer, and the capability it
+returns is exported to a global variable named `KR_DETACH_TOKEN`. When the last command in the line
+ends, the block finishes with the status according to fish, and the variable is removed (note it
+never touches the universal store) before the normal `fish_postexec`, title update and exit request
+are run. Note that, as with the zsh and bash hooks, the `fish_preexec` and `fish_title` hooks and
+the job and signal handling in the line will see this variable.
+
+If a ctrl-c or other signal ending the shell arrives while informing the worker, the line ends
+without running and the end block is returned with the status 128 + signal (e.g. 130 for ctrl-c) and
+no `fish_preexec`, `fish_postexec` or OSC 133 mark is written for the line. Note that ctrl-c at the
+prompt from a previous completion or binding is cleared before this so it will not skip a line. Also
+note that readers started during a line (e.g. breakpoint or source -) are considered to be the
+builtin 'read', will not make the prompt generation go up and will not own anything, so they will
+run in the block of the outer line, with its capability, and a command typed at that prompt asks for
+nothing and carries the outer token.
+
+In exec_external_command, right before forking to run an external command. This is only done if the
+command is run from a line (no function - and thus no alias - source, eval, command substitution,
+event or prompt), on the main thread, with only one process in its job, in the foreground, with no
+variable assignments before it and with no pipes or other buffers in its IO. Also, the block stack
+must only contain (if|while|for|switch|begin) blocks from the line and the top block. (Note that
+"begin; cmd; end &" is in the foreground in fish, only "cmd & " is in the background). The answer is
+a launcher vector and the shell's own environment with the variables from the answer added, both
+built before the fork, so that nothing allocates after it. The child starts the launcher with
+execve. If the launcher fails to start, the command as typed is run instead. A launch takes the
+forking path and not posix_spawn, because the child is where the launcher starts. If ctrl-c or
+another signal to end the shell comes in while waiting for an answer, the command is not started and
+the above status codes are returned.
+
 The guarded entry is a file of its own under `conf.d`. Files there run before the person's
 `config.fish`, so the entry registers a one-shot handler on the first prompt: by then the person's
 configuration and key bindings are in place, and the integration goes on top of them.
@@ -225,6 +263,16 @@ The editor's own queue is read live and refused when it cannot be: the two field
 The module goes in front of the host's read-line entry point when it loads, before the person's profiles run. A check that ends the last profile asks whether the host would still call the module's own function or the editor's own function, by identity and by the text the editor's own file gives the function, compared character for character, and not by module name. An editor whose file does not define the function once is refused as `psreadline_reader_unreadable`. Any other command under that name is refused as `reader_replaced`, and the session being created closes with that loss. The commands refused are a function that replaces the entry point, one that wraps the one before it, one that calls the editor directly, one made inside the editor's module scope, an alias, and the editor's own function replaced where it lives and exported again. The editor imported again puts its own function back, and the module goes back in front of it.
 
 Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt ends the shell the way the editor's own would. When a wrapped handler runs, the exit the editor signals is recognised through the exception chain and carried out by replacing the empty line with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. The module also binds only a chord that the editor stores under the spelling it was given. The editor keeps `Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that chord would take over the plain question mark and whatever the person had there would go. The module leaves such a chord alone, and a configured gesture whose chord is one is refused as `gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as `psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound safely.
+
+This module is the part that communicates with KalaReach's worker. Its main purpose is reporting to the worker the lines of text that it sees through its read-line wrapper, and relaying information about them. To this end, the first thing it does every time the user accepts a line by pressing Enter is report to the worker the text returned by `ReadLine`, which is the accepted line. The end of that line is the next entry to the wrapper, which reads the value of the automatic variable `$?` before anything else. On accepting the line, after telling the worker the line's text (the whole text, in case it's multi-line) and the directory in which native commands are to be started (that of the current `FileSystem` location's provider), the module tells the worker the revision of its working directory and awaits its answer for at most a second, and sets `$env:KR_DETACH_TOKEN` to the token the answer carries. In any case, when the wrapper is next entered, the module reports to the worker the end of the block it was processing and removes the variable from the environment, whether the worker answered or not. The variable is also removed by `Remove-KalaReachHooks`. Its removal is done by setting it to the `null` value of a string, which leaves no empty variable behind on Unix systems and adds no entry to the automatic variable `$Error`. Failure to send the data is traced but ignored, so that the module never takes away the user's PSReadLine.
+
+After reading the status (using the method `GetValue` of the type `PSVariable` so as to not create an entry in the variable `$Error`), the module, for a line that `Resolve-KalaReachCommand` was called for, reports the value of the variable `$LASTEXITCODE` if it's an integer, or if it isn't, `0` if the value of the variable `$?` is true, or if it's false, `$LASTEXITCODE` if it's a non-zero integer and the value of `$global:Error[0]` is the same as it was when the line was accepted or it's a native-command failure with that exit code, or `1` otherwise. Some cases are known in which the wrong exit code is read. These cases are (1) when Ctrl-C is pressed while the module is waiting for an answer to a line resolution, because in that case the pipeline is stopped before the native command is run and a stale exit code from a previous native command is read; (2) when, after a native command has failed, a statement that is not a native command fails and reads the stale code; and (3) when, in a line, a native command fails after an earlier error. The time it takes to run the function `prompt` is counted in the duration, because it's run between a command and the next entry; the function also inherits the token, and if it changes the value of `$LASTEXITCODE` or `$Error[0]`, the line's exit code is changed. The module does not wrap `prompt`. Ctrl-C pressed while the module is waiting for an answer to a line's acceptance is not taken: the line is run, and the block exits with exit code `0`. This behaviour differs from that of fish, in which a line for which an answer is awaited and that is skipped by pressing Ctrl-C exits with exit code `130`.
+
+Prompts opened by a running line, either by calling the method `EnterNestedPrompt()` of `$Host` or by entering the debugger, are not lines. They report themselves as a reader of the `read` builtin, do not advance prompt generation, do not start nor end blocks, and do not wait for answers. Their acceptances do not carry context, so that the worker, which will still be expecting the outer line because the context of the reader it registered was `read_builtin`, will not replace it. The outer line's token, the text it accepted, and its resolve flag will remain the same.
+
+This module exports two functions that can be used by a command lookup handler. The first is `Test-KalaReachCommand -Origin -Name`, which takes no executable, so a handler can substitute a script block only for a command the module may ask about (a substituted block changes `$?` and pipes text where the native command pipes bytes); and the second is `Resolve-KalaReachCommand -Origin -Name -Arguments -Executable`, which asks. Both functions answer the query only if the query's origin is `Runspace`, the runspace (or, more precisely, the session) is registered, a line is running in the session, a nested prompt is not open, the module is not owing an answer, the command name does not contain any of the characters `/`, `\` or `:`, the accepted line, when parsed, consists of one statement only, that statement is a pipeline, that pipeline has one element, that element is a command, no command is found anywhere else in the syntax tree, the command is not to be run in the background, the command has no redirections, the command has no `--%` (because, as of 7.4, the byte stream is lost with it), the command's first word is a constant string equal to the name ignoring case, and, for `Resolve-KalaReachCommand` alone, the executable is an absolute path, the executable's extension is either `.exe` or `.com` on Windows (other extensions are not integrated by the route), the arguments are a vector of strings, the call is not already in progress for the accepted line, and the function has not been called before for the accepted line. If all these conditions are met, a message of type `command_resolve` is sent and an answer is waited for at most one second, the time for the sending and the waiting being taken from the same time budget. If the command is to be run as-is, the function returns `$null`; otherwise, it returns an object with the path to the launcher, the arguments to give it, and the environment variables to set in addition to the existing ones. The arguments to the launcher are the string `launch`, the string `--`, the path to the executable, and the vector of arguments sent by the worker, which should start with the name as entered. Any kind of failure, refusal, bypassing, or deadline exceeding results in the function returning `$null`. No arguments or values are traced. A command lookup function should pass to the function the origin and the name with which it was called, and the executable with which PowerShell looked it up. It should not create an entry in the variable `$Error`, and if it can't start the launcher, it should run the command as entered. Because the command lookup function is called before the first statement of the wrapper and any script it runs will replace the value of the variable `$?`, the function reads that variable first, and sets its value back last.
+
+This module reads frames from the worker at key moments, but no test runs this package against a real worker. The real worker is tested as part of the fish package; this module is tested against the endpoint that the harness provides, and on Windows, through a named pipe.
 
 `Publish-KalaReachQualification` is what `scripts/build-shells.sh` is for the others: it checks the
 editor against the range the manifest pins, records what it found, installs the module and the
@@ -267,12 +315,23 @@ adapter for that reader:
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
 | `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256 and base64url, for the one proof taken at startup |
 | `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
+| `kr_bridge_fish.rs` (fish only) | The reader's own state and the shell's own variables and executor, in Rust beside the reader: the same reads, the line's block and capability, and the question in front of each command |
 | `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: put a variable in its exported environment or take one out, say which prompt it is at and what the last line exited with, and decide whether a command is one of the line's own |
 
-The first three files are the same source in both packages, and a test in
+The first three files are the same source in the three packages that compile them, and a test in
 `crates/kr-shell-integration/tests/` asserts they have not drifted. They are duplicated because
 each patch set has to be publishable on its own, against its own upstream project, under that
 project's licence.
+
+The core also notes that the worker doesn't have a fence for a reader (either because the previous
+exchange ended with no fence, or because the published fence has gone), and the adapters will then
+report to the worker that the reader is idle again the next time it waits. However, the worker
+retries only when the reader next reports that it is idle, and it drops an idle report that arrives
+while an exchange is still open, so the reader would not be fenced at that prompt. In particular, if
+the reader reports that it is idle only once per wait, it stays unfenced at a prompt of a shell that
+asks the terminal questions of its own. This is because the terminal's answers to those questions
+arrive at the reader while the exchange for the prompt is still open, and that exchange ends
+withheld.
 
 Nothing in the bridge links against the rest of the host. It speaks to the worker over a socket,
 and the reader calls into it through a small set of functions.

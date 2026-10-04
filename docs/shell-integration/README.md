@@ -250,9 +250,10 @@ Every package records, and the worker keeps with the session:
 
 Everything below comes from the reader itself, at the moment the reader does the thing. This is the
 contract a bridge speaks and the host answers; which of these a given package sends is that
-package's own declaration. The Zsh and Bash packages send every event in this table. The fish and
-PSReadLine packages send neither `command_resolve` nor `command_block`, so a command in one of those
-shells runs as it was typed and reports no block.
+package's own declaration. The Zsh, Bash and fish packages send every event in this table. The
+PSReadLine package sends `command_block` for each line, and sends `command_resolve` only when a
+command-lookup handler calls its `Resolve-KalaReachCommand`, so a command in that shell runs as it
+was typed unless a handler asks about it.
 
 | Event | When | Fields |
 | --- | --- | --- |
@@ -329,15 +330,21 @@ prompt, and that line is the one that runs.
 
 The Zsh and Bash packages export it for a primary or continuation line, after waiting at most one
 second for the answer that carries it, and take it out of the environment again when the next
-primary reader starts, whether or not the bridge is still connected by then. The fish and PSReadLine
-packages do not export it, so a bare `kr detach` inside one of those is answered with the
-instruction to name the attachment, which is the refusal this contract asks for rather than an
-attachment the host cannot stand behind.
+primary reader starts, whether or not the bridge is still connected by then. The fish package
+exports it as a global variable just before a line is to be run and undefines it as soon as the last
+command in that line has completed. The PSReadLine package sets it in the process environment when a
+line has been accepted for running and undefines it at the next entry to its read-line function,
+with or without the bridge. Both fish and PSReadLine will wait at most one second for the answer
+that carries it. If a line is run that causes a new reader to start (eg breakpoint or a nested
+prompt) that reader will inherit the capability for the duration and not advertise its own. If the
+line's token is null, or the shell does not have integration, the answer is the instruction to name
+the attachment, which is the refusal this contract asks for rather than an attachment the host
+cannot stand behind.
 
 ### The command a line runs
 
-The Zsh and Bash packages ask before each command of an accepted line that the root shell starts
-itself: an external command found on the search path, at the top level of the line, in the
+The Zsh, Bash and fish packages ask before each command of an accepted line that the root shell
+starts itself: an external command found on the search path, at the top level of the line, in the
 foreground and with no pipe. The question is `command_resolve`, asked from the shell's executor
 after its own search has found the file and before it forks, so it names the vector the shell is
 about to run, the absolute path it found and the directory it runs in. A command in a subshell, a
@@ -348,7 +355,9 @@ file, an `eval`, a trap or a prompt hook runs is not a command of the line. None
 each runs as it was typed. A script is a process of its own, so only the interpreter it is started
 with is asked about. Zsh expands a filename pattern and applies the assignments in front of a
 command only in the child it forks, so a command with either is not asked about either: `PATH` or
-`ARGV0` there would change the file or the vector that runs.
+`ARGV0` there would change the file or the vector that runs. The PSReadLine package asks through
+`Resolve-KalaReachCommand`, which a command-lookup handler calls for a line that is one native
+command and nothing else.
 
 The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
 endpoint all run the command exactly as the shell would have run it without asking: the same file,
@@ -366,9 +375,10 @@ they did before.
 Each line also reports its command block from the reader's own boundaries. When a primary line is
 accepted, its block starts with the line as the editor accepted it, the directory and that
 directory's revision, and a continuation line joins it. When the next primary reader starts, the
-block ends with the status the shell itself holds for the line and how long the line ran. An empty
-line runs nothing and reports no block, and the input a running command reads through the editor
-belongs to that command.
+block ends with the status the shell itself holds for the line and how long the line ran. fish ends
+the block as soon as the line's last command has ended, before `fish_postexec` runs, and the
+PSReadLine package ends it at the next read-line entry. An empty line runs nothing and reports no
+block, and the input a running command reads through the editor belongs to that command.
 
 A session that names an absolute path in `KR_SHELL_BRIDGE_TRACE` gets one line of diagnostics in
 that file for each question, answer and block, as long as the path is a plain file: a pipe or a
