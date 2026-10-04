@@ -14704,6 +14704,10 @@ export interface CommandIntegrationReport {
   flags: string[]
   /**
    * How an invocation of its command runs in a session created now.
+   *
+   * `native_bridge` only for an integration that is on, can launch on this host and has no
+   * `reason` that says its invocations run as typed; every other report says `native_terminal`,
+   * the person's own program with nothing added.
    */
   mode: 'native_terminal' | 'gateway' | 'native_bridge'
   /**
@@ -14713,6 +14717,13 @@ export interface CommandIntegrationReport {
   /**
    * What else the host knows of why the state is what it is: why an installation is left out
    * of the admissions, or why a package could not be read.
+   *
+   * For an integration that is on it is also why an invocation runs as typed here, and then
+   * `mode` is `native_terminal`: its flags cannot be written with the installed forwarder (none
+   * is installed, or a flag holds the placeholder anywhere but at the start of a word); on Windows
+   * its flags name the forwarder by its own name, which an application may look for in its
+   * working directory before its search path; or the executable the daemon's search path names
+   * first is a script or shim that no launcher starts.
    */
   reason: string | null
   /**

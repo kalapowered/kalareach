@@ -7504,7 +7504,7 @@
         },
         "mode": {
           "$ref": "#/$defs/IntegrationMode",
-          "description": "How an invocation of its command runs in a session created now."
+          "description": "How an invocation of its command runs in a session created now.\n\n`native_bridge` only for an integration that is on, can launch on this host and has no\n`reason` that says its invocations run as typed; every other report says `native_terminal`,\nthe person's own program with nothing added."
         },
         "plugin_id": {
           "description": "The package, as `publisher/plugin`.",
@@ -7519,7 +7519,7 @@
               "type": "null"
             }
           ],
-          "description": "What else the host knows of why the state is what it is: why an installation is left out\nof the admissions, or why a package could not be read."
+          "description": "What else the host knows of why the state is what it is: why an installation is left out\nof the admissions, or why a package could not be read.\n\nFor an integration that is on it is also why an invocation runs as typed here, and then\n`mode` is `native_terminal`: its flags cannot be written with the installed forwarder (none\nis installed, or a flag holds the placeholder anywhere but at the start of a word); on Windows\nits flags name the forwarder by its own name, which an application may look for in its\nworking directory before its search path; or the executable the daemon's search path names\nfirst is a script or shim that no launcher starts."
         },
         "state": {
           "$ref": "#/$defs/CommandIntegrationState",
