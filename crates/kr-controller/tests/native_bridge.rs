@@ -493,6 +493,12 @@ const AWKWARD: &[&str] = &[
     "back\\slash",
     "\u{e9}\u{4e2d}\u{1f600}",
     "x'; touch PLANTED; '",
+    "$(touch PLANTED)",
+    "*",
+    "-n",
+    "~",
+    "#hash",
+    "!bang",
 ];
 
 /// KR-REQ-11.42: a registration that names the forwarder by the package's placeholder is written
