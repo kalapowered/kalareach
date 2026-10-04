@@ -281,7 +281,7 @@ impl Program {
             // SAFETY: the list was initialised above and nothing else holds it.
             unsafe { DeleteProcThreadAttributeList(attributes) };
             return Err(format!(
-                "{} could not be set up to be created in the job that holds it: {failure}",
+                "{} could not be set up to be created in its job with its handles: {failure}",
                 executable.display()
             ));
         }
@@ -340,8 +340,10 @@ impl Program {
     }
 
     /// Ends the program, which has not run: nothing it could have started exists. A termination
-    /// that fails leaves the holder armed, so the program is ended with the launcher at the latest.
-    /// The typed command this launcher goes on to run is the launcher's child and not in the holder.
+    /// that fails leaves the holder armed, so the program is ended with the launcher at the latest;
+    /// where a failed start has let the holder go already, the backend's own job ends it when no
+    /// word that it started arrives in time. The typed command this launcher goes on to run is the
+    /// launcher's child and not in the holder.
     fn end(&self) {
         // SAFETY: the handle is this value's own and open for the call.
         unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
@@ -718,6 +720,17 @@ mod tests {
         }
     }
 
+    /// Asserts that this process is not in `holder`. A process in an armed holder ends with it, so
+    /// a holder that holds this process is let go of before the assertion fails, or the failure
+    /// would end the test before it could be reported.
+    fn assert_outside(holder: &OwnedHandle, message: &str) {
+        let inside = this_process_is_in(holder);
+        if inside {
+            let _ = ends_with_its_handle(holder, false);
+        }
+        assert!(!inside, "{message}");
+    }
+
     /// Whether this process is in `job`, directly or in a job nested in it.
     fn this_process_is_in(job: &OwnedHandle) -> bool {
         let mut inside = 0_i32;
@@ -752,9 +765,9 @@ mod tests {
             "the program is in the holder as soon as it exists"
         );
         assert!(armed(&ended.0.holder), "which ends it with the launcher");
-        assert!(
-            !this_process_is_in(&ended.0.holder),
-            "and the launcher is not in it, so nothing the launcher runs afterwards is"
+        assert_outside(
+            &ended.0.holder,
+            "and the launcher is not in it, so nothing the launcher runs afterwards is",
         );
         ended.0.end();
         assert_eq!(ended.0.wait(), 1, "an ended program has not run");
@@ -764,7 +777,7 @@ mod tests {
             Ending(Program::create(&executable, &vector, &[]).expect("a program is created"));
         assert!(holds(&started.0.holder, &started.0.process));
         assert!(armed(&started.0.holder));
-        assert!(!this_process_is_in(&started.0.holder));
+        assert_outside(&started.0.holder, "the launcher is not in it");
         started.0.resume().expect("the program is started");
         assert!(
             !armed(&started.0.holder),
