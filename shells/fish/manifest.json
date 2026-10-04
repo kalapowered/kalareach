@@ -47,6 +47,12 @@
       "file": "patches/0003-fish-bridge-activation.patch",
       "revision": "1",
       "purpose": "The bridge core is compiled into the shell, the named `kr-eof-decide` binding joins the reader's own command table, the bridge loads before the user's configuration and before the first primary reader, and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
+    },
+    {
+      "name": "fish-command-resolve",
+      "file": "patches/0004-fish-command-resolve.patch",
+      "revision": "1",
+      "purpose": "The line the root shell runs is reported as a command block, with the capability minted for it exported to its commands and removed with it, and a line the person cancels while the worker is told of it is ended before it runs; and the question in front of each command of that line, asked in the executor before the fork, with the launcher its answer can name started in the command's place."
     }
   ],
   "sources": [
