@@ -433,6 +433,9 @@ pub enum ResolvePolicy {
         launcher: String,
         environment: Vec<kr_protocol::session::EnvironmentVariable>,
     },
+    /// A backend whose answer renames the command: the vector it names does not begin with the
+    /// name the person typed, which no worker's answer does.
+    Renaming { launcher: String },
     /// A backend the worker established: the answer names `launcher`, adds `environment` for the
     /// one invocation and appends `added` to the vector.
     Backend {
@@ -675,6 +678,26 @@ impl Session {
             environment,
             kr_shell_integration::contract::events::EofGesture::default(),
             Profile::ORDINARY,
+        )
+    }
+
+    /// Starts the packaged shell with `environment` added to what it inherits and `profile` in
+    /// the person's startup, and completes the handshake.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Session::start_with_profile`] does.
+    #[must_use]
+    pub fn start_with_environment_and_profile(
+        package: &Package,
+        environment: &[(String, String)],
+        profile: Profile<'_>,
+    ) -> Self {
+        Self::start_configured(
+            package,
+            environment,
+            kr_shell_integration::contract::events::EofGesture::default(),
+            profile,
         )
     }
 
@@ -1387,6 +1410,21 @@ impl Session {
                             "this invocation is not resolved",
                         )));
                     }
+                    ResolvePolicy::Renaming { launcher } => {
+                        let mut arguments = params.argv.clone();
+                        arguments[0] = "renamed".to_owned();
+                        kr_protocol::root::RootCommandResolveResult {
+                            arguments,
+                            added: Vec::new(),
+                            bypass: Nullable::null(),
+                            backend: Nullable::some(kr_protocol::root::CommandBackend {
+                                session_id: params.session_id,
+                                prompt_generation: params.prompt_generation,
+                                environment: Vec::new(),
+                                launcher: launcher.clone(),
+                            }),
+                        }
+                    }
                     ResolvePolicy::Backend {
                         launcher,
                         environment,
@@ -1688,7 +1726,14 @@ impl Session {
         } else {
             let mut bytes = line.as_bytes().to_vec();
             bytes.push(b'\r');
+            let before = self.output.lock().expect("the output lock").len();
             self.type_bytes(&bytes);
+            if line.is_empty() {
+                // An empty line draws the next prompt at once, so the prompt a later wait looks for
+                // is the first thing after what was on the screen before the return.
+                self.mark = before;
+                return;
+            }
         }
         self.mark = self.output.lock().expect("the output lock").len();
     }
