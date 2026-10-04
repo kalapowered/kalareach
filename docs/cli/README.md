@@ -239,8 +239,8 @@ forwarded; when it turns it off, the terminal's scrollback behaves normally agai
 
 ### What the command does to a keystroke
 
-Nothing. It is worth saying as a list, because each item is something a terminal client is often
-built to do and this one must not:
+The command does nothing to a keystroke. It is worth saying as a list, because each item is
+something a terminal client is often built to do and this one must not:
 
 | What the person does | What the command sends |
 | --- | --- |
@@ -276,20 +276,20 @@ it in half, and while a paste is open nothing is a key or a pointer report. Past
 reaches the session byte for byte. A paste a terminal sends without delimiters at all is text the
 command cannot tell from typing.
 
-The window this terminal is looking through is the session's to say. Each report about it waits
-for the one before it to settle. Usually that is when the session has answered it and the screen
-that answer names has arrived: every answer and every screen names a revision of the window, so a
-screen the session drew before a report, a repaint of where the window was, is never taken for
-the report's own. A refusal settles a report at once and changes nothing. So does an answer that
-hands this terminal the session's own bytes, and so does a new subscription that begins with
-them, because the session hands its bytes only to a window at the live screen's first line and
-column. Nothing is reported while a new subscription is being asked for, so the first thing it
-delivers can only answer what was sent before. What the person presses meanwhile waits too, and goes from where that screen
+The session decides which window this terminal is looking through. Each report about it waits for
+the one before it to settle. Usually that is when the session has answered it and the screen that
+answer names has arrived: every answer and every screen names a revision of the window, so a screen
+the session drew before a report, a repaint of where the window was, is never taken for the report's
+own. A refusal settles a report at once and changes nothing. So does an answer that hands this
+terminal the session's own bytes, and so does a new subscription that begins with them, because the
+session hands its bytes only to a window at the live screen's first line and column. Nothing is
+reported while a new subscription is being asked for, so the first thing it delivers can only answer
+what was sent before. What the person presses meanwhile waits too, and goes from where that screen
 puts the window. Presses in one direction add up, and a reversal waits its turn, so a press the
-window cannot make is spent without taking the next one with it. A report of this terminal's
-*size* waits the same way. Only the newest size waits, carrying where the window is, so a report
-refused meanwhile never takes a newer size with it. A resize this terminal makes as the size's
-owner is not such a report and goes at once.
+window cannot make is spent without taking the next one with it. A report of this terminal's *size*
+waits the same way. Only the newest size waits, carrying where the window is, so a report refused
+meanwhile never takes a newer size with it. A resize this terminal makes as the size's owner is not
+such a report and goes at once.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
@@ -298,15 +298,15 @@ window is the only way above its screen. They are also the application's while a
 program is running, because its buffer keeps no history and it has its own use for those keys; the
 window comes back to the live screen with the screen that program took.
 
-While this terminal is showing rows above the live page no pointer report reaches the application. It would address
-a cell of the live screen, and the rows the person is looking at are not on it; section 8 gives that
-case its answer, that input outside the visible grid has no application effect. Every report is
-taken, whether it arrives on its own, among other bytes, or in halves a read boundary cut it into,
-and the wheel among them moves the window. Half of one waits a moment for the rest; if nothing
-comes it was not a report and it goes to the application, which is the one way a report split by a
-long pause reaches it. Inside a bracketed paste nothing is taken at all. Typing goes to the application wherever the window is,
-and with `--follow-live` the first key brings the window back to the live screen, because what a
-person types is answered there.
+While this terminal is showing rows above the live page, no pointer report reaches the application.
+It would address a cell of the live screen, and the rows the person is looking at are not on it;
+section 8 gives that case its answer, that input outside the visible grid has no application effect.
+Every report is taken, whether it arrives on its own, among other bytes, or in halves a read
+boundary cut it into, and the wheel among them moves the window. Half of one waits a moment for the
+rest; if nothing comes it was not a report and it goes to the application, which is the one way a
+report split by a long pause reaches it. Inside a bracketed paste nothing is taken at all. Typing
+goes to the application wherever the window is, and with `--follow-live` the first key brings the
+window back to the live screen, because what a person types is answered there.
 
 The command does not map pointer coordinates for a window that is panned across the columns; that
 belongs with the rest of a window's pointer handling.
@@ -352,9 +352,9 @@ A window narrower or shorter than the session shows the part it has room for. No
 what is outside the window is not drawn, and a line the application wrapped is drawn as two rows,
 which is what a destination told about a row it has drawn itself can carry.
 
-An update this terminal cannot apply — one continuing from a screen it does not hold, or from
-another projection generation — is not drawn. The command asks the session for a fresh screen
-instead, which is what the contract says to do and is cheaper than reasoning about what was missed.
+An update this terminal cannot apply (one continuing from a screen it does not hold, or from another
+projection generation) is not drawn. The command asks the session for a fresh screen instead, which
+is what the contract says to do and is cheaper than reasoning about what was missed.
 
 Two things are drawn only when they exist: the outer terminal keeps whatever it was showing while a
 snapshot's pages are still arriving, because a screen half installed is not the session's screen,
@@ -382,7 +382,7 @@ every colour the session set and keep their own for the ones it did not.
 ### The restoration guard
 
 A broken connection must not leave a terminal in raw mode, and the restoration has to survive the
-attach process being killed — which no in-process handler can do, because `SIGKILL` runs no handler.
+attach process being killed, which no in-process handler can do, because `SIGKILL` runs no handler.
 
 So the saved state lives in another process. `kr attach` starts `kr-attach-guard` before anything
 touches the terminal and gives it one end of a pipe, its own handle on the terminal and the
@@ -390,15 +390,15 @@ terminal's complete mode state.
 
 * A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
   acting.
-* Any other end — a crash, `SIGKILL`, the machine running out of memory — closes the pipe. The
+* Any other end (a crash, `SIGKILL` or the machine running out of memory) closes the pipe. The
   guard's read returns end of file and it restores the terminal itself.
 
 The guard runs in its own process group, so signals aimed at the attach process do not reach it, and
 it handles the background-write signal so that changing the terminal from the background is not a
 reason to stop it.
 
-Its limit is stated plainly: nothing recovers a terminal whose emulator has died, because there is
-nothing left to restore.
+Its limit is that nothing recovers a terminal whose emulator has died, because there is nothing left
+to restore.
 
 Only then does it ask the terminal anything. The capability handshake is bounded and synchronous,
 and every question in it must be answered, so the questions follow the profile the terminal
@@ -409,12 +409,12 @@ terminator: the one thing that proves no earlier answer is still in flight.
 
 Nothing else is asked. A question whose answer is optional is not a question this command may ask,
 and nothing beyond the terminator can be required of a terminal calling itself `xterm-256color`:
-Terminal.app answers neither colour query, and requiring one would fail every attach there. What
-the command may do instead is not ask, which is the honest way to not know. A reply a terminal
-volunteers is still recorded, because a terminal that says what it has negotiated has told the
-truth about itself either way, and what it reported is what a cleanup puts back. Reading the answers
-means putting the terminal into a mode where they arrive, which is why the guard exists first. The
-answers then reach the guard over the same pipe.
+Terminal.app answers neither colour query, and requiring one would fail every attach there. What the
+command may do instead is not ask, and so not know. A reply a terminal volunteers is still recorded,
+because a terminal that says what it has negotiated has told the truth about itself either way, and
+what it reported is what a cleanup puts back. Reading the answers means putting the terminal into a
+mode where they arrive, which is why the guard exists first. The answers then reach the guard over
+the same pipe.
 
 An answer may arrive in pieces. A terminal is free to send half a reply, and the exchange keeps its
 place between reads rather than treating the first half as something the person typed. The terminal
@@ -438,11 +438,11 @@ still receive a late reply. What the person typed while the host was asking is k
 answers and is the first input the attachment forwards.
 
 Both paths out put everything back: the mode words, the control characters, the sequences that undo
-what an application may have left enabled - the alternate screen, mouse reporting, bracketed paste,
-the coordinate system a projection installed - and then the keyboard protocols the terminal had
-chosen for itself. A cleanup that runs before the attachment began forwarding, because the handshake failed
-or the process was killed during it, leaves those protocols alone: nothing that had happened could
-have changed them.
+what an application may have left enabled (the alternate screen, mouse reporting, bracketed paste
+and the coordinate system a projection installed), and then the keyboard protocols the terminal had
+chosen for itself. A cleanup that runs before the attachment began forwarding, because the handshake
+failed or the process was killed during it, leaves those protocols alone: nothing that had happened
+could have changed them.
 
 Those sequences are the documented defaults, and for the modes the attachment itself changes they
 are not the last word. The handshake asks a terminal declaring one of xterm's names what it has set
@@ -534,14 +534,14 @@ many sessions the keystrokes crossed, and one that did not receives the text.
 
 ### Over SSH, including to the same host
 
-An attachment over SSH is an ordinary attachment. The terminal it asks is the pseudo-terminal
-`sshd` gave it, the replies come back over the same connection, and every capability comes from that
+An attachment over SSH is an ordinary attachment. The terminal it asks is the pseudo-terminal `sshd`
+gave it, the replies come back over the same connection, and every capability comes from that
 exchange rather than from anything about the host: nothing is assumed because the far end happens to
-be this machine. A loopback, `ssh localhost kr attach 1`, is therefore the same path as a remote one,
-with two consequences worth stating. The handshake's one-second bound covers the round trip, so a
-link slow enough to lose the terminator fails that attach rather than continuing on a stream that may
-still deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection
-before the attachment sees it, exactly as it does inside any other full-screen application.
+be this machine. A loopback, `ssh localhost kr attach 1`, is therefore the same path as a remote
+one, with two consequences. The handshake's one-second bound covers the round trip, so a link slow
+enough to lose the terminator fails that attach rather than continuing on a stream that may still
+deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection before
+the attachment sees it, exactly as it does inside any other full-screen application.
 
 ### In an enrolled environment
 
@@ -609,7 +609,12 @@ names something no longer installed is not an error, because nobody asked for it
 | `--cancel` | Stop the fetch that is running and remove what it wrote |
 | `--environment <id>` | Act in another environment than this installation's own |
 
-The options `--on` and `--off` are mutually exclusive, and `--download` cannot be combined with `--off` or `--cancel`. One action regarding the settings and one regarding the download can be given at the same time. The settings are recorded in the host's configuration and a fetch is started in the daemon, and the command prints what setup shows afterwards, so the output of `--download` is what setup shows once the fetch has been started. A battery setting that is neither `on` nor `off` is a usage failure and changes nothing.
+The options `--on` and `--off` are mutually exclusive, and `--download` cannot be combined with
+`--off` or `--cancel`. One action on the settings and one on the download can be given at the same
+time. The settings are recorded in the host's configuration and a fetch is started in the daemon,
+and the command prints what setup shows afterwards, so the output of `--download` is what setup
+shows once the fetch has been started. A battery setting that is neither `on` nor `off` is a usage
+failure and changes nothing.
 
 With `--json` the same answer is printed as a document with the fields `offered`, `enabled`, `on_battery`, `profile_id`, `asset_bytes`, `sources`, `download`, `fetched_bytes`, `failure`, `can_cancel`, `can_disable`, `needs_hosted_account`, `unavailable`, `state` and `paused`. The daemon of the environment must be running when this command is run.
 
@@ -622,15 +627,15 @@ editor fence at the moment the line is accepted. That record is what the detach 
 so the terminal that gets removed is the one the person is sitting at, never whichever client
 happens to hold the input lease by the time the command runs.
 
-What connects the running command to that record is a capability, not anything about the process
-the command runs in. The worker mints one secret for the line it has just recorded and gives it to
-that line's own execution, through the integration, in `KR_DETACH_TOKEN`. `kr detach` with no
+What connects the running command to that record is a capability, not anything about the process the
+command runs in. The worker mints one secret for the line it has just recorded and gives it to that
+line's own execution, through the integration, in `KR_DETACH_TOKEN`. `kr detach` with no
 `--attachment` presents whatever that variable holds and the session answers from it alone: one
 line, one capability, one attachment. Nothing about a caller's process is read, because nothing
-about a process says which line it belongs to — it can be started by an earlier line, resumed from
-the background with `fg`, left running after the line that started it finished, or share the
-shell's own process group because job control is off. Each of those is a caller that looks exactly
-like the line running now and is not it.
+about a process says which line it belongs to: it can be started by an earlier line, resumed from
+the background with `fg`, left running after the line that started it finished, or share the shell's
+own process group because job control is off. Each of those is a caller that looks exactly like the
+line running now and is not it.
 
 The capability lasts as long as its line runs. It ends when that line's command reports the status
 it exited with, when the reader comes back at a later prompt, when the next line is accepted, and
@@ -749,7 +754,7 @@ surface on the machine the session is on.
 Exactly one answer flag is required. `--other` is the free-text option every `select` and `confirm`
 carries; it stays free text and is never read as a listed choice or as yes.
 
-Listings lead with the application identity the host verified — the executable the kernel names and
+Listings lead with the application identity the host verified: the executable the kernel names and
 its process identifier. The `agent_name` the caller supplied appears beside it as an unverified
 label.
 
@@ -839,7 +844,7 @@ account for.
 an installed agent runs; there is nothing to read in its output by hand, and it writes nothing else
 to that stream.
 
-It offers four tools — `ask_user`, `wait_for_answer`, `cancel_question` and `send_notification` —
+It offers four tools (`ask_user`, `wait_for_answer`, `cancel_question` and `send_notification`)
 bound to the session this process is running in. Outside a session every tool answers
 `NOT_IN_KR_SESSION` with the instruction to start the agent inside one, and creates nothing.
 [docs/contact/README.md](../contact/README.md) explains the binding, the states and the limits.
@@ -879,8 +884,8 @@ A `--json` failure carries the same information, and the protocol code with it. 
 
 ## `kr doctor`
 
-Read-only. It asks the host what it is, what it is configured from and what is wrong with it, and
-it repairs nothing.
+`kr doctor` is read-only: it asks the host what it is, what it is configured from and what is wrong
+with it, and it repairs nothing.
 
 ```sh
 kr doctor                          # each check's verdict, with evidence only where one did not pass
@@ -1024,19 +1029,18 @@ so is a session that was created when privacy mode was on but has completed its 
 This first reads whether the host is in privacy mode, then reads the sessions, and then reads
 whether the host is in privacy mode again. If the host is in privacy mode at either read, or if the
 generation of privacy mode changes between the two reads of privacy mode, this will not export any
-sessions and, if the host lists any, print the number of sessions that it left out and the reason
-why. (If privacy mode is off at the second read but changed since the first, the reason will tell
-you to run the command again.) If any other error occurs while reading the privacy mode or the
-sessions, this will fail (and not write anything on disk). An empty bundle (with no sessions) is
-valid, so this will exit as if it were only running diagnostics, for example by printing:
+sessions and, if the host lists any, print the number of sessions that it left out and the reason.
+(If privacy mode is off at the second read but changed since the first, the reason will tell you to
+run the command again.) If any other error occurs while reading the privacy mode or the sessions,
+this will fail (and not write anything on disk). An empty bundle (with no sessions) is valid, so
+this will exit as if it were only running diagnostics, for example by printing:
 
 ```text
   content/sessions.json: the shell, working directory and closure of 0 sessions, redacted by session-content-1 and printed before it was written (digest 9f2c...); 2 sessions left out: privacy mode is on
 ```
 
-The content preview, the manifest, and the `content_left_out` key of the JSON document produced when
-using the `--json` option, will all include the number of sessions that were left out for each
-reason.
+The content preview, the manifest and the `content_left_out` key of the `--json` document all
+include the number of sessions left out for each reason.
 
 #### What it shows and what it removes
 
@@ -1091,10 +1095,10 @@ include non-escaped `/`, `?` or `#` in URLs, options that start with only one `-
 value in `$'...'` quoting, a value with a command substitution, backticks, `${...}` or a
 parenthesised array in it, or user names included in paths (except your home directory); a secret in
 one of these forms stays unless another rule happens to match it, as one named `Password=...` in a
-connection string would be. Please look over the content in the preview and make sure there is
-nothing you don't want to share before continuing. Note that some invisible characters, such as text
-direction overrides and zero-width characters, will be written as escapes, so that what you see on
-the screen is what is in the file.
+connection string would be. Before continuing, look over the content in the preview and make sure
+there is nothing in it you do not want to share. Some invisible characters, such as text direction
+overrides and zero-width characters, are written as escapes, so that what you see on the screen is
+what is in the file.
 
 #### Writing it
 
@@ -1203,7 +1207,7 @@ selected only with `--start`.
 A refresh of a running environment also opens a bridge to it and reports what answered: the
 environment identity, the user the helper runs as inside it, the protocol version and the frame
 bound. That line is the connection diagnostic, and it says what stopped the bridge when one could
-not be opened — the program that would not start, the environment that answered with another
+not be opened: the program that would not start, the environment that answered with another
 identity, or the destination's own refusal.
 
 An SSH host is enrolled with `--access ssh`, and `--probe` asks its helper over ssh which
@@ -1683,8 +1687,8 @@ daemon before anything else.
 
 An environment whose daemon has not run since an earlier schema step does not stop an update: the
 update brings its registry forward before it classes it, and says so. An environment that is no
-longer present (perhaps the container has been removed) will be named by its recorded roots, and skipped. See
-`docs/host/updates.md` for details.
+longer present, such as one whose container has been removed, is named by its recorded roots and
+skipped. See `docs/host/updates.md` for details.
 
 With `--json`, `kr host update` returns JSON with the keys `source`, `target`, `checked_only`
 (whether it only checked), `restarted` (the environments whose daemons it started again), `carried`
