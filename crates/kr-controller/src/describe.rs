@@ -186,16 +186,16 @@ impl DescribeModule {
         }
     }
 
-    /// Waits until the host has taken `settings` and published the turn that applied them, so that
-    /// an answer built after it shows the pause they cause and not the one from before. A host
-    /// that does not run, or does not answer in time, is not waited for: the answer then shows
-    /// what it last published.
-    pub(crate) async fn settings_applied(&self, settings: kr_describe::resource::ResourceSettings) {
+    /// Waits until the host has taken everything posted to it so far and published the turn that
+    /// took it, so that an answer built after it shows the pause a setting just changed causes, and
+    /// not the one from before it. A host that does not run is not waited for. When the host does
+    /// not answer within the bound, what it last published is what the answer shows: that is its
+    /// state, and it takes the setting at its next turn.
+    pub(crate) async fn until_host_turns(&self) {
         let Some(host) = self.host().filter(|host| host.runs()) else {
             return;
         };
-        let taken = host.settings_and_wait(Some(settings.enabled), Some(settings.on_battery));
-        let _ = tokio::time::timeout(SETTINGS_WAIT, taken).await;
+        let _ = tokio::time::timeout(SETTINGS_WAIT, host.turned()).await;
     }
 
     /// Wakes the host, for this crate's own tests that change what it reads.
@@ -680,9 +680,9 @@ impl crate::service::Controller {
                 if params.enabled.0 == Some(false) {
                     self.descriptions.fetches.cancel();
                 }
-                self.descriptions
-                    .settings_applied(self.description_settings())
-                    .await;
+                // The settings were posted to the host, in order, when the document was accepted;
+                // the answer waits for the turn that took them.
+                self.descriptions.until_host_turns().await;
                 self.description_setup()
             }
             Method::DescriptionDownload => {

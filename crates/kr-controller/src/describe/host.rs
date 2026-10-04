@@ -93,8 +93,11 @@ enum Message {
     Settings {
         enabled: Option<bool>,
         on_battery: Option<bool>,
-        /// Told once the turn that applied them has published what it found, when asked to.
-        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Everything posted before this has been taken: answer once the turn that took it has
+    /// published what it found.
+    Turned {
+        done: tokio::sync::oneshot::Sender<()>,
     },
     /// Forget everything held in memory, and answer when it is done.
     Purge { done: SyncSender<()> },
@@ -577,23 +580,15 @@ impl DescribeHost {
         self.post(Message::Settings {
             enabled,
             on_battery,
-            done: None,
         });
     }
 
-    /// Applies the owner's settings, and returns what completes once the turn that applied them
-    /// has published what it found, so that an answer built after it shows the pause they cause.
-    pub(crate) fn settings_and_wait(
-        &self,
-        enabled: Option<bool>,
-        on_battery: Option<bool>,
-    ) -> tokio::sync::oneshot::Receiver<()> {
+    /// Returns what completes once the host has taken everything posted to it before this call and
+    /// published the turn that took it, so that an answer built after it shows what that turn
+    /// found: the pause an owner's setting causes, and not the one from before it.
+    pub(crate) fn turned(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (done, taken) = tokio::sync::oneshot::channel();
-        self.post(Message::Settings {
-            enabled,
-            on_battery,
-            done: Some(done),
-        });
+        self.post(Message::Turned { done });
         taken
     }
 
@@ -849,7 +844,6 @@ impl Thread {
                 Message::Settings {
                     enabled,
                     on_battery,
-                    done,
                 } => {
                     if let Some(enabled) = enabled {
                         self.driver.service_mut().set_enabled(enabled);
@@ -857,9 +851,11 @@ impl Thread {
                     if let Some(allowed) = on_battery {
                         self.driver.service_mut().set_on_battery(allowed);
                     }
+                }
+                Message::Turned { done } => {
                     // Told once the turn has published what it found, so the answer the caller
-                    // builds next shows the pause the setting causes.
-                    self.held.acks.extend(done);
+                    // builds next shows the pause what came before it causes.
+                    self.held.acks.push(done);
                 }
                 Message::Purge { done } => {
                     let _ = self.driver.service_mut().forget_content();
@@ -1689,7 +1685,6 @@ mod tests {
             .send(Message::Settings {
                 enabled: Some(false),
                 on_battery: None,
-                done: None,
             })
             .expect("the message is posted");
         host.shared.waker.wake();
@@ -1708,12 +1703,12 @@ mod tests {
         );
     }
 
-    /// A settings change is acknowledged after the turn that applies it, and that turn's snapshot
-    /// shows the pause the change causes: an answer built when the acknowledgement arrives never
-    /// shows the pause from before it. The control is the snapshot before the change, which shows
-    /// no pause.
+    /// What is posted to the host is acknowledged by the turn that takes it, and that turn's
+    /// snapshot shows the pause it causes: an answer built when the acknowledgement arrives is
+    /// not the one from before the change. The control is the snapshot before the change, which
+    /// shows no pause.
     #[test]
-    fn a_settings_change_is_acknowledged_after_the_turn_that_shows_its_pause() {
+    fn a_settings_change_is_acknowledged_by_the_turn_that_shows_its_pause() {
         use kr_describe::budget::GIB;
         use kr_describe::resource::{PowerSource, ThermalState};
 
@@ -1737,7 +1732,8 @@ mod tests {
             "nothing pauses it to begin with"
         );
 
-        let mut acknowledged = handle.settings_and_wait(Some(false), None);
+        handle.settings(Some(false), None);
+        let mut acknowledged = handle.turned();
         assert!(
             acknowledged.try_recv().is_err(),
             "not acknowledged before the host has turned"
@@ -1745,7 +1741,7 @@ mod tests {
         host.turn();
         assert!(
             acknowledged.try_recv().is_ok(),
-            "acknowledged by the turn that applied it"
+            "acknowledged by the turn that took the change"
         );
         assert_eq!(handle.snapshot().paused, Some(DescriptionPause::Disabled));
     }
