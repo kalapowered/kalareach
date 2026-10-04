@@ -944,9 +944,10 @@ async fn kr_req_12_07_a_rule_whose_file_stem_ends_in_com_recognises_the_command_
     std::fs::create_dir_all(&other).expect("a directory");
     let found = other.join("agent.com.exe");
     std::fs::copy(stand_in_program(), &found).expect("a program stands in");
+    let spelt = invocation(&["agent.com"]);
     let asked = EstablishRequest {
         executable: found.to_str().expect("a text path"),
-        ..request(&setup, &invocation(&["agent.com"]), &integration, 9)
+        ..request(&setup, &spelt, &integration, 9)
     };
     setup
         .backends
