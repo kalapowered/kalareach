@@ -29,15 +29,14 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -136,28 +135,12 @@ pub(super) fn environment_block(
     block
 }
 
-/// Makes this process a member of `job`, so that every process it creates from now on is born in
-/// it as well.
-fn join(job: &OwnedHandle) -> Result<(), String> {
-    // SAFETY: the handle is the job's, open for the call; the pseudo handle for this process names
-    // it and needs no closing.
-    let joined =
-        unsafe { AssignProcessToJobObject(job.as_raw_handle().cast(), GetCurrentProcess()) };
-    if joined == 0 {
-        return Err(format!(
-            "this launcher could not join the job that holds its program: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
 /// The program the launcher created, suspended.
 ///
-/// The launcher joins a job of its own, set to end what it holds when its last handle closes, just
-/// before it creates the program, so the program is born in that job and no moment exists in which
-/// it is created and not held. The launcher holds the only handle. A launcher that stops for any
-/// reason after that, whatever the backend has or has not done, ends the program it created, which
+/// The program is created in a job of the launcher's own, set to end what it holds when its last
+/// handle closes, so it is born held and no moment exists in which it is created and not held. The
+/// launcher holds the only handle and is not in the job. A launcher that stops for any reason after
+/// the creation, whatever the backend has or has not done, ends the program it created, which
 /// nothing could start. Once the backend has committed the launch, or the program has been ended,
 /// the setting is taken off, so the launcher's own end ends nothing the program started.
 pub(super) struct Program {
@@ -256,33 +239,47 @@ impl Program {
         let mut bytes = 0_usize;
         // SAFETY: the count is a local this thread owns, and a null list is what asks for the size;
         // the call reports failure for it, which is the answer.
-        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut bytes) };
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &raw mut bytes) };
         let mut list = vec![0_usize; bytes.div_ceil(std::mem::size_of::<usize>())];
         let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = list.as_mut_ptr().cast();
         // SAFETY: the buffer is at least the size the call above asked for and outlives every use.
-        if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut bytes) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &raw mut bytes) } == 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        if !handles.is_empty() {
+        // The program is created in the holder, so it is born held and nothing is left to assign
+        // after it exists. The launcher is not in the holder.
+        let jobs = [holder.as_raw_handle().cast::<std::ffi::c_void>()];
+        let update = |attribute: u32, values: &[HANDLE]| -> Result<(), String> {
             // SAFETY: the list is initialised, the array outlives the creation, and the size is
             // that array's own.
             let updated = unsafe {
                 UpdateProcThreadAttribute(
                     attributes,
                     0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    handles.as_ptr().cast(),
-                    std::mem::size_of_val(handles.as_slice()),
+                    attribute as usize,
+                    values.as_ptr().cast(),
+                    std::mem::size_of_val(values),
                     std::ptr::null_mut(),
                     std::ptr::null(),
                 )
             };
             if updated == 0 {
-                let failure = std::io::Error::last_os_error();
-                // SAFETY: the list was initialised above and nothing else holds it.
-                unsafe { DeleteProcThreadAttributeList(attributes) };
-                return Err(failure.to_string());
+                Err(std::io::Error::last_os_error().to_string())
+            } else {
+                Ok(())
             }
+        };
+        let listed = update(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs).and_then(|()| {
+            if handles.is_empty() {
+                Ok(())
+            } else {
+                update(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles)
+            }
+        });
+        if let Err(failure) = listed {
+            // SAFETY: the list was initialised above and nothing else holds it.
+            unsafe { DeleteProcThreadAttributeList(attributes) };
+            return Err(failure);
         }
         // SAFETY: all zeroes is the documented starting state of a structure of integers, pointers
         // and handles.
@@ -295,13 +292,6 @@ impl Program {
         startup.StartupInfo.hStdError = standard[2];
         // SAFETY: all zeroes is a structure of integers that the call fills in.
         let mut started: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        // Joined last, with everything that could fail already done: from here the program is born
-        // in the holder, and the holder is let go of again on every way out that does not start it.
-        if let Err(failure) = join(&holder) {
-            // SAFETY: the list was initialised above, nothing else holds it.
-            unsafe { DeleteProcThreadAttributeList(attributes) };
-            return Err(failure);
-        }
         // SAFETY: every pointer is to a local that outlives the call. The command line is mutable
         // because the call may write into it. The handles inherited are the ones the list names;
         // with none to name, none are inherited.
@@ -324,8 +314,6 @@ impl Program {
         // holds it.
         unsafe { DeleteProcThreadAttributeList(attributes) };
         if let Some(failure) = failure {
-            // Nothing was created in the holder, and this launcher is in it: it ends nothing.
-            let _ = ends_with_its_handle(&holder, false);
             return Err(format!(
                 "{} could not be created: {failure}",
                 executable.display()
