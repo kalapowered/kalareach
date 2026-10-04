@@ -127,22 +127,27 @@ fn a_prompt_is_made_to_fit_by_dropping_the_oldest_events_first() {
     assert!(dropped_some, "no budget in the range dropped an event");
 }
 
-/// KR-REQ-22.10: the facts are kept before any event, whatever order they are shown in, with what a
-/// session is for first; the one part that does not fit whole is cut to a prefix of its text, and
-/// nothing is kept after it.
+/// KR-REQ-22.10: the intent, the directory and the repository are kept first, with what a session
+/// is for first, then the newest event, then the branch, the thread and the application, then the
+/// other events newest first; the one part that does not fit whole is cut to a prefix of its text,
+/// and nothing is kept after it.
 #[test]
-fn the_facts_are_kept_before_the_events_and_only_the_last_part_kept_is_cut() {
+fn the_parts_are_kept_in_their_order_of_worth_and_only_the_last_part_kept_is_cut() {
     let prompt = crowded().prompt();
     let base = base_of(&prompt);
-    let intent = prompt.fact("intent").expect("an intent");
     let line_of = |label: &str| {
         let text = prompt.fact(label).expect("a fact");
         format!("{label}: <<{text}>>")
     };
+    let size = |label: &str| {
+        prompt
+            .fact(label)
+            .map_or(0, |text| text.len() + label.len() + 6)
+    };
 
     // Room for the intent and some of the next fact: the intent is whole, the directory, which is
     // the next in worth, is cut, and nothing else is there.
-    let budget = base + count(&format!("intent: <<{intent}>>\n")).expect("a count") + 12;
+    let budget = base + size("intent").div_ceil(4) + 12;
     let fitted = prompt.fit(budget, count).expect("a prompt that fits");
     assert!(fitted.text.contains(&line_of("intent")));
     assert!(fitted.cut);
@@ -158,12 +163,32 @@ fn the_facts_are_kept_before_the_events_and_only_the_last_part_kept_is_cut() {
         assert!(!fitted.text.contains(later), "{later} kept after a cut");
     }
 
-    // Room for every fact and a few events: the facts are whole.
-    let facts = prompt
+    // Room for the three facts and part of the newest event: the newest event comes before the
+    // branch, the thread and the application.
+    let three: usize = ["intent", "directory", "repository"]
+        .into_iter()
+        .map(size)
+        .sum();
+    let fitted = prompt
+        .fit(base + three.div_ceil(4) + 12, count)
+        .expect("a prompt that fits");
+    for label in ["intent", "directory", "repository"] {
+        assert!(fitted.text.contains(&line_of(label)), "{label}");
+    }
+    assert_eq!(events_shown(&fitted.text), vec![8], "the newest event, cut");
+    for later in ["branch", "thread", "application"] {
+        assert!(
+            !fitted.text.contains(&format!("{later}: <<")),
+            "{later} kept after the newest event"
+        );
+    }
+
+    // Room for every fact and a few events: the facts are whole and the newest events are there.
+    let facts: usize = prompt
         .facts
         .iter()
         .map(|datum| datum.text.len() + datum.label.len() + 6)
-        .sum::<usize>();
+        .sum();
     let fitted = prompt
         .fit(base + facts.div_ceil(4) + 40, count)
         .expect("a prompt that fits");
@@ -174,7 +199,7 @@ fn the_facts_are_kept_before_the_events_and_only_the_last_part_kept_is_cut() {
                 .contains(&format!("{}: <<{}>>", datum.label, datum.text))
         );
     }
-    assert!(!events_shown(&fitted.text).is_empty());
+    assert!(events_shown(&fitted.text).contains(&8));
 }
 
 /// KR-REQ-22.10: a counter that is not steady, which makes a longer text count fewer tokens as a
@@ -262,7 +287,7 @@ fn a_prompt_may_be_what_the_deadline_and_the_window_leave() {
         + u64::from(bounds.max_output_tokens) * REFERENCE_OUTPUT_MS_PER_TOKEN
         + u64::from(bounds.prompt_tokens) * 1_000 / REFERENCE_PROMPT_TOKENS_PER_SECOND;
     assert!(worst_ms <= bounds.deadline_ms, "{worst_ms} ms");
-    // And not by a wide margin the other way: one more token is past it.
+    // And no wider than that: twenty tokens more are past it.
     let one_more = REFERENCE_JOB_OVERHEAD_MS
         + u64::from(bounds.max_output_tokens) * REFERENCE_OUTPUT_MS_PER_TOKEN
         + u64::from(bounds.prompt_tokens + 20) * 1_000 / REFERENCE_PROMPT_TOKENS_PER_SECOND;

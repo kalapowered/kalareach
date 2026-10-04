@@ -387,6 +387,8 @@ fn a_signed_profile_that_states_the_wrong_thing_is_still_refused() {
         ("\"top_p\": 1.0", "\"top_p\": 4.0"),
         ("\"top_k\": 1", "\"top_k\": 0"),
         ("\"context_tokens\": 4096", "\"context_tokens\": 0"),
+        // A window that cannot hold the instruction beside the output bound: no job could exist.
+        ("\"context_tokens\": 4096", "\"context_tokens\": 600"),
         ("\"max_output_tokens\": 128", "\"max_output_tokens\": 8192"),
         ("\"cpu_threads\": 4", "\"cpu_threads\": 0"),
         (
@@ -667,4 +669,38 @@ fn a_candidate_cannot_be_mapped_without_the_gates_it_declares() {
             )
             .is_ok()
     );
+}
+
+/// KR-REQ-22.10: the instruction fits every shipped profile's prompt bound byte for byte, which is
+/// the most tokens it can be in any tokenizer, so a job exists for every context whatever the
+/// vocabulary. A profile verification refuses a window with less room than that for the instruction
+/// and the output bound, and the smallest window that has it is accepted.
+#[test]
+fn the_instruction_fits_every_prompt_bound_in_any_tokenizer() {
+    let instruction = kr_describe::prompt::Prompt::bare().text().len();
+    for profile in built_in().profiles() {
+        let bounds = Budgets::DEFAULTS.bounds(profile.execution());
+        assert!(
+            instruction + 2 <= bounds.prompt_tokens as usize,
+            "{}: {instruction} bytes of instruction, {} tokens of prompt",
+            profile.profile_id(),
+            bounds.prompt_tokens
+        );
+    }
+
+    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair");
+    let trust = ProfileTrust::new(vec![*keys.public()]);
+    let with_window = |tokens: usize| {
+        let document = catalogue::DEFAULT_PROFILE_DOCUMENT.replace(
+            "\"context_tokens\": 4096",
+            &format!("\"context_tokens\": {tokens}"),
+        );
+        trust.verify(&sign(&document, &keys))
+    };
+    let least = instruction + 2 + 128;
+    assert!(with_window(least).is_ok());
+    assert!(matches!(
+        with_window(least - 1),
+        Err(DescribeError::ProfileRefused { .. })
+    ));
 }

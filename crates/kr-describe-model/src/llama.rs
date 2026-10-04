@@ -54,11 +54,10 @@ use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token_type::LlamaTokenAttr;
 
-use kr_describe::budget::Budgets;
 use kr_describe::output::end_cut_answer;
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::{Asset, ModelProfile};
-use kr_describe::prompt::{FitError, Prompt};
+use kr_describe::prompt::FitError;
 use kr_describe::serve::{Generating, Job, LoadWork, Loading, Model, Verifying, own_rss_bytes};
 use kr_describe::wire::{JobEnd, LoadEnd, Phases, VerifyResult};
 use kr_protocol::scalars::U64;
@@ -328,32 +327,11 @@ impl LlamaRuntime {
             drop(model);
             return Err((LoadEnd::DeadlineExceeded, None));
         }
-        let runtime = Self {
+        Ok(Self {
             model,
             context_tokens: profile.execution().context_tokens,
             weights_path: weights.to_path_buf(),
-        };
-        // A job exists for every context only if the instruction alone, with the longest numbers the
-        // answer repeats, is within what a prompt may be. A profile whose window is too small for
-        // that cannot serve a description, whatever the project text is.
-        let bounds = Budgets::DEFAULTS.bounds(profile.execution());
-        let base = runtime
-            .prompt_tokens(&Prompt::bare().text())
-            .map_err(|detail| (LoadEnd::Failed, Some(detail)))?
-            .tokens
-            .len();
-        if base > bounds.prompt_tokens as usize {
-            return Err((
-                LoadEnd::Refused,
-                Some(format!(
-                    "{} has no room for a description: the instruction alone is {base} tokens, \
-                     and a prompt may be {}",
-                    profile.profile_id(),
-                    bounds.prompt_tokens
-                )),
-            ));
-        }
-        Ok(runtime)
+        })
     }
 
     /// Returns the file this model was loaded from.
@@ -437,6 +415,17 @@ impl LlamaRuntime {
         Ok((tokens, spelled_out))
     }
 
+    /// Returns how many tokens `text` is, as an answer: read as the tokenizer reads it, with the
+    /// spelling of a control token written out as characters, and without the framing a prompt
+    /// has.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the text could not be tokenized.
+    pub fn answer_tokens(&self, text: &str) -> std::result::Result<usize, String> {
+        self.text_tokens(text).map(|(tokens, _)| tokens.len())
+    }
+
     /// Returns whether a token is one the model reads as the structure of a prompt, which text
     /// from a project must never become: a control token, the unknown token, a token the
     /// vocabulary defines on top of its text, the ends of a sequence and the end of a turn.
@@ -513,15 +502,16 @@ impl LlamaRuntime {
     /// vocabulary has, which is how a model writes text it knows. The second is one codepoint at a
     /// time, which writes every character the vocabulary has a token for on its own whole. Neither
     /// is the other's whole: a byte-level vocabulary can split a space and the character after it
-    /// across tokens, and a token that ends inside a character is refused by the grammar when the
-    /// character it could finish is one it leaves out, so a character with no token of its own is
+    /// across tokens, and a token that ends inside a character is refused by the grammar when no
+    /// character it could finish is one it lists, so a character with no token of its own can be
     /// refused alone and taken inside a longer token. The spelling of a control token inside the
     /// text is written out as characters, so `</s>` inside a title is text and not the end of the
     /// answer.
     ///
     /// What this shows depends on where the output came from. For an answer the model produced
-    /// under this grammar it shows the answer is complete and was not cut short; for text written
-    /// by hand, as `tests/grammar.rs` does, it shows how llama.cpp reads the grammar.
+    /// under this grammar it shows the answer is a whole object, which an answer the output bound
+    /// stopped is made into when it can be; for text written by hand, as `tests/grammar.rs` does,
+    /// it shows how llama.cpp reads the grammar.
     ///
     /// # Errors
     ///
@@ -782,7 +772,12 @@ impl LlamaRuntime {
         peak_rss_bytes = peak_rss_bytes.max(own_rss_bytes().unwrap_or(0));
         if !finished {
             // The output bound stopped the answer before the model ended it.
-            produced = end_cut_answer(&produced, job.prompt);
+            produced = end_cut_answer(
+                &produced,
+                job.prompt,
+                job.max_output_tokens as usize,
+                |text| self.answer_tokens(text).unwrap_or(usize::MAX),
+            );
         }
         Ok(Generating::Produced {
             bytes: produced,

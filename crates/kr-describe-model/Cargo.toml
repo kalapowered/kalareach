@@ -30,8 +30,6 @@ sysinfo.workspace = true
 vtparse.workspace = true
 
 [dev-dependencies]
-# What a profile with a window too small for a description looks like, and the signing of it.
-kr-describe = { workspace = true, features = ["testing"] }
 kr-crypto.workspace = true
 # Places the description process on the internal disk before a test starts it.
 kr-ipc = { workspace = true, features = ["testing"] }
