@@ -716,6 +716,30 @@ fn windows() -> Vec<Step> {
             ],
         ),
         qualified_only(
+            "the forwarder's placeholder",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-plugin-sdk",
+                "--lib",
+                "forwarder",
+            ],
+            "forwarder",
+        ),
+        qualified_only(
+            "the command a typed name is looked up by",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-shell-integration",
+                "--lib",
+                "host::command",
+            ],
+            "host::command",
+        ),
+        qualified_only(
             "the doctor's reading of the platform's command backends",
             &[
                 "test",
