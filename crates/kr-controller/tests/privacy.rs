@@ -1667,6 +1667,253 @@ async fn kr_req_18_08_a_delivered_question_leaves_none_of_the_sessions_words_in_
     environment.stop().await;
 }
 
+/// A web service on this machine's loopback interface that answers every request with 200 and
+/// keeps the body of each, and nowhere else.
+struct Webhook {
+    address: String,
+    port: u16,
+    bodies: Arc<Mutex<Vec<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Webhook {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (kept, stopping) = (Arc::clone(&bodies), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                if stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut connection) = connection else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let (head, wanted) = loop {
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                    match connection.read(&mut chunk) {
+                        Ok(0) | Err(_) => break (request.len(), 0),
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                };
+                while request.len() < head + wanted {
+                    match connection.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                if wanted > 0 {
+                    kept.lock()
+                        .expect("not poisoned")
+                        .push(String::from_utf8_lossy(&request[head..]).into_owned());
+                }
+                let _ = connection.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                );
+            }
+        });
+        Self {
+            address: format!("http://127.0.0.1:{port}/hook"),
+            port,
+            bodies,
+            stop,
+        }
+    }
+
+    /// The body of every request this service was sent, in order.
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("not poisoned").clone()
+    }
+}
+
+impl Drop for Webhook {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The accepting thread is waiting for one more connection, and this is it.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+/// KR-REQ-18.08: a host sends content to an external destination only under an explicit recipient
+/// policy and a content policy, and the daemon a person runs holds to both over a real connection.
+/// Four webhooks on this machine's loopback interface are configured on one daemon, the managed
+/// transport a shipped daemon attaches reaches them, and a question is asked inside a real
+/// session. The webhook whose rule names a grant that reaches the session is told once: what it
+/// receives says its recipients can read it and carries none of the words of the question or of
+/// its context, and the journal's files carry none either. The webhook with no rule at all,
+/// the one whose rule names the grant of a device that has since been unpaired and the one whose
+/// grant reaches another session than this one are sent nothing, the first two with a refusal
+/// recorded in the journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_18_08_an_external_destination_is_told_only_under_its_rule_and_its_grant() {
+    const WORDS: &str = "Deploy the release to production?";
+    const CONTEXT: &str = "the release is tagged";
+    let environment = Environment::start().await;
+    let controller = environment.controller();
+    let reaching_this_session = environment
+        .raw_device(reaching(&[ActionRight::SessionView]))
+        .await;
+    let unpaired_since = environment
+        .raw_device(reaching(&[ActionRight::SessionView]))
+        .await;
+    let mut another_session = reaching(&[ActionRight::SessionView]);
+    another_session.session_selector = SessionSelector::These {
+        session_ids: [SessionId::new(Uuid::from_bytes([0x77; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    let reaching_another = environment.raw_device(another_session).await;
+
+    let told = Webhook::start();
+    let ruleless = Webhook::start();
+    let unpaired = Webhook::start();
+    let elsewhere = Webhook::start();
+    let destination = |id: &str, hook: &Webhook, grant: Option<&RawPaired>| DestinationRecord {
+        id: DestinationId::new(id).expect("an identifier"),
+        destination: Destination::External(ExternalDestination {
+            kind: DestinationKind::Webhook,
+            endpoint: hook.address.clone(),
+            idempotency: Idempotency::Unsupported,
+            credential: None,
+        }),
+        rule: grant.map(|paired| DeliveryRule {
+            name: "anything that wants a person".to_owned(),
+            grant_id: Some(paired.record.grant.grant_id),
+        }),
+        enabled: true,
+        configured_at_ms: now(),
+    };
+    for record in [
+        destination("told", &told, Some(&reaching_this_session)),
+        destination("ruleless", &ruleless, None),
+        destination("unpaired", &unpaired, Some(&unpaired_since)),
+        destination("elsewhere", &elsewhere, Some(&reaching_another)),
+    ] {
+        controller
+            .delivery()
+            .configure(&record)
+            .expect("a destination");
+    }
+    // The recipient's pairing ends through the owner's own call, before anything is asked.
+    let mut owner = environment.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        environment.environment_id(),
+        &mut owner,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: unpaired_since.record.device_id,
+        },
+    )
+    .await
+    .expect("the owner unpairs the device");
+    assert!(controller.attach_delivery_transport(Arc::new(
+        kr_controller::push::transport::ManagedTransports::new(None)
+    )));
+
+    let _asked = environment.worker.ask("deploy-1", WORDS);
+    until(
+        "the webhook under a grant that reaches the session being told",
+        || !told.bodies().is_empty(),
+    )
+    .await;
+
+    // Every destination was decided in the transaction that admitted the message above.
+    let records = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().deliveries().expect("a read")))
+        .expect("the journal");
+    let state_of = |id: &str| {
+        records
+            .iter()
+            .filter(|record| record.destination_id.as_str() == id)
+            .map(|record| record.state)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(state_of("ruleless"), [DeliveryState::Refused]);
+    assert_eq!(state_of("unpaired"), [DeliveryState::Refused]);
+    assert!(
+        state_of("elsewhere").is_empty(),
+        "a message about a session the grant does not reach is not one this destination wants"
+    );
+    assert!(ruleless.bodies().is_empty(), "no rule, so nothing is sent");
+    assert!(
+        unpaired.bodies().is_empty(),
+        "a grant whose device was unpaired admits nothing"
+    );
+    assert!(
+        elsewhere.bodies().is_empty(),
+        "a grant that does not reach the session is told nothing about it"
+    );
+
+    // What the one told destination received, and what the journal kept.
+    let received = told.bodies();
+    assert_eq!(received.len(), 1, "told once: {received:?}");
+    let message: serde_json::Value = serde_json::from_str(&received[0]).expect("a JSON message");
+    assert!(
+        message["body"]
+            .as_str()
+            .is_some_and(|body| body.ends_with(kr_delivery::external::RECIPIENTS_CAN_READ)),
+        "the message says its recipients can read it: {message}"
+    );
+    for words in [WORDS, CONTEXT] {
+        assert!(
+            !received[0].contains(words),
+            "the session's words reached the webhook: {words}"
+        );
+    }
+    let state = environment
+        .host
+        .tree()
+        .environment()
+        .state_dir()
+        .to_path_buf();
+    let holds = |bytes: &[u8], words: &str| {
+        bytes
+            .windows(words.len())
+            .any(|window| window == words.as_bytes())
+    };
+    let mut found_the_destination = false;
+    for name in [
+        "delivery.sqlite3",
+        "delivery.sqlite3-wal",
+        "delivery.sqlite3-shm",
+    ] {
+        let Ok(bytes) = std::fs::read(state.join(name)) else {
+            assert_ne!(
+                name, "delivery.sqlite3",
+                "the journal's own file is the one that is scanned"
+            );
+            continue;
+        };
+        for words in [WORDS, CONTEXT] {
+            assert!(!holds(&bytes, words), "{name} holds the words: {words}");
+        }
+        // The scan reads a file that records the delivery: it finds the destination's own name.
+        found_the_destination |= holds(&bytes, "ruleless");
+    }
+    assert!(
+        found_the_destination,
+        "the scan reads what the journal kept"
+    );
+    drop(owner);
+    environment.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-23.34, KR-REQ-22.17 and KR-REQ-24.14: the session's name at both doors
 // ---------------------------------------------------------------------------------------------
