@@ -118,8 +118,8 @@ jobs:
       # library: leave the static C runtime out, and stop the linker naming the library's missing
       # debug database once per object file. `.cargo/config.toml` carries them so that every Windows
       # build gets them, and RUSTFLAGS in the environment replaces that file's flags rather than
-      # adding to them. LNK4098, which reports two C runtimes in one image, is deliberately not
-      # silenced: the step after the builds refuses it.
+      # adding to them. LNK4098, which reports objects asking for two different C runtimes, is
+      # deliberately not silenced: the step after the builds refuses it.
       CARGO_INCREMENTAL: "0"
     steps:
       # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
@@ -185,8 +185,8 @@ jobs:
           if (($declared -join ',') -ne ($built -join ',')) {
             throw (
               "The crates this release builds declare [$($declared -join ', ')] and this workflow " +
-              "builds [$($built -join ', ')]. Add the missing binary to the build and staging " +
-              'steps, or remove the one that is gone.'
+              "builds [$($built -join ', ')]. Add the missing binary to the build, the build-log " +
+              'check and the staging steps, or remove the one that is gone.'
             )
           }
 
@@ -201,6 +201,18 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "archive=kalareach-windows-x64-$version+$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "version $version, commit $commit"
+
+      # RUSTFLAGS in the environment replaces the flags in `.cargo/config.toml`, the link flags
+      # among them, even when it is empty, and the link then says whatever it says. Nothing here
+      # sets it, so a run that finds it set stops before building rather than depending on what the
+      # linker reports.
+      - name: Refuse an environment that replaces the workspace's link flags
+        shell: bash
+        run: |
+          if [ -n "${RUSTFLAGS+set}${CARGO_ENCODED_RUSTFLAGS+set}" ]; then
+            echo '::error::RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS is set, and either one replaces the link flags in .cargo/config.toml.'
+            exit 1
+          fi
 
       # One command per step, run by a shell that stops when the command fails, and each one keeps
       # what it printed: the step after the builds reads the linker's own words out of those logs.
@@ -239,13 +251,14 @@ jobs:
           mkdir -p "$logs"
           cargo build --locked --release -p kr-describe-model --bin kr-describe-inference 2>&1 | tee "$logs/kr-describe-inference.log"
 
-      # `LNK4098` is the linker saying that two C runtimes are going into one image. The C library
-      # this workspace vendors was built against the static runtime and Rust links the dynamic one;
-      # `.cargo/config.toml` leaves the static one out of the link, so the warning means a build
-      # lost those flags, and an environment variable that replaces them is the usual way. The
-      # image would then hold two heaps and two copies of the runtime's state. This reads what the
-      # five builds printed and stops the run before anything is staged, let alone signed.
-      - name: Refuse a build that put two C runtimes in one image
+      # `LNK4098` is the linker saying that objects in one link ask for two different C runtimes.
+      # The C library this workspace vendors was built against the static runtime and Rust links the
+      # dynamic one, and `.cargo/config.toml` leaves the static one out of the link. Without that
+      # flag the static runtime can be pulled into the image beside the dynamic one, which gives two
+      # heaps and two copies of the runtime's state, and any other source of the warning wants a
+      # look too. This reads what the five builds printed and stops the run before anything is
+      # staged, let alone signed. A log it cannot read stops the run as well.
+      - name: Refuse a build whose link reported conflicting C runtimes
         shell: bash
         run: |
           logs="$(cygpath -u "$RUNNER_TEMP")/build"
@@ -255,8 +268,14 @@ jobs:
               exit 1
             fi
           done
-          if grep -n 'LNK4098' "$logs"/*.log; then
-            echo '::error::A link reported LNK4098: two C runtimes in one image. Look for what replaced the workspace link flags in .cargo/config.toml.'
+          found=0
+          grep -n 'LNK4098' "$logs"/*.log || found=$?
+          if [ "$found" -eq 0 ]; then
+            echo '::error::A link reported LNK4098: objects asking for two different C runtimes. Look for what replaced the workspace link flags in .cargo/config.toml.'
+            exit 1
+          fi
+          if [ "$found" -ne 1 ]; then
+            echo '::error::The build logs could not be searched for LNK4098.'
             exit 1
           fi
           echo 'No link reported LNK4098.'
