@@ -59,7 +59,8 @@
 #     ignore every name, so a renamed heading, an empty section and a pattern moved out of it are
 #     refused. The check runs with no ignore file of the machine and with case-sensitive patterns,
 #     so neither can stand in for a pattern the section lacks. A tracked file that the section's
-#     own patterns match, at any depth, is refused as well.
+#     own patterns match, at any depth, is refused as well, and a negation in the section does
+#     not lift a name out of that: the tracked-file check reads the section without its negations.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
@@ -355,12 +356,13 @@ local_section() {
 }
 
 # Asks `git check-ignore` about each name in `local_names`, created in the clone and removed again,
-# and refuses a tracked file that the section's own patterns match. Git runs with no ignore file of
-# this machine and with case-sensitive patterns, so an ignore rule of the person running the check
-# or a lower-case pattern on a case-insensitive file system cannot stand in for the section.
+# and refuses a tracked file that the section's own patterns match, read without the section's
+# negations. Git runs with no ignore file of this machine and with case-sensitive patterns, so an
+# ignore rule of the person running the check or a lower-case pattern on a case-insensitive file
+# system cannot stand in for the section.
 refuse_ignores() {
   local clone="$1" name path created=() directories=() directory missing=() tracked item section
-  local alone=() unsectioned=0 scratch
+  local alone=() unsectioned=0 scratch ignoring
   local options=(-c core.excludesFile=/dev/null -c core.ignoreCase=false)
   : > "$clone/.git/info/exclude"
   section="$root/local-section.ignore"
@@ -379,9 +381,14 @@ refuse_ignores() {
       fi
     done
   fi
-  # What the commit tracks under a name the section ignores, whatever the depth.
-  if [ -s "$section" ]; then
-    tracked="$(clean git -C "$clone" "${options[@]}" ls-files -c -i -X "$section")"
+  # What the commit tracks under a name the section ignores, whatever the depth. A negation lifts a
+  # name out of the section, and a section can lift one that none of `local_names` is, so the
+  # patterns that ignore are read without the lines that negate: a tracked file that the section's
+  # patterns match is refused whatever a negation says about it.
+  ignoring="$root/local-section-ignoring.ignore"
+  grep -a -v '^!' "$section" > "$ignoring" || true
+  if [ -s "$ignoring" ]; then
+    tracked="$(clean git -C "$clone" "${options[@]}" ls-files -c -i -X "$ignoring")"
   else
     tracked=""
   fi
@@ -829,6 +836,25 @@ self_test() {
     expect "a tracked file the section matches ($name) is refused" refuse \
       "the commit tracks files that the .gitignore's local workspace section matches" --no-steps
   done
+
+  # A negation inside the section for a name that is not one of the probes leaves every probe
+  # ignored, so only the tracked-file check can see what it lets through.
+  directory="$work/ignore-tracked-negated"
+  make_fixture "$directory"
+  printf '!AGENTS-project.md\n' >> "$directory/.gitignore"
+  printf 'notes\n' > "$directory/AGENTS-project.md"
+  commit_fixture "$directory" "Track a file the section's negation lets through"
+  expect "a tracked file that a negation in the section lets through is refused" refuse \
+    "the commit tracks files that the .gitignore's local workspace section matches" --no-steps
+
+  # The same, with a byte in a comment of the section that a text filter treats as the end of text.
+  directory="$work/ignore-tracked-negated-binary"
+  make_fixture "$directory"
+  printf '# a\0 b\n!AGENTS-project.md\n' >> "$directory/.gitignore"
+  printf 'notes\n' > "$directory/AGENTS-project.md"
+  commit_fixture "$directory" "Track a file the section's negation lets through"
+  expect "a negation after a byte that ends text is still not read as lifting a name" refuse \
+    "the commit tracks files that the .gitignore's local workspace section matches" --no-steps
 
   directory="$work/commit-body"
   make_fixture "$directory"
