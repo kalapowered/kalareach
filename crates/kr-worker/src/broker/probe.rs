@@ -129,7 +129,12 @@ pub fn run_within(
     // Ended whatever happened: an application that printed its answer and then kept running is
     // not one this host leaves behind, and what it started goes with it.
     process.end();
-    let _ = reader.join();
+    // Not waited for: a descendant that left the probe's group or job (a Unix process that made a
+    // session of its own) can hold the pipe open, and the launch must not wait on it. The reader
+    // ends by itself when the last holder lets go; where it has already finished it is collected.
+    if reader.is_finished() {
+        let _ = reader.join();
+    }
     match printed {
         Ok(printed) => probe.read_mode(&printed).map_or_else(
             || {
