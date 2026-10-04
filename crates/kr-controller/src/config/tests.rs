@@ -326,8 +326,9 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        6 + configuration::SELECTIONS.len(),
-        "four preferences, two locations and every selection read at the next start"
+        6 + configuration::SELECTIONS.len() + 1,
+        "four preferences, two locations, every selection read at the next start and the agents \
+         the document chooses an ownership profile for"
     );
     for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
@@ -1389,4 +1390,43 @@ fn the_environment_additions_in_force_are_reported_by_name_and_never_by_value() 
     for private in ["planted", "EDITOR", "GOPATH", "/home/someone"] {
         assert!(!exported.contains(private), "{private} left in: {exported}");
     }
+}
+
+/// KR-REQ-07.64: an agent the document chooses reduced ownership for is in the report as a name,
+/// read for the sessions created afterwards; a host with no such choice reports none.
+#[test]
+fn an_agent_chosen_for_reduced_ownership_is_in_the_report_for_new_sessions() {
+    use kr_protocol::broker::AgentOwnership;
+    use kr_protocol::hostinfo::configuration::{AgentChoice, ValueSource};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let row = |report: &EffectiveConfiguration| {
+        report
+            .values
+            .iter()
+            .find(|row| row.key == "agents.ownership")
+            .cloned()
+            .expect("the agents row is always reported")
+    };
+    let none = reported(&environment);
+    assert_eq!(row(&none).value(), "none");
+    assert_eq!(row(&none).source, ValueSource::Default);
+
+    let mut document = ConfigurationDocument::empty();
+    document.agents.insert(
+        "kalareach/codex".to_owned(),
+        AgentChoice {
+            ownership: AgentOwnership::Reduced,
+        },
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&environment),
+        configuration::contents(&document).as_bytes(),
+    )
+    .expect("writes the document");
+    let chosen = reported(&environment);
+    assert_eq!(row(&chosen).value(), "kalareach/codex=reduced");
+    assert_eq!(row(&chosen).source, ValueSource::HostConfiguration);
+    assert_eq!(row(&chosen).effect, ValueEffect::NewSessionsOnly);
 }

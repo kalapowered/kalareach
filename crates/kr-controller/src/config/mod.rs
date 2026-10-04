@@ -572,6 +572,11 @@ pub fn effective(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));
+    // The agents the owner chose an ownership profile for, read for the sessions created next.
+    values.push(configuration::agents_row(
+        resolver.loaded().document.as_ref(),
+        &resolver.document().display().to_string(),
+    ));
     // What the document asks for, narrowed by what this machine allows, and then replaced by the
     // number admission is actually enforcing. The two are the same on an ordinary host; where they
     // differ - an unusable document, or effects that failed - the report prints the one in force
