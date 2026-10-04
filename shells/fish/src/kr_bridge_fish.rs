@@ -917,8 +917,17 @@ fn announce_resumed(reader: &mut Reader<'_>) {
 /// caller of this is. Returns true when the reader must come out of what it is doing: a launch was
 /// accepted, or a cancellation ended the wait.
 pub fn service(reader: &mut Reader<'_>) -> bool {
+    serviced(reader).0
+}
+
+/// [`service`], and whether the worker's retry of a withheld fence was taken by it.
+///
+/// The retry is the worker's wait for the reader's next idle report, which a reader that reports
+/// idle once per wait would never make. It is taken only once the reader's queues are clear, so a
+/// reader still holding input leaves it owed and it is taken the next time the mailbox is read.
+fn serviced(reader: &mut Reader<'_>) -> (bool, bool) {
     if !registered() {
-        return false;
+        return (false, false);
     }
     let retry = with_reader(reader, || {
         // Safety: the reader is parked for the whole of the call, and the core reads its state
@@ -929,13 +938,11 @@ pub fn service(reader: &mut Reader<'_>) -> bool {
         }
     });
     if retry {
-        // The worker holds no fence for this reader and retries at its next idle report. An
-        // exchange that was still open when the reader first reported idle ends withheld, and
-        // that report was dropped with it, so the wait the reader is in has to report again,
-        // now that its queues are clear.
+        // An exchange that was still open when the reader first reported idle ends withheld, and
+        // that report was dropped with it, so the wait the reader is in reports again.
         state().idle_reported = false;
     }
-    settle(reader)
+    (settle(reader), retry)
 }
 
 /// Carries out what reading the mailbox asked the reader to do.
@@ -1020,8 +1027,13 @@ pub fn wait(reader: &mut Reader<'_>) -> bool {
         return false;
     }
     state().in_key_wait = true;
-    let interrupted = service(reader);
+    let (interrupted, retried) = serviced(reader);
     state().in_key_wait = false;
+    if retried && !interrupted {
+        // The reader may be about to block with nothing more to wake it, so the report the
+        // worker's retry waits for goes now rather than at a wait that may not come.
+        before_wait(reader);
+    }
     interrupted
 }
 
