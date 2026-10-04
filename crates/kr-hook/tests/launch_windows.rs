@@ -181,6 +181,7 @@ impl Shell {
                 runtime_dir: placed.host.root().to_path_buf(),
                 sources: Arc::clone(&sources),
                 launcher: Some(placed.forwarder.clone()),
+                registered_forwarder: Some(placed.forwarder.clone()),
             },
             runtime.handle().clone(),
         ));

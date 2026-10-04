@@ -57,6 +57,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_sdk::forwarder;
 use kr_plugin_sdk::matching::MatchRule;
 use kr_plugin_sdk::plugin::{BridgeRemoval, BridgeStep, NativeBridge};
 use kr_plugin_sdk::version::PackageVersion;
@@ -641,6 +642,19 @@ impl NativeBridges {
             .clone()
     }
 
+    /// True unless the journal's release registered a forwarder, and this host now names another.
+    fn names_the_forwarder_it_was_applied_with(&self, journal: &Journal) -> bool {
+        let applied = journal
+            .release
+            .as_ref()
+            .and_then(|release| release.facts.as_ref())
+            .map(|facts| &facts.forwarder);
+        match (applied, self.host.forwarder.as_ref()) {
+            (Some(applied), Some(now)) => applied == now,
+            _ => true,
+        }
+    }
+
     /// True when the journal's release was applied in another directory than the one this host
     /// now keeps its application's plugins in.
     fn moved(&self, journal: &Journal) -> bool {
@@ -660,9 +674,12 @@ impl NativeBridges {
         self.settle(&mut journal)?;
         // What an earlier run left and named, and has gone since, no longer holds anything up.
         let rechecked = self.recheck(&mut journal);
+        // A registration names the forwarder by the path it was written with, so a release applied
+        // with another forwarder is not the release that is wanted: it is taken out and applied
+        // again with the one this host names now.
         let same = wanted.is_some_and(|target| {
             journal.digest() == Some(target.package_digest.to_string().as_str())
-        });
+        }) && self.names_the_forwarder_it_was_applied_with(&journal);
         // A removal an earlier run began is finished, and a release no longer wanted, or applied in
         // a directory this host no longer keeps its application's plugins in, is taken out before
         // another is applied.
@@ -796,7 +813,7 @@ impl NativeBridges {
                      would start a forwarder this host cannot name"
                 )
             })?;
-        let removal = removal_of(recipe)?;
+        let mut removal = removal_of(recipe)?;
         let mut sources = Vec::new();
         for step in &recipe.install {
             if let BridgeStep::InstallFile {
@@ -821,6 +838,23 @@ impl NativeBridges {
         permitted(recipe)?;
         place_is_free(&root, journal, recipe)?;
         let facts = registration(&sources, &forwarder, recipe.application.as_str())?;
+        // What is written is the template with the forwarder's path where the package names the
+        // forwarder, and it is that file's bytes the journal knows the file by from here on: the
+        // recipe's digests name the template, which is what the package's hash signs.
+        let mut written = Vec::new();
+        for (destination, template) in &sources {
+            written.push((
+                destination.clone(),
+                expanded(destination, template, &forwarder)?,
+            ));
+        }
+        for entry in &mut removal {
+            if let Removal::File { path, digest } = entry
+                && let Some((_, bytes)) = written.iter().find(|(named, _)| named == path)
+            {
+                *digest = PayloadDigest::of(bytes).to_string();
+            }
+        }
         // The forwarder a registration starts reports for the application it names, and a
         // launch of this package admits only its own: a registration for another package's
         // application would be a bridge no launch of either could use.
@@ -838,21 +872,17 @@ impl NativeBridges {
         let mut steps = Vec::new();
         for step in &recipe.install {
             match step {
-                BridgeStep::InstallFile {
-                    destination,
-                    digest,
-                    ..
-                } => {
+                BridgeStep::InstallFile { destination, .. } => {
                     let path = destination.to_string();
-                    let digest = digest.to_string();
-                    if file_is_ours(journal, &root, &path, &digest)? {
-                        continue;
-                    }
-                    let bytes = sources
+                    let bytes = written
                         .iter()
                         .find(|(named, _)| *named == path)
                         .map(|(_, bytes)| bytes.clone())
                         .unwrap_or_default();
+                    let digest = PayloadDigest::of(&bytes).to_string();
+                    if file_is_ours(journal, &root, &path, &digest)? {
+                        continue;
+                    }
                     steps.push(Planned::File {
                         path,
                         digest,
@@ -2294,6 +2324,85 @@ fn registration(
     }))
 }
 
+/// A template's bytes with the forwarder's path written where the package names the forwarder, and
+/// checked to say what the package meant.
+///
+/// A template that names no forwarder is returned as it is, so a package that registers the bare
+/// name installs the bytes its recipe names. Otherwise the path is written for where the
+/// placeholder stands (a program started whole, or a line a shell runs), and the result is read
+/// again beside the template: every string of it is the template's, or the template's with the
+/// path in the place the package marked, and the commands a registration runs are the forwarder
+/// and nothing else.
+fn expanded(
+    destination: &str,
+    template: &[u8],
+    forwarder: &Path,
+) -> std::result::Result<Vec<u8>, String> {
+    let Ok(text) = std::str::from_utf8(template) else {
+        return Ok(template.to_vec());
+    };
+    if !forwarder::mentions(text) {
+        return Ok(template.to_vec());
+    }
+    let written = forwarder::expand(text, forwarder)
+        .map_err(|error| format!("{destination} cannot be written with the forwarder: {error}"))?;
+    let path = forwarder
+        .to_str()
+        .ok_or_else(|| "the forwarder's path is not text".to_owned())?;
+    let faithful = match (
+        serde_json::from_str::<serde_json::Value>(text),
+        serde_json::from_str::<serde_json::Value>(&written),
+    ) {
+        (Ok(template), Ok(written)) => says_the_same(&template, &written, path),
+        _ => false,
+    };
+    if !faithful {
+        return Err(format!(
+            "{destination} written with the forwarder does not say what the package meant"
+        ));
+    }
+    Ok(written.into_bytes())
+}
+
+/// Whether `written` is `template` with `forwarder` where a string is, or starts with, the
+/// placeholder, and nothing else changed.
+fn says_the_same(
+    template: &serde_json::Value,
+    written: &serde_json::Value,
+    forwarder: &str,
+) -> bool {
+    use serde_json::Value;
+    match (template, written) {
+        (Value::String(template), Value::String(written)) => {
+            if template == forwarder::PLACEHOLDER {
+                written == forwarder
+            } else if let Some(rest) =
+                template.strip_prefix(&format!("{} ", forwarder::PLACEHOLDER))
+            {
+                *written == format!("{} {rest}", forwarder::posix_word(forwarder))
+            } else {
+                template == written && !forwarder::mentions(template)
+            }
+        }
+        (Value::Array(template), Value::Array(written)) => {
+            template.len() == written.len()
+                && template
+                    .iter()
+                    .zip(written)
+                    .all(|(template, written)| says_the_same(template, written, forwarder))
+        }
+        (Value::Object(template), Value::Object(written)) => {
+            template.len() == written.len()
+                && template.iter().all(|(key, template)| {
+                    written
+                        .get(key)
+                        .is_some_and(|written| says_the_same(template, written, forwarder))
+                })
+        }
+        (template, written) => template == written,
+    }
+}
+
 fn invocations(
     value: &serde_json::Value,
     destination: &str,
@@ -2325,7 +2434,7 @@ fn invocations(
                 {
                     return Err(unaccepted());
                 }
-                let surface = if command == "kr-hook" {
+                let surface = if command == "kr-hook" || command == forwarder::PLACEHOLDER {
                     let arguments = members.get("args").and_then(serde_json::Value::as_array);
                     let words: Vec<&str> = arguments
                         .map(|arguments| {
@@ -2350,10 +2459,14 @@ fn invocations(
                     }
                     let words: Vec<&str> = command.split(' ').collect();
                     match words.as_slice() {
-                        ["kr-hook", application, "hook"] if plain_word(application) => {
+                        ["kr-hook" | forwarder::PLACEHOLDER, application, "hook"]
+                            if plain_word(application) =>
+                        {
                             (*application, BridgeSurface::Hook)
                         }
-                        ["kr-hook", application, "channel"] if plain_word(application) => {
+                        ["kr-hook" | forwarder::PLACEHOLDER, application, "channel"]
+                            if plain_word(application) =>
+                        {
                             (*application, BridgeSurface::Channel)
                         }
                         _ => return Err(unaccepted()),

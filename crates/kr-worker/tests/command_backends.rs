@@ -156,6 +156,7 @@ impl Setup {
             os_user: "someone".to_owned(),
             runtime_dir: runtime.clone(),
             sources,
+            registered_forwarder: Some(launcher.clone()),
             launcher: Some(launcher),
         });
         let backends = CommandBackends::new(
@@ -409,6 +410,7 @@ async fn kr_req_12_07_a_bypassed_invocation_creates_nothing() {
 
     let without_launcher = Setup::with(|config| CommandBackendsConfig {
         launcher: None,
+        registered_forwarder: None,
         ..config
     });
     without_launcher
@@ -434,6 +436,9 @@ async fn a_platform_that_cannot_publish_a_credential_file_establishes_nothing() 
             runtime_dir: setup.runtime.clone(),
             sources: Arc::clone(setup.backends.sources()),
             launcher: Some(setup.directory.join("bin").join(executable_name("kr-hook"))),
+            registered_forwarder: Some(
+                setup.directory.join("bin").join(executable_name("kr-hook")),
+            ),
         },
         tokio::runtime::Handle::current(),
     )
@@ -540,6 +545,9 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
             runtime_dir: setup.runtime.clone(),
             sources: Arc::clone(setup.backends.sources()),
             launcher: Some(setup.directory.join("bin").join(executable_name("kr-hook"))),
+            registered_forwarder: Some(
+                setup.directory.join("bin").join(executable_name("kr-hook")),
+            ),
         },
         tokio::runtime::Handle::current(),
     );

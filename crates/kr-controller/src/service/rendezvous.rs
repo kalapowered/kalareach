@@ -359,7 +359,11 @@ impl Controller {
         let enabled = self.in_force().command_integrations;
         let integrations = Arc::clone(&self.integrations);
         let read = tokio::task::spawn_blocking(move || {
-            crate::catalogue::integrations::fill(&integrations.read(&packages), &enabled)
+            crate::catalogue::integrations::fill(
+                &integrations.read(&packages),
+                &enabled,
+                crate::catalogue::integrations::registered_forwarder().as_deref(),
+            )
         });
         match tokio::time::timeout(WORKER_EXCHANGE, read).await {
             Ok(Ok(fill)) => fill,
