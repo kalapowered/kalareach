@@ -495,3 +495,26 @@ fn the_released_declarations_are_what_a_launch_adds() {
     );
     assert!(qoder.variables.is_empty());
 }
+
+/// KR-REQ-12.20: Gemini CLI's package is not offered on Windows, where Gemini CLI starts a hook
+/// through PowerShell by a bare name and no command route integrates it (its npm shim is a script),
+/// so a host there leaves it out as a package that does not support the operating system and says
+/// that, as it does for any package. The two packages that start the forwarder directly are offered
+/// there, which is the control.
+#[test]
+fn the_released_gemini_cli_package_is_not_offered_on_windows_and_the_others_are() {
+    let platforms = |package: &str| -> Vec<kr_plugin_sdk::matching::OperatingSystem> {
+        let manifest: kr_plugin_sdk::plugin::PluginManifest =
+            serde_json::from_slice(&released(package)).expect("the released manifest reads");
+        manifest
+            .platforms
+            .iter()
+            .map(|platform| platform.os)
+            .collect()
+    };
+    use kr_plugin_sdk::matching::OperatingSystem::{Linux, MacOs, Windows};
+    assert_eq!(platforms("gemini-cli"), [Linux, MacOs]);
+    for package in ["claude-code", "qoder-cli"] {
+        assert!(platforms(package).contains(&Windows), "{package}");
+    }
+}

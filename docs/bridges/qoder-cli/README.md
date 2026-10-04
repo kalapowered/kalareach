@@ -28,10 +28,13 @@ The flags are two elements, placed after the command name and before whatever th
 | `PostToolUseFailure` | 5 seconds |
 | `Notification` | 5 seconds |
 
-Every entry is `kr-hook qoder-cli hook` in exec form, a `command` with its `args`, with no matcher,
-so it runs for every tool, notification and session source. Qoder CLI starts an exec-form hook
-itself, as its own child, with no shell between them; the `qoder` entry point execs `qodercli` in
-place, so the process the worker launched is the one that starts the hooks. That is what lets a
+Every entry runs the forwarder with the arguments `qoder-cli hook` in exec form, a `command` with
+its `args`, with no matcher. The package writes the forwarder as `{kr_hook}`, and the host replaces
+it in the flag with the full path of its `kr-hook`, written as JSON text, before it adds the flag to
+the launch. Qoder CLI therefore starts that file, and not a program of the same name in the folder
+it works in. It runs for every tool, notification and session source. Qoder CLI starts an exec-form
+hook itself, as its own child, with no shell between them; the `qoder` entry point execs `qodercli`
+in place, so the process the worker launched is the one that starts the hooks. That is what lets a
 Qoder CLI hook select the worker's thread.
 
 ## Why these five events
@@ -82,7 +85,7 @@ A package declares these two elements as its command integration's flags, as
 [the plugin reference](../../plugins/README.md#command-integration) describes, and the worker takes
 them only from the verified package. A package that installs no native bridge gets a hook bridge
 for its own application on each integrated launch, on this installation's own `kr-hook`: Qoder CLI
-finds `kr-hook` on the launch's search path, and a hook that runs another copy, or says it is
+starts it by the full path the flag names, and a hook that runs another copy, or says it is
 another application's, is refused at admission.
 The two elements are added together or not at all, so a Qoder CLI command typed with `--settings`
 of its own, as two elements or as `--settings=<file>`, runs as typed, and the shell is told
@@ -96,5 +99,5 @@ a person first trusts a folder reports no start; its later events are reported.
 
 These facts were read from Qoder CLI 1.1.63 with no account signed in: a session starting and
 ending, the hooks' parent and their environment on the binary, the other three events' payloads
-from the vendor's hook reference. The host admits no bridge on Windows, because it writes a
-launch's credential file only on Unix.
+from the vendor's hook reference. On Windows the worker admits a hook by the job the launched
+Qoder CLI was started in, as the Claude Code bridge describes.

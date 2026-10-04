@@ -20,7 +20,7 @@ the user's own Gemini CLI directory, and no settings key:
 | --- | --- |
 | `extensions/kalareach/.gemini-extension-install.json` | The extension's install record: `/dev/null/kalareach` as a `local` source |
 | `extensions/kalareach/gemini-extension.json` | The extension `kalareach`: a name, a version and a description, and nothing it could load |
-| `extensions/kalareach/hooks/hooks.json` | `kr-hook gemini-cli hook` for `SessionStart` and `Notification` with a timeout of 5000 milliseconds, and for `SessionEnd` with 1000 |
+| `extensions/kalareach/hooks/hooks.json` | `{kr_hook} gemini-cli hook` for `SessionStart` and `Notification` with a timeout of 5000 milliseconds, and for `SessionEnd` with 1000 |
 
 Gemini CLI loads every extension in that directory for every project and every later session,
 unless the person disables it, and runs an extension's hooks beside the hooks in the person's own
@@ -54,19 +54,23 @@ without one.
 
 The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
-every hook starts the forwarder's `gemini-cli hook` invocation as a command of plain words, for
+every hook starts the forwarder's `gemini-cli hook` invocation as the placeholder and plain words, for
 exactly the events the forwarder reports, with a timeout its deadline fits inside, and that the
 record names `/dev/null/kalareach` and nothing else.
 
 ## How Gemini CLI starts the forwarder
 
 Gemini CLI runs every hook's command as `bash -c "<command>"`, with the `bash` it finds on the path,
-and gives it Gemini CLI's own environment. Bash runs a command of plain words in its own process,
-so `kr-hook gemini-cli hook` is started by Gemini CLI's process with no shell left between them,
-and it inherits the launch's `KR_REGISTRATION`. Gemini CLI removes variables from a hook's
-environment only where the person switched on its redaction setting, which leaves
-`KR_REGISTRATION` alone, or where `GITHUB_SHA` is set or `SURFACE` is `Github`, which removes it;
-there the forwarder answers `{}` and reports nothing.
+and gives it Gemini CLI's own environment. The package writes the line as `{kr_hook} gemini-cli
+hook`. The host replaces the placeholder with the full path of the forwarder as one word in single
+quotes, an apostrophe in the path written as `'\''`, so bash reads the path as one program however
+many spaces or other characters it holds. Bash runs a command that is one program and its arguments
+in its own process, so the forwarder is started by Gemini CLI's process with no shell left between
+them, and it inherits the launch's `KR_REGISTRATION`. The package is not offered on Windows, where
+Gemini CLI starts a hook through PowerShell and no command route integrates the npm shim. Gemini CLI
+removes variables from a hook's environment only where the person switched on its redaction setting,
+which leaves `KR_REGISTRATION` alone, or where `GITHUB_SHA` is set or `SURFACE` is `Github`, which
+removes it; there the forwarder answers `{}` and reports nothing.
 
 ## Why these three events
 
@@ -122,5 +126,5 @@ about the hooks it ran; the worker's later reports of an ended thread change not
 These facts were read from Gemini CLI 0.60.0 with no account signed in and no model turn. A session
 starting and ending, the hooks' parent and their environment, and the install record with and
 without an allow list and beside a planted update were checked on the binary; the notification and
-tool behaviour comes from the build's own code and the hook reference it ships. The host admits no
-bridge on Windows, because it writes a launch's credential file only on Unix.
+tool behaviour comes from the build's own code and the hook reference it ships. The package is not
+offered on Windows.

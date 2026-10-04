@@ -5140,7 +5140,7 @@ nothing that happens on disk afterwards reaches it.
 Some applications cannot be proxied: they start their extension processes themselves, over their
 own standard streams. For those, a connector package installs a small registration in the
 application's own plugin or hook location, and the application starts the core forwarder, `kr-hook`,
-wherever that registration says. Each forwarder process connects to the launch's endpoint and
+by the full path the host wrote into that registration. Each forwarder process connects to the launch's endpoint and
 declares which bridge it is: the application, and the registration that started it (a `hook` or a
 `channel`).
 
@@ -5198,7 +5198,9 @@ the launcher has said that it started the program, ending the launcher ends noth
 started. A program the launcher runs as typed also gives the launcher its whole 32-bit exit code. If
 anything goes wrong before the commit, the program never ran: the launcher ends it and runs the
 command as typed. A launcher that cannot create its program says why in its frame, and the worker
-keeps the reason on the backend, because no instance exists to keep it.
+keeps the reason on the backend, because no instance exists to keep it. A command typed on Windows
+is looked up by the name the file system gives the program, and a shim as the shell's first hit
+establishes nothing; the Claude Code bridge's documentation has the rules.
 
 A program the integration did not launch is adopted, never given a gateway after the fact. Four
 times a second, while a command has the terminal, the worker reads the terminal's foreground group,
