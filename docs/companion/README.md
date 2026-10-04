@@ -102,6 +102,10 @@ cannot qualify is refused with the host's reason; a stock shell is created only 
 chooses one. The creation sends none of this device's environment: the host decides what the
 session starts with.
 
+Each row in the session list will display the name that has been provided by the host. Until the host provides a name, the session directory name will be displayed instead. A title the host made from the session's metadata will be shown with no label. If the session has been pinned with a name, the name will be displayed next to “Pinned”. If the local model has written a title for the session, it will be displayed next to “Generated”, with the line the model wrote about what the session is doing below it. If that line is out of date, or there is a newer line waiting, a line will be included saying so. For each session listing displayed on screen, and a buffer above and below, the host will be asked for this information, once for each listing. If the user is searching, all session listings will be asked, so that the search can be run against the titles. If a read fails, the row stays as it was.
+
+Setup offers session descriptions from the host's own answer. Initially, the card will display the size of the download, as well as the source of the download. It will also say that no account is needed. Once the user presses the download button, the progress of the download will be shown in the card. If it fails, the reason for failure will be shown. The card also contains a button to cancel the download, a switch to turn session descriptions on or off, and a switch to allow them on battery power. All of these will require the host to perform the action, and the card will display the result given by the host. For example, the host refuses a change made from a paired device, and the card displays the refusal in the host's words.
+
 A draft keeps the conversation it was written for: the agent's instance and the binding revision the
 person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
 is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A draft
