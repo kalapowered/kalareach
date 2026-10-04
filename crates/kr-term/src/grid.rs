@@ -505,6 +505,10 @@ struct PrintOrigin {
     cursor_seqno: usize,
 }
 
+/// What fraction of the historical cache's bound a pass that brings the rows back under it leaves
+/// free, as a divisor: a thirty-second.
+const ROW_CACHE_SLACK_DIVISOR: u64 = 32;
+
 /// A hyperlink as the grid holds it: where it points, and the parameters that tell one link to
 /// that place from another.
 ///
@@ -1188,20 +1192,27 @@ impl CanonicalGrid {
     ///
     /// One pass is enough, and it lands under the bound rather than converging towards it. The row
     /// count kept is read off what the rows cost: the oldest are given up one at a time until what
-    /// is left costs no more than the bound, and the library drops every row past that count. The
-    /// configured scrollback size is put back afterwards, so the history can grow again when the
-    /// rows that arrive next cost less. Working it out from the average cost of a row would leave
-    /// the answer wrong whenever the rows are not all the same size, which is the usual case.
-    /// Nothing is walked and no cell is read: every one of those figures was taken where its row
-    /// left the screen.
+    /// is left costs no more than the bound less a thirty-second of it, and the library drops
+    /// every row past that count. The configured scrollback size is put back
+    /// afterwards, so the history can grow again when the rows that arrive next cost less. Working
+    /// it out from the average cost of a row would leave the answer wrong whenever the rows are not
+    /// all the same size, which is the usual case. Nothing is walked and no cell is read: every one
+    /// of those figures was taken where its row left the screen.
+    ///
+    /// The room left under the bound reduces how often a history that is full needs a pass: with
+    /// the count put back, the next row would otherwise be over the bound again, and a session
+    /// printing steadily would pay for a pass, the library's eviction and a diagnostic on every
+    /// line. Rows that cost more than the room still bring a pass each, and a bound under thirty-two
+    /// bytes leaves none.
     pub fn enforce_row_cache(&mut self, limit: u64) -> bool {
         if self.history.total <= limit {
             return false;
         }
+        let target = limit.saturating_sub(limit / ROW_CACHE_SLACK_DIVISOR);
         let mut remaining = self.history.total;
         let mut given_up = 0usize;
         for charge in &self.history.charges {
-            if remaining <= limit {
+            if remaining <= target {
                 break;
             }
             remaining = remaining.saturating_sub(*charge);
