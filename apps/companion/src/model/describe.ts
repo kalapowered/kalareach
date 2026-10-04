@@ -77,6 +77,13 @@ export function shownTitle(directoryName: string, described: Described | undefin
 /** How many descriptions are read at one time. A list of sessions is short; the bound is the host's. */
 const READS_AT_ONCE = 4
 
+/**
+ * How long before the rows shown are asked about again, in milliseconds: the host's cooldown, under
+ * which it describes no session twice. A row left on a screen is read again at that pace, because a
+ * line that was current when it was read has not stopped being the host's to age.
+ */
+const READ_AGAIN_MS = 30_000
+
 /** How far beyond the edge of the list's screen a row still counts as shown, in pixels: about two rows. */
 const SHOWN_MARGIN_PX = 160
 
@@ -84,6 +91,8 @@ const SHOWN_MARGIN_PX = 160
 interface Reads {
   readonly port: HostPort
   readonly listing: unknown
+  /** How many times the shown rows have been read again since the screen opened. */
+  readonly round: number
   readonly asked: Set<string>
   readonly queue: string[]
   running: number
@@ -110,14 +119,15 @@ function pump(reads: Reads, answered: (sessionId: string, answer: Described) => 
 }
 
 /**
- * Reads the host's description of each session in `wanted`, once for each listing.
+ * Reads the host's description of each session in `wanted`, once for each listing and each round.
  *
  * `wanted` is the sessions a person can see (or is searching among), not every session listed: the
  * host describes what is asked about, and a long list is asked about as it is scrolled. A session
- * is asked about once for a listing, and again when `listing` is a new list, so a row follows what
- * the host has published since the last one. A read that fails leaves its row as it was, because
- * every row has its directory to show. The newest listing is the one whose rows are read: a read
- * begun for an older one, or answering after the screen has gone, changes nothing.
+ * is asked about once for a listing, and again when `listing` is a new list or the host's cooldown
+ * has passed on a screen left open, so a row follows what the host has published since the last
+ * read and says when its line has aged. A read that fails leaves its row as it was, because every
+ * row has its directory to show. The newest reads are the ones whose rows are shown: a read begun
+ * for an older listing, or answering after the screen has gone, changes nothing.
  */
 export function useDescriptions(
   port: HostPort,
@@ -126,13 +136,31 @@ export function useDescriptions(
 ): ReadonlyMap<string, Described> {
   const [described, setDescribed] = useState<ReadonlyMap<string, Described>>(new Map())
   const reads = useRef<Reads | null>(null)
+  const [round, setRound] = useState(0)
   const key = wanted.join(',')
+  const idle = key.length === 0
+
+  // Nothing is read again while no row is wanted.
+  useEffect(() => {
+    if (idle) return undefined
+    const timer = setInterval(() => {
+      setRound((past) => past + 1)
+    }, READ_AGAIN_MS)
+    return () => {
+      clearInterval(timer)
+    }
+  }, [idle])
 
   useEffect(() => {
     let current = reads.current
-    if (current === null || current.port !== port || current.listing !== listing) {
+    if (
+      current === null ||
+      current.port !== port ||
+      current.listing !== listing ||
+      current.round !== round
+    ) {
       if (current !== null) current.live = false
-      current = { port, listing, asked: new Set(), queue: [], running: 0, live: true }
+      current = { port, listing, round, asked: new Set(), queue: [], running: 0, live: true }
       reads.current = current
     }
     for (const sessionId of key.length === 0 ? [] : key.split(',')) {
@@ -143,7 +171,7 @@ export function useDescriptions(
     pump(current, (sessionId, answer) => {
       setDescribed((held) => new Map(held).set(sessionId, answer))
     })
-  }, [port, listing, key])
+  }, [port, listing, round, key])
 
   useEffect(
     () => () => {
