@@ -403,13 +403,16 @@ function Disconnect-KrEndpoint {
     $script:Kr.DetachIds.Clear()
 }
 
+# Sends bytes, waiting for room in the socket until `$DeadlineTick`, a moment on the clock that
+# only goes forward: the time of day can be set while a send waits. A caller that has a budget of
+# its own passes the moment it fixed before it built what it sends, so the building is part of the
+# budget; one that has none gets the default from the moment the send starts.
 function Send-KrBytes {
-    param([byte[]]$Bytes, [uint64]$BudgetMs = 2000)
+    param([byte[]]$Bytes, [uint64]$DeadlineTick = 0)
     $socket = $script:Kr.Socket
     if ($null -eq $socket) { return $false }
     $sent = 0
-    # The clock that only goes forward: the time of day can be set while a send waits for room.
-    $deadline = (Get-KrTickMs) + $BudgetMs
+    $deadline = if ($DeadlineTick -ne 0) { $DeadlineTick } else { (Get-KrTickMs) + 2000 }
     while ($sent -lt $Bytes.Length) {
         try {
             if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
@@ -437,7 +440,7 @@ function Send-KrBytes {
 }
 
 function Send-KrFrame {
-    param($Value, [uint64]$BudgetMs = 2000)
+    param($Value, [uint64]$DeadlineTick = 0)
     $body = ConvertTo-KrCbor $Value
     if ($body.Length -gt $script:KR_MAX_FRAME) { return $false }
     $framed = [byte[]]::new($body.Length + 4)
@@ -446,7 +449,7 @@ function Send-KrFrame {
     $framed[2] = [byte](($body.Length -shr 8) -band 0xFF)
     $framed[3] = [byte]($body.Length -band 0xFF)
     [Array]::Copy($body, 0, $framed, 4, $body.Length)
-    Send-KrBytes $framed $BudgetMs
+    Send-KrBytes $framed $DeadlineTick
 }
 
 # Takes whatever the pipe has already delivered, and leaves one read outstanding for the next.
@@ -573,7 +576,7 @@ function New-KrGesture {
 }
 
 function Send-KrEvent {
-    param([string]$Name, [hashtable]$Payload, [uint64]$BudgetMs = 2000)
+    param([string]$Name, [hashtable]$Payload, [uint64]$DeadlineTick = 0)
     if (-not $script:Kr.Registered) { return }
     $script:Kr.EventCounter++
     $script:Kr.LastEventId = $script:Kr.EventCounter
@@ -582,7 +585,7 @@ function Send-KrEvent {
             id    = $script:Kr.EventCounter
             event = @{ $Name = $Payload }
         }
-    } $BudgetMs | Out-Null
+    } $DeadlineTick | Out-Null
 }
 
 function Send-KrAnswer {
@@ -1233,6 +1236,12 @@ function Read-KrRevocation {
 # the frames already read. Everything else stays where it is, in order, for the reader to take at
 # its next step: a request for the reader, a publication and a detach's answer all belong to a
 # reader, and none is running while a command starts.
+# The identifier a frame names, or nothing when it is not a number.
+function ConvertTo-KrId {
+    param($Value)
+    try { [uint64]$Value } catch { $null }
+}
+
 function Read-KrAnswers {
     $at = 0
     while ($script:Kr.Registered -and ($script:Kr.Incoming.Count - $at) -ge 4) {
@@ -1246,7 +1255,12 @@ function Read-KrAnswers {
         $variant = if ($null -eq $value) { $null } else { Get-KrVariant $value }
         $taken = $false
         if ($null -ne $variant -and $variant.Name -eq 'event_result' -and $variant.Payload -is [hashtable]) {
-            $id = [uint64]$variant.Payload['id']
+            $id = ConvertTo-KrId $variant.Payload['id']
+            if ($null -eq $id) {
+                # A frame the worker does not send: the endpoint is not one to go on reading.
+                Disconnect-KrEndpoint
+                return
+            }
             if (($id -eq $script:Kr.AcceptId -and -not $script:Kr.AcceptAnswered) -or
                 ($id -eq $script:Kr.ResolveId -and -not $script:Kr.ResolveAnswered)) {
                 Read-KrEventResult $id $variant.Payload['result']
@@ -1347,7 +1361,6 @@ function Invoke-KrAskResolve {
     }
     # One monotonic budget covers the send and the wait.
     $deadline = (Get-KrTickMs) + $BudgetMs
-    $sendBudget = [uint64][Math]::Max([int64]0, [int64]$deadline - [int64](Get-KrTickMs))
     Send-KrEvent 'command_resolve' @{
         cwd               = $Cwd
         argv              = [string[]]@($Argv)
@@ -1356,7 +1369,7 @@ function Invoke-KrAskResolve {
         interactive       = $true
         cwd_revision      = $CwdRevision
         prompt_generation = $PromptGeneration
-    } $sendBudget
+    } $deadline
     if (-not $script:Kr.Registered) { return $null }
     $script:Kr.ResolveId = $script:Kr.LastEventId
     $script:Kr.ResolveAnswered = $false
@@ -1379,7 +1392,7 @@ function Invoke-KrFrame {
         'fence_published' { Read-KrPublication $variant.Payload; return }
         'launch_revoked' { Read-KrRevocation $variant.Payload; return }
         'event_result' {
-            $answered = try { [uint64]$variant.Payload['id'] } catch { $null }
+            $answered = ConvertTo-KrId $variant.Payload['id']
             if ($null -eq $answered) { Disconnect-KrEndpoint; return }
             Read-KrEventResult $answered $variant.Payload['result']
             return
