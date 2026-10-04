@@ -6,6 +6,11 @@ name: windows-link-evidence
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - 'task/**'
+    paths:
+      - '.github/workflows/windows-link-evidence.yml'
 
 permissions:
   contents: read

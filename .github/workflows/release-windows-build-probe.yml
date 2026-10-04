@@ -23,6 +23,11 @@ on:
         required: false
         default: ''
         type: string
+  push:
+    branches:
+      - 'task/**'
+    paths:
+      - '.github/workflows/release-windows-build-probe.yml'
 
 # `id-token: write` is what lets the runner ask GitHub for the token Entra exchanges; it grants
 # nothing in this repository. Everything else reads.
