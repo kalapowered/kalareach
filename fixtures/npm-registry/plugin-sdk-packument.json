@@ -1,0 +1,117 @@
+{
+  "_id": "@kalareach/plugin-sdk",
+  "_rev": "2-c3b97a643072db32f4dc3cbee1c46512",
+  "name": "@kalareach/plugin-sdk",
+  "dist-tags": {
+    "latest": "0.0.0"
+  },
+  "versions": {
+    "0.0.0-stage": {
+      "name": "@kalareach/plugin-sdk",
+      "version": "0.0.0-stage",
+      "_id": "@kalareach/plugin-sdk@0.0.0-stage",
+      "stub": true,
+      "maintainers": [
+        {
+          "name": "kalapowered",
+          "email": "devops@kala.to"
+        }
+      ],
+      "dist": {
+        "shasum": "fa6ccc5d3a2e722200b00de15fb4fad4ae1efe1b",
+        "tarball": "https://registry.npmjs.org/@kalareach/plugin-sdk/-/plugin-sdk-0.0.0-stage.tgz",
+        "fileCount": 2,
+        "integrity": "sha512-62FEeoG3S+cqZFB7fswteuA2/gY3HqkEd3AoYqPOvwaFPqxAyIomEZ9q9DnazcW48KqK/QVDPlaiESHzqWrFPQ==",
+        "signatures": [
+          {
+            "sig": "MEUCIGtowZil9OcZsgXhMcCzYW3ATam0GmUH0ST3EX1rWVxNAiEA5rn+5P5kocKBnON/2Bux7gsZ1BVWepyFOqQgXzV9tiU=",
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+          }
+        ],
+        "unpackedSize": 343
+      },
+      "_npmUser": {
+        "name": "kalapowered",
+        "email": "devops@kala.to"
+      },
+      "description": "Temporary package placeholder for staged publishing",
+      "directories": {}
+    },
+    "0.0.0": {
+      "_id": "@kalareach/plugin-sdk@0.0.0",
+      "bugs": {
+        "url": "https://github.com/kalapowered/kalareach/issues"
+      },
+      "dist": {
+        "shasum": "dbc6f0cba0aee9306c941ace8d60ad0f563c47e0",
+        "tarball": "https://registry.npmjs.org/@kalareach/plugin-sdk/-/plugin-sdk-0.0.0.tgz",
+        "fileCount": 2,
+        "integrity": "sha512-FA/76ZWQ67OdS4Mra6fpPbnhWY+DwK+sgxAvRrxZZxCkHex2K59xhnFTWfxWHJoESK1TXFD/wec1j2rwjWiieQ==",
+        "signatures": [
+          {
+            "sig": "MEUCIQCAkxeCmUgBHw0LyQDjfvD8YQVy3sfeBHRyIu5Ns4GQMQIgCgnN8Nt9HX8/4jgVCW4Yd+O1Q+HnCY7OUouuW3wwbdU=",
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+          },
+          {
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+            "sig": "MEYCIQCO5ArOmIneN8uTkzKBVf+8E2zq2zgMX4Uc6mWq+7AzNgIhANnISS1R9SyGF2oih07FOzWmXHpRdKSmLvI3RRmZ2kpp"
+          }
+        ],
+        "unpackedSize": 606
+      },
+      "name": "@kalareach/plugin-sdk",
+      "license": "BSD-3-Clause",
+      "version": "0.0.0",
+      "_npmUser": {
+        "name": "kalapowered",
+        "email": "devops@kala.to"
+      },
+      "homepage": "https://github.com/kalapowered/kalareach#readme",
+      "repository": {
+        "url": "git+https://github.com/kalapowered/kalareach.git",
+        "type": "git",
+        "directory": "packages/plugin-sdk"
+      },
+      "_npmVersion": "10.9.8",
+      "description": "Placeholder. The KalaReach plugin SDK is published from kalapowered/kalareach by its release workflow, with provenance.",
+      "directories": {},
+      "maintainers": [
+        {
+          "name": "kalapowered",
+          "email": "devops@kala.to"
+        }
+      ],
+      "_nodeVersion": "22.23.2",
+      "_hasShrinkwrap": false,
+      "_npmOperationalInternal": {
+        "host": "s3://npm-registry-packages-npm-production",
+        "tmp": "tmp/plugin-sdk_0.0.0_1791125492387_0.7978546871437568"
+      }
+    }
+  },
+  "time": {
+    "created": "2026-10-04T14:48:55.223Z",
+    "modified": "2026-10-04T14:51:32.695Z",
+    "0.0.0-stage": "2026-10-04T14:48:55.223Z",
+    "0.0.0": "2026-10-04T14:51:32.484Z"
+  },
+  "description": "Placeholder. The KalaReach plugin SDK is published from kalapowered/kalareach by its release workflow, with provenance.",
+  "maintainers": [
+    {
+      "name": "kalapowered",
+      "email": "devops@kala.to"
+    }
+  ],
+  "readme": "# @kalareach/plugin-sdk\n\nPlaceholder release. The KalaReach plugin SDK is published from https://github.com/kalapowered/kalareach by its release workflow, with provenance. Use a version above 0.0.0.\n",
+  "readmeFilename": "README.md",
+  "homepage": "https://github.com/kalapowered/kalareach#readme",
+  "repository": {
+    "url": "git+https://github.com/kalapowered/kalareach.git",
+    "type": "git",
+    "directory": "packages/plugin-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/kalapowered/kalareach/issues"
+  },
+  "license": "BSD-3-Clause"
+}
