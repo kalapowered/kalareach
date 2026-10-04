@@ -529,12 +529,16 @@ impl Engine {
             } else {
                 Vec::new()
             };
-            let before_the_cursor_moves =
-                (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out());
+            let before_the_cursor_moves = if cursor_moves.is_empty() {
+                (false, false)
+            } else {
+                (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out())
+            };
             // The library returns to the primary buffer on a soft reset, and a terminal stays in
             // the alternate one. A direct terminal reading the same bytes would be showing a
             // different buffer from the canonical grid from here on, so the attachment projects.
-            if decision.apply_to_grid && is_soft_reset(&event.kind) && self.grid.alternate_active()
+            // The buffer is asked first because it is a flag, and reading the sequence is not.
+            if decision.apply_to_grid && self.grid.alternate_active() && is_soft_reset(&event.kind)
             {
                 disposition = DirectDisposition::RequireProjection;
             }
