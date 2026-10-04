@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { SessionDescribeResult } from '@kalareach/protocol'
+import type { SessionDescribeResult, SessionListResult } from '@kalareach/protocol'
 
 import { readOnCadence, type Cadence } from '../app/cadence'
 import { ask } from '../mobile/model/call'
@@ -62,6 +62,16 @@ export function freshnessNote(described: Described | undefined): string | null {
     default:
       return null
   }
+}
+
+/**
+ * The application in the foreground of a session, in words: a root shell at its prompt is the
+ * shell, and anything else the host reports is an agent.
+ */
+export function applicationName(session: SessionListResult['sessions'][number]): 'Shell' | 'Agent' {
+  return session.application_state === null || session.application_state === 'shell_ready'
+    ? 'Shell'
+    : 'Agent'
 }
 
 /** A directory's own name: its last component, which every host can say of a session. */
