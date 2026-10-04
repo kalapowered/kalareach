@@ -539,6 +539,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows_inheritance
 
+      # A vendor's own sandbox under the session's job. A sandbox that nests a job of its own, limited
+      # in processes, memory and the user interface, launches under the session's job, a try at breaking
+      # away is refused, and the closure ends every process the vendor made and reads its coverage as
+      # complete. Under a session job that restricts desktops the launch is refused by name and starts
+      # nothing; the profile the configuration selected for that agent starts it in a job of its own,
+      # ended by the closure and by a worker that dies, and its coverage never reads complete.
+      - name: Test a vendor's own sandbox under the session's job
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test windows_vendor
+
       # The backends an integrated invocation is given before it runs, on this platform: a launch's
       # endpoint and credential exist before the answer, a bypass creates nothing, and each session
       # has a root of its own. The launcher against them is run by the forwarder's suite, above.

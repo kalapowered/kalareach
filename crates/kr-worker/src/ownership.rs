@@ -12,7 +12,13 @@
 //! | --- | --- | --- |
 //! | A Linux control group the worker created | every descendant, including one that changed session | complete |
 //! | A Windows job object | every descendant, including one that detached | complete |
+//! | A Windows job object, and an agent in a job of its own | the agent's descendants, tracked by start identity | incomplete |
 //! | The terminal's process group | everything that stayed in the group | incomplete |
+//!
+//! The third row exists only where it was explicitly selected. An agent whose own sandbox cannot
+//! run under the session's job is launched in a kill-on-close job of its own, listed beside the
+//! session's, and the closure reads what both hold and ends both; it never reads complete, because
+//! the second job is not the one a session's closure rests on.
 //!
 //! On a Unix host without a delegated control group, the last row is read in one of two ways. On
 //! Linux the worker is the child subreaper, so a process whose parent exits becomes the worker's
@@ -211,25 +217,46 @@ impl OwnedProcesses {
             ));
             return false;
         };
+        self.note_reduced_agents(&job);
+        let mut empty = true;
         match job.process_ids() {
+            Ok(held) if held.is_empty() => {}
             Ok(held) => {
-                if held.is_empty() {
-                    return true;
-                }
                 self.note_unestablished(format!(
                     "the session's job object still held {} process(es) when the closure was \
                      written",
                     held.len()
                 ));
-                false
+                empty = false;
             }
             Err(error) => {
                 self.note_unestablished(format!(
                     "the session's job object would not say what was left in it: {error}"
                 ));
-                false
+                empty = false;
             }
         }
+        for agent in job.reduced_agents() {
+            match agent.process_ids() {
+                Ok(held) if held.is_empty() => {}
+                Ok(held) => {
+                    self.note_unestablished(format!(
+                        "the job of an agent that ran under reduced ownership still held {} \
+                         process(es) when the closure was written",
+                        held.len()
+                    ));
+                    empty = false;
+                }
+                Err(error) => {
+                    self.note_unestablished(format!(
+                        "the job of an agent that ran under reduced ownership would not say what \
+                         was left in it: {error}"
+                    ));
+                    empty = false;
+                }
+            }
+        }
+        empty
     }
 
     /// Asks the boundary itself whether it is holding anything.
@@ -360,15 +387,25 @@ impl OwnedProcesses {
             ));
             return;
         };
-        let members = match job.process_ids() {
+        self.note_reduced_agents(&job);
+        let mut members = match job.process_ids() {
             Ok(members) => members,
             Err(error) => {
                 self.note_unestablished(format!(
                     "the session's job object would not say which processes it holds: {error}"
                 ));
-                return;
+                Vec::new()
             }
         };
+        for agent in job.reduced_agents() {
+            match agent.process_ids() {
+                Ok(held) => members.extend(held),
+                Err(error) => self.note_unestablished(format!(
+                    "the job of an agent that ran under reduced ownership would not say which \
+                     processes it holds: {error}"
+                )),
+            }
+        }
         let mut unreadable = 0_usize;
         for pid in members {
             // Asked about every time, not only the first: an identifier the record already holds
@@ -391,6 +428,23 @@ impl OwnedProcesses {
                 "the session's job object holds {unreadable} process(es) this host could not \
                  describe, so they are not in the record"
             ));
+        }
+    }
+
+    /// Records that an agent of this session ran under the reduced-ownership profile, which keeps
+    /// the closure's coverage incomplete for as long as the session has one.
+    ///
+    /// The agent's processes are still read by start identity and still ended, but they were not
+    /// held by the session's job, and a closure that counted them as covered by it would be
+    /// claiming a boundary it did not have.
+    #[cfg(windows)]
+    fn note_reduced_agents(&self, job: &crate::windows::job::SessionJob) {
+        if !job.reduced_agents().is_empty() {
+            self.note_unestablished(
+                "an agent of this session ran under an explicitly selected reduced-ownership \
+                 profile: its processes were tracked by start identity in a job of their own and \
+                 not held by the session's job, so they are not counted as covered by it",
+            );
         }
     }
 
@@ -537,10 +591,12 @@ impl OwnedProcesses {
 /// failing is a named launch failure rather than a session with less.
 ///
 /// Section 7's other permitted outcome, an **explicitly selected** reduced-ownership execution
-/// profile, is not something this build offers: nothing selects one, so nothing returns one, and
-/// no session is quietly given one instead of the boundary it asked for. Where the job later stops
-/// answering, that is recorded as something this host could not establish, which keeps the
-/// closure's coverage incomplete and puts the reason in its receipt.
+/// profile, is an agent's and not a session's: no session is quietly given one instead of the
+/// boundary it asked for, and an agent runs under one only where the configuration names its
+/// package. The session's boundary is the job either way, and an agent under the profile is
+/// recorded on it, which keeps the closure's coverage incomplete and puts the reason in its
+/// receipt. Where the job later stops answering, that is recorded as something this host could not
+/// establish, with the same consequence.
 #[cfg(windows)]
 #[must_use]
 pub fn boundary_for(_group: Option<i32>, root: &ProcessStartIdentity) -> OwnershipBoundary {
@@ -648,6 +704,16 @@ pub fn force_stop(owned: &OwnedProcesses) {
                     owned.note_unestablished(format!(
                         "the session's job object refused to end what it holds: {error}"
                     ));
+                }
+                // An agent that ran under reduced ownership is in a job of its own, which the
+                // session's does not reach.
+                for agent in job.reduced_agents() {
+                    if let Err(error) = agent.terminate(1) {
+                        owned.note_unestablished(format!(
+                            "the job of an agent that ran under reduced ownership refused to end \
+                             what it holds: {error}"
+                        ));
+                    }
                 }
             }
             None => owned.note_unestablished(format!(
