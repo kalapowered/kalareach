@@ -18,11 +18,13 @@
  * know one was granted without performing the operation it guards. Both sentences are on the
  * screen.
  *
- * And nothing here is a switch that does something on the person's behalf. Every control either
- * reads, or opens a settings pane, or records a choice for the installation to act on.
+ * And nothing here does something on the person's behalf that they did not press. Every control
+ * either reads, or opens a settings pane, or records a choice for the installation to act on, or
+ * (on the descriptions card) asks the host to change a setting or start or stop a fetch and then
+ * shows what the host says it did.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach/protocol'
 
@@ -933,20 +935,7 @@ function HostStep({
  * address: the host selected the one profile it would fetch, and says where it would fetch it from.
  */
 function DescriptionsCard({ descriptions }: { readonly descriptions: DescriptionSetupState }): ReactNode {
-  const { setup, failure, refusal, busy } = descriptions
-  // Pressing the fetch's button replaces it with the button for what it started. A person on the
-  // keyboard, or with a screen reader, is left where the press was: on the new button, not the page.
-  const footer = useRef<HTMLElement>(null)
-  const pressedFetch = useRef(false)
-  useEffect(() => {
-    if (!pressedFetch.current || busy) return
-    pressedFetch.current = false
-    if (document.activeElement === document.body) footer.current?.querySelector('button')?.focus()
-  }, [busy])
-  const askFetch = (action: 'start' | 'cancel'): void => {
-    pressedFetch.current = true
-    descriptions.download(action)
-  }
+  const { setup, failure, refusal } = descriptions
   const status = setup === null ? null : statusOf(setup)
   const fraction = setup === null ? null : fetchedFraction(setup)
   const canStart =
@@ -955,6 +944,19 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
     (setup.download === 'not_started' ||
       setup.download === 'cancelled' ||
       setup.download === 'failed')
+  // One button for the fetch, whichever way it can go: starting it, or stopping it. The same
+  // element stays in the footer as its words change, so a person on it, by keyboard or screen
+  // reader, is still on it when the host's answer changes what it does, or the fetch ends.
+  const fetchButton =
+    setup?.can_cancel === true
+      ? ({ action: 'cancel', label: 'Cancel the download', testId: 'setup-model-cancel' } as const)
+      : canStart
+        ? ({
+            action: 'start',
+            label: setup.download === 'failed' ? 'Try the download again' : 'Download it',
+            testId: 'setup-model-download'
+          } as const)
+        : null
   return (
     <Card data-testid="setup-model">
       <header className="card-header">
@@ -975,7 +977,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           named by its directory.
         </p>
         {setup === null ? (
-          <p className="faint small" data-testid="setup-model-unread" role={failure ? 'alert' : undefined}>
+          <p className="faint small" data-testid="setup-model-unread" role="status">
             {failure
               ? `What this host offers could not be read. ${failure}`
               : 'Reading what this host offers…'}
@@ -1033,7 +1035,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             <Switch
               checked={setup.enabled}
               label="Describe my sessions"
-              disabled={busy || (setup.enabled && !setup.can_disable)}
+              disabled={setup.enabled && !setup.can_disable}
               onChange={descriptions.enable}
             />
           </label>
@@ -1042,39 +1044,26 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             <Switch
               checked={setup.on_battery}
               label="Keep going on battery power"
-              disabled={busy}
               onChange={descriptions.onBattery}
             />
           </label>
         </div>
       ) : null}
-      <footer className="card-footer setup-route" ref={footer}>
+      <footer className="card-footer setup-route">
         {setup === null ? (
-          <Button data-testid="setup-model-retry" disabled={busy} onClick={descriptions.reload}>
+          <Button data-testid="setup-model-retry" onClick={descriptions.reload}>
             Ask again
           </Button>
         ) : null}
-        {setup?.can_cancel ? (
+        {fetchButton ? (
           <Button
-            data-testid="setup-model-cancel"
-            disabled={busy}
+            tone={fetchButton.action === 'start' ? 'primary' : 'default'}
+            data-testid={fetchButton.testId}
             onClick={() => {
-              askFetch('cancel')
+              descriptions.download(fetchButton.action)
             }}
           >
-            Cancel the download
-          </Button>
-        ) : null}
-        {canStart ? (
-          <Button
-            tone="primary"
-            data-testid="setup-model-download"
-            disabled={busy}
-            onClick={() => {
-              askFetch('start')
-            }}
-          >
-            {setup.download === 'failed' ? 'Try the download again' : 'Download it'}
+            {fetchButton.label}
           </Button>
         ) : null}
       </footer>

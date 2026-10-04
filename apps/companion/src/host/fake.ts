@@ -710,12 +710,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   }
   let pairedDevice = false
   /** The two writes of description setup are the host's own to make: a paired device is refused. */
-  const requireLocalSocket = () => {
+  const requireLocalSocket = (change: 'a setting' | 'the download') => {
     requireOwner()
     if (pairedDevice) {
       refuse(
         'PERMISSION_DENIED',
-        'Session description settings are changed at the host itself, not from a paired device.'
+        `Session descriptions are set up at the host itself: ${change} is not changed from a paired device.`
       )
     }
   }
@@ -853,7 +853,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         return { ...descriptionSetup }
       }),
     descriptionConfigure: (params) => {
-      requireLocalSocket()
+      requireLocalSocket('a setting')
       descriptionConfigures.push(params)
       const was = descriptionSetup.enabled
       const enabled = params.enabled ?? descriptionSetup.enabled
@@ -870,7 +870,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return settledSetup()
     },
     descriptionDownload: (params) => {
-      requireLocalSocket()
+      requireLocalSocket('the download')
       descriptionDownloads.push(params)
       if (params.action === 'start') {
         if (!descriptionSetup.offered) {

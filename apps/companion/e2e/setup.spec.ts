@@ -217,22 +217,60 @@ test.describe('the first-start assistant', () => {
     await capture(page, 'setup-host-03.28')
   })
 
-  // KR-REQ-22.01, KR-REQ-13.19: the session descriptions card names each control, and a press on
-  // the fetch's button with the keyboard leaves focus on the button that replaces it, so a person
-  // is not put back at the top of the page after each press.
-  test('names the descriptions card’s controls and keeps focus on the fetch button that replaces the one pressed', async ({
+  // KR-REQ-22.01, KR-REQ-13.19: the session descriptions card names each control, and a person on
+  // the keyboard stays on the control they are on: while the host answers a press, while the card
+  // follows a fetch that is running, and when the fetch's button changes what it does.
+  test('names the descriptions card’s controls and keeps focus where the person is while the host answers', async ({
     page
   }) => {
     await openSetup(page)
     await step(page, 'host')
     const card = page.getByTestId('setup-model')
-    await expect(card.getByRole('switch', { name: 'Describe my sessions' })).toBeVisible()
+    const enable = card.getByRole('switch', { name: 'Describe my sessions' })
+    await expect(enable).toBeVisible()
     await expect(card.getByRole('switch', { name: 'Keep going on battery power' })).toBeVisible()
 
-    await card.getByRole('button', { name: 'Download it' }).focus()
+    // The host's answers are held, as a slow host's are, and counted by the page's own reads.
+    type Held = { readonly count: number; release(): void }
+    const held = (): Promise<number> =>
+      page.evaluate(() => (window as unknown as { held?: Held }).held?.count ?? 0)
+    const hold = (): Promise<void> =>
+      page.evaluate(() => {
+        ;(window as unknown as { held?: Held }).held = window.krTestHost?.hold('descriptionSetup')
+      })
+    const release = (): Promise<void> =>
+      page.evaluate(() => {
+        ;(window as unknown as { held?: Held }).held?.release()
+      })
+
+    // A switch pressed from the keyboard is still the focused control while the host has not yet
+    // answered the read that follows the change, and after it has.
+    await enable.focus()
+    await hold()
+    await page.keyboard.press('Space')
+    await expect.poll(held).toBeGreaterThan(0)
+    await expect(enable).toBeFocused()
+    await expect(enable).toBeEnabled()
+    await expect(enable).not.toHaveAttribute('aria-disabled', 'true')
+    await release()
+    await expect(enable).toHaveAttribute('aria-checked', 'true')
+    await expect(enable).toBeFocused()
+
+    // The fetch's one button becomes the one that stops it, with the person still on it.
+    const fetch = card.getByTestId('setup-model-download')
+    await fetch.focus()
     await page.keyboard.press('Enter')
     await expect(card.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
-    await expect(card.getByRole('button', { name: 'Cancel the download' })).toBeFocused()
+    const cancel = card.getByRole('button', { name: 'Cancel the download' })
+    await expect(cancel).toBeFocused()
+
+    // While the card follows the fetch, each read of its progress leaves the button usable.
+    await hold()
+    await expect.poll(held).toBeGreaterThan(0)
+    await expect(cancel).toBeEnabled()
+    await expect(cancel).not.toHaveAttribute('aria-disabled', 'true')
+    await expect(cancel).toBeFocused()
+    await release()
 
     await page.keyboard.press('Enter')
     await expect(card.getByRole('button', { name: 'Download it' })).toBeFocused()

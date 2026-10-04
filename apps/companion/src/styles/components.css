@@ -435,6 +435,12 @@ main {
   inset: calc((18px - var(--target)) / 2) calc((32px - var(--target)) / 2);
 }
 
+/* A switch that cannot be changed now stays on the keyboard's path, so it can be found and read. */
+.switch-control[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .switch-control[aria-checked='true'] {
   background: var(--accent);
   border-color: var(--accent);

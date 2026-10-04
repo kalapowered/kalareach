@@ -186,7 +186,7 @@ describe('the setup card for session descriptions', () => {
     await person.click(screen.getByRole('switch', { name: 'Describe my sessions' }))
     await waitFor(() => {
       expect(screen.getByTestId('setup-model-refused')).toHaveTextContent(
-        'changed at the host itself, not from a paired device'
+        'a setting is not changed from a paired device'
       )
     })
     expect(screen.getByRole('switch', { name: 'Describe my sessions' })).toHaveAttribute(
@@ -197,7 +197,7 @@ describe('the setup card for session descriptions', () => {
     await person.click(screen.getByTestId('setup-model-download'))
     await waitFor(() => {
       expect(screen.getByTestId('setup-model-refused')).toHaveTextContent(
-        'changed at the host itself, not from a paired device'
+        'the download is not changed from a paired device'
       )
     })
     expect(screen.getByTestId('setup-model-download')).toBeEnabled()
