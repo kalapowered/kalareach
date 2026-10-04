@@ -1,10 +1,12 @@
 //! The credential every managed-service method authenticates with (sections 16, 17, 23).
 //!
 //! The `Services` group of section 23 is the whole of what a native installation asks a managed
-//! service for: push registration and sender credentials, mailbox reads, authority synchronisation,
-//! settings exchange and backup manifests. None of them needs an account. What each one needs is
-//! proof that the caller holds the private half of one device authorisation key, and that the
-//! request in front of the service is the request that key signed.
+//! service for: push registration and sender credentials, the mailbox, authority synchronisation,
+//! settings exchange, backup manifests and managed storage. The storage methods carry an account
+//! token beside the service credential, as do some requests of two others: a backup generation's
+//! publication and the recovery bundle's. What the credential proves is that the caller holds the
+//! private half of one device authorisation key, and that the request in front of the service is
+//! the request that key signed.
 //!
 //! That is one problem, so it has one answer here rather than one per service. A later service
 //! adds a method to the registry and reuses [`ServiceRequestSignature`]; it does not invent a
@@ -20,7 +22,7 @@
 //! | --- | --- |
 //! | `gateway_origin` | A signature made for one deployment replayed against another |
 //! | `method` | A signature for a read presented as the authorisation for a write |
-//! | `nonce` | The same signed request accepted twice |
+//! | `nonce` | The same signed request taking effect twice |
 //! | `signed_at_ms` | A captured request held and presented much later |
 //! | `body_digest` | The body swapped for another under a signature that still verifies |
 //!
