@@ -154,6 +154,41 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     }
   }
 
+  // The host's own words are the row's text, and a title or a line can hold a long word: at the
+  // largest size on the narrowest screen each line of a described row stays inside the row.
+  for (const surface of ['ios', 'android'] as const) {
+    test(`keeps what the host says about a session inside its row on ${surface}`, async ({ page }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.addInitScript((id) => {
+        let held: Window['krTestHost']
+        Object.defineProperty(window, 'krTestHost', {
+          configurable: true,
+          get: () => held,
+          set: (controls: Window['krTestHost']) => {
+            held = controls
+            controls?.describe(id, {
+              title: 'Pairing-code-entry-and-host-approval-flow',
+              source: 'generated',
+              activity_text: 'Checks/the/code-entry/flow/and/host/approval/screen',
+              freshness: 'stale'
+            })
+          }
+        })
+      }, SESSION)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+      const row = page.locator(`.m-row[data-session="${SESSION}"]`)
+      await expect(row.getByTestId('description-freshness')).toBeVisible()
+      const outside = await row.evaluate((element) => {
+        const edge = element.getBoundingClientRect().right
+        return [...element.querySelectorAll('span')]
+          .filter((span) => span.getBoundingClientRect().right > edge + 0.5)
+          .map((span) => span.textContent?.slice(0, 40) ?? '')
+      })
+      expect(outside, 'lines of the row that run past its edge').toEqual([])
+    })
+  }
+
   // With the text at its largest, Send beside the message field would leave the field a few letters
   // wide: Send goes on a row of its own instead, and the field keeps room to type in.
   for (const surface of ['ios', 'android'] as const) {

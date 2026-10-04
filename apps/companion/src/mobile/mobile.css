@@ -450,8 +450,13 @@
   color: var(--muted);
 }
 
-/* A path or a command is one long word: it breaks where the row ends rather than run past it. */
+/*
+ * A path, a command or a title is one long word: it breaks where the row ends rather than run
+ * past it. The row is one column as wide as its longest word, so each line of it needs this.
+ */
 .m-row-title,
+.m-row-description,
+.m-row-activity,
 .m-row-where,
 .m-row-detail {
   overflow-wrap: anywhere;
