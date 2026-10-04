@@ -3,8 +3,8 @@
 `@kalareach/protocol` and `@kalareach/plugin-sdk` are generated from the Rust types in this
 repository and published as immutable archives attached to a GitHub release. A consumer pins one
 archive by its URL and its integrity, so its lockfile records exactly which bytes it installs and
-where they came from. There is no registry entry, no path dependency on a neighbouring checkout and
-no Git dependency on a branch. The archives are public downloads, so installing a consumer needs no
+where they came from. A pin is never a registry entry, a path dependency on a neighbouring checkout
+or a Git dependency on a branch. The archives are public downloads, so installing a consumer needs no
 credential for this repository.
 
 What these digests establish is byte integrity: that an archive is the one the release published.
@@ -108,6 +108,107 @@ it is, and a mistake is corrected by releasing a new commit under its own tag. A
 before publishing is the other case: it leaves a draft, and once that draft is deleted the same tag
 can be released again by re-running the run that failed, because pushing a tag that is already on
 the remote produces no event at all.
+
+## Publishing the plugin SDK to the npm registry
+
+Publishing to the npm registry happens at the same time that archives are published, and is
+triggered by the same tag. The workflow `.github/workflows/package-npm.yml` is triggered by a tag of
+the form `packages/v*`, the same as for the release, and so it will run alongside the release
+workflow. It publishes the plugin SDK archive that the release workflow attached to the release,
+rather than building a second one. Only the plugin SDK is published, as `@kalareach/plugin-sdk`; the
+protocol package is not published to the npm registry. A consumer that pins the release URL, as
+described below, still takes its archive from GitHub.
+
+The `package-npm` workflow has two jobs, `check` and `publish`. The `check` job fetches the plugin
+SDK archive and `SHA512SUMS` file from the release, and performs a number of checks. Because the
+release workflow will be running at the same time, and the release may not be published yet, the job
+will wait up to 50 minutes for the release to become available. The job requires the release to be
+immutable. The checks confirm that the archive in the release matches the hash listed in
+`SHA512SUMS`, and that it matches an archive created by `npm pack` from the same commit. It also
+uses `npm publish --dry-run` to confirm that the archive would be publishable to the npm registry.
+Finally, it records the sha512 of the archive so that it can be checked again in the `publish` job.
+The `publish` job will only run if the `check` job is successful, and it will wait until someone has
+approved the deployment. It downloads the release again, and refuses any archive whose sha512 is not
+the recorded value. It then publishes the archive to the npm registry, using
+`npm publish --provenance --access public` to attach provenance information identifying the
+workflow and the commit from which it was published. It authenticates to the npm registry using the
+workflow's own identity, via OpenID Connect, so this repository holds no npm token.
+
+It is possible to run the workflow on a branch to test the `check` job. In that case, it will not
+use an archive from a release, but will use the `scripts/release-packages.sh` script to pack the
+checked-out commit, and then run the same checks and the dry run. The `publish` job will fail, due
+to the deployment policy on the environment it uses, but it will not run any of its steps, so will
+not publish anything.
+
+### The `npm-publish` environment
+
+The `publish` job uses the `npm-publish` GitHub environment, so that a person has to approve the
+deployment. The environment has a required reviewer, so that a deployment to it requires approval
+from someone, and a deployment policy that only allows it to be used from tags of the form
+`packages/v*`. It is separate from the `release-signing` environment used in the Windows release
+workflow, which only allows the `main` branch and tags of the form `host/v*`, and which has access
+to the signing identity used for signing Windows binaries. An npm publish does not need that signing
+identity, and `release-signing` would refuse a `packages/v*` tag anyway, so the npm publish has an
+environment of its own. The repository administrator owns `npm-publish` and its reviewers.
+
+### Configuring the package as a trusted publisher
+
+Publishing to the npm registry requires the package to have a trusted publisher configured for the
+workflow. The package must exist before it can be configured, so the first publish will need to be
+done manually by someone who is an owner of the `@kalareach` organisation. After that, the package
+settings on npmjs.com can be used to add a trusted publisher for the workflow, with GitHub Actions
+as the provider and these fields:
+
+| Field | Value |
+| --- | --- |
+| Organisation or user | `kalapowered` |
+| Repository | `kalareach` |
+| Workflow filename | `package-npm.yml` |
+| Environment name | `npm-publish` |
+| Allowed actions | `npm publish` |
+
+The `npm stage publish` action will always be allowed, but the `npm dist-tag` action should not be
+allowed, because the workflow does not run that command. Trusted publishing needs npm 11.5.1 or
+later and Node 22.14.0 or later on a GitHub-hosted runner, and the workflow installs versions that
+meet both. Unfortunately, the npm website does not check these details, and there is no way to edit
+the trusted publisher, only to remove it and add it again. If any of the details are wrong, the
+publish will fail with an authentication error, and the trusted publisher will need to be removed
+and added again with the correct details. All of the details are case-sensitive, and the workflow
+filename should be the filename only, including the extension.
+
+### Configuring the package to disallow publishing with tokens
+
+Once a trusted publisher has been configured and used to publish a version, the package can be
+configured to disallow publishing with tokens. This can be done from the package settings on
+npmjs.com, by changing the "Publishing access" option to "Require two-factor authentication and
+disallow tokens", and selecting "Update Package Settings". This will prevent anyone from publishing
+a version using a token, but will still allow someone to publish a version if they have two-factor
+authentication enabled on their account. However, the trusted publisher will still be able to
+publish versions, because it uses a short-lived token that is specific to the workflow. Any token
+used for the first publish should be revoked.
+
+### Approving a deployment to the npm registry
+
+Once a tag of the form `packages/v*` has been pushed, the workflow will run. When the `check` job
+passes, the `publish` job waits, and GitHub asks the environment's reviewer to approve it. A run
+waits at most 30 days for an approval. The reviewer:
+
+1. Opens the run from the repository's Actions tab and confirms that `check` passed, which means the
+   archive matches the release's sums and what `npm pack` makes.
+2. Reads the tag, which names the version and the commit, and decides whether that version should go
+   on the registry. npm accepts a version number once, so a published version cannot be published
+   again with another archive.
+3. Chooses Review deployments, selects `npm-publish`, and chooses Approve and deploy. Choosing
+   Reject ends the run with nothing published.
+4. When the job finishes, runs `npm view @kalareach/plugin-sdk version` and checks that the package
+   page shows the provenance for that version.
+
+If the deployment is rejected, or if it waited 30 days without approval, the run can be started
+again by selecting "Re-run" from the run page, and the `publish` job will wait for someone to
+approve the deployment again. Note that the run will use the version of the workflow from the commit
+that was tagged, so if the workflow needs to be changed, a new tag will need to be created. However,
+if something needs to be changed about the package, such as the trusted publisher, then the run can
+be restarted without creating a new tag.
 
 ## How a consumer pins a release
 
