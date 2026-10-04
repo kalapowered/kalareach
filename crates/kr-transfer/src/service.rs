@@ -1127,6 +1127,12 @@ impl TransferService {
             // question is asked again here: verifying the file took as long as the file is large,
             // and what the invalidation writes is this action's effect.
             let mut store = self.locked()?;
+            // So is the record: another request can have taken this action's identifier since the
+            // check at the top of the call, and an identifier carrying a different payload is
+            // refused before anything is moved. Under the lock, the record decides again.
+            if let Recorded::Answered(answered) = recorded_with(&store, action)? {
+                return Ok(answered);
+            }
             ask_admission(action)?;
             let moved = commit_admitted(action, || {
                 store.close_upload_from(
