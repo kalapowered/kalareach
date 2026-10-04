@@ -57,17 +57,17 @@ them; nothing in the protocol depends on the defaults.
 | one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
-submission is recorded rather than inferred from age. The host records it whenever a prompt that
-names the draft, whether the prompt is submitted or queued, is forwarded to the session's worker,
-and before the worker answers. Once the host records the attachment, nothing the worker does
-afterwards, including a lost connection, can leave it on the seven-day window. If the worker refuses
-the prompt, the attachment is still moved to the session's retention; this is not optimal (the
-attachment may be retained longer than is necessary), but it cannot lose a file. A repeat of the
-action that the worker answers from what it kept sends nothing, and nothing is recorded. The host
-tells the service which sessions its retention still covers, and the service does not guess. An
-attachment uploaded without a session takes the draft's session when it is submitted to one, or the
-session the prompt names when the draft has none, so the retention that applies is the session's
-rather than the seven-day window that applied while nothing held it.
+submission is recorded rather than inferred from age. The host is responsible for recording it for
+each prompt that names a draft, whether the prompt is submitted or queued, when it forwards the
+prompt to the session's worker and before the worker answers. Even if something goes wrong with the
+worker, or the connection the prompt came on is lost, the attachment cannot be left on the seven-day
+window. The record is tied to the action: it fixes which attachments the prompt carries, so a repeat
+of the action adds nothing, even when the draft has gained an attachment since. An attachment
+belongs to only one session. One uploaded without a session takes the session of the first prompt
+that carries it, and a prompt to any other session that names a draft holding it is refused before
+anything is sent. If the worker refuses a prompt, its attachments are still recorded for that
+session, because the prompt was sent to it. The host tells the service which sessions its retention
+still covers; the service never guesses.
 
 The sweep asks the archive which sessions still keep what was submitted to them. A session is
 considered to be covered if there exists a reservation or worker for that session in the session

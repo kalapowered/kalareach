@@ -596,6 +596,14 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS cursors (
                      consumer TEXT PRIMARY KEY,
                      sequence INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS prompt_records (
+                     actor_id       TEXT NOT NULL,
+                     action_id      BLOB NOT NULL,
+                     draft_id       BLOB NOT NULL,
+                     session_id     BLOB NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
                  );",
             )
             .map_err(TransferError::store)?;
@@ -1232,45 +1240,116 @@ impl Store {
         Ok(true)
     }
 
-    /// Records that a draft holding this attachment was submitted to a session.
+    /// Records that the prompt an action sends names a draft, and puts the attachments the draft
+    /// held when that action was first recorded under the session's retention.
     ///
-    /// The first submission stands: a second one changes nothing and announces nothing.
+    /// The first record of an action stands: the draft, the session and the moment are fixed by it,
+    /// and recording the action again carries out what it recorded and nothing else. So an
+    /// attachment bound to the draft after the action was first recorded is not one the action's
+    /// prompt carried, whatever number of times the action is asked again. An attachment already
+    /// submitted keeps its submission, and one without a session takes the session of the prompt.
+    ///
+    /// An attachment belongs to one session. One that belongs to another is refused, as binding it
+    /// to a second session's draft is, and the refusal writes nothing: neither the action's record
+    /// nor any attachment's submission.
+    ///
+    /// Returns how many attachments the action's prompt carries.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn mark_submitted(
+    /// Returns [`TransferError::IdConflict`] when the action was recorded for another draft or
+    /// session, [`TransferError::InvalidArgument`] when an attachment belongs to another session,
+    /// and [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn record_prompt(
         &mut self,
-        transfer_id: TransferId,
-        at_ms: TimestampMs,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        draft_id: DraftId,
         session_id: SessionId,
-    ) -> Result<()> {
+        at_ms: TimestampMs,
+    ) -> Result<usize> {
         let transaction = self.begin()?;
-        let changed = transaction
+        transaction
             .execute(
-                // The session is recorded only where the upload had none. An attachment already
-                // bound to a session keeps that one; submission does not move it.
-                "UPDATE uploads
-                 SET submitted_at_ms = ?2,
-                     session_id = COALESCE(session_id, ?3)
-                 WHERE transfer_id = ?1 AND submitted_at_ms IS NULL",
+                "INSERT OR IGNORE INTO prompt_records
+                     (actor_id, action_id, draft_id, session_id, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    uuid_sql(transfer_id.get()),
-                    as_i64(at_ms.get()),
+                    actor_id.as_str(),
+                    uuid_sql(action_id),
+                    uuid_sql(draft_id.get()),
                     uuid_sql(session_id.get()),
+                    as_i64(at_ms.get()),
                 ],
             )
             .map_err(TransferError::store)?;
-        if changed == 0 {
-            return Ok(());
+        let (recorded_draft, recorded_session, recorded_at): (Uuid, Uuid, i64) = transaction
+            .query_row(
+                "SELECT draft_id, session_id, recorded_at_ms FROM prompt_records
+                 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), uuid_sql(action_id)],
+                |row| Ok((uuid_column(row, 0)?, uuid_column(row, 1)?, row.get(2)?)),
+            )
+            .map_err(TransferError::store)?;
+        if recorded_draft != draft_id.get() || recorded_session != session_id.get() {
+            return Err(TransferError::IdConflict {
+                action: action_id.to_string(),
+                method: "a prompt".to_owned(),
+            });
         }
-        record_event(
-            &transaction,
-            "upload.submitted",
-            &transfer_id.to_string(),
-            at_ms,
-        )?;
-        transaction.commit().map_err(TransferError::store)
+        let carried: Vec<(Uuid, Option<Uuid>, bool)> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT binding.transfer_id, upload.session_id,
+                            upload.submitted_at_ms IS NOT NULL
+                     FROM draft_attachments AS binding
+                     JOIN uploads AS upload ON upload.transfer_id = binding.transfer_id
+                     WHERE binding.draft_id = ?1 AND binding.bound_at_ms <= ?2",
+                )
+                .map_err(TransferError::store)?;
+            let rows = statement
+                .query_map(params![uuid_sql(draft_id.get()), recorded_at], |row| {
+                    Ok((uuid_column(row, 0)?, optional_uuid(row, 1)?, row.get(2)?))
+                })
+                .map_err(TransferError::store)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(TransferError::store)?
+        };
+        for (_, owner, _) in &carried {
+            if owner.is_some_and(|owner| owner != session_id.get()) {
+                return Err(TransferError::invalid(
+                    "an attachment of this draft belongs to another session, and an attachment is \
+                     held by one session",
+                ));
+            }
+        }
+        for (transfer, _, submitted) in &carried {
+            if *submitted {
+                continue;
+            }
+            // The session is recorded only where the upload had none: an attachment bound to a
+            // session keeps that one.
+            transaction
+                .execute(
+                    "UPDATE uploads
+                     SET submitted_at_ms = ?2, session_id = COALESCE(session_id, ?3)
+                     WHERE transfer_id = ?1 AND submitted_at_ms IS NULL",
+                    params![
+                        uuid_sql(*transfer),
+                        as_i64(at_ms.get()),
+                        uuid_sql(session_id.get())
+                    ],
+                )
+                .map_err(TransferError::store)?;
+            record_event(
+                &transaction,
+                "upload.submitted",
+                &TransferId::new(*transfer).to_string(),
+                at_ms,
+            )?;
+        }
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(carried.len())
     }
 
     /// Returns every upload in one of the given states, oldest first.
@@ -2195,6 +2274,13 @@ impl Store {
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
     pub fn forget_actions_before(&self, at_ms: TimestampMs) -> Result<usize> {
+        // A prompt's record is kept as long as the action it belongs to can be asked again.
+        self.connection
+            .execute(
+                "DELETE FROM prompt_records WHERE recorded_at_ms < ?1",
+                params![as_i64(at_ms.get())],
+            )
+            .map_err(TransferError::store)?;
         self.connection
             .execute(
                 "DELETE FROM actions WHERE recorded_at_ms < ?1",

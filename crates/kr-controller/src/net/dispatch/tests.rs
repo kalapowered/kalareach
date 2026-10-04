@@ -1672,6 +1672,17 @@ fn a_published_attachment(
     actor: &kr_protocol::ids::ActorId,
     name: &str,
 ) -> kr_protocol::transfer::AttachmentHandle {
+    a_published_attachment_for(controller, environment_id, actor, name, None)
+}
+
+/// Publishes one small attachment for `actor`, begun for `session_id` where there is one.
+fn a_published_attachment_for(
+    controller: &crate::service::Controller,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    actor: &kr_protocol::ids::ActorId,
+    name: &str,
+    session_id: Option<kr_protocol::ids::SessionId>,
+) -> kr_protocol::transfer::AttachmentHandle {
     use kr_protocol::scalars::{Bytes, Digest256, U64};
     use kr_protocol::transfer::{
         ChunkDescriptor, UploadBeginParams, UploadChunkParams, UploadFinishParams,
@@ -1685,7 +1696,7 @@ fn a_published_attachment(
             actor,
             &UploadBeginParams {
                 environment_id,
-                session_id: Nullable::null(),
+                session_id: Nullable(session_id),
                 device_id: Nullable::null(),
                 declared_byte_len: U64::new(bytes.len() as u64),
                 declared_digest: digest,
@@ -1970,7 +1981,33 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     assert!(handle.submitted);
     assert_eq!(handle.session_id, Nullable::some(world.session_id));
 
-    // A worker that refuses the prompt leaves the attachment with the session's retention.
+    // An attachment belongs to one session. A prompt to another is refused before anything is
+    // forwarded, and records nothing.
+    let sent_before = script.forwarded().len();
+    let foreign = a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &actor,
+        "foreign.bin",
+        Some(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())),
+    );
+    let foreign_draft = an_empty_draft(controller, world.environment_id, &actor);
+    let foreign_draft = bound_to_a_draft(controller, &actor, &foreign_draft, &foreign).draft_id;
+    let answer = connection
+        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            6,
+            foreign_draft,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(!answered_ok(&answer), "{:?}", answer.frame());
+    assert_eq!(script.forwarded().len(), sent_before, "nothing was sent");
+    assert!(!is_submitted(controller, &actor, foreign_draft));
+
+    // A worker that refuses the prompt leaves the attachment with that session: it was sent one.
     let refused =
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "refused.bin");
     script.accepts_prompts(false);
@@ -2076,6 +2113,79 @@ async fn a_retry_answered_from_the_workers_receipt_does_not_submit_an_attachment
             })
         ),
         "the retry is answered with what the worker kept: {:?}",
+        answered.frame()
+    );
+    let held = the_attachments_of(controller, &actor, draft.draft_id);
+    assert_eq!(held.len(), 2);
+    assert!(held[0].submitted, "the attachment the prompt carried");
+    assert!(
+        !held[1].submitted,
+        "the attachment added after the prompt was sent"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11: a retry that reaches the worker, because the host could not read the receipt of its
+/// action first, and that the worker answers from what it kept, submits nothing that was added to
+/// the draft since the prompt was first sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_the_worker_answers_from_what_it_kept_does_not_submit_an_attachment_added_since() {
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 45));
+    let actor = connection.device.principal();
+    let first = a_published_attachment(controller, world.environment_id, &actor, "first.bin");
+    let draft = an_empty_draft(controller, world.environment_id, &actor);
+    let draft = bound_to_a_draft(controller, &actor, &draft, &first);
+    script.accepts_prompts(true);
+    let prompt = a_prompt_naming(
+        &world,
+        &connection,
+        Method::AgentPromptSubmit,
+        1,
+        draft.draft_id,
+    );
+    connection
+        .answer(ControlFrame::Mutation(Box::new(prompt.clone())))
+        .await
+        .expect("the prompt is answered");
+
+    // Another attachment joins the draft. The worker keeps its answer to the action and says so
+    // when the prompt is sent again, while its answer to a read of that action's receipt is a
+    // refusal, so the retry is forwarded.
+    let second = a_published_attachment(controller, world.environment_id, &actor, "second.bin");
+    let draft = controller
+        .transfer()
+        .service()
+        .draft(&actor, draft.draft_id)
+        .expect("reads the draft");
+    bound_to_a_draft(controller, &actor, &draft, &second);
+    script.answers_prompts_as_kept();
+    let sent_before = script.forwarded().len();
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt)))
+        .await
+        .expect("the retry is answered");
+    assert_eq!(
+        script.forwarded().len(),
+        sent_before + 1,
+        "the retry reached the worker"
+    );
+    assert!(
+        matches!(
+            answered.frame(),
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
         answered.frame()
     );
     let held = the_attachments_of(controller, &actor, draft.draft_id);

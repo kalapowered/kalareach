@@ -448,29 +448,31 @@ impl TransferModule {
         }
     }
 
-    /// Records that a prompt naming a draft is being sent to a session, which moves the draft's
+    /// Records that the prompt an action sends to a session names a draft, which moves the draft's
     /// attachments from the seven-day window of an unused attachment onto that session's retention.
     ///
     /// It runs before the prompt is forwarded to the session's worker, so that nothing the worker
     /// does or fails to do afterwards decides whether a file this host was asked to hand to a
-    /// session is kept. It binds the attachments the draft holds at that moment, and a repeat of
-    /// the action that the worker answers from what it kept sends nothing and records nothing. A
-    /// draft this actor does not hold has no attachments for this host to retain, so naming one is
-    /// not a failure.
+    /// session is kept. The first record of the action fixes the attachments its prompt carries, so
+    /// a repeat of the action records nothing new. A draft this actor does not hold has no
+    /// attachments for this host to retain, so naming one is not a failure.
     ///
     /// # Errors
     ///
-    /// Returns the refusal the service decided, other than for a draft it does not hold.
+    /// Returns the refusal the service decided, other than for a draft it does not hold: among
+    /// them an attachment that belongs to another session.
     pub async fn record_submission(
         &self,
         actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
         draft_id: kr_protocol::ids::DraftId,
         session_id: SessionId,
     ) -> Answer<usize> {
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
+        let action_id = action_id.get();
         blocking(
-            move || match service.mark_submitted(&actor, draft_id, session_id) {
+            move || match service.record_prompt(&actor, action_id, draft_id, session_id) {
                 Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
                 other => Ok(other?),
             },
