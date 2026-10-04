@@ -130,7 +130,7 @@ pub fn run(value: &Run) -> CellRun {
         cells: cells(value.cells),
         text: value.text.clone(),
         rendition: rendition(value.rendition),
-        hyperlink: Nullable(value.hyperlink.clone()),
+        hyperlink: Nullable(value.hyperlink.as_ref().map(|link| link.uri.clone())),
     }
 }
 
@@ -342,7 +342,7 @@ pub fn saved_cursor(value: &SavedCursor) -> SavedCursorState {
         },
         origin_mode: value.origin_mode,
         style: cells(value.style),
-        hyperlink: Nullable(value.hyperlink.clone()),
+        hyperlink: Nullable(value.hyperlink.as_ref().map(|link| link.uri.clone())),
     }
 }
 
@@ -377,7 +377,7 @@ pub fn hyperlinks(values: &[kr_term::snapshot::HyperlinkRange]) -> Result<Vec<Hy
                 row: row_id(range.row)?,
                 start_column: cells(range.start_col),
                 end_column: cells(range.end_col),
-                uri: range.uri.clone(),
+                uri: range.link.uri.clone(),
             })
         })
         .collect()

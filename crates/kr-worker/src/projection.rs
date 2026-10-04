@@ -1324,7 +1324,10 @@ mod projection_tests {
                 },
                 origin_mode: false,
                 style: 1,
-                hyperlink: Some("https://example.invalid/what-the-shell-was-in".to_owned()),
+                hyperlink: Some(kr_term::grid::Link::new(
+                    "https://example.invalid/what-the-shell-was-in",
+                    "",
+                )),
             }),
             Some(kr_term::snapshot::SavedCursor {
                 buffer: kr_term::snapshot::ActiveBuffer::Alternate,

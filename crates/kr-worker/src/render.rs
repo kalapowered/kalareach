@@ -49,6 +49,7 @@
 //!   character: the next one the application prints lands beside the last column instead of
 //!   wrapping to the next row.
 
+use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
 use kr_term::modes::ALTERNATE_BUFFER_MODES;
 use kr_term::palette::Rgb;
@@ -222,7 +223,7 @@ struct Writer {
     /// the terminal already had.
     pen: Option<Rendition>,
     /// The hyperlink currently open, so a run does not reopen the one it is already inside.
-    link: Option<String>,
+    link: Option<Link>,
     /// True once the snapshot's own open hyperlink has been installed, so it is not closed again.
     link_is_the_snapshots: bool,
     /// The character sets the application had selected, held back until the rows are painted.
@@ -381,9 +382,9 @@ impl Writer {
                 self.osc(b"2", title.window.as_bytes());
             }
             RestoreOp::SetRendition { rendition } => self.rendition(*rendition),
-            RestoreOp::SetHyperlink { uri } => {
-                match uri {
-                    Some(uri) => self.open_link(uri),
+            RestoreOp::SetHyperlink { link } => {
+                match link {
+                    Some(link) => self.open_link(link),
                     None => {
                         if self.link.is_some() {
                             self.close_link();
@@ -392,7 +393,7 @@ impl Writer {
                 }
                 // Whatever this leaves open is the link the application has open, so the next
                 // character it prints belongs to it and this writer does not close it again.
-                self.link_is_the_snapshots = uri.is_some();
+                self.link_is_the_snapshots = link.is_some();
             }
             RestoreOp::SetSavedCursor { cursor } => self.saved_cursor(cursor),
             RestoreOp::SetCursor { cursor } => self.cursor(*cursor),
@@ -581,7 +582,7 @@ impl Writer {
         self.move_to_column(column);
         self.rendition(run.rendition);
         match run.hyperlink.as_ref() {
-            Some(uri) => self.open_link(uri),
+            Some(link) => self.open_link(link),
             None => {
                 if self.link.is_some() {
                     self.close_link();
@@ -666,14 +667,14 @@ impl Writer {
         self.pen = Some(rendition);
     }
 
-    fn open_link(&mut self, uri: &str) {
-        if self.link.as_deref() == Some(uri) {
+    /// Opens `link`, with the parameters that make it the link it is, unless it is the one already
+    /// open. Two links to one target stay two on the terminal that is drawn into.
+    fn open_link(&mut self, link: &Link) {
+        if self.link.as_ref() == Some(link) {
             return;
         }
-        let mut body = b";".to_vec();
-        body.extend_from_slice(uri.as_bytes());
-        self.osc(b"8", &body);
-        self.link = Some(uri.to_owned());
+        self.osc(b"8", link.payload().as_bytes());
+        self.link = Some(link.clone());
     }
 
     fn close_link(&mut self) {
@@ -704,7 +705,7 @@ impl Writer {
         self.designations(&cursor.charsets);
         self.rendition(cursor.rendition);
         match cursor.hyperlink.as_ref() {
-            Some(uri) => self.open_link(uri),
+            Some(link) => self.open_link(link),
             None => {
                 if self.link.is_some() {
                     self.close_link();
@@ -721,7 +722,7 @@ impl Writer {
         // screen rather than the pen this one happened to leave behind.
         self.rendition(restore_pen);
         match restore_link {
-            Some(uri) => self.open_link(&uri),
+            Some(link) => self.open_link(&link),
             None => {
                 if self.link.is_some() {
                     self.close_link();
@@ -1755,7 +1756,7 @@ mod tests {
         // showing is preceded by the default shape.
         for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
             let mut linked = row(0, 0, "link");
-            linked.runs[0].hyperlink = Some("https://example.invalid/".to_owned());
+            linked.runs[0].hyperlink = Some(Link::new("https://example.invalid/", ""));
             let operations = vec![
                 RestoreOp::SelectBuffer { buffer: active },
                 RestoreOp::PaintInactiveRow { row: linked },
@@ -1997,7 +1998,7 @@ mod tests {
         // that text outside the link.
         let rendered = render(
             &[RestoreOp::SetHyperlink {
-                uri: Some("https://example.invalid/".to_owned()),
+                link: Some(Link::new("https://example.invalid/", "")),
             }],
             viewport(24, 80),
             Keyboard::Install,
@@ -2007,14 +2008,45 @@ mod tests {
         assert_eq!(text, "\x1b]8;;https://example.invalid/\x1b\\");
     }
 
+    /// Two links to one target are two links on the terminal a restoration is drawn into, because
+    /// each is opened with the identifier it had.
+    #[test]
+    fn a_restoration_opens_each_link_with_the_parameters_it_has() {
+        let mut linked = row(0, 0, "abcd");
+        let first = Link::new("https://example.invalid/", "id=a");
+        let second = Link::new("https://example.invalid/", "id=b");
+        linked.runs[0].text = "ab".to_owned();
+        linked.runs[0].cells = 2;
+        linked.runs[0].hyperlink = Some(first);
+        let mut next = linked.runs[0].clone();
+        next.text = "cd".to_owned();
+        next.column = 2;
+        next.hyperlink = Some(second);
+        linked.runs.push(next);
+        let rendered = render(
+            &[RestoreOp::PaintRow { row: linked }],
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        let opened: Vec<&str> = text.matches("\x1b]8;id=").collect();
+        assert_eq!(opened.len(), 2, "{text:?}");
+        assert!(
+            text.contains("\x1b]8;id=a;https://example.invalid/\x1b\\ab")
+                && text.contains("\x1b]8;id=b;https://example.invalid/\x1b\\cd"),
+            "{text:?}"
+        );
+    }
+
     #[test]
     fn a_link_opened_only_to_draw_a_run_is_closed_again() {
         let mut linked = row(0, 0, "text");
-        linked.runs[0].hyperlink = Some("https://example.invalid/".to_owned());
+        linked.runs[0].hyperlink = Some(Link::new("https://example.invalid/", ""));
         let rendered = render(
             &[
                 RestoreOp::PaintRow { row: linked },
-                RestoreOp::SetHyperlink { uri: None },
+                RestoreOp::SetHyperlink { link: None },
             ],
             viewport(24, 80),
             Keyboard::Install,

@@ -12,7 +12,7 @@
 
 use crate::budget::GridSize;
 use crate::error::{Result, TermError};
-use crate::grid::{GridRow, Rendition};
+use crate::grid::{GridRow, Link, Rendition};
 use crate::modes::ModeKind;
 use crate::palette::{PaletteSource, Rgb};
 use crate::title::{SavedTitle, TitleEntry};
@@ -83,7 +83,7 @@ pub struct SavedCursor {
     ///
     /// A saved pen carries the open link with it, so text printed after a restore belongs to the
     /// link the application had open when it saved.
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<Link>,
 }
 
 /// The keyboard negotiation a reconnecting client has to be put back into.
@@ -161,8 +161,8 @@ pub struct HyperlinkRange {
     pub start_col: u32,
     /// One past the last column.
     pub end_col: u32,
-    /// The target.
-    pub uri: String,
+    /// The link.
+    pub link: Link,
 }
 
 /// The palette a snapshot carries.
@@ -246,7 +246,7 @@ pub struct Snapshot {
     /// An application can open a link and print nothing before a client reconnects, and the link
     /// belongs to what it prints next. Without this the reconnecting client would leave that text
     /// outside the link.
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<Link>,
     /// The palette.
     pub palette: PaletteSnapshot,
     /// The rows of the active buffer, with stable identifiers and wrap markers.
@@ -317,7 +317,7 @@ pub struct Delta {
     ///
     /// `Some(None)` is an open link that closed. Without this a reconnecting client cannot put the
     /// next live character inside the link the application opened before it arrived.
-    pub hyperlink: Option<Option<String>>,
+    pub hyperlink: Option<Option<Link>>,
 }
 
 impl Delta {
@@ -438,8 +438,8 @@ pub enum RestoreOp {
     /// Set the titles and the virtual stack.
     /// Opens the hyperlink the next character belongs to, or closes the open one.
     SetHyperlink {
-        /// The target, or nothing when no link is open.
-        uri: Option<String>,
+        /// The link, or nothing when no link is open.
+        link: Option<Link>,
     },
     /// Paints a row of the buffer that is not active.
     PaintInactiveRow {
@@ -515,7 +515,7 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
         rendition: snapshot.rendition,
     });
     ops.push(RestoreOp::SetHyperlink {
-        uri: snapshot.hyperlink.clone(),
+        link: snapshot.hyperlink.clone(),
     });
     for cursor in snapshot.saved_cursors.iter().flatten() {
         ops.push(RestoreOp::SetSavedCursor {

@@ -945,7 +945,7 @@ fn a_hyperlink_target_keeps_its_semicolons() {
         .iter()
         .find_map(|run| run.hyperlink.clone())
         .expect("the link survived");
-    assert_eq!(link, "https://example.invalid/a;b");
+    assert_eq!(link.uri, "https://example.invalid/a;b");
 }
 
 /// A selective title push saves only what it names, and a pop restores only what was saved.

@@ -1883,7 +1883,10 @@ fn encoded_row_bytes(row: &GridRow) -> usize {
             .map(|run| {
                 crate::grid::RUN_OVERHEAD_BYTES
                     + run.text.len()
-                    + run.hyperlink.as_ref().map_or(0, std::string::String::len)
+                    + run
+                        .hyperlink
+                        .as_ref()
+                        .map_or(0, |link| link.uri.len() + link.params.len())
             })
             .sum::<usize>()
 }
@@ -1940,12 +1943,12 @@ fn hyperlinks_of(rows: &[GridRow]) -> Vec<HyperlinkRange> {
     let mut out = Vec::new();
     for row in rows {
         for run in &row.runs {
-            if let Some(uri) = &run.hyperlink {
+            if let Some(link) = &run.hyperlink {
                 out.push(HyperlinkRange {
                     row: row.stable_id,
                     start_col: run.column,
                     end_col: run.column + run.cells,
-                    uri: uri.clone(),
+                    link: link.clone(),
                 });
             }
         }
