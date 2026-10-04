@@ -217,6 +217,13 @@ void kr_bridge_lost(int loss, const char *detail);
 /* Non-zero while a launch this bridge installed is waiting to be accepted. */
 int kr_bridge_launch_pending(void);
 
+/*
+ * Non-zero once, after the worker has said it holds no fence for this reader (an exchange that
+ * ended with none, or a fence that has gone). The worker then waits for the reader's next idle
+ * report, so a reader that reports idle once per wait reports again.
+ */
+int kr_bridge_take_fence_retry(void);
+
 /* ---- the command a line runs ----------------------------------------------------------------- */
 
 /*
