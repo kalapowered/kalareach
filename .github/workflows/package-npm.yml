@@ -17,6 +17,13 @@ name: package-npm
 # sha512 is not that one. Both refuse a release that is not immutable, so an asset cannot be
 # replaced between the check and the publish.
 #
+# npm takes each version once, and two package releases can name the same version, since a tag names
+# the commit as well as the version. The check job therefore asks the registry what it holds under
+# the archive's version before anything waits for approval: a version npm does not hold goes on to
+# the publish job; the very archive under a version npm holds ends the run with a notice and
+# leaves the publish job skipped, so nobody is asked to approve a publish that has nothing to do;
+# another archive under a version npm holds fails the check.
+#
 # A run started by hand on a branch rehearses the check job: it packs the checked-out commit with
 # the release script, checks and dry-runs the result, and stops there, because the environment's
 # policy refuses the publish job a ref that is not a release tag before any step of it runs.
@@ -45,6 +52,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       sha512: ${{ steps.approved.outputs.sha512 }}
+      published: ${{ steps.registry.outputs.published }}
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -138,12 +146,21 @@ jobs:
         id: approved
         run: echo "sha512=$(sha512sum "$ARCHIVE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      # The publish job runs only when npm holds nothing under this version. The same archive under a
+      # held version ends the run here with a notice, and another archive under it fails here.
+      - name: Ask npm whether it already holds this version
+        id: registry
+        run: python3 scripts/check-release-npm.py registry --archive "$ARCHIVE" --github-output "$GITHUB_OUTPUT"
+
       - name: Ask npm what publishing would do
         run: npm publish "$ARCHIVE" --dry-run --access public
 
   publish:
     name: publish to npm
     needs: check
+    # A skipped job asks nobody for approval. Only an answer of `false` goes on, so a check that
+    # recorded no answer publishes nothing.
+    if: needs.check.outputs.published == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # The gate. Nothing above needs the environment, and nothing below runs before it is approved.
