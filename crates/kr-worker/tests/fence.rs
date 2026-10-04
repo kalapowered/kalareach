@@ -63,7 +63,7 @@ const SOON: Duration = Duration::from_secs(5);
 
 /// How long the machine holds input for a reader's exchange, which is the 250 ms rule: a case that
 /// is about that deadline passing moves its session's clock this far.
-const THE_HOLD: Duration = Duration::from_millis(250);
+const THE_HOLD: Duration = Duration::from_millis(kr_protocol::root::FENCE_EXCHANGE_TIMEOUT.get());
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -1209,14 +1209,7 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
     at_the_gate(&gate).await;
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
-    clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
-    wired
-        .runtime
-        .session()
-        .fence()
-        .expect("a driver")
-        .waker()
-        .notify_one();
+    wired.pass(kr_worker::fence::FENCE_WRITE_LIMIT);
     echoed(&wired.runtime, b"waiting-keys").await;
     {
         let session = wired.runtime.session();
@@ -1271,14 +1264,7 @@ async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_un
         "the machine holds the new holder's keys while it asks for a new fence"
     );
     // The exchange's deadline passes on the machine's own clock.
-    clock.advance(Duration::from_millis(250));
-    wired
-        .runtime
-        .session()
-        .fence()
-        .expect("a driver")
-        .waker()
-        .notify_one();
+    wired.pass(THE_HOLD);
     echoed(&wired.runtime, b"second-keys").await;
     {
         let session = wired.runtime.session();
@@ -1402,14 +1388,7 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
     );
 
     // The launch's hold ends on the machine's own clock.
-    clock.advance(Duration::from_millis(250));
-    wired
-        .runtime
-        .session()
-        .fence()
-        .expect("a driver")
-        .waker()
-        .notify_one();
+    wired.pass(THE_HOLD);
     echoed(&wired.runtime, b"launch-held-keys").await;
     {
         let session = wired.runtime.session();
@@ -2061,14 +2040,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
 
     // The hold's deadline is reached on the machine's own clock. Nothing but this and the reader's
     // own frames can end it, and the reading has not ended.
-    clock.advance(Duration::from_millis(250));
-    wired
-        .runtime
-        .session()
-        .fence()
-        .expect("a driver")
-        .waker()
-        .notify_one();
+    wired.pass(THE_HOLD);
     echoed(&wired.runtime, b"second").await;
     assert!(
         still_there(waiting),
@@ -5640,14 +5612,7 @@ async fn a_launch_is_refused_once_an_application_takes_the_foreground_and_is_nev
         }))
         .await
         .expect("leaves");
-    let waited = tokio::time::Instant::now() + SOON;
-    while wired.runtime.session().fence().expect("a driver").state() != FenceState::Outside {
-        assert!(
-            tokio::time::Instant::now() < waited,
-            "the reader left the prompt"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    until_the_reader_has_left(&wired.runtime).await;
     let refused = client
         .mutate(
             Method::ShellLaunch,
