@@ -126,10 +126,10 @@ will wait up to 50 minutes for the release to become available. The job requires
 immutable. The checks confirm that the archive in the release matches the hash listed in
 `SHA512SUMS`, and that it matches an archive created by `npm pack` from the same commit. It also
 runs `npm publish --dry-run` on the archive to see what npm would publish. Finally, it records the
-sha512 of the archive so that it can be checked again in the `publish` job. The `publish` job will
-only run if the `check` job is successful, and it will wait until someone has approved the
-deployment. It downloads the release again, and refuses any archive whose sha512 is not the recorded
-value. It then publishes the archive to the npm registry, using
+sha512 of the archive so that it can be checked again in the `publish` job. The `publish` job runs
+only if the `check` job succeeds and npm does not already have the version, and it waits until
+someone has approved the deployment. It downloads the release again, and refuses any archive whose
+sha512 is not the recorded value. It then publishes the archive to the npm registry, using
 `npm publish --provenance --access public` to attach provenance information identifying the workflow
 and the commit from which it was published. It authenticates to the npm registry using the
 workflow's own identity, via OpenID Connect, so this repository holds no npm token.
@@ -154,10 +154,13 @@ environment of its own. The repository administrator owns `npm-publish` and its 
 ### Configuring the package as a trusted publisher
 
 Publishing to the npm registry requires the package to have a trusted publisher configured for the
-workflow. The package must exist before it can be configured, so the first publish will need to be
-done manually by someone who is an owner of the `@kalareach` organisation. After that, the package
-settings on npmjs.com can be used to add a trusted publisher for the workflow, with GitHub Actions
-as the provider and these fields:
+workflow. The package needs to already exist to add trusted publishers for it, which is why its
+first version, `0.0.0`, was manually published by an owner of the `@kalareach` organisation. This
+version is a placeholder containing only a manifest and a README, no code is included. Note that no
+release is numbered `0.0.0`, and a release numbered `0.0.0` would fail the registry check, since npm
+already has that version with another archive. To add a trusted publisher for the workflow, go to
+the package's settings on npmjs.com and add a new trusted publisher, selecting GitHub Actions as the
+provider and filling out the fields as follows:
 
 | Field | Value |
 | --- | --- |
@@ -187,6 +190,29 @@ authentication enabled on their account. However, the trusted publisher will sti
 publish versions, because it uses a short-lived token that is specific to the workflow. Any token
 used for the first publish should be revoked.
 
+### A version npm already has
+
+Since npm only allows a specific version to be published once, and a tag names a commit as well as a
+version, so that two releases can carry the same version, there is need to check whether the version
+is already published on npm or not before it goes to the stage for manual approval (in order to
+avoid going all the way there only to fail at the very last step of the job, i. e. on
+`npm publish`). That's why there is a job called `check`. It basically runs the command
+`npm view @kalareach/plugin-sdk@<version> dist.integrity` for the version in the archive and
+compares the returned value to the archive's own sha512 integrity. There are three scenarios
+possible:
+
+- The version doesn't exist on npm. In this case, the process continues as described above (awaiting
+  for manual approval in the `publish` job).
+- The version exists on npm with the same integrity. That archive is already published, so the whole
+  run is terminated with a notice and the `publish` job is skipped. Nobody is asked to approve
+  anything.
+- The version exists on npm with a different integrity. The `check` job fails and outputs both
+  integrities in the message. This archive cannot be published under that version, so the release
+  needs a version npm does not have.
+
+A registry that cannot be reached or read also fails the `check` job. It is never taken to mean that
+the version is absent.
+
 ### Approving a deployment to the npm registry
 
 Once a tag of the form `packages/v*` has been pushed, the workflow will run. When the `check` job
@@ -197,7 +223,7 @@ waits at most 30 days for an approval. The reviewer:
    archive matches the release's sums and what `npm pack` makes.
 2. Reads the tag, which names the version and the commit, and decides whether that version should go
    on the registry. npm accepts a version number once, so a published version cannot be published
-   again with another archive.
+   again with another archive; a version npm already has never reaches this step.
 3. Chooses Review deployments, selects `npm-publish`, and chooses Approve and deploy. Choosing
    Reject ends the run with nothing published.
 4. When the job finishes, runs `npm view @kalareach/plugin-sdk version` and checks that the package
