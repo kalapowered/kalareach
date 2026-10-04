@@ -1701,6 +1701,12 @@ fn piece_in(items: &[Item], piece: &[char]) -> bool {
 /// held to this.)
 const KEY_PIECE: usize = 8;
 
+thread_local! {
+    /// How many times this thread has searched a text for a piece of a key: what a text's recording
+    /// costs is counted in searches, which a test holds to a number the text's length cannot raise.
+    static KEY_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether `rows`, read as one run, hold a piece of eight characters of one of `secrets`, whichever
 /// of the colour-looking sequences in them are colour and whichever are characters of the key. A
 /// value of fewer than eight characters has no piece. An encoding of the key that changes its
@@ -1708,6 +1714,7 @@ const KEY_PIECE: usize = 8;
 /// eight characters kept apart by other letters or digits, or an escape sequence that is not a
 /// colour code and a terminal would draw nothing for, between pieces of seven.
 fn holds_a_key(rows: &[&str], secrets: &[&str]) -> bool {
+    KEY_SEARCHES.with(|searches| searches.set(searches.get() + 1));
     let items: Vec<Item> = rows.iter().flat_map(|row| items_of(row)).collect();
     secrets.iter().any(|secret| {
         let secret: Vec<char> = items_of(secret)
@@ -2136,16 +2143,21 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// `text` as the part records or prints it: as it is, or, where it holds a piece of a held key
-/// (`secrets`), only its first words (up to the colon that ends the class a failure begins with)
-/// and a line that says the rest is not kept.
+/// (`secrets`), only its first words (up to the first colon or line break, the colon that ends the
+/// class a failure begins with), where those hold no piece of a key, and a line that says the rest
+/// is not kept.
 fn recorded_text(text: &str, secrets: &[&str]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if !holds_a_key(&lines, secrets) {
         return text.to_owned();
     }
+    // A longer head holds every piece a shorter one holds, so the first delimiter after the first
+    // character is the only one whose head can be free of a key: one search decides, and a head
+    // that holds a piece is discarded whatever follows it.
     let head = text
         .match_indices([':', '\n'])
-        .find(|(at, _)| *at > 0 && !holds_a_key(&[&text[..*at]], secrets))
+        .find(|(at, _)| *at > 0)
+        .filter(|(at, _)| !holds_a_key(&[&text[..*at]], secrets))
         .map_or("", |(at, _)| &text[..=at.min(text.len() - 1)]);
     let head = head.trim_end_matches('\n');
     format!("{head} (the rest holds a key, so it is not kept)")
@@ -9144,6 +9156,51 @@ fn a_failure_that_holds_a_piece_of_a_key_keeps_its_class_and_loses_only_its_text
     let wrapped =
         format!("{ISOLATION_UNPROVEN} a probe wrote sk-or-\nv1-0123456789abcdef0123456789abcdef");
     assert!(recorded_text(&wrapped, &[key]).starts_with(ISOLATION_UNPROVEN));
+}
+
+/// A text that holds a key is recorded after a number of searches that its length cannot raise: the
+/// first words it keeps are decided by the first delimiter alone, because a longer head holds every
+/// piece a shorter one does.
+#[test]
+fn a_long_text_that_holds_a_key_is_recorded_after_a_fixed_number_of_searches() {
+    let key = "sk-or-v1-0123456789abcdef0123456789abcdef";
+    let text = format!("{key}{}", ":abcdefg\n".repeat(2000));
+    let before = KEY_SEARCHES.with(std::cell::Cell::get);
+    let kept = recorded_text(&text, &[key]);
+    let searches = KEY_SEARCHES.with(std::cell::Cell::get) - before;
+    assert!(!kept.contains("0123456789abcdef"), "{kept}");
+    assert!(
+        kept.ends_with("so it is not kept)") && kept.len() < 100,
+        "the rows after the key are not kept"
+    );
+    assert!(
+        searches <= 2,
+        "{searches} searches for a text of 2,000 rows"
+    );
+    // The first delimiter decides because a head never holds less than a shorter one: checked over
+    // the ways a key is written, escapes and wraps included.
+    let synthetic = "sk-synthetic-1234567890abcdef";
+    let coloured = "sk-synthetic-1234mabcdefg";
+    let escaped = [
+        ("token \u{1b}[1~1234567890abcdef: x\n", synthetic),
+        ("sk-synthetic-\u{1b}[31m1234567890abcdef: x\n", synthetic),
+        ("sk-synthetic-\u{1b}[1234567890m abcdef: x\n", synthetic),
+        ("\u{1b}[1234ma\u{1b}[0mbcdefg: x\n", coloured),
+        ("\u{1b}[1234mabcdefg: x\n", coloured),
+        ("┃ sk-synthetic-1234\n┃ 567890abcdef: x\n", synthetic),
+    ];
+    for (text, key) in escaped {
+        let mut held = false;
+        for (at, _) in text.match_indices([':', '\n']) {
+            let now = holds_a_key(&[&text[..at]], &[key]);
+            assert!(
+                now || !held,
+                "{text:?}: the head to {at} holds less than a shorter one"
+            );
+            held |= now;
+        }
+        assert!(held, "{text:?} holds the key");
+    }
 }
 
 /// A colour code that is also a run of key characters, beside another that is not: each is read
