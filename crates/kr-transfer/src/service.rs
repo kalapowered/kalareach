@@ -2287,19 +2287,16 @@ impl TransferService {
                     )
                 }
                 // A publication that ended in neither of those ways ended as a refusal, and the
-                // repeat is owed that refusal rather than a handle that names nothing.
-                (UPLOAD_FINISH, UploadState::Invalidated) => Settled::Failure(
-                    ErrorCode::AttachmentIntegrity,
-                    row.invalid_reason
-                        .clone()
-                        .unwrap_or_else(|| "this upload ended without being published".to_owned()),
-                ),
-                (UPLOAD_FINISH, UploadState::Expired) => Settled::Failure(
-                    ErrorCode::ResourceUnavailable,
-                    row.invalid_reason
-                        .clone()
-                        .unwrap_or_else(|| "this upload ended without being published".to_owned()),
-                ),
+                // repeat is owed that refusal rather than a handle that names nothing: the one a
+                // retry of the finish is given, so that recovery and a retry record the same
+                // answer under the same code and the same words, whichever way the upload ended.
+                (
+                    UPLOAD_FINISH,
+                    UploadState::Invalidated | UploadState::Expired | UploadState::Cancelled,
+                ) => {
+                    let refusal = publication_refusal(&row);
+                    Settled::Failure(refusal.code(), refusal.to_string())
+                }
                 // Cancelled *and* released: the bytes are only back in the budget once the payload
                 // is gone, and a result that said otherwise would be wrong. A row still marked for
                 // cleanup is left to the next pass, which runs after the retry that removes it.
