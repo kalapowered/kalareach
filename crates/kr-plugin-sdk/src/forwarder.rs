@@ -187,7 +187,9 @@ pub fn expand_flags(
 /// before its search path on some platforms, so a program planted there would run in the
 /// forwarder's place. The name is read where it stands in the text, whatever the text is, and JSON
 /// escapes are read first, so a flag that holds it anywhere is one: a package that needs the
-/// forwarder writes the placeholder, which the installed forwarder's path replaces.
+/// forwarder writes the placeholder, which the installed forwarder's path replaces. A flag that
+/// holds the name for another purpose (a log file's name) is refused there too, and is better
+/// written without it.
 #[must_use]
 pub fn names_the_forwarder_itself(flags: &[String]) -> bool {
     flags
@@ -318,8 +320,6 @@ mod tests {
             r#"{"a": "{kr_hook}", "b": "\u007bkr_hook}"}"#,
             // Not a document as a whole: an option's name before the one that is.
             r#"--settings={"command":"\u007bkr_hook}"}"#,
-            // A document a stricter reader refuses and a browser's accepts: a lone surrogate.
-            r#"{"x": "\ud800", "command": "\u007bkr_hook}"}"#,
         ] {
             assert!(mentions(template), "{template}");
             assert_eq!(

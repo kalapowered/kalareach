@@ -219,6 +219,20 @@ fn a_command_two_packages_integrate_resolves_to_neither() {
     assert!(sources.for_command("claude").is_none());
 }
 
+/// KR-REQ-12.07: a package recognises the file a shell found only for its own command: a file its
+/// rule names, found for another name, is not the command's.
+#[cfg(unix)]
+#[test]
+fn kr_req_12_07_a_rule_recognises_a_file_found_for_its_own_command_only() {
+    let store = Store::new("recognise");
+    let connector = InstalledConnector::read(store.package()).expect("the package is read");
+    assert!(connector.recognises("claude", "/usr/local/bin/claude"));
+    assert!(
+        !connector.recognises("other", "/usr/local/bin/claude"),
+        "a program the rule names, found for another name"
+    );
+}
+
 /// A manifest's integration names a command one of the package's match rules recognises: the
 /// package check refuses a path, another application's name and no name at all, and nothing is
 /// integrated from such a package.

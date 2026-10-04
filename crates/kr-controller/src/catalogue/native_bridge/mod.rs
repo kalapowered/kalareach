@@ -2423,8 +2423,9 @@ fn invocations(
             for (name, nested) in members {
                 // The placeholder stands where a command starts and nowhere else: a key or a value
                 // that holds it elsewhere would have the host write the forwarder's path into
-                // something the registration does not run.
-                if forwarder::mentions(name) {
+                // something the registration does not run. These are decoded already; what the
+                // file spells with escapes is read in its own text, where the host writes the path.
+                if name.contains(forwarder::PLACEHOLDER) {
                     return Err(format!(
                         "{destination} names the forwarder's placeholder somewhere that is not a \
                          command"
@@ -2440,7 +2441,7 @@ fn invocations(
                 invocations(item, destination, applications, surfaces)?;
             }
         }
-        serde_json::Value::String(text) if forwarder::mentions(text) => {
+        serde_json::Value::String(text) if text.contains(forwarder::PLACEHOLDER) => {
             return Err(format!(
                 "{destination} names the forwarder's placeholder somewhere that is not a command"
             ));

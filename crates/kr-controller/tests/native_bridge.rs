@@ -701,6 +701,28 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
     }
 }
 
+/// KR-REQ-11.42: the text of an escape in a value is only text. A hook whose name is the characters
+/// `\u007bkr_hook}` (a JSON file spells them with an escaped backslash) is no placeholder in a place
+/// that is not a command, and the file is installed as it stands.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_text_of_an_escape_in_a_value_is_only_text() {
+    let hooks = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "\\u007bkr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#;
+    let site = Site::new();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release_with_hooks("literal", hooks)))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied);
+    let written =
+        String::from_utf8(std::fs::read(site.application().join(HOOKS_PATH)).expect("the hooks"))
+            .expect("text");
+    assert!(
+        written.contains(r#""name": "\\u007bkr_hook}""#),
+        "{written}"
+    );
+}
+
 /// KR-REQ-11.42: the placeholder is written in the form this host registers the forwarder in for its
 /// application. Gemini CLI runs a handler's command as a line in a shell, so the path is written
 /// there as one quoted word, and a handler of the program form would hand the shell an unquoted
@@ -710,7 +732,7 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
 /// own form is applied.
 #[cfg(unix)]
 #[test]
-fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_command_in() {
+fn kr_req_11_42_the_placeholder_is_written_in_the_form_this_host_registers_for_its_application() {
     let gemini_line = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook} gemini-cli hook", "timeout": 5000}]}]}}"#;
     let gemini_program = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook}", "args": ["gemini-cli", "hook"], "timeout": 5000}]}]}}"#;
     let site = GeminiSite::new();

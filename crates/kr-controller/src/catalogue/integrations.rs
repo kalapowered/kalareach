@@ -492,38 +492,32 @@ fn resolved(
         } else {
             None
         });
-        if report.unavailable.0.is_none() {
-            // What an integrated launch records as its mode.
-            report.mode = IntegrationMode::NativeBridge;
+    }
+    // A worker runs every invocation as typed where it cannot use the flags a package declares: it
+    // cannot write the forwarder into them, or they name the forwarder by its own name, which an
+    // application may look for in its working directory before its search path. The report says so
+    // beside the state, read from the declared flags, which are what the worker reads.
+    let declared_flags = connector
+        .and_then(|connector| connector.manifest().command_integration.as_ref())
+        .map(|declared| declared.flags.as_slice());
+    if report.state == CommandIntegrationState::On
+        && report.reason.0.is_none()
+        && let Some(flags) = declared_flags
+    {
+        if let Err(error) = kr_plugin_sdk::forwarder::expand_flags(flags, host.forwarder.as_deref())
+        {
+            report.reason = Nullable::some(format!(
+                "its flags cannot be written with the installed forwarder, so an invocation runs \
+                 as typed: {error}"
+            ));
+        } else if cfg!(windows) && kr_plugin_sdk::forwarder::names_the_forwarder_itself(flags) {
+            report.reason = Nullable::some(
+                "its flags name the forwarder by its own name, which an application may look for \
+                 in its working directory before its search path, so an invocation runs as typed \
+                 until the package names the forwarder by the placeholder"
+                    .to_owned(),
+            );
         }
-    }
-    // Flags that name the forwarder stay as declared where this host cannot write them, and a worker
-    // that cannot write them runs every invocation as typed: the report says so beside the state.
-    if report.state == CommandIntegrationState::On
-        && report.reason.0.is_none()
-        && let Err(error) =
-            kr_plugin_sdk::forwarder::expand_flags(&report.flags, host.forwarder.as_deref())
-    {
-        report.reason = Nullable::some(format!(
-            "its flags cannot be written with the installed forwarder, so an invocation runs as \
-             typed: {error}"
-        ));
-    }
-    if report.state == CommandIntegrationState::On
-        && report.reason.0.is_none()
-        && cfg!(windows)
-        && connector
-            .and_then(|connector| connector.manifest().command_integration.as_ref())
-            .is_some_and(|declared| {
-                kr_plugin_sdk::forwarder::names_the_forwarder_itself(&declared.flags)
-            })
-    {
-        report.reason = Nullable::some(
-            "its flags name the forwarder by its own name, which an application may look for in \
-             its working directory before its search path, so an invocation runs as typed until \
-             the package names the forwarder by the placeholder"
-                .to_owned(),
-        );
     }
     if let Some(command) = report.command.0.as_deref()
         && let Some(executable) = resolve(command, &host.search_path)
@@ -544,6 +538,13 @@ fn resolved(
                 executable.display()
             ));
         }
+    }
+    // What an integrated launch records as its mode: only an integration a new session can use.
+    if report.state == CommandIntegrationState::On
+        && report.unavailable.0.is_none()
+        && report.reason.0.is_none()
+    {
+        report.mode = IntegrationMode::NativeBridge;
     }
     report
 }
@@ -646,8 +647,8 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
         );
     }
     // A reason beside an integration that is on says why an invocation runs as typed here: the
-    // flags cannot be written, or the executable found first is a shim, so a new session gets none
-    // of it.
+    // flags cannot be written, they name the forwarder by its own name on a platform where that is
+    // not safe, or the executable found first is a shim, so a new session gets none of it.
     let usable = |report: &&CommandIntegrationReport| {
         report.state == CommandIntegrationState::On
             && report.unavailable.0.is_none()
