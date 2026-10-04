@@ -886,20 +886,21 @@ An installed release whose manifest carries a native bridge recipe, installed wi
 installation stands: the package is enabled, its repository has not revoked the release and the
 organisation's adapter allowlist, where there is one, names it. Disabling the package, a revocation,
 a list that no longer names it, a grant that withdraws that capability and removing the package each
-take the recipe out again, whatever the disable policy says about live bindings, and the installation
-stays. After every plugin change, every synchronisation, pin and removal, every change of the
-allowlist, and each time the daemon starts, the package's bridge is brought to what its
-installation wants, so a recipe
-a stopped daemon left part way is finished or taken out before anything else is served. The recipe
-keeps a journal of its own for each package under `native-bridges/` in the environment's state
-directory, apart from the catalogue's records, and never changes a method's answer or receipt: an
-installation's answer says what the catalogue did, and the journal says what the recipe did. Its
-version check needs a signed record that names the application's executable by digest: a build the
-release's entry in the repository's signed index names for this host's platform. Records arrive
-with a synchronisation, so the bridges are brought up to date after every sync as well. No published
-release names a build yet, so every recipe is still refused and the journal says why.
-`docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
-leaves.
+take the recipe out again, whatever the disable policy says about live bindings, and the
+installation stays. After every plugin change, every synchronisation, pin and removal, every change
+of the allowlist, and each time the daemon starts, the package's bridge is brought to what its
+installation wants, so a recipe a stopped daemon left part way is finished or taken out before
+anything else is served. The recipe keeps a journal of its own for each package under
+`native-bridges/` in the environment's state directory, apart from the catalogue's records, and
+never changes a method's answer or receipt: an installation's answer says what the catalogue did,
+and the journal says what the recipe did. Its version check needs a signed record that names the
+application's executable by digest: a build the release's entry in the repository's signed index
+names for this host's platform. Records arrive with a synchronisation, so the bridges are brought up
+to date after every sync as well. A recipe is refused, and the journal says why, when no signed
+record names an executable of the application, when no such executable is on the search path, when
+an executable there is not one a record names, and when the version a record names is outside the
+range the recipe is written for. `docs/plugins/catalogue.md` has what is checked before anything is
+written and what a removal leaves.
 
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
 through the same module a local caller reaches, so a device's `catalogue.list` and the owner's are
