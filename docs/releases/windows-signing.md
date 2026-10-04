@@ -48,43 +48,53 @@ certificate chain root-first and the timestamp certificate subject from the rele
 
 ## What a release carries
 
-`.github/workflows/release-windows.yml` builds on a GitHub-hosted `windows-2025` runner and signs
-every executable and PowerShell payload it staged: `kr.exe`, `kr-attach-guard.exe`, `kr-worker.exe`,
-`kr-controller.exe` and `kr-describe-inference.exe`, the PowerShell module scripts (`KalaReach.ShellBridge.psd1`,
-`KalaReach.ShellBridge.psm1`, `KrBridge.ps1`, `KrCbor.ps1`, `KrReader.ps1`), and the startup script
-`shells/psreadline/startup/kr-profile.ps1`. PowerShell will not load any of those under an all-signed
-execution policy unless every one of them carries a signature, so they are signed together or not at
-all.
+The `.github/workflows/release-windows.yml` workflow runs on the `windows-2025` (GitHub-hosted)
+runner and signs the `kr.exe`, `kr-attach-guard.exe`, `kr-worker.exe`, `kr-controller.exe`,
+`kr-describe-inference.exe`, `kr-hook.exe` and `kr-plugin-host.exe` executables, and the
+`KalaReach.ShellBridge.psd1`, `KalaReach.ShellBridge.psm1`, `KrBridge.ps1`, `KrCbor.ps1` and
+`KrReader.ps1` PowerShell module scripts, and the `shells/psreadline/startup/kr-profile.ps1` startup
+script. All the scripts need to be signed if they are to be loadable with an all-signed execution
+policy, so they are signed together or not at all.
 
 The archive also carries `LICENSE`, the package manifest `shells/psreadline/manifest.json`, and
 `shells/psreadline/LICENSE`. These files are data rather than executable code; they are not sent to
 SignTool. The archive itself (`.zip`), the gate receipt (`signatures.txt`), and the checksum file
 (`SHA256SUMS`) are likewise unsigned data files.
 
-The workflow builds all five executables that will be included in the release, one `--bin` target
-each, using the MSVC toolchain. The names and crates that contain them are: `kr` (in `kr-cli`),
-`kr-attach-guard` (in `kr-cli`), `kr-worker` (in `kr-worker`), `kr-controller` (in `kr-controller`),
-and `kr-describe-inference` (in `kr-describe-model`). It checks against the workspace's package
-metadata that these are all the binaries those four crates declare, except the stub the description
-tests start in place of the model and the benchmark that measures the model against real weights,
-which no release carries. The executables are copied by exact name from the `target\release`
-directory to a staging directory. Doing it by name is important so that the workflow does not simply
-copy everything in the release directory, which might include old binaries from a previous run that
-were cached.
+The workflow builds all seven of the executables to be included in the release (one `--bin` target
+at a time, using the MSVC toolchain). The executables, and the crates they come from, are `kr` and
+`kr-attach-guard` from `kr-cli`, `kr-worker` from `kr-worker`, `kr-controller` from `kr-controller`,
+`kr-describe-inference` from `kr-describe-model`, `kr-hook` from `kr-hook` and `kr-plugin-host` from
+`kr-plugin-host`. `kr-hook` is the forwarder that an agent's hooks start and the relay a launched
+agent reaches its worker through, and `kr-plugin-host` runs plugin components, one process per
+environment. Without them a host installed from the archive cannot run agent hooks or plugins. The
+workflow checks against the workspace package metadata that these are all the binaries those six
+crates declare (except for the model description test stub and the benchmark using real weights,
+which aren't included in the release). They are then copied, by specific name, from the
+`target\release` directory to the staging directory. It's important to copy them by specific name,
+as otherwise the copy might get old binaries from the cached `target\release` directory.
 
-The prebuilt version of libsodium that this workspace uses is built to use the static C runtime, but
-the Rust MSVC targets use the dynamic C runtime. Including both in a single executable leads to
-issues with having two different heap implementations, and the linker reports `LNK4098`. The
-workspace's `.cargo/config.toml` excludes the static C runtime from linking. The release job sets no
-`RUSTFLAGS`, since that variable would replace the flags that exclude the static C runtime, and a run
-that finds it set stops before it builds. After the five builds, the job reads their logs and stops
-if any link reported `LNK4098`, before anything is staged or signed.
+The included prebuilt libsodium is built to use the static C runtime, and the Rust MSVC targets use
+the dynamic C runtime. Including both in the same executable causes issues with the two different
+heaps, and the linker reports `LNK4098`. To avoid including the static C runtime when linking, the
+`.cargo/config.toml` file excludes it. However, if `RUSTFLAGS` is set, that replaces the flags which
+exclude the static C runtime. So the job doesn't set `RUSTFLAGS`, and will stop before it builds if
+it finds it set. Additionally, after the seven builds, the job reads the build logs and will stop if
+it finds that any link reported `LNK4098`, before anything is staged or signed.
 
 The archive holds a `signatures.txt` written by the verification step, not by the build. It records
 one line per artefact: the SHA-256 of the bytes that were verified, the certificate that signed
 them, its thumbprint, when it expires, the timestamping authority that countersigned, and the
 certificate chain from the root. It also records the SHA-256 digests of the data files. Beside the
 archive is a `SHA256SUMS` covering the archive itself.
+
+After the pack step, which holds the archive to its own inventory (a build that left an executable
+out would still match that), the release job checks that all seven executables are files at the top
+level of the archive, using the `scripts/check-windows-archive.ps1` script. This lists every
+executable the archive lacks and fails if the archive doesn't include them all, or if it can't be
+read at all. The gate job, which runs before the release job, tests the script with archives missing
+each of the executables, one with an executable below the top level, one which isn't an archive at
+all, and one which doesn't exist, as well as a control archive which should pass the check.
 
 Both records end every line in a line feed alone, although the runner that writes them is Windows.
 A carriage return would break the sum on macOS: `shasum` and the `sha256sum` macOS ships read it as
