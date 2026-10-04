@@ -617,6 +617,21 @@ fn the_grammar_admits_exactly_the_characters_validation_accepts() {
             admitted || refused || character == '"' || character == '\\',
             "the grammar leaves out {codepoint:#06x}, which validation accepts"
         );
+        // The quote and the backslash are the two a JSON string cannot hold bare.
+        assert!(
+            !(admitted && (character == '"' || character == '\\')),
+            "the grammar admits {codepoint:#06x}, which a string cannot hold"
+        );
+    }
+    // No codepoint of the surrogate range, which no UTF-8 text holds.
+    for surrogate in 0xD800..=0xDFFF_u32 {
+        let named = ranges
+            .iter()
+            .any(|(from, to)| (*from..=*to).contains(&surrogate));
+        assert!(
+            named == negated,
+            "the grammar admits the surrogate {surrogate:#06x}"
+        );
     }
 }
 
@@ -628,6 +643,30 @@ fn text_of(codepoints: &[u32]) -> String {
         .collect()
 }
 
+/// One token for every four bytes, rounded up: the stand-in tokenizer.
+fn stand_in(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+/// The prompt of a job at revision 2 over the cursor interval 3 to 11.
+fn prompt_at_two() -> Prompt {
+    Prompt {
+        revision: U64::new(2),
+        cursor_from: U64::new(3),
+        cursor_to: U64::new(11),
+        facts: Vec::new(),
+        events: Vec::new(),
+    }
+}
+
+/// The answer whose activity text is `activity`.
+fn answer_with(activity: &str) -> String {
+    format!(
+        "{{\"title\": \"kalareach\", \"activity_text\": \"{activity}\", \
+         \"source_cursor\": {{\"from\": 3, \"to\": 11}}, \"context_revision\": 2}}"
+    )
+}
+
 /// KR-REQ-22.18: an answer the output bound stopped is ended where it can be, at every place it
 /// can stop. Inside the activity text it is ended on a boundary between characters a person sees
 /// of the whole text, with the prompt's own revision and cursor interval written after it, and
@@ -635,13 +674,7 @@ fn text_of(codepoints: &[u32]) -> String {
 /// activity text, so inside the title, nothing is done and validation refuses it as it does today.
 #[test]
 fn an_answer_the_output_bound_stopped_is_ended_on_a_boundary_and_still_validates() {
-    let prompt = Prompt {
-        revision: U64::new(2),
-        cursor_from: U64::new(3),
-        cursor_to: U64::new(11),
-        facts: Vec::new(),
-        events: Vec::new(),
-    };
+    let prompt = prompt_at_two();
     // A combining mark after a letter, a family of three people joined by joiners, an Arabic
     // sentence, and plain text.
     let accented = text_of(&[
@@ -672,7 +705,7 @@ fn an_answer_the_output_bound_stopped_is_ended_on_a_boundary_and_still_validates
             .collect();
         for stopped_at in 0..=full.len() {
             let written = &full.as_bytes()[..stopped_at];
-            let ended = end_cut_answer(written, &prompt);
+            let ended = end_cut_answer(written, &prompt, usize::MAX, stand_in);
             let validated = validate(&ended, &produced_under(), &expectation(2));
             if stopped_at == full.len() {
                 assert_eq!(ended, written, "a whole answer is left as it is");
@@ -710,4 +743,91 @@ fn an_answer_the_output_bound_stopped_is_ended_on_a_boundary_and_still_validates
         ended_inside > 100,
         "{ended_inside} cuts inside an activity text were ended"
     );
+}
+
+/// KR-REQ-22.18: the answer an output bound stopped is within the bound it was stopped at, as the
+/// tokenizer counts, and a bigger bound never keeps less of the activity text. A bound with no room
+/// for the title and the fields that repeat the prompt leaves the bytes as they are, so the answer
+/// is refused and the session keeps its title.
+#[test]
+fn an_answer_the_output_bound_stopped_is_within_that_bound() {
+    let prompt = prompt_at_two();
+    let activity = "Checks the code-entry flow and host approval screen for the pairing work";
+    let full = answer_with(activity);
+    let written = &full.as_bytes()[..full.find("approval").expect("a word") + 3];
+    let mut last = 0;
+    let mut ended = 0;
+    for bound in 0..=stand_in(&full) {
+        let answer = end_cut_answer(written, &prompt, bound, stand_in);
+        if answer == written {
+            assert!(
+                bound < stand_in(&answer_with("C")),
+                "bound {bound} left room for the title and one character"
+            );
+            continue;
+        }
+        let answer = String::from_utf8(answer).expect("text");
+        assert!(
+            stand_in(&answer) <= bound,
+            "{} > {bound}",
+            stand_in(&answer)
+        );
+        let kept = validate(answer.as_bytes(), &produced_under(), &expectation(2))
+            .expect("an answer within its bound")
+            .activity;
+        assert!(kept.as_str().len() >= last, "a bigger bound kept less");
+        last = kept.as_str().len();
+        ended += 1;
+    }
+    assert!(ended > 10, "{ended} bounds ended the answer");
+}
+
+/// KR-REQ-22.18: nothing the model wrote is corrected. A number it had begun to repeat that is not
+/// the prompt's, bytes that are not text inside the answer, and a title that has not ended are each
+/// left as they are, and refused as they would be whole.
+#[test]
+fn what_the_model_wrote_wrongly_is_left_as_it_is() {
+    let prompt = prompt_at_two();
+    let full = answer_with("Checks the flow");
+    let wrong = full.replace("\"from\": 3", "\"from\": 7");
+    let stopped = wrong.find("\"to\"").expect("a field");
+    let written = &wrong.as_bytes()[..stopped];
+    assert_eq!(
+        end_cut_answer(written, &prompt, usize::MAX, stand_in),
+        written,
+        "a wrong echo of the interval"
+    );
+
+    let mut broken = full.clone().into_bytes();
+    let at = full.find("flow").expect("a word");
+    broken[at] = 0xFF;
+    let written = &broken[..at + 3];
+    assert_eq!(
+        end_cut_answer(written, &prompt, usize::MAX, stand_in),
+        written,
+        "bytes that are not text inside the activity text"
+    );
+
+    let written = &full.as_bytes()[..full.find("kalareach").expect("a title") + 4];
+    assert_eq!(
+        end_cut_answer(written, &prompt, usize::MAX, stand_in),
+        written,
+        "a title that has not ended"
+    );
+}
+
+/// KR-REQ-22.18: white space is not trimmed from inside a character a person sees. A prepended mark
+/// takes the space after it into its character, so the activity text stopped after it is ended
+/// before that character and not between the mark and its space.
+#[test]
+fn white_space_inside_a_character_is_not_trimmed_from_the_end_of_a_cut_activity_text() {
+    let prompt = prompt_at_two();
+    let activity = text_of(&[0x41, 0x600, 0x20, 0x42, 0x20, 0x43]);
+    let full = answer_with(&activity);
+    let written = &full.as_bytes()[..=full.find('B').expect("a letter")];
+    let ended = end_cut_answer(written, &prompt, usize::MAX, stand_in);
+    let kept = validate(&ended, &produced_under(), &expectation(2))
+        .expect("an answer that ends")
+        .activity;
+    assert_eq!(kept.as_str(), "A");
 }

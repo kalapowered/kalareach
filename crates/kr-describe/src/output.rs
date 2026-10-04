@@ -359,59 +359,107 @@ fn check_field(
     Ok(())
 }
 
-/// Ends an answer that ran out of output room, where it can be ended.
+/// Ends an answer that ran out of output room, where it can be ended, so that the whole answer is
+/// within `max_tokens` as `count` counts tokens.
 ///
 /// The model writes the answer a token at a time under the grammar, and the output bound can stop
 /// it before the object is closed. What it had written is a prefix of the grammar's object, and
 /// the grammar fixes the order of the fields, so where the prefix stopped is known. Only the
 /// activity text may end early:
 ///
-/// - Stopped inside the activity text, the text is cut back to the last boundary between characters
-///   a person sees, and the last of them is left out because the next token might have been part of
-///   it. The string is closed, and the two fields that repeat the revision and the cursor interval
-///   are written from the prompt, because they are the prompt's own values and no part of what the
-///   model chose to say.
-/// - Stopped after the activity text, inside the fields that repeat the prompt, those fields are
-///   written from the prompt the same way.
-/// - Already a whole object, or stopped before the activity text, or with nothing left of the
-///   activity text, the bytes come back as they are: a title is never cut, and what [`validate`]
-///   refuses it still refuses.
+/// - Stopped inside the activity text, or inside the fields that repeat the prompt after it, the
+///   answer is the title as written, the activity text cut back to the longest run of whole
+///   characters a person sees that leaves the answer within `max_tokens`, the closing quote, and
+///   the two fields that repeat the revision and the cursor interval written from the prompt,
+///   because they are the prompt's own values and no part of what the model chose to say. When it
+///   stopped inside the activity text the last character it had written is not kept, because the
+///   next token might have been part of it; and a run never ends in white space, which a published
+///   text would lose from inside a character.
+/// - Stopped inside the fields that repeat the prompt, what the model had written of them has to
+///   be the start of what the prompt says, or the bytes come back as they are: a wrong number is
+///   refused here as it is when the answer is whole.
+/// - Already a whole object, or stopped before the activity text, or with no run of the activity
+///   text that fits, or with bytes that are not text, the bytes come back as they are: a title is
+///   never cut, and what [`validate`] refuses it still refuses.
 #[must_use]
-pub fn end_cut_answer(written: &[u8], prompt: &crate::prompt::Prompt) -> Vec<u8> {
+pub fn end_cut_answer(
+    written: &[u8],
+    prompt: &crate::prompt::Prompt,
+    max_tokens: usize,
+    mut count: impl FnMut(&str) -> usize,
+) -> Vec<u8> {
+    let unchanged = || written.to_vec();
     if serde_json::from_slice::<serde_json::Value>(written).is_ok() {
-        return written.to_vec();
+        return unchanged();
     }
-    // Whole characters only: the last token can be half of one.
+    // Whole characters only: the last token can be half of one, and bytes that are not text in the
+    // middle are not an answer to end.
     let text = match std::str::from_utf8(written) {
         Ok(text) => text,
-        Err(error) => std::str::from_utf8(&written[..error.valid_up_to()]).unwrap_or_default(),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&written[..error.valid_up_to()]).unwrap_or_default()
+        }
+        Err(_) => return unchanged(),
     };
     // The strings of the object hold no quote, so the quotes are the fields' own: two around
     // `title`, two around its value, two around `activity_text`, and two around its value.
     let quotes: Vec<usize> = text.match_indices('"').map(|(at, _)| at).collect();
     if quotes.len() < 7 || &text[quotes[4]..=quotes[5]] != "\"activity_text\"" {
-        return written.to_vec();
+        return unchanged();
     }
-    let mut ended = if quotes.len() >= 8 {
-        text[..=quotes[7]].to_owned()
-    } else {
-        let started = quotes[6];
-        let activity = &text[started + 1..];
-        let kept = activity
-            .grapheme_indices(true)
-            .next_back()
-            .map_or("", |(last, _)| &activity[..last])
-            .trim_end();
-        if kept.is_empty() {
-            return written.to_vec();
-        }
-        format!("{}{kept}\"", &text[..=started])
-    };
-    ended.push_str(&format!(
+    let tail = format!(
         ", \"source_cursor\": {{\"from\": {}, \"to\": {}}}, \"context_revision\": {}}}",
         prompt.cursor_from.get(),
         prompt.cursor_to.get(),
         prompt.revision.get()
-    ));
-    ended.into_bytes()
+    );
+    let (activity, whole) = if quotes.len() >= 8 {
+        // What the model wrote after the activity text has to be the start of the tail.
+        let spaceless = |text: &str| text.replace(' ', "");
+        if !spaceless(&tail).starts_with(&spaceless(&text[quotes[7] + 1..])) {
+            return unchanged();
+        }
+        (&text[quotes[6] + 1..quotes[7]], true)
+    } else {
+        (&text[quotes[6] + 1..], false)
+    };
+
+    // The activity text in the characters a person sees, less the last when it may be unfinished,
+    // and less any that would end the text in white space.
+    let mut clusters: Vec<&str> = activity.graphemes(true).collect();
+    if !whole {
+        clusters.pop();
+    }
+    let ends_in_text = |kept: usize| {
+        kept > 0
+            && clusters[kept - 1]
+                .chars()
+                .next_back()
+                .is_some_and(|character| !character.is_whitespace())
+    };
+    let answer = |kept: usize| {
+        format!(
+            "{}{}\"{tail}",
+            &text[..=quotes[6]],
+            clusters[..kept].concat()
+        )
+    };
+    // The most clusters that leave the answer within the bound, found by halving; the one kept is
+    // one that was counted and fit.
+    let candidates: Vec<usize> = (1..=clusters.len())
+        .filter(|kept| ends_in_text(*kept))
+        .collect();
+    let (mut low, mut high) = (0, candidates.len());
+    let mut best = None;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let candidate = answer(candidates[middle]);
+        if count(&candidate) <= max_tokens {
+            best = Some(candidate);
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    best.map_or_else(unchanged, String::into_bytes)
 }

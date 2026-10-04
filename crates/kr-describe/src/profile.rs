@@ -431,8 +431,17 @@ impl ModelProfile {
         {
             return refuse("an execution bound of nought");
         }
-        if fields.execution.max_output_tokens >= fields.execution.context_tokens {
-            return refuse("an output bound that leaves no room for a prompt");
+        // A prompt is never more tokens than it is bytes, whatever the vocabulary, so a window that
+        // holds the instruction byte for byte, a token each for the start and the end of a sequence
+        // and the output bound has room for a prompt of any tokenizer. A profile with less would
+        // have jobs that could not exist.
+        let instruction = crate::prompt::Prompt::bare().text().len() as u64;
+        if u64::from(fields.execution.context_tokens)
+            < instruction + 2 + u64::from(fields.execution.max_output_tokens)
+        {
+            return refuse(
+                "a context window with no room for the instruction beside the output bound",
+            );
         }
         if fields.assets.is_empty() {
             return refuse("no assets to verify");

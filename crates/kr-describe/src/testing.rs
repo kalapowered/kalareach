@@ -19,7 +19,7 @@ use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, Signature64, U64};
 
 use crate::priority::Cancellation;
 use crate::profile::catalogue::Catalogue;
-use crate::profile::{Asset, ModelProfile, ProfileDocument, ProfileTrust, SignedProfile};
+use crate::profile::{Asset, ProfileDocument, ProfileTrust, SignedProfile};
 use crate::prompt::Prompt;
 use crate::serve::{Generating, Job, LoadWork, Loading, Model, Options, Verifying};
 use crate::wire::{
@@ -775,31 +775,6 @@ impl TestProfile {
         document["execution"]["resident_estimate"]["weights_bytes"] = total.into();
         document.to_string()
     }
-}
-
-/// The default profile this build ships, with a context window of `context_tokens`, signed with a
-/// key of its own: what a profile whose window is too small for a description looks like.
-///
-/// # Panics
-///
-/// Panics when the shipped document is not what this expects, which is a mistake in this build.
-#[must_use]
-pub fn default_profile_with_window(context_tokens: u32) -> ModelProfile {
-    let mut document: serde_json::Value =
-        serde_json::from_str(crate::profile::catalogue::DEFAULT_PROFILE_DOCUMENT)
-            .expect("a shipped profile is JSON");
-    document["execution"]["context_tokens"] = context_tokens.into();
-    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a test key");
-    let document = ProfileDocument::new(document.to_string().into_bytes());
-    let transcript = document.transcript().expect("a transcript");
-    let signature = kr_crypto::sign::sign(&keys, &transcript).expect("a signature");
-    ProfileTrust::new(vec![*keys.public()])
-        .verify(&SignedProfile {
-            document,
-            key: *keys.public(),
-            signature,
-        })
-        .expect("a profile signed with the key it is verified under")
 }
 
 /// A catalogue a test signs with a key of its own, for a daemon and for the stub executable it
