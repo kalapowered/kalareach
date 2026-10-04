@@ -29,6 +29,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(windows)]
+use kr_protocol::broker::AgentOwnership;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, GatewayConnectionId, PluginId};
 
@@ -684,24 +686,39 @@ fn start_agent(
 /// after that parent exits, so the broker places a caller under an agent by what the agent's job
 /// holds rather than by a walk up the parents. It is given its standard input and output as pipes
 /// and nothing else this worker holds.
+///
+/// An agent whose package the configuration explicitly chose reduced ownership for is started in
+/// a job of its own alone: one that ends what it holds when the last handle to it closes, which is
+/// held by the session's record of its reduced agents, so the session's closure lists what it
+/// holds and ends it. Nothing else changes about the launch, and the vendor's own sandbox is left
+/// exactly as the vendor made it.
 #[cfg(windows)]
 fn start_agent(
     program: &str,
     arguments: &[String],
     directory: &std::path::Path,
     registration: &std::path::Path,
-    session: &crate::windows::job::SessionJob,
+    session: &Arc<crate::windows::job::SessionJob>,
+    ownership: AgentOwnership,
 ) -> Result<(AgentChild, ProcessStartIdentity)> {
     let could_not_start =
         |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
-    let job = crate::windows::job::AgentJob::create().map_err(could_not_start)?;
+    let reduced = ownership == AgentOwnership::Reduced;
+    let job = Arc::new(
+        if reduced {
+            crate::windows::job::AgentJob::create_owning()
+        } else {
+            crate::windows::job::AgentJob::create()
+        }
+        .map_err(could_not_start)?,
+    );
     let mut child = crate::windows::launch::start(&crate::windows::launch::Spec {
         program: std::path::Path::new(program),
         arguments,
         directory,
         // One variable: the registration names the credential file beside it.
         environment: &[("KR_REGISTRATION", registration.as_os_str())],
-        session: Some(session),
+        session: (!reduced).then_some(session.as_ref()),
         agent: &job,
         pipe_input: true,
         pipe_output: true,
@@ -720,8 +737,59 @@ fn start_agent(
             )));
         }
     };
-    crate::windows::job::keep_agent(started.clone(), Arc::new(job), child.stdin.clone());
+    if reduced {
+        // Before the agent has run for long enough to matter: the closure reads the session's
+        // record, and an agent it did not know of would be one it could not end.
+        session.adopt_reduced(Arc::clone(&job));
+    }
+    crate::windows::job::keep_agent(started.clone(), job, child.stdin.clone());
     Ok((child, started))
+}
+
+/// Refuses a launch whose jobs a vendor's own sandbox cannot run under, by name, before anything
+/// starts.
+///
+/// Section 7 allows two outcomes where a vendor sandbox is incompatible with the jobs it would
+/// run under: a named launch failure, or an explicitly selected reduced-ownership profile. The
+/// vendor's sandbox is never switched off and breakaway is never granted to make it start. What
+/// the sandbox cannot run under is a chain that restricts desktops: it makes one of its own.
+#[cfg(windows)]
+fn refuse_what_a_vendor_sandbox_cannot_run_under(
+    session: &crate::windows::job::SessionJob,
+    ownership: AgentOwnership,
+) -> Result<()> {
+    use crate::windows::job::SandboxBlock;
+
+    // An agent in a job of its own is not under the session's, so only the worker's own job can
+    // stop it.
+    let held_by = (ownership == AgentOwnership::Full).then_some(session);
+    let block = crate::windows::job::sandbox_block(held_by).map_err(|error| {
+        BrokerError::PreconditionFailed {
+            detail: format!(
+                "the limits of the jobs this agent would start in could not be read, so nothing \
+                 was started: {error}"
+            ),
+        }
+    })?;
+    let detail = match block {
+        None => return Ok(()),
+        Some(SandboxBlock::SessionJob) => {
+            "the session's job restricts access to desktops, which a vendor's own sandbox needs \
+             to make one of its own, so nothing was started and the sandbox was left as it is; \
+             name this agent's package in the configuration's agents section with reduced \
+             ownership to start it in a job of its own, which its closure then reads as \
+             incomplete coverage"
+        }
+        Some(SandboxBlock::WorkersOwnJob) => {
+            "the job this worker is itself in restricts access to desktops, which a vendor's own \
+             sandbox needs to make one of its own, and every process this worker starts is under \
+             that job whatever job the agent is put in, so nothing was started and the sandbox \
+             was left as it is"
+        }
+    };
+    Err(BrokerError::PreconditionFailed {
+        detail: detail.to_owned(),
+    })
 }
 
 /// One agent this host started, and what it started.
@@ -933,6 +1001,8 @@ impl NativeGateway {
                 detail: "this launch has no session job to be held by, so nothing was started"
                     .to_owned(),
             })?;
+        #[cfg(windows)]
+        refuse_what_a_vendor_sandbox_cannot_run_under(&session, intent.profile.ownership)?;
         crate::broker::process::check_private_directory(&self.runtime_directory)?;
         let credential = Credential::generate()?;
         // The launch's hold on its instance. Every failure from here gives back what it took, by
@@ -954,6 +1024,7 @@ impl NativeGateway {
             &self.launch.working_directory,
             &registration_path,
             &session,
+            reservation.profile().ownership,
         )?;
         #[cfg(feature = "testing")]
         {
