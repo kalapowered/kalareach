@@ -2231,8 +2231,9 @@ impl TransferService {
     /// the session's retention.
     ///
     /// Submission itself is a separate action performed elsewhere: this records its consequence for
-    /// storage and nothing else. Recording it again changes nothing, so a repeat of the submission
-    /// can settle a record the first attempt did not reach.
+    /// storage and nothing else. It binds the attachments the draft holds when it is called. An
+    /// attachment that is already submitted keeps the submission it has, so recording again
+    /// changes nothing for it.
     ///
     /// # Errors
     ///

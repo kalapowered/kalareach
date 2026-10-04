@@ -448,14 +448,15 @@ impl TransferModule {
         }
     }
 
-    /// Records that a prompt carrying a draft was submitted to a session, which moves the draft's
+    /// Records that a prompt naming a draft is being sent to a session, which moves the draft's
     /// attachments from the seven-day window of an unused attachment onto that session's retention.
     ///
-    /// It runs once the session's worker has accepted the submission, and again for a repeat of the
-    /// same action, which the worker answers from what it kept: recording it twice changes
-    /// nothing, and a repeat is how a record the first attempt did not reach is settled. A draft
-    /// this actor does not hold has no attachments for this host to retain, so naming one is not
-    /// a failure.
+    /// It runs before the prompt is forwarded to the session's worker, so that nothing the worker
+    /// does or fails to do afterwards decides whether a file this host was asked to hand to a
+    /// session is kept. It binds the attachments the draft holds at that moment, and a repeat of
+    /// the action that the worker answers from what it kept sends nothing and records nothing. A
+    /// draft this actor does not hold has no attachments for this host to retain, so naming one is
+    /// not a failure.
     ///
     /// # Errors
     ///
