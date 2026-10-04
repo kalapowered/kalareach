@@ -88,10 +88,12 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }
-# WebP is deliberately absent. The pinned lossless decoder derives its Huffman group count from a
-# sixteen-bit metadata field and allocates tables from it, which no pixel-based budget can bound, so
-# the format is not compiled in and a WebP publishes without a preview. It returns when the pin
-# bounds that allocation.
+# The preview module runs PNG, JPEG and GIF and nothing else, and these are the decoders it asks for.
+# WebP is withheld by the module's allowlist, not by this list: the lossless decoder derives its
+# Huffman group count from a sixteen-bit metadata field and allocates tables from it, which no
+# pixel-based budget can bound, and the terminal engine's `image` dependency enables every default
+# format, so Cargo links the WebP decoder into the daemon and the worker whatever is listed here. A
+# WebP publishes without a preview. It returns when WebP decoding is bounded in what it allocates.
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
 interprocess = { version = "=2.4.4", features = ["tokio"] }
 iroh = { version = "=1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-ring"] }

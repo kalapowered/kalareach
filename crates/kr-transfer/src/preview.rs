@@ -6,17 +6,20 @@
 //! either one needs a reviewed renderer, and this is not one.
 //!
 //! WebP is on that list and is withheld here, which is a decision rather than an omission. The
-//! pinned lossless decoder takes its Huffman group count from a sixteen-bit metadata field and
-//! allocates a table set per group, so a file of a few kilobytes can ask for hundreds of megabytes
-//! that no bound on pixels can catch. The decoder is not compiled in, the bytes are recognised
-//! from their signature, and the attachment publishes with no preview and a reason. The preview
-//! returns when the pin bounds that allocation.
+//! lossless decoder takes its Huffman group count from a sixteen-bit metadata field and allocates
+//! a table set per group, so a file of a few kilobytes can ask for hundreds of megabytes that no
+//! bound on pixels can catch. The withholding is this module's allowlist: only PNG, JPEG and GIF
+//! reach a decoder, a WebP is recognised from its signature, and the attachment publishes with no
+//! preview and a reason. It does not depend on what is linked. The terminal engine's own `image`
+//! dependency enables every default format and Cargo builds one `image` for the whole graph, so
+//! the WebP decoder is linked into the daemon and the worker whatever this crate's features say.
+//! The preview returns when WebP decoding is bounded in what it allocates.
 //!
 //! Three properties matter more than the decode itself.
 //!
 //! * The format comes from the bytes, not from the client. A declared media type is a claim and a
-//!   filename extension is metadata; `image`'s own sniffing decides what decoder runs, and PNG,
-//!   JPEG and GIF are the only decoders this crate compiles in.
+//!   filename extension is metadata; `image`'s own sniffing names the format, and only PNG, JPEG
+//!   and GIF are ever run: a format outside those three is refused before a decoder is built.
 //! * A refusal is a refusal, never a substitute. When a decode fails, is too large, or is a format
 //!   this decoder does not handle, the attachment publishes with no preview and the original file
 //!   is untouched. Nothing invents a placeholder image.
@@ -49,18 +52,18 @@ const NEVER_DECODED: &[&str] = &[
 /// This is the number that bounds the pixel buffers of a decode, which is the part image
 /// dimensions decide. `image` documents its own allocation limit as advisory and its decoders hold
 /// more than the output buffer while they work, so the limit is set on the decoder *and* the decode
-/// is refused in advance on this charge. Sixteen is the worst case among the decoders compiled in
-/// here:
+/// is refused in advance on this charge. Sixteen is the worst case among the decoders this module
+/// runs:
 ///
 /// * a PNG decoded to sixteen-bit RGBA is eight bytes per pixel of output;
-/// * a decoder that composites, as an animated WebP would, holds the output, the frame it decoded
-///   and the canvas it draws onto, which is three four-byte buffers at once;
+/// * a decoder that composites holds the output, the frame it decoded and the canvas it draws
+///   onto, which is three four-byte buffers at once;
 /// * a GIF holds its frame buffer and the image it crops into.
 ///
 /// Sixteen covers each of those with room left. What it does not bound is a structure a codec
 /// allocates from its own metadata rather than from its dimensions; the answer to a decoder that
-/// does that is not to compile it in, which is why WebP is withheld. The number belongs to the pins
-/// in the manifest: it is re-derived when `image` or one of its codecs moves.
+/// does that is not to run it, which is why WebP is withheld. The number belongs to the pins in the
+/// manifest: it is re-derived when `image` or one of its codecs moves.
 const DECODE_BYTES_PER_PIXEL: u64 = 16;
 
 /// Why no preview was produced.
@@ -358,9 +361,9 @@ fn header<S: Read + Seek>(
         })?;
     let format = match reader.format() {
         Some(format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif)) => format,
-        // The decoder is not compiled in, so `image` cannot name this format. The signature is
-        // read here instead, so the refusal says which format it was rather than lumping a WebP in
-        // with everything this host does not recognise.
+        // Every other format is refused before a decoder is built, whichever decoders are linked.
+        // A WebP's signature is read here, so the refusal says which format it was rather than
+        // lumping it in with everything this host does not run.
         _ if webp_signature(source)? => {
             return Err(PreviewRefusal::FormatWithheld {
                 reason: WEBP_WITHHELD,
@@ -493,7 +496,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_format_produces_no_preview() {
-        // A TIFF header. The format is real and this build does not compile its decoder.
+        // A TIFF header: a real image format that this module does not run.
         let mut source = Cursor::new(b"II\x2a\x00\x08\x00\x00\x00".to_vec());
         assert_eq!(
             generate(&mut source, "image/tiff"),

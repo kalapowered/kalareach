@@ -162,7 +162,7 @@ fn a_failed_preview_keeps_the_original_file_and_says_why() {
 #[test]
 fn an_unsupported_format_transfers_as_a_file() {
     let harness = Harness::create();
-    // A TIFF header: a real image format whose decoder is not compiled in.
+    // A TIFF header: a real image format that the preview module does not run.
     let handle = harness.publish(b"II\x2a\x00\x08\x00\x00\x00", "image/tiff", "scan.tiff");
     assert!(handle.preview.as_ref().is_none());
     assert!(
@@ -323,14 +323,15 @@ fn a_gif_frame_larger_than_its_screen_is_refused() {
 }
 
 /// KR-REQ-14.13: a WebP publishes without a preview, and says so, rather than reaching a decoder
-/// whose allocation this host cannot bound.
+/// whose allocation this host cannot bound, though the WebP decoder is linked.
 ///
 /// The bytes below are a *small* lossless WebP: a sixteen-by-sixteen canvas, well inside the pixel
 /// charge, and forty-odd bytes, well inside the encoded-input limit. Neither of those bounds would
 /// have stopped it. What makes it dangerous is the field after the header, which says the number of
 /// Huffman groups comes from the entropy image rather than from the canvas, and that is the
-/// allocation no bound on pixels can reach. Nothing decodes it: the decoder is not compiled in, and
-/// the refusal comes from the twelve-byte container signature before any decoder is built.
+/// allocation no bound on pixels can reach. Nothing decodes it: this crate's tests link the WebP
+/// decoder, as the daemon and the worker do, and the refusal comes from the allowlist and the
+/// twelve-byte container signature before any decoder is built.
 #[test]
 fn a_webp_publishes_without_a_preview_and_says_why() {
     let harness = Harness::create();
