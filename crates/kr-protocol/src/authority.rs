@@ -49,6 +49,9 @@ pub enum RequiredAuthority {
     VoiceGrant,
     /// An installation or host service credential presented at a service endpoint.
     ServiceCredential,
+    /// An account's token, presented in the same request as the service credential and checked
+    /// with it. The account it names is the one whose storage the request reads or changes.
+    AccountToken,
     /// The registered plugin effect's own declared rights, intersected at dispatch.
     PluginEffectRights,
     /// The verified originating application or helper and its caller token on private IPC.
@@ -165,6 +168,8 @@ pub enum ResourceSelectorKind {
     Draft,
     /// One upload or download transfer.
     Transfer,
+    /// One stored archive object, named by its archive and object identifiers.
+    StoredObject,
     /// One project repository.
     Project,
     /// One directory the owner authorised for repository work.
@@ -315,6 +320,14 @@ pub enum IdempotencyBehaviour {
     Keyed {
         /// The key the operation is idempotent under.
         key: &'static str,
+    },
+    /// Applies only against the revision the caller read. A request decided against a revision
+    /// the record has left changes nothing and is answered with the state as it stands, whether or
+    /// not an earlier copy of it landed. A request against the current revision of an existing
+    /// record that asks for what the record already holds changes nothing and says so.
+    CompareAndSwap {
+        /// The revision the request is compared against, named by what it is a revision of.
+        against: &'static str,
     },
     /// An ordered stream. Positions are acknowledged per connection and never replayed;
     /// reconnecting creates a new stream identity.

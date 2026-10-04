@@ -1085,6 +1085,7 @@ export type ResourceSelectorKind =
   | 'question'
   | 'draft'
   | 'transfer'
+  | 'stored_object'
   | 'project'
   | 'project_location'
   | 'workspace'
@@ -15811,6 +15812,14 @@ export interface MethodEntry {
           key: string
         }
       }
+    | {
+        compare_and_swap: {
+          /**
+           * The revision the request is compared against, named by what it is a revision of.
+           */
+          against: string
+        }
+      }
     | 'ordered_stream'
   /**
    * The only ingress classes that may reach this method.
@@ -16048,6 +16057,7 @@ export interface RequiredRight {
     | 'issuing_owner_context'
     | 'voice_grant'
     | 'service_credential'
+    | 'account_token'
     | 'plugin_effect_rights'
     | 'local_caller_token'
     | 'issuer_delegation'

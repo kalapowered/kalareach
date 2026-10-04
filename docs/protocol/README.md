@@ -471,13 +471,13 @@ Each entry states:
 | --- | --- |
 | `effect` | `read` or `write` |
 | `ingress` | The only ingress classes that may reach the method |
-| `required_rights` | Everything the actor must present, intersected |
-| `resource_selectors` | The resources the request names and the host resolves first |
+| `required_rights` | Everything the actor must present, intersected: grant rights and the proofs presented beside them, such as a service credential or an account token |
+| `resource_selectors` | The resources the request names and the host resolves first, such as a session, a transfer or one stored archive object |
 | `history_filter` | How the shared history filter applies to the result |
 | `capability` | Which capability evidence is required, and which revision it is bound to |
 | `freshness` | Which freshness context the request carries |
 | `confirmation` | Whether a fresh owner confirmation is required |
-| `idempotency` | How a repeated request is resolved |
+| `idempotency` | How a repeated request is resolved: an idempotent read, deduplication by action, a protocol key, a comparison against a revision, or an ordered stream |
 
 Reading the fields:
 
@@ -667,10 +667,13 @@ predecessor needs evidence from outside this chain.
 
 ## The service credential
 
-Every method in the `Services` group of section 23 is authenticated the same way, by one credential
-defined in `crates/kr-protocol/src/service.rs`. No account is involved. What a caller proves is that
-it holds the private half of one key, and that the request in front of the service is the request
-that key signed.
+All the methods of the `Services` group of section 23 share the same authentication method and the
+same credential (defined in `crates/kr-protocol/src/service.rs`). What a caller proves is that it
+holds the private half of one key, and that the request in front of the service is the request that
+key signed. For the methods related to the managed storage, the requests also contain the token of
+the account they concern. For the methods `backup.manifest` and `sync.compare_exchange`, some of the
+requests (a backup generation's publication, and the requests about the recovery bundle) contain
+the token of the account they concern, but not all of them.
 
 A signature covers `CBOR([domain, ServiceRequestPayload])`, and the payload carries five fields:
 
@@ -678,7 +681,7 @@ A signature covers `CBOR([domain, ServiceRequestPayload])`, and the payload carr
 | --- | --- |
 | `gateway_origin` | A signature made for one deployment replayed against another |
 | `method` | A signature for a read presented as the authorisation for a write |
-| `nonce` | The same signed request accepted twice |
+| `nonce` | The same signed request taking effect twice |
 | `signed_at_ms` | A captured request held and presented much later |
 | `body_digest` | The body swapped for another under a signature that still verifies |
 
@@ -694,12 +697,26 @@ still admissible for another whole window after it was made. `ServiceRequestPayl
 the first check and `nonce_retained_until_ms` says how long the second one has to remember.
 
 `InstallationId` is the first sixteen bytes of the SHA-256 of the device authorisation public key,
-written in hyphenated form. It is derived rather than asserted: a caller that presents a key and a
-signature has already proved which installation it is, so nothing in a request body says who the
-caller is. An identifier is 128 bits, so it names a key rather than standing in for one: a service
-records the whole key it first saw, looks it up by the identifier, and compares against the key. A
-later request carrying a different key is refused, which makes replacing an installation key a
-deliberate step rather than a side effect of asking.
+formatted with hyphens. It is derived rather than asserted: a caller that presents a key and a
+signature has already proved which installation it is, so no request body is taken to say who the
+caller is. A storage body does name its installation, but the service compares that name with the
+identifier the key derives and refuses a mismatch. An identifier is 128 bits, so it names a key
+rather than standing in for one: a service records the whole key it first saw, looks it up by the
+identifier, and compares against the key. A later request carrying a different key is refused, which
+makes replacing an installation key a deliberate step rather than a side effect of asking.
+
+Each of the eight `storage.*` methods lists `account_token` beside `service_credential` in its
+`required_rights`. This token must have the scope `backup.write`, and it names the account whose
+storage the request reads or changes. This token is not bound to any installation; instead, the
+installation specified in the body of the storage method is checked against the signing key as
+described above. That ties the two proofs to one caller.
+
+For the storage methods, a key that names the request nonce, as `installation id + request nonce`
+does, means a request carrying that nonce. A key without one, as `upload id` does, means a fresh
+signature for the same identity. That is not permission to send a request again; a client decides
+that for each request. `storage.retention.set` is compared against the retention revision instead: a
+request decided against a revision the record has left changes nothing, and the answer carries the
+retention as it stands.
 
 An origin is an origin, so `GatewayOrigin` uses the grammar `RendezvousOrigin` already fixes: a
 scheme, a canonically spelled host, an optional non-default port, and nothing else. The one

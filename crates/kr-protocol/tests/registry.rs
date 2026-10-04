@@ -1116,8 +1116,26 @@ fn service_methods_use_a_service_credential() {
                 "{}: a service method presents a service credential",
                 entry.name
             );
+            if entry.name.starts_with("storage.") {
+                assert!(
+                    entry.required_rights.iter().any(|required| matches!(
+                        required.authority,
+                        RequiredAuthority::AccountToken
+                    )),
+                    "{}: managed storage belongs to an account, which presents its token beside the credential",
+                    entry.name
+                );
+            }
         }
     }
+
+    assert!(
+        matches!(
+            lookup("storage.retention.set").expect("listed").idempotency,
+            IdempotencyBehaviour::CompareAndSwap { .. }
+        ),
+        "a retention change is decided against the revision the caller read"
+    );
 }
 
 #[test]

@@ -283,10 +283,10 @@ links to its document.
 | `authority.sync` | write | `service_client` | Exchange signed revocation requests and host acknowledgements. Only the host issues its own ordered revisions, and it rejects an older revision. |  |
 | `sync.compare_exchange` | write | `service_client` | Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation. |  |
 | `backup.manifest` | write | `service_client` | Publish or fetch a backup generation manifest. Writer authority is verified. |  |
-| `storage.status` | read | `service_client` | Report what managed storage this principal holds, what is awaiting deletion and the retention the service applies to it. |  |
-| `storage.retention.set` | write | `service_client` | Turn managed backup storage on and set how many daily snapshots it keeps, within the bounds the service publishes. It is off until this is asked for. |  |
+| `storage.status` | read | `service_client` | Report what managed storage this account holds, what is awaiting deletion and the retention recorded for it. |  |
+| `storage.retention.set` | write | `service_client` | Turn managed backup storage on or off and record the number of daily snapshots the account's backups keep, within the bounds the service publishes. It is off until this is asked for. A change decided against a revision the record has left changes nothing and is answered with the retention as it stands. |  |
 | `storage.upload.create` | write | `service_client` | Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists. |  |
-| `storage.upload.part` | write | `service_client` | Upload one part. The service reads at most the declared length and refuses an oversized or wrong-hash body before it writes anything. |  |
+| `storage.upload.part` | write | `service_client` | Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content. |  |
 | `storage.upload.complete` | write | `service_client` | Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave. |  |
 | `storage.upload.abort` | write | `service_client` | Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed. |  |
 | `storage.object.read` | read | `service_client` | Read a bounded range of one stored object's ciphertext. The service holds no key for it. |  |

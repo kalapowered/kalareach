@@ -4535,12 +4535,16 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
         "installation"
       ],
-      "summary": "Report what managed storage this principal holds, what is awaiting deletion and the retention the service applies to it.",
+      "summary": "Report what managed storage this account holds, what is awaiting deletion and the retention recorded for it.",
       "version": 1
     },
     {
@@ -4551,8 +4555,8 @@
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "keyed": {
-          "key": "principal + retention revision"
+        "compare_and_swap": {
+          "against": "retention revision"
         }
       },
       "ingress": [
@@ -4564,12 +4568,16 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
         "installation"
       ],
-      "summary": "Turn managed backup storage on and set how many daily snapshots it keeps, within the bounds the service publishes. It is off until this is asked for.",
+      "summary": "Turn managed backup storage on or off and record the number of daily snapshots the account's backups keep, within the bounds the service publishes. It is off until this is asked for. A change decided against a revision the record has left changes nothing and is answered with the retention as it stands.",
       "version": 1
     },
     {
@@ -4581,7 +4589,7 @@
       "history_filter": "not_applicable",
       "idempotency": {
         "keyed": {
-          "key": "archive id + object id"
+          "key": "installation id + request nonce"
         }
       },
       "ingress": [
@@ -4593,11 +4601,16 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
-        "transfer",
-        "installation"
+        "installation",
+        "stored_object",
+        "transfer"
       ],
       "summary": "Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists.",
       "version": 1
@@ -4623,12 +4636,17 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
+        "installation",
         "transfer"
       ],
-      "summary": "Upload one part. The service reads at most the declared length and refuses an oversized or wrong-hash body before it writes anything.",
+      "summary": "Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content.",
       "version": 1
     },
     {
@@ -4652,9 +4670,14 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
+        "installation",
         "transfer"
       ],
       "summary": "Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave.",
@@ -4681,9 +4704,14 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
+        "installation",
         "transfer"
       ],
       "summary": "Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed.",
@@ -4706,10 +4734,15 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
-        "transfer"
+        "installation",
+        "stored_object"
       ],
       "summary": "Read a bounded range of one stored object's ciphertext. The service holds no key for it.",
       "version": 1
@@ -4723,7 +4756,7 @@
       "history_filter": "not_applicable",
       "idempotency": {
         "keyed": {
-          "key": "archive id + object id"
+          "key": "installation id + request nonce"
         }
       },
       "ingress": [
@@ -4735,10 +4768,15 @@
         {
           "authority": "service_credential",
           "when": "always"
+        },
+        {
+          "authority": "account_token",
+          "when": "always"
         }
       ],
       "resource_selectors": [
-        "transfer"
+        "installation",
+        "stored_object"
       ],
       "summary": "Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released.",
       "version": 1
