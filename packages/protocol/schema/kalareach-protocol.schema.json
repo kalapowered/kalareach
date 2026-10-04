@@ -15909,6 +15909,29 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
+          "description": "Applies only against the revision the caller read. A request decided against a revision\nthe record has left changes nothing and is answered with the state as it stands, whether or\nnot an earlier copy of it landed. A request against the current revision of an existing\nrecord that asks for what the record already holds changes nothing and says so.",
+          "properties": {
+            "compare_and_swap": {
+              "additionalProperties": false,
+              "properties": {
+                "against": {
+                  "description": "The revision the request is compared against, named by what it is a revision of.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "against"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "compare_and_swap"
+          ],
+          "type": "object"
+        },
+        {
           "const": "ordered_stream",
           "description": "An ordered stream. Positions are acknowledged per connection and never replayed;\nreconnecting creates a new stream identity.",
           "type": "string"
@@ -19200,12 +19223,12 @@
         },
         {
           "const": "storage.status",
-          "description": "Report what managed storage this principal holds, what is awaiting deletion and the retention the service applies to it.",
+          "description": "Report what managed storage this account holds, what is awaiting deletion and the retention recorded for it.",
           "type": "string"
         },
         {
           "const": "storage.retention.set",
-          "description": "Turn managed backup storage on and set how many daily snapshots it keeps, within the bounds the service publishes. It is off until this is asked for.",
+          "description": "Turn managed backup storage on or off and record the number of daily snapshots the account's backups keep, within the bounds the service publishes. It is off until this is asked for. A change decided against a revision the record has left changes nothing and is answered with the retention as it stands.",
           "type": "string"
         },
         {
@@ -19215,7 +19238,7 @@
         },
         {
           "const": "storage.upload.part",
-          "description": "Upload one part. The service reads at most the declared length and refuses an oversized or wrong-hash body before it writes anything.",
+          "description": "Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content.",
           "type": "string"
         },
         {
@@ -29289,6 +29312,11 @@
           "type": "string"
         },
         {
+          "const": "account_token",
+          "description": "An account's token, presented in the same request as the service credential and checked\nwith it. The account it names is the one whose storage the request reads or changes.",
+          "type": "string"
+        },
+        {
           "const": "plugin_effect_rights",
           "description": "The registered plugin effect's own declared rights, intersected at dispatch.",
           "type": "string"
@@ -29399,6 +29427,11 @@
         {
           "const": "transfer",
           "description": "One upload or download transfer.",
+          "type": "string"
+        },
+        {
+          "const": "stored_object",
+          "description": "One stored archive object, named by its archive and object identifiers.",
           "type": "string"
         },
         {

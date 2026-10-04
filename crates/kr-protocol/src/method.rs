@@ -259,6 +259,10 @@ const fn keyed(key: &'static str) -> IdempotencyBehaviour {
     IdempotencyBehaviour::Keyed { key }
 }
 
+const fn compare_and_swap(against: &'static str) -> IdempotencyBehaviour {
+    IdempotencyBehaviour::CompareAndSwap { against }
+}
+
 const NO_CAPABILITY: CapabilityRequirement = CapabilityRequirement::None;
 const READ: IdempotencyBehaviour = IdempotencyBehaviour::IdempotentRead;
 const ACTION: IdempotencyBehaviour = IdempotencyBehaviour::ActionDeduplicated;
@@ -1409,65 +1413,75 @@ methods! {
     doc: "Publish or fetch a backup generation manifest. Writer authority is verified.";
 
     StorageStatus = "storage.status", Services,
-    effect: Read, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    effect: Read, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
     selectors: [Installation],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: READ,
-    doc: "Report what managed storage this principal holds, what is awaiting deletion and the \
-          retention the service applies to it.";
+    doc: "Report what managed storage this account holds, what is awaiting deletion and the \
+          retention recorded for it.";
 
     StorageRetentionSet = "storage.retention.set", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
     selectors: [Installation],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
-    confirmation: None, idempotency: keyed("principal + retention revision"),
-    doc: "Turn managed backup storage on and set how many daily snapshots it keeps, within the \
-          bounds the service publishes. It is off until this is asked for.";
+    confirmation: None, idempotency: compare_and_swap("retention revision"),
+    doc: "Turn managed backup storage on or off and record the number of daily snapshots the \
+          account's backups keep, within the bounds the service publishes. It is off until this \
+          is asked for. A change decided against a revision the record has left changes nothing \
+          and is answered with the retention as it stands.";
 
     StorageUploadCreate = "storage.upload.create", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer, Installation],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, StoredObject, Transfer],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
-    confirmation: None, idempotency: keyed("archive id + object id"),
+    confirmation: None, idempotency: keyed("installation id + request nonce"),
     doc: "Reserve the declared maximum and allocate one random object key, upload identifier and \
           immutable part table. No content is accepted before all of that exists.";
 
     StorageUploadPart = "storage.upload.part", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, Transfer],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: keyed("upload id + part number"),
-    doc: "Upload one part. The service reads at most the declared length and refuses an oversized \
-          or wrong-hash body before it writes anything.";
+    doc: "Upload one part. The service reads at most the declared length plus one byte and \
+          refuses an oversized or wrong-hash body before it writes the part's content.";
 
     StorageUploadComplete = "storage.upload.complete", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, Transfer],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: keyed("upload id"),
     doc: "Complete the upload. The service verifies every part size and the total, settles the \
           hold as stored bytes, and answers a repeat with the result it already gave.";
 
     StorageUploadAbort = "storage.upload.abort", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, Transfer],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: keyed("upload id"),
     doc: "Abandon the upload. New parts and completions are fenced first, then the stored state is \
           removed, and the hold is given back only once that removal is confirmed.";
 
     StorageObjectRead = "storage.object.read", Services,
-    effect: Read, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer],
+    effect: Read, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, StoredObject],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: READ,
     doc: "Read a bounded range of one stored object's ciphertext. The service holds no key for it.";
 
     StorageObjectDelete = "storage.object.delete", Services,
-    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
-    selectors: [Transfer],
+    effect: Write, ingress: [ServiceClient],
+    rights: [basis(ServiceCredential), basis(AccountToken)],
+    selectors: [Installation, StoredObject],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
-    confirmation: None, idempotency: keyed("archive id + object id"),
+    confirmation: None, idempotency: keyed("installation id + request nonce"),
     doc: "Delete one stored object. It becomes a tombstone for the published window before the \
           ciphertext is removed and the allowance released.";
 
