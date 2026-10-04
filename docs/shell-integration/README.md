@@ -364,7 +364,9 @@ endpoint all run the command exactly as the shell would have run it without aski
 the same vector and the same environment. While an answer is owed nothing waits for another one, so
 a worker that has stopped answering costs one wait rather than one per command. When the answer
 carries a backend, the forked child starts the launcher the backend names, as `<launcher> launch --
-<executable> <arguments>`, with the backend's variables added to that one child's environment. The
+<executable> <arguments>`, with the backend's variables added to that one child's environment. In the PSReadLine package,
+`Resolve-KalaReachCommand` returns the launcher, its arguments and the environment, and the
+command-lookup handler starts it. The
 launcher is only ever the absolute path the answer gives and is never searched for; one that is not
 an absolute path to an executable file is refused, and the command runs as it was typed.
 
