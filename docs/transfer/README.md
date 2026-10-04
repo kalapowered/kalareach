@@ -57,18 +57,20 @@ them; nothing in the protocol depends on the defaults.
 | one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
-submission is recorded rather than inferred from age. The host tells the service which sessions its
-retention still covers; the service never guesses. An attachment uploaded without a session takes
-the draft's session when it is submitted to one, so the retention that applies is the session's
-rather than the seven-day window that applied while nothing held it.
+submission is recorded rather than inferred from age. The host records it when the session's worker
+accepts a prompt that names the draft, and again for a repeat of that action. The host tells the
+service which sessions its retention still covers; the service never guesses. An attachment uploaded
+without a session takes the draft's session when it is submitted to one, or the session the prompt
+names when the draft has none, so the retention that applies is the session's rather than the
+seven-day window that applied while nothing held it.
 
-What the host currently answers with is the session registry: a session is covered while it has a
-launch reservation in any phase, which includes failed and closed ones. That preserves files rather
-than losing them, and it is deliberately the conservative direction, but it is not yet the session
-retention policy the archive owns. Until the archive's retained-session state is the thing the
-sweep asks, a submitted attachment can be preserved longer than that policy would keep it. The
-service asks one question through one interface, so making the archive the authority is a change to
-the answer and not to the sweep.
+The sweep asks the archive which sessions still keep what was submitted to them. A session is
+considered to be covered if there exists a reservation or worker for that session in the session
+registry in any phase (even failed or closed phases) or if there exists any kind of record of it in
+the archive (summary, closure record, receipt, retained output, or a journal or spool the archive
+cannot read). If the archive cannot finish its scan, the sweep operation stops, since the sweep
+reads a session it does not find as one that has ended and removes its attachments. Declining to
+delete is the answer that cannot lose a file.
 
 The environment's staged total counts three things together: receiving uploads at their declared
 size, published attachments still on disk, and open download snapshots. A snapshot is storage this

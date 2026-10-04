@@ -23,7 +23,8 @@
 //! failure set.
 //!
 //! The daemon also gives the service the two things it cannot know for itself: which sessions its
-//! retention still covers, and when to sweep.
+//! retention still covers, which the archive answers ([`Controller::archive_retention`]), and when
+//! to sweep.
 //!
 //! The attachment-chunk endpoint is bound and served by whoever runs the daemon, the same way the
 //! control endpoint is. That is deliberate: a listener has to be released before the next daemon
@@ -40,11 +41,10 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActorId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
-use kr_transfer::service::{Action, RetainedOutcome, SessionRetention, Subject};
+use kr_transfer::service::{Action, RetainedOutcome, Subject};
 use kr_transfer::{Sweep, TransferService};
 
 use crate::error::{ControllerError, Result};
-use crate::registry::LaunchPhase;
 use crate::service::Controller;
 
 /// How often the daemon sweeps expired transfers.
@@ -52,20 +52,6 @@ use crate::service::Controller;
 /// Every window the sweep enforces is measured in hours or days, so an hour is frequent enough to
 /// keep the staging area honest and rare enough that it costs nothing.
 pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
-/// Every launch phase a session's reservation can be in.
-///
-/// A session with a reservation in any of them is one the registry still knows about, which is
-/// what retention is measured against here.
-const EVERY_PHASE: &[LaunchPhase] = &[
-    LaunchPhase::Reserved,
-    LaunchPhase::Spawned,
-    LaunchPhase::Claimed,
-    LaunchPhase::Live,
-    LaunchPhase::Fenced,
-    LaunchPhase::Failed,
-    LaunchPhase::Closed,
-];
 
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -835,62 +821,6 @@ impl TransferModule {
     }
 }
 
-/// The sessions the registry still knows about.
-///
-/// Retention is the archive service's policy to decide; what this settles is the part the transfer
-/// service cannot see for itself. A session the registry has a record of keeps what was submitted
-/// to it, and one it has no record of keeps nothing. Declining to delete is the answer that cannot
-/// lose a file.
-#[derive(Clone, Debug, Default)]
-pub struct RegistryRetention {
-    sessions: std::collections::BTreeSet<SessionId>,
-}
-
-impl RegistryRetention {
-    /// Records one session as retained.
-    pub fn insert(&mut self, session_id: SessionId) {
-        self.sessions.insert(session_id);
-    }
-
-    /// Returns how many sessions are retained.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.sessions.len()
-    }
-
-    /// Returns true when no session is retained.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-}
-
-impl SessionRetention for RegistryRetention {
-    fn retains(&self, session_id: SessionId) -> bool {
-        self.sessions.contains(&session_id)
-    }
-}
-
-impl Controller {
-    /// Returns the sessions this environment's registry still knows about.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be read.
-    /// This is a synchronous read of the registry's own store, so it is called from a blocking
-    /// task: the lock is taken in its blocking form, which is only correct off the reactor.
-    pub fn session_retention(&self) -> Result<RegistryRetention> {
-        let registry = self.registry_handle().blocking_lock();
-        let mut retention = RegistryRetention::default();
-        for phase in EVERY_PHASE {
-            for reservation in registry.reservations_in(*phase)? {
-                retention.insert(reservation.session_id);
-            }
-        }
-        Ok(retention)
-    }
-}
-
 /// Starts the environment's expiry sweep.
 ///
 /// The sweep holds the daemon weakly between sweeps and while a sweep waits for its thread, and
@@ -1156,19 +1086,5 @@ mod tests {
                 method.as_str()
             );
         }
-    }
-
-    #[test]
-    fn a_retention_answers_only_for_the_sessions_it_holds() {
-        use kr_protocol::scalars::Uuid;
-
-        let held = SessionId::new(Uuid::from_bytes([1; 16]));
-        let other = SessionId::new(Uuid::from_bytes([2; 16]));
-        let mut retention = RegistryRetention::default();
-        assert!(retention.is_empty());
-        retention.insert(held);
-        assert_eq!(retention.len(), 1);
-        assert!(retention.retains(held));
-        assert!(!retention.retains(other));
     }
 }
