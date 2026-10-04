@@ -791,36 +791,38 @@ async fn kr_req_12_22_flags_that_name_the_forwarder_are_compared_after_it_is_wri
     assert!(without.backends.root().is_none(), "and nothing is created");
 }
 
-/// KR-REQ-12.22: flags that start the forwarder by its bare name, as the packages written before the
-/// placeholder do, are integrated where the application finds a program by its search path, and
-/// nowhere that it looks in its own working directory first: on Windows they establish nothing and the
-/// invocation runs as typed. The control is the same package's flags with the forwarder's path.
+/// KR-REQ-12.22: flags that name the forwarder by its own name, as the packages written before the
+/// placeholder do, are integrated where a program is found by the search path, and not on Windows,
+/// where an application may look in its own working directory first: there they establish nothing
+/// and the invocation runs as typed, whatever the spelling of the name. The control is the same
+/// package's flags with the forwarder's path, which the test above establishes.
 #[tokio::test]
-async fn kr_req_12_22_flags_that_start_the_forwarder_by_its_bare_name_are_not_integrated_on_windows()
- {
+async fn kr_req_12_22_flags_that_name_the_forwarder_itself_are_not_integrated_on_windows() {
     let declared = fixture::qoder_flags();
-    let bare: Vec<String> = declared
-        .iter()
-        .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, "kr-hook"))
-        .collect();
-    assert_ne!(bare, declared, "the placeholder is replaced");
-    let mut shape = fixture::Shape::qoder_cli();
-    shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(bare);
-    let setup = Setup::shaped(&shape, &["bin", "qodercli"], |config| config);
-    let answered = invocation_adding(
-        &["qodercli"],
-        &bare.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    let established =
-        setup
-            .backends
-            .establish(&request(&setup, &answered, &qoder(bare.clone()), 1));
-    if cfg!(windows) {
-        let why = established.expect_err("a bare name is searched for in the working directory");
-        assert!(why.contains("bare name"), "{why}");
-        assert!(setup.backends.root().is_none(), "nothing was created");
-    } else {
-        established.expect("where a program is found by the search path, the bare name stands");
+    for spelling in ["kr-hook", "kr-hook.exe", "KR-HOOK"] {
+        let named: Vec<String> = declared
+            .iter()
+            .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, spelling))
+            .collect();
+        assert_ne!(named, declared, "the placeholder is replaced");
+        let mut shape = fixture::Shape::qoder_cli();
+        shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(named);
+        let setup = Setup::shaped(&shape, &["bin", "qodercli"], |config| config);
+        let answered = invocation_adding(
+            &["qodercli"],
+            &named.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let established =
+            setup
+                .backends
+                .establish(&request(&setup, &answered, &qoder(named.clone()), 1));
+        if cfg!(windows) {
+            let why = established.expect_err(spelling);
+            assert!(why.contains("its own name"), "{spelling}: {why}");
+            assert!(setup.backends.root().is_none(), "nothing was created");
+        } else {
+            established.unwrap_or_else(|why| panic!("{spelling}: {why}"));
+        }
     }
 }
 
@@ -906,7 +908,7 @@ async fn kr_req_12_07_a_command_is_looked_up_by_the_name_its_platform_gives_the_
 }
 
 /// KR-REQ-12.07: a package whose rule names a program with a `.com` file stem recognises it by the
-/// name it declares, though a command is looked up without its `.com`.
+/// name it declares and by the name a command is looked up by, though the lookup takes the `.com` off.
 #[cfg(windows)]
 #[tokio::test]
 async fn kr_req_12_07_a_rule_whose_file_stem_ends_in_com_recognises_the_command_it_names() {
@@ -916,20 +918,27 @@ async fn kr_req_12_07_a_rule_whose_file_stem_ends_in_com_recognises_the_command_
         native_bridge: false,
         ..fixture::Shape::claude_code()
     };
-    let setup = Setup::shaped(&shape, &["bin", "agent.com"], |config| config);
+    let setup = Setup::shaped(&shape, &["bin", "agent"], |config| config);
+    let program = setup.directory.join("bin").join("agent.com");
+    std::fs::copy(stand_in_program(), &program).expect("a program stands in");
     let integration = CommandIntegration {
         command: "agent.com".to_owned(),
         ..Setup::integration()
     };
-    setup
-        .backends
-        .establish(&request(
-            &setup,
-            &invocation(&["agent.com"]),
-            &integration,
-            1,
-        ))
-        .expect("the package that declares the name recognises it");
+    for (generation, typed) in ["agent.com", "agent", "AGENT"].into_iter().enumerate() {
+        let spelt = invocation(&[typed]);
+        let asked = EstablishRequest {
+            executable: program.to_str().expect("a text path"),
+            ..request(&setup, &spelt, &integration, 1 + generation as u64)
+        };
+        setup
+            .backends
+            .establish(&asked)
+            .unwrap_or_else(|why| panic!("{typed}: {why}"));
+        setup
+            .backends
+            .line_ended(PromptGeneration::new(1 + generation as u64));
+    }
 }
 
 /// KR-REQ-12.07: two packages whose integrated commands the platform reads as one name are both left
