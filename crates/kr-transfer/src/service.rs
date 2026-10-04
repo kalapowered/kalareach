@@ -11,7 +11,7 @@
 //! * [`TransferService::draft_add_attachment`] binds a handle to a draft and records that the
 //!   adapter was asked. It does not submit anything, and a failed insertion leaves both the draft
 //!   and the published attachment exactly where they were.
-//! * Submission is [`TransferService::mark_submitted`], which only changes what retention applies.
+//! * Submission is [`TransferService::record_prompt`], which only changes what retention applies.
 //!   Acceptance by the agent is [`TransferService::record_insertion_outcome`] with upstream
 //!   evidence, and nothing else sets it.
 
@@ -2227,38 +2227,31 @@ impl TransferService {
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))
     }
 
-    /// Records that a draft was submitted to a session, which is what moves its attachments onto
-    /// the session's retention.
+    /// Records that the prompt an action sends names a draft, which is what moves the draft's
+    /// attachments onto the session's retention.
     ///
     /// Submission itself is a separate action performed elsewhere: this records its consequence for
-    /// storage and nothing else. It binds the attachments the draft holds when it is called. An
-    /// attachment that is already submitted keeps the submission it has, so recording again
-    /// changes nothing for it.
+    /// storage and nothing else, and it is recorded when the prompt is about to be sent, so that
+    /// nothing that happens to the prompt afterwards can leave a file this host was asked to hand
+    /// to a session on the seven-day window. The first record of an action fixes which attachments
+    /// its prompt carries ([`Store::record_prompt`]), so asking again is safe and carries out only
+    /// that. Returns how many attachments the prompt carries.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::UnknownDraft`] when nothing is named.
-    pub fn mark_submitted(
+    /// Returns [`TransferError::UnknownDraft`] when the draft is not this actor's, and what
+    /// [`Store::record_prompt`] returns otherwise.
+    pub fn record_prompt(
         &self,
         actor: &ActorId,
+        action_id: Uuid,
         draft_id: DraftId,
-        submitted_to: SessionId,
+        session_id: SessionId,
     ) -> Result<usize> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
-        let row = draft_of(&store, draft_id, actor)?;
-        let bindings = store.bindings(draft_id)?;
-        // A draft composed for a session is held by that one. A draft that named none is held by
-        // the session it was submitted to, so that what was submitted never keeps the seven-day
-        // window of an attachment no session holds.
-        let session_id = row.session_id.unwrap_or(submitted_to);
-        for binding in &bindings {
-            // An attachment uploaded without a session takes the draft's when it is submitted to
-            // one. Without that its retention would stay the seven-day window while the session
-            // was the thing actually holding it.
-            store.mark_submitted(binding.transfer_id, now, session_id)?;
-        }
-        Ok(bindings.len())
+        draft_of(&store, draft_id, actor)?;
+        store.record_prompt(actor, action_id, draft_id, session_id, now)
     }
 
     /// Returns one draft with its bindings.
