@@ -5140,8 +5140,9 @@ nothing that happens on disk afterwards reaches it.
 Some applications cannot be proxied: they start their extension processes themselves, over their
 own standard streams. For those, a connector package installs a small registration in the
 application's own plugin or hook location, and the application starts the core forwarder, `kr-hook`,
-by the full path the host wrote into that registration. Each forwarder process connects to the launch's endpoint and
-declares which bridge it is: the application, and the registration that started it (a `hook` or a
+by the full path the host wrote into that registration (a package written before the host wrote it
+names `kr-hook` alone, and the application finds it by its search path). Each forwarder process
+connects to the launch's endpoint and declares which bridge it is: the application, and the registration that started it (a `hook` or a
 `channel`).
 
 None of those processes is the process this host launched, so a bridge is admitted by the launch

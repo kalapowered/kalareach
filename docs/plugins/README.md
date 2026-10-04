@@ -147,10 +147,12 @@ start of a JSON string. Alone, it names a program the application starts itself:
 its `args`, or a flag whose value is a JSON document. Followed by a space, it begins a line an
 application runs through a shell, and the path is written as one word in single quotes. The package
 validator refuses a flag that holds it anywhere else, and the host refuses a registration file that
-does. The host writes the path as the text of a JSON string, so a path with spaces, quotes,
+does, one that spells it with JSON escapes included. The host writes the path as the text of a JSON string, so a path with spaces, quotes,
 backslashes or non-ASCII characters is still one path. A package that uses the placeholder states
 `"sdk_range": ">=0.1.3, <0.2.0"`, because a host on an earlier contract would write the text as it
-stands, and refuses a release it cannot read.
+stands, and refuses a release it cannot read. A package written before the placeholder starts the
+forwarder by its bare name, and on Windows, which looks in an application's working directory before
+its search path, the host runs an invocation of it as typed.
 
 The owner confirms `command_integration.launch` on every release, as for a native bridge, because
 the flags and variables are part of the release. The grant shows the package's `grant_statement`
