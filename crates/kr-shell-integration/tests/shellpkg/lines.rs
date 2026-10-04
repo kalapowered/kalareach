@@ -435,7 +435,7 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
     let executable = told(&probes.probe());
     for line in [
         format!("Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @(1,@{{}}) -Executable '{executable}'"),
-        format!("Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @('a') -Executable 5"),
+        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @('a') -Executable 5".to_owned(),
         "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments $null -Executable $null".to_owned(),
     ] {
         let before = session.written();
