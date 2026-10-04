@@ -1856,16 +1856,6 @@ fn prompting_and_viewing(
     })
 }
 
-/// What a worker that took a prompt answers with.
-fn an_accepted_prompt() -> kr_protocol::agent::AgentMutationResult {
-    kr_protocol::agent::AgentMutationResult {
-        binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-        provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        upstream_request_id: Nullable::null(),
-        turn_id: Nullable::null(),
-    }
-}
-
 /// The attachments of a draft, as the transfer service holds them.
 fn the_attachments_of(
     controller: &crate::service::Controller,
@@ -1898,8 +1888,9 @@ fn is_submitted(
 /// The draft names no session, so the session the prompt goes to is what holds the attachment. The
 /// record is made before the worker is asked, so a worker that is still deciding, one that refuses
 /// and a connection that has ended all leave it in place: a file this host was asked to hand to a
-/// session is never left on the seven-day window of an unused attachment. A prompt that is refused
-/// before it is forwarded, for want of the right to prompt, records nothing.
+/// session is never left on the seven-day window of an unused attachment. What the draft gets
+/// after that is held too. A prompt that is refused before it is forwarded, for want of the right
+/// to prompt, records nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retention_when_forwarded()
 {
@@ -2041,6 +2032,23 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     assert!(answered_ok(&answer), "{:?}", answer.frame());
     assert!(is_submitted(controller, &actor, queued));
 
+    // The session's agent reads the draft when it does, so an attachment bound after the draft was
+    // sent is held as well.
+    let later = a_published_attachment(controller, world.environment_id, &actor, "later.bin");
+    let sent = controller
+        .transfer()
+        .service()
+        .draft(&actor, queued)
+        .expect("reads the draft");
+    bound_to_a_draft(controller, &actor, &sent, &later);
+    let held = the_attachments_of(controller, &actor, queued);
+    assert_eq!(held.len(), 2);
+    assert!(held.iter().all(|handle| handle.submitted));
+    assert!(
+        held.iter()
+            .all(|handle| handle.session_id == Nullable::some(world.session_id))
+    );
+
     // A draft this device does not hold has nothing for this host to retain, and is no failure of
     // a prompt the worker takes.
     let answer = connection
@@ -2054,147 +2062,6 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
         .await
         .expect("the prompt is answered");
     assert!(answered_ok(&answer), "{:?}", answer.frame());
-    world.serving.abort();
-}
-
-/// KR-REQ-14.11: a retry of a prompt that the worker answers from what it kept records nothing, so
-/// an attachment added to the draft after the prompt was sent is not marked as submitted by it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_retry_answered_from_the_workers_receipt_does_not_submit_an_attachment_added_since() {
-    use kr_protocol::envelope::ControlFrame;
-
-    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
-
-    let script = Scripted::new();
-    let world = scripted::scripted(&script).await;
-    let controller = &world.controller;
-    let connection =
-        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 42));
-    let actor = connection.device.principal();
-    let first = a_published_attachment(controller, world.environment_id, &actor, "first.bin");
-    let draft = an_empty_draft(controller, world.environment_id, &actor);
-    let draft = bound_to_a_draft(controller, &actor, &draft, &first);
-    script.accepts_prompts(true);
-    let prompt = a_prompt_naming(
-        &world,
-        &connection,
-        Method::AgentPromptSubmit,
-        1,
-        draft.draft_id,
-    );
-    connection
-        .answer(ControlFrame::Mutation(Box::new(prompt.clone())))
-        .await
-        .expect("the prompt is answered");
-    assert!(the_attachments_of(controller, &actor, draft.draft_id)[0].submitted);
-
-    // Another attachment joins the draft, and the prompt is asked again as if its answer was lost.
-    let second = a_published_attachment(controller, world.environment_id, &actor, "second.bin");
-    let draft = controller
-        .transfer()
-        .service()
-        .draft(&actor, draft.draft_id)
-        .expect("reads the draft");
-    bound_to_a_draft(controller, &actor, &draft, &second);
-    script.kept(
-        prompt.action_id,
-        ParamsValue::from_typed(&an_accepted_prompt()).expect("encodes"),
-    );
-    let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(prompt)))
-        .await
-        .expect("the retry is answered");
-    assert!(
-        matches!(
-            answered.frame(),
-            ControlFrame::Response(kr_protocol::envelope::Response {
-                outcome: kr_protocol::envelope::Outcome::Ok(_),
-                ..
-            })
-        ),
-        "the retry is answered with what the worker kept: {:?}",
-        answered.frame()
-    );
-    let held = the_attachments_of(controller, &actor, draft.draft_id);
-    assert_eq!(held.len(), 2);
-    assert!(held[0].submitted, "the attachment the prompt carried");
-    assert!(
-        !held[1].submitted,
-        "the attachment added after the prompt was sent"
-    );
-    world.serving.abort();
-}
-
-/// KR-REQ-14.11: a retry that reaches the worker, because the host could not read the receipt of its
-/// action first, and that the worker answers from what it kept, submits nothing that was added to
-/// the draft since the prompt was first sent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_retry_the_worker_answers_from_what_it_kept_does_not_submit_an_attachment_added_since() {
-    use kr_protocol::envelope::ControlFrame;
-
-    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
-
-    let script = Scripted::new();
-    let world = scripted::scripted(&script).await;
-    let controller = &world.controller;
-    let connection =
-        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 45));
-    let actor = connection.device.principal();
-    let first = a_published_attachment(controller, world.environment_id, &actor, "first.bin");
-    let draft = an_empty_draft(controller, world.environment_id, &actor);
-    let draft = bound_to_a_draft(controller, &actor, &draft, &first);
-    script.accepts_prompts(true);
-    let prompt = a_prompt_naming(
-        &world,
-        &connection,
-        Method::AgentPromptSubmit,
-        1,
-        draft.draft_id,
-    );
-    connection
-        .answer(ControlFrame::Mutation(Box::new(prompt.clone())))
-        .await
-        .expect("the prompt is answered");
-
-    // Another attachment joins the draft. The worker keeps its answer to the action and says so
-    // when the prompt is sent again, while its answer to a read of that action's receipt is a
-    // refusal, so the retry is forwarded.
-    let second = a_published_attachment(controller, world.environment_id, &actor, "second.bin");
-    let draft = controller
-        .transfer()
-        .service()
-        .draft(&actor, draft.draft_id)
-        .expect("reads the draft");
-    bound_to_a_draft(controller, &actor, &draft, &second);
-    script.answers_prompts_as_kept();
-    let sent_before = script.forwarded().len();
-    let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(prompt)))
-        .await
-        .expect("the retry is answered");
-    assert_eq!(
-        script.forwarded().len(),
-        sent_before + 1,
-        "the retry reached the worker"
-    );
-    assert!(
-        matches!(
-            answered.frame(),
-            ControlFrame::Response(kr_protocol::envelope::Response {
-                outcome: kr_protocol::envelope::Outcome::Ok(_),
-                ..
-            })
-        ),
-        "{:?}",
-        answered.frame()
-    );
-    let held = the_attachments_of(controller, &actor, draft.draft_id);
-    assert_eq!(held.len(), 2);
-    assert!(held[0].submitted, "the attachment the prompt carried");
-    assert!(
-        !held[1].submitted,
-        "the attachment added after the prompt was sent"
-    );
     world.serving.abort();
 }
 

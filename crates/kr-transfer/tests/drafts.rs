@@ -174,7 +174,6 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
             .service
             .record_prompt(
                 &harness.actor,
-                kr_ipc::new_uuid(),
                 created.draft_id,
                 created.session_id.0.expect("a session")
             )

@@ -448,31 +448,30 @@ impl TransferModule {
         }
     }
 
-    /// Records that the prompt an action sends to a session names a draft, which moves the draft's
-    /// attachments from the seven-day window of an unused attachment onto that session's retention.
+    /// Records that a prompt sends a draft to a session, which moves the draft's attachments, and
+    /// any it gets later, from the seven-day window of an unused attachment onto that session's
+    /// retention.
     ///
     /// It runs before the prompt is forwarded to the session's worker, so that nothing the worker
     /// does or fails to do afterwards decides whether a file this host was asked to hand to a
-    /// session is kept. The first record of the action fixes the attachments its prompt carries, so
-    /// a repeat of the action records nothing new. A draft this actor does not hold has no
-    /// attachments for this host to retain, so naming one is not a failure.
+    /// session is kept. A draft is sent to one session, so a repeat of the prompt has nothing left
+    /// to record. A draft this actor does not hold has no attachments for this host to retain, so
+    /// naming one is not a failure.
     ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, other than for a draft it does not hold: among
-    /// them an attachment that belongs to another session.
+    /// them a draft that is for another session, or holds an attachment that belongs to one.
     pub async fn record_submission(
         &self,
         actor_id: &ActorId,
-        action_id: kr_protocol::ids::ActionId,
         draft_id: kr_protocol::ids::DraftId,
         session_id: SessionId,
     ) -> Answer<usize> {
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
-        let action_id = action_id.get();
         blocking(
-            move || match service.record_prompt(&actor, action_id, draft_id, session_id) {
+            move || match service.record_prompt(&actor, draft_id, session_id) {
                 Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
                 other => Ok(other?),
             },

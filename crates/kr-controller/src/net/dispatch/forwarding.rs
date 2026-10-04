@@ -271,23 +271,18 @@ impl RemoteConnection {
         // from here, before it is sent. What a worker answers, and whether anyone is left to hear
         // it, cannot then decide whether a file this host was asked to hand to a session is kept:
         // a connection that ends while the worker answers, a worker that cannot be asked again, and
-        // an answer that is not shown to the device all leave the record where it is. An attachment
-        // belongs to one session, so a draft that holds one that belongs to another is refused
-        // here and nothing is sent. The record belongs to the action: a repeat of it, which may
-        // reach the worker when the host could not read the receipt first, finds what the first
-        // record fixed and adds nothing. A prompt the worker refuses was still sent to that
-        // session, and its attachments stay with it. If the record cannot be made the prompt is
-        // not sent.
+        // an answer that is not shown to the device all leave the record where it is. A draft is
+        // sent to one session, and an attachment belongs to one, so a draft that is for another
+        // session, or holds an attachment that belongs to one, is refused here and nothing is sent.
+        // What the draft gets after this is the session's too, so the session's agent finds
+        // nothing in it that is not held, whenever it reads it, and a repeat of the prompt has
+        // nothing left to record. A prompt the worker refuses was still sent to that session, and
+        // its attachments stay with it. If the record cannot be made the prompt is not sent.
         if let Some(draft_id) = prompted_draft(mutation)
             && let Err(error) = self
                 .controller
                 .transfer
-                .record_submission(
-                    &self.device.principal(),
-                    mutation.action_id,
-                    draft_id,
-                    session_id,
-                )
+                .record_submission(&self.device.principal(), draft_id, session_id)
                 .await
         {
             return failure(mutation.request_id, error);

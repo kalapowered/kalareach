@@ -1962,7 +1962,9 @@ impl TransferService {
     ///
     /// The attachment and the draft must both belong to the caller, and where both name a session
     /// it must be the same one: an attachment bound to one session would otherwise be retained
-    /// against it while a draft for another session held it.
+    /// against it while a draft for another session held it. A draft names the session it targets
+    /// or, once a prompt has sent it to one, that session, and an attachment bound to a draft that
+    /// was sent is held by the session from then on.
     ///
     /// # Errors
     ///
@@ -1990,7 +1992,10 @@ impl TransferService {
                 detail: "only a published attachment can be bound to a draft".to_owned(),
             });
         }
-        if let (Some(attachment_session), Some(draft_session)) = (upload.session_id, row.session_id)
+        // The session a draft is for is the one it targets, or the one it was sent to.
+        let sent_to = store.draft_sent_to(params.draft_id)?;
+        let draft_session = row.session_id.or(sent_to);
+        if let (Some(attachment_session), Some(draft_session)) = (upload.session_id, draft_session)
             && attachment_session != draft_session
         {
             return Err(TransferError::invalid(format!(
@@ -2038,7 +2043,7 @@ impl TransferService {
         let session_for_attachment = upload
             .session_id
             .is_none()
-            .then_some(row.session_id)
+            .then_some(draft_session)
             .flatten();
         let ordinal = existing
             .iter()
@@ -2084,6 +2089,13 @@ impl TransferService {
         {
             slot.0.session_id = Nullable::some(session_id);
         }
+        // An attachment bound to a draft that was sent to a session is held by it from here.
+        let submitted_at = sent_to.map(|_| now);
+        if submitted_at.is_some()
+            && let Some(slot) = position.and_then(|position| handles.get_mut(position))
+        {
+            slot.0.submitted = true;
+        }
         if let Some(grant) = &grant
             && let Some(slot) = position.and_then(|position| handles.get_mut(position))
         {
@@ -2122,6 +2134,7 @@ impl TransferService {
                 grant.as_ref(),
                 retained.as_ref(),
                 session_for_attachment,
+                submitted_at,
             )
         })? {
             Some(_) => Ok(result),
@@ -2210,7 +2223,7 @@ impl TransferService {
         store
             // The insertion outcome changes the binding's state and nothing about which session
             // owns the attachment.
-            .bind_attachment(&binding, row.revision, None, None, None)?
+            .bind_attachment(&binding, row.revision, None, None, None, None)?
             .ok_or_else(|| TransferError::store("the draft's revision moved during this record"))?;
         let bindings = store.bindings(draft_id)?;
         let handles = self.handles_of(&store, &bindings)?;
@@ -2227,15 +2240,15 @@ impl TransferService {
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))
     }
 
-    /// Records that the prompt an action sends names a draft, which is what moves the draft's
-    /// attachments onto the session's retention.
+    /// Records that a draft is sent to a session, which is what moves its attachments onto the
+    /// session's retention.
     ///
     /// Submission itself is a separate action performed elsewhere: this records its consequence for
     /// storage and nothing else, and it is recorded when the prompt is about to be sent, so that
     /// nothing that happens to the prompt afterwards can leave a file this host was asked to hand
-    /// to a session on the seven-day window. The first record of an action fixes which attachments
-    /// its prompt carries ([`Store::record_prompt`]), so asking again is safe and carries out only
-    /// that. Returns how many attachments the prompt carries.
+    /// to a session on the seven-day window. A draft is sent to one session ([`Store::record_prompt`]),
+    /// and an attachment bound to it afterwards is the session's too, so recording the draft again
+    /// is safe and has nothing left to add. Returns how many attachments the draft holds.
     ///
     /// # Errors
     ///
@@ -2244,14 +2257,13 @@ impl TransferService {
     pub fn record_prompt(
         &self,
         actor: &ActorId,
-        action_id: Uuid,
         draft_id: DraftId,
         session_id: SessionId,
     ) -> Result<usize> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
         draft_of(&store, draft_id, actor)?;
-        store.record_prompt(actor, action_id, draft_id, session_id, now)
+        store.record_prompt(draft_id, session_id, now)
     }
 
     /// Returns one draft with its bindings.
