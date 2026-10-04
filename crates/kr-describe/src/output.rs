@@ -26,6 +26,7 @@
 
 use kr_worker::privacy::PrivacyGeneration;
 use serde::Deserialize;
+use unicode_segmentation::UnicodeSegmentation;
 
 use kr_protocol::ids::SessionEpoch;
 
@@ -356,4 +357,61 @@ fn check_field(
         });
     }
     Ok(())
+}
+
+/// Ends an answer that ran out of output room, where it can be ended.
+///
+/// The model writes the answer a token at a time under the grammar, and the output bound can stop
+/// it before the object is closed. What it had written is a prefix of the grammar's object, and
+/// the grammar fixes the order of the fields, so where the prefix stopped is known. Only the
+/// activity text may end early:
+///
+/// - Stopped inside the activity text, the text is cut back to the last boundary between characters
+///   a person sees, and the last of them is left out because the next token might have been part of
+///   it. The string is closed, and the two fields that repeat the revision and the cursor interval
+///   are written from the prompt, because they are the prompt's own values and no part of what the
+///   model chose to say.
+/// - Stopped after the activity text, inside the fields that repeat the prompt, those fields are
+///   written from the prompt the same way.
+/// - Already a whole object, or stopped before the activity text, or with nothing left of the
+///   activity text, the bytes come back as they are: a title is never cut, and what [`validate`]
+///   refuses it still refuses.
+#[must_use]
+pub fn end_cut_answer(written: &[u8], prompt: &crate::prompt::Prompt) -> Vec<u8> {
+    if serde_json::from_slice::<serde_json::Value>(written).is_ok() {
+        return written.to_vec();
+    }
+    // Whole characters only: the last token can be half of one.
+    let text = match std::str::from_utf8(written) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&written[..error.valid_up_to()]).unwrap_or_default(),
+    };
+    // The strings of the object hold no quote, so the quotes are the fields' own: two around
+    // `title`, two around its value, two around `activity_text`, and two around its value.
+    let quotes: Vec<usize> = text.match_indices('"').map(|(at, _)| at).collect();
+    if quotes.len() < 7 || &text[quotes[4]..=quotes[5]] != "\"activity_text\"" {
+        return written.to_vec();
+    }
+    let mut ended = if quotes.len() >= 8 {
+        text[..=quotes[7]].to_owned()
+    } else {
+        let started = quotes[6];
+        let activity = &text[started + 1..];
+        let kept = activity
+            .grapheme_indices(true)
+            .next_back()
+            .map_or("", |(last, _)| &activity[..last])
+            .trim_end();
+        if kept.is_empty() {
+            return written.to_vec();
+        }
+        format!("{}{kept}\"", &text[..=started])
+    };
+    ended.push_str(&format!(
+        ", \"source_cursor\": {{\"from\": {}, \"to\": {}}}, \"context_revision\": {}}}",
+        prompt.cursor_from.get(),
+        prompt.cursor_to.get(),
+        prompt.revision.get()
+    ));
+    ended.into_bytes()
 }

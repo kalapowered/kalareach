@@ -226,6 +226,9 @@ tokio-util = "=0.7.18"
 tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "getrandom", "ring"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
+# Where a text can be cut without cutting a character a person sees: the end of a generated
+# activity line that ran out of room.
+unicode-segmentation = "=1.13.3"
 url = "=2.5.8"
 webrtc = { version = "=0.21.0", default-features = false, features = ["runtime-tokio", "crypto-ring"] }
 # The one outbound HTTP request this product makes from a client: an image a person explicitly
