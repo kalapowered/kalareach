@@ -125,9 +125,9 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
             state: "Line::compress_for_scrollback() keeping the cells, attributes and wrap \
                     markers it was given",
             reason: "the pinned width model gives a cell to every scalar that has a width of its \
-                     own, and the compact row representation used to work out where the cells were \
-                     by clustering the row's text again, which joined adjacent scalars and dropped \
-                     the columns they held",
+                     own, and a compact row that worked out where its cells are by clustering its \
+                     text again would join adjacent scalars and drop the columns they held, so the \
+                     compact form keeps the cell boundaries it was given",
         },
     ],
     required_patch: &[],

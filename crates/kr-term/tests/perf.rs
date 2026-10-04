@@ -569,9 +569,9 @@ fn sustained_output_stays_inside_the_row_cache_bound() {
 ///
 /// The historical cache is enforced in bytes, and a row can carry a hundred times what the row
 /// beside it carries, so the enforcement cannot be a row count. Working the figure out by walking
-/// the rows makes every read cost what the whole history costs, which is what it used to do: a
-/// session printing steadily saturated a core and left the host unable to keep up with an
-/// application producing a few hundred kibibytes a second.
+/// the rows would make every read cost what the whole history costs: a session printing steadily
+/// would saturate a core and leave the host unable to keep up with an application producing a few
+/// hundred kibibytes a second.
 ///
 /// So the figure is carried. This feeds the same bytes to two sessions doing the same work, one
 /// whose history is emptied before every read and one whose history is at its bound and evicting
@@ -594,8 +594,8 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
     const FILL_LIMIT: usize = 4_096;
     /// How much further apart the two phases may be before the cost is growing with the history.
     ///
-    /// Walking the history made the deep phase sixty times the shallow one, so this is wide enough
-    /// to be quiet on a loaded machine and still far inside what a walk would produce.
+    /// Walking the history would make the deep phase about sixty times the shallow one, so this is
+    /// wide enough to be quiet on a loaded machine and still far inside what a walk would produce.
     const TOLERANCE: f64 = 4.0;
 
     let read = build_scrolling_stream(READ_BYTES);

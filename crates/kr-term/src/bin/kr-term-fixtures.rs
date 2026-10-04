@@ -1,8 +1,8 @@
 //! Writes the terminal conformance fixtures, or checks that the committed ones are current.
 //!
 //! Run with no arguments to write `fixtures/terminal/`, and with `--check` to fail when a committed
-//! file differs from what the engine produces now. Continuous integration runs the second form, so
-//! a change in behaviour has to arrive together with the fixture that records it.
+//! file differs from what the engine produces now, so a change in behaviour has to arrive together
+//! with the fixture that records it.
 //!
 //! With `--terminfo <directory>` it writes the compiled terminfo database into that directory
 //! instead, in the layout a terminfo library reads, for a release tree that carries one.
