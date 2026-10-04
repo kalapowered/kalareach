@@ -219,7 +219,8 @@ pub enum CleanupBoundary {
     ///
     /// This is the boundary section 7 names, and it is the only one that cannot name something
     /// else: it is derived from the reservation rather than from a process identifier the kernel
-    /// may since have reused. No supervisor in this build stops one yet.
+    /// may since have reused. This build records none with a worker, so
+    /// [`ArchiveService::fence_owned`] never reports one.
     SupervisedUnit(String),
     /// No boundary this host can work from.
     None,
@@ -271,12 +272,13 @@ pub struct Fenced {
     pub boundary: CleanupBoundary,
     /// The processes this pass terminated.
     ///
-    /// Empty until this host records a boundary it can stop: nothing is terminated on the
-    /// strength of an identifier the kernel may have reused.
+    /// Always empty in this build: nothing is terminated on the strength of an identifier the
+    /// kernel may have reused, and no boundary is recorded to stop.
     pub stopped: Vec<ProcessStartIdentity>,
     /// How many recorded processes had already ended.
     pub already_gone: u64,
-    /// How many recorded processes this host could not account for.
+    /// How many things this host could not account for. A fence in this build counts one: the
+    /// cleanup boundary itself, which it has none of.
     pub unaccounted: u64,
     /// Resources known to survive, which are the user's rather than this host's.
     pub surviving: Vec<kr_protocol::session::SurvivingResource>,
@@ -505,8 +507,10 @@ impl ArchiveService {
     ///
     /// Section 7: after a worker crash the controller fences its endpoints, uses the cgroup or
     /// Job or the recorded identities for cleanup, and records any incomplete coverage. The
-    /// endpoint is fenced by [`Self::take_ownership`]. This is the second half, and what it
-    /// reports today is that the second half has no boundary to work from.
+    /// endpoint is fenced by [`Self::take_ownership`]. This is the second half. It terminates no
+    /// process and names no [`CleanupBoundary`]: it counts the recorded processes the kernel
+    /// confirms have ended, carries the closure's surviving resources through, counts the
+    /// boundary itself as one thing it cannot account for, and reports incomplete coverage.
     ///
     /// **Nothing is inferred from a dead identifier.** A worker's descendants join the group it
     /// led, and after the worker has gone the kernel is free to give its number to an unrelated
@@ -517,10 +521,8 @@ impl ArchiveService {
     ///
     /// What would work is the boundary the platform itself keeps: the transient unit or Job the
     /// supervisor started this worker in, which is named from the reservation and cannot name
-    /// anything else. This host does not record or stop one yet, so the coverage this returns is
-    /// incomplete and says why. The next step is for the supervisor to record that boundary with
-    /// the worker, so this can terminate it under recovery ownership before it retires the
-    /// identity.
+    /// anything else. This host records no such boundary with a worker, so there is none for this
+    /// to stop, and the coverage it returns is incomplete.
     #[must_use]
     pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
         Fenced {

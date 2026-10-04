@@ -72,9 +72,9 @@ use crate::error::{DeliveryError, Result};
 /// is computed the same way. Version 8 adds the time privacy mode was last turned off, which is
 /// how a decision made while it was on is told from one made after. A journal written under
 /// version 6 or 7 is brought forward in place, once, when it is opened ([`migrate_forward`]); a
-/// journal written under any other version is refused rather than read with the columns of
-/// another shape, matched against bindings this build no longer computes the same way, or trusted
-/// to hold no request it should not.
+/// journal written under a version below 6 or above 8 is refused rather than read with the
+/// columns of another shape, matched against bindings this build no longer computes the same way,
+/// or trusted to hold no request it should not.
 const SCHEMA_VERSION: i64 = 8;
 
 /// The oldest schema this build brings forward rather than refusing.
@@ -712,7 +712,7 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the file cannot be opened or the schema
     /// cannot be created, and [`DeliveryError::JournalUnreadable`] when the file holds a schema
-    /// version this build does not write.
+    /// version below the oldest this build brings forward or above the one it writes.
     pub fn open(path: &Path) -> Result<Self> {
         Self::prepare(Connection::open(path)?)
     }
