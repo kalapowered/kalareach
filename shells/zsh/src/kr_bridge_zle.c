@@ -80,6 +80,20 @@ static int kr_key_selected;
 /* Whether this wait has already reported the reader idle. */
 static int kr_idle_reported;
 
+/*
+ * Reads the mailbox. The worker retries a withheld fence at the reader's next idle report and
+ * drops one that arrives while its exchange is still open, so a reader that was told no fence was
+ * published reports idle again however many reports it has already sent.
+ */
+static void
+kr_zle_service(void)
+{
+    kr_bridge_service();
+    if (kr_bridge_take_fence_retry()) {
+        kr_idle_reported = 0;
+    }
+}
+
 /* A launch this reader installed, so a revocation can take exactly that text back out. */
 static int kr_installed_chars;
 
@@ -1356,7 +1370,7 @@ kr_zle_boundary(void)
      * not run yet, so it is input of the person's that anything the mailbox holds waits behind.
      */
     kr_key_selected = 1;
-    kr_bridge_service();
+    kr_zle_service();
     kr_key_selected = 0;
     if (done) {
         return 1;		/* a launch was installed and accepted */
@@ -1395,7 +1409,7 @@ kr_zle_wait(void)
     }
     /* Everything answered from here is answered by a reader that is waiting for another key. */
     kr_in_key_wait = 1;
-    kr_bridge_service();
+    kr_zle_service();
     kr_in_key_wait = 0;
     if (kr_cancel_requested) {
         /* The wait is over, so the reader is out of whatever the cancellation ended and the
@@ -1428,12 +1442,12 @@ kr_zle_pass_end(void)
     /* Whatever the pass did, the reader's queues may have changed, so the next wait reports
      * itself idle again and the worker gets its retry point. */
     kr_idle_reported = 0;
-    kr_bridge_service();
+    kr_zle_service();
     /* Reading the endpoint there can itself have ended something, and at a pass boundary that has
      * ended too, so whatever came behind it is read now rather than at the next keystroke. */
     kr_cancel_requested = kr_cancel_consumed = 0;
     kr_bridge_cancel_settled();
-    kr_bridge_service();
+    kr_zle_service();
 }
 
 void

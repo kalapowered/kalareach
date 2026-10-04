@@ -58,6 +58,35 @@ static int kr_gathering;
 /* Whether this wait has already reported the reader idle. */
 static int kr_idle_reported;
 
+/* Reports the reader idle once per wait: everything Readline had buffered has been taken, and the
+   reader is not filling its own buffer. */
+static void
+kr_rl_report_idle (void)
+{
+  if (kr_idle_reported == 0 && _rl_kr_buffered () <= 0 && _rl_kr_macro_remaining () <= 0)
+    {
+      /* One of the three points the worker retries a withheld fence at. */
+      kr_idle_reported = 1;
+      kr_bridge_reader_idle ();
+    }
+}
+
+/* Reads the mailbox. The worker retries a withheld fence at the reader's next idle report and
+   drops one that arrives while its exchange is still open, so a reader that was told no fence was
+   published reports idle again however many reports it has already sent, and does so here: this
+   reader reaches its idle point once per read, not on every pass through its wait. */
+static void
+kr_rl_service (void)
+{
+  kr_bridge_service ();
+  if (kr_bridge_take_fence_retry ())
+    {
+      kr_idle_reported = 0;
+      if (kr_gathering == 0)
+        kr_rl_report_idle ();
+    }
+}
+
 /* What the reader is in the middle of, where Readline keeps no state of its own for it. */
 static int kr_pending_quoted;
 static int kr_pending_paste_open;
@@ -500,13 +529,8 @@ kr_rl_idle (void)
   if (kr_bridge_registered () == 0 || kr_gathering)
     return;
   /* Everything Readline had buffered has been taken, so this is the reader's idle point. */
-  if (kr_idle_reported == 0 && _rl_kr_buffered () <= 0 && _rl_kr_macro_remaining () <= 0)
-    {
-      /* One of the three points the worker retries a withheld fence at. */
-      kr_idle_reported = 1;
-      kr_bridge_reader_idle ();
-    }
-  kr_bridge_service ();
+  kr_rl_report_idle ();
+  kr_rl_service ();
 }
 
 void
@@ -520,7 +544,7 @@ kr_rl_wait (void)
 {
   if (kr_bridge_registered () == 0 || kr_gathering)
     return 0;
-  kr_bridge_service ();
+  kr_rl_service ();
   if (kr_cancel_requested)
     return 1;
   return rl_done != 0;
