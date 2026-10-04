@@ -61,6 +61,10 @@ use kr_worker::session::{Session, SessionConfig};
 /// How long a test waits for something that should already have happened.
 const SOON: Duration = Duration::from_secs(5);
 
+/// How long the machine holds input for a reader's exchange, which is the 250 ms rule: a case that
+/// is about that deadline passing moves its session's clock this far.
+const THE_HOLD: Duration = Duration::from_millis(250);
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -104,6 +108,10 @@ fn terminal(session_id: SessionId) -> SessionAttachParams {
 }
 
 /// One session, its endpoint, its bridge and the client that talks to it.
+///
+/// The session's fence machine reads a clock that only the case moves. Its exchange, launch and
+/// write deadlines therefore never pass because the case was slow to answer on a loaded machine,
+/// and a case that is about a deadline passing says so with [`Wired::pass`].
 struct Wired {
     _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
@@ -114,9 +122,25 @@ struct Wired {
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     bridge: ScriptedBridge,
+    clock: Arc<kr_transport::clock::ManualClock>,
 }
 
 impl Wired {
+    /// Lets `by` pass on the machine's own clock, and has the connection's timer look at it.
+    ///
+    /// A deadline the machine set earlier is reached once the clock has moved past it. Call this
+    /// after the stimulus that started the deadline has been seen on the bridge: a deadline is
+    /// counted from the reading the machine took when it was set.
+    fn pass(&self, by: Duration) {
+        self.clock.advance(by);
+        self.runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .waker()
+            .notify_one();
+    }
+
     fn target(&self) -> ActionTarget {
         ActionTarget {
             environment_id: self.environment_id,
@@ -446,9 +470,14 @@ async fn wired_profiled(
     register: bool,
     launch_profile: kr_protocol::session::LaunchProfile,
 ) -> Wired {
-    wired_built(mode, register, Bridging::ordinary(), move |config| {
-        config.launch_profile = launch_profile.clone();
-    })
+    wired_built(
+        mode,
+        register,
+        Bridging::on_a_clock_of_its_own(),
+        move |config| {
+            config.launch_profile = launch_profile.clone();
+        },
+    )
     .await
 }
 
@@ -465,7 +494,7 @@ async fn wired_holding_fences(
         ShellMode::Managed,
         true,
         Bridging {
-            clock: Arc::clone(clock) as Arc<_>,
+            clock: Arc::clone(clock),
             fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
             hello_abi: "zle-5.9",
         },
@@ -476,8 +505,8 @@ async fn wired_holding_fences(
 
 /// What a session's bridge server is built with.
 struct Bridging {
-    /// The clock the session's fence machine reads.
-    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
+    /// The clock the session's fence machine reads, which only the case moves.
+    clock: Arc<kr_transport::clock::ManualClock>,
     /// What the server keeps each published fence from its connection's writer for, if anything.
     fence_hold: Option<FenceHold>,
     /// The editor ABI the reference shell's hello declares. The worker supports `zle-5.9`.
@@ -485,10 +514,10 @@ struct Bridging {
 }
 
 impl Bridging {
-    /// The ordinary clock, and every fence written as soon as the writer has it.
-    fn ordinary() -> Self {
+    /// A clock of its own that the case moves, and every fence written as soon as the writer has it.
+    fn on_a_clock_of_its_own() -> Self {
         Self {
-            clock: Arc::new(SystemContinuousClock::new()),
+            clock: Arc::new(kr_transport::clock::ManualClock::new()),
             fence_hold: None,
             hello_abi: "zle-5.9",
         }
@@ -539,6 +568,7 @@ async fn wired_built(
 
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
+    let clock = Arc::clone(&bridging.clock);
     if mode == ShellMode::Managed {
         session.install_fence(FenceDriver::new(
             session_id,
@@ -639,6 +669,7 @@ async fn wired_built(
         environment_id,
         endpoint,
         bridge,
+        clock,
     }
 }
 
@@ -869,6 +900,7 @@ async fn an_unanswered_exchange_releases_the_held_input_and_says_the_editor_was_
         }
     };
     assert_eq!(asked.deadline_ms.get(), 250);
+    wired.pass(THE_HOLD);
     let withheld = loop {
         match wired.next().await {
             ToBridge::FencePublished(publication) => break publication,
@@ -1776,6 +1808,7 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
                 .write_input(holder, epoch, 0, b"held\n", None, std::time::Instant::now())
                 .expect("accepted");
         }
+        wired.pass(THE_HOLD);
         let delivered = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if contains(&retained(&wired.runtime.session()), b"held") {
@@ -1800,10 +1833,15 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
 
 /// A managed session bound to this host's desktop, with its bridge registered.
 async fn wired_desktop_bound() -> Wired {
-    wired_built(ShellMode::Managed, true, Bridging::ordinary(), |config| {
-        // Desktop-bound, so its watch wants a reading of its own rather than reporting none.
-        config.worker_profile = WorkerProfile::DesktopBound;
-    })
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging::on_a_clock_of_its_own(),
+        |config| {
+            // Desktop-bound, so its watch wants a reading of its own rather than reporting none.
+            config.worker_profile = WorkerProfile::DesktopBound;
+        },
+    )
     .await
 }
 
@@ -1939,7 +1977,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
         ShellMode::Managed,
         true,
         Bridging {
-            clock: Arc::clone(&clock) as Arc<_>,
+            clock: Arc::clone(&clock),
             fence_hold: None,
             hello_abi: "zle-5.9",
         },
@@ -4531,6 +4569,7 @@ async fn an_unanswered_launch_is_outstanding_through_its_revocation_and_ends_wit
 
     // The revocation comes and goes. The launch is still with the reader, and the caller is still
     // waiting for its decision, so it is still outstanding.
+    wired.pass(THE_HOLD);
     let revoked = tokio::time::timeout(SOON, async {
         loop {
             if matches!(wired.next().await, ToBridge::LaunchRevoked { .. }) {
@@ -4800,6 +4839,15 @@ async fn a_launch_the_reader_never_answers_revokes_and_reports_what_it_can() {
             .await
     });
     // The worker revokes at its own deadline and waits for the reader's word.
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } if matches!(*request, WorkerRequest::Launch(_)) => {
+                break;
+            }
+            _ => continue,
+        }
+    }
+    wired.pass(THE_HOLD);
     let revoked = loop {
         match wired.next().await {
             ToBridge::LaunchRevoked { reason, .. } => break reason,
@@ -5356,6 +5404,7 @@ async fn held_input_reaches_the_terminal_in_order_and_the_client_hears_why_it_wa
 
     // The hold ends at its own deadline. The batches go to the terminal in the order they arrived,
     // which is what the program on the other end of it echoes back.
+    wired.pass(THE_HOLD);
     let seen = tokio::time::timeout(SOON, async {
         loop {
             let seen = retained(&wired.runtime.session());
@@ -5430,6 +5479,7 @@ async fn a_reader_that_never_answers_leaves_the_takeover_receipt_unknown() {
             _ => continue,
         }
     }
+    wired.pass(THE_HOLD);
     let receipt = tokio::time::timeout(SOON, async {
         loop {
             if let Some(receipt) = wired.runtime.session().last_takeover_receipt() {
@@ -5508,6 +5558,7 @@ async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
             _ => continue,
         }
     };
+    wired.pass(THE_HOLD);
     let revoked = loop {
         match wired.next().await {
             ToBridge::LaunchRevoked { transaction, .. } => break transaction,
@@ -5850,7 +5901,7 @@ async fn a_shell_refused_at_the_handshake_ends_the_create_with_the_named_error()
         false,
         Bridging {
             hello_abi: "zle-5.8",
-            ..Bridging::ordinary()
+            ..Bridging::on_a_clock_of_its_own()
         },
         |_| {},
     )
