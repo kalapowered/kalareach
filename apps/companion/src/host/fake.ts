@@ -245,6 +245,11 @@ export interface FakeHostControls {
    */
   addSessions(count: number): void
   /**
+   * Reaches the host as a paired device does: every read answers as before, and the host refuses
+   * the two writes of description setup, which only its own socket may make.
+   */
+  reachAsPairedDevice(): void
+  /**
    * Changes what description setup says, as the host would after something outside this device
    * changed it: its offer, its settings or how a fetch is going.
    */
@@ -703,6 +708,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       refuse('PERMISSION_DENIED', 'This device may not manage this host.')
     }
   }
+  let pairedDevice = false
+  /** The two writes of description setup are the host's own to make: a paired device is refused. */
+  const requireLocalSocket = () => {
+    requireOwner()
+    if (pairedDevice) {
+      refuse(
+        'PERMISSION_DENIED',
+        'Session description settings are changed at the host itself, not from a paired device.'
+      )
+    }
+  }
 
   const port: HostPort = {
     connectionState: () => reading('connectionState', connectionNow),
@@ -837,7 +853,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         return { ...descriptionSetup }
       }),
     descriptionConfigure: (params) => {
-      requireOwner()
+      requireLocalSocket()
       descriptionConfigures.push(params)
       const was = descriptionSetup.enabled
       const enabled = params.enabled ?? descriptionSetup.enabled
@@ -854,7 +870,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return settledSetup()
     },
     descriptionDownload: (params) => {
-      requireOwner()
+      requireLocalSocket()
       descriptionDownloads.push(params)
       if (params.action === 'start') {
         if (!descriptionSetup.offered) {
@@ -1561,6 +1577,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         created.push(summary)
         records.startShell(summary.session_id)
       }
+    },
+    reachAsPairedDevice() {
+      pairedDevice = true
     },
     changeDescriptionSetup(change) {
       descriptionSetup = { ...descriptionSetup, ...change }

@@ -172,6 +172,39 @@ describe('the setup card for session descriptions', () => {
     expect(screen.getByTestId('setup-model-size')).toBeInTheDocument()
   })
 
+  // A host reached as a paired device answers the card's read and refuses its two writes, which
+  // only the host's own socket may make. The card names the host's refusal and shows the state as
+  // the host holds it.
+  it('names the host’s refusal of each write from a paired device and shows the state as it stands', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.reachAsPairedDevice()
+    open(port, { view: 'setup' })
+    await toHostStep()
+    expect(await screen.findByTestId('setup-model-size')).toBeInTheDocument()
+
+    await person.click(screen.getByRole('switch', { name: 'Describe my sessions' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-model-refused')).toHaveTextContent(
+        'changed at the host itself, not from a paired device'
+      )
+    })
+    expect(screen.getByRole('switch', { name: 'Describe my sessions' })).toHaveAttribute(
+      'aria-checked',
+      'false'
+    )
+
+    await person.click(screen.getByTestId('setup-model-download'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-model-refused')).toHaveTextContent(
+        'changed at the host itself, not from a paired device'
+      )
+    })
+    expect(screen.getByTestId('setup-model-download')).toBeEnabled()
+    expect(controls.descriptionConfigures).toEqual([])
+    expect(controls.descriptionDownloads).toEqual([])
+  })
+
   it('shows a host that refuses a device its setup in the host’s words', async () => {
     const { port, controls } = fakeHost()
     controls.setRights(['session.create'])
