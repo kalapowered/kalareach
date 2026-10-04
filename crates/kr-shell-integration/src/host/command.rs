@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 pub enum Resolution {
     /// The invocation runs with the agent's flags and a worker-owned backend behind it.
     Integrated {
-        /// The command name, exactly as it was typed.
+        /// The command name of the integration that took it. It is the name the typed one is looked
+        /// up by (see [`lookup_name`]), which is the typed name itself where this platform looks
+        /// commands up by the exact name; the argument vector keeps what was typed.
         command: String,
         /// The argument vector that will be run: what was typed, plus the agent's flags.
         arguments: Vec<String>,
@@ -93,6 +95,33 @@ impl Resolution {
     }
 }
 
+/// Returns the name a typed command is looked up by.
+///
+/// A command is the file of that name in a directory of the search path, and a platform decides what
+/// names the same file. On Unix that is the exact name. On Windows the file system and the shell
+/// ignore the case of ASCII letters and run a program with or without its `.exe` or `.com`, so
+/// `Gemini`, `gemini.exe` and `GEMINI.COM` are one command, and the name looked up is the typed one
+/// in lower case without that suffix. What is typed is what runs: only the lookup changes.
+#[must_use]
+pub fn lookup_name(typed: &str) -> std::borrow::Cow<'_, str> {
+    if !cfg!(windows) {
+        return std::borrow::Cow::Borrowed(typed);
+    }
+    let folded = typed.to_ascii_lowercase();
+    let name = folded
+        .strip_suffix(".exe")
+        .or_else(|| folded.strip_suffix(".com"))
+        .unwrap_or(&folded);
+    std::borrow::Cow::Owned(name.to_owned())
+}
+
+/// Whether a typed command names a path: a directory separator anywhere in it. Somebody who names a
+/// program by path, relative or absolute, is asking for that program and not for what the name
+/// stands for. A backslash is a separator on Windows and an ordinary character in a name elsewhere.
+fn names_a_path(command: &str) -> bool {
+    command.contains('/') || (cfg!(windows) && command.contains('\\'))
+}
+
 /// What the shell is when an invocation is resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvocationContext {
@@ -134,13 +163,14 @@ pub fn resolve(
     if !context.interactive {
         return bypass(CommandBypassReason::NotInteractive);
     }
-    if command.contains('/') {
+    if names_a_path(&command) {
         // The documented bypass. Somebody who names the binary by path is asking for that binary.
         return bypass(CommandBypassReason::AbsolutePath);
     }
+    let looked_up = lookup_name(&command);
     let Some(integration) = integrations
         .iter()
-        .find(|integration| integration.command == command)
+        .find(|integration| lookup_name(&integration.command) == looked_up)
     else {
         return bypass(CommandBypassReason::NotIntegrated);
     };
@@ -168,7 +198,7 @@ pub fn resolve(
     let mut arguments = argv.to_vec();
     arguments.splice(options_end..options_end, added.iter().cloned());
     Resolution::Integrated {
-        command,
+        command: integration.command.clone(),
         arguments,
         added,
     }
@@ -250,6 +280,89 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    /// The lookup name is what the platform treats as one command: nothing changes where names are
+    /// exact, and on Windows the case of ASCII letters and a trailing `.exe` or `.com` are not part
+    /// of it. A name that is not an executable's (`.cmd`, `.ps1`, another suffix, a second suffix)
+    /// keeps everything but its case.
+    #[test]
+    fn a_typed_command_is_looked_up_by_the_name_its_platform_gives_the_same_file() {
+        for (typed, windows, elsewhere) in [
+            ("codex", "codex", "codex"),
+            ("Codex", "codex", "Codex"),
+            ("codex.exe", "codex", "codex.exe"),
+            ("CODEX.EXE", "codex", "CODEX.EXE"),
+            ("Codex.Com", "codex", "Codex.Com"),
+            ("codex.cmd", "codex.cmd", "codex.cmd"),
+            ("codex.ps1", "codex.ps1", "codex.ps1"),
+            ("codex.exe.exe", "codex.exe", "codex.exe.exe"),
+            ("\u{c9}cole.exe", "\u{c9}cole", "\u{c9}cole.exe"),
+        ] {
+            assert_eq!(
+                lookup_name(typed),
+                if cfg!(windows) { windows } else { elsewhere },
+                "{typed}"
+            );
+        }
+    }
+
+    /// KR-REQ-12.07: where names are exact an invocation spelt another way is not integrated, and
+    /// where they are not it is, with the vector it was typed in. A path, whatever its spelling, is
+    /// the bypass: a backslash is a separator only on Windows.
+    #[test]
+    fn the_name_an_invocation_is_typed_with_decides_by_what_its_platform_calls_the_same_command() {
+        let spelt = ["Codex", "codex.exe", "CODEX.COM"];
+        for typed in spelt {
+            let resolved = resolve(&integrations(), MANAGED, &argv(&[typed, "--model", "o"]));
+            if cfg!(windows) {
+                let Resolution::Integrated {
+                    command, arguments, ..
+                } = resolved
+                else {
+                    panic!("{typed} is the integrated command here");
+                };
+                assert_eq!(command, "codex", "the integration's own name");
+                assert_eq!(
+                    arguments,
+                    argv(&[typed, "--model", "o", "--kr-gateway"]),
+                    "{typed}: what was typed is what runs"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        resolved,
+                        Resolution::Bypassed {
+                            reason: CommandBypassReason::NotIntegrated,
+                            ..
+                        }
+                    ),
+                    "{typed} is another command here: {resolved:?}"
+                );
+            }
+        }
+        for path in ["./codex", "/usr/bin/codex", "bin/codex"] {
+            assert!(
+                matches!(
+                    resolve(&integrations(), MANAGED, &argv(&[path])),
+                    Resolution::Bypassed {
+                        reason: CommandBypassReason::AbsolutePath,
+                        ..
+                    }
+                ),
+                "{path}"
+            );
+        }
+        let backslashed = resolve(&integrations(), MANAGED, &argv(&["bin\\codex.exe"]));
+        let reason = if cfg!(windows) {
+            CommandBypassReason::AbsolutePath
+        } else {
+            CommandBypassReason::NotIntegrated
+        };
+        assert!(
+            matches!(backslashed, Resolution::Bypassed { reason: found, .. } if found == reason),
+            "{backslashed:?}"
+        );
     }
 
     #[test]

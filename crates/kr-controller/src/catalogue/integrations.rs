@@ -506,6 +506,16 @@ fn resolved(
                 .and_then(|digest| connector.qualified_version(&digest).map(str::to_owned))
         }));
         report.executable = Nullable::some(executable.display().to_string());
+        // What the shell finds first is what an invocation runs, and a launcher cannot start a
+        // shim: an invocation that finds one runs as typed, which a person who turned the
+        // integration on is told here, beside the executable.
+        if !kr_worker::broker::commands::starts_directly(&executable) && report.reason.0.is_none() {
+            report.reason = Nullable::some(format!(
+                "first hit is {}, a script or shim that no launcher starts, so an invocation that \
+                 finds it runs as typed",
+                executable.display()
+            ));
+        }
     }
     report
 }
@@ -547,18 +557,32 @@ fn described(
 
 /// The first executable `command` names on `search_path`, as a shell's search finds it.
 fn resolve(command: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
-    let extensions: Vec<String> = if cfg!(windows) {
-        // A command is found under each of the extensions the platform runs, in its order.
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    resolve_with(command, search_path, &extensions)
+    let pathext = std::env::var("PATHEXT").ok();
+    resolve_with(
+        command,
+        search_path,
+        &extensions(cfg!(windows), pathext.as_deref()),
+    )
+}
+
+/// The suffixes a command is looked for under in each directory, in order.
+///
+/// Where names are exact it is looked for as it is. On Windows it is found under each of the
+/// extensions the platform runs, `pathext` naming them, and in one directory PowerShell takes a
+/// `.ps1` script before the program those extensions name, which is why that one comes first.
+fn extensions(windows: bool, pathext: Option<&str>) -> Vec<String> {
+    if !windows {
+        return vec![String::new()];
+    }
+    std::iter::once(".ps1".to_owned())
+        .chain(
+            pathext
+                .unwrap_or(".COM;.EXE;.BAT;.CMD")
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_ascii_lowercase),
+        )
+        .collect()
 }
 
 /// The first runnable `command` followed by one of `extensions` in a directory of `search_path`:

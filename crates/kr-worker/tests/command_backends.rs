@@ -791,6 +791,87 @@ async fn kr_req_12_22_flags_that_name_the_forwarder_are_compared_after_it_is_wri
     assert!(without.backends.root().is_none(), "and nothing is created");
 }
 
+/// KR-REQ-12.07: where the shell finds a shim and not a program, the invocation establishes nothing
+/// and the reason names it: `first hit is <the shim>`. A `.cmd`, a `.bat` and a `.ps1` are run by an
+/// interpreter whose identity is not the agent's, so no launch of one could name the agent. Where
+/// names are exact there are no shims and the same files are programs. The control on every platform
+/// is the program itself.
+#[tokio::test]
+async fn kr_req_12_07_a_shim_is_the_first_hit_and_establishes_nothing() {
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    let claude = invocation(&["claude"]);
+    setup
+        .backends
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("the program establishes");
+    setup.backends.line_ended(PromptGeneration::new(1));
+
+    for (generation, name) in ["claude.cmd", "claude.bat", "claude.ps1"]
+        .into_iter()
+        .enumerate()
+    {
+        let shim = setup.directory.join("bin").join(name);
+        std::fs::copy(stand_in_program(), &shim).expect("a shim stands in");
+        let asked = EstablishRequest {
+            executable: shim.to_str().expect("a text path"),
+            ..request(&setup, &claude, &integration, 10 + generation as u64)
+        };
+        let answered = setup.backends.establish(&asked);
+        if cfg!(windows) {
+            let why = answered.expect_err(name);
+            assert!(
+                why.starts_with(&format!("first hit is {}", shim.display())),
+                "{name}: {why}"
+            );
+        } else {
+            answered.expect(name);
+            setup
+                .backends
+                .line_ended(PromptGeneration::new(10 + generation as u64));
+        }
+    }
+}
+
+/// KR-REQ-12.07: a command is looked up by the name its platform gives the file: on Windows
+/// `CLAUDE`, `Claude.EXE` and `claude.com` are the integrated `claude`, and the vector the answer
+/// runs keeps what was typed; where names are exact they are other commands and nothing is
+/// established.
+#[tokio::test]
+async fn kr_req_12_07_a_command_is_looked_up_by_the_name_its_platform_gives_the_file() {
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    for (generation, typed) in ["CLAUDE", "Claude.EXE", "claude.com"]
+        .into_iter()
+        .enumerate()
+    {
+        let spelt = invocation(&[typed, "--resume"]);
+        let asked = request(&setup, &spelt, &integration, 1 + generation as u64);
+        let answered = setup.backends.establish(&asked);
+        if cfg!(windows) {
+            let backend = answered.unwrap_or_else(|why| panic!("{typed}: {why}"));
+            assert!(
+                backend.launcher.ends_with(&executable_name("kr-hook")),
+                "{typed}"
+            );
+            assert_eq!(
+                registration_name(&backend),
+                "registration.2.2",
+                "{typed}: the flags stand after what was typed"
+            );
+            setup
+                .backends
+                .line_ended(PromptGeneration::new(1 + generation as u64));
+        } else {
+            answered.expect_err(typed);
+        }
+    }
+    assert!(
+        cfg!(windows) || setup.backends.root().is_none(),
+        "a command of another name creates nothing"
+    );
+}
+
 /// KR-REQ-12.07: the integration's flags are added whole or not at all. A run that leaves one out,
 /// as the shell's answer does when the person typed that one, establishes nothing, so the command
 /// runs as typed; one the person typed whole establishes with nothing added.
