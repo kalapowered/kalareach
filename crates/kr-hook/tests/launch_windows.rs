@@ -940,8 +940,9 @@ fn kr_req_07_64_a_launcher_in_a_job_that_restricts_desktops_declines_and_the_typ
     );
     let report = shell.report_from("restricted", &mut launcher);
     assert_eq!(
-        report["relaunch"], "%GEMINI_CLI_NO_RELAUNCH%",
-        "the typed program ran in the person's own environment: {report:?}"
+        (report["variable"].as_str(), report["relaunch"].as_str()),
+        ("", ""),
+        "the typed program ran in the person's own environment, with no backend behind it: {report:?}"
     );
     let status = launcher.wait().expect("the launcher ends with the program");
     assert_eq!(status.code(), Some(7), "the typed program ran and ended");
