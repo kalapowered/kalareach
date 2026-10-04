@@ -1488,7 +1488,7 @@ the destination's own side, so no arrangement of hops turns a network device int
 A request crosses at most one bridge. A handshake that says the request has already been bridged is
 refused, and so is a carried request that would open a bridge of its own: the destination serves
 what arrives over the helper's local connection as an ordinary local request, so the rule is kept at
-the hop that knows one was crossed. A federated proxy is not part of this version.
+the hop that knows one was crossed. This version has no federated proxy.
 
 ### Opening a bridge to create or attach
 
