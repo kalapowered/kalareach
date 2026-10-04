@@ -114,6 +114,13 @@ static struct {
     unsigned long fence_reader;
     unsigned char fence_attachment[KR_UUID_LEN];
     unsigned long long fence_epoch;
+    /*
+     * Set when the worker says it holds no fence for this reader: an exchange ended with none, or
+     * the fence it published has gone. The worker retries at the reader's next idle report, so the
+     * reader owes one, however many it has already sent. The reader takes this with
+     * kr_bridge_take_fence_retry.
+     */
+    int fence_retry;
 
     /* The gesture in force, and one the line discipline has changed to. */
     int gesture_disabled;
@@ -474,6 +481,7 @@ kr_disconnect(int loss)
     }
     kr.registered = 0;
     kr.fence_live = 0;
+    kr.fence_retry = 0;
     kr.launch_pending = 0;
     /* Nothing more will be answered, so nothing is owed and nothing is waited for. */
     kr.owed = 0;
@@ -1210,6 +1218,15 @@ int
 kr_bridge_launch_pending(void)
 {
     return kr.launch_pending;
+}
+
+int
+kr_bridge_take_fence_retry(void)
+{
+    int retry = kr.fence_retry;
+
+    kr.fence_retry = 0;
+    return retry;
 }
 
 /* ---- events ---------------------------------------------------------------------------------- */
@@ -2041,8 +2058,10 @@ kr_take_publication(const kr_cbor_doc *doc, int publication)
         kr.fence_live = 1;
         return;
     }
-    /* Withheld and invalidated both mean the bridge holds no fence. */
+    /* Withheld and invalidated both mean the bridge holds no fence, and that the worker is
+     * waiting for the reader's next idle report to ask again. */
     kr.fence_live = 0;
+    kr.fence_retry = 1;
 }
 
 /* Whether `id` is a detach this bridge submitted and has had no answer to, forgetting it if so. */

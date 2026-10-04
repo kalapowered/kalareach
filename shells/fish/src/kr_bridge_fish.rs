@@ -147,6 +147,7 @@ unsafe extern "C" {
     fn kr_bridge_cancel_settled();
     fn kr_bridge_lost(loss: c_int, detail: *const c_char);
     fn kr_bridge_launch_pending() -> c_int;
+    fn kr_bridge_take_fence_retry() -> c_int;
     fn kr_bridge_root_process() -> c_int;
     fn kr_bridge_resolve(
         argv: *const *const c_char,
@@ -923,6 +924,13 @@ pub fn service(reader: &mut Reader<'_>) -> bool {
         // Safety: the reader is parked for the whole of the call.
         unsafe { kr_bridge_service() };
     });
+    // Safety: the core keeps this flag and asks nothing of ours to report it.
+    if unsafe { kr_bridge_take_fence_retry() } != 0 {
+        // The worker holds no fence for this reader and retries at its next idle report. An
+        // exchange that was still open when the reader first reported idle ends withheld, and
+        // that report was dropped with it, so the wait the reader is in has to report again.
+        state().idle_reported = false;
+    }
     settle(reader)
 }
 
