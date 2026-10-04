@@ -87,6 +87,8 @@ pub(super) struct Scripted {
     receipts_only: std::sync::Mutex<BTreeMap<ActionId, (Method, ProtocolError)>>,
     /// Whether it accepts a prompt submission, as a worker whose agent takes the prompt does.
     accepts_prompts: AtomicBool,
+    /// Where it holds the next prompt submission it is forwarded, once a test has set one.
+    holding_a_prompt: std::sync::Mutex<Option<End>>,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -120,7 +122,21 @@ impl Scripted {
             forwarded_with_history: std::sync::Mutex::new(Vec::new()),
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
             accepts_prompts: AtomicBool::new(false),
+            holding_a_prompt: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Has this worker hold the next prompt submission it is forwarded, before it answers. The
+    /// first half says that the submission has arrived, and the worker answers it once the second
+    /// is sent or dropped.
+    pub(super) fn hold_the_next_prompt(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (go, going) = oneshot::channel();
+        *self
+            .holding_a_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(End { arrived, go: going });
+        (arrival, go)
     }
 
     /// Has this worker accept the prompt submissions it is forwarded, or stop accepting them.
@@ -542,9 +558,19 @@ fn serve_scripted(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((*forwarded).clone());
-                            if forwarded.mutation.method == Method::AgentPromptSubmit.into()
+                            if (forwarded.mutation.method == Method::AgentPromptSubmit.into()
+                                || forwarded.mutation.method == Method::AgentPromptQueue.into())
                                 && script.accepts_prompts.load(Ordering::Acquire)
                             {
+                                let holding = script
+                                    .holding_a_prompt
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                if let Some(holding) = holding {
+                                    let _ = holding.arrived.send(());
+                                    let _ = holding.go.await;
+                                }
                                 let accepted = kr_protocol::agent::AgentMutationResult {
                                     binding_revision: kr_protocol::ids::AgentBindingRevision::new(
                                         1,

@@ -60,6 +60,39 @@ pub(super) fn held_by_an_earlier_worker(method: Method) -> ProtocolError {
     ProtocolError::new(ErrorCode::UnsupportedCapability, detail)
 }
 
+/// The draft a prompt names, when the mutation is a prompt that names a draft.
+///
+/// A queued prompt counts with a submitted one. The session's agent holds it from the moment the
+/// worker accepts it and may run it long after, and this host is not told when it does, so what it
+/// carries is the session's from the start: keeping it for the session's retention can keep a file
+/// longer than needed and cannot lose one.
+fn submitted_draft(mutation: &MutationRequest) -> Option<kr_protocol::ids::DraftId> {
+    if !matches!(
+        mutation.method.method(),
+        Some(Method::AgentPromptSubmit | Method::AgentPromptQueue)
+    ) {
+        return None;
+    }
+    mutation
+        .params
+        .to_typed::<kr_protocol::agent::AgentPromptParams>()
+        .ok()
+        .and_then(|params| params.draft_id.0)
+}
+
+/// What a caller is told when its prompt was submitted and this host could not record that its
+/// draft's attachments were.
+fn submission_unrecorded(error: &ProtocolError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        format!(
+            "the prompt was submitted, and this host could not record that its draft's \
+             attachments were, so ask again under the same action: {}",
+            error.message
+        ),
+    )
+}
+
 impl RemoteConnection {
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
     ///
@@ -237,15 +270,7 @@ impl RemoteConnection {
         // The draft a prompt submission names. Once the worker has accepted the prompt, this host
         // records the submission, which is what puts the draft's attachments under the session's
         // retention.
-        let submitted_draft = (mutation.method.method() == Some(Method::AgentPromptSubmit))
-            .then(|| {
-                mutation
-                    .params
-                    .to_typed::<kr_protocol::agent::AgentPromptParams>()
-                    .ok()
-            })
-            .flatten()
-            .and_then(|params| params.draft_id.0);
+        let submitted_draft = submitted_draft(mutation);
         let envelope = self.envelope(validated);
         let deadline = match self
             .controller
@@ -275,8 +300,15 @@ impl RemoteConnection {
         // holds no grants: section 8's intersection of requested capabilities with the actor's
         // rights is made where the attachment is admitted, out of what the host checked this
         // request against.
+        //
+        // The record of a submission is part of that effect. A connection that ends while the
+        // worker answers cancels this handler and not the task, and a prompt the worker accepted
+        // must put its draft's attachments under the session's retention whether or not anyone is
+        // left to hear the answer.
+        let controller = Arc::clone(&self.controller);
+        let principal = self.device.principal();
         let effect = tokio::spawn(async move {
-            proxy
+            let answered = proxy
                 .forward_mutation(
                     &mutation,
                     Vouched {
@@ -286,10 +318,19 @@ impl RemoteConnection {
                     },
                     deadline,
                 )
-                .await
+                .await?;
+            let unrecorded = match submitted_draft {
+                Some(draft_id) if matches!(answered.response.outcome, Outcome::Ok(_)) => controller
+                    .transfer
+                    .record_submission(&principal, draft_id, session_id)
+                    .await
+                    .err(),
+                _ => None,
+            };
+            Ok::<_, ControllerError>((answered, unrecorded))
         });
         match effect.await {
-            Ok(Ok(answered)) => {
+            Ok(Ok((answered, unrecorded))) => {
                 if answered.retained {
                     // A retained answer is a read of somebody's receipt. A worker that holds
                     // nothing to a scope gave it whole, so it is not shown; one that does gave
@@ -303,32 +344,12 @@ impl RemoteConnection {
                         Err(error) => return failure(request_id, error),
                     }
                 }
-                if let Some(draft_id) = submitted_draft
-                    && matches!(answered.response.outcome, Outcome::Ok(_))
-                {
+                if let Some(error) = unrecorded {
                     // The prompt is submitted whatever this records, so a failure here is not a
-                    // refusal. The caller is told the outcome is unknown, asks again under the
-                    // same action, and the worker answers from what it kept and this records
-                    // the submission again.
-                    if let Err(error) = self
-                        .controller
-                        .transfer
-                        .record_submission(&self.device.principal(), draft_id, session_id)
-                        .await
-                    {
-                        return failure(
-                            request_id,
-                            ProtocolError::new(
-                                ErrorCode::OutcomeUnknown,
-                                format!(
-                                    "the prompt was submitted, and this host could not record \
-                                     that its draft's attachments were, so ask again under the \
-                                     same action: {}",
-                                    error.message
-                                ),
-                            ),
-                        );
-                    }
+                    // refusal. The caller is told the outcome is unknown and asks again under the
+                    // same action: the worker answers from what it kept, and that answer records
+                    // the submission again ([`Self::retained_remotely`]).
+                    return failure(request_id, submission_unrecorded(&error));
                 }
                 ControlFrame::Response(Response {
                     request_id,
@@ -623,6 +644,19 @@ impl RemoteConnection {
         }
         if !holds {
             return Err(RouteRefusal::Conflict(held_by_an_earlier_worker(answering)));
+        }
+        // A prompt the worker accepted is a submission whether or not the attempt that made it got
+        // to record that. This answer is that worker's result for the same action, so the record
+        // is made again here, and it changes nothing where it was made the first time.
+        if read_back.result.0.is_some()
+            && let Some(draft_id) = submitted_draft(mutation)
+            && let Err(error) = self
+                .controller
+                .transfer
+                .record_submission(&actor_id, draft_id, session_id)
+                .await
+        {
+            return Err(RouteRefusal::Conflict(submission_unrecorded(&error)));
         }
         // The result when the action produced one, and the receipt when it has not: a caller that
         // resubmitted is told what became of its action, and nothing is dispatched again.
