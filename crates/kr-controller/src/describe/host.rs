@@ -151,6 +151,28 @@ pub(crate) struct Snapshot {
     /// When this host started, on the wall clock: a description produced before it is from an
     /// earlier daemon, whose context revisions say nothing about this one's.
     pub started_wall_ms: u64,
+    /// What the host last observed of each live session's directory and program.
+    pub seen: BTreeMap<SessionId, Seen>,
+}
+
+/// What the host observed of one session's directory and program, and when.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// The directory the newest command ran in, with its repository when it is inside one.
+    pub directory: Option<SeenText>,
+    /// The program of the newest command.
+    pub application: Option<SeenText>,
+}
+
+/// One thing the host observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeenText {
+    /// What was observed.
+    pub text: String,
+    /// When the host first observed it as it stands, on the wall clock, in milliseconds.
+    pub at_ms: u64,
+    /// The privacy generation it was captured under: nothing of another generation is read.
+    pub generation: PrivacyGeneration,
 }
 
 /// What the host has done, counted, for this crate's own tests and for the doctor.
@@ -415,6 +437,7 @@ impl DescribeHost {
                         clock,
                         conditions,
                         last_event: BTreeMap::new(),
+                        seen: BTreeMap::new(),
                         started_wall_ms,
                         abandon,
                         held: Held {
@@ -742,6 +765,8 @@ struct Thread {
     conditions: Option<Arc<Mutex<HostConditions>>>,
     /// The newest event cursor taken from each session's facts.
     last_event: BTreeMap<SessionId, u64>,
+    /// What was last observed of each session's directory and program, and when.
+    seen: BTreeMap<SessionId, Seen>,
     /// When this thread started, on the wall clock.
     started_wall_ms: u64,
     /// Whether the process is left running when this thread ends.
@@ -833,6 +858,7 @@ impl Thread {
                     // The service forgot the session's events; so does the host's cursor, or the
                     // events its worker still holds would be taken for ones it had seen.
                     self.last_event.remove(&session_id);
+                    self.seen.remove(&session_id);
                     // A session opened while privacy mode is on is fenced from the start, at the
                     // generation in force.
                     let published = self.privacy.now();
@@ -846,6 +872,7 @@ impl Thread {
                 Message::Closed { session_id } => {
                     self.driver.service_mut().session_closed(&session_id, now);
                     self.last_event.remove(&session_id);
+                    self.seen.remove(&session_id);
                 }
                 Message::Settings {
                     enabled,
@@ -871,6 +898,7 @@ impl Thread {
                         .unwrap_or_else(PoisonError::into_inner)
                         .clear();
                     self.last_event.clear();
+                    self.seen.clear();
                     // Owed until it is done, and no longer.
                     let _ = self.shared.purges_owed.fetch_update(
                         Ordering::AcqRel,
@@ -1054,6 +1082,12 @@ impl Thread {
             service.set_privacy_generation(session_id, generation);
         }
         capture(service, session_id, facts, now, &mut self.last_event);
+        note_seen(
+            self.seen.entry(session_id).or_default(),
+            facts,
+            generation,
+            now.wall_ms().get(),
+        );
         drop(admission);
     }
 
@@ -1125,6 +1159,7 @@ impl Thread {
             figures,
             setup: Some(setup),
             started_wall_ms: self.started_wall_ms,
+            seen: self.seen.clone(),
         };
         *self
             .shared
@@ -1143,6 +1178,46 @@ impl Thread {
         due.map_or(IDLE_WAIT, |due| {
             Duration::from_millis(due.saturating_sub(now.monotonic_ms())).min(IDLE_WAIT)
         })
+    }
+}
+
+/// Records what a page of facts says of a session's directory and program, keeping the moment each
+/// was first observed as it stands: a page that repeats what is held moves nothing, and one that
+/// changes it, or that is of another privacy generation, starts its moment again.
+fn note_seen(
+    seen: &mut Seen,
+    facts: &kr_protocol::describe::DescriptionFacts,
+    generation: PrivacyGeneration,
+    at_ms: u64,
+) {
+    let directory = facts
+        .directory
+        .0
+        .as_ref()
+        .map(|name| match facts.repository.0.as_ref() {
+            Some(repository) => match repository.branch.0.as_deref() {
+                Some(branch) if !branch.is_empty() => {
+                    format!("{name} (repository {}, branch {branch})", repository.name)
+                }
+                _ => format!("{name} (repository {})", repository.name),
+            },
+            None => name.clone(),
+        });
+    for (held, text) in [
+        (&mut seen.directory, directory),
+        (&mut seen.application, facts.application.0.clone()),
+    ] {
+        *held = match (held.take(), text) {
+            (Some(was), Some(text)) if was.text == text && was.generation == generation => {
+                Some(was)
+            }
+            (_, Some(text)) => Some(SeenText {
+                text,
+                at_ms,
+                generation,
+            }),
+            (_, None) => None,
+        };
     }
 }
 
@@ -1393,6 +1468,7 @@ pub(crate) mod tests {
             clock: Clock::skewed(Arc::new(AtomicU64::new(0))),
             conditions: None,
             last_event: BTreeMap::new(),
+            seen: BTreeMap::new(),
             started_wall_ms: 0,
             abandon: false,
             held: Held::default(),
@@ -1514,6 +1590,59 @@ pub(crate) mod tests {
         let (_directory, mut behind) = thread(state(2, false));
         behind.apply(session(), &page(1), now);
         assert!(!pending(&behind), "the generation in force is another");
+    }
+
+    /// What the host observed of a session's directory and program carries the moment it first
+    /// observed each as it stands: a page that repeats what is held keeps it, a change starts the
+    /// moment again for what changed and for nothing else, and what was captured under another
+    /// generation is not kept. The control is the first page, which sets both.
+    #[test]
+    fn what_was_observed_keeps_the_moment_it_was_first_observed_as_it_stands() {
+        let (_directory, mut host) = thread(state(0, false));
+        let seen = |host: &Thread| host.seen.get(&session()).cloned().expect("a record");
+        host.apply(session(), &page(0), Reading::new(1_000, 1_700_000_001_000));
+        let first = seen(&host);
+        assert_eq!(
+            first.directory.as_ref().map(|d| d.at_ms),
+            Some(1_700_000_001_000)
+        );
+        assert_eq!(
+            first.application.as_ref().map(|a| a.at_ms),
+            Some(1_700_000_001_000)
+        );
+
+        // The same facts again, with another revision: nothing moves.
+        host.apply(
+            session(),
+            &page_with(0, 2, |_| {}),
+            Reading::new(2_000, 1_700_000_002_000),
+        );
+        assert_eq!(seen(&host), first);
+
+        // A program that changes moves its moment and not the directory's.
+        host.apply(
+            session(),
+            &page_with(0, 3, |facts| {
+                facts.application = Nullable::some("make".to_owned());
+            }),
+            Reading::new(3_000, 1_700_000_003_000),
+        );
+        let changed = seen(&host);
+        assert_eq!(changed.directory, first.directory);
+        let application = changed.application.expect("a program");
+        assert_eq!(
+            (application.text.as_str(), application.at_ms),
+            ("make", 1_700_000_003_000)
+        );
+
+        // A program that is no longer reported is no longer held.
+        host.apply(
+            session(),
+            &page_with(0, 4, |facts| facts.application = Nullable::null()),
+            Reading::new(4_000, 1_700_000_004_000),
+        );
+        assert_eq!(seen(&host).application, None);
+        assert_eq!(seen(&host).directory, first.directory);
     }
 
     /// A session's fence is lowered at the first page admitted at a newer non-private generation
