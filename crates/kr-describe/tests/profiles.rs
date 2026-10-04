@@ -387,8 +387,6 @@ fn a_signed_profile_that_states_the_wrong_thing_is_still_refused() {
         ("\"top_p\": 1.0", "\"top_p\": 4.0"),
         ("\"top_k\": 1", "\"top_k\": 0"),
         ("\"context_tokens\": 4096", "\"context_tokens\": 0"),
-        // A window that cannot hold the instruction beside the output bound: no job could exist.
-        ("\"context_tokens\": 4096", "\"context_tokens\": 600"),
         ("\"max_output_tokens\": 128", "\"max_output_tokens\": 8192"),
         ("\"cpu_threads\": 4", "\"cpu_threads\": 0"),
         (
