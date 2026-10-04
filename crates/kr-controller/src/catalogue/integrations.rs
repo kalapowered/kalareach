@@ -494,9 +494,9 @@ fn resolved(
         });
     }
     // A worker runs every invocation as typed where it cannot use the flags a package declares: it
-    // cannot write the forwarder into them, or they name the forwarder by its own name, which an
-    // application may look for in its working directory before its search path. The report says so
-    // beside the state, read from the declared flags, which are what the worker reads.
+    // cannot write the forwarder into them or, on Windows, they name the forwarder by its own name,
+    // which an application may look for in its working directory before its search path. The report
+    // says so beside the state, read from the declared flags, which are what the worker reads.
     let declared_flags = connector
         .and_then(|connector| connector.manifest().command_integration.as_ref())
         .map(|declared| declared.flags.as_slice());
