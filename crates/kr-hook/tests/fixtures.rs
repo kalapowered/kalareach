@@ -3,7 +3,7 @@
 //! The Claude Code connector package installs three files into the user's own Claude Code
 //! directory, and those files are what start this forwarder. Their copies under
 //! `fixtures/bridges/claude-code/` are the bytes the package publishes (the plugins repository at
-//! `2760679a70dd8f7b177266b69a6bab93de084b27`, `plugins/kalareach/claude-code/bridge/`), pinned here
+//! `f369c549f2ec5fa851d5d5f849261f225f7fd65c`, `plugins/kalareach/claude-code/bridge/`), pinned here
 //! by the SHA-256 digests the package's own recipe names. They name the forwarder by the
 //! placeholder `{kr_hook}`, which the host replaces with the installed forwarder's path when it
 //! writes the files; this suite checks the placeholder stands where the host replaces it, and that
@@ -13,7 +13,7 @@
 //! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
 //! CLI directory: its manifest, its hooks and its install record. Their copies under
 //! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
-//! `2760679a70dd8f7b177266b69a6bab93de084b27`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! `f369c549f2ec5fa851d5d5f849261f225f7fd65c`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
 //! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
@@ -23,7 +23,7 @@
 //!
 //! What a launch adds comes from each release's own command integration, which its manifest
 //! declares. The manifests of the three released packages are under `fixtures/plugins/released/`,
-//! copied byte for byte from the plugins repository at `9f003bb6b31899e0c59b6e24d0b10756a16ff7ab`,
+//! copied byte for byte from the plugins repository at `bb50ebb41f7ebe4e5fb8cb388b816c849007306d`,
 //! and pinned by their SHA-256 digests, which are the package hashes an owner confirms at
 //! installation.
 //!
@@ -442,15 +442,15 @@ fn the_released_manifests_are_the_pinned_packages() {
     for (package, digest) in [
         (
             "claude-code",
-            "df9efe055ecd4ce482f62e780983ae31de86980da1d03c42214c7c2bcffe56d4",
+            "4e967df9fc5c0e3c1feddb1a7767e04f0c6ad02831fc6e455f8291a0882f5214",
         ),
         (
             "gemini-cli",
-            "2ce2bc21016eb17f9018f74df9134fc52aa0e5312342e1bda5b23ec4724edb79",
+            "72dd20cf01448d3e1d8cfed962a13f7cf7bc69c7a5abdc5a20b9edcd664f2c4b",
         ),
         (
             "qoder-cli",
-            "356d33e4057b3b75b99ee6acfe275e06658932660511a117a8d86c9693756227",
+            "839be8df1b15cdc500c9f6e4bb5564a6bfff0f2bb6fb8a0497821b9762165a14",
         ),
     ] {
         assert_eq!(sha256(&released(package)), digest, "{package}");
