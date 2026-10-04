@@ -915,6 +915,7 @@ fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
         "row": saved.row,
         "pending_wrap": saved.pending_wrap,
         "origin_mode": saved.origin_mode,
+        "shift_out": saved.shift_out,
         "style": saved.style,
         "charsets": {
             "g0": saved.charsets.g0,

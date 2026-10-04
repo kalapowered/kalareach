@@ -1322,6 +1322,7 @@ mod projection_tests {
                     g0: "B".to_owned(),
                     g1: "B".to_owned(),
                 },
+                shift_out: false,
                 origin_mode: false,
                 style: 1,
                 hyperlink: Some(kr_term::grid::Link::new(
@@ -1339,6 +1340,7 @@ mod projection_tests {
                     g0: "B".to_owned(),
                     g1: "B".to_owned(),
                 },
+                shift_out: false,
                 origin_mode: false,
                 style: 1,
                 hyperlink: None,

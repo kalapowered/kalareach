@@ -1407,6 +1407,13 @@ impl CanonicalGrid {
         self.sync_history();
     }
 
+    /// Selects the shift-in character set again, after something in the reducer left it.
+    pub fn set_shift_in(&mut self) {
+        self.terminal
+            .perform_actions(vec![Action::Control(ControlCode::ShiftIn)]);
+        self.sync_history();
+    }
+
     /// The DECSCUSR style the reducer is using.
     ///
     /// A cursor restore puts back the shape that was saved with it, without a sequence of its own,
@@ -1462,6 +1469,8 @@ impl CanonicalGrid {
             origin_mode: saved.dec_origin_mode,
             style: style_of(saved.position.shape),
             hyperlink: saved.pen.hyperlink().map(|link| Link::of(link)),
+            // The grid library keeps no shift beside a saved cursor; the session that drives it does.
+            shift_out: false,
         })
     }
 
