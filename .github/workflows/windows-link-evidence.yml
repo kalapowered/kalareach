@@ -1,0 +1,120 @@
+name: windows-link-evidence
+
+# Reads the C runtime out of Windows executables: what an archive already built links against, and
+# what a rebuild of one executable at the same commit links when the job-wide RUSTFLAGS is set and
+# when it is not. Builds and reads only; it signs and publishes nothing.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  ARCHIVE_RUN: "36221734570"
+  ARCHIVE_NAME: "kalareach-windows-x64-0.1.0+1a76374fe73d"
+  ARCHIVE_COMMIT: "1a76374fe73df697ed9fb36e53036eb7510e14c6"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  archive:
+    name: the signed archive's executables
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Download the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $into = Join-Path $env:RUNNER_TEMP 'download'
+          gh run download $env:ARCHIVE_RUN --repo $env:GITHUB_REPOSITORY --name $env:ARCHIVE_NAME --dir $into
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -LiteralPath $into -Recurse -File | ForEach-Object { Write-Host ('{0}  {1}' -f $_.Length, $_.FullName) }
+          $zip = Get-ChildItem -LiteralPath $into -Filter '*.zip' | Select-Object -First 1
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath (Join-Path $env:RUNNER_TEMP 'unpacked')
+
+      - name: Read what each executable imports
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $install 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe |
+            Where-Object { $_.FullName -like '*\bin\Hostx64\x64\*' } | Sort-Object FullName | Select-Object -Last 1
+          Write-Host "dumpbin: $($dumpbin.FullName)"
+          $root = Join-Path $env:RUNNER_TEMP 'unpacked'
+          foreach ($name in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe')) {
+            $path = Join-Path $root $name
+            Write-Host "=== $name  sha256 $((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())"
+            & $dumpbin.FullName /nologo /dependents $path
+          }
+          Get-Content -LiteralPath (Join-Path $root 'signatures.txt') | Select-String -Pattern '\.exe'
+
+  link:
+    name: rebuild kr-attach-guard (${{ matrix.variant }})
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [job-wide-rustflags, workspace-flags]
+    steps:
+      - name: Check out the commit the archive was built from
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.ARCHIVE_COMMIT }}
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Set the job-wide RUSTFLAGS the release job used to set
+        if: matrix.variant == 'job-wide-rustflags'
+        run: '"RUSTFLAGS=-Clink-arg=/IGNORE:4099" | Out-File -FilePath $env:GITHUB_ENV -Append'
+
+      - name: Build with a link map
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $map = Join-Path $env:RUNNER_TEMP 'kr-attach-guard.map'
+          Write-Host "RUSTFLAGS=[$env:RUSTFLAGS]"
+          cargo rustc --locked --release -p kr-cli --bin kr-attach-guard -- "-Clink-arg=/MAP:$map" 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'build.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Read the link
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'build.log'
+          Write-Host "LNK4098 lines in the build output: $(@(Select-String -LiteralPath $build -Pattern 'LNK4098').Count)"
+          Write-Host "any LNK lines in the build output: $(@(Select-String -LiteralPath $build -Pattern 'LNK\d{4}').Count)"
+
+          $map = Join-Path $env:RUNNER_TEMP 'kr-attach-guard.map'
+          Write-Host "map: $((Get-Item -LiteralPath $map).Length) bytes"
+          $objects = [ordered]@{}
+          foreach ($line in (Get-Content -LiteralPath $map)) {
+            if ($line -match '^\s*[0-9a-f]{4}:[0-9a-f]{8}\s' -and $line -match '\s([^\s:]+):\S+\s*$') {
+              $library = $Matches[1].ToLowerInvariant()
+              if (-not $objects.Contains($library)) { $objects[$library] = 0 }
+              $objects[$library] += 1
+            }
+          }
+          Write-Host 'map entries by the library or object they came from:'
+          $objects.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 40 | ForEach-Object { Write-Host ('  {0,7}  {1}' -f $_.Value, $_.Key) }
+          Write-Host 'entries from the static C runtime (libcmt, libvcruntime, libucrt):'
+          Select-String -LiteralPath $map -Pattern '(?i)\b(libcmt|libvcruntime|libucrt)d?:' | Select-Object -First 25 | ForEach-Object { Write-Host ('  ' + $_.Line.Trim()) }
+          Write-Host "entries from the static C runtime in all: $(@(Select-String -LiteralPath $map -Pattern '(?i)\b(libcmt|libvcruntime|libucrt)d?:').Count)"
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $install 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe |
+            Where-Object { $_.FullName -like '*\bin\Hostx64\x64\*' } | Sort-Object FullName | Select-Object -Last 1
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\kr-attach-guard.exe'
+          Write-Host "=== $exe  $((Get-Item -LiteralPath $exe).Length) bytes"
+          & $dumpbin.FullName /nologo /dependents $exe
