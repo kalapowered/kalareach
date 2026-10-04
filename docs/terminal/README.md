@@ -86,6 +86,8 @@ tab-clear parameter is not a count: at every value it is a different operation, 
 silently do something else. Those values are checked against their own set instead, and a value
 outside it is `X`.
 
+The repeat request (`CSI b`) draws the last printed character again through the path text takes, so it honours a pending wrap. The library's own repeat does not, and is not used.
+
 **Keyboard negotiation is checked before it travels.** Only `modifyOtherKeys` resource 4 at level 0,
 1 or 2 is qualified, and only the Kitty keyboard flags in the profile's subset. `CSI > 16 u` asks
 for text association, which the input encoders cannot produce, so it is `X` rather than a flag the
@@ -131,8 +133,7 @@ The sequence itself then happens as though the controls had not been there.
 The bytes stop there. Forwarding them would perform each control a second time, once by this engine
 and once by the terminal reading the same bytes, and a repainted screen is a smaller price than two
 bells. NUL and DEL are the exception both ways: every terminal discards them, so they are discarded
-here and the sequence still travels. A sequence carrying more than eight controls is an extension,
-because at that point it is not a sequence with controls in it.
+here and the sequence still travels.
 
 ## The byte policy
 
@@ -192,10 +193,8 @@ A sequence prelude is bounded too. Past 256 retained bytes the parser keeps its 
 the span length and stops retaining bytes, so `CSI` followed by two megabytes of digits costs
 nothing, and the sequence becomes an extension.
 
-A control byte inside a prelude is consumed and ignored rather than abandoning the sequence, so
-`CSI 5 NUL ; 3 H` still moves the cursor to row 5, column 3. kr-vt/1 does not execute the embedded
-control where a VT terminal would; the parameters are the important part, and losing them to a stray
-NUL would be worse.
+A NUL or DEL byte inside a prelude is consumed and ignored rather than abandoning the sequence, so
+`CSI 5 NUL ; 3 H` still moves the cursor to row 5, column 3.
 
 ### tmux passthrough
 
@@ -273,8 +272,8 @@ changed and the mark reaches a client reading deltas.
 The result is checked by feeding every case one byte at a time, settling the screen after each byte,
 and requiring the same screen as the single-read answer.
 
-A cell is bounded at 64 bytes, which is the per-cell content bound: past it the cell ends and the
-next scalar starts a new one, so a run of combining marks cannot become one unbounded cell. The
+A cell is bounded at 64 bytes, which is the per-cell content bound: past it the marks are dropped
+and reported as a truncation, so a run of combining marks cannot become one unbounded cell. The
 bound also stops the redraw above from growing a cell without limit across quiet periods.
 
 ## The canonical grid
@@ -348,7 +347,7 @@ snapshot needs rather than a convenience.
 | `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state. The same cursor coordinates place the next character in different cells with and without it, and at the bottom-right corner that character decides what scrolls |
 | `TerminalState::saved_cursor()`, a shared reference to either buffer's saved cursor, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor that carries only a position restores the wrong colours from the wrong origin. Each buffer keeps its own, so a restoration reads both |
 | `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor upstream exposes returns whichever buffer is active. Copying the primary buffer aside on every switch would be a second copy of state that can drift from the first, which is the failure the single-reducer rule exists to prevent |
-| `Line::compress_for_scrollback()` keeping the cells, attributes and wrap markers it was given | The pinned width model gives a cell to every scalar that has a width of its own, and the compact row representation used to work out where the cells were by clustering the row's text again, which joined adjacent scalars and dropped the columns they held |
+| `Line::compress_for_scrollback()` keeping the cells, attributes and wrap markers it was given | The pinned width model gives a cell to every scalar that has a width of its own, and a compact row that worked out where its cells are by clustering its text again would join adjacent scalars and drop the columns they held, so the compact form keeps the cell boundaries it was given |
 
 `kr_term::unicode::LIBRARY` carries the same record in the crate, and its `required_patch` list is
 empty: the pinned revision exposes everything section 8 asks a snapshot to carry.
@@ -802,7 +801,7 @@ ones it did not.
 | One control sequence's retained bytes | 256 |
 | One cell's content | 64 bytes |
 | In-memory historical rows | 8 MiB per session |
-| Distinct hyperlink targets | 4,096 per session |
+| Distinct hyperlink targets | 4,096 held at once |
 | One hyperlink | 2,048 bytes |
 | Canonical screens, metadata and per-cell storage | 64 MiB per session |
 | History page | 1,000 rows and 1 MiB |
@@ -918,15 +917,12 @@ them, so a cell left under a wide one by a scroll that copied it there keeps wha
 measurement finds it. Both are properties of how the grid library stores a row rather than of what
 the session is doing, and both are bounded by a geometry that was admitted.
 
-A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
-selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
-rendition and the character-set designations and leaves the rest of the modes where they were. So
-what it clears is noted before the restore and put back afterwards, through the same sequences an
-application would have used.
+Restoring the cursor is a little different. When the pinned revision restores a cursor, it clears newline mode and the shift-out selection. A terminal keeps newline mode, and restores the shift the cursor was saved with, in addition to the position, rendition, and char set designations. The session records that shift for the buffer whose cursor is saved. Upon restoration of the cursor, it applies that shift and puts newline mode back as it was, through the same sequences an application would have used.
 
 The historical-row bound is enforced rather than reported. What the retained rows cost is carried,
 charged where each row leaves the screen, and when the charge passes the bound the engine lowers the
-library's scrollback row count so older rows are evicted as new ones arrive. That happens after
+library's scrollback row count until the older rows are evicted, then puts the configured count
+back, so the history grows again when later rows cost less. That happens after
 every grid mutation, so the bound is enforced where the rows arrive rather than at whichever read
 comes next: two rows can carry more than the whole of it. Reading every retained row's cells is a
 separate thing, needed for what the hyperlink objects cost, and it happens when the stream goes
@@ -967,12 +963,9 @@ out to hold, and a row that is dropped gives nothing back until the objects on i
 again, so the reserved figure drifts above the truth while a session prints. A refusal against the
 envelope on that figure would refuse a link the session has room for, so the objects are measured
 first, before anything is charged for the link being admitted: a measurement replaces the account
-with what the grid is holding, and the object this link is for is not on a row yet. The other three
-refusals need no measurement, because none of them is against the envelope: a link longer than one
-link may be, a parameter field arriving with no target, and a table already holding as many
-distinct targets as a session keeps. A link with parameters and no target is refused the same way:
+with what the grid is holding, and the object this link is for is not on a row yet. The other two refusals need no measurement, because neither is against what the session holds: a link longer than one link may be, and a parameter field arriving with no target. A table already holding as many distinct targets as a session keeps is measured first as well. The table lists the links the grid still holds, so a link whose last cell has scrolled out of the history is removed from it when the objects are read. The reading happens once a read: a read that carries a flood of links the session has no room for walks the rows once, not once for each link. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
-identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
+identifiers in links nothing can follow. Two links to one target are two ranges when their parameters differ, and a restoration opens each with the parameters it had. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
@@ -1016,8 +1009,6 @@ a screen that is correct for both halves of the deque its rows sit in, so a reta
 index comparison there and nothing more. `CanonicalGrid::rows_read` counts the rows a measurement
 read the cells of, and `a_read_reads_as_many_rows_as_the_geometry_has` holds that a session at its
 cache bound reads no more than twice what a session with an empty history reads over the same run.
-What the account removes is the walk a *single row leaving the screen* used to cost, which is the
-one that grew with the history and happened thousands of times a read.
 
 `CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
 test compares the two after every operation of a randomised sequence of prints, resizes, buffer
@@ -1029,13 +1020,9 @@ Sizing the room to the charges on it instead would put a pair of reallocations, 
 whole history, on the arrival of a single row whenever the rows arriving cost a little more than
 the rows they replace.
 
-That is what makes the byte bound affordable. Working the figure out by walking the history made
-every read cost what the whole history cost, so a session printing steadily paid a scan of
-everything it had retained on every read: on one machine 0.10 MiB/s of scrolling output against
-the 5 MiB/s of KR-PERF-007, and a read behind 1,841 retained rows costing sixty-two times a read
-behind ninety. `cargo test -p kr-term --release --test perf` asserts both ends of that: the rate on
-a stream that scrolls, and that a read behind a full cache costs what a read behind an empty one
-costs.
+That is what makes the byte bound affordable. `cargo test -p kr-term --release --test perf` asserts
+two things about it: the rate on a stream that scrolls, and that a read behind a full cache costs
+what a read behind an empty one costs.
 
 Eviction reads the same figures. The rows to give up are chosen by what each one costs, oldest
 first, until what is left costs no more than the bound, so one pass lands under it rather than
@@ -1105,8 +1092,7 @@ A parameterised capability is a small program, not a template, so the check runs
 entry carries representative `arguments` and the expansion is computed from the capability's own
 value, with a terminfo parameter machine that implements the stack, the arithmetic, the conditionals
 and the printf conversions. A sample written out by hand can drift from the value it claims to
-illustrate, and a drifting sample proves the wrong thing: an advertised clipboard capability whose
-sample used an invalid selection once passed a check its real expansion would have failed. The
+illustrate, and a drifting sample proves the wrong thing. The
 expansion each entry produced is in the fixture. That is the `coverage` section of
 `fixtures/terminal/terminfo-xterm-256color.json` and the test
 `every_advertised_capability_has_a_class`.
@@ -1381,11 +1367,8 @@ still leave a different screen. Two steps that ask whether a pending wrap surviv
 (`autowrap.pending-survives-erase-line` and `autowrap.pending-survives-save-and-restore`) end with a
 character written afterwards, so the cursor shows where that character went.
 
-On one step the grid followed both terminals. An absolute column past the right edge in `CSI H`,
-`CSI f` or `CSI G` left the grid's cursor one column beyond the last, where both terminals stop on
-the last column. The grid now holds the cursor on the last column. The records above were measured
-with that change (`addressing.clamps-to-the-corner` agrees in both). A wide character that starts on
-the last column is a separate case, described below, and stays as it was.
+An absolute column past the right edge in `CSI H`, `CSI f` or `CSI G` leaves the cursor on the
+last column in the grid and in both terminals (`addressing.clamps-to-the-corner`).
 
 On other steps both terminals answer alike and the grid differs. A wide character that ends exactly
 at the last column leaves the grid's cursor one column short of the last, where both terminals
@@ -1530,30 +1513,16 @@ of the two: the one that scrolls pays for every row joining the historical cache
 spends most of what it is asked to do on clearing the screen, which writes the cells of every row
 the erasure covers that is not already empty.
 
-| Host | Plain stream | Stream that scrolls | Where it was measured |
+| Host | Plain stream | Stream that scrolls | Measured on |
 | --- | --- | --- | --- |
-| Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs of this revision |
-| AMD EPYC 7763 64-Core, 4 processors | 6.1 to 6.2 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315, 35167627730 and 35169947110 |
-| AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | `core-ci` runs 35168759717 and 35164400630 |
-| Intel Xeon Platinum 8573C, 4 processors | 8.0 to 8.1 MiB/s | 7.4 to 7.6 MiB/s | `core-ci` runs 35163469612 and 35172122622 |
-| Intel Xeon Platinum 8370C, 4 processors | 7.0 MiB/s | 6.4 MiB/s | `core-ci` run 35174246084 |
-| Intel Xeon 6973P-C, 4 processors | 9.7 MiB/s | 9.3 MiB/s | `core-ci` run 35175248504 |
+| Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs |
+| AMD EPYC 7763 64-Core, 4 processors | 6.1 to 6.2 MiB/s | 5.9 MiB/s | hosted CI runs |
+| AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | hosted CI runs |
+| Intel Xeon Platinum 8573C, 4 processors | 8.0 to 8.1 MiB/s | 7.4 to 7.6 MiB/s | hosted CI runs |
+| Intel Xeon Platinum 8370C, 4 processors | 7.0 MiB/s | 6.4 MiB/s | hosted CI runs |
+| Intel Xeon 6973P-C, 4 processors | 9.7 MiB/s | 9.3 MiB/s | hosted CI runs |
 
-The slowest of those hosts is where the comparison is clearest. `core-ci` measured 3.79 MiB/s on the
-stream that scrolls, below the target, on an AMD EPYC 7763 twenty minutes before it measured
-5.86 MiB/s on one of the same class. What differs between those two runs, in this repository, is
-this engine and nothing else; what the two hosts were doing otherwise is not something a hosted
-runner tells anybody.
-
-Each row is one host's sampled runs and not a fixed property of that processor. The platform names a
-class of processor rather than a machine, and one named class has answered a quarter apart on the
-plain stream across the runs behind this revision, so the rows above are not a ranking of
-processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
-the figures, the processor and the verdict it measured, so a row can be read back to the run it came
-from. Two of the EPYC 9V74 runs are 27% apart on the plain stream and 26% apart on the one that
-scrolls. The wider end of the EPYC 9V74 row, and the narrower end of the Xeon row, were taken a few
-commits before the last change to the output path, which only takes work off it; the rest are of the
-engine as it stands.
+Each row represents one host's sampled runs, and so should not be considered a fixed property of that processor. The platform name denotes a class of processor rather than a machine. Even using the same class of processor, there can be a 25% difference between plain streams, so the rows above are not a ranking of processors. Each run retains the figures, the processor and the verdict it measured. Two of the EPYC 9V74 runs are 27% apart on the plain stream and 26% apart on the one that scrolls.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both
