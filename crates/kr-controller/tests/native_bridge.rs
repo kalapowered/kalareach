@@ -746,6 +746,49 @@ fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
+
+    // A server of a server file is started as a program: a line there is no program's name.
+    let site = Site::new();
+    let before = site.tree();
+    let servers = r#"{"mcpServers": {"kalareach-channels": {"type": "stdio", "command": "{kr_hook} claude-code channel"}}}"#;
+    std::fs::create_dir_all(site.package("servers").join("bridge")).expect("a package");
+    for (file, bytes) in [
+        ("plugin-manifest.json", pinned("plugin-manifest.json")),
+        ("hooks.json", pinned("hooks.json")),
+        ("mcp-servers.json", servers.as_bytes().to_vec()),
+    ] {
+        std::fs::write(site.package("servers").join("bridge").join(file), bytes)
+            .expect("a package file");
+    }
+    let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+    let digest = PayloadDigest::of(servers.as_bytes()).to_string();
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            if step["destination"] == SERVERS_PATH {
+                step["digest"] = serde_json::json!(digest);
+            }
+        }
+    }
+    let release = BridgeTarget {
+        plugin_id: plugin(),
+        package_digest: PayloadDigest::of(b"servers"),
+        package_dir: site.package("servers"),
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        match_rules: match_rules(),
+        qualified: vec![QualifiedExecutable {
+            digest: hex_digest(EXECUTABLE),
+            version: "2.1.278".to_owned(),
+        }],
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("starts a command as a program"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// KR-REQ-11.42: a release applied with one forwarder is not the release wanted once this host names
