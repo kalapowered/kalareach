@@ -2,14 +2,14 @@
   "manifest_version": 1,
   "publisher_id": "kalareach",
   "plugin_name": "gemini-cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "display_name": "Gemini CLI",
   "description": "Recognises Gemini CLI, observes its sessions through hooks, reads its agent protocol through a declarative table and stops the turn it is running, with the stock terminal untouched.",
-  "sdk_range": ">=0.1.2, <0.2.0",
+  "sdk_range": ">=0.1.3, <0.2.0",
   "wit_range": ">=0.1.0, <0.2.0",
   "source": {
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "revision": "3efd5eed04308e54e6a55c19f7483c55d8b3e515"
+    "revision": "2760679a70dd8f7b177266b69a6bab93de084b27"
   },
   "match_rules": [
     {
@@ -49,20 +49,14 @@
       "architectures": [
         "aarch64"
       ]
-    },
-    {
-      "os": "windows",
-      "architectures": [
-        "x86_64"
-      ]
     }
   ],
   "payloads": [
     {
       "role": "asset",
       "path": "README.md",
-      "digest": "a7bcda7cced8487adb022022cfbc73b635424314d8e111208f5c53646d00f83f",
-      "size_bytes": "10439"
+      "digest": "48ffece46c598c4532e00ed13cda2223932eeaa76dda8738842770748807f8b3",
+      "size_bytes": "10655"
     },
     {
       "role": "native_bridge",
@@ -79,8 +73,8 @@
     {
       "role": "native_bridge",
       "path": "bridge/hooks.json",
-      "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba",
-      "size_bytes": "738"
+      "digest": "8b5a969d228a005058462485bbbc79bd74fec9fb64a7837dc9efe10987992a18",
+      "size_bytes": "744"
     },
     {
       "role": "connector",
@@ -182,14 +176,14 @@
         "type": "install_file",
         "source": "bridge/hooks.json",
         "destination": "extensions/kalareach/hooks/hooks.json",
-        "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba"
+        "digest": "8b5a969d228a005058462485bbbc79bd74fec9fb64a7837dc9efe10987992a18"
       }
     ],
     "remove": [
       {
         "type": "remove_file",
         "destination": "extensions/kalareach/hooks/hooks.json",
-        "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba"
+        "digest": "8b5a969d228a005058462485bbbc79bd74fec9fb64a7837dc9efe10987992a18"
       },
       {
         "type": "remove_file",
@@ -202,7 +196,7 @@
         "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb"
       }
     ],
-    "grant_statement": "Installs three files under your own Gemini CLI directory: the manifest of an extension named kalareach, its hooks, and the record of where it is installed. Gemini CLI loads the extension for every project and every later session, whether or not you trust the folder, beside your own hooks; where your settings allow only listed extensions, it loads it only when one of your patterns matches the source that record names. Gemini CLI then starts the KalaReach forwarder itself, through bash, so the forwarder runs under Gemini CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees each session's SessionStart, SessionEnd and Notification events and no tool events, because Gemini CLI reads a failing hook's error text as a refusal of a finished tool's result. Removal deletes exactly those three files, each only while it still holds the bytes that were installed, and the record last, only once nothing else is left beside it."
+    "grant_statement": "Installs three files under your own Gemini CLI directory: the manifest of an extension named kalareach, its hooks, and the record of where it is installed. Gemini CLI loads the extension for every project and every later session, whether or not you trust the folder, beside your own hooks; where your settings allow only listed extensions, it loads it only when one of your patterns matches the source that record names. Gemini CLI then starts the KalaReach forwarder itself, through bash, by the full path KalaReach writes in, so the forwarder runs under Gemini CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees each session's SessionStart, SessionEnd and Notification events and no tool events, because Gemini CLI reads a failing hook's error text as a refusal of a finished tool's result. Removal deletes exactly those three files, each only while it still holds the bytes that were installed, and the record last, only once nothing else is left beside it."
   },
   "command_integration": {
     "command": "gemini",

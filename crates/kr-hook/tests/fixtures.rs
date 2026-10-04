@@ -3,15 +3,17 @@
 //! The Claude Code connector package installs three files into the user's own Claude Code
 //! directory, and those files are what start this forwarder. Their copies under
 //! `fixtures/bridges/claude-code/` are the bytes the package publishes (the plugins repository at
-//! `7f2e71292eff15e8f63d4c331b253080011633c7`, `plugins/kalareach/claude-code/bridge/`), pinned here
-//! by the SHA-256 digests the package's own recipe names. A package change moves the copies and
-//! the digests together, and this suite then checks that the forwarder still answers what the new
-//! files invoke.
+//! `2760679a70dd8f7b177266b69a6bab93de084b27`, `plugins/kalareach/claude-code/bridge/`), pinned here
+//! by the SHA-256 digests the package's own recipe names. They name the forwarder by the
+//! placeholder `{kr_hook}`, which the host replaces with the installed forwarder's path when it
+//! writes the files; this suite checks the placeholder stands where the host replaces it, and that
+//! the forwarder still answers what the new files invoke. A package change moves the copies and the
+//! digests together.
 //!
 //! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
 //! CLI directory: its manifest, its hooks and its install record. Their copies under
 //! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
-//! `158b20ce7b748554e6eedcf09803239b2ee5d6c2`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! `2760679a70dd8f7b177266b69a6bab93de084b27`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
 //! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
@@ -21,7 +23,7 @@
 //!
 //! What a launch adds comes from each release's own command integration, which its manifest
 //! declares. The manifests of the three released packages are under `fixtures/plugins/released/`,
-//! copied byte for byte from the plugins repository at `c1c2c3afaf370157a44909464504773096c9b19a`,
+//! copied byte for byte from the plugins repository at `9f003bb6b31899e0c59b6e24d0b10756a16ff7ab`,
 //! and pinned by their SHA-256 digests, which are the package hashes an owner confirms at
 //! installation.
 //!
@@ -71,8 +73,15 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// The invocation a registration names, parsed by the forwarder's own command line.
+///
+/// The registration names the forwarder by the placeholder, which is what the host replaces with
+/// the installed forwarder's path.
 fn parsed(command: &serde_json::Value, args: &serde_json::Value) -> Command {
-    assert_eq!(command, "kr-hook", "the registration starts the forwarder");
+    assert_eq!(
+        command,
+        kr_plugin_sdk::forwarder::PLACEHOLDER,
+        "the registration starts the forwarder"
+    );
     let args: Vec<&str> = args
         .as_array()
         .expect("an argument list")
@@ -92,11 +101,11 @@ fn the_bridge_files_are_the_bytes_the_package_publishes() {
     for (name, digest) in [
         (
             "hooks.json",
-            "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727",
+            "c81a5d098b6282ddfc1111183e308e3ab6094bcb76a6455019df7133c0f0f641",
         ),
         (
             "mcp-servers.json",
-            "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea",
+            "b514ddff583d9c3d926233ce402b4e7d27eb3b76cffce369f5ea4cb30460c82a",
         ),
         (
             "plugin-manifest.json",
@@ -205,7 +214,7 @@ fn the_channel_registration_starts_the_forwarders_channel_under_its_name() {
 fn the_qoder_cli_flags_are_the_pinned_bytes() {
     assert_eq!(
         sha256(&fixture("qoder-cli", "flags.json")),
-        "d867f03b41f63a11688ee1c6e0a79455ffbaca09d2c38150b6f8d4b4c269261f"
+        "4a23ebef3076b3d7f5aaa817d3f4f78561c48db869c6147b92a503e0c3fb6c23"
     );
 }
 
@@ -284,7 +293,7 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
         ),
         (
             "hooks.json",
-            "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba",
+            "8b5a969d228a005058462485bbbc79bd74fec9fb64a7837dc9efe10987992a18",
         ),
         (
             "gemini-extension-install.json",
@@ -342,14 +351,20 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
         assert_eq!(handler["name"], "kalareach", "{event}");
         let command = handler["command"].as_str().expect("a command");
         let words: Vec<&str> = command.split(' ').collect();
+        assert_eq!(
+            words[0],
+            kr_plugin_sdk::forwarder::PLACEHOLDER,
+            "{event}: the line starts with the placeholder, which the host writes as one quoted word"
+        );
         assert!(
-            words.iter().all(|word| {
+            words[1..].iter().all(|word| {
                 !word.is_empty()
                     && word
                         .chars()
                         .all(|character| character.is_ascii_alphanumeric() || character == '-')
             }),
-            "{event}: {command:?} is plain words, which bash runs in its own process"
+            "{event}: {command:?} is the forwarder and plain words, which bash runs in its own \
+             process"
         );
         assert_eq!(
             parsed(&serde_json::json!(words[0]), &serde_json::json!(words[1..])),
@@ -389,7 +404,7 @@ fn released(package: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/plugins/released/kalareach")
         .join(package)
-        .join("0.4.0/plugin.json");
+        .join("0.5.0/plugin.json");
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
@@ -427,15 +442,15 @@ fn the_released_manifests_are_the_pinned_packages() {
     for (package, digest) in [
         (
             "claude-code",
-            "4459b1c66bf63415455dcba780501c7a8771638172acc7218e9472fa58444d88",
+            "df9efe055ecd4ce482f62e780983ae31de86980da1d03c42214c7c2bcffe56d4",
         ),
         (
             "gemini-cli",
-            "4022d82656b5fbb7ad4e380978194ef3c2fa08aa669ff1890559e2b57a5e567b",
+            "2ce2bc21016eb17f9018f74df9134fc52aa0e5312342e1bda5b23ec4724edb79",
         ),
         (
             "qoder-cli",
-            "d26c69197ec46528fd36da257e601a1c6153aeeb76999355a2eab55d6bb1d927",
+            "356d33e4057b3b75b99ee6acfe275e06658932660511a117a8d86c9693756227",
         ),
     ] {
         assert_eq!(sha256(&released(package)), digest, "{package}");

@@ -97,6 +97,68 @@ fn each_integration_that_applies_gives_an_entry_on_or_off_by_the_configuration()
     assert_eq!(entries[2].flags, fixture::qoder_flags());
 }
 
+/// KR-REQ-12.22: a package whose flags name the forwarder by the placeholder gives its session the
+/// flags written with the installed forwarder's full path, and the doctor reports those flags, so
+/// what a person reads is what a session carries. Where no forwarder is installed the flags are as
+/// the package declares them, and a flag that names no forwarder is the same either way.
+#[test]
+fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_the_doctor() {
+    let store = Store::new("forwarder");
+    let packages = vec![
+        store.admitted(&fixture::Shape::claude_code(), |_| {}),
+        store.admitted(&fixture::Shape::qoder_cli(), |_| {}),
+    ];
+    let reading = Integrations::new().read(&packages);
+    let forwarder = Path::new("/Applications/Kala Reach/it's/current/bin/kr-hook");
+    let entries = super::fill(
+        &reading,
+        &enabled(&["claude-code", "qoder-cli"]),
+        Some(forwarder),
+    )
+    .entries;
+    assert_eq!(
+        entries[0].flags,
+        fixture::FLAGS.map(str::to_owned),
+        "a flag that names no forwarder is the same"
+    );
+    assert_eq!(entries[1].flags[0], "--settings");
+    let settings: serde_json::Value =
+        serde_json::from_str(&entries[1].flags[1]).expect("the settings are JSON");
+    for event in settings["hooks"].as_object().expect("events").values() {
+        assert_eq!(
+            event[0]["hooks"][0]["command"],
+            forwarder.to_str().expect("text"),
+            "each hook starts the forwarder by its full path"
+        );
+    }
+
+    let host = Host {
+        forwarder: Some(forwarder.to_path_buf()),
+        ..able(Vec::new())
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["qoder-cli"]), &host);
+    let qoder = reported
+        .reports
+        .iter()
+        .find(|report| report.plugin_id == "kalareach/qoder-cli")
+        .expect("reported");
+    assert_eq!(
+        qoder.flags, entries[1].flags,
+        "the doctor says what a session carries"
+    );
+
+    let without = super::fill(&reading, &enabled(&["qoder-cli"]), None).entries;
+    let qoder = without
+        .iter()
+        .find(|entry| entry.plugin_id == plugin("qoder-cli"))
+        .expect("an entry");
+    assert_eq!(
+        qoder.flags,
+        fixture::qoder_flags(),
+        "with no forwarder installed the flags are as declared"
+    );
+}
+
 /// KR-REQ-12.07: an integration whose grant the installation does not hold gives no entry, whatever
 /// the configuration names; nor does a package that declares none, nor two packages that integrate
 /// one command.
