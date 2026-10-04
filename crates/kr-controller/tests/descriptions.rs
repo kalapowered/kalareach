@@ -1663,6 +1663,9 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
     // Off: the document says so, the answer says so, the process ends and describe says why.
     let off = environment.configure(Some(false), None).await;
     assert!(!off.enabled);
+    // The answer to the change shows the pause the change causes, not the one from before it.
+    assert_eq!(off.paused.0, Some(DescriptionPause::Disabled), "{off:?}");
+    assert_eq!(off.state, DescriptionState::ResourcePaused, "{off:?}");
     let resolver = environment.controller().configuration();
     let document = resolver.loaded();
     assert_eq!(
@@ -1692,8 +1695,10 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
     let battery = environment.configure(None, Some(true)).await;
     assert!(battery.on_battery && !battery.enabled);
 
-    // On again: the same host describes, with a process of its own.
-    environment.configure(Some(true), None).await;
+    // On again: the same host describes, with a process of its own, and the answer to the change
+    // no longer shows the pause.
+    let on = environment.configure(Some(true), None).await;
+    assert_eq!(on.paused.0, None, "{on:?}");
     environment.workers[0].report("make", "/home/a/other", None);
     until("a second process serving the next description", || {
         environment.figures().started >= 2 && environment.figures().jobs.published >= 2
