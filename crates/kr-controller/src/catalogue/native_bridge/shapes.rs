@@ -31,7 +31,7 @@ pub(super) fn check(application: &str, directory: &str, tail: &str, value: &Valu
             ],
             directory,
         ),
-        ("Claude Code", ".mcp.json") => servers(value),
+        ("Claude Code", ".mcp.json") => servers(application, value),
         ("Gemini CLI", "gemini-extension.json") => {
             manifest(value, &["name", "version", "description"], directory)
         }
@@ -96,7 +96,7 @@ fn manifest(value: &Value, allowed: &[&str], directory: &str) -> Checked {
 
 /// An MCP server file: servers that start a program, each with its kind, its command and its
 /// arguments, and no member that makes a server connect, fetch or run anything beside that.
-fn servers(value: &Value) -> Checked {
+fn servers(application: &str, value: &Value) -> Checked {
     let held = members(value, &["mcpServers"], "the server file")?;
     let Some(Value::Object(servers)) = held.get("mcpServers") else {
         return Err("the server file has no mcpServers object".to_owned());
@@ -108,13 +108,17 @@ fn servers(value: &Value) -> Checked {
         {
             return Err("a server is not one that starts a program with a command".to_owned());
         }
+        if let Some(command) = held.get("command") {
+            placeholder_form(application, command, held.get("args"))?;
+        }
     }
     Ok(())
 }
 
 /// Whether the application runs a command it is given as a line in a shell. Gemini CLI does: a
 /// handler's command is one line, and a program it starts is a word of that line. The others start
-/// the command as a program, with its arguments in a list beside it.
+/// the command as a program, with its arguments in a list beside it, and so does every application
+/// a server of a server file is started by.
 fn runs_a_line(application: &str) -> bool {
     application == "Gemini CLI"
 }
