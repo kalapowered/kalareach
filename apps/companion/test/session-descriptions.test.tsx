@@ -7,7 +7,7 @@
  * row the host has not answered yet shows what every host knows, the directory the session is in.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -41,6 +41,10 @@ function describedHost() {
   host.controls.describe(SESSION_OFFLINE, { title: 'Release 1.0', source: 'pinned' })
   return host
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 // KR-REQ-13.10: a session row shows the description the host gives it.
 describe("the desktop session list shows each session's description", () => {
@@ -142,6 +146,27 @@ describe("the desktop session list shows each session's description", () => {
       setTimeout(resolve, 20)
     })
     expect(within(kept).getByRole('heading', { level: 3 })).toHaveTextContent('kalareach-web')
+  })
+
+  // Section 22: a description that has aged is shown as aged. A screen left open is read again at
+  // the host's cooldown, so the note appears without the person leaving and coming back.
+  it('reads a row again once the host’s cooldown has passed on a screen left open, and says when its line has aged', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { port, controls } = describedHost()
+    open(port, { view: 'sessions' })
+    const row = await screen.findByTestId('session-row-1')
+    await waitFor(() => {
+      expect(within(row).getByTestId('description-activity')).toBeInTheDocument()
+    })
+    expect(within(row).queryByTestId('description-freshness')).toBeNull()
+
+    controls.describe(SESSION_MAIN, { freshness: 'stale' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    await waitFor(() => {
+      expect(within(row).getByTestId('description-freshness')).toHaveTextContent('Out of date')
+    })
   })
 
   it('finds a session by the title the host gave it', async () => {
