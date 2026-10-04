@@ -108,17 +108,31 @@ async fn open(enrolment: &EnvironmentEnrolment, target: BridgeTarget) -> Result<
 /// Opens a bridge to the control daemon of an enrolled environment that is already running, and
 /// starts nothing.
 ///
-/// Running the helper in a stopped distribution starts it, and a container's runtime refuses to
-/// run anything in a stopped one, so what the platform says of the environment is asked first, as
-/// an enrolment by probe asks it: one that is not running is reported rather than started. The
-/// opening says that it may not start the environment's daemon either, so a running environment
-/// whose daemon is not is reported by the helper.
+/// The environment is checked as `require_running` does, and the opening says that it may not
+/// start the environment's daemon either, so a running environment whose daemon is not is reported
+/// by the helper.
 ///
 /// # Errors
 ///
 /// Returns `ENVIRONMENT_UNAVAILABLE` for an environment that is not running, and the destination's
 /// refusal or a failure to reach it otherwise.
 pub async fn open_running(enrolment: &EnvironmentEnrolment) -> Result<BridgedLink> {
+    require_running(enrolment).await?;
+    reach(enrolment, BridgeTarget::Controller, false).await
+}
+
+/// Refuses an enrolled environment that is not running, and starts nothing.
+///
+/// Running the helper in a stopped distribution starts it, and a container's runtime refuses to
+/// run anything in a stopped one, so what the platform says of the environment is asked first, as
+/// an enrolment by probe asks it: one that is not running is reported rather than started. Only a
+/// refresh told to start it, a create or an attach may start an environment.
+///
+/// # Errors
+///
+/// Returns `ENVIRONMENT_UNAVAILABLE` for an environment that is not running, or that this host
+/// could not ask about.
+pub(crate) async fn require_running(enrolment: &EnvironmentEnrolment) -> Result<()> {
     use kr_controller::bridge::platform::PlatformObserver;
     use kr_controller::bridge::store::Observer as _;
     use kr_protocol::identity::EnvironmentPresence;
@@ -130,7 +144,7 @@ pub async fn open_running(enrolment: &EnvironmentEnrolment) -> Result<BridgedLin
             .map_err(|_| CliError::Other(Shown::said("asking the environment did not finish")))?
     };
     match observed {
-        Ok(EnvironmentPresence::Running) => reach(enrolment, BridgeTarget::Controller, false).await,
+        Ok(EnvironmentPresence::Running) => Ok(()),
         Ok(_) | Err(_) => Err(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
             message: Shown::said(

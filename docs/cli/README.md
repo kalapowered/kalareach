@@ -552,7 +552,7 @@ socket. The two actions that may start an environment are the only ones that do.
 attach starts a stopped distribution by running the helper in it, and starts a stopped container
 with the container runtime. The helper then reaches the daemon through that environment's own
 configured startup, and says what to set up when none is configured. A listing, a refresh without
-`--start`, an enrolment and an export start nothing.
+`--start`, an enrolment, an export and a `kr host machine` command start nothing.
 
 Sessions started in this way will have an initial working directory of the home directory of the
 user that the kr helper process is running as in the environment, unless `--cwd` is specified with a
@@ -1584,7 +1584,7 @@ kr host machine undo                                    # put the environments t
 
 Without a step the command prints the environment's group and its revision, how the record last changed, the group the environment left by that change, and the `--expect` text that names the record. Every step takes `--expect <group>@<revision>`, written as that output prints it, because a step is approved against the record the owner saw. A step against any other record is refused with `DRAFT_CONFLICT`, exit status 8, and changes nothing. `join` takes the group to enter, any identifier, including one that nobody is in. `merge` takes the group the environment's group is merged into, and `split` takes none, since the environment mints a fresh group of its own. A step prints the group the environment records now and the action it was taken under.
 
-`--environment` names the environment. Without it the command acts in this installation's own environment. It takes the identifier of one of this host's own environments, or the identifier or label of an environment enrolled for a process bridge. A group is always what that environment reports of itself, read from its own `host.info`, through its bridge where it has one. An enrolment records no group and is never where one is read from. Steps, like every owner action, are taken as the owner at this machine, and no step reaches an environment other than the one named.
+`--environment` names the environment. Without it the command acts in this installation's own environment. It takes the identifier of one of this host's own environments, or the identifier or label of an environment enrolled for a process bridge. A group is always what that environment reports of itself, read from its own `host.info`, through its bridge where it has one. An enrolment records no group and is never where one is read from. Steps, like every owner action, are taken as the owner at this machine, and no step reaches an environment other than the one named. For an enrolled environment the command opens a bridge that starts nothing: a distribution or container that is stopped is reported as `ENVIRONMENT_UNAVAILABLE`.
 
 ### A merge over several environments
 
