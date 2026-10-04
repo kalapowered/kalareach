@@ -1689,8 +1689,8 @@ pub fn a_reader_reports_itself_idle_again_when_the_worker_withholds_a_fence(kind
 /// acted on: the start of an escape sequence in Zsh and Bash, and a paste in fish, where an escape
 /// is resolved on a timer. The order of the endpoint decides the absence: the reader reads the
 /// withheld frame before it reads the exchange sent after it, so a report that frame brought would
-/// arrive before that exchange's answer. Once the reader lets go of what it held, its queues are
-/// clear.
+/// arrive before that exchange's answer. Once the reader lets go of what it held, the retry the
+/// withheld frame left owed is taken and it reports itself idle.
 pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_withholds_a_fence(
     kind: ShellKind,
 ) {
@@ -1723,12 +1723,16 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
     session.forget_events();
 
     session.withhold(WithheldReason::QueuesNotDrained);
+    // The reader answers what it reads in the order it read it, and takes the retry after it has
+    // answered, so a report the withheld frame brought is sent before the answer to an exchange
+    // that is asked after the first one's answer has come.
     let after = session.fence_exchange_before(&enter, fence_id(31), deadline);
     assert!(
         !after.queues.partial_key_drained,
         "what the reader was holding ended on its own: {:?}",
         after.queues
     );
+    let _ = session.fence_exchange_before(&enter, fence_id(32), deadline);
     assert!(
         !session.saw_event(Duration::ZERO, |event| matches!(
             event,
@@ -1739,15 +1743,28 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
         "a reader that still held input reported itself idle when the worker withheld its fence"
     );
 
-    // Once the reader has let go of what it held, the exchange the worker asks for next is
-    // acknowledged with every queue clear: nothing the withheld frame did is left in the way.
+    // Once the reader has let go of what it held, the retry the withheld frame left owed is taken:
+    // it reports itself idle, which is the point the worker asks again at, and its next exchange is
+    // acknowledged with every queue clear.
     for bytes in teardown {
         session.type_bytes(bytes);
     }
-    let mut recovered = session.fence_exchange_before(&enter, fence_id(32), deadline);
-    while !recovered.queues.all_drained() && Instant::now() < deadline {
-        recovered = session.fence_exchange_before(&enter, fence_id(32), deadline);
-    }
+    let (_, event) = session.expect_event("an idle report once the reader let go", |event| {
+        matches!(
+            event,
+            BridgeEvent::ReaderIdle(idle)
+                if idle.prompt_generation == enter.prompt_generation
+                    && idle.reader_revision == enter.reader_revision
+        )
+    });
+    let BridgeEvent::ReaderIdle(idle) = event else {
+        unreachable!()
+    };
+    assert!(
+        idle.snapshot.queued_keys == U64::new(0) && idle.snapshot.pending_bytes == U64::new(0),
+        "the report after the reader let go was not an idle reader's: {idle:?}"
+    );
+    let recovered = session.fence_exchange_before(&enter, fence_id(33), deadline);
     assert!(
         recovered.queues.all_drained() && recovered.snapshot.is_drained(),
         "the reader did not clear its queues once it let go of what it held: {:?} {:?}",

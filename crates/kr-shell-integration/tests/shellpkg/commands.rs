@@ -1029,7 +1029,19 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
 
-    // The answer that comes late, after the command has run as it was typed, is a refusal, and a
+    // A worker that answers what came after the unanswered question has caught up, so the next
+    // command asks again.
+    session.commands.policy = ResolvePolicy::default();
+    let asked = session.run_asking("kr-probe caught-up", "probe-ran");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a worker that has caught up is asked again: {asked:?}"
+    );
+    assert_eq!(last_run(&probes).arguments, ["caught-up"]);
+
+    // The answer that comes late, after the command has run as it was typed and a worker that caught up
+    // has been asked again, is a refusal, and a
     // refusal that answers a question is no detach's whenever it comes: it draws no hint and
     // consumes no gesture. The command typed after it runs only once the shell is at a prompt
     // again, which is after it has read the refusal.
@@ -1049,17 +1061,6 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
         decisions,
         "a late refusal consumed a gesture"
     );
-
-    // A worker that answers what came after the unanswered question has caught up, so the next
-    // command asks again.
-    session.commands.policy = ResolvePolicy::default();
-    let asked = session.run_asking("kr-probe caught-up", "probe-ran");
-    assert_eq!(
-        asked.len(),
-        1,
-        "a worker that has caught up is asked again: {asked:?}"
-    );
-    assert_eq!(last_run(&probes).arguments, ["caught-up"]);
 
     // A refusal answers the question it names and nothing else: the command runs as it was typed,
     // and no detach is taken to have been refused. What a refusal taken for a detach's would do is
