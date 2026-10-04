@@ -220,7 +220,6 @@ pub struct Engine {
     budget: SessionBudget,
     lease: LeaseHolder,
     projection_generation: u64,
-    cursor_style: u32,
     links: BTreeSet<String>,
     checkpoints: VecDeque<Checkpoint>,
     revision: u64,
@@ -277,7 +276,6 @@ impl Engine {
             budget,
             lease: LeaseHolder::none(),
             projection_generation: 1,
-            cursor_style: 1,
             links: BTreeSet::new(),
             checkpoints: VecDeque::new(),
             revision: 0,
@@ -1193,7 +1191,6 @@ impl Engine {
                     self.modes.full_reset();
                     self.titles = TitleState::new();
                     self.palette.reset_all();
-                    self.cursor_style = 1;
                     self.title_revision = self.next_revision();
                     self.palette_revision = self.next_revision();
                     self.advance_projection();
@@ -1256,7 +1253,6 @@ impl Engine {
             (None, [b'!'], b'p') => {
                 // DECSTR returns the primary screen, which resets the projection with it.
                 self.modes.soft_reset();
-                self.cursor_style = 1;
                 // The reset selects the first character set again, and the cursors it clears are
                 // the ones that held a shift.
                 self.saved_shift = [false; 2];
@@ -1264,9 +1260,6 @@ impl Engine {
                     self.grid.set_shift_in();
                 }
                 self.advance_projection();
-            }
-            (None, [b' '], b'q') => {
-                self.cursor_style = u32::try_from(csi.first_or(1).max(0)).unwrap_or(1);
             }
             (None, [], b't') => {
                 let target = title_target(csi.number(1));

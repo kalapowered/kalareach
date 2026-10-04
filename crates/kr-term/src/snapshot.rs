@@ -438,7 +438,6 @@ pub enum RestoreOp {
         /// The saved cursor.
         cursor: SavedCursor,
     },
-    /// Set the titles and the virtual stack.
     /// Opens the hyperlink the next character belongs to, or closes the open one.
     SetHyperlink {
         /// The link, or nothing when no link is open.
