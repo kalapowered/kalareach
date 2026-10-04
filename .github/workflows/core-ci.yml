@@ -539,6 +539,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows_inheritance
 
+      # What the worker reads of an installed package: its connector, its command integration, its
+      # launch probe and its bridge, each from the verified manifest, with an installation's grants
+      # and an absolute forwarder where an installation names one.
+      - name: Test the connector the worker reads from an installed package
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test connectors
+
       # A vendor's own sandbox under the session's job. A sandbox that nests a job of its own, limited
       # in processes, memory and the user interface, launches under the session's job, a try at breaking
       # away is refused, and the closure ends every process the vendor made and reads its coverage as

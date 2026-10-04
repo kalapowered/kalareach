@@ -705,6 +705,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the connector the worker reads from an installed package",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "connectors",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "a vendor's own sandbox under the session's job",
             &[
                 "test",
