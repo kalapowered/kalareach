@@ -4249,6 +4249,7 @@ async fn input_a_command_reads_is_not_a_line_and_leaves_the_capability_alone() {
         }))
         .await
         .expect("leaves");
+    until_the_reader_has_left(&wired.runtime).await;
 
     // The command asks its question, and another client has the keys by the time it does.
     let answerer = holder_over(&mut client, &wired).await;
@@ -6105,7 +6106,9 @@ async fn an_answer_queued_after_the_fence_invalidates_it_until_the_reader_proves
     assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
 
     // The reader idles, which is where a withheld fence is asked for again, and its own snapshot
-    // is what accounts for the bytes it was sent. A launch reserved on that fence is not refused.
+    // is what accounts for the bytes it was sent once the writer has written them. A launch
+    // reserved on that fence is not refused.
+    until_replies_written(&wired.runtime).await;
     wired
         .bridge
         .send_event(idle(wired.session_id, 1, 1))
@@ -6340,6 +6343,9 @@ async fn an_answer_queued_during_the_exchange_withholds_the_fence_until_the_next
         FenceState::Unfenced
     );
 
+    // The next exchange proves the queues clear only once the answer has reached the terminal, so
+    // it begins after the writer has written it.
+    until_replies_written(&wired.runtime).await;
     wired
         .bridge
         .send_event(idle(wired.session_id, 1, 1))
@@ -6433,6 +6439,19 @@ async fn an_answer_still_unwritten_when_a_later_exchange_begins_keeps_that_excha
         .expect("acknowledges");
     until_fenced(&wired.runtime).await;
     wired.close().await;
+}
+
+/// Waits until the machine has taken the reader's leave. A takeover the machine takes while it
+/// still has the reader asks that reader for a fence, and the leave then withholds that exchange:
+/// the publication of that reaches the bridge ahead of the fence a case asks for next.
+async fn until_the_reader_has_left(runtime: &SessionRuntime) {
+    tokio::time::timeout(SOON, async {
+        while runtime.session().fence().expect("a driver").state() != FenceState::Outside {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reader left the prompt");
 }
 
 /// Waits until the writer has written every answer the host queued for the terminal.
