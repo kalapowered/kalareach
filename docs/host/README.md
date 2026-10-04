@@ -3668,13 +3668,13 @@ record in the same transaction as the pause.
 `kr_worker::action::time` holds this host's time contract. It rests on three anchors and concludes
 only what each one supports.
 
-What asks it today is retention: section 9 stops expiry-based collection while the wall clock
-cannot be proved, and the session's journal prunes only when the contract says collection may run.
-The deadlines that exist besides that, the action window, the dispatch lease and the accepted
-deadline of a mutation, are decided on the transport's suspend-aware continuous clock, which is the
-same anchor reached by a different route. The consumer the contract has and nothing yet uses is the
-cross-reboot signed object: no store holds one, and `ExpiringObject::signed_across_reboot` is the
-shape the grant and archive tasks hand it.
+What asks it is retention: section 9 stops expiry-based collection while the wall clock cannot be
+proved, and the session's journal prunes only when the contract says collection may run. The
+deadlines that exist besides that, the action window, the dispatch lease and the accepted deadline
+of a mutation, are decided on the transport's suspend-aware continuous clock, which is the same
+anchor reached by a different route. The contract also has a shape for a signed object that has to
+outlive a reboot, `ExpiringObject::signed_across_reboot`: no store holds one, and nothing outside
+the contract's own tests builds one.
 
 | Anchor | What it proves |
 | --- | --- |
