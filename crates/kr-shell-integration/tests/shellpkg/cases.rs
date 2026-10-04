@@ -237,10 +237,29 @@ impl Session {
         (entry, fence)
     }
 
-    /// Clears whatever is in the edit buffer.
+    /// Clears whatever is in the edit buffer, and returns once the reader has said it is empty.
+    ///
+    /// The reader reports what it holds each time it comes to wait for a key, so the first report
+    /// that arrives after the key was typed is about a reader that has dealt with it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no such report arrives inside the reply window.
     pub fn clear_line(&mut self) {
+        // What the reader sent before this point is read first, so that it is not taken for what
+        // the key brings.
+        self.pump(Duration::ZERO);
+        let reports = self.idle_reports;
         self.type_bytes(CTRL_U);
-        std::thread::sleep(Duration::from_millis(60));
+        let deadline = self.deadline_for(REPLY);
+        while !(self.idle_reports > reports && self.last_idle_empty) {
+            assert!(
+                !deadline.passed(),
+                "the reader did not report an empty buffer after the line was cleared:\n{}",
+                self.terminal_output()
+            );
+            self.pump(Duration::from_millis(10));
+        }
     }
 }
 

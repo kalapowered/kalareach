@@ -10,11 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use kr_protocol::root::{
-    CommandBypassReason, DETACH_HINT, LAUNCH_READER_BUDGET, LaunchCommand, ReaderContext,
-    RootCommandResolveParams,
+    CommandBypassReason, DETACH_HINT, FENCE_EXCHANGE_TIMEOUT, FenceCause, LAUNCH_READER_BUDGET,
+    LaunchCommand, ReaderContext, RootCommandResolveParams, RootEditorFenceParams,
 };
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_shell_integration::contract::events::ConsumeReason;
@@ -24,11 +23,6 @@ use kr_shell_integration::contract::requests::{
 };
 
 use super::*;
-
-/// How long a shell waits for an answer before it runs a command as it was typed.
-///
-/// The packages' own constant, restated so a package that waited less, or not at all, fails here.
-pub const ANSWER_WAIT: Duration = Duration::from_millis(1000);
 
 /// Programs a case runs, in a directory of the case's own on the internal disk, and what each
 /// recorded about how it was started.
@@ -183,6 +177,7 @@ impl Probes {
         // A launcher that is an executable file the system cannot start.
         place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
+        std::fs::write(root.join("script.ps1"), "kr-probe from-a-script\n").expect("a script");
         Self {
             _directory: directory,
             root,
@@ -275,7 +270,7 @@ impl Default for Probes {
 }
 
 /// A session of this package's own with the probes on its search path, at an answering prompt.
-fn a_session_with_probes(package: &Package, probes: &Probes) -> Session {
+pub(super) fn a_session_with_probes(package: &Package, probes: &Probes) -> Session {
     let mut session = Session::start_with(package, &probes.environment());
     session.first_prompt();
     session.forget_events();
@@ -322,7 +317,7 @@ impl Session {
 }
 
 /// The last start of the program, which a case has just waited for.
-fn last_run(probes: &Probes) -> ProbeRun {
+pub(super) fn last_run(probes: &Probes) -> ProbeRun {
     probes
         .runs()
         .last()
@@ -407,7 +402,12 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
 
     // An argument that is not text cannot be named exactly in a request, so the command runs as
     // it was typed without a question.
-    let asked = session.run_asking("kr-probe $'\\xff'", "probe-ran");
+    let not_text = if kind == ShellKind::Fish {
+        "kr-probe \\xff"
+    } else {
+        "kr-probe $'\\xff'"
+    };
+    let asked = session.run_asking(not_text, "probe-ran");
     assert!(
         asked.is_empty(),
         "an argument that is not text was asked about: {asked:?}"
@@ -424,35 +424,40 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
     let mut session = a_session_with_probes(&package, &probes);
     let script = probes.script();
 
-    let forms = [
-        ("a pipeline", "kr-probe in-a-pipeline | cat".to_owned()),
-        ("a subshell", "(kr-probe in-a-subshell)".to_owned()),
-        (
-            "a command substitution",
-            "printf '%s\\n' \"$(kr-probe in-a-substitution)\"".to_owned(),
-        ),
-        (
-            "a background job",
-            "kr-probe in-the-background & wait".to_owned(),
-        ),
-        ("a sourced script", format!(". '{}'", told(&script))),
-        (
-            "a function",
-            "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
-        ),
-        ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
-        // The last part of a pipeline can run in the root shell itself: zsh runs a group there,
-        // and a redirection of the group's own does not make it any less part of the pipeline.
-        (
-            "a group at the end of a pipeline",
-            "printf x | { kr-probe in-a-group; }".to_owned(),
-        ),
-        (
-            "a redirected group at the end of a pipeline",
-            "printf x | { kr-probe in-a-redirected-group; } </dev/null".to_owned(),
-        ),
-    ];
-    let mut forms = forms.to_vec();
+    let mut forms = if kind == ShellKind::Fish {
+        fish_forms_that_never_ask(&script)
+    } else {
+        let forms = [
+            ("a pipeline", "kr-probe in-a-pipeline | cat".to_owned()),
+            ("a subshell", "(kr-probe in-a-subshell)".to_owned()),
+            (
+                "a command substitution",
+                "printf '%s\\n' \"$(kr-probe in-a-substitution)\"".to_owned(),
+            ),
+            (
+                "a background job",
+                "kr-probe in-the-background & wait".to_owned(),
+            ),
+            ("a sourced script", format!(". '{}'", told(&script))),
+            (
+                "a function",
+                "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
+            ),
+            ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
+            // The last part of a pipeline can run in the root shell itself: zsh runs a group
+            // there, and a redirection of the group's own does not make it any less part of the
+            // pipeline.
+            (
+                "a group at the end of a pipeline",
+                "printf x | { kr-probe in-a-group; }".to_owned(),
+            ),
+            (
+                "a redirected group at the end of a pipeline",
+                "printf x | { kr-probe in-a-redirected-group; } </dev/null".to_owned(),
+            ),
+        ];
+        forms.to_vec()
+    };
     if kind == ShellKind::Bash {
         // Bash runs the last part of a pipeline itself when job control is off and lastpipe is on.
         forms.push((
@@ -486,15 +491,33 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
         assert_eq!(probes.runs().len(), runs + 1, "{form} ran the program once");
     }
 
-    // A group reading a string is no pipeline, however the shell carries the string to it: it
-    // asks.
-    let asked = session.run_asking("{ kr-probe from-a-string; } <<<x", "probe-ran");
-    assert_eq!(
-        asked.len(),
-        1,
-        "a group reading a string asks once: {asked:?}"
-    );
-    assert_eq!(last_run(&probes).arguments, ["from-a-string"]);
+    if kind == ShellKind::Fish {
+        fish_handlers_never_ask(&mut session, &probes);
+        // A group with a redirection of its own is a block the shell runs itself, in the foreground
+        // and in no pipeline: its command is the line's own, and it asks.
+        let asked = session.run_asking(
+            "begin; kr-probe from-a-redirected-block; end </dev/null",
+            "probe-ran",
+        );
+        assert_eq!(asked.len(), 1, "a redirected block asks once: {asked:?}");
+        assert_eq!(last_run(&probes).arguments, ["from-a-redirected-block"]);
+        // The same block, now with a pipe in front of its command, is part of the pipeline.
+        let asked = session.run_asking(
+            "printf x | begin; kr-probe from-a-piped-block; end",
+            "probe-ran",
+        );
+        assert!(asked.is_empty(), "a piped block asked: {asked:?}");
+    } else {
+        // A group reading a string is no pipeline, however the shell carries the string to it: it
+        // asks.
+        let asked = session.run_asking("{ kr-probe from-a-string; } <<<x", "probe-ran");
+        assert_eq!(
+            asked.len(),
+            1,
+            "a group reading a string asks once: {asked:?}"
+        );
+        assert_eq!(last_run(&probes).arguments, ["from-a-string"]);
+    }
 
     // The interpreter a script is started with is a command of the line, so it asks; nothing
     // the script runs does.
@@ -502,6 +525,103 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
     assert_eq!(asked.len(), 1, "only the interpreter asks: {asked:?}");
     assert_eq!(asked[0].argv[0], "sh");
     assert_eq!(last_run(&probes).arguments, ["from-a-script"]);
+}
+
+/// The forms of a fish line whose commands the root shell does not start itself.
+///
+/// Fish runs a group, a function, an `eval`, a substitution, a sourced file and an event handler
+/// inside its own blocks, and a command in any of them is not one of the line's own.
+fn fish_forms_that_never_ask(script: &Path) -> Vec<(&'static str, String)> {
+    vec![
+        ("a pipeline", "kr-probe in-a-pipeline | cat".to_owned()),
+        (
+            "a command substitution",
+            "printf '%s\\n' (kr-probe in-a-substitution)".to_owned(),
+        ),
+        (
+            "a background job",
+            "kr-probe in-the-background & wait".to_owned(),
+        ),
+        ("a sourced script", format!("source '{}'", told(script))),
+        (
+            "a function",
+            "function kr_probe_function; kr-probe in-a-function; end; kr_probe_function".to_owned(),
+        ),
+        ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
+        // A redirection on `eval` is the shell's own and changes nothing about the command it
+        // evaluates.
+        (
+            "an eval with a redirection",
+            "eval 'kr-probe in-a-redirected-eval' </dev/null".to_owned(),
+        ),
+        (
+            "a group at the end of a pipeline",
+            "printf x | begin; kr-probe in-a-group; end".to_owned(),
+        ),
+        (
+            "an event the line emits",
+            "function kr_on_event --on-event kr_event; kr-probe in-an-event; end; emit kr_event"
+                .to_owned(),
+        ),
+    ]
+}
+
+/// Handlers fish runs around a line: the one for `fish_preexec` and the prompt function. Their
+/// commands are the shell's own, not the line's, and ask nothing.
+fn fish_handlers_never_ask(session: &mut Session, probes: &Probes) {
+    let asked_before = session.commands.resolves.len();
+    let started = |probes: &Probes, word: &str| {
+        probes
+            .runs()
+            .iter()
+            .filter(|run| run.arguments == [word])
+            .count()
+    };
+
+    // A `fish_preexec` handler is defined by one line and runs at the start of the next, before
+    // that line's own commands.
+    let defined = format!(
+        "function kr_preexec --on-event fish_preexec; kr-probe in-preexec; end; {}",
+        print_assembled(ShellKind::Fish, "kr-preexec-defined")
+    );
+    assert!(session.run(&defined, "kr-preexec-defined"));
+    assert_eq!(started(probes, "in-preexec"), 0, "the handler ran early");
+    let erased = format!(
+        "functions -e kr_preexec; {}",
+        print_assembled(ShellKind::Fish, "kr-preexec-erased")
+    );
+    assert!(session.run(&erased, "kr-preexec-erased"));
+    assert_eq!(
+        started(probes, "in-preexec"),
+        1,
+        "the handler ran once, for the line after it"
+    );
+
+    // The prompt function runs before every prompt it draws, so a probe it starts has run by the
+    // time a line typed at that prompt does.
+    let prompt = session.prompt.clone();
+    let redefined = format!(
+        "function fish_prompt; kr-probe in-the-prompt >/dev/null; printf '%s' '{prompt}'; end; {}",
+        print_assembled(ShellKind::Fish, "kr-prompt-defined")
+    );
+    assert!(session.run(&redefined, "kr-prompt-defined"));
+    assert!(session.answered("kr-prompt-drawn"));
+    assert!(
+        started(probes, "in-the-prompt") >= 1,
+        "the prompt function's command did not run"
+    );
+    let restored = format!(
+        "function fish_prompt; printf '%s' '{prompt}'; end; {}",
+        print_assembled(ShellKind::Fish, "kr-prompt-restored")
+    );
+    assert!(session.run(&restored, "kr-prompt-restored"));
+
+    assert_eq!(
+        session.commands.resolves.len(),
+        asked_before,
+        "a handler's command asked: {:?}",
+        &session.commands.resolves[asked_before..]
+    );
 }
 
 /// KR-REQ-12.07: a command runs the file and the vector its shell would run. Assignments in front
@@ -522,6 +642,30 @@ pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
         added: Vec::new(),
     };
     let other = probes.other_directory();
+
+    if kind == ShellKind::Fish {
+        // Fish applies the assignments in front of a command in a block of its own, so the command
+        // is not one of the line's own: it asks nothing and runs with the assignment. The same
+        // command without it is asked about, and goes through the launcher.
+        let launches = probes.launches().len();
+        let asked = session.run_asking("KR_MARK=1 kr-probe assigned", "probe-ran");
+        assert!(
+            asked.is_empty(),
+            "a command with an assignment asked: {asked:?}"
+        );
+        assert_eq!(probes.launches().len(), launches, "the launcher started");
+        let ran = last_run(&probes);
+        assert_eq!(ran.arguments, ["assigned"]);
+        assert_eq!(
+            ran.environment.get("KR_MARK").map(String::as_str),
+            Some("1"),
+            "the command ran with its assignment"
+        );
+        let asked = session.run_asking("kr-probe unassigned", "launcher-ran");
+        assert_eq!(asked.len(), 1, "the same command asks: {asked:?}");
+        assert_eq!(probes.launches().len(), launches + 1);
+        return;
+    }
 
     let launches = probes.launches().len();
     let asked = session.run_asking(
@@ -618,26 +762,19 @@ pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
 
 /// KR-REQ-12.07: a worker that does not answer leaves the command running as typed once the
 /// deadline has passed, and a worker that has stopped answering is not asked again.
+///
+/// Nothing here times anything. The command is asked about once and then runs as typed, and every
+/// absence is decided by order: a command the shell ran after the refusal proves the refusal had
+/// been taken, and an answer to a request the reader was asked afterwards proves everything the
+/// reader sent before it has been read.
 pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind: ShellKind) {
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
     session.commands.policy = ResolvePolicy::Silent;
-    let started = Instant::now();
     let asked = session.run_asking("kr-probe unanswered", "probe-ran");
-    let waited = started.elapsed();
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
-    assert!(
-        waited >= ANSWER_WAIT,
-        "the command started after {waited:?}, before the answer's deadline"
-    );
-    // The deadline, and time for a busy machine to schedule the command after it, but no second
-    // wait of the same length.
-    assert!(
-        waited < ANSWER_WAIT * 2 + Duration::from_secs(4),
-        "the command started after {waited:?}, long after the answer's deadline"
-    );
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
 
     // A worker that answers what came after the unanswered question has caught up, so the next
@@ -652,27 +789,29 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     assert_eq!(last_run(&probes).arguments, ["caught-up"]);
 
     // A refusal answers the question it names and nothing else: the command runs as it was typed,
-    // and no detach is taken to have been refused.
+    // and no detach is taken to have been refused. What a refusal taken for a detach's would do is
+    // draw the hint and report a consumed gesture, at the next reader the shell enters, so a
+    // command that runs after that reader has entered finds both already there.
     session.commands.policy = ResolvePolicy::Refuse;
     let before = session.written();
+    let decisions = session.events.managed_decisions();
     let asked = session.run_asking("kr-probe refused", "probe-ran");
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["refused"]);
+    session.commands.policy = ResolvePolicy::default();
+    assert!(session.answered("kr-after-refusal"));
+    session.barrier();
+    let shown = session.shown_before(before, "kr-after-refusal");
     assert!(
-        !session
-            .drew_after(before, DETACH_HINT, Duration::from_millis(500))
-            .was_drawn(),
+        !shown.contains(DETACH_HINT),
         "a refused question was taken for a refused detach:\n{}",
         session.terminal_output()
     );
-    assert!(
-        !session.saw_event(Duration::from_millis(200), |event| matches!(
-            event,
-            kr_shell_integration::contract::events::BridgeEvent::PreEofConsumed(_)
-        )),
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
         "a refused question consumed a gesture"
     );
-    session.commands.policy = ResolvePolicy::default();
 
     // A worker that answers nothing at all is not asked again while an answer is owed: the
     // commands after it run as they were typed without a question.
@@ -684,6 +823,52 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
             "a question went to a worker that owes an answer: {asked:?}"
         );
         assert_eq!(last_run(&probes).arguments, [word]);
+    }
+}
+
+impl Session {
+    /// Asks the reader something and waits for its answer.
+    ///
+    /// The reader writes what it has to say in order, so when the answer is here everything it
+    /// sent before answering has been read too, whichever way it answered. This is the barrier
+    /// that stands in for a wait of a chosen length where a check needs to say that nothing else
+    /// came.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader does not answer inside the reply window.
+    pub fn barrier(&mut self) {
+        let (generation, revision) = self.last_entry.as_ref().map_or_else(
+            || {
+                (
+                    kr_protocol::root::PromptGeneration::new(0),
+                    kr_protocol::root::ReaderRevision::new(0),
+                )
+            },
+            |entry| (entry.prompt_generation, entry.reader_revision),
+        );
+        let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+            session_id: self.session_id,
+            fence_id: fence_id(201),
+            prompt_generation: generation,
+            reader_revision: revision,
+            deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+            cause: FenceCause::Retry,
+        }));
+        let _ = self.answer(id);
+    }
+
+    /// What the terminal showed after `start` and before the first copy of `marker` that follows,
+    /// where the marker is something a command printed.
+    #[must_use]
+    pub fn shown_before(&self, start: usize, marker: &str) -> String {
+        let output = self.output.lock().expect("the output lock");
+        let from = start.min(output.len());
+        let end = output[from..]
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
+            .map_or(output.len(), |at| from + at);
+        String::from_utf8_lossy(&output[from..end]).into_owned()
     }
 }
 
@@ -780,6 +965,23 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
     assert_eq!(ran.names(), control.names());
     assert!(!ran.environment.contains_key("KR_REGISTRATION"));
 
+    if kind == ShellKind::Fish {
+        // Fish starts a command that needs no terminal with `posix_spawn`, which under
+        // `status job-control none` is every command. The launcher is started all the same.
+        session.commands.policy = backend(told(&probes.launcher()));
+        let launches = probes.launches().len();
+        let asked = session.run_asking(
+            "status job-control none; kr-probe without-job-control; status job-control full",
+            "launcher-ran",
+        );
+        assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+        assert_eq!(
+            probes.launches().len(),
+            launches + 1,
+            "the launcher did not run without job control"
+        );
+    }
+
     // The backend's variables were that one child's: the shell exports none of them.
     session.commands.policy = ResolvePolicy::default();
     let asked = session.run_asking("kr-probe afterwards", "probe-ran");
@@ -794,6 +996,8 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
 fn reading_through_the_editor(kind: ShellKind) -> &'static str {
     match kind {
         ShellKind::Zsh => "vared -c kr_reply",
+        // Fish's `read` reads through its own editor whenever its input is a terminal.
+        ShellKind::Fish => "read -l kr_reply",
         _ => "read -e -r kr_reply",
     }
 }
@@ -913,6 +1117,77 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
         commands.iter().all(|command| command == reading),
         "only the line that read the input is reported: {commands:?}"
     );
+
+    // What the shell cannot see into is still part of its line: a function, a pipeline, an `eval`
+    // and a sourced file each report the one block of the line that ran them.
+    for (what, line) in lines_the_shell_cannot_see_into(kind, &probes) {
+        let reported = session.commands.blocks.len();
+        assert!(session.run(&line, "probe-ran"), "{what}");
+        session.until(&format!("{what}'s finished block"), |commands| {
+            commands.blocks[reported..]
+                .iter()
+                .any(|block| block.exit_status.0.is_some())
+        });
+        let blocks = session.commands.blocks[reported..].to_vec();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "{what} reported one block when it started and one when it finished: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().all(|block| block.command == line),
+            "{what} reported another command than the line: {blocks:?}"
+        );
+        assert_eq!(blocks[1].exit_status.0.map(|status| status.get()), Some(0));
+    }
+}
+
+/// Lines whose program runs where the shell cannot see it from the line: inside a function, a
+/// pipeline, an `eval` and a sourced file. Each prints `probe-ran` and succeeds.
+fn lines_the_shell_cannot_see_into(
+    kind: ShellKind,
+    probes: &Probes,
+) -> Vec<(&'static str, String)> {
+    let script = told(&probes.script());
+    match kind {
+        ShellKind::Fish => vec![
+            (
+                "a function",
+                "function kr_probe_function; kr-probe in-a-function; end; kr_probe_function"
+                    .to_owned(),
+            ),
+            ("a pipeline", "kr-probe in-a-pipeline | cat".to_owned()),
+            ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
+            ("a sourced file", format!("source '{script}'")),
+        ],
+        ShellKind::PowerShell => vec![
+            (
+                "a function",
+                "function Invoke-KrProbe { kr-probe in-a-function }; Invoke-KrProbe".to_owned(),
+            ),
+            (
+                "a pipeline",
+                "kr-probe in-a-pipeline | Out-String".to_owned(),
+            ),
+            (
+                "an expression",
+                "Invoke-Expression 'kr-probe in-an-eval'".to_owned(),
+            ),
+            (
+                "a sourced file",
+                format!(". '{}'", told(&probes.path("script.ps1"))),
+            ),
+        ],
+        ShellKind::Zsh | ShellKind::Bash => vec![
+            (
+                "a function",
+                "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
+            ),
+            ("a pipeline", "kr-probe in-a-pipeline | cat".to_owned()),
+            ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
+            ("a sourced file", format!(". '{script}'")),
+        ],
+    }
 }
 
 /// KR-REQ-07.84: the commands a line runs are started with the capability the worker minted for
@@ -987,6 +1262,7 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
 
     // A gesture at a fenced prompt leaves a detach waiting for the worker's answer, which comes
     // only after the next line has been typed. The fence stays held until the answer arrives.
+    let decisions_before = session.events.managed_decisions();
     let (reader, held) = session.fenced_prompt(4);
     session.type_bytes(CTRL_D);
     let (detach, _) = session.expect_event("eof_detach", |event| {
@@ -1123,14 +1399,6 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         consumed_between, 1,
         "the refusal was not taken between the probes on either side of it: {arrivals:?}"
     );
-    assert!(
-        !session.saw_event(Duration::from_millis(300), |event| matches!(
-            event,
-            BridgeEvent::PreEofConsumed(_)
-        )),
-        "a refused detach was acted on more than once"
-    );
-
     // The last of those frames was the withdrawal, so a gesture now finds no fence at all.
     session.type_bytes(CTRL_D);
     let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
@@ -1143,6 +1411,15 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
 
     session.commands.stuck = false;
     assert!(session.answered("kr-after-traffic"));
+    session.barrier();
+    // The decisions the worker was told of since the case began are the gesture's detach, the
+    // refusal's consumption and the second gesture's: a refused detach acted on more than once
+    // would be a fourth.
+    assert_eq!(
+        session.events.managed_decisions() - decisions_before,
+        3,
+        "the refused detach was not acted on exactly once"
+    );
     let probed = [
         before_refusal,
         after_refusal,
@@ -1919,12 +2196,18 @@ pub fn an_enabled_integration_adds_its_flags_only_to_the_agents_interactive_invo
     let planted = run(&mut session, "alias claude=codex");
     assert!(planted.is_empty(), "{planted:?}");
     let asked = run(&mut session, "claude via-alias > /dev/null");
-    assert_eq!(asked.len(), 1, "{asked:?}");
-    assert_eq!(
-        asked[0].argv,
-        ["codex", "via-alias"],
-        "the request reports what the alias makes the shell run"
-    );
+    if kind == ShellKind::Fish {
+        // An alias is a function in fish, and a command a function runs is none of the line's
+        // own: nothing is asked, and nothing is added.
+        assert!(asked.is_empty(), "an alias asked: {asked:?}");
+    } else {
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            asked[0].argv,
+            ["codex", "via-alias"],
+            "the request reports what the alias makes the shell run"
+        );
+    }
     assert_eq!(
         probes.launches().len(),
         1,
