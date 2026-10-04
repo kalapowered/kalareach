@@ -36,16 +36,26 @@ use crate::profile::ProfileRevision;
 /// The grammar every description is generated under.
 ///
 /// It admits exactly one object, with exactly the four fields section 22 names, in one order. The
-/// two string fields exclude both control ranges and the two delimiters outright, so a title with a
-/// newline in it is not merely rejected later: it cannot be sampled. The bounds are the section's
-/// own, counted in codepoints, which is what a GBNF repetition over a character class counts, and
-/// the numbers are JSON integers rather than digit runs, so a leading zero cannot be produced
-/// either.
+/// two string fields admit every character but the control ranges, the two delimiters, and the
+/// bidirectional controls and line separators that [`validate`] refuses, so a title with a newline
+/// or a right-to-left override in it is not merely rejected later: it cannot be sampled. What the
+/// character class admits is everything but [`crate::metadata::is_forbidden_in_a_label`], the quote
+/// and the backslash, and a test holds the two equal over every codepoint. The bounds are the
+/// section's own, counted in codepoints, which is what a GBNF repetition over a character class
+/// counts, and the numbers are JSON integers rather than digit runs, so a leading zero cannot be
+/// produced either.
+///
+/// The class lists what is admitted and does not name what is left out, and that is deliberate.
+/// A byte-level vocabulary has tokens that end inside a character, and llama.cpp admits one of
+/// them when some character it could finish is in a listed class, and refuses it when some
+/// character it could finish is in a negated class's excluded set. Left out by name, the
+/// bidirectional controls would refuse every token that ends in the first byte of an Arabic or a
+/// Persian letter or of the joiners, and the model could no longer copy the text it was given.
 pub const DESCRIPTION_GRAMMAR: &str = r#"root ::= "{" ws "\"title\":" ws title "," ws "\"activity_text\":" ws activity "," ws "\"source_cursor\":" ws cursor "," ws "\"context_revision\":" ws number ws "}"
 title ::= "\"" char{1,64} "\""
 activity ::= "\"" char{1,160} "\""
 cursor ::= "{" ws "\"from\":" ws number "," ws "\"to\":" ws number ws "}"
-char ::= [^"\\\x00-\x1F\x7F-\x9F]
+char ::= [\x20-\x21\x23-\x5B\x5D-\x7E\xA0-\u061B\u061D-\u200D\u2010-\u2027\u202F-\u2065\u206A-\uD7FF\uE000-\U0010FFFF]
 number ::= "0" | [1-9] [0-9]{0,18}
 ws ::= " "?
 "#;

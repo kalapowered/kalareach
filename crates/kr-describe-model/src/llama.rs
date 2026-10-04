@@ -385,8 +385,8 @@ impl LlamaRuntime {
                 .map_err(|error| format!("the prompt could not be tokenized: {error}"))
         };
         let framed = tokenize(prompt, AddBos::Always)?;
-        let text = tokenize(prompt, AddBos::Never)?;
-        if !text.iter().any(|token| self.is_structure(*token)) {
+        let (text, spelled_out) = self.text_tokens(prompt)?;
+        if spelled_out == 0 {
             return Ok(PromptTokens {
                 tokens: framed,
                 spelled_out: 0,
@@ -407,8 +407,25 @@ impl LlamaRuntime {
             .flatten()
             .ok_or_else(|| "the vocabulary's framing could not be read".to_owned())?;
         let mut tokens = probed[..at].to_vec();
+        tokens.extend(text);
+        tokens.extend_from_slice(&probed[at + probe.len()..]);
+        Ok(PromptTokens {
+            tokens,
+            spelled_out,
+        })
+    }
+
+    /// Returns the tokens of `text` as the tokenizer reads it, without the framing the vocabulary
+    /// adds to a prompt, with each structure token written out as the characters of its spelling,
+    /// and how many were.
+    fn text_tokens(&self, text: &str) -> std::result::Result<(Vec<LlamaToken>, usize), String> {
+        let bare = self
+            .model
+            .str_to_token(text, AddBos::Never)
+            .map_err(|error| format!("the prompt could not be tokenized: {error}"))?;
+        let mut tokens = Vec::with_capacity(bare.len());
         let mut spelled_out = 0;
-        for token in text {
+        for token in bare {
             if self.is_structure(token) {
                 spelled_out += 1;
                 tokens.extend(self.spelling_tokens(token)?);
@@ -416,11 +433,7 @@ impl LlamaRuntime {
                 tokens.push(token);
             }
         }
-        tokens.extend_from_slice(&probed[at + probe.len()..]);
-        Ok(PromptTokens {
-            tokens,
-            spelled_out,
-        })
+        Ok((tokens, spelled_out))
     }
 
     /// Returns whether a token is one the model reads as the structure of a prompt, which text
@@ -490,16 +503,20 @@ impl LlamaRuntime {
         Ok(tokens)
     }
 
-    /// Returns whether llama.cpp's own grammar machinery takes `output` as a whole answer: every
-    /// token of the output is one the grammar allows next, and it allows the end of the answer
-    /// where the output ends.
+    /// Returns whether llama.cpp's own grammar machinery takes `output` as a whole answer: some way
+    /// of writing it as tokens is one where every token is allowed next by the grammar, and the
+    /// grammar allows the end of the answer where the output ends.
     ///
-    /// The output is given to the grammar one codepoint at a time, and each codepoint is
-    /// tokenized on its own. The tokenizer reads the spelling of a control token as the token, so
-    /// tokenizing the whole text would turn `</s>` inside a title into the end of the answer; and
-    /// a byte-level vocabulary splits a space and the character after it across tokens in ways
-    /// the grammar refuses halfway through a character, which no generation would choose.
-    /// A codepoint tokenized alone is a codepoint the vocabulary writes whole wherever it can.
+    /// A text is written as tokens in two ways, and the answer is taken when either way is. The
+    /// first is how the tokenizer reads it, merging characters into the longest tokens the
+    /// vocabulary has, which is how a model writes text it knows. The second is one codepoint at a
+    /// time, which writes every character the vocabulary has a token for on its own whole. Neither
+    /// is the other's whole: a byte-level vocabulary can split a space and the character after it
+    /// across tokens, and a token that ends inside a character is refused by the grammar when the
+    /// character it could finish is one it leaves out, so a character with no token of its own is
+    /// refused alone and taken inside a longer token. The spelling of a control token inside the
+    /// text is written out as characters, so `</s>` inside a title is text and not the end of the
+    /// answer.
     ///
     /// What this shows depends on where the output came from. For an answer the model produced
     /// under this grammar it shows the answer is complete and was not cut short; for text written
@@ -507,50 +524,67 @@ impl LlamaRuntime {
     ///
     /// # Errors
     ///
-    /// Returns what went wrong when the grammar is refused, the output is not text, a character of
-    /// it cannot be tokenized or its token cannot be spelled, the vocabulary has no
-    /// end-of-sequence token, or the tokens do not spell the output back.
+    /// Returns what went wrong when the grammar is refused, the output is not text, it cannot be
+    /// tokenized or a token cannot be spelled, the vocabulary has no end-of-sequence token, or
+    /// neither way of writing the output as tokens spells it back.
     pub fn grammar_takes(&self, grammar: &str, output: &[u8]) -> std::result::Result<bool, String> {
-        let mut sampler = LlamaSampler::grammar(&self.model, grammar, "root")
-            .map_err(|error| format!("the grammar was refused: {error}"))?;
         let text = std::str::from_utf8(output)
             .map_err(|error| format!("the output is not text: {error}"))?;
         let end = self.model.token_eos();
         if end.0 < 0 {
             return Err("this vocabulary has no end-of-sequence token to ask about".to_owned());
         }
-        let mut spelled: Vec<u8> = Vec::with_capacity(output.len());
-        let mut tokens: Vec<LlamaToken> = Vec::new();
+        let mut codepoints: Vec<LlamaToken> = Vec::new();
         for character in text.chars() {
             let mut buffer = [0_u8; 4];
-            let piece = self
-                .model
-                .str_to_token(character.encode_utf8(&mut buffer), AddBos::Never)
-                .map_err(|error| format!("{character:?} could not be tokenized: {error}"))?;
-            for token in piece {
-                let bytes = self
-                    .model
-                    .token_to_piece_bytes(token, PIECE_BYTES, true, None)
-                    .map_err(|error| format!("a token could not be spelled: {error}"))?;
-                spelled.extend_from_slice(&bytes);
-                tokens.push(token);
+            codepoints.extend(
+                self.model
+                    .str_to_token(character.encode_utf8(&mut buffer), AddBos::Never)
+                    .map_err(|error| format!("{character:?} could not be tokenized: {error}"))?,
+            );
+        }
+        let mut spelled_back = false;
+        for tokens in [self.text_tokens(text)?.0, codepoints] {
+            let mut spelled: Vec<u8> = Vec::with_capacity(output.len());
+            for token in &tokens {
+                spelled.extend(self.piece(*token, true)?);
+            }
+            if spelled != output {
+                continue;
+            }
+            spelled_back = true;
+            if self.grammar_takes_tokens(grammar, &tokens, end)? {
+                return Ok(true);
             }
         }
-        if spelled != output {
-            return Err(
+        if spelled_back {
+            Ok(false)
+        } else {
+            Err(
                 "the tokenizer does not spell the output back, so it cannot be asked of the \
                  grammar"
                     .to_owned(),
-            );
+            )
         }
+    }
+
+    /// Returns whether the grammar takes `tokens` and then allows `end`.
+    fn grammar_takes_tokens(
+        &self,
+        grammar: &str,
+        tokens: &[LlamaToken],
+        end: LlamaToken,
+    ) -> std::result::Result<bool, String> {
+        let mut sampler = LlamaSampler::grammar(&self.model, grammar, "root")
+            .map_err(|error| format!("the grammar was refused: {error}"))?;
         for token in tokens {
             // An end token inside the output is an end of the answer, not text of it.
-            if self.model.is_eog_token(token) || !grammar_allows(&sampler, token) {
+            if self.model.is_eog_token(*token) || !grammar_allows(&sampler, *token) {
                 return Ok(false);
             }
             // Accepted only after the grammar allowed it: the library ends the process over a
             // token its grammar has no place for.
-            sampler.accept(token);
+            sampler.accept(*token);
         }
         Ok(grammar_allows(&sampler, end))
     }
@@ -727,12 +761,10 @@ impl LlamaRuntime {
             }
             // Bytes rather than text, and assembled at the end: one token can be half of a
             // codepoint, and a decoder that answered per token would either drop it or invent a
-            // replacement character in the middle of a name.
-            let piece = self
-                .model
-                .token_to_piece_bytes(chosen, PIECE_BYTES, false, None)
-                .map_err(|error| format!("a token could not be decoded: {error}"))?;
-            produced.extend_from_slice(&piece);
+            // replacement character in the middle of a name. A control token the grammar let
+            // through, because the characters of its spelling are characters a string may hold,
+            // is written as that spelling, like any other text.
+            produced.extend_from_slice(&self.piece(chosen, true)?);
             let decode_started = Instant::now();
             batch.clear();
             batch

@@ -87,4 +87,40 @@ fn llama_cpp_takes_the_answers_the_grammar_describes_and_refuses_the_rest() {
     ] {
         assert!(!takes(&bad), "refused: {bad:?}");
     }
+
+    // What validation refuses, the grammar leaves out: the bidirectional controls and the line and
+    // paragraph separators, which no generation may write.
+    for refused in [
+        0x061C_u32, 0x200E, 0x200F, 0x2028, 0x2029, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066,
+        0x2067, 0x2068, 0x2069,
+    ] {
+        let character = char::from_u32(refused).expect("a character");
+        for bad in [
+            answer(&format!("x{character}y"), "y"),
+            answer("x", &format!("y{character}z")),
+        ] {
+            assert!(!takes(&bad), "refused: U+{refused:04X}");
+        }
+    }
+    // And what scripts need it takes, written as the model writes it: an Arabic sentence, a Persian
+    // word with its zero-width non-joiner, and a family of three joined by zero-width joiners. A
+    // grammar that left the bidirectional controls out by name would refuse the tokens that end
+    // inside the first byte of such letters, and the model could no longer copy the text it was
+    // given.
+    let persian: String = [0x645_u32, 0x6CC, 0x200C, 0x62E, 0x648, 0x627, 0x647, 0x645]
+        .iter()
+        .map(|codepoint| char::from_u32(*codepoint).expect("a character"))
+        .collect();
+    let family: String = [0x1F468_u32, 0x200D, 0x1F469, 0x200D, 0x1F467]
+        .iter()
+        .map(|codepoint| char::from_u32(*codepoint).expect("a character"))
+        .collect();
+    for kept in [
+        "مراجعة شاشة موافقة المضيف",
+        persian.as_str(),
+        family.as_str(),
+    ] {
+        assert!(takes(&answer(kept, "y")), "taken: {kept}");
+        assert!(takes(&answer("x", kept)), "taken: {kept}");
+    }
 }
