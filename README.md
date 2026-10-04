@@ -80,7 +80,8 @@ Requirements for building the project:
   built with, and Git and Python 3;
 - on Linux, the headers of the system WebView the companion application's backend links: WebKitGTK
   4.1, GTK 3, libayatana-appindicator, librsvg and libsoup 3;
-- On macOS, fish (for a root shell used in the worker's terminal suite)
+- On macOS, fish, which the Fish test in `crates/kr-worker/tests/shells.rs` starts as a session's
+  root shell (macOS ships the Bash and Zsh that the file's other two tests start)
 - curl, make, patch, and tar, as well as the headers for ncurses, and gettext (for the managed shell
   packages), and PowerShell >= 7.4 with PSReadLine >= 2.3.4 < 3.0.0 (for the PSReadLine package)
 
