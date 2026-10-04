@@ -4,7 +4,8 @@
 //! I/O unit), providing OS-level acoustic echo cancellation (AEC), gain control (AGC),
 //! and noise suppression. All callback registration and start/stop APIs are safe Rust.
 //!
-//! On Linux and Windows, returns `UNAVAILABLE` errors, matching the established pattern in `verify.rs`.
+//! On Linux and Windows, `start` returns a `RESOURCE_UNAVAILABLE` error (`CommandError::unsupported`),
+//! as the verification ceremony does on a device that has none.
 
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,7 @@ impl AudioDevice {
     ///
     /// # Errors
     ///
-    /// Returns `UNAVAILABLE` on non-macOS, or a local failure if CoreAudio fails to start.
+    /// Returns a local failure if CoreAudio fails to start.
     #[cfg(target_os = "macos")]
     pub fn start<F>(&mut self, mut on_captured_frame: F) -> Result<()>
     where
@@ -118,7 +119,7 @@ impl AudioDevice {
     ///
     /// # Errors
     ///
-    /// Always returns `UNAVAILABLE`.
+    /// Always returns `RESOURCE_UNAVAILABLE`.
     #[cfg(not(target_os = "macos"))]
     pub fn start<F>(&mut self, _on_captured_frame: F) -> Result<()>
     where
