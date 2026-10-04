@@ -996,12 +996,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
             .expect("binds the attachment");
         harness
             .service
-            .record_prompt(
-                &harness.actor,
-                kr_ipc::new_uuid(),
-                draft.draft_id,
-                session_id,
-            )
+            .record_prompt(&harness.actor, draft.draft_id, session_id)
             .expect("records the submission");
 
         harness
@@ -1025,12 +1020,16 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
     }
 }
 
-/// KR-REQ-14.11: an action's record fixes the attachments its prompt carries, so asking again
-/// never submits one that was bound to the draft afterwards.
+/// KR-REQ-14.11: a draft sent to a session holds, for that session, every attachment it gets
+/// afterwards, and is sent to no other.
+///
+/// The session's agent reads the draft when it does, so an attachment bound after the draft was
+/// sent is as much the session's as one bound before it.
 #[test]
-fn a_prompt_record_fixes_the_attachments_the_prompt_carries() {
+fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
     let harness = Harness::create();
     let session_id = SessionId::new(Uuid::from_bytes([13; 16]));
+    let other = SessionId::new(Uuid::from_bytes([14; 16]));
     let draft = harness
         .service
         .draft_create(
@@ -1046,10 +1045,15 @@ fn a_prompt_record_fixes_the_attachments_the_prompt_carries() {
         )
         .expect("creates the draft")
         .draft;
-    let bind = |name: &str| {
+    let bind = |name: &str, begun_for: Option<SessionId>| {
         let bytes = pattern(32);
         let begun = harness
-            .begin(&bytes, "application/octet-stream", name)
+            .begin_for(
+                &bytes,
+                "application/octet-stream",
+                name,
+                Nullable(begun_for),
+            )
             .expect("reserves the upload");
         harness
             .send_all(begun.transfer_id, &bytes)
@@ -1075,67 +1079,52 @@ fn a_prompt_record_fixes_the_attachments_the_prompt_carries() {
                 },
                 None,
             )
-            .expect("binds the attachment");
-        handle.transfer_id
+            .map(|bound| (handle.transfer_id, bound.attachment.handle))
     };
-    let submitted = |transfer_id: TransferId| {
-        harness
+    let held = |transfer_id: TransferId| {
+        let handle = harness
             .service
             .attachment_handle(&harness.actor, transfer_id)
-            .expect("reads the handle")
-            .submitted
+            .expect("reads the handle");
+        (handle.submitted, handle.session_id)
     };
 
-    let first = bind("first.bin");
-    let action = kr_ipc::new_uuid();
+    let (first, _) = bind("first.bin", None).expect("binds the first attachment");
+    assert_eq!(held(first), (false, Nullable::null()));
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, action, draft.draft_id, session_id)
+            .record_prompt(&harness.actor, draft.draft_id, session_id)
             .expect("records the prompt"),
         1
     );
-    assert!(submitted(first));
+    assert_eq!(held(first), (true, Nullable::some(session_id)));
 
-    // Another attachment joins the draft, and the same action is recorded again.
-    harness.clock.advance(1000);
-    let second = bind("second.bin");
+    // An attachment bound after the draft was sent is held by the session, in the reply that binds
+    // it and afterwards.
+    let (second, bound) = bind("second.bin", None).expect("binds the second attachment");
+    assert!(bound.submitted);
+    assert_eq!(bound.session_id, Nullable::some(session_id));
+    assert_eq!(held(second), (true, Nullable::some(session_id)));
+
+    // An attachment that belongs to another session cannot join it.
+    let refusal =
+        bind("foreign.bin", Some(other)).expect_err("refuses an attachment of another session");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+
+    // Sent again to the same session it changes nothing; to another it is refused.
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, action, draft.draft_id, session_id)
+            .record_prompt(&harness.actor, draft.draft_id, session_id)
             .expect("records the prompt again"),
-        1,
-        "the action's prompt still carries the one attachment"
-    );
-    assert!(!submitted(second));
-
-    // Another action carries both.
-    assert_eq!(
-        harness
-            .service
-            .record_prompt(
-                &harness.actor,
-                kr_ipc::new_uuid(),
-                draft.draft_id,
-                session_id
-            )
-            .expect("records another prompt"),
         2
     );
-    assert!(submitted(second));
-
-    // The same action for another session is a reused identifier.
     let refusal = harness
         .service
-        .record_prompt(
-            &harness.actor,
-            action,
-            draft.draft_id,
-            SessionId::new(Uuid::from_bytes([14; 16])),
-        )
-        .expect_err("refuses a reused identifier");
-    assert_eq!(refusal.code(), ErrorCode::IdConflict);
+        .record_prompt(&harness.actor, draft.draft_id, other)
+        .expect_err("a draft is sent to one session");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
 }
 
 /// KR-REQ-14.11: an attachment belongs to one session. A prompt to another is refused and records
@@ -1190,10 +1179,9 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
         )
         .expect("binds the attachment");
 
-    let action = kr_ipc::new_uuid();
     let refusal = harness
         .service
-        .record_prompt(&harness.actor, action, draft.draft_id, other)
+        .record_prompt(&harness.actor, draft.draft_id, other)
         .expect_err("another session's prompt is refused");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
     assert!(
@@ -1204,11 +1192,11 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
             .submitted
     );
 
-    // The refusal wrote nothing, not even the action's record: the same action goes to the owner.
+    // The refusal wrote nothing, not even the draft's record: the draft goes to the owner.
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, action, draft.draft_id, owner)
+            .record_prompt(&harness.actor, draft.draft_id, owner)
             .expect("the owner's prompt is recorded"),
         1
     );
@@ -1278,12 +1266,7 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
         .expect("binds the attachment");
     harness
         .service
-        .record_prompt(
-            &harness.actor,
-            kr_ipc::new_uuid(),
-            draft.draft_id,
-            session_id,
-        )
+        .record_prompt(&harness.actor, draft.draft_id, session_id)
         .expect("records the submission");
 
     // One hour later, long before seven days, the session's retention ends.

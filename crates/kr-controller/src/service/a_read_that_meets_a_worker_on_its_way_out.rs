@@ -89,10 +89,6 @@ pub(super) struct Scripted {
     accepts_prompts: AtomicBool,
     /// Where it holds the next prompt submission it is forwarded, once a test has set one.
     holding_a_prompt: std::sync::Mutex<Option<End>>,
-    /// Whether it answers the prompt submissions it is forwarded from what it kept, as it does an
-    /// action it has already taken, while its answer to a read of that action's receipt is a
-    /// refusal.
-    answers_prompts_as_kept: AtomicBool,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -127,13 +123,7 @@ impl Scripted {
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
             accepts_prompts: AtomicBool::new(false),
             holding_a_prompt: std::sync::Mutex::new(None),
-            answers_prompts_as_kept: AtomicBool::new(false),
         })
-    }
-
-    /// Has this worker answer the prompt submissions it is forwarded from what it kept.
-    pub(super) fn answers_prompts_as_kept(&self) {
-        self.answers_prompts_as_kept.store(true, Ordering::Release);
     }
 
     /// Has this worker hold the next prompt submission it is forwarded, before it answers. The
@@ -590,18 +580,7 @@ fn serve_scripted(
                                     upstream_request_id: Nullable::null(),
                                     turn_id: Nullable::null(),
                                 };
-                                let answer = respond(forwarded.mutation.request_id, &accepted);
-                                vec![match answer {
-                                    ControlFrame::Response(response)
-                                        if proxy
-                                            && script
-                                                .answers_prompts_as_kept
-                                                .load(Ordering::Acquire) =>
-                                    {
-                                        ControlFrame::RetainedResponse(Box::new(response))
-                                    }
-                                    other => other,
-                                }]
+                                vec![respond(forwarded.mutation.request_id, &accepted)]
                             } else if forwarded.mutation.method != Method::SessionClose.into() {
                                 // Any other action is answered from the receipt this worker keeps
                                 // for it, when it keeps one, and refused otherwise.
