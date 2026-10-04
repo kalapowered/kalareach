@@ -181,6 +181,12 @@
   margin-bottom: 4px;
 }
 
+/* The host's own words can be one long word: they break where their column ends. */
+.session-row h3,
+.session-row .session-activity {
+  overflow-wrap: anywhere;
+}
+
 .session-row p {
   font-size: 0.625rem;
   color: var(--muted);
