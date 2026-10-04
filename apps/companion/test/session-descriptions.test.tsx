@@ -191,7 +191,123 @@ describe("the desktop session list shows each session's description", () => {
     await waitFor(() => {
       expect(within(row).getByRole('heading', { level: 3 })).toHaveTextContent('KalaReach pairing')
     })
-    expect(controls.described.length, 'every session, once, in the first round').toBeGreaterThanOrEqual(11)
+    await waitFor(() => {
+      expect(controls.described.length, 'every session, in the first round').toBe(11)
+    })
+    expect(controls.described.length).toBe(new Set(controls.described).size)
+  })
+
+  // One read the host never answers holds back its own row and no other: the rounds go on, and a
+  // line that has aged beside it is shown as aged.
+  it('goes on reading the other rows when the host never answers one', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { port, controls } = describedHost()
+    const held = controls.hold('sessionDescribe')
+    open(port, { view: 'sessions' })
+    await waitFor(() => {
+      expect(held.count).toBe(3)
+    })
+    // The first session's read is never answered; the other two are.
+    held.answer(1)
+    held.answer(2)
+    controls.describe(SESSION_BUILD, {
+      title: 'Web release',
+      source: 'generated',
+      activity_text: 'Runs the website checks',
+      freshness: 'stale'
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000)
+    })
+    await waitFor(() => {
+      expect(held.count, 'the next round asked about the two that answered, and not the third').toBe(5)
+    })
+    held.answer(3)
+    held.answer(4)
+    await waitFor(() => {
+      expect(
+        within(screen.getByTestId('session-row-2')).getByTestId('description-freshness')
+      ).toHaveTextContent('Out of date')
+    })
+
+    // And the round after that one, with the first read still unanswered.
+    controls.describe(SESSION_BUILD, { freshness: 'delayed' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000)
+    })
+    await waitFor(() => {
+      expect(held.count, 'a third round, with the first session still unanswered').toBe(7)
+    })
+    held.answer(5)
+    held.answer(6)
+    await waitFor(() => {
+      expect(
+        within(screen.getByTestId('session-row-2')).getByTestId('description-freshness')
+      ).toHaveTextContent('A newer description is waiting')
+    })
+  })
+
+  // A page that is hidden, as a minimised window is, starts no read, and the reads that were
+  // waiting start when it is shown again.
+  it('starts no read while the page is hidden and the waiting ones when it is shown', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get')
+    visibility.mockReturnValue('visible')
+    const { port, controls } = describedHost()
+    controls.addSessions(8)
+    const held = controls.hold('sessionDescribe')
+    open(port, { view: 'sessions' })
+    await waitFor(() => {
+      expect(held.count).toBe(4)
+    })
+    visibility.mockReturnValue('hidden')
+    held.release()
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50)
+      })
+    })
+    expect(controls.described.length, 'no read begun while hidden').toBe(4)
+
+    visibility.mockReturnValue('visible')
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    // Shown again, the rows that were waiting are read, and the rows already read are read again,
+    // as a page shown again reads what may have changed while it was away.
+    await waitFor(() => {
+      expect(new Set(controls.described).size).toBe(11)
+    })
+    visibility.mockRestore()
+  })
+
+  // A search keeps the row a person is on, even when a fresh answer from the host no longer matches.
+  it('keeps the row a person is on in the results of a search when the host’s words about it change', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const person = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const { port, controls } = describedHost()
+    open(port, { view: 'sessions' })
+    await waitFor(() => {
+      expect(
+        within(screen.getByTestId('session-row-1')).getByTestId('description-activity')
+      ).toBeInTheDocument()
+    })
+    await person.type(screen.getByRole('searchbox'), 'host approval')
+    const row = screen.getByTestId('session-row-1')
+    expect(screen.queryByTestId('session-row-2')).toBeNull()
+    act(() => {
+      row.focus()
+    })
+    expect(row).toHaveFocus()
+
+    controls.describe(SESSION_MAIN, { title: 'Release notes', activity_text: 'Edits the changelog' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000)
+    })
+    await waitFor(() => {
+      expect(within(row).getByRole('heading', { level: 3 })).toHaveTextContent('Release notes')
+    })
+    expect(row, 'the row stays and keeps focus').toBeInTheDocument()
+    expect(row).toHaveFocus()
   })
 
   it('finds a session by the title the host gave it', async () => {

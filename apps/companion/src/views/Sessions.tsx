@@ -110,8 +110,11 @@ export function Sessions(): ReactNode {
     list
   )
 
+  // The row a person is on stays in the results while they are on it, even if the host's words
+  // about it no longer match the search: a row that goes under their keyboard takes their place.
+  const [onRow, setOnRow] = useState<string | null>(null)
   const sessions = (list?.sessions ?? []).filter((session) => {
-    if (query.trim().length === 0) return true
+    if (query.trim().length === 0 || session.session_id === onRow) return true
     const needle = query.toLowerCase()
     const described = descriptions.get(session.session_id)
     return (
@@ -197,6 +200,12 @@ export function Sessions(): ReactNode {
               data-testid={`session-row-${session.display_number}`}
               data-session={session.session_id}
               ref={track}
+              onFocus={() => {
+                setOnRow(session.session_id)
+              }}
+              onBlur={() => {
+                setOnRow(null)
+              }}
               onClick={() => {
                 go({ view: 'session', sessionId: session.session_id, pane: 'semantic' })
               }}
