@@ -107,15 +107,24 @@ function startReads(port: HostPort): Reads {
   return { port, asked: new Set(), pending: new Set(), queue: [], running: 0, live: true, settled: [] }
 }
 
-/** Lets the callers waiting for the reads go, once none is left. */
+/**
+ * Lets the callers waiting for a round go once every session of it has been asked about. A read
+ * that has not answered does not hold the round: the sessions that did answer are read again at the
+ * next one, and the one that has not is left as it is until it does.
+ */
 function release(reads: Reads): void {
-  if (reads.pending.size > 0 && reads.live) return
+  if (reads.queue.length > 0 && reads.live) return
   for (const done of reads.settled.splice(0)) done()
 }
 
-/** Starts reads from the queue until `READS_AT_ONCE` are waiting for the host. */
+/** Whether the page is hidden, as a minimised window or a phone app in the background is. */
+function hidden(): boolean {
+  return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+}
+
+/** Starts reads from the queue until `READS_AT_ONCE` are waiting for the host, none while hidden. */
 function pump(reads: Reads, answered: (sessionId: string, answer: Described) => void): void {
-  while (reads.live && reads.running < READS_AT_ONCE) {
+  while (reads.live && !hidden() && reads.running < READS_AT_ONCE) {
     const sessionId = reads.queue.shift()
     if (sessionId === undefined) return
     reads.running += 1
@@ -160,8 +169,9 @@ function want(
  * is asked about once in a round. A round starts when the list is first shown, when `listing` is a
  * new list, and a cooldown after the last read of the one before has answered, while the page is
  * shown (`readOnCadence`), so a row follows what the host has published and says when its line has
- * aged. At most four reads wait for the host at any time, a slow answer is shown when it comes, and
- * a session whose read is still on its way is not asked about again. A read that fails leaves its
+ * aged. At most four reads wait for the host at any time, none starts while the page is hidden, a
+ * slow answer is shown when it comes, and a session whose read is still on its way is not asked
+ * about again; a read that never answers holds back only its own row. A read that fails leaves its
  * row as it was, because every row has its directory to show. A read for another host, or
  * answering after the screen has gone, changes nothing.
  */
@@ -186,19 +196,32 @@ export function useDescriptions(
   // The reads of one host, and the rounds that start them. Another host starts them over.
   useEffect(() => {
     const reads = startReads(port)
+    // A round ends when every session of it has been asked about, or after a cooldown if the host
+    // has not answered the ones it holds: one unanswered read never stops the rounds after it.
     const cadence = readOnCadence(
       () =>
         new Promise<void>((resolve) => {
+          const bound = setTimeout(done, READ_AGAIN_MS)
+          function done(): void {
+            clearTimeout(bound)
+            resolve()
+          }
           reads.asked.clear()
           want(reads, latest.current, answered)
-          reads.settled.push(resolve)
+          reads.settled.push(done)
           release(reads)
         }),
       READ_AGAIN_MS
     )
     reading.current = { reads, cadence }
     cadence.now()
+    // Reads that were waiting for the page to be shown start when it is.
+    const shown = (): void => {
+      pump(reads, answered)
+    }
+    document.addEventListener('visibilitychange', shown)
     return () => {
+      document.removeEventListener('visibilitychange', shown)
       reads.live = false
       cadence.stop()
       release(reads)
