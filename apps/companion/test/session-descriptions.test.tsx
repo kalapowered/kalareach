@@ -8,7 +8,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -358,5 +358,55 @@ describe("the phone's session list shows each session's description", () => {
       'Checks the code-entry flow and host approval screen'
     )
     expect(screen.getByTestId('description-freshness')).toHaveTextContent('Out of date')
+  })
+})
+
+// KR-REQ-13.10: the session's own screen names it as the list does.
+describe("the session's header names the session as the list does", () => {
+  it("shows the generated title with its label, and the pinned name with its own", async () => {
+    const { port } = describedHost()
+    open(port, { view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const header = await screen.findByRole('heading', { level: 1 })
+    await waitFor(() => {
+      expect(header).toHaveTextContent('KalaReach pairing')
+    })
+    expect(within(header).getByTestId('description-source')).toHaveTextContent('Generated')
+    cleanup()
+
+    open(port, { view: 'session', sessionId: SESSION_OFFLINE, pane: 'semantic' })
+    const pinned = await screen.findByRole('heading', { level: 1 })
+    await waitFor(() => {
+      expect(pinned).toHaveTextContent('Release 1.0')
+    })
+    expect(within(pinned).getByTestId('description-source')).toHaveTextContent('Pinned')
+  })
+
+  it("shows the directory until the host has answered, and for a session the host only knows by its metadata", async () => {
+    const { port, controls } = describedHost()
+    const held = controls.hold('sessionDescribe')
+    open(port, { view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const header = await screen.findByRole('heading', { level: 1 })
+    await waitFor(() => {
+      expect(header).toHaveTextContent('kalareach')
+    })
+    expect(within(header).queryByTestId('description-source')).toBeNull()
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    await waitFor(() => {
+      expect(header).toHaveTextContent('KalaReach pairing')
+    })
+    cleanup()
+
+    // The title the host made from the session's metadata carries no label.
+    open(port, { view: 'session', sessionId: SESSION_BUILD, pane: 'semantic' })
+    const metadata = await screen.findByRole('heading', { level: 1 })
+    await waitFor(() => {
+      expect(metadata).toHaveTextContent('kalareach-web')
+    })
+    expect(within(metadata).queryByTestId('description-source')).toBeNull()
   })
 })

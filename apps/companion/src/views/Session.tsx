@@ -30,6 +30,7 @@ import { RetainedOutput } from './Output'
 import { Sharing } from './Sharing'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
+import { shownTitle, sourceLabel, useDescriptions } from '../model/describe'
 import { describeApplicationState, sessionDescription } from './Sessions'
 
 /** What the view has read of one session. */
@@ -196,6 +197,10 @@ export function Session({
 
   const summary = session?.session
   const state = summary ? describeApplicationState(summary) : null
+  // The header names the session as the list does: by what the host says it is, and by its
+  // directory until the host has said.
+  const described = useDescriptions(port, [sessionId], sessionId).get(sessionId)
+  const label = sourceLabel(described)
   // What every mutation about this session names. The epoch comes from the host's own record of
   // the session, beside its identifier, so an action can never be aimed at a session that has been
   // replaced since the person looked at it.
@@ -240,7 +245,17 @@ export function Session({
             Session {summary?.display_number ?? ''}
             {state ? ` · ${state.label}` : ''}
           </p>
-          <h1>{summary ? sessionDescription(summary) : 'Session'}</h1>
+          <h1>
+            {summary ? shownTitle(sessionDescription(summary), described) : 'Session'}
+            {summary && label ? (
+              <>
+                {' '}
+                <Badge tone="neutral" data-testid="description-source">
+                  {label}
+                </Badge>
+              </>
+            ) : null}
+          </h1>
           <p className="session-meta mono">{summary?.cwd ?? ''}</p>
           {summary?.shell_mode === 'native_compat' ? (
             // A stock shell is labelled wherever the session is shown, with what that means here.
