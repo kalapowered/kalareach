@@ -1098,7 +1098,7 @@ impl Engine {
                     self.measure_now = true;
                     self.modes.full_reset();
                     self.titles = TitleState::new();
-                    self.palette = Palette::new(self.palette.source());
+                    self.palette.reset_all();
                     self.cursor_style = 1;
                     self.title_revision = self.next_revision();
                     self.palette_revision = self.next_revision();

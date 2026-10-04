@@ -455,6 +455,44 @@ fn a_dynamic_colour_list_sets_each_colour_in_turn() {
     );
 }
 
+/// KR-REQ-08.30: a reset puts a dynamic colour back to what the session started with. When that
+/// was a client's own palette, the reset returns to the palette the client shared and not to the
+/// profile's preset, and so does a full reset.
+#[test]
+fn a_colour_reset_returns_to_the_palette_the_session_adopted() {
+    let mut engine = engine();
+    engine.adopt_palette(kr_term::palette::Palette::from_client_preference(
+        kr_term::palette::Rgb::new(1, 2, 3),
+        kr_term::palette::Rgb::new(4, 5, 6),
+    ));
+    let adopted_foreground = || b"\x1b]10;rgb:0101/0202/0303\x1b\\".to_vec();
+    let adopted_background = || b"\x1b]11;rgb:0404/0505/0606\x1b\\".to_vec();
+
+    // An application changes both colours, then resets them one at a time.
+    engine.feed(b"\x1b]10;#aabbcc\x1b\\\x1b]11;#ddeeff\x1b\\", 0);
+    engine.feed(b"\x1b]110\x1b\\\x1b]111\x1b\\", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b]10;?\x1b\\", 0),
+        [adopted_foreground()]
+    );
+    assert_eq!(
+        replies(&mut engine, b"\x1b]11;?\x1b\\", 0),
+        [adopted_background()]
+    );
+
+    // A full reset undoes an application's changes to the colours as well.
+    engine.feed(b"\x1b]10;#aabbcc\x1b\\\x1b]4;1;#112233\x1b\\\x1bc", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b]10;?\x1b\\", 0),
+        [adopted_foreground()]
+    );
+    assert_eq!(
+        replies(&mut engine, b"\x1b]4;1;?\x1b\\", 0),
+        [b"\x1b]4;1;rgb:cdcd/0000/0000\x1b\\".to_vec()],
+        "and the indexed colours are the profile's"
+    );
+}
+
 /// A cursor report under origin mode is relative to the margins.
 #[test]
 fn a_cursor_report_honours_origin_mode() {
