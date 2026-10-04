@@ -94,6 +94,13 @@ jobs:
         shell: bash
         run: bash scripts/check-release-sums.sh self-test
 
+      # The check the release job holds its finished archive to, for the executables an installed
+      # host cannot do without, is put through archives that each lack one of them.
+      - name: Drive the archive check with archives made to fail
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\check-windows-archive.ps1" -SelfTest
+          exit $LASTEXITCODE
+
   release:
     name: build, sign and publish
     needs: gate
@@ -150,8 +157,8 @@ jobs:
       # version the archive carries and the commit it came from; a tag that names either of them
       # wrongly stops the run here rather than producing an archive nobody can place.
       #
-      # This is also where the executables this release carries are settled. The five below are
-      # built one step each, and the workspace is asked what binaries those four crates declare: a
+      # This is also where the executables this release carries are settled. The seven below are
+      # built one step each, and the workspace is asked what binaries those six crates declare: a
       # binary added to one of them fails this step by name until it is built and staged too, rather
       # than being left out of the release quietly. Two binaries those crates declare are not part of
       # a release and are named here as such: the stub the description tests start in place of the
@@ -174,19 +181,19 @@ jobs:
           $notShipped = @('kr-stub-inference', 'kr-describe-bench')
           $declared = @(
             $metadata.packages |
-              Where-Object { $_.name -in @('kr-cli', 'kr-worker', 'kr-controller', 'kr-describe-model') } |
+              Where-Object { $_.name -in @('kr-cli', 'kr-worker', 'kr-controller', 'kr-describe-model', 'kr-hook', 'kr-plugin-host') } |
               ForEach-Object { $_.targets } |
               Where-Object { $_.kind -contains 'bin' } |
               ForEach-Object { $_.name } |
               Where-Object { $_ -notin $notShipped } |
               Sort-Object
           )
-          $built = @('kr', 'kr-attach-guard', 'kr-controller', 'kr-describe-inference', 'kr-worker')
+          $built = @('kr', 'kr-attach-guard', 'kr-controller', 'kr-describe-inference', 'kr-hook', 'kr-plugin-host', 'kr-worker')
           if (($declared -join ',') -ne ($built -join ',')) {
             throw (
               "The crates this release builds declare [$($declared -join ', ')] and this workflow " +
               "builds [$($built -join ', ')]. Add the missing binary to the build, the build-log " +
-              'check and the staging steps, or remove the one that is gone.'
+              'check, the staging steps and the archive check, or remove the one that is gone.'
             )
           }
 
@@ -251,18 +258,32 @@ jobs:
           mkdir -p "$logs"
           cargo build --locked --release -p kr-describe-model --bin kr-describe-inference 2>&1 | tee "$logs/kr-describe-inference.log"
 
+      - name: Build the forwarder
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-hook --bin kr-hook 2>&1 | tee "$logs/kr-hook.log"
+
+      - name: Build the plugin host
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-plugin-host --bin kr-plugin-host 2>&1 | tee "$logs/kr-plugin-host.log"
+
       # `LNK4098` is the linker saying that objects in one link ask for two different C runtimes.
       # The C library this workspace vendors was built against the static runtime and Rust links the
       # dynamic one, and `.cargo/config.toml` leaves the static one out of the link. Without that
       # flag the static runtime can be pulled into the image beside the dynamic one, which gives two
       # heaps and two copies of the runtime's state, and any other source of the warning wants a
-      # look too. This reads what the five builds printed and stops the run before anything is
+      # look too. This reads what the seven builds printed and stops the run before anything is
       # staged, let alone signed. A log it cannot read stops the run as well.
       - name: Refuse a build whose link reported conflicting C runtimes
         shell: bash
         run: |
           logs="$(cygpath -u "$RUNNER_TEMP")/build"
-          for name in kr kr-attach-guard kr-worker kr-controller kr-describe-inference; do
+          for name in kr kr-attach-guard kr-worker kr-controller kr-describe-inference kr-hook kr-plugin-host; do
             if [ ! -s "$logs/$name.log" ]; then
               echo "::error::The log of the $name build is not there, so its link cannot be read."
               exit 1
@@ -317,7 +338,7 @@ jobs:
           }
 
           $target = Join-Path $env:GITHUB_WORKSPACE 'target\release'
-          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe')) {
+          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe', 'kr-hook.exe', 'kr-plugin-host.exe')) {
             Copy-Into -Root $staging -Relative $executable -From (Join-Path $target $executable)
           }
 
@@ -340,14 +361,14 @@ jobs:
             ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($data.Length).TrimStart('\')) }
 
       # Each executable in the layout the archive will carry is started once, from where it is
-      # staged, and asked its version. The description process is found beside the worker, so an
-      # archive whose layout lost it, or whose build cannot start here, stops this run before
-      # anything is signed.
+      # staged, and asked its version. The description process and the forwarder are found beside
+      # the worker, so an archive whose layout lost either of them, or whose build cannot start
+      # here, stops this run before anything is signed.
       - name: Start each staged executable
         run: |
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:RUNNER_TEMP 'staging'
-          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe')) {
+          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe', 'kr-hook.exe', 'kr-plugin-host.exe')) {
             $path = Join-Path $staging $executable
             $said = & $path --version
             if ($LASTEXITCODE -ne 0) {
@@ -545,6 +566,20 @@ jobs:
 
           Write-Host "$signed signed artefacts and $($unsigned.Count) data files in $(Split-Path -Leaf $archive)"
           "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # What the archive holds is checked against what an installed host cannot do without, as well
+      # as against what was packed: the step above holds the archive to its own inventory, which a
+      # build that left an executable out would still match. Each of the seven executables has to be
+      # a file at the archive's top level, so an archive without one of them, the forwarder and the
+      # plugin host among them, goes no further than this.
+      - name: Refuse an archive that lacks a host executable
+        env:
+          KR_ARCHIVE: ${{ steps.release.outputs.archive }}
+          KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\check-windows-archive.ps1" `
+            -Archive (Join-Path $env:KR_RELEASE_DIR ($env:KR_ARCHIVE + '.zip'))
+          exit $LASTEXITCODE
 
       # The two records people check a download with, held to what their checkers read before
       # anything can upload them: SHA256SUMS beside the archive, and signatures.txt inside it. The
