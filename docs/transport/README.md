@@ -736,6 +736,7 @@ makes no call and serves its local endpoint alone.
 | --- | --- |
 | `PairedDirectory` | `net::devices`, a durable table of device records keyed by endpoint identity. Revocation is a state of the record, not its absence, so a host can say a device *was* paired |
 | `principal_for` | the device principal derived from the identity the host assigned at pairing, so `(actor_id, action_id)` names one device's action |
+| `authority_revision` | the revision the lease issuer holds, read before the host's handshake exchange begins and compared with the revision in force when the connection is registered |
 | `pairing_surface` | `net::pairing`, over `kr-pairing`'s own state machines. Every host on the network offers it: a host with no owner yet serves exactly the first-owner ceremony, and every confirmation is checked against the owner devices the host has paired |
 | `serve` | `net::dispatch`, one authorised connection at a time |
 | `control_stream_lost` | the connection's registration is withdrawn, which is what stops its lease being renewed |
@@ -746,7 +747,9 @@ table, the order a revocation takes. The store is the same one its local callers
 so a revocation fences both ingresses through one table, and every read, every subscription batch
 and every dispatch checks it. Revoking a device writes the record's revocation and advances the
 authority revision inside that one critical section too, so no connection can be admitted between
-the record being withdrawn and the revision that fences the live ones.
+the record being withdrawn and the revision that fences the live ones. A connection whose handshake
+began under an older revision than the one in force is refused at registration, because a revocation
+recorded in between found no registration of it to withdraw.
 
 **Work that must complete.** A mutation's effect runs on its own task, and the release of what a
 connection owned at its worker runs on another, after the handler has been dropped.

@@ -20,7 +20,7 @@ use kr_crypto::connect::ChallengeLedger;
 use kr_crypto::keys::TransportIdentityKeyPair;
 use kr_protocol::envelope::{ControlEvent, ControlFrame};
 use kr_protocol::hello::{ActionWindow, ClientOffer, HostSelection};
-use kr_protocol::ids::{ActorId, ConnectionId, ControllerGeneration, DeviceId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, ControllerGeneration, DeviceId};
 use kr_protocol::scalars::{Digest256, EndpointKey, to_base64url};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -196,6 +196,17 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
     /// no outstanding invitation does.
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>>;
 
+    /// Returns the authority revision this host holds now.
+    ///
+    /// The listener reads it once a connection's QUIC handshake is done and before the host's own
+    /// handshake begins, so before the peer can have been told it is accepted, and hands it to
+    /// [`Self::serve`] as
+    /// [`AuthorisedSession::authorised_under`]. A host registers a connection only once it is
+    /// served, after the handshake has finished, and a withdrawal of authority can land in
+    /// between and find no registration to take away. The revision read here is what lets the host
+    /// see that the connection was authorised before that withdrawal.
+    fn authority_revision(&self) -> AuthorityRevision;
+
     /// Serves one authorised connection until it ends.
     ///
     /// The listener has already proved both authorisation keys, allocated the connection identity,
@@ -348,6 +359,10 @@ pub struct AuthorisedSession {
     pub action_window: ActionWindow,
     /// The host's continuous clock.
     pub clock: Arc<dyn ContinuousClock>,
+    /// The authority revision the host held before this connection was authorised
+    /// ([`HostHandler::authority_revision`]), and so the latest one its authorisation can have been
+    /// decided under.
+    pub authorised_under: AuthorityRevision,
 }
 
 /// A running listener.
@@ -545,7 +560,7 @@ async fn serve_connection<H: HostHandler>(
             ));
         }
     };
-    let (connection, admitted) = admitted;
+    let (connection, admitted, authorised_under) = admitted;
 
     match admitted {
         Admitted::Unpaired(mut unpaired) => {
@@ -577,16 +592,20 @@ async fn serve_connection<H: HostHandler>(
             // An authorised connection is no longer unauthorised traffic, so it releases the
             // admission slot it held; its own limits govern it from here.
             drop(slot);
-            serve_authorised(state, connection, authorised).await
+            serve_authorised(state, connection, authorised, authorised_under).await
         }
     }
 }
 
 /// Completes the QUIC handshake and the KalaReach one, under the caller's deadline.
+///
+/// The authority revision comes back beside the connection: it is the host's revision read once
+/// the QUIC handshake is done and before the peer's offer is read, so the peer cannot have been
+/// told it is accepted under a revision newer than this ([`HostHandler::authority_revision`]).
 async fn admit<H: HostHandler>(
     state: &AcceptLoop<H>,
     connecting: iroh::endpoint::Accepting,
-) -> Result<(Connection, Admitted)> {
+) -> Result<(Connection, Admitted, AuthorityRevision)> {
     // The first bidirectional stream is accepted from the 0-RTT connection, because QUIC marks a
     // stream as early data only when it is accepted while the handshake is still running. Nothing
     // is *read* from it here: the read happens after `handshake_completed`, so no frame is ever
@@ -603,6 +622,7 @@ async fn admit<H: HostHandler>(
         .await
         .map_err(|error| TransportError::Connect(error.to_string()))?;
 
+    let authorised_under = state.handler.authority_revision();
     let admitted = crate::handshake::accept_on(
         &connection,
         send,
@@ -615,13 +635,14 @@ async fn admit<H: HostHandler>(
         &state.windows,
     )
     .await?;
-    Ok((connection, admitted))
+    Ok((connection, admitted, authorised_under))
 }
 
 async fn serve_authorised<H: HostHandler>(
     state: AcceptLoop<H>,
     connection: Connection,
     authorised: Box<crate::handshake::AuthorisedConnection>,
+    authorised_under: AuthorityRevision,
 ) -> Result<()> {
     let connection_id = authorised.connection_id;
     let hook: Arc<dyn RevocationHook> = Arc::new(HandlerHook {
@@ -703,6 +724,7 @@ async fn serve_authorised<H: HostHandler>(
         windows: Arc::clone(&state.windows),
         action_window: authorised.action_window,
         clock: Arc::clone(&state.clock),
+        authorised_under,
     };
     // The handler is raced against the control stream and against the connection. Whichever ends
     // first ends the session: a control stream that failed, or whose peer closed its send
