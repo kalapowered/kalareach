@@ -414,6 +414,8 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
         "Test-KalaReachCommand -Origin Runspace -Name @(1,2)",
         "Test-KalaReachCommand -Origin Runspace -Name $null",
         "Test-KalaReachCommand -Origin Runspace -Name (Get-Date)",
+        // A name of the wrong kind that PowerShell would join into the right one.
+        "Test-KalaReachCommand -Origin Runspace -Name @('Test-KalaReachCommand')",
     ] {
         let before = session.written();
         assert!(session.run(line, "False"), "{line}");
@@ -425,15 +427,20 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
             "{line} failed"
         );
     }
-    // Asking about a command with arguments that are not text is an answer of nothing, and the
-    // line still ends: the one command of the line is `Resolve-KalaReachCommand` itself, so it is
-    // the line the entry point speaks for, and it answers nothing for every wrong kind.
+    // Asking about a command with arguments that are not text is an answer of nothing and sends
+    // no question, and the line still ends. The one command of the line is
+    // `Resolve-KalaReachCommand` itself, so it is the line the entry point speaks for. The first
+    // line has a usable executable and arguments that are not text, which PowerShell would join
+    // into words; the second has text arguments and an executable that is not text.
+    let executable = told(&probes.probe());
     for line in [
-        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @(1,@{}) -Executable 5",
-        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments $null -Executable $null",
+        format!("Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @(1,@{{}}) -Executable '{executable}'"),
+        format!("Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @('a') -Executable 5"),
+        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments $null -Executable $null".to_owned(),
     ] {
         let before = session.written();
-        session.type_line(line);
+        let asked = session.commands.resolves.len();
+        session.type_line(&line);
         assert!(session.answered("kr-after-the-wrong-resolve"), "{line}");
         assert!(
             !session
@@ -441,6 +448,11 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
                 .to_lowercase()
                 .contains("exception"),
             "{line} failed"
+        );
+        assert_eq!(
+            session.commands.resolves.len(),
+            asked,
+            "{line} sent a question"
         );
     }
     assert!(session.answered("kr-after-the-wrong-kinds"));
