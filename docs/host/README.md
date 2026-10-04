@@ -3318,9 +3318,9 @@ what it removes is exactly the thing a person cannot check for themselves.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps.
-* **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident
-  window; the projection's own history is not reached, because removing rows from it while keeping
-  the live screen needs an interface the task that owns the projection has to provide.
+* **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident window;
+  the projection's own history is not reached, because removing rows from it while keeping the live
+  screen needs an interface the projection does not have.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
 * **Content that settles is taken in a second step.** An action admitted under privacy mode has
