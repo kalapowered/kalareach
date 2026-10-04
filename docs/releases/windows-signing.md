@@ -61,10 +61,24 @@ The archive also carries `LICENSE`, the package manifest `shells/psreadline/mani
 SignTool. The archive itself (`.zip`), the gate receipt (`signatures.txt`), and the checksum file
 (`SHA256SUMS`) are likewise unsigned data files.
 
-The workflow builds the four explicit `--bin` targets with the MSVC toolchain, verifies against
-workspace package metadata that the built list matches what the three crates declare, and copies each
-executable by exact name from `target\release` into staging, rather than sweeping up whatever the
-directory holds. This prevents obsolete cached binaries from entering the archive.
+The workflow builds all five executables that will be included in the release, one `--bin` target
+each, using the MSVC toolchain. The names and crates that contain them are: `kr` (in `kr-cli`),
+`kr-attach-guard` (in `kr-cli`), `kr-worker` (in `kr-worker`), `kr-controller` (in `kr-controller`),
+and `kr-describe-inference` (in `kr-describe-model`). It checks against the workspace's package
+metadata that these are all the binaries those four crates declare, except the stub the description
+tests start in place of the model and the benchmark that measures the model against real weights,
+which no release carries. The executables are copied by exact name from the `target\release`
+directory to a staging directory. Doing it by name is important so that the workflow does not simply
+copy everything in the release directory, which might include old binaries from a previous run that
+were cached.
+
+The prebuilt version of libsodium that this workspace uses is built to use the static C runtime, but
+the Rust MSVC targets use the dynamic C runtime. Including both in a single executable leads to
+issues with having two different heap implementations, and the linker reports `LNK4098`. The
+workspace's `.cargo/config.toml` excludes the static C runtime from linking. The release job sets no
+`RUSTFLAGS`, since that variable would replace the flags that exclude the static C runtime. After
+the five builds, the job reads their logs and stops if any link reported `LNK4098`, before anything
+is staged or signed.
 
 The archive holds a `signatures.txt` written by the verification step, not by the build. It records
 one line per artefact: the SHA-256 of the bytes that were verified, the certificate that signed
