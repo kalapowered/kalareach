@@ -1324,6 +1324,31 @@ fn a_wide_cell_is_reserved_for_the_columns_it_covers() {
     );
 }
 
+/// KR-REQ-08.79: a wide character written in the last column overhangs the margin, so its row
+/// holds one cell more than the geometry has columns. The reservation covers that cell, on every
+/// row of both buffers.
+#[test]
+fn a_wide_cell_overhanging_the_margin_is_reserved_for() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(4, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // The pen is as expensive as a pen gets, so a cell carries everything it can. Every row of
+    // each buffer ends in a two-cell character that starts in the last column.
+    let row = "\x1b[38;2;10;20;30;48;2;40;50;60;4:3m\x1b]8;id=x;https://example.invalid/\x1b\\abc\u{754c}\x1b[0m";
+    for _ in 0..2 {
+        engine.feed(format!("\x1b[H{row}\x1b[2;1H{row}").as_bytes(), 0);
+        engine.feed(b"\x1b[?1049h", 0);
+    }
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the rows hold more than the geometry reserved for them"
+    );
+}
+
 /// A cell that keeps an allocation of its own for its attributes costs more than one that does
 /// not, so a screen of coloured cells is not charged as a screen of plain ones.
 #[test]
@@ -1622,7 +1647,7 @@ fn a_link_is_never_admitted_past_the_envelope() {
 
     // Wide enough that every link's cell stays on the screen, so no object is given up.
     let mut engine = Engine::new(EngineConfig {
-        size: GridSize::new(647, 96),
+        size: GridSize::new(640, 96),
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
