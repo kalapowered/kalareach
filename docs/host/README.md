@@ -1323,7 +1323,7 @@ Two machines run them and they run different things.
 
 **The GitHub-hosted runner** (`windows-2025`, the `windows` job in `.github/workflows/core-ci.yml`)
 compiles the whole workspace and its tests with `-D warnings` and then runs what has been qualified
-on this platform, one command per step:
+on this platform, one command per step, among them:
 
 ```
 cargo test --locked -p kr-term -p kr-project -p kr-cli
@@ -1379,12 +1379,15 @@ cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-p
 Every command in that list needs the developer environment for the target loaded first, which
 `vcvarsall.bat x64` or `vcvarsall.bat x64_arm64` does.
 
-`cargo test -p kr-worker` on its own, with every suite, does not pass here yet; what each suite hits
-is recorded where this branch's work was handed over. Nothing has to be set for the link:
-`.cargo/config.toml` carries what the MSVC targets need, which is to leave the static C runtime out
-of the image and to stop the linker reporting the vendored C library's missing debug database once
-per object file. Setting `RUSTFLAGS` in the environment replaces those flags rather than adding to
-them, so a Windows build is run without it.
+The runner runs the worker's suites one at a time (its library, and the `windows`,
+`windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
+`windows_inheritance`, `command_backends`, `question_bindings`, `questions_answer`, `authority`,
+`persistence` and `host` suites) and does not run `cargo test -p kr-worker` with every suite,
+because the worker's other integration suites are the ones described above as compiled and not run.
+Nothing has to be set for the link: `.cargo/config.toml` carries what the MSVC targets need, which
+is to leave the static C runtime out of the image and to stop the linker reporting the vendored C
+library's missing debug database once per object file. Setting `RUSTFLAGS` in the environment
+replaces those flags rather than adding to them, so a Windows build is run without it.
 
 `cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
 PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains
