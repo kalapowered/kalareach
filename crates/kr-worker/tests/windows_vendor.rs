@@ -391,9 +391,9 @@ fn vendor_stand_in() {
 /// the user interface, nests under the session's job. The agent launches, the process inside the
 /// sandbox is held by the session's job and by the agent's, a try at breaking away is refused, and
 /// the closure ends every process the vendor made and reads its ownership coverage as complete.
-#[test]
-fn kr_req_07_64_a_sandbox_that_nests_under_the_session_job_launches_and_the_closure_ends_all_of_it()
-{
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_sandbox_that_nests_under_the_session_job_launches_and_the_closure_ends_all_of_it()
+ {
     let session = Arc::new(SessionJob::create().expect("a session job"));
     let launch = Launch::start(1, AgentOwnership::Full, &session).expect("the agent launches");
     let report = launch.report();
@@ -454,8 +454,8 @@ fn kr_req_07_64_a_sandbox_that_nests_under_the_session_job_launches_and_the_clos
 /// KR-REQ-07.64: where the session's job restricts desktops, which a vendor's own sandbox cannot
 /// run under, the full launch is refused by name before anything starts, and nothing of the
 /// vendor's sandbox is touched to make it start.
-#[test]
-fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_by_name_and_starts_nothing()
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_by_name_and_starts_nothing()
  {
     let session = Arc::new(SessionJob::create_restricting(DESKTOP).expect("a restricted job"));
     assert_ne!(
@@ -493,8 +493,8 @@ fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_by_name
 /// ownership, starts the agent in a job of its own alone. Its processes are listed by start
 /// identity and the vendor's own job nests under that one, breakaway is still refused, and the
 /// closure ends all of it, reading the coverage as incomplete with the reason in the receipt.
-#[test]
-fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_its_own_and_never_reads_complete()
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_its_own_and_never_reads_complete()
  {
     let session = Arc::new(SessionJob::create_restricting(DESKTOP).expect("a restricted job"));
     let launch = Launch::start(3, AgentOwnership::Reduced, &session)
@@ -575,8 +575,8 @@ fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_its_own_
 /// KR-REQ-07.64: an agent under reduced ownership is in a job nothing but this worker holds, so a
 /// worker that dies, and lets go of every handle to it, takes the agent and everything the vendor
 /// made down with it.
-#[test]
-fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_with_it() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_with_it() {
     let session = Arc::new(SessionJob::create().expect("a session job"));
     let launch = Launch::start(4, AgentOwnership::Reduced, &session)
         .expect("the selected profile starts the agent");
@@ -704,9 +704,9 @@ fn start_native_codex(
 /// KR-REQ-07.64, against the real Codex: its sandbox runs the command as a restricted-token child
 /// of its own under the session's job, the launch succeeds, and the closure ends every process the
 /// vendor made. Run with `KR_NATIVE_CODEX` naming the pinned `codex.exe`.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs the pinned Codex build: set KR_NATIVE_CODEX to its codex.exe"]
-fn native_codex_nests_under_the_session_job_and_the_closure_ends_everything_it_made() {
+async fn native_codex_nests_under_the_session_job_and_the_closure_ends_everything_it_made() {
     let codex = native_codex().expect("KR_NATIVE_CODEX names the pinned codex.exe");
     let session = Arc::new(SessionJob::create().expect("a session job"));
     let launch = start_native_codex(11, AgentOwnership::Full, &session, &codex)
@@ -747,9 +747,9 @@ fn native_codex_nests_under_the_session_job_and_the_closure_ends_everything_it_m
 /// launch is a named failure that starts nothing, and the explicitly selected reduced profile
 /// starts Codex in a job of its own, its sandbox runs the command, the closure ends all of it and
 /// the coverage reads incomplete. Run with `KR_NATIVE_CODEX` naming the pinned `codex.exe`.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs the pinned Codex build: set KR_NATIVE_CODEX to its codex.exe"]
-fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_runs_reduced() {
+async fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_runs_reduced() {
     let codex = native_codex().expect("KR_NATIVE_CODEX names the pinned codex.exe");
     let session = Arc::new(SessionJob::create_restricting(DESKTOP).expect("a restricted job"));
     let refused = start_native_codex(12, AgentOwnership::Full, &session, &codex)
