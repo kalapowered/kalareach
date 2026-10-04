@@ -861,7 +861,9 @@ fn a_counter_that_is_not_steady_still_finds_the_run_that_fits() {
     let written = &full.as_bytes()[..full.find("flow").expect("a word") + 2];
     let unsteady = |text: &str| -> usize {
         // Only the run of 14 characters counts within the bound, as a merge of its last letters
-        // into one token would make it; the shorter and the longer runs count one over.
+        // into one token would make it; the shorter and the longer runs count one over. The
+        // shorter runs count over on purpose: a search that takes a shorter run to count less
+        // stops at the first run over the bound it meets, and never reaches the 14.
         let activity = text
             .split("\"activity_text\": \"")
             .nth(1)
