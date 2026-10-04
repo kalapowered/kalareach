@@ -481,7 +481,7 @@ force is refused and reported as refused.
 
 | Ceiling | Intersected with |
 | --- | --- |
-| `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit yet, so nothing narrows the choice and `kr doctor` says so |
+| `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit, so nothing narrows the choice and `kr doctor` says so |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
 | `disable_policy` | not an intersection but the administrator's own setting: what happens to a live binding whose release its repository revokes. `warn_only` (the default), `disable_at_next_admission` or `disable_at_once` |
 | `enrolment` | section 11's own budgets: what one repository's metadata, kept generations and cached payloads may cost, how large one package may be and how many bytes one synchronisation may transfer; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
