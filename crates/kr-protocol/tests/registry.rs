@@ -219,15 +219,15 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
-    // Section 23's table is the minimum public surface, and the entries below are the whole of
-    // what this build adds to it. Each is a managed-service method whose credential names the
-    // method it was signed for, so a surface section 17 describes and section 23's table does not
-    // list still needs an entry here: without one there is no name to sign, and a signature made
-    // for one operation would serve for another. Section 23 also requires each effect to carry its
-    // own exhaustive entry with its own effect class, so a write never travels under a read entry:
-    // the mailbox is written and acknowledged as well as read, and managed storage reads objects
-    // and its own status apart from everything it writes. Every other method is the
-    // specification's own; a further addition changes this list and is noticed here.
+    // Section 23's table is the minimum public surface. These ten entries are the managed-service
+    // methods that table does not list, and the groups below add their own. Each is a
+    // managed-service method whose credential names the method it was signed for, so a surface
+    // section 17 describes and section 23's table does not list still needs an entry here: without
+    // one there is no name to sign, and a signature made for one operation would serve for another.
+    // Section 23 also requires each effect to carry its own exhaustive entry with its own effect
+    // class, so a write never travels under a read entry: the mailbox is written and acknowledged
+    // as well as read, and managed storage reads objects and its own status apart from everything
+    // it writes. A further managed-service method changes this list and is noticed here.
     let added = [
         ("mailbox.deliver", EffectClass::Write),
         ("mailbox.acknowledge", EffectClass::Write),

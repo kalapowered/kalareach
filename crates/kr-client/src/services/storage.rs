@@ -4,12 +4,12 @@
 //! Section 17: managed uploads are bounded parts the service mediates. The declared maximum is
 //! reserved against the allowance, and one object key, one upload identity and an immutable part
 //! table are allocated, before any content is accepted. Every part is 8 MiB but the last, the
-//! service reads at most its declared length and refuses a wrong length or hash before it writes,
-//! and completion is the service's: it checks every part and the total, settles the reservation as
-//! stored bytes, and answers a completion asked for again with the result it already gave. No
-//! storage address ever reaches this client, so every byte goes through the service in both
-//! directions. [`ManagedStorageService`] is how a device or a host reaches it: the
-//! [`StorageService`] this crate carries, over [`SignedService`].
+//! service reads at most its declared length plus one byte and refuses a wrong length or hash
+//! before it writes the part's content, and completion is the service's: it checks every part and
+//! the total, settles the reservation as stored bytes, and answers a completion asked for again
+//! with the result it already gave. No storage address ever reaches this client, so every byte
+//! goes through the service in both directions. [`ManagedStorageService`] is how a device or a host
+//! reaches it: the [`StorageService`] this crate carries, over [`SignedService`].
 //!
 //! It seals nothing and opens nothing. What it uploads is ciphertext a producer made, which the
 //! service holds under a key nobody outside it knows, and what it reads back is the same bytes.
@@ -129,7 +129,7 @@ pub const MAX_STORAGE_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// the refusal a read can be answered with instead.
 pub const STORAGE_READ_ANSWER_LIMIT_BYTES: u64 = MAX_STORAGE_READ_BYTES + 64 * 1024;
 
-/// The most daily snapshots the service keeps for an archive, which is also its default.
+/// The most daily snapshots a retention may record for an archive, which is also its default.
 pub const MAX_DAILY_SNAPSHOTS: u32 = 30;
 
 /// The longest upload identity this client carries.
