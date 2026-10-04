@@ -1423,6 +1423,22 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
 
     // An empty line runs nothing and reports nothing: the next block is the next command's.
     let reported = session.commands.blocks.len();
+    if dialect(kind).types_at_the_prompt {
+        // A return that reaches this editor before it reads the terminal is taken by the terminal's
+        // own line discipline as a line feed, which the editor binds nothing to: no line is
+        // accepted and no prompt follows. The line before has finished, which says nothing of
+        // whether the editor is reading again, so this waits for that as every other line does.
+        assert!(
+            session.wait_for_prompt(),
+            "the shell drew no prompt to type the empty line at:\n{}",
+            session.terminal_output()
+        );
+        assert!(
+            session.wait_for_editor_reading(),
+            "the editor never read the terminal at the prompt of the empty line:\n{}",
+            session.terminal_output()
+        );
+    }
     session.type_line("");
     let marker_command = print_assembled(kind, "kr-after-empty");
     assert!(session.run(&marker_command, "kr-after-empty"));
