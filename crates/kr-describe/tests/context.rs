@@ -13,10 +13,15 @@ use kr_describe::context::{
     SemanticEventKind, Settled, admits,
 };
 use kr_describe::metadata::{ActivityText, RepositoryFacts, Title};
-use kr_describe::output::{DESCRIPTION_GRAMMAR, Expectation, ProducedUnder, Rejection, validate};
+use kr_describe::output::{
+    DESCRIPTION_GRAMMAR, Expectation, ProducedUnder, Rejection, end_cut_answer, validate,
+};
 use kr_describe::profile::ProfileRevision;
+use kr_describe::prompt::Prompt;
 use kr_protocol::ids::SessionEpoch;
+use kr_protocol::scalars::U64;
 use kr_worker::privacy::{PrivacyGeneration, PrivacyMode};
+use unicode_segmentation::UnicodeSegmentation;
 
 use support::{at, binding, environment_id, session};
 
@@ -613,4 +618,96 @@ fn the_grammar_admits_exactly_the_characters_validation_accepts() {
             "the grammar leaves out {codepoint:#06x}, which validation accepts"
         );
     }
+}
+
+/// A text from codepoints, for the ones a source file cannot show: a combining mark and a joiner.
+fn text_of(codepoints: &[u32]) -> String {
+    codepoints
+        .iter()
+        .map(|codepoint| char::from_u32(*codepoint).expect("a character"))
+        .collect()
+}
+
+/// KR-REQ-22.18: an answer the output bound stopped is ended where it can be, at every place it
+/// can stop. Inside the activity text it is ended on a boundary between characters a person sees
+/// of the whole text, with the prompt's own revision and cursor interval written after it, and
+/// passes validation; after the activity text it is the same with the text whole; before the
+/// activity text, so inside the title, nothing is done and validation refuses it as it does today.
+#[test]
+fn an_answer_the_output_bound_stopped_is_ended_on_a_boundary_and_still_validates() {
+    let prompt = Prompt {
+        revision: U64::new(2),
+        cursor_from: U64::new(3),
+        cursor_to: U64::new(11),
+        facts: Vec::new(),
+        events: Vec::new(),
+    };
+    // A combining mark after a letter, a family of three people joined by joiners, an Arabic
+    // sentence, and plain text.
+    let accented = text_of(&[
+        0x63, 0x61, 0x66, 0x65, 0x301, 0x20, 0x6F, 0x75, 0x76, 0x65, 0x72, 0x74,
+    ]);
+    let family = text_of(&[
+        0x68, 0x6F, 0x6D, 0x65, 0x20, 0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467, 0x20, 0x68, 0x65,
+        0x72, 0x65,
+    ]);
+    let activities = [
+        "Checks the code-entry flow and host approval screen".to_owned(),
+        accented,
+        family,
+        "مراجعة شاشة موافقة المضيف".to_owned(),
+    ];
+    let mut ended_inside = 0;
+    for activity in activities {
+        let full = format!(
+            "{{\"title\": \"kalareach\", \"activity_text\": \"{activity}\", \
+             \"source_cursor\": {{\"from\": 3, \"to\": 11}}, \"context_revision\": 2}}"
+        );
+        let quotes: Vec<usize> = full.match_indices('"').map(|(at, _)| at).collect();
+        let (opens, closes) = (quotes[6], quotes[7]);
+        let boundaries: Vec<usize> = activity
+            .grapheme_indices(true)
+            .map(|(at, _)| at)
+            .chain([activity.len()])
+            .collect();
+        for stopped_at in 0..=full.len() {
+            let written = &full.as_bytes()[..stopped_at];
+            let ended = end_cut_answer(written, &prompt);
+            let validated = validate(&ended, &produced_under(), &expectation(2));
+            if stopped_at == full.len() {
+                assert_eq!(ended, written, "a whole answer is left as it is");
+                assert!(validated.is_ok());
+            } else if stopped_at <= opens {
+                // Not into the activity text yet: the title is never cut, and nothing is done.
+                assert_eq!(ended, written, "stopped at {stopped_at}");
+                assert!(validated.is_err(), "stopped at {stopped_at}");
+            } else if stopped_at <= closes {
+                match validated {
+                    Ok(description) => {
+                        ended_inside += 1;
+                        let kept = description.activity.as_str();
+                        assert!(activity.starts_with(kept), "{kept:?} of {activity:?}");
+                        assert!(
+                            boundaries.contains(&kept.len()),
+                            "{kept:?} of {activity:?} ends inside a character"
+                        );
+                        assert!(kept.len() < activity.len() || stopped_at > closes);
+                        assert_eq!(description.cursor, CursorInterval::new(3, 11));
+                        assert_eq!(description.revision, ContextRevision::new(2));
+                    }
+                    // Nothing of the activity text was left to end it with.
+                    Err(_) => assert_eq!(ended, written, "stopped at {stopped_at}"),
+                }
+            } else {
+                // After the activity text, in the fields that repeat the prompt: the text whole.
+                let description = validated.expect("an answer stopped after its activity text");
+                assert_eq!(description.activity.as_str(), activity);
+                assert_eq!(description.cursor, CursorInterval::new(3, 11));
+            }
+        }
+    }
+    assert!(
+        ended_inside > 100,
+        "{ended_inside} cuts inside an activity text were ended"
+    );
 }

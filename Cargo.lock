@@ -4544,6 +4544,7 @@ dependencies = [
  "thiserror 2.0.20",
  "thread-priority",
  "toml_edit 0.25.15+spec-1.1.0",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -4560,6 +4561,7 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",
+ "unicode-segmentation",
  "vtparse",
 ]
 
