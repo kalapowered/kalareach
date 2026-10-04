@@ -204,6 +204,8 @@ export function useDescriptions(
           const bound = setTimeout(done, READ_AGAIN_MS)
           function done(): void {
             clearTimeout(bound)
+            const at = reads.settled.indexOf(done)
+            if (at >= 0) reads.settled.splice(at, 1)
             resolve()
           }
           reads.asked.clear()
