@@ -236,13 +236,11 @@ can still mislead a model about what a session is doing, and nothing here claims
 
 ## What fits in the prompt
 
-## What fits in the prompt
-
 The daemon sends the process the parts of the prompt: the revision and cursor interval the answer repeats, the session's facts and its recent events. The process adds the fixed instruction, counts tokens with the model's own tokenizer and makes the prompt fit its bound. It always keeps the instruction and the two provenance lines. After those it keeps parts in this order: the task intent, the directory and the repository, then the newest event, then the branch, the thread and the application, then the other events, newest first. Each is kept whole while the prompt fits. The first one that does not fit is cut to a run of its codepoints that does, and nothing after it is kept. The oldest events go first, and the same context under the same bound gives the same prompt every time.
 
 A prompt is trimmed only when its session is large. The benchmark's ordinary sessions are 180 to 250 tokens and are never trimmed. Its largest context, with every field and every event at its bound, is 708 tokens in Latin text and fits whole. The same context in Arabic text is 1,768 tokens, in Hebrew 2,152 and in emoji 5,164, and each is trimmed to 891 tokens or just under. Some scripts cost more tokens than others, so a session with long Arabic events can be trimmed where a Latin one is not.
 
-No job can be too large for a profile. Verifying a profile refuses a context window that cannot hold the instruction byte for byte, two framing tokens and the output bound, because a prompt is never more tokens than it is bytes.
+No job can be too large for a profile. Verifying a profile refuses a context window that cannot hold the instruction byte for byte, two framing tokens and the output bound, because in a byte-level vocabulary a prompt is never more tokens than it is bytes.
 
 ## What comes out
 
