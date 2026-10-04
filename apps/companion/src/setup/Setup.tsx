@@ -1013,13 +1013,16 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           model, not somewhere else. Nothing about KalaReach needs it: without it, a session is
           named by its directory.
         </p>
-        {setup === null ? (
-          <p className="faint small" data-testid="setup-model-unread" role="status">
-            {failure
-              ? `What this host offers could not be read. ${failure}`
-              : 'Reading what this host offers…'}
-          </p>
-        ) : null}
+        {/* A live region that is always on the card, so what is put in it is announced. */}
+        <div role="status">
+          {setup === null ? (
+            <p className="faint small" data-testid="setup-model-unread">
+              {failure
+                ? `What this host offers could not be read. ${failure}`
+                : 'Reading what this host offers…'}
+            </p>
+          ) : null}
+        </div>
         {setup && !setup.offered ? (
           <p className="faint small" data-testid="setup-model-unavailable">
             This host offers no model. {setup.unavailable ?? 'It gave no reason.'}
