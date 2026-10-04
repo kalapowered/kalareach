@@ -217,6 +217,27 @@ test.describe('the first-start assistant', () => {
     await capture(page, 'setup-host-03.28')
   })
 
+  // KR-REQ-22.01, KR-REQ-13.19: the session descriptions card names each control, and a press on
+  // the fetch's button with the keyboard leaves focus on the button that replaces it, so a person
+  // is not put back at the top of the page after each press.
+  test('names the descriptions card’s controls and keeps focus on the fetch button that replaces the one pressed', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'host')
+    const card = page.getByTestId('setup-model')
+    await expect(card.getByRole('switch', { name: 'Describe my sessions' })).toBeVisible()
+    await expect(card.getByRole('switch', { name: 'Keep going on battery power' })).toBeVisible()
+
+    await card.getByRole('button', { name: 'Download it' }).focus()
+    await page.keyboard.press('Enter')
+    await expect(card.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
+    await expect(card.getByRole('button', { name: 'Cancel the download' })).toBeFocused()
+
+    await page.keyboard.press('Enter')
+    await expect(card.getByRole('button', { name: 'Download it' })).toBeFocused()
+  })
+
   // KR-REQ-13.19: a switch is drawn smaller than a finger, and a press anywhere across a target of
   // the platform's size around it still lands on it, at the desktop's token and at 44 and 48 px.
   test('takes a press across the full target around each switch', async ({ page }) => {
