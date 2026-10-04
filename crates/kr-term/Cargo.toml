@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = ["conformance"]
 # The conformance corpus and the fixture generator. Enabled by default so `cargo test -p kr-term`
-# runs the corpus; the dependency plan spells it out as `--features conformance`.
+# runs the corpus.
 conformance = ["dep:serde_json"]
 
 [[bin]]

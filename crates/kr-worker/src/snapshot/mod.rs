@@ -1,9 +1,8 @@
 //! The projection producer: snapshots, bounded row pages, deltas and explicit resets.
 //!
-//! A projected attachment used to be sent a rendering of the whole screen after every batch of
-//! output. Section 8 forbids exactly that — ordinary output is not redrawn after every batch — and
-//! the answer is this module. A client is installed once, from a snapshot, and then receives one
-//! bounded update per batch: the rows that changed and the state that changed with them.
+//! Section 8 forbids redrawing a projected attachment's whole screen after every batch of output,
+//! so a client is installed once, from a snapshot, and then receives one bounded update per batch:
+//! the rows that changed and the state that changed with them.
 //!
 //! # What a client holds, and why it is two numbers
 //!

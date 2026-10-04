@@ -658,7 +658,7 @@ fn diagnostics_never_touch_the_output_stream() {
     );
 }
 
-// ------------------------------------------- behaviour the review found wrong
+// ------------------------------------------------------------ title stack and mode handling
 
 /// Title stack operations are the session's own and never reach the outer terminal's stack.
 #[test]

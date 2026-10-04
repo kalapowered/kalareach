@@ -645,7 +645,7 @@ fn ground_after_marks_a_safe_handoff_point() {
     );
 }
 
-// ------------------------------------------------- framing the review found wrong
+// ------------------------------------------------------------ framing of control strings
 
 /// `ESC ESC` is payload only inside a tmux envelope.
 ///

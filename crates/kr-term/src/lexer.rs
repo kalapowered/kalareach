@@ -72,8 +72,9 @@ pub struct LexLimits {
     /// Byte bound on one grapheme cluster, which is the content of one cell.
     ///
     /// Section 8 requires per-cell encoded content to be limited so that repeated combining
-    /// characters cannot allocate without bound. Past the bound a cluster ends and the next scalar
-    /// starts a new one, which the projection shows as a separate cell.
+    /// characters cannot allocate without bound. Past the bound the run ends, and the combining
+    /// marks that follow have no cell to join: the grid drops them, reports the truncation and
+    /// requires projection.
     pub max_cluster_bytes: usize,
 }
 
