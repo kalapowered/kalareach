@@ -1468,8 +1468,17 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
         return controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
     }
     let reported = session.commands.blocks.len();
+    let entries = session.commands.entries.len();
     let reading = reading_through_the_editor(kind);
     session.type_line(reading);
+    // What is typed goes in once the reader the line starts is reading: before that it goes to a
+    // terminal that is not that reader's yet, and a shell may throw away what it finds there when
+    // it takes the terminal for the reader.
+    session.until("the reader the line starts", |commands| {
+        commands.entries[entries..]
+            .iter()
+            .any(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
+    });
     session.type_line("kr-typed-input");
     session.until("the reading line's finished block", |commands| {
         commands.blocks[reported..]
