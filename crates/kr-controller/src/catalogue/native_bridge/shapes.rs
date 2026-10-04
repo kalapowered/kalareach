@@ -117,8 +117,8 @@ fn servers(application: &str, value: &Value) -> Checked {
 
 /// Whether this host registers the forwarder for the application as a line a shell runs. Gemini CLI
 /// runs a handler's command as one line, and a program it starts is a word of that line. The others
-/// are registered as a program with its arguments in a list beside it, as is every server of a
-/// server file.
+/// are registered as a program with its arguments in a list beside it, and Claude Code's server file
+/// is the only server file there is.
 fn runs_a_line(application: &str) -> bool {
     application == "Gemini CLI"
 }

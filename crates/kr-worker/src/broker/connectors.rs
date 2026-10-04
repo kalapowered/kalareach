@@ -406,9 +406,11 @@ impl InstalledConnector {
         let Some((directory, file)) = executable.rsplit_once('/') else {
             return false;
         };
-        // By the name a command is looked up by, and by the file the shell found where that is the
-        // same name: a rule's file stem may itself end in `.com`, which the lookup name takes off.
+        // By the name a command is looked up by, by the name as it was typed, and by the file the
+        // shell found where that is the same name: a rule's file stem may itself end in `.com`,
+        // which the lookup name takes off, and a rule never recognises a file found for another name.
         self.matches_executable(&format!("{directory}/{}", lookup_name(command)))
+            || self.matches_executable(&format!("{directory}/{command}"))
             || (lookup_name(file) == lookup_name(command) && self.matches_executable(&executable))
     }
 

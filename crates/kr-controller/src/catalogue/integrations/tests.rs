@@ -151,6 +151,20 @@ fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_t
         check(&reported, &enabled(&["qoder-cli"])).status,
         DoctorStatus::Ok
     );
+    // A forwarder installed in a directory whose name is the placeholder's text is a path like any
+    // other: the doctor writes it once, and has nothing to say of it.
+    let odd = Host {
+        forwarder: Some(PathBuf::from("/Applications/{kr_hook}/current/bin/kr-hook")),
+        ..able(Vec::new())
+    };
+    let reported = report(Some(&reading), &[], &enabled(&["qoder-cli"]), &odd);
+    let qoder = reported
+        .reports
+        .iter()
+        .find(|report| report.plugin_id == "kalareach/qoder-cli")
+        .expect("reported");
+    assert_eq!(qoder.reason.0, None);
+    assert!(qoder.flags[1].contains("/Applications/{kr_hook}/current/bin/kr-hook"));
 
     let without = super::fill(&reading, &enabled(&["qoder-cli"]), None).entries;
     let qoder = without
@@ -181,6 +195,11 @@ fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_t
             .is_some_and(|reason| reason.contains("forwarder")),
         "the doctor says why an invocation runs as typed: {:?}",
         qoder.reason
+    );
+    assert_eq!(
+        qoder.mode,
+        IntegrationMode::NativeTerminal,
+        "and does not show it as integrated"
     );
     assert_eq!(
         check(&reported, &enabled(&["qoder-cli"])).status,

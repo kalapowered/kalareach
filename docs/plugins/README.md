@@ -146,12 +146,12 @@ host replaces that with the full path of the `kr-hook` it installed. The placeho
 start of a JSON string. Alone, it names a program the application starts itself: a `command` with
 its `args`, or a flag whose value is a JSON document. Followed by a space, it begins a line an
 application runs through a shell, and the path is written as one word in single quotes. The package
-validator refuses a flag that holds it anywhere else, and the host refuses a registration file that
-does, one that spells it with JSON escapes included. The host writes the path as the text of a JSON string, so a path with spaces, quotes,
+validator refuses a flag that holds it anywhere else or spells it with JSON escapes, and the host
+refuses a registration file that does either. The host writes the path as the text of a JSON string, so a path with spaces, quotes,
 backslashes or non-ASCII characters is still one path. A package that uses the placeholder states
 `"sdk_range": ">=0.1.3, <0.2.0"`, because a host on an earlier contract would write the text as it
-stands, and refuses a release it cannot read. A package written before the placeholder names the
-forwarder by its own name in its flags. An application may look in its working directory for a
+stands, and refuses a release it cannot read. A package written before the placeholder that
+registers the forwarder in its flags names it by its own name. An application may look in its working directory for a
 program started by a bare name before it searches (Qoder CLI does on Windows), so on Windows the
 host runs an invocation with such flags as typed.
 
