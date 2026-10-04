@@ -353,6 +353,11 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
+    /// Where this host's own tests stop a network connection the transport has authorised, before
+    /// the host registers it, so that a revocation can land in between. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    before_a_connection_is_registered: ReadPause,
     /// Where this host's own tests stop a read whose worker has stopped answering, once it has
     /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
     /// away in every shipped build.

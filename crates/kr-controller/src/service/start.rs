@@ -601,6 +601,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_retained_lookup: ReadPause::default(),
             #[cfg(feature = "testing")]
+            before_a_connection_is_registered: ReadPause::default(),
+            #[cfg(feature = "testing")]
             before_the_lease: ReadPause::default(),
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
