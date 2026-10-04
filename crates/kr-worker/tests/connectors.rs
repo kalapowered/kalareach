@@ -510,7 +510,7 @@ fn released(package: &str) -> serde_json::Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/plugins/released/kalareach")
         .join(package)
-        .join("0.4.0/plugin.json");
+        .join("0.5.0/plugin.json");
     let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     serde_json::from_slice(&bytes).expect("the released manifest is JSON")
 }
