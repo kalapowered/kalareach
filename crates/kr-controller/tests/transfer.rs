@@ -877,18 +877,18 @@ async fn a_draft_is_created_through_the_daemon_and_carries_its_revision() {
     assert_eq!(refusal.code, ErrorCode::InvalidArgument);
 }
 
-/// KR-REQ-24.09: the daemon's own expiry sweep runs against the registry's view of its sessions.
+/// KR-REQ-24.09: the daemon's own expiry sweep runs against the archive's view of its sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_daemon_sweeps_under_its_registrys_view_of_its_sessions() {
+async fn the_daemon_sweeps_under_the_archives_view_of_its_sessions() {
     let host = host().await;
     let retention = {
         // Read the way the daemon reads it, on a blocking task: the registry's lock is a
         // task-aware one and its blocking form is only correct off the reactor.
         let controller = Arc::clone(&host.controller);
-        tokio::task::spawn_blocking(move || controller.session_retention())
+        tokio::task::spawn_blocking(move || controller.archive_retention())
             .await
             .expect("the task ran")
-            .expect("reads the registry")
+            .expect("reads the archive")
     };
     assert!(
         retention.is_empty(),
