@@ -691,21 +691,21 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
     AdmissionCase {
         id: "widest_grid_that_fits_at_forty_rows",
         covers: "KR-REQ-08.79 the widest grid that fits at a height",
-        cols: 1_554,
+        cols: 1_553,
         rows: 40,
         resize: None,
     },
     AdmissionCase {
         id: "widest_grid_that_does_not_at_forty_rows",
         covers: "KR-REQ-08.79 rejection before allocation",
-        cols: 1_555,
+        cols: 1_554,
         rows: 40,
         resize: None,
     },
     AdmissionCase {
         id: "most_cells_admitted",
         covers: "KR-REQ-08.79 the largest cell count any shape is admitted at",
-        cols: 1_943,
+        cols: 1_942,
         rows: 32,
         resize: None,
     },
@@ -714,7 +714,7 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
         covers: "KR-REQ-08.79 a smaller grid of a costlier shape is refused",
         // Fewer cells than the case above and refused all the same: a tall grid keeps more rows,
         // and rows cost something of their own.
-        cols: 61,
+        cols: 60,
         rows: 1_002,
         resize: None,
     },

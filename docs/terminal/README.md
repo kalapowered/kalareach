@@ -845,7 +845,8 @@ or about anything a record reaches through a pointer and this model measures sep
 attribute allocation can grow while the cell itself stays the size it was. The limits recorded
 below and in the allocation notes still apply.
 
-One cell of one buffer, in reserved bytes:
+A row is reserved one cell wider than the geometry, because a wide character written in the last
+column overhangs the margin. One cell of one buffer, in reserved bytes:
 
 | Part | Bytes | Why |
 | --- | --- | --- |
@@ -866,18 +867,18 @@ The rest of the reservation:
 | Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
 | Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
-So an 80 by 24 session reserves 20,820,232 bytes of its 67,108,864, and the default invisible
-120 by 40 reserves 23,045,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
+So an 80 by 24 session reserves 20,838,664 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 23,076,360. A full-width 2,048 by 24 terminal is admitted; so is every grid at
 that height, because 2,048 columns is the widest section 8 allows. The largest grid the dimensions
-allow, 2,048 by 128, would need 220,760,456 bytes, so it is refused before anything is allocated
+allow, 2,048 by 128, would need 220,858,760 bytes, so it is refused before anything is allocated
 for it.
 
 There is no single boundary in cells, because a row costs something of its own: the largest cell
-count any shape is admitted at is 1,943 by 32, or 62,176 cells, and 61 by 1,002 is refused at
-61,122. The boundary by height is what a client cares about, and
-`fixtures/terminal/admission.json` records it: 1,554 columns are admitted at 40 rows and 1,555 are
-not; 484 at 128 rows and 485 are not; 248 by 248 is the largest square and 249 by 249 is refused;
-59 columns are admitted at the full 1,024 rows.
+count any shape is admitted at is 1,942 by 32, or 62,144 cells, and 60 by 1,002 is refused at
+60,120. The boundary by height is what a client cares about, and
+`fixtures/terminal/admission.json` records it: 1,553 columns are admitted at 40 rows and 1,554 are
+not; 483 at 128 rows and 484 are not; 248 by 248 is the largest square and 249 by 249 is refused;
+58 columns are admitted at the full 1,024 rows.
 
 The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
 64 MiB session budget, so a session's resident state is bounded by the two together and each is
