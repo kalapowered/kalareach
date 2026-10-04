@@ -1020,6 +1020,94 @@ fn the_search_takes_the_extensions_in_their_order() {
     );
 }
 
+/// KR-REQ-12.07: the suffixes a command is looked for under are the platform's: none where names
+/// are exact, and on Windows PowerShell's order, a `.ps1` script first and then the extensions the
+/// platform runs, as it names them.
+#[test]
+fn the_suffixes_a_command_is_looked_for_under_are_the_platforms() {
+    assert_eq!(extensions(false, Some(".COM;.EXE")), [""]);
+    assert_eq!(
+        extensions(true, Some(".COM;.EXE;;.CMD")),
+        [".ps1", ".com", ".exe", ".cmd"]
+    );
+    assert_eq!(
+        extensions(true, None),
+        [".ps1", ".com", ".exe", ".bat", ".cmd"],
+        "the platform's own list where none is given"
+    );
+}
+
+/// KR-REQ-12.07: where what the shell finds first is a shim and not a program, the doctor says so
+/// beside the integration: `first hit is <the shim>`. Where it finds a program the doctor says
+/// nothing of the kind, and a script ahead of a program in one directory is the first hit, as it is
+/// for PowerShell. Elsewhere there are no shims, and nothing is said.
+#[test]
+fn the_doctor_names_a_shim_as_the_first_hit_and_a_program_not_at_all() {
+    let store = Store::new("shim");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    let reason = |directory: &Path| {
+        let reported = report(
+            Some(&reading),
+            &[],
+            &enabled(&["claude-code"]),
+            &able(vec![directory.to_path_buf()]),
+        );
+        (
+            reported.reports[0].executable.0.clone(),
+            reported.reports[0].reason.0.clone(),
+        )
+    };
+    let program = store.0.join("program");
+    let program_hit = executable(
+        &program,
+        if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        },
+    );
+    let (found, why) = reason(&program);
+    assert_eq!(found, Some(program_hit.display().to_string()));
+    assert_eq!(why, None, "a program is not a shim");
+
+    let shimmed = store.0.join("shimmed");
+    executable(
+        &shimmed,
+        if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        },
+    );
+    let shim = executable(&shimmed, "claude.ps1");
+    let (found, why) = reason(&shimmed);
+    if cfg!(windows) {
+        assert_eq!(
+            found,
+            Some(shim.display().to_string()),
+            "the script comes first"
+        );
+        let why = why.expect("a shim is the first hit");
+        assert!(
+            why.starts_with(&format!("first hit is {}", shim.display())),
+            "{why}"
+        );
+    } else {
+        assert_eq!(why, None, "no platform of exact names has a shim");
+    }
+
+    let only = store.0.join("only");
+    let cmd = executable(&only, "claude.cmd");
+    let (found, why) = reason(&only);
+    if cfg!(windows) {
+        assert_eq!(found, Some(cmd.display().to_string()));
+        assert!(why.is_some_and(|why| why.contains("first hit is")));
+    } else {
+        assert_eq!(found, None);
+    }
+}
+
 /// KR-REQ-07.45: a file this account cannot execute is passed over for the next candidate. The
 /// launcher is held to the same rule, `kr_worker::broker::commands::runnable`, which the worker's
 /// own tests cover.

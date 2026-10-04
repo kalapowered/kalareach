@@ -41,6 +41,7 @@ use kr_protocol::broker::{DecodingTrust, OfferedDecision};
 use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
 use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
 use kr_protocol::session::EnvironmentVariable;
+pub use kr_shell_integration::host::command::lookup_name;
 
 use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
@@ -404,7 +405,7 @@ impl InstalledConnector {
         let Some((directory, _)) = executable.rsplit_once('/') else {
             return false;
         };
-        self.matches_executable(&format!("{directory}/{command}"))
+        self.matches_executable(&format!("{directory}/{}", lookup_name(command)))
     }
 
     /// Returns the decisions a declarative interpretation offers: the ones the table's decision
@@ -595,9 +596,11 @@ impl ConnectorSources {
         let mut connectors = Vec::new();
         let mut integrating: BTreeMap<String, Vec<Arc<InstalledConnector>>> = BTreeMap::new();
         for connector in read {
+            // By the name a command is looked up by, so two packages whose commands one platform
+            // reads as the same name are the conflict they are there.
             match connector
                 .integration()
-                .map(|integration| integration.command.clone())
+                .map(|integration| lookup_name(&integration.command).into_owned())
             {
                 Some(command) => integrating.entry(command).or_default().push(connector),
                 None => connectors.push(connector),
@@ -654,7 +657,7 @@ impl ConnectorSources {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         held.by_command
-            .get(command)
+            .get(&*lookup_name(command))
             .map(|connector| (Arc::clone(connector), held.frame))
     }
 
@@ -665,7 +668,7 @@ impl ConnectorSources {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_command
-            .get(command)
+            .get(&*lookup_name(command))
             .cloned()
     }
 }

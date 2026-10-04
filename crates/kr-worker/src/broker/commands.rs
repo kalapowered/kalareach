@@ -2511,12 +2511,33 @@ fn check_executable(executable: &str) -> std::result::Result<(), String> {
             "the executable {executable:?} is not an absolute path"
         ));
     }
+    if !starts_directly(path) {
+        return Err(format!(
+            "first hit is {executable}, a script or shim that no launcher starts, so this invocation \
+             runs as typed"
+        ));
+    }
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("the executable {executable:?} cannot be read: {error}"))?;
     if !metadata.is_file() {
         return Err(format!("the executable {executable:?} is not a file"));
     }
     Ok(())
+}
+
+/// Whether a launcher can start `path` itself, which is what an integrated invocation's executable
+/// has to be.
+///
+/// On Windows that is a program: an `.exe` or a `.com`. A `.cmd`, a `.bat` or a `.ps1` (the shims
+/// npm puts beside an agent it installs) is run by an interpreter whose identity is not the agent's,
+/// so a launch of one would name the interpreter; the invocation runs as typed. Elsewhere any file is
+/// asked, and an interpreter's script is refused where the program is read.
+#[must_use]
+pub fn starts_directly(path: &Path) -> bool {
+    !cfg!(windows)
+        || path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+        })
 }
 
 /// Whether `path` is a regular file this account may execute: what a launcher, and an executable a
