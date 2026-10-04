@@ -247,8 +247,9 @@ not report a creation instant, its modification instant). So the question is nev
 exists; it is which name holds *that object*. The creation instant is the second half of the witness
 because a filesystem reuses a device and inode pair once the object that held them is gone, and
 reuse with the same creation instant is not something a filesystem produces. Where a platform
-reports no creation instant, the witness is the identity alone and the host says so rather than
-claiming more.
+reports no creation instant, the witness holds the modification instant instead. A later reading is
+compared by identity, and by instant too when both readings have one; where a platform gives no
+instant of either kind, the identity alone is the witness.
 
 That question is asked through a handle, so it is asked by the daemon that holds one: the running
 operation, whose publication failed part way, asks it at once through the destination it already
