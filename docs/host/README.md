@@ -111,7 +111,8 @@ configuration file this host reads.
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
   "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
   "voice": { "broker_origin": "https://voice.example.com" },
-  "startup": { "controller": "standalone" }
+  "startup": { "controller": "standalone" },
+  "agents": { "kalareach/codex": { "ownership": "reduced" } }
 }
 ```
 
@@ -421,6 +422,16 @@ computed each listed package is reported as `unknown`. An integration a new sess
 launched without for its size is reported as `too_large`. One answer carries at most 256 reports
 and 384 KiB of them, the listed packages first, and the check counts any it leaves out. A session
 whose own search path differs can find another; each launch records the one it ran.
+
+`agents` chooses a reduced-ownership profile for one agent, by package (`publisher/plugin`). An
+entry names `reduced` and nothing else. A package with no entry runs under full ownership, and a
+document this host cannot use chooses nothing. The document is refused if a key is not a
+`publisher/plugin` identifier, if an ownership is neither `full` nor `reduced`, if an entry names
+anything besides `ownership`, or if it names more than 64 packages, so a misspelt package is never
+read as no choice. An edit reaches the sessions created afterwards. `kr doctor` reports the choice
+as the value `agents.ownership` and prints one line for each package: `reduced ownership; a launch
+is tracked by start identity and its closure never reads complete; the command route does not apply
+it`. An export carries the package names by their class and length.
 
 `environment_additions` is the preference that adds variables to a session started with the host's
 environment, described under *The environment a session starts with*.
@@ -1240,9 +1251,11 @@ cannot leave by asking. A vendor sandbox that creates a job of its own nests ins
 nesting and breakaway are separate questions, and disabling the second says nothing about the first.
 Where the job cannot be created, cannot hold what it must, or does not hold the shell, the **launch
 fails by name**: no session is silently given a weaker boundary instead. Section 7's other permitted
-outcome, an explicitly selected reduced-ownership execution profile, is not something this build
-offers, because nothing selects one. A GUI resource that has to outlive the session is created
-outside the job and is never ended by closing one.
+outcome, an explicitly selected reduced-ownership execution profile, belongs to an agent and not to
+a session: no session is given one, and an agent runs under one only where the configuration names
+its package. A GUI resource that has to outlive the session is created outside the job and is never
+ended by closing one. *A vendor's own sandbox*, below, says what an agent's sandbox needs of these
+jobs.
 
 A closure says what it could not establish. A job that stops answering, a process the operating
 system will not describe, and a termination the kernel refused are each carried into the closure
@@ -1317,6 +1330,38 @@ the task stays registered with no trigger, so nothing starts until a `kr new` af
 A `kr new` run over SSH on a machine where the user is signed in nowhere cannot use the task: the
 Task Scheduler does not start it, and `kr new` says so.
 Removing the task, as `kr host startup --clear` does, ends nothing it started.
+
+### A vendor's own sandbox
+
+An agent the broker launches starts in the session's job and in a job of its own. A vendor's sandbox
+that makes jobs of its own nests under both: it limits processes, memory and the user interface, and
+closing the session's job ends every process it made. Codex 0.155.1 does this. Its sandbox runs a
+command as a restricted-token child of `codex.exe` inside the session's job. A child of that command
+that asks to break away leaves the sandbox's job and stays in the session's, which still holds it.
+The closure reads the session's ownership coverage as complete once the job lists nothing.
+
+A sandbox cannot start under a job that restricts access to desktops, because it makes a desktop of
+its own and the system refuses (`CreateDesktopW failed: 5`). Before a launch starts anything it
+reads the limits of the session's job and of the innermost job the worker itself is in. A
+restriction it finds is a named launch failure: nothing starts, the vendor's sandbox is left as it
+is, and no breakaway is granted. The jobs this product makes carry no such restriction, and the
+limits of a job above the worker cannot be read; there the vendor fails at its own start and the
+launch reports that exit.
+
+The other outcome is a choice, and it is somebody's to make. An entry for the agent's package in the
+`agents` section of the configuration document (see *Configuration*) starts that agent in a
+kill-on-close job of its own and not in the session's. The closure lists what that job holds by
+start identity and ends it, and reads its ownership coverage as incomplete, with the reason in the
+receipt. A worker that dies ends the agent too, since the worker holds the only handle to the job.
+The choice is no way past a restriction on the worker's own job, and it never switches the vendor's
+sandbox off. The launch profile records it as `ownership`. Because the jobs this product makes
+restrict nothing, the profile today is the explicit escape section 7 asks for, and a test builds the
+job that needs it.
+
+The command route has no such profile: a program it starts runs in the shell's own job. A launcher
+whose job restricts desktops declines before it creates the program and says why to the backend,
+which keeps the reason on the launch attempt. The typed command then runs as typed, as it does
+without the integration.
 
 ### Running the Windows tests
 
@@ -1419,10 +1464,12 @@ description service it builds on, `kr-describe`, holds no model and is checked w
 `.cargo/config.toml` sets link flags for the two MSVC targets alone, so the GNU target takes nothing
 from them.
 
-What no automated suite here establishes, and a person at this machine has to: a vendor sandbox
-that creates a job of its own running inside the session's job; a child that asks to break away
-being refused; an IME composing at a real keyboard; and Windows Terminal, WSL interop and a nested
-ConPTY across the release matrix.
+What no automated suite here establishes, and a person at this machine has to: an IME composing at
+a real keyboard; and Windows Terminal, WSL interop and a nested ConPTY across the release matrix.
+A vendor's sandbox running inside the session's job, and the closure ending what it made, is run
+against the pinned Codex build by the ignored cases of `crates/kr-worker/tests/windows_vendor.rs`
+once `KR_NATIVE_CODEX` names its `codex.exe`; the same cases run with a stand-in vendor in the
+windows job.
 
 ## WSL and containers
 
@@ -4741,6 +4788,14 @@ A profile records the resolved executable and its digest, the distribution, the 
 argument vector, what is known about authentication, and the integration mode. It is written before
 the launch, so a refused launch still leaves a record of what was going to be run.
 
+A profile also records how completely the session's closure accounts for what the launch starts, as
+`ownership`: `full`, or `reduced` where the configuration chose it for the agent's package. It
+records `vendor_mode` too: the word the application's own package read for the mode the application
+runs in, exactly as the application printed it, or null. A ledger an earlier build wrote holds
+profiles without the two fields. The first open by this build records each as `full` and null, in
+one transaction with the schema version (7 to 8), and a ledger with a row it cannot read is left as
+it was.
+
 A launch intent is prepared against the idle root shell and executed against it. If an application
 has taken the foreground, or the prompt has moved, the launch is refused, and refusing is the
 whole answer. There is no path in this code that writes the command into whatever is reading the
@@ -4761,6 +4816,38 @@ conversation and a bridge's selection, and not a command line that resumes a con
 itself. If a bridge reports that an instance selected a conversation another live instance of the
 same session holds, the host refuses the selection: the instance is left with no thread vouched for,
 and rich mutations stay suspended until the binding is verified again.
+
+### What a launch reads of its application's mode
+
+A package can declare a launch probe in its manifest: the application's own diagnostic command, the
+options of the launch that decide which configuration the diagnostic reads, and where in its output
+the mode is. The owner confirms the capability `launch.probe` on every release, because the probe
+runs the application's executable with arguments the package chose. Codex 0.155.1 prints `disabled`
+where no Windows sandbox is set, `elevated` for its elevated sandbox and `<redacted>` for its
+unelevated one, and a package for it reads that word at `/checks/sandbox.helpers/details/sandbox
+backend` of `codex doctor --json`. The host records the word as printed and interprets nothing.
+
+A launch the worker starts runs the probe before it reserves anything, in the launch's own
+environment and directory, with no input and no shell. The probe has five seconds and may print 256
+KiB, and it runs in a job (a process group on Unix) that ends with it. A nonzero exit status is not
+a failure, because the diagnostic reports a problem in the output it prints. A probe that cannot
+start, does not finish, prints too much or prints nothing the pointer reaches records no mode and
+never stops the launch by itself.
+
+The options the declaration names are copied with their values from the launch's arguments, in the
+forms the vendor reads them: `-c v`, `-cv`, `-c=v`, `--config v` and `--config=v`. For Codex they
+are `-c`, `--config`, `--enable` and `--disable`, and each of them changes what `doctor` prints.
+Codex refuses `-p` and `--profile` before `doctor`, so they are not carried. A package can also list
+the modes its application cannot run with in a Windows service session, the session a worker has
+when no person is signed in. A launch there whose mode is listed fails by name before anything
+starts, where it would otherwise hang.
+
+`kr doctor` runs the same declaration for the executable the daemon's own search path names for each
+granted package. It runs in the daemon's environment, which a launch's may differ from, and prints
+the word it read and where it read it from, or why it read none. A package whose installation does
+not hold `launch.probe` is reported as not run. A launch through the command route records no mode:
+the worker is not given the shell's environment, and that environment decides which configuration
+the application reads.
 
 ### What a native exit ends
 
