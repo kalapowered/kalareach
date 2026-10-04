@@ -2,14 +2,14 @@
   "manifest_version": 1,
   "publisher_id": "kalareach",
   "plugin_name": "qoder-cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "display_name": "Qoder CLI",
   "description": "Recognises Qoder CLI, reads its agent protocol through a declarative table and stops the turn it is running, with the terminal as the default route.",
-  "sdk_range": ">=0.1.2, <0.2.0",
+  "sdk_range": ">=0.1.3, <0.2.0",
   "wit_range": ">=0.1.0, <0.2.0",
   "source": {
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "revision": "3efd5eed04308e54e6a55c19f7483c55d8b3e515"
+    "revision": "2760679a70dd8f7b177266b69a6bab93de084b27"
   },
   "match_rules": [
     {
@@ -85,8 +85,8 @@
     {
       "role": "asset",
       "path": "README.md",
-      "digest": "0c3c912ac90dbb0a9dc810cea46338634a8ac98e54e959d88181a1a57022fada",
-      "size_bytes": "7918"
+      "digest": "bbe7aea4ee59d8c6712bbc6526384de9d48ff76857e437be4c96ed3403168c9b",
+      "size_bytes": "8025"
     },
     {
       "role": "connector",
@@ -169,9 +169,9 @@
     "command": "qodercli",
     "flags": [
       "--settings",
-      "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":1}]}],\"PostToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"PostToolUseFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"Notification\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"kr-hook\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}]}}"
+      "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"{kr_hook}\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"{kr_hook}\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":1}]}],\"PostToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"{kr_hook}\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"PostToolUseFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"{kr_hook}\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}],\"Notification\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"{kr_hook}\",\"args\":[\"qoder-cli\",\"hook\"],\"timeout\":5}]}]}}"
     ],
     "variables": [],
-    "grant_statement": "When you run qodercli in a KalaReach session with this integration on, KalaReach adds --settings with inline settings that register the KalaReach forwarder, kr-hook qoder-cli hook, for SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification, with a timeout of one second for SessionEnd and five for the others. Qoder CLI runs these hooks beside your own, and nothing is written to your Qoder CLI settings. Qoder CLI starts the forwarder itself, so the forwarder runs under Qoder CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees those five events of that session."
+    "grant_statement": "When you run qodercli in a KalaReach session with this integration on, KalaReach adds --settings with inline settings that register the KalaReach forwarder, by the full path of the copy KalaReach installed, with the arguments qoder-cli hook, for SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification, with a timeout of one second for SessionEnd and five for the others. Qoder CLI runs these hooks beside your own, and nothing is written to your Qoder CLI settings. Qoder CLI starts the forwarder itself, so the forwarder runs under Qoder CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees those five events of that session."
   }
 }

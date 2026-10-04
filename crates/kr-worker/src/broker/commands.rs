@@ -973,7 +973,11 @@ impl CommandBackends {
             working_directory: PathBuf::from(request.cwd),
         };
         let mut gateway = NativeGateway::bind(Arc::clone(&self.broker), &directory, launch)?;
-        if let Some(installed) = connector.launch_bridge(launcher) {
+        // The hooks a package registers inline start the forwarder by the path they were written
+        // with, which an update keeps current, so that is the forwarder a bridge of this launch has
+        // to be running; the launcher is the one this worker's own release has.
+        let forwarder = self.registered_forwarder.as_deref().unwrap_or(launcher);
+        if let Some(installed) = connector.launch_bridge(forwarder) {
             gateway = gateway.with_bridge(installed)?;
         }
         let gateway = Arc::new(gateway);

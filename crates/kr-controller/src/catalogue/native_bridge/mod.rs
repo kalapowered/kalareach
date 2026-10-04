@@ -2324,15 +2324,12 @@ fn registration(
     }))
 }
 
-/// A template's bytes with the forwarder's path written where the package names the forwarder, and
-/// checked to say what the package meant.
+/// A template's bytes with the forwarder's path written where the package names the forwarder.
 ///
 /// A template that names no forwarder is returned as it is, so a package that registers the bare
 /// name installs the bytes its recipe names. Otherwise the path is written for where the
-/// placeholder stands (a program started whole, or a line a shell runs), and the result is read
-/// again beside the template: every string of it is the template's, or the template's with the
-/// path in the place the package marked, and the commands a registration runs are the forwarder
-/// and nothing else.
+/// placeholder stands (a program started whole, or a line a shell runs); the template has been read
+/// by [`registration`] already, so the commands it runs are the forwarder and nothing else.
 fn expanded(
     destination: &str,
     template: &[u8],
@@ -2344,63 +2341,9 @@ fn expanded(
     if !forwarder::mentions(text) {
         return Ok(template.to_vec());
     }
-    let written = forwarder::expand(text, forwarder)
-        .map_err(|error| format!("{destination} cannot be written with the forwarder: {error}"))?;
-    let path = forwarder
-        .to_str()
-        .ok_or_else(|| "the forwarder's path is not text".to_owned())?;
-    let faithful = match (
-        serde_json::from_str::<serde_json::Value>(text),
-        serde_json::from_str::<serde_json::Value>(&written),
-    ) {
-        (Ok(template), Ok(written)) => says_the_same(&template, &written, path),
-        _ => false,
-    };
-    if !faithful {
-        return Err(format!(
-            "{destination} written with the forwarder does not say what the package meant"
-        ));
-    }
-    Ok(written.into_bytes())
-}
-
-/// Whether `written` is `template` with `forwarder` where a string is, or starts with, the
-/// placeholder, and nothing else changed.
-fn says_the_same(
-    template: &serde_json::Value,
-    written: &serde_json::Value,
-    forwarder: &str,
-) -> bool {
-    use serde_json::Value;
-    match (template, written) {
-        (Value::String(template), Value::String(written)) => {
-            if template == forwarder::PLACEHOLDER {
-                written == forwarder
-            } else if let Some(rest) =
-                template.strip_prefix(&format!("{} ", forwarder::PLACEHOLDER))
-            {
-                *written == format!("{} {rest}", forwarder::posix_word(forwarder))
-            } else {
-                template == written && !forwarder::mentions(template)
-            }
-        }
-        (Value::Array(template), Value::Array(written)) => {
-            template.len() == written.len()
-                && template
-                    .iter()
-                    .zip(written)
-                    .all(|(template, written)| says_the_same(template, written, forwarder))
-        }
-        (Value::Object(template), Value::Object(written)) => {
-            template.len() == written.len()
-                && template.iter().all(|(key, template)| {
-                    written
-                        .get(key)
-                        .is_some_and(|written| says_the_same(template, written, forwarder))
-                })
-        }
-        (template, written) => template == written,
-    }
+    forwarder::expand(text, forwarder)
+        .map(String::into_bytes)
+        .map_err(|error| format!("{destination} cannot be written with the forwarder: {error}"))
 }
 
 fn invocations(
@@ -2475,14 +2418,30 @@ fn invocations(
                 applications.insert(surface.0.to_owned());
                 surfaces.insert(surface.1);
             }
-            for nested in members.values() {
-                invocations(nested, destination, applications, surfaces)?;
+            for (name, nested) in members {
+                // The placeholder stands where a command starts and nowhere else: a key or a value
+                // that holds it elsewhere would have the host write the forwarder's path into
+                // something the registration does not run.
+                if forwarder::mentions(name) {
+                    return Err(format!(
+                        "{destination} names the forwarder's placeholder somewhere that is not a \
+                         command"
+                    ));
+                }
+                if name != "command" {
+                    invocations(nested, destination, applications, surfaces)?;
+                }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
                 invocations(item, destination, applications, surfaces)?;
             }
+        }
+        serde_json::Value::String(text) if forwarder::mentions(text) => {
+            return Err(format!(
+                "{destination} names the forwarder's placeholder somewhere that is not a command"
+            ));
         }
         _ => {}
     }

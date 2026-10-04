@@ -2,7 +2,7 @@
   "mcpServers": {
     "kalareach": {
       "type": "stdio",
-      "command": "kr-hook",
+      "command": "{kr_hook}",
       "args": [
         "claude-code",
         "channel"

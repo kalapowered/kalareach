@@ -33,8 +33,8 @@ use kr_protocol::scalars::Digest256;
 
 /// The digests release 0.3.0's recipe names for its three files.
 const MANIFEST_DIGEST: &str = "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c";
-const SERVERS_DIGEST: &str = "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea";
-const HOOKS_DIGEST: &str = "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727";
+const SERVERS_DIGEST: &str = "b514ddff583d9c3d926233ce402b4e7d27eb3b76cffce369f5ea4cb30460c82a";
+const HOOKS_DIGEST: &str = "c81a5d098b6282ddfc1111183e308e3ab6094bcb76a6455019df7133c0f0f641";
 
 const MANIFEST_PATH: &str = "skills/kalareach-channels/.claude-plugin/plugin.json";
 const SERVERS_PATH: &str = "skills/kalareach-channels/.mcp.json";
@@ -61,6 +61,15 @@ fn pinned(name: &str) -> Vec<u8> {
             .join(name),
     )
     .expect("a pinned registration file")
+}
+
+/// The bytes the executor installs for one pinned registration file: the package's file with the
+/// forwarder's path written where the package names the forwarder.
+fn written(name: &str, forwarder: &Path) -> Vec<u8> {
+    let template = String::from_utf8(pinned(name)).expect("a text file");
+    kr_plugin_sdk::forwarder::expand(&template, forwarder)
+        .expect("the file is written with the forwarder")
+        .into_bytes()
 }
 
 /// The recipe of release 0.3.0, with the hooks file's digest given.
@@ -116,6 +125,8 @@ fn hex_digest(bytes: &[u8]) -> Digest256 {
 struct Site {
     _temp: tempfile::TempDir,
     root: PathBuf,
+    /// Where this site's stand-in for the forwarder is, which the registrations are written with.
+    forwarder: PathBuf,
 }
 
 impl Site {
@@ -123,10 +134,30 @@ impl Site {
         Self::with_settings(Some(SETTINGS))
     }
 
+    /// A site whose forwarder is `kr-hook` in a directory called `directory` under its root, a name
+    /// a person's machine can have and a shell or a document reads as syntax.
+    fn with_forwarder_in(directory: &str) -> Self {
+        let mut site = Self::build(Some(SETTINGS));
+        let forwarder = site.root.join(directory).join("kr-hook");
+        std::fs::create_dir_all(forwarder.parent().expect("a parent")).expect("a directory");
+        std::fs::write(&forwarder, b"a stand-in for the forwarder").expect("a forwarder");
+        site.forwarder = forwarder;
+        site
+    }
+
     fn with_settings(settings: Option<&str>) -> Self {
+        Self::build(settings)
+    }
+
+    fn build(settings: Option<&str>) -> Self {
         let temp = tempfile::tempdir().expect("a temporary directory");
         let root = temp.path().to_path_buf();
-        let site = Self { _temp: temp, root };
+        let forwarder = root.join("bin/kr-hook");
+        let site = Self {
+            _temp: temp,
+            root,
+            forwarder,
+        };
         std::fs::create_dir_all(site.application()).expect("the application's directory");
         if let Some(settings) = settings {
             std::fs::write(site.application().join("settings.json"), settings).expect("settings");
@@ -159,7 +190,12 @@ impl Site {
     }
 
     fn forwarder(&self) -> PathBuf {
-        self.root.join("bin/kr-hook")
+        self.forwarder.clone()
+    }
+
+    /// The bytes the executor installs for one pinned registration file at this site.
+    fn written(&self, name: &str) -> Vec<u8> {
+        written(name, &self.forwarder())
     }
 
     fn package(&self, release: &str) -> PathBuf {
@@ -230,6 +266,31 @@ impl Site {
         }
     }
 
+    /// A release whose hooks file is `hooks`, with its own package, and everything else as the
+    /// pinned release has it.
+    fn release_with_hooks(&self, name: &str, hooks: &str) -> BridgeTarget {
+        for (file, bytes) in [
+            ("plugin-manifest.json", pinned("plugin-manifest.json")),
+            ("mcp-servers.json", pinned("mcp-servers.json")),
+            ("hooks.json", hooks.as_bytes().to_vec()),
+        ] {
+            let path = self.package(name).join("bridge").join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a package");
+            std::fs::write(path, bytes).expect("a package file");
+        }
+        BridgeTarget {
+            plugin_id: plugin(),
+            package_digest: PayloadDigest::of(name.as_bytes()),
+            package_dir: self.package(name),
+            recipe: recipe_with_hooks(&PayloadDigest::of(hooks.as_bytes()).to_string()),
+            match_rules: match_rules(),
+            qualified: vec![QualifiedExecutable {
+                digest: hex_digest(EXECUTABLE),
+                version: "2.1.278".to_owned(),
+            }],
+        }
+    }
+
     /// Everything under the application's directory.
     fn tree(&self) -> BTreeMap<String, Node> {
         snapshot(&self.application())
@@ -277,7 +338,7 @@ fn snapshot(root: &Path) -> BTreeMap<String, Node> {
 }
 
 /// The tree an application directory holding [`SETTINGS`] has once the recipe is applied.
-fn applied_tree(before: &BTreeMap<String, Node>) -> BTreeMap<String, Node> {
+fn applied_tree(before: &BTreeMap<String, Node>, forwarder: &Path) -> BTreeMap<String, Node> {
     let mut expected = before.clone();
     for directory in [
         "skills/kalareach-channels",
@@ -292,9 +353,12 @@ fn applied_tree(before: &BTreeMap<String, Node>) -> BTreeMap<String, Node> {
     );
     expected.insert(
         SERVERS_PATH.to_owned(),
-        Node::File(pinned("mcp-servers.json")),
+        Node::File(written("mcp-servers.json", forwarder)),
     );
-    expected.insert(HOOKS_PATH.to_owned(), Node::File(pinned("hooks.json")));
+    expected.insert(
+        HOOKS_PATH.to_owned(),
+        Node::File(written("hooks.json", forwarder)),
+    );
     expected.insert(
         "settings.json".to_owned(),
         Node::File(SETTINGS_WITH_KEY.as_bytes().to_vec()),
@@ -329,7 +393,7 @@ fn kr_req_11_42_installing_writes_the_three_files_and_the_key_and_nothing_else()
     assert_eq!(settled, Settled::Applied);
     assert_eq!(
         site.tree(),
-        applied_tree(&before),
+        applied_tree(&before, &site.forwarder()),
         "exactly the recipe's changes"
     );
     let facts = bridges
@@ -394,6 +458,273 @@ fn kr_req_11_42_removing_restores_the_tree() {
     }
 }
 
+/// The commands a Claude Code registration file starts, each as the text the file holds.
+fn commands_of(document: &[u8]) -> Vec<String> {
+    fn collect(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(members) => {
+                if let Some(command) = members.get("command").and_then(serde_json::Value::as_str) {
+                    found.push(command.to_owned());
+                }
+                members.values().for_each(|member| collect(member, found));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    collect(
+        &serde_json::from_slice(document).expect("a JSON document"),
+        &mut found,
+    );
+    found
+}
+
+/// Directory names a person's machine can have, each with a character a document or a shell reads
+/// as syntax.
+const AWKWARD: &[&str] = &[
+    "with space",
+    "it's",
+    "dollar$HOME",
+    "back`tick`",
+    "amp&semi;pipe|redirect>less<",
+    "percent%d",
+    "double\"quote",
+    "back\\slash",
+    "\u{e9}\u{4e2d}\u{1f600}",
+    "x'; touch PLANTED; '",
+];
+
+/// KR-REQ-11.42: a registration that names the forwarder by the package's placeholder is written
+/// with the installed forwarder's full path: the hooks and the channel server each start exactly
+/// that file, their arguments are the package's, and the file is known by the digest of what was
+/// written. Taking the bridge out removes those files by that digest.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_registration_is_written_with_the_installed_forwarders_path() {
+    let site = Site::new();
+    let bridges = site.bridges();
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    let path = site.forwarder().to_string_lossy().into_owned();
+    for file in [HOOKS_PATH, SERVERS_PATH] {
+        let bytes = std::fs::read(site.application().join(file)).expect("the installed file");
+        let commands = commands_of(&bytes);
+        assert!(!commands.is_empty(), "{file}");
+        assert!(
+            commands.iter().all(|command| *command == path),
+            "{file}: every command is the forwarder's full path: {commands:?}"
+        );
+    }
+    let reports = bridges.reports().expect("reads");
+    let hooks = reports[0]
+        .files
+        .iter()
+        .find(|file| file.path == HOOKS_PATH)
+        .expect("the hooks file is reported");
+    assert_eq!(
+        hooks.digest,
+        PayloadDigest::of(&site.written("hooks.json")).to_string(),
+        "known by the digest of what was written, not by the package's"
+    );
+    assert_ne!(hooks.digest, HOOKS_DIGEST);
+
+    bridges.reconcile(&plugin(), None).expect("removes");
+    assert!(!site.application().join(HOOKS_PATH).exists());
+    assert!(!site.application().join(SERVERS_PATH).exists());
+}
+
+/// KR-REQ-11.42: a forwarder whose path holds a space, an apostrophe, a dollar sign, a backtick, an
+/// ampersand, a percent sign, a double quotation mark, a backslash or non-ASCII text is written so
+/// that the document still holds exactly that path as the command: nothing of it is read as syntax
+/// of the document. The control is the plain path, which the same code writes.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_forwarder_path_that_holds_syntax_is_written_whole() {
+    for directory in std::iter::once("plain").chain(AWKWARD.iter().copied()) {
+        let site = Site::with_forwarder_in(directory);
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles");
+        assert_eq!(settled, Settled::Applied, "{directory}");
+        let path = site.forwarder().to_string_lossy().into_owned();
+        for file in [HOOKS_PATH, SERVERS_PATH] {
+            let bytes = std::fs::read(site.application().join(file)).expect("the installed file");
+            assert_eq!(
+                commands_of(&bytes),
+                vec![path.clone(); commands_of(&bytes).len()],
+                "{directory}: {file}"
+            );
+        }
+    }
+}
+
+/// A forwarder whose directory name holds shell syntax, installed by Gemini CLI's recipe into its
+/// hooks file, and the line that file gives Gemini CLI to run, run by a real shell the way Gemini
+/// CLI runs it.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_gemini_cli_hook_line_starts_exactly_the_forwarder_whatever_its_path_holds() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for directory in std::iter::once("plain").chain(AWKWARD.iter().copied()) {
+        let site = GeminiSite::new();
+        // A forwarder of this site's own, in a directory with the awkward name: a script that writes
+        // the arguments it was started with beside itself.
+        let program = site.root.join(directory).join("kr-hook");
+        std::fs::create_dir_all(program.parent().expect("a parent")).expect("a directory");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nfor argument in \"$@\"; do printf '%s\\n' \"$argument\"; done > \"$(dirname \"$0\")/arguments\"\n",
+        )
+        .expect("the forwarder");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("runnable");
+        let mut host = site.host();
+        host.forwarder = Some(program.clone());
+        let bridges = NativeBridges::new(host);
+
+        let settled = bridges
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("reconciles");
+        assert_eq!(settled, Settled::Applied, "{directory}");
+
+        let hooks = std::fs::read(site.application().join(GEMINI_HOOKS_PATH)).expect("the hooks");
+        let lines = commands_of(&hooks);
+        assert_eq!(lines.len(), 3, "{directory}");
+        let working = program.parent().expect("a parent").to_path_buf();
+        for line in lines {
+            let ran = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&line)
+                .current_dir(&working)
+                .output()
+                .expect("the shell runs");
+            assert!(
+                ran.status.success() && ran.stderr.is_empty(),
+                "{directory}: {line}: {}",
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(working.join("arguments")).expect("the forwarder ran"),
+                "gemini-cli\nhook\n",
+                "{directory}: the shell started the forwarder with the package's two arguments"
+            );
+            assert!(
+                !working.join("PLANTED").exists() && !site.root.join("PLANTED").exists(),
+                "{directory}: nothing the path spells ran"
+            );
+        }
+    }
+}
+
+/// KR-REQ-11.42: a package that registers the bare name, as the packages before the placeholder do,
+/// installs the bytes its recipe names unchanged. The control is the same recipe with the
+/// placeholder, which is written with the path.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_package_that_registers_the_bare_name_installs_its_bytes_unchanged() {
+    let site = Site::new();
+    let bare = String::from_utf8(pinned("hooks.json"))
+        .expect("text")
+        .replace(kr_plugin_sdk::forwarder::PLACEHOLDER, "kr-hook");
+    let bridges = site.bridges();
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release_with_hooks("bare", &bare)))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    assert_eq!(
+        std::fs::read(site.application().join(HOOKS_PATH)).expect("the hooks"),
+        bare.as_bytes(),
+        "the bare name is installed as the package wrote it"
+    );
+}
+
+/// KR-REQ-11.42: a placeholder anywhere but at the start of a command, or a document in which it
+/// would start something other than the forwarder, refuses the recipe before anything is written.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_written() {
+    for (name, hooks) in [
+        (
+            "inside a word",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "x{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
+            "after a word",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "{kr_hook}x", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
+            "as the application it reports for",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "{kr_hook}", "args": ["{kr_hook}", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
+            "as a name",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "{kr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
+            "beside another command",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "{kr_hook} claude-code hook; other", "timeout": 5}]}]}}"#,
+        ),
+    ] {
+        let site = Site::new();
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release_with_hooks("odd", hooks)))
+            .expect("reconciles");
+        assert!(
+            matches!(settled, Settled::Refused(_)),
+            "{name}: refused, not {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "{name}: nothing was written");
+    }
+}
+
+/// KR-REQ-11.42: a release applied with one forwarder is not the release wanted once this host names
+/// another: it is taken out and applied again with the new path, so the registration never names a
+/// program that is no longer the installation's. The control is the same host, which changes nothing.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_release_is_applied_again_when_the_forwarder_it_names_has_moved() {
+    let site = Site::new();
+    site.bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    assert_eq!(
+        site.bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles"),
+        Settled::Unchanged,
+        "the same forwarder changes nothing"
+    );
+
+    let moved = site.root.join("moved/kr-hook");
+    std::fs::create_dir_all(moved.parent().expect("a parent")).expect("a directory");
+    std::fs::write(&moved, b"a stand-in for the forwarder").expect("a forwarder");
+    let mut host = site.host();
+    host.forwarder = Some(moved.clone());
+    let elsewhere = NativeBridges::new(host);
+
+    let settled = elsewhere
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    let path = moved.to_string_lossy().into_owned();
+    let hooks = std::fs::read(site.application().join(HOOKS_PATH)).expect("the hooks");
+    assert!(
+        commands_of(&hooks).iter().all(|command| *command == path),
+        "every command is the new forwarder"
+    );
+}
+
 /// A second reconciliation of an applied release changes nothing, and a new host reads the same
 /// record back.
 #[cfg(unix)]
@@ -450,7 +781,7 @@ fn a_release_follows_the_application_directory_to_another_place() {
 
     assert_eq!(settled, Settled::Applied);
     assert_eq!(site.tree(), before, "taken out of the first directory");
-    let mut expected = applied_tree(&other_before);
+    let mut expected = applied_tree(&other_before, &site.forwarder());
     expected.insert("skills".to_owned(), Node::Directory);
     assert_eq!(snapshot(&other), expected, "and applied in the second");
 }
@@ -572,7 +903,7 @@ fn kr_req_11_42_a_file_this_host_did_not_write_is_refused() {
     let site = Site::new();
     let existing = site.application().join(SERVERS_PATH);
     std::fs::create_dir_all(existing.parent().expect("a parent")).expect("a directory");
-    std::fs::write(&existing, pinned("mcp-servers.json")).expect("the same bytes");
+    std::fs::write(&existing, site.written("mcp-servers.json")).expect("the same bytes");
     let before = site.tree();
     let bridges = site.bridges();
 
@@ -1220,7 +1551,7 @@ fn a_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
     assert_eq!(settled, Settled::Applied, "{settled:?}");
     assert_eq!(
         site.tree(),
-        applied_tree(&before),
+        applied_tree(&before, &site.forwarder()),
         "applied beside the empty directories"
     );
 }
@@ -1281,7 +1612,11 @@ fn a_directory_put_in_the_place_of_the_one_this_host_made_is_refused() {
         .reconcile(&plugin(), Some(&site.release()))
         .expect("finishes");
     assert_eq!(settled, Settled::Applied, "{settled:?}");
-    assert_eq!(site.tree(), applied_tree(&before), "finished exactly");
+    assert_eq!(
+        site.tree(),
+        applied_tree(&before, &site.forwarder()),
+        "finished exactly"
+    );
 
     // Another directory is in its place.
     let stopped = stopped_at(stop, &|_| {}, &apply).expect("stops after the record");
@@ -1466,7 +1801,7 @@ fn a_name_for_the_directory_itself_and_a_hidden_folder_are_not_another_plugin() 
         .reconcile(&plugin(), Some(&site.release()))
         .expect("finishes");
     assert_eq!(settled, Settled::Applied, "{settled:?}");
-    let mut expected = applied_tree(&before);
+    let mut expected = applied_tree(&before, &site.forwarder());
     expected.insert(
         "skills/alias".to_owned(),
         Node::Link(PathBuf::from("kalareach-channels")),
@@ -1838,7 +2173,8 @@ fn a_removal_is_not_sent_through_a_link_into_another_directory() {
         .expect("applies");
     let elsewhere = site.root.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("another directory");
-    std::fs::write(elsewhere.join("hooks.json"), pinned("hooks.json")).expect("the same bytes");
+    std::fs::write(elsewhere.join("hooks.json"), site.written("hooks.json"))
+        .expect("the same bytes");
     let hooks = site.application().join("skills/kalareach-channels/hooks");
     std::fs::remove_dir_all(&hooks).expect("somebody removes it");
     std::os::unix::fs::symlink(&elsewhere, &hooks).expect("and puts a link there");
@@ -1847,7 +2183,7 @@ fn a_removal_is_not_sent_through_a_link_into_another_directory() {
 
     assert_eq!(
         std::fs::read(elsewhere.join("hooks.json")).expect("still there"),
-        pinned("hooks.json"),
+        site.written("hooks.json"),
         "the file the link leads to is not touched"
     );
     let reports = bridges.reports().expect("reads");
@@ -2326,7 +2662,6 @@ fn left_and_named(site: &Site, settled: &Settled, step: usize) {
 fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone() {
     let reference = Site::new();
     let before = reference.tree();
-    let applied = applied_tree(&before);
     let mut boundaries = 0;
     let mut unrecorded = 0;
     for step in 1.. {
@@ -2338,6 +2673,8 @@ fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone()
         };
         boundaries += 1;
         let site = &stopped.site;
+        // Each site registers its own forwarder, so each ends with the tree written with its path.
+        let applied = applied_tree(&before, &site.forwarder());
         assert!(
             site.bridges()
                 .facts(&plugin(), site.release().package_digest)
@@ -2493,9 +2830,13 @@ fn an_upgrade_stopped_at_each_boundary_ends_with_the_new_release() {
         } else {
             assert_eq!(settled, Settled::Applied, "step {step}");
         }
+        let template =
+            std::fs::read_to_string(site.package("b").join("bridge/hooks.json")).expect("reads");
         assert_eq!(
             std::fs::read(site.application().join(HOOKS_PATH)).expect("the new file"),
-            std::fs::read(site.package("b").join("bridge/hooks.json")).expect("reads"),
+            kr_plugin_sdk::forwarder::expand(&template, &site.forwarder())
+                .expect("written with the forwarder")
+                .into_bytes(),
             "step {step}"
         );
         assert!(
@@ -3067,7 +3408,7 @@ fn protection_is_read_from_the_document_the_replacement_would_take_the_place_of(
     );
     let mut moved = snapshot(&original);
     moved.remove("settings.json");
-    let mut expected = applied_tree(&before);
+    let mut expected = applied_tree(&before, &site.forwarder());
     expected.remove("settings.json");
     assert_eq!(
         moved, expected,
@@ -3516,12 +3857,15 @@ fn a_copy_of_an_installed_file_is_not_taken_for_it() {
     // Somebody writes the same bytes to a new file and puts it in the installed file's place.
     let hooks = site.application().join(HOOKS_PATH);
     let copy = site.root.join("hooks-copy.json");
-    std::fs::write(&copy, pinned("hooks.json")).expect("a copy");
+    std::fs::write(&copy, site.written("hooks.json")).expect("a copy");
     std::fs::rename(&copy, &hooks).expect("put in its place");
 
     bridges.reconcile(&plugin(), None).expect("reconciles");
 
-    assert_eq!(std::fs::read(&hooks).expect("left"), pinned("hooks.json"));
+    assert_eq!(
+        std::fs::read(&hooks).expect("left"),
+        site.written("hooks.json")
+    );
     assert!(
         !site.application().join(SERVERS_PATH).exists(),
         "the rest goes"
@@ -4073,7 +4417,7 @@ const GEMINI_RECORD_DIGEST: &str =
 const GEMINI_MANIFEST_DIGEST: &str =
     "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7";
 const GEMINI_HOOKS_DIGEST: &str =
-    "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba";
+    "8b5a969d228a005058462485bbbc79bd74fec9fb64a7837dc9efe10987992a18";
 
 const GEMINI_RECORD_PATH: &str = "extensions/kalareach/.gemini-extension-install.json";
 const GEMINI_MANIFEST_PATH: &str = "extensions/kalareach/gemini-extension.json";
@@ -4097,6 +4441,15 @@ fn gemini_pinned(name: &str) -> Vec<u8> {
             .join(name),
     )
     .expect("a pinned Gemini CLI file")
+}
+
+/// The bytes the executor installs for one pinned Gemini CLI file: the package's file with the
+/// forwarder's path written where the package names the forwarder.
+fn gemini_written(name: &str, forwarder: &Path) -> Vec<u8> {
+    let template = String::from_utf8(gemini_pinned(name)).expect("a text file");
+    kr_plugin_sdk::forwarder::expand(&template, forwarder)
+        .expect("the file is written with the forwarder")
+        .into_bytes()
 }
 
 /// The recipe the Gemini CLI package ships, as its manifest states it.
@@ -4238,7 +4591,10 @@ impl GeminiSite {
             (GEMINI_MANIFEST_PATH, "gemini-extension.json"),
             (GEMINI_HOOKS_PATH, "hooks.json"),
         ] {
-            expected.insert(path.to_owned(), Node::File(gemini_pinned(name)));
+            expected.insert(
+                path.to_owned(),
+                Node::File(gemini_written(name, &self.forwarder())),
+            );
         }
         expected
     }
@@ -4487,7 +4843,6 @@ fn kr_req_11_42_an_application_the_host_does_not_know_places_nothing() {
 fn kr_req_11_42_a_gemini_cli_installation_stopped_at_each_boundary_is_finished_or_undone() {
     let reference = GeminiSite::new();
     let before = reference.tree();
-    let applied = reference.applied(&before);
     let mut boundaries = 0;
     let mut unrecorded = 0;
     for step in 1.. {
@@ -4498,6 +4853,7 @@ fn kr_req_11_42_a_gemini_cli_installation_stopped_at_each_boundary_is_finished_o
             break;
         }
         boundaries += 1;
+        let applied = site.applied(&before);
         let left_unrecorded = bridges
             .steps()
             .last()
@@ -4820,10 +5176,14 @@ fn kr_req_11_42_the_doctor_reports_an_applied_bridge_and_its_files_by_digest() {
         .map(|file| (file.path.as_str(), file.digest.as_str()))
         .collect();
     files.sort_unstable();
+    // The hooks file is known by the digest of what was written, with the forwarder's path in it,
+    // and not by the digest of the package's file.
+    let hooks_written =
+        PayloadDigest::of(&gemini_written("hooks.json", &site.forwarder())).to_string();
     let mut expected = [
         (GEMINI_RECORD_PATH, GEMINI_RECORD_DIGEST),
         (GEMINI_MANIFEST_PATH, GEMINI_MANIFEST_DIGEST),
-        (GEMINI_HOOKS_PATH, GEMINI_HOOKS_DIGEST),
+        (GEMINI_HOOKS_PATH, hooks_written.as_str()),
     ];
     expected.sort_unstable();
     assert_eq!(files, expected, "each file the host published, by digest");

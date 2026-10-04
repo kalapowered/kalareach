@@ -702,6 +702,95 @@ async fn kr_req_12_07_a_session_entry_whose_flags_are_not_the_package_s_establis
     assert!(setup.backends.root().is_none(), "nothing was created");
 }
 
+fn qoder(flags: Vec<String>) -> CommandIntegration {
+    CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/qoder-cli")
+            .expect("a plugin identifier"),
+        command: "qodercli".to_owned(),
+        flags,
+        enabled: true,
+    }
+}
+
+/// KR-REQ-12.22: a package whose flags name the forwarder by the placeholder is compared with the
+/// session's flags after the same replacement: the session's entry, which the daemon wrote with the
+/// installed forwarder's path, establishes, and the answer adds those flags. An entry holding the
+/// package's text as declared, the path of another forwarder, or a worker that can name no
+/// forwarder, establishes nothing.
+#[tokio::test]
+async fn kr_req_12_22_flags_that_name_the_forwarder_are_compared_after_it_is_written() {
+    let setup = Setup::shaped(
+        &fixture::Shape::qoder_cli(),
+        &["bin", "qodercli"],
+        |config| config,
+    );
+    let forwarder = setup.directory.join("bin").join(executable_name("kr-hook"));
+    let declared = fixture::qoder_flags();
+    let written = kr_plugin_sdk::forwarder::expand_flags(&declared, Some(&forwarder))
+        .expect("the flags are written with the forwarder");
+    assert_ne!(written, declared, "the placeholder is replaced");
+
+    let answered = invocation_adding(
+        &["qodercli"],
+        &written.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    setup
+        .backends
+        .establish(&request(&setup, &answered, &qoder(written.clone()), 1))
+        .expect("the entry the daemon wrote establishes");
+    assert_eq!(
+        registration_name(
+            &setup
+                .backends
+                .establish(&request(&setup, &answered, &qoder(written.clone()), 1))
+                .expect("a retry gets the backend it was given")
+        ),
+        "registration.1.2"
+    );
+
+    for (why, entry) in [
+        ("the package's text as declared", qoder(declared.clone())),
+        (
+            "another forwarder's path",
+            qoder(
+                kr_plugin_sdk::forwarder::expand_flags(
+                    &declared,
+                    Some(
+                        &setup
+                            .directory
+                            .join("elsewhere")
+                            .join(executable_name("kr-hook")),
+                    ),
+                )
+                .expect("written"),
+            ),
+        ),
+    ] {
+        let later = invocation_adding(
+            &["qodercli"],
+            &entry.flags.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        setup
+            .backends
+            .establish(&request(&setup, &later, &entry, 2))
+            .expect_err(why);
+    }
+
+    let without = Setup::shaped(
+        &fixture::Shape::qoder_cli(),
+        &["bin", "qodercli"],
+        |config| CommandBackendsConfig {
+            registered_forwarder: None,
+            ..config
+        },
+    );
+    without
+        .backends
+        .establish(&request(&without, &answered, &qoder(written), 1))
+        .expect_err("a worker that can name no forwarder cannot write the flags");
+    assert!(without.backends.root().is_none(), "and nothing is created");
+}
+
 /// KR-REQ-12.07: the integration's flags are added whole or not at all. A run that leaves one out,
 /// as the shell's answer does when the person typed that one, establishes nothing, so the command
 /// runs as typed; one the person typed whole establishes with nothing added.

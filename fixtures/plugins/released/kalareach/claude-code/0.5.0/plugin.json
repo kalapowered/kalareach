@@ -2,14 +2,14 @@
   "manifest_version": 1,
   "publisher_id": "kalareach",
   "plugin_name": "claude-code",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "display_name": "Claude Code",
   "description": "Recognises Claude Code, observes it through lifecycle and tool hooks, carries a message into the session and declares how the tool approvals it relays are answered.",
-  "sdk_range": ">=0.1.2, <0.2.0",
+  "sdk_range": ">=0.1.3, <0.2.0",
   "wit_range": ">=0.1.0, <0.2.0",
   "source": {
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "revision": "3efd5eed04308e54e6a55c19f7483c55d8b3e515"
+    "revision": "2760679a70dd8f7b177266b69a6bab93de084b27"
   },
   "match_rules": [
     {
@@ -61,20 +61,20 @@
     {
       "role": "asset",
       "path": "README.md",
-      "digest": "aecc4582377dc8867e6f72847e14c635821930899ea1f0ff3ee13f68227a69c2",
-      "size_bytes": "12304"
+      "digest": "3134eb0cfde9e7c2c6a3f0c3301fc307c34e415c96bca6976407559f7e089fde",
+      "size_bytes": "12445"
     },
     {
       "role": "native_bridge",
       "path": "bridge/hooks.json",
-      "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727",
-      "size_bytes": "1398"
+      "digest": "c81a5d098b6282ddfc1111183e308e3ab6094bcb76a6455019df7133c0f0f641",
+      "size_bytes": "1408"
     },
     {
       "role": "native_bridge",
       "path": "bridge/mcp-servers.json",
-      "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea",
-      "size_bytes": "167"
+      "digest": "b514ddff583d9c3d926233ce402b4e7d27eb3b76cffce369f5ea4cb30460c82a",
+      "size_bytes": "169"
     },
     {
       "role": "native_bridge",
@@ -246,13 +246,13 @@
         "type": "install_file",
         "source": "bridge/mcp-servers.json",
         "destination": "skills/kalareach-channels/.mcp.json",
-        "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea"
+        "digest": "b514ddff583d9c3d926233ce402b4e7d27eb3b76cffce369f5ea4cb30460c82a"
       },
       {
         "type": "install_file",
         "source": "bridge/hooks.json",
         "destination": "skills/kalareach-channels/hooks/hooks.json",
-        "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727"
+        "digest": "c81a5d098b6282ddfc1111183e308e3ab6094bcb76a6455019df7133c0f0f641"
       },
       {
         "type": "add_configuration_key",
@@ -270,12 +270,12 @@
       {
         "type": "remove_file",
         "destination": "skills/kalareach-channels/hooks/hooks.json",
-        "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727"
+        "digest": "c81a5d098b6282ddfc1111183e308e3ab6094bcb76a6455019df7133c0f0f641"
       },
       {
         "type": "remove_file",
         "destination": "skills/kalareach-channels/.mcp.json",
-        "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea"
+        "digest": "b514ddff583d9c3d926233ce402b4e7d27eb3b76cffce369f5ea4cb30460c82a"
       },
       {
         "type": "remove_file",
@@ -283,7 +283,7 @@
         "digest": "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c"
       }
     ],
-    "grant_statement": "Installs three registration files under your own Claude Code directory, where they apply to every project and every later session, and adds one settings key that enables them. Claude Code then starts the KalaReach forwarder itself, so the forwarder runs under Claude Code's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees the session's SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification events, and every Channels tool approval relayed to it. Removal takes the key back out and deletes exactly those three files, each only while it still holds the bytes that were installed."
+    "grant_statement": "Installs three registration files under your own Claude Code directory, where they apply to every project and every later session, and adds one settings key that enables them. Each file names the KalaReach forwarder by the full path of the copy KalaReach installed, which KalaReach writes into the file when it installs it. Claude Code then starts the KalaReach forwarder itself, so the forwarder runs under Claude Code's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees the session's SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification events, and every Channels tool approval relayed to it. Removal takes the key back out and deletes exactly those three files, each only while it still holds the bytes that were installed."
   },
   "command_integration": {
     "command": "claude",
