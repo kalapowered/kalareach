@@ -924,8 +924,9 @@ Restoring the cursor is a little different. When the pinned revision restores a 
 
 The historical-row bound is enforced rather than reported. What the retained rows cost is carried,
 charged where each row leaves the screen, and when the charge passes the bound the engine lowers the
-library's scrollback row count until the older rows are evicted, then puts the configured count
-back, so the history grows again when later rows cost less. That happens after
+library's scrollback row count until the older rows are evicted, and until a thirty-second of the
+bound is free besides, to reduce how often evictions come, then puts the configured count back, so
+the history grows again when later rows cost less. That happens after
 every grid mutation, so the bound is enforced where the rows arrive rather than at whichever read
 comes next: two rows can carry more than the whole of it. Reading every retained row's cells is a
 separate thing, needed for what the hyperlink objects cost, and it happens when the stream goes
