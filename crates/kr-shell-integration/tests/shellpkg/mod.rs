@@ -479,6 +479,8 @@ pub struct Commands {
     close_requested: bool,
     /// Every resolve the bridge asked.
     pub resolves: Vec<kr_protocol::root::RootCommandResolveParams>,
+    /// The resolves this side left unanswered, by the identifier the bridge gave each.
+    pub unanswered: Vec<RequestId>,
     /// Every command block the bridge reported.
     pub blocks: Vec<kr_protocol::root::RootCommandBlockParams>,
     /// The capability each acceptance was answered with.
@@ -1281,6 +1283,9 @@ impl Session {
                         self.last_idle_empty = idle.editor.buffer_empty;
                     }
                     let outcome = self.routine_answer(&event);
+                    if outcome.is_none() && matches!(event, BridgeEvent::CommandResolve(_)) {
+                        self.commands.unanswered.push(id);
+                    }
                     if let Some(result) = outcome {
                         // What a case put ahead of this answer goes first, in the same write, so
                         // the shell reads it while it waits.

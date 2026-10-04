@@ -176,10 +176,11 @@ if ($Mode -eq 'wait') {
     Write-Report ("queued {0}" -f ($queued -join ','))
     # The second question is never answered, so the wait ends with nothing, and the answer is owed.
     $second = Ask-About 'two' 1500
-    Write-Report ("second answered={0} owed={1}" -f ($null -ne $second), ($script:Kr.Owed -ne 0))
-    # While an answer is owed a question sends nothing.
+    Write-Report ("second answered={0}" -f ($null -ne $second))
+    # While an answer is owed a question sends nothing, which the order of the frames the worker
+    # reads shows.
     $third = Ask-About 'three' 1500
-    Write-Report ("third answered={0} owed={1}" -f ($null -ne $third), ($script:Kr.Owed -ne 0))
+    Write-Report ("third answered={0}" -f ($null -ne $third))
     # A known event, which has to be the next frame the worker reads after the second question.
     Send-KrEvent 'hooks_activated' @{
         modules           = @()

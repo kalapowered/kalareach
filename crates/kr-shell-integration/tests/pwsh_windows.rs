@@ -509,8 +509,8 @@ async fn a_question_takes_only_its_answer_and_is_not_asked_again_while_one_is_ow
         "first answered=True\n",
         "first bypass=not_integrated\n",
         "queued fence_published,launch_revoked\n",
-        "second answered=False owed=True\n",
-        "third answered=False owed=True\n",
+        "second answered=False\n",
+        "third answered=False\n",
         "known event sent\n",
     ] {
         assert!(observed.contains(line), "{line:?} is not in:\n{observed}");
