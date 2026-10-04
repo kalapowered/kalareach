@@ -22,7 +22,7 @@
  * reads, or opens a settings pane, or records a choice for the installation to act on.
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach/protocol'
 
@@ -934,6 +934,19 @@ function HostStep({
  */
 function DescriptionsCard({ descriptions }: { readonly descriptions: DescriptionSetupState }): ReactNode {
   const { setup, failure, refusal, busy } = descriptions
+  // Pressing the fetch's button replaces it with the button for what it started. A person on the
+  // keyboard, or with a screen reader, is left where the press was: on the new button, not the page.
+  const footer = useRef<HTMLElement>(null)
+  const pressedFetch = useRef(false)
+  useEffect(() => {
+    if (!pressedFetch.current || busy) return
+    pressedFetch.current = false
+    if (document.activeElement === document.body) footer.current?.querySelector('button')?.focus()
+  }, [busy])
+  const askFetch = (action: 'start' | 'cancel'): void => {
+    pressedFetch.current = true
+    descriptions.download(action)
+  }
   const status = setup === null ? null : statusOf(setup)
   const fraction = setup === null ? null : fetchedFraction(setup)
   const canStart =
@@ -962,7 +975,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           named by its directory.
         </p>
         {setup === null ? (
-          <p className="faint small" data-testid="setup-model-unread">
+          <p className="faint small" data-testid="setup-model-unread" role={failure ? 'alert' : undefined}>
             {failure
               ? `What this host offers could not be read. ${failure}`
               : 'Reading what this host offers…'}
@@ -995,7 +1008,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
               </p>
             ) : null}
             {setup.download === 'failed' ? (
-              <p className="faint small" data-testid="setup-model-failure">
+              <p className="faint small" data-testid="setup-model-failure" role="alert">
                 The download failed. {setup.failure ?? 'The host gave no reason.'}
               </p>
             ) : null}
@@ -1008,7 +1021,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           </>
         ) : null}
         {refusal ? (
-          <p className="faint small" data-testid="setup-model-refused">
+          <p className="faint small" data-testid="setup-model-refused" role="alert">
             {refusal}
           </p>
         ) : null}
@@ -1035,7 +1048,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           </label>
         </div>
       ) : null}
-      <footer className="card-footer setup-route">
+      <footer className="card-footer setup-route" ref={footer}>
         {setup === null ? (
           <Button data-testid="setup-model-retry" disabled={busy} onClick={descriptions.reload}>
             Ask again
@@ -1046,7 +1059,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             data-testid="setup-model-cancel"
             disabled={busy}
             onClick={() => {
-              descriptions.download('cancel')
+              askFetch('cancel')
             }}
           >
             Cancel the download
@@ -1058,7 +1071,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             data-testid="setup-model-download"
             disabled={busy}
             onClick={() => {
-              descriptions.download('start')
+              askFetch('start')
             }}
           >
             {setup.download === 'failed' ? 'Try the download again' : 'Download it'}
