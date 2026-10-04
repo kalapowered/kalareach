@@ -1333,15 +1333,19 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
         expected_buffer_revision: EditorBufferRevision::new(1),
     };
     let target = wired.target();
+    // The caller's connection is handed back with its answer and kept until the case ends. It is
+    // the lease holder's, so when it goes the lease ends, and keys the writer has not yet written
+    // by then are dropped with it, however soon the writer would have written them.
     let calling = tokio::spawn(async move {
-        client
+        let outcome = client
             .mutate(
                 Method::ShellLaunch,
                 ActionId::new(kr_ipc::new_uuid()),
                 target,
                 &params,
             )
-            .await
+            .await;
+        (client, outcome)
     });
     tokio::time::timeout(SOON, async {
         while wired.runtime.session().fence().expect("a driver").state()
@@ -1389,12 +1393,11 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
         );
         assert_eq!(session.waiting_for_fence(), 0);
     }
-    let error = tokio::time::timeout(SOON, calling)
+    let (_client, outcome) = tokio::time::timeout(SOON, calling)
         .await
         .expect("the caller was answered")
-        .expect("joins")
-        .expect("reaches the worker")
-        .expect_err("refused");
+        .expect("joins");
+    let error = outcome.expect("reaches the worker").expect_err("refused");
     assert_eq!(
         error.code,
         ErrorCode::OutcomeUnknown,
