@@ -512,12 +512,16 @@ fn resolved(
     if report.state == CommandIntegrationState::On
         && report.reason.0.is_none()
         && cfg!(windows)
-        && kr_plugin_sdk::forwarder::starts_by_bare_name(&report.flags)
+        && connector
+            .and_then(|connector| connector.manifest().command_integration.as_ref())
+            .is_some_and(|declared| {
+                kr_plugin_sdk::forwarder::names_the_forwarder_itself(&declared.flags)
+            })
     {
         report.reason = Nullable::some(
-            "its flags start the forwarder by its bare name, which Windows looks for in the \
-             application's working directory first, so an invocation runs as typed until the \
-             package names the forwarder by its path"
+            "its flags name the forwarder by its own name, which an application may look for in \
+             its working directory before its search path, so an invocation runs as typed until \
+             the package names the forwarder by the placeholder"
                 .to_owned(),
         );
     }
@@ -641,8 +645,13 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
             None,
         );
     }
+    // A reason beside an integration that is on says why an invocation runs as typed here: the
+    // flags cannot be written, or the executable found first is a shim, so a new session gets none
+    // of it.
     let usable = |report: &&CommandIntegrationReport| {
-        report.state == CommandIntegrationState::On && report.unavailable.0.is_none()
+        report.state == CommandIntegrationState::On
+            && report.unavailable.0.is_none()
+            && report.reason.0.is_none()
     };
     let on = reports.iter().filter(usable).count();
     let off = reports

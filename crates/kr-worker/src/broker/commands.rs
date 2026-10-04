@@ -705,16 +705,17 @@ impl CommandBackends {
                  connector declares"
             ));
         }
-        // Windows looks for a program started by a bare name in the application's own working
-        // directory before its search path, so flags that start the forwarder that way would run a
-        // program planted there. The packages written before the placeholder do. This refusal goes
-        // with the bare-name forms the native bridge executor still reads, once no catalogue holds
-        // such a package.
-        if cfg!(windows) && kr_plugin_sdk::forwarder::starts_by_bare_name(&declared.flags) {
+        // An application may look for a program started by a bare name in its own working directory
+        // before its search path (Qoder CLI does on Windows), so flags that name the forwarder by
+        // its own name would run a program planted there. The packages written before the
+        // placeholder do. This refusal goes with the bare-name forms the native bridge executor
+        // still reads, once no catalogue holds such a package.
+        if cfg!(windows) && kr_plugin_sdk::forwarder::names_the_forwarder_itself(&declared.flags) {
             return Err(format!(
-                "the flags the installed connector declares start the forwarder by its bare name, \
-                 which Windows looks for in the application's working directory first, so \
-                 {command:?} runs as typed until the package names the forwarder by its path"
+                "the flags the installed connector declares name the forwarder by its own name, \
+                 which an application may look for in its working directory before its search \
+                 path, so {command:?} runs as typed until the package names the forwarder by the \
+                 placeholder"
             ));
         }
         // The flags are whole argument elements in a fixed order, so they are added as one run or,

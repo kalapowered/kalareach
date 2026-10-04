@@ -18,9 +18,10 @@
 //! the host cannot replace without guessing what it means, and the host refuses it. So does a
 //! package that spells it with JSON escapes (`\u007bkr_hook}`): an application decodes the string
 //! to the placeholder and would start a program of that name, and the host replaces only what it
-//! finds written out. The same function serves a registration file and a flag whose value is a JSON
-//! document (Qoder CLI's inline settings), since in both the placeholder stands inside a JSON
-//! string.
+//! finds written out. The escapes are read in the text as it stands, whether or not the text as a
+//! whole is a JSON document, since a flag can carry one after an option's name. The same function
+//! serves a registration file and a flag whose value is a JSON document (Qoder CLI's inline
+//! settings), since in both the placeholder stands inside a JSON string.
 
 use std::path::Path;
 
@@ -29,6 +30,41 @@ pub const PLACEHOLDER: &str = "{kr_hook}";
 
 /// The forwarder's own name, which the packages written before the placeholder start it by.
 const BARE_NAME: &str = "kr-hook";
+
+/// The number of times the placeholder appears in `text`.
+fn count(text: &str) -> usize {
+    text.matches(PLACEHOLDER).count()
+}
+
+/// `text` with every JSON escape of an ASCII character (`\u007b` for a left brace) written as that
+/// character. Any other backslash stays with the character after it, so an escaped backslash
+/// followed by `u007b` is the text it is. The escapes are read wherever they stand, in a text that
+/// is not a JSON document as well.
+fn unescaped(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let rest = characters.as_str();
+        let ascii = rest
+            .strip_prefix('u')
+            .and_then(|digits| digits.get(..4))
+            .filter(|digits| digits.bytes().all(|digit| digit.is_ascii_hexdigit()))
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+            .filter(u8::is_ascii);
+        if let Some(ascii) = ascii {
+            decoded.push(char::from(ascii));
+            characters = rest[5..].chars();
+        } else {
+            decoded.push(character);
+            decoded.extend(characters.next());
+        }
+    }
+    decoded
+}
 
 /// Why a text could not be written with the forwarder's path.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -48,30 +84,15 @@ pub enum ExpandError {
         /// Where the placeholder starts, in bytes.
         at: usize,
     },
-    /// A JSON string holds the placeholder only once its escapes are read.
+    /// The placeholder is written with JSON escapes.
     #[error("{PLACEHOLDER} is written with JSON escapes, which the host does not replace")]
     Escaped,
 }
 
-/// Returns true when `text` holds the placeholder, written out or, where `text` is JSON, in a key
-/// or a string it decodes to.
+/// Returns true when `text` holds the placeholder, written out or spelt with JSON escapes.
 #[must_use]
 pub fn mentions(text: &str) -> bool {
-    text.contains(PLACEHOLDER)
-        || serde_json::from_str::<serde_json::Value>(text)
-            .is_ok_and(|document| decoded_mentions(&document))
-}
-
-/// Whether a key or a string of `document` holds the placeholder.
-fn decoded_mentions(document: &serde_json::Value) -> bool {
-    match document {
-        serde_json::Value::String(text) => text.contains(PLACEHOLDER),
-        serde_json::Value::Array(items) => items.iter().any(decoded_mentions),
-        serde_json::Value::Object(members) => members
-            .iter()
-            .any(|(key, member)| key.contains(PLACEHOLDER) || decoded_mentions(member)),
-        _ => false,
-    }
+    text.contains(PLACEHOLDER) || unescaped(text).contains(PLACEHOLDER)
 }
 
 /// Returns `text` with every placeholder replaced by `forwarder`, quoted for where it stands.
@@ -86,6 +107,11 @@ fn decoded_mentions(document: &serde_json::Value) -> bool {
 pub fn expand(text: &str, forwarder: &Path) -> Result<String, ExpandError> {
     if !mentions(text) {
         return Ok(text.to_owned());
+    }
+    // The escapes are read first, and only in what the package wrote: a placeholder the application
+    // would read that is not one written out was spelt with escapes.
+    if count(&unescaped(text)) > count(text) {
+        return Err(ExpandError::Escaped);
     }
     let path = forwarder.to_str().ok_or(ExpandError::NotText)?;
     let exec = json_text(path);
@@ -114,11 +140,6 @@ pub fn expand(text: &str, forwarder: &Path) -> Result<String, ExpandError> {
         consumed = at + PLACEHOLDER.len();
     }
     expanded.push_str(rest);
-    // What is left is read as the application reads it: a placeholder that was written out has been
-    // replaced, so one that a string holds now was spelt with escapes.
-    if mentions(&expanded) {
-        return Err(ExpandError::Escaped);
-    }
     Ok(expanded)
 }
 
@@ -159,29 +180,19 @@ pub fn expand_flags(
         .collect()
 }
 
-/// Returns true when a flag is a JSON document that starts the forwarder by its bare name, as the
-/// packages written before the placeholder do: `kr-hook` alone, or as the first word of a line.
+/// Returns true when a flag names the forwarder by its own name, as the packages written before the
+/// placeholder do (`kr-hook`, or as the first word of a line), in any case and with any suffix.
 ///
 /// A program that is started by a bare name is looked for in the application's own working directory
-/// first on Windows, so a program planted there would run in the forwarder's place.
+/// before its search path on some platforms, so a program planted there would run in the
+/// forwarder's place. The name is read where it stands in the text, whatever the text is, and JSON
+/// escapes are read first, so a flag that holds it anywhere is one: a package that needs the
+/// forwarder writes the placeholder, which the installed forwarder's path replaces.
 #[must_use]
-pub fn starts_by_bare_name(flags: &[String]) -> bool {
-    fn bare(document: &serde_json::Value) -> bool {
-        match document {
-            serde_json::Value::String(text) => {
-                text == BARE_NAME
-                    || text
-                        .strip_prefix(BARE_NAME)
-                        .is_some_and(|rest| rest.starts_with(' '))
-            }
-            serde_json::Value::Array(items) => items.iter().any(bare),
-            serde_json::Value::Object(members) => members.values().any(bare),
-            _ => false,
-        }
-    }
-    flags.iter().any(|flag| {
-        serde_json::from_str::<serde_json::Value>(flag).is_ok_and(|document| bare(&document))
-    })
+pub fn names_the_forwarder_itself(flags: &[String]) -> bool {
+    flags
+        .iter()
+        .any(|flag| unescaped(flag).to_ascii_lowercase().contains(BARE_NAME))
 }
 
 /// Writes `text` as the inside of a JSON string.
@@ -305,6 +316,10 @@ mod tests {
             r#"{"command": "\u007bkr_hook} gemini-cli hook"}"#,
             r#"{"\u007bkr_hook}": 1}"#,
             r#"{"a": "{kr_hook}", "b": "\u007bkr_hook}"}"#,
+            // Not a document as a whole: an option's name before the one that is.
+            r#"--settings={"command":"\u007bkr_hook}"}"#,
+            // A document a stricter reader refuses and a browser's accepts: a lone surrogate.
+            r#"{"x": "\ud800", "command": "\u007bkr_hook}"}"#,
         ] {
             assert!(mentions(template), "{template}");
             assert_eq!(
@@ -323,21 +338,41 @@ mod tests {
     }
 
     #[test]
-    fn flags_that_start_the_forwarder_by_its_bare_name_are_known() {
-        let bare = |text: &str| starts_by_bare_name(&[text.to_owned()]);
-        assert!(bare(
-            r#"{"hooks":[{"command":"kr-hook","args":["qoder-cli","hook"]}]}"#
-        ));
-        assert!(bare(r#"{"hooks":[{"command":"kr-hook qoder-cli hook"}]}"#));
-        assert!(!bare(
-            r#"{"hooks":[{"command":"{kr_hook}","args":["qoder-cli","hook"]}]}"#
-        ));
-        assert!(!bare(r#"{"hooks":[{"command":"/opt/kr-hook"}]}"#));
-        assert!(!bare("--settings"));
-        assert!(
-            !bare("kr-hook"),
-            "a flag that is not a document starts nothing"
-        );
+    fn flags_that_name_the_forwarder_itself_are_known_in_every_spelling() {
+        let names = |text: &str| names_the_forwarder_itself(&[text.to_owned()]);
+        for flag in [
+            r#"{"hooks":[{"command":"kr-hook","args":["qoder-cli","hook"]}]}"#,
+            r#"{"hooks":[{"command":"kr-hook qoder-cli hook"}]}"#,
+            r#"{"hooks":[{"command":"kr-hook.exe","args":["qoder-cli","hook"]}]}"#,
+            r#"{"hooks":[{"command":"KR-HOOK","args":["qoder-cli","hook"]}]}"#,
+            r#"{"hooks":[{"command":"kr-hook\tqoder-cli hook"}]}"#,
+            r#"{"hooks":[{"command":"\u006br-hook"}]}"#,
+            r#"--settings={"hooks":[{"command":"kr-hook"}]}"#,
+            "kr-hook",
+        ] {
+            assert!(names(flag), "{flag}");
+        }
+        for flag in [
+            r#"{"hooks":[{"command":"{kr_hook}","args":["qoder-cli","hook"]}]}"#,
+            "--settings",
+            "--model=other",
+        ] {
+            assert!(!names(flag), "{flag}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_backslash_before_the_text_of_an_escape_is_only_text() {
+        let text = r#"{"command": "\\u007bkr_hook}"}"#;
+        assert!(!mentions(text), "{text}");
+        assert_eq!(expand(text, Path::new("/opt/kr-hook")).as_deref(), Ok(text));
+    }
+
+    #[test]
+    fn a_path_that_holds_the_placeholders_text_is_written_as_the_path_it_is() {
+        let path = Path::new(r"C:\Users\{kr_hook}\KalaReach\kr-hook.exe");
+        let expanded = expand(r#"{"command": "{kr_hook}"}"#, path).expect("expands");
+        assert_eq!(decoded(&expanded)["command"], path.to_str().expect("text"));
     }
 
     #[test]

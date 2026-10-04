@@ -146,6 +146,11 @@ fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_t
         qoder.flags, entries[1].flags,
         "the doctor says what a session carries"
     );
+    assert_eq!(qoder.reason.0, None, "and says nothing of why it cannot");
+    assert_eq!(
+        check(&reported, &enabled(&["qoder-cli"])).status,
+        DoctorStatus::Ok
+    );
 
     let without = super::fill(&reading, &enabled(&["qoder-cli"]), None).entries;
     let qoder = without
@@ -177,35 +182,48 @@ fn flags_that_name_the_forwarder_are_written_with_its_path_for_the_session_and_t
         "the doctor says why an invocation runs as typed: {:?}",
         qoder.reason
     );
+    assert_eq!(
+        check(&reported, &enabled(&["qoder-cli"])).status,
+        DoctorStatus::Warning,
+        "and a new session cannot use it"
+    );
 }
 
-/// KR-REQ-12.22: where a program started by a bare name is looked for in the application's own
-/// working directory first, as on Windows, the doctor says that an integration whose flags start the
-/// forwarder that way runs as typed. Elsewhere it says nothing of the kind.
+/// KR-REQ-12.22: where an application may look for a program in its own working directory before its
+/// search path, as on Windows, the doctor says that an integration whose flags name the forwarder by
+/// its own name runs as typed, in whatever spelling, and a new session cannot use it. Elsewhere it says
+/// nothing of the kind.
 #[test]
-fn the_doctor_says_why_flags_that_start_the_forwarder_by_its_bare_name_run_as_typed_on_windows() {
+fn the_doctor_says_why_flags_that_name_the_forwarder_itself_run_as_typed_on_windows() {
     let store = Store::new("bare");
-    let bare: Vec<String> = fixture::qoder_flags()
-        .iter()
-        .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, "kr-hook"))
-        .collect();
-    let mut shape = fixture::Shape::qoder_cli();
-    shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(bare);
-    let reading = Integrations::new().read(&[store.admitted(&shape, |_| {})]);
-    let reported = report(
-        Some(&reading),
-        &[],
-        &enabled(&["qoder-cli"]),
-        &able(Vec::new()),
-    );
-    let reason = reported.reports[0].reason.0.as_deref();
-    if cfg!(windows) {
-        assert!(
-            reason.is_some_and(|reason| reason.contains("bare name")),
-            "{reason:?}"
+    for spelling in ["kr-hook", "KR-HOOK.exe"] {
+        let named: Vec<String> = fixture::qoder_flags()
+            .iter()
+            .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, spelling))
+            .collect();
+        let mut shape = fixture::Shape::qoder_cli();
+        shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(named);
+        let reading = Integrations::new().read(&[store.admitted(&shape, |_| {})]);
+        let reported = report(
+            Some(&reading),
+            &[],
+            &enabled(&["qoder-cli"]),
+            &able(Vec::new()),
         );
-    } else {
-        assert_eq!(reason, None);
+        let reason = reported.reports[0].reason.0.as_deref();
+        if cfg!(windows) {
+            assert!(
+                reason.is_some_and(|reason| reason.contains("its own name")),
+                "{spelling}: {reason:?}"
+            );
+            assert_eq!(
+                check(&reported, &enabled(&["qoder-cli"])).status,
+                DoctorStatus::Warning,
+                "{spelling}: a new session cannot use it"
+            );
+        } else {
+            assert_eq!(reason, None, "{spelling}");
+        }
     }
 }
 
