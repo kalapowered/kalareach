@@ -290,7 +290,7 @@ fn bound_title(selector: Option<u32>, parts: &mut Vec<Vec<u8>>) {
 /// Invalid UTF-8 becomes U+FFFD, which is what the byte policy says malformed text renders as, and
 /// a control scalar is dropped rather than painted. A payload that needed sanitising is one whose
 /// original bytes are never forwarded, so the two halves cannot diverge.
-fn sanitise(part: &[u8]) -> Vec<u8> {
+pub(crate) fn sanitise(part: &[u8]) -> Vec<u8> {
     if crate::event::bytes_are_direct_safe(part) {
         return part.to_vec();
     }
