@@ -1,0 +1,133 @@
+Subject: [PATCH 4/4] fish: report each line of the root shell as a block and ask the integration before starting its commands
+
+The interactive loop is where the root shell knows that it is about to run a line the person
+accepted. The line is reported there, with the capability the worker minted for it exported to the
+commands of that line and removed with it, and a block that is finished with the shell's own status
+when the line is. A line that the person cancels while the worker is being told of it, or that the
+shell is leaving, is ended before anything runs. A reader that starts inside a running line, such
+as the one a breakpoint runs, hands its own lines back to the evaluator and owns nothing.
+
+An opt-in command integration has to establish its backend before the program it serves starts, so
+the question is asked at the one point where the shell knows exactly what it is about to run: the
+executor, after the search has found the file and before the fork. It is asked only for an external
+command of that line that the root shell starts itself, in the foreground, in no pipeline and under
+no function, sourced file, `eval`, substitution, event, prompt or assignment. The answer either
+leaves the command exactly as it was, or names a launcher that the forked child starts in its
+place with the backend's variables added. A launcher that cannot be started leaves the command as
+it was typed. The answer is made before the fork, so nothing allocates in the child.
+
+Nothing the person sees changes: no key binding, no function, alias or hook of theirs, and no line
+in the history.
+
+This patch is a derivative work of fish and carries the GNU General Public Licence, version 2; see
+shells/fish/LICENSE.
+
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -36,7 +36,7 @@
+     InternalProc, Job, JobGroupRef, Pid, ProcStatus, Process, ProcessType, hup_jobs,
+     is_interactive_session, jobs_requiring_warning_on_exit, no_exec, print_exit_warning_for_jobs,
+ };
+-use crate::reader::{reader_run_count, restore_term_mode};
++use crate::reader::{kr_bridge, reader_run_count, restore_term_mode};
+ use crate::redirection::{Dup2List, dup2_list_resolve_chain};
+ use crate::signal::RawSignal;
+ use crate::threads::{ThreadPool, is_forked_child};
+@@ -889,10 +889,21 @@
+     let envv = parser.vars().export_array();
+ 
+     let actual_cmd = wcs2zstring(&p.actual_cmd);
++
++    // A command of the line the root shell runs itself asks the integration before it starts: it
++    // runs as it was typed, or through the launcher the answer names.
++    let kr_launch = match kr_bridge::asking(parser, j, p, proc_io_chain) {
++        kr_bridge::Asked::Launch(launch) => Some(launch),
++        kr_bridge::Asked::Stopped(status) => {
++            p.status.set(ProcStatus::from_exit_code(status));
++            return Err(());
++        }
++        kr_bridge::Asked::Not | kr_bridge::Asked::AsTyped => None,
++    };
+ 
+     #[cfg(have_posix_spawn)]
+     // Prefer to use posix_spawn, since it's faster on some systems like OS X.
+-    if can_use_posix_spawn_for_job(j, &dup2s) {
++    if kr_launch.is_none() && can_use_posix_spawn_for_job(j, &dup2s) {
+         let file = parser.current_filename.borrow();
+         let count = FORK_COUNT.fetch_add(1, Ordering::Relaxed) + 1; // spawn counts as a fork+exec
+ 
+@@ -934,6 +945,11 @@
+     }
+ 
+     fork_child_for_process(j, p, &dup2s, pgroup_policy, |p| {
++        if let Some(launch) = &kr_launch {
++            // Returns only when the launcher could not be started, and the command then runs as
++            // it was typed.
++            launch.exec();
++        }
+         signal_safe_launch_process(p, &actual_cmd, &argv, &envv)
+     })
+ }
+@@ -1016,6 +1032,8 @@
+     let io_chain = io_chain.clone();
+     let node = node.clone();
+     Box::new(move |parser: &mut Parser, _out, _err| {
++        // The body of a block process is a top block that is not a second line.
++        let _body = kr_bridge::CountedBlockProcess::new();
+         parser
+             .eval_node(&node, &io_chain, job_group.as_ref(), BlockType::Top)
+             .status
+--- a/src/reader/reader.rs
++++ b/src/reader/reader.rs
+@@ -942,15 +942,25 @@
+         tty.disable_tty_protocols();
+         reader.clear(EditableLineTag::Commandline);
+         reader.update_buff_pos(EditableLineTag::Commandline, None);
+-        BufferedOutputter::new(Outputter::stdoutput()).write_command(Osc133CommandStart(&command));
+-        event::fire_generic(
+-            reader.parser,
+-            L!("fish_preexec").to_owned(),
+-            vec![command.clone()],
+-        );
+-        let eval_res = reader_run_command(reader.parser, &command);
+-        signal_clear_cancel();
+-        if !eval_res.no_status {
++        // The root shell's own line is reported to the worker, which may have it ended before
++        // anything runs: the execution below is then skipped, and the rest of the pass still runs.
++        let kr_line = kr_bridge::command_starting(&mut reader, &command);
++        let kr_skipped = kr_line == kr_bridge::LineStart::Skipped;
++        let mut no_status = false;
++        if !kr_skipped {
++            BufferedOutputter::new(Outputter::stdoutput())
++                .write_command(Osc133CommandStart(&command));
++            event::fire_generic(
++                reader.parser,
++                L!("fish_preexec").to_owned(),
++                vec![command.clone()],
++            );
++            let eval_res = reader_run_command(reader.parser, &command);
++            kr_bridge::command_finished(&mut reader, kr_line);
++            signal_clear_cancel();
++            no_status = eval_res.no_status;
++        }
++        if !no_status {
+             STATUS_COUNT.fetch_add(1, Ordering::Relaxed);
+         }
+ 
+@@ -958,10 +968,12 @@
+         reader.data.exit_loop_requested |= reader.parser.libdata().exit_current_script;
+         reader.parser.libdata_mut().exit_current_script = false;
+ 
+-        BufferedOutputter::new(Outputter::stdoutput()).write_command(Osc133CommandFinished {
+-            exit_status: reader.parser.last_status(),
+-        });
+-        event::fire_generic(reader.parser, L!("fish_postexec").to_owned(), vec![command]);
++        if !kr_skipped {
++            BufferedOutputter::new(Outputter::stdoutput()).write_command(Osc133CommandFinished {
++                exit_status: reader.parser.last_status(),
++            });
++            event::fire_generic(reader.parser, L!("fish_postexec").to_owned(), vec![command]);
++        }
+         // Allow any pending history items to be returned in the history array.
+         reader.history.resolve_pending();
+ 

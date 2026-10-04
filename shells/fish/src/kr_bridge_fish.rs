@@ -23,18 +23,28 @@
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong};
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::reader::{Reader, ReaderData, kr_terminal_eof, read_generation_count};
-use crate::env::{EnvMode, EnvSetMode, EnvStack, Environment as _};
+use super::reader::{
+    Reader, ReaderData, fish_is_unwinding_for_exit, kr_terminal_eof, read_generation_count,
+    reader_exit_signal,
+};
+use crate::env::{EnvMode, EnvSetMode, EnvStack, Environment as _, Statuses};
 use crate::input::{
     CharEvent, DEFAULT_BIND_MODE, InputEventQueuer as _, KeyNameStyle, ReadlineCmd, bindings,
     input_function_get_code, input_get_bind_mode,
 };
+use crate::io::{IoChain, IoMode};
 use crate::key::Key;
 use crate::key::Modifiers;
+use crate::null_terminated_array::OwningNullTerminatedArray;
+use crate::parser::BlockType;
 use crate::parser::Parser;
 use crate::prelude::*;
+use crate::proc::{Job, Process};
+use crate::signal::{signal_check_cancel, signal_clear_cancel};
 use crate::threads::assert_is_main_thread;
+use crate::threads::is_main_thread;
 use fish_widestring::{WString, bytes2wcstring, wcs2bytes, wstr};
 
 /// Which reader is running, as the contract names them.
@@ -137,6 +147,35 @@ unsafe extern "C" {
     fn kr_bridge_cancel_settled();
     fn kr_bridge_lost(loss: c_int, detail: *const c_char);
     fn kr_bridge_launch_pending() -> c_int;
+    fn kr_bridge_root_process() -> c_int;
+    fn kr_bridge_resolve(
+        argv: *const *const c_char,
+        argc: usize,
+        executable: *const c_char,
+        cwd: *const c_char,
+        cwd_revision: c_ulong,
+        prompt_generation: c_ulong,
+        out: *mut KrResolution,
+    ) -> c_int;
+    fn kr_bridge_resolution_free(resolution: *mut KrResolution);
+    fn kr_bridge_line_token() -> *const c_char;
+    fn kr_bridge_block_started(
+        prompt_generation: c_ulong,
+        line: *const c_char,
+        len: usize,
+        cwd: *const c_char,
+        cwd_revision: c_ulong,
+    );
+    fn kr_bridge_block_finished(status: c_int);
+}
+
+/// What the worker answered a resolve with. The layout is `kr_resolution` in `kr_bridge.h`.
+#[repr(C)]
+struct KrResolution {
+    launch: c_int,
+    launcher: *mut c_char,
+    arguments: *mut *mut c_char,
+    environment: *mut *mut c_char,
 }
 
 /// The reader the core's questions are answered from, while one of its calls is in flight.
@@ -225,6 +264,9 @@ struct BridgeState {
     gesture_followed: bool,
     /// A reader underneath one that has just left, waiting to be announced with its own state.
     resume_pending: bool,
+    /// True from the moment the root shell starts the line the person accepted until that line
+    /// has finished. A reader that starts inside it is the line's own, not the root editor's.
+    line_running: bool,
 }
 
 struct BridgeStateCell(UnsafeCell<BridgeState>);
@@ -260,6 +302,7 @@ static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     gesture_bound: false,
     gesture_followed: false,
     resume_pending: false,
+    line_running: false,
 }));
 
 /// The bridge's own state. Main thread only, like the reader it belongs to.
@@ -377,6 +420,16 @@ fn keymap_of(parser: &Parser) -> c_int {
 
 // ---- what the reader supplies ------------------------------------------------------------------
 
+/// Whether `data` is the root shell's own prompt reader.
+///
+/// The prompt reader the interactive loop runs is the root editor's, and every other reader is a
+/// line's: the `read` builtin's, and one a line starts itself (`breakpoint`, `source -`), which
+/// fish runs on the same prompt event and which would otherwise be taken for a new prompt. This
+/// one condition decides the context every report names and whether the prompt generation moves.
+fn reader_is_primary(data: &ReaderData) -> bool {
+    data.kr_is_primary() && !state().line_running
+}
+
 /// Fills `out` from the reader's own state, atomically.
 ///
 /// # Safety
@@ -416,11 +469,11 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
             || input_get_bind_mode(parser.vars()) == L!("operator");
     }
 
-    out.reader_context = if data.kr_is_primary() {
+    out.reader_context = if reader_is_primary(data) {
         KR_CONTEXT_PRIMARY
     } else {
-        // fish edits a continuation inside one buffer, so the other reader it runs is the one the
-        // `read` builtin pushes.
+        // fish edits a continuation inside one buffer, so the other readers it runs are the one
+        // the `read` builtin pushes and the ones a line starts itself.
         KR_CONTEXT_READ_BUILTIN
     };
     // The reader's own edit generation: one for every edit the line went through, which is what
@@ -748,7 +801,7 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         // underneath this one and waits for it to leave.
         state.resume_pending = false;
     }
-    let primary = reader.kr_is_primary();
+    let primary = reader_is_primary(reader.data);
     {
         let state = state();
         state.reader_revision += 1;
@@ -994,6 +1047,359 @@ pub fn pass_end(reader: &mut Reader<'_>) {
 pub fn launch_pending() -> bool {
     // Safety: the core keeps this flag and asks nothing of ours to report it.
     unsafe { kr_bridge_launch_pending() != 0 }
+}
+
+// ---- the commands a line runs -------------------------------------------------------------------
+
+/// The variable the commands of one line inherit, and nothing after that line does.
+const KR_TOKEN_VARIABLE: &wstr = L!("KR_DETACH_TOKEN");
+
+/// How a line the person accepted begins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LineStart {
+    /// A line this bridge reports nothing about: a shell that never registered, or a line typed at
+    /// a reader that a running line started itself.
+    Foreign,
+    /// The root shell's own line, reported to the worker and now running.
+    Run,
+    /// The root shell's own line, reported and then ended before anything ran by a signal that
+    /// arrived while the worker was being told of it.
+    Skipped,
+}
+
+/// What the shell does about a command it is about to start.
+pub enum Asked {
+    /// Nothing was asked: the command is not one of the line's own, or the worker is not there.
+    Not,
+    /// The command runs exactly as it was typed.
+    AsTyped,
+    /// The command runs through the launcher the worker named.
+    Launch(Launch),
+    /// A signal ended the command before it started: the status it leaves.
+    Stopped(c_int),
+}
+
+/// A launcher, its argument vector and the environment it is started with, all made before the
+/// fork so that nothing is allocated after it.
+pub struct Launch {
+    launcher: CString,
+    argv: OwningNullTerminatedArray,
+    envv: OwningNullTerminatedArray,
+}
+
+impl Launch {
+    /// Starts the launcher in this process's place. Returns only when it could not be started,
+    /// and the command then runs as it was typed.
+    ///
+    /// Called in a forked child: nothing here allocates.
+    pub fn exec(&self) {
+        // Safety: the three pointers are live for as long as `self`, which the child holds.
+        unsafe { libc::execve(self.launcher.as_ptr(), self.argv.get(), self.envv.get()) };
+    }
+}
+
+/// How many block processes are running their body: a redirected `begin` is a process of its own
+/// whose body is a block of the evaluator's top kind, which is not a second line.
+static BLOCK_PROCESSES: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks one block process as running its body, for as long as it is held.
+pub struct CountedBlockProcess;
+
+impl CountedBlockProcess {
+    pub fn new() -> Self {
+        BLOCK_PROCESSES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for CountedBlockProcess {
+    fn drop(&mut self) {
+        BLOCK_PROCESSES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The directory a command starts in: the shell's own `$PWD`, which is where a program is started.
+fn working_directory(parser: &Parser) -> Vec<u8> {
+    parser
+        .vars()
+        .get(L!("PWD"))
+        .map(|pwd| wcs2bytes(&pwd.as_string()))
+        .unwrap_or_default()
+}
+
+/// The signal that ends a command before it starts, as the status it leaves: 128 plus the signal.
+///
+/// SIGINT is the shell's cancellation, set by the handler and kept until something clears it. An
+/// exit signal (SIGHUP, SIGTERM) is not a cancellation: the interactive loop ends through its own
+/// exit check once the line is over.
+fn stopping_signal() -> Option<c_int> {
+    let cancelled = signal_check_cancel();
+    if cancelled != 0 {
+        return Some(cancelled);
+    }
+    let exit = reader_exit_signal();
+    if exit != 0 {
+        return Some(exit);
+    }
+    fish_is_unwinding_for_exit().then_some(libc::SIGTERM)
+}
+
+fn remove_token() {
+    // The shell's own variable only: the universal store is never touched.
+    EnvStack::globals().remove(
+        KR_TOKEN_VARIABLE,
+        EnvSetMode::new(EnvMode::GLOBAL, /*is_repainting=*/ false),
+    );
+}
+
+fn export_token(token: &CStr) {
+    EnvStack::globals().set_one(
+        KR_TOKEN_VARIABLE,
+        EnvSetMode::new(EnvMode::GLOBAL_EXPORTED, /*is_repainting=*/ false),
+        bytes2wcstring(token.to_bytes()),
+    );
+}
+
+/// The root shell is about to run the line the person accepted.
+///
+/// The worker is told of the line and answers with the capability minted for it, which is exported
+/// for the commands of this line and removed when it ends. A line has one owner: the root process
+/// with no line running. A reader that starts inside a line (`breakpoint`, `source -`) hands its
+/// own lines back to the evaluator without a word, so the outer line keeps its block and its
+/// capability.
+///
+/// A cancellation left at the prompt is not this line's, so it is cleared before the worker is
+/// told, and one that arrives while the worker is being told of the line ends it before anything
+/// runs.
+pub fn command_starting(reader: &mut Reader<'_>, command: &wstr) -> LineStart {
+    if !registered() || state().line_running {
+        return LineStart::Foreign;
+    }
+    // Safety: the core only reads its own registration.
+    if unsafe { kr_bridge_root_process() } == 0 {
+        return LineStart::Foreign;
+    }
+    signal_clear_cancel();
+
+    let line = wcs2bytes(command);
+    let cwd = CString::new(working_directory(reader.parser)).unwrap_or_default();
+    let (generation, revision) = {
+        let state = state();
+        (
+            state.prompt_generation as c_ulong,
+            state.cwd_revision as c_ulong,
+        )
+    };
+    // Safety: the line and the directory live until the calls return, and no reader is parked: the
+    // core asks nothing of one here.
+    let token = unsafe {
+        kr_bridge_block_started(
+            generation,
+            line.as_ptr().cast(),
+            line.len(),
+            cwd.as_ptr(),
+            revision,
+        );
+        kr_bridge_line_token()
+    };
+    if token.is_null() {
+        remove_token();
+    } else {
+        // Safety: the core returns a null-terminated string that it keeps until the next line.
+        export_token(unsafe { CStr::from_ptr(token) });
+    }
+
+    if let Some(signal) = stopping_signal() {
+        let status = 128 + signal;
+        reader.parser.set_last_statuses(Statuses::just(status));
+        if signal_check_cancel() != 0 {
+            signal_clear_cancel();
+        }
+        // Safety: as above.
+        unsafe { kr_bridge_block_finished(status) };
+        remove_token();
+        return LineStart::Skipped;
+    }
+    state().line_running = true;
+    LineStart::Run
+}
+
+/// The line the root shell ran has finished: its block is reported with the shell's own status and
+/// the capability leaves the environment with it.
+pub fn command_finished(reader: &mut Reader<'_>, start: LineStart) {
+    if start != LineStart::Run {
+        return;
+    }
+    state().line_running = false;
+    // Safety: the core reads nothing of ours here.
+    unsafe { kr_bridge_block_finished(reader.parser.last_status()) };
+    remove_token();
+}
+
+/// Whether the block stack holds only what the root shell's own line can hold: the line's own top
+/// block and the control blocks of the line itself. A function, a sourced file, an `eval`, a
+/// substitution, an event handler, a prompt, a breakpoint and an assignment each push a block of
+/// another kind or a second top block, and a command inside any of them is not the line's own.
+fn only_the_lines_own_blocks(parser: &Parser) -> bool {
+    let mut tops: usize = 0;
+    for block in parser.blocks_iter_rev() {
+        match block.typ() {
+            BlockType::IfBlock
+            | BlockType::WhileBlock
+            | BlockType::ForBlock
+            | BlockType::SwitchBlock
+            | BlockType::Begin => {}
+            BlockType::Top => tops += 1,
+            _ => return false,
+        }
+    }
+    // The body of a redirected group is a top block of its own, counted when it started running.
+    tops.saturating_sub(BLOCK_PROCESSES.load(Ordering::Relaxed)) == 1
+}
+
+/// Whether the command `process` is a command of the line the root shell is running itself, in
+/// the foreground and in no pipeline, which is the only kind the worker is asked about.
+fn is_the_lines_own(parser: &Parser, job: &Job, io: &IoChain) -> bool {
+    is_main_thread()
+        && registered()
+        && state().line_running
+        && job.processes().len() == 1
+        && job.group().is_foreground()
+        && io
+            .0
+            .iter()
+            .all(|redirect| !matches!(redirect.io_mode(), IoMode::Pipe | IoMode::BufferFill))
+        && only_the_lines_own_blocks(parser)
+}
+
+/// What a name and a vector are told to the worker as: the bytes fish holds, which are text where
+/// the person typed text, and which the core refuses to name where they are not.
+fn c_string(bytes: Vec<u8>) -> Option<CString> {
+    CString::new(bytes).ok()
+}
+
+/// Whether two `NAME=value` entries name the same variable.
+fn same_variable(a: &[u8], b: &[u8]) -> bool {
+    let name = |entry: &'_ [u8]| {
+        entry
+            .iter()
+            .position(|&byte| byte == b'=')
+            .unwrap_or(entry.len())
+    };
+    a[..name(a)] == b[..name(b)]
+}
+
+/// Copies a vector of strings the core owns, ending with a null pointer.
+///
+/// # Safety
+///
+/// `vector` is null or points at null-terminated strings, the last entry of the vector being null.
+unsafe fn copy_vector(vector: *mut *mut c_char) -> Vec<CString> {
+    let mut copied = Vec::new();
+    if vector.is_null() {
+        return copied;
+    }
+    let mut at = vector;
+    // Safety: the vector ends with a null pointer, which is where this stops.
+    unsafe {
+        while !(*at).is_null() {
+            copied.push(CStr::from_ptr(*at).to_owned());
+            at = at.add(1);
+        }
+    }
+    copied
+}
+
+/// The question the executor puts before it starts a command: is this one the worker has a say in?
+///
+/// It is asked only for a command of the line the root shell runs itself (see
+/// [`is_the_lines_own`]); the answer either leaves the command exactly as it was typed or names a
+/// launcher that runs in its place with the backend's variables added to the shell's own.
+pub fn asking(parser: &Parser, job: &Job, process: &Process, io: &IoChain) -> Asked {
+    if !is_the_lines_own(parser, job, io) {
+        return Asked::Not;
+    }
+    let cwd = working_directory(parser);
+    // A search that went through a relative directory on the path is joined to the directory the
+    // command starts in.
+    let mut executable = wcs2bytes(&process.actual_cmd);
+    if executable.first() != Some(&b'/') {
+        let mut joined = cwd.clone();
+        joined.push(b'/');
+        joined.extend_from_slice(&executable);
+        executable = joined;
+    }
+    let words: Option<Vec<CString>> = process
+        .argv()
+        .iter()
+        .map(|word| c_string(wcs2bytes(word)))
+        .collect();
+    let (Some(words), Some(executable), Some(cwd)) = (words, c_string(executable), c_string(cwd))
+    else {
+        return Asked::Not;
+    };
+    let pointers: Vec<*const c_char> = words.iter().map(|word| word.as_ptr()).collect();
+    let (generation, revision) = {
+        let state = state();
+        (
+            state.prompt_generation as c_ulong,
+            state.cwd_revision as c_ulong,
+        )
+    };
+    let mut resolution = KrResolution {
+        launch: 0,
+        launcher: std::ptr::null_mut(),
+        arguments: std::ptr::null_mut(),
+        environment: std::ptr::null_mut(),
+    };
+    // Safety: every pointer is to memory that lives until the call returns, and the core fills
+    // `resolution` with memory of its own that it frees below.
+    let launching = unsafe {
+        kr_bridge_resolve(
+            pointers.as_ptr(),
+            pointers.len(),
+            executable.as_ptr(),
+            cwd.as_ptr(),
+            revision,
+            generation,
+            &mut resolution,
+        )
+    } != 0;
+
+    // The wait is where a signal arrives. Whether the answer launches or the command runs as typed
+    // (which is what no answer means), a command the person has cancelled or that the shell is
+    // leaving does not start. The status is set by the caller as the launch failure paths do, so it
+    // is the one that stays.
+    let outcome = if let Some(signal) = stopping_signal() {
+        Asked::Stopped(128 + signal)
+    } else if launching && !resolution.launcher.is_null() {
+        // Safety: the core filled these with null-terminated strings.
+        let launcher = unsafe { CStr::from_ptr(resolution.launcher) }.to_owned();
+        let argv = unsafe { copy_vector(resolution.arguments) };
+        let added = unsafe { copy_vector(resolution.environment) };
+        let mut environment: Vec<CString> = parser
+            .vars()
+            .export_array()
+            .iter()
+            .filter(|entry| {
+                !added
+                    .iter()
+                    .any(|named| same_variable(entry.to_bytes(), named.to_bytes()))
+            })
+            .cloned()
+            .collect();
+        environment.extend(added);
+        Asked::Launch(Launch {
+            launcher,
+            argv: OwningNullTerminatedArray::new(argv),
+            envv: OwningNullTerminatedArray::new(environment),
+        })
+    } else {
+        Asked::AsTyped
+    };
+    // Safety: `resolution` is what the core filled in, or all zeroes.
+    unsafe { kr_bridge_resolution_free(&mut resolution) };
+    outcome
 }
 
 /// Records the sequence that invoked the operation about to run, which is this reader's `$KEYS`.
