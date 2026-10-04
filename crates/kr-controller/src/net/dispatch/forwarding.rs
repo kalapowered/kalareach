@@ -234,6 +234,18 @@ impl RemoteConnection {
         if let Err(refusal) = self.claim_route(mutation, Some(session_id)) {
             return failure(mutation.request_id, refusal.into_error());
         }
+        // The draft a prompt submission names. Once the worker has accepted the prompt, this host
+        // records the submission, which is what puts the draft's attachments under the session's
+        // retention.
+        let submitted_draft = (mutation.method.method() == Some(Method::AgentPromptSubmit))
+            .then(|| {
+                mutation
+                    .params
+                    .to_typed::<kr_protocol::agent::AgentPromptParams>()
+                    .ok()
+            })
+            .flatten()
+            .and_then(|params| params.draft_id.0);
         let envelope = self.envelope(validated);
         let deadline = match self
             .controller
@@ -289,6 +301,33 @@ impl RemoteConnection {
                     match self.may_read_receipts(Some(session_id), answering) {
                         Ok(read) => *asked = Some(read),
                         Err(error) => return failure(request_id, error),
+                    }
+                }
+                if let Some(draft_id) = submitted_draft
+                    && matches!(answered.response.outcome, Outcome::Ok(_))
+                {
+                    // The prompt is submitted whatever this records, so a failure here is not a
+                    // refusal. The caller is told the outcome is unknown, asks again under the
+                    // same action, and the worker answers from what it kept and this records
+                    // the submission again.
+                    if let Err(error) = self
+                        .controller
+                        .transfer
+                        .record_submission(&self.device.principal(), draft_id, session_id)
+                        .await
+                    {
+                        return failure(
+                            request_id,
+                            ProtocolError::new(
+                                ErrorCode::OutcomeUnknown,
+                                format!(
+                                    "the prompt was submitted, and this host could not record \
+                                     that its draft's attachments were, so ask again under the \
+                                     same action: {}",
+                                    error.message
+                                ),
+                            ),
+                        );
                     }
                 }
                 ControlFrame::Response(Response {

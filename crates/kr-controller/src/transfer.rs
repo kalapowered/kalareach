@@ -443,6 +443,35 @@ impl TransferModule {
             .unwrap_or(false)
     }
 
+    /// Records that a prompt carrying a draft was submitted to a session, which moves the draft's
+    /// attachments from the seven-day window of an unused attachment onto that session's retention.
+    ///
+    /// It runs once the session's worker has accepted the submission, and again for a repeat of the
+    /// same action, which the worker answers from what it kept: recording it twice changes
+    /// nothing, and a repeat is how a record the first attempt did not reach is settled. A draft
+    /// this actor does not hold has no attachments for this host to retain, so naming one is not
+    /// a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the service decided, other than for a draft it does not hold.
+    pub async fn record_submission(
+        &self,
+        actor_id: &ActorId,
+        draft_id: kr_protocol::ids::DraftId,
+        session_id: SessionId,
+    ) -> Answer<usize> {
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        blocking(
+            move || match service.mark_submitted(&actor, draft_id, session_id) {
+                Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
+                other => Ok(other?),
+            },
+        )
+        .await
+    }
+
     /// Serves one transfer read and returns the frame it answers with.
     #[must_use]
     pub async fn read_frame(&self, actor_id: &ActorId, request: &Request) -> ControlFrame {

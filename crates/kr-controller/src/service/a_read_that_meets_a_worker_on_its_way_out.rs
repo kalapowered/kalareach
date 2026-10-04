@@ -85,6 +85,8 @@ pub(super) struct Scripted {
     /// The receipts it keeps with no result, by the action they belong to: the method, and the
     /// failure the receipt records.
     receipts_only: std::sync::Mutex<BTreeMap<ActionId, (Method, ProtocolError)>>,
+    /// Whether it accepts a prompt submission, as a worker whose agent takes the prompt does.
+    accepts_prompts: AtomicBool,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -117,7 +119,13 @@ impl Scripted {
             forwarded: std::sync::Mutex::new(Vec::new()),
             forwarded_with_history: std::sync::Mutex::new(Vec::new()),
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
+            accepts_prompts: AtomicBool::new(false),
         })
+    }
+
+    /// Has this worker accept the prompt submissions it is forwarded, or stop accepting them.
+    pub(super) fn accepts_prompts(&self, accepting: bool) {
+        self.accepts_prompts.store(accepting, Ordering::Release);
     }
 
     /// Has this worker state what a worker built before results were held to a scope states: that
@@ -534,7 +542,20 @@ fn serve_scripted(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((*forwarded).clone());
-                            if forwarded.mutation.method != Method::SessionClose.into() {
+                            if forwarded.mutation.method == Method::AgentPromptSubmit.into()
+                                && script.accepts_prompts.load(Ordering::Acquire)
+                            {
+                                let accepted = kr_protocol::agent::AgentMutationResult {
+                                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(
+                                        1,
+                                    ),
+                                    provenance:
+                                        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                                    upstream_request_id: Nullable::null(),
+                                    turn_id: Nullable::null(),
+                                };
+                                vec![respond(forwarded.mutation.request_id, &accepted)]
+                            } else if forwarded.mutation.method != Method::SessionClose.into() {
                                 // Any other action is answered from the receipt this worker keeps
                                 // for it, when it keeps one, and refused otherwise.
                                 let kept = script
