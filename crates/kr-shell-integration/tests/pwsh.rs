@@ -133,6 +133,104 @@ fn the_configured_chord_detaches_and_any_other_key_is_the_editors_own() {
     shellpkg::the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_own(PWSH);
 }
 
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_interactive_command_asks_once_before_it_starts_and_a_bypass_runs_it_as_typed() {
+    shellpkg::an_interactive_command_asks_once_and_runs_as_typed(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_command_that_is_not_the_whole_of_its_line_never_asks_and_a_lone_native_command_does() {
+    shellpkg::forms_the_root_shell_does_not_start_itself_never_ask(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_path_as_the_name_runs_as_typed_and_asks_nothing() {
+    shellpkg::an_absolute_path_invocation_runs_as_typed(PWSH);
+}
+
+/// KR-REQ-07.34, KR-REQ-07.35
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn frames_that_arrive_while_a_command_waits_reach_the_reader_once() {
+    shellpkg::frames_that_arrive_while_a_command_waits_reach_the_reader_once(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_worker_that_does_not_answer_leaves_the_command_as_typed_after_the_deadline() {
+    shellpkg::an_unanswered_question_runs_the_command_as_typed_after_the_deadline(PWSH);
+}
+
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_backend_runs_the_command_through_the_launcher_it_names() {
+    shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(PWSH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn each_line_reports_its_command_block_with_status_duration_and_directory() {
+    shellpkg::each_line_reports_its_block_with_status_duration_and_directory(PWSH);
+}
+
+/// KR-REQ-07.84
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_line_exports_the_capability_minted_for_it_and_no_other() {
+    shellpkg::a_line_exports_the_capability_minted_for_it(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_entry_points_answer_by_origin_and_never_fail() {
+    shellpkg::the_entry_points_answer_by_origin_and_never_fail(PWSH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_line_reports_the_status_the_shell_would_show() {
+    shellpkg::a_line_reports_the_status_the_shell_would_show(PWSH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_block_reports_the_file_system_directory() {
+    shellpkg::a_block_reports_the_file_system_directory(PWSH);
+}
+
+/// KR-REQ-12.07, KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_launcher_leaves_its_exit_status_as_the_lines() {
+    shellpkg::a_launcher_leaves_its_exit_status_as_the_lines(PWSH);
+}
+
+/// KR-REQ-07.84, KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability() {
+    shellpkg::a_prompt_a_line_opens_keeps_the_lines_block_and_capability(PWSH);
+}
+
+/// KR-REQ-07.84
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working() {
+    shellpkg::a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(PWSH);
+}
+
 /// The editors this suite stands in for the real one with: each is a .NET type with the two fields
 /// the module reads its queue from, or something short of that.
 ///
