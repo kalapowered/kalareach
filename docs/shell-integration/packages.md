@@ -325,13 +325,13 @@ project's licence.
 
 The core also notes that the worker doesn't have a fence for a reader (either because the previous
 exchange ended with no fence, or because the published fence has gone), and the adapters will then
-report to the worker that the reader is idle again the next time it waits. However, the worker
-retries only when the reader next reports that it is idle, and it drops an idle report that arrives
-while an exchange is still open, so the reader would not be fenced at that prompt. In particular, if
-the reader reports that it is idle only once per wait, it stays unfenced at a prompt of a shell that
-asks the terminal questions of its own. This is because the terminal's answers to those questions
-arrive at the reader while the exchange for the prompt is still open, and that exchange ends
-withheld.
+report to the worker that the reader is idle again, once the reader's own queues are clear. However,
+the worker retries only when the reader next reports that it is idle, and it drops an idle report
+that arrives while an exchange is still open, so the reader would not be fenced at that prompt. In
+particular, if the reader reports that it is idle only once per wait, it stays unfenced at a prompt
+of a shell that asks the terminal questions of its own. This is because the terminal's answers to
+those questions arrive at the reader while the exchange for the prompt is still open, and that
+exchange ends withheld.
 
 Nothing in the bridge links against the rest of the host. It speaks to the worker over a socket,
 and the reader calls into it through a small set of functions.
