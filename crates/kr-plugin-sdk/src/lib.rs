@@ -56,6 +56,7 @@
 //! | [`connector`] | The declarative native-proxy table |
 //! | [`plugin`] | The `plugin.json` manifest |
 //! | [`integration`] | A package's command integration: its command, flags and variables |
+//! | [`forwarder`] | The placeholder a package writes for the forwarder, and how the host replaces it |
 //! | [`catalogue`] | The signed catalogue index |
 //! | [`package`] | The on-disk package layout |
 //! | [`validate`] | Package validation and its stable finding codes |
@@ -96,6 +97,7 @@ pub mod connector;
 pub mod digest;
 pub mod effect;
 pub mod example;
+pub mod forwarder;
 pub mod identity;
 pub mod ids;
 pub mod integration;
