@@ -14,7 +14,9 @@
 //!
 //! * The command is a bare name, the executable name of one of the package's own match rules.
 //! * The flags are whole argument elements, added in the order declared, each one line of text
-//!   with nothing in it that a person reading the grant could not see.
+//!   with nothing in it that a person reading the grant could not see. A flag may hold the
+//!   forwarder's placeholder (see [`crate::forwarder`]), which the host replaces with the installed
+//!   forwarder's path, and the grant says so.
 //! * A variable is one of [`PERMITTED_VARIABLES`], by exact name and value. Reserved `KR_` values
 //!   come only from the worker, and a variable that loads code, changes a search path or chooses a
 //!   startup file changes what a program runs. No list of forbidden names can be complete, so this
@@ -23,6 +25,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::forwarder;
 use crate::matching::MatchRule;
 use crate::text::{Summary, is_forbidden_text_char};
 
@@ -108,6 +111,13 @@ impl CommandIntegration {
             let flags: Vec<String> = self.flags.iter().map(|flag| quoted(flag)).collect();
             statement.push_str(&flags.join(" "));
             statement.push('.');
+            if self.flags.iter().any(|flag| forwarder::mentions(flag)) {
+                statement.push_str(&format!(
+                    " {} is replaced by the full path of the KalaReach forwarder installed on this \
+                     machine, written as the path of a program the application starts.",
+                    forwarder::PLACEHOLDER
+                ));
+            }
         }
         if self.variables.is_empty() {
             statement.push_str(" It sets no environment variables.");
@@ -246,6 +256,11 @@ fn flag_problem(flag: &str) -> Option<String> {
             "it carries U+{:04X}, which a person reading the grant could not see",
             u32::from(character)
         ));
+    }
+    // The host writes the forwarder's path where the placeholder stands, so it has to stand where
+    // the host can.
+    if let Err(error) = forwarder::expand(flag, std::path::Path::new("/kalareach/bin/kr-hook")) {
+        return Some(error.to_string());
     }
     None
 }
@@ -391,6 +406,42 @@ mod tests {
                 .problems(&rules)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_forwarder_placeholder_is_allowed_where_the_host_can_replace_it_and_the_grant_says_so() {
+        let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"{kr_hook}","args":["qoder-cli","hook"]}]}]}}"#;
+        let rules = [rule("agent", &[])];
+        let placed = integration("agent", &["--settings", settings], &[]);
+        assert!(placed.problems(&rules).is_empty());
+        let statement = placed.statement();
+        assert!(
+            statement.ends_with(
+                " {kr_hook} is replaced by the full path of the KalaReach forwarder installed on \
+                 this machine, written as the path of a program the application starts. It sets no \
+                 environment variables."
+            ),
+            "{statement}"
+        );
+        assert!(
+            !integration("agent", &["--flag"], &[])
+                .statement()
+                .contains("{kr_hook}"),
+            "a declaration without the placeholder says nothing of it"
+        );
+        for misplaced in [
+            "--hook={kr_hook}",
+            "x{kr_hook}",
+            "{kr_hook}",
+            "\"a{kr_hook}\"",
+        ] {
+            assert!(
+                !integration("agent", &[misplaced], &[])
+                    .problems(&rules)
+                    .is_empty(),
+                "{misplaced:?} is refused"
+            );
+        }
     }
 
     #[test]
