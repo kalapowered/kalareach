@@ -554,8 +554,8 @@ impl CommandBackends {
     }
 
     /// Tells a test when the next launch's launcher has said it started its program, for this
-    /// host's own tests: the launch is then complete, and a launcher that is ended after this ends
-    /// a program that is already the host's to supervise.
+    /// host's own tests: the launch is then complete, and a launcher that is ended after this
+    /// leaves the program it started running.
     ///
     /// Returns the end that is sent to when the launcher's word has been read. It is compiled away
     /// in every shipped build.

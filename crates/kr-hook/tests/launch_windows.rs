@@ -1000,10 +1000,11 @@ fn kr_req_12_02_a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_
 }
 
 /// KR-REQ-12.02, the control of the case above: a program a launcher started is not ended with the
-/// launcher. Once the program is running the launcher is ended from outside, and the program, which
-/// waits for that, still writes what it was waiting to write. The program is started after the
-/// launcher has let go of its job, so there is no moment at which it runs and the launcher's end
-/// would end it.
+/// launcher. Once the worker has read that the launcher started the program, the launcher is ended
+/// from outside, and the program, which waits for that, still writes what it was waiting to write.
+/// The program is started after the launcher has let go of its job; before the worker has read
+/// that the launcher started it, a launcher that is gone is the worker's to answer by ending the
+/// program, which is not this case.
 #[test]
 fn kr_req_12_02_a_program_that_is_started_outlives_the_launcher_that_started_it() {
     let shell = Shell::new();
