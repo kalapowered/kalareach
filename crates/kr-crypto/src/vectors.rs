@@ -208,9 +208,10 @@ pub fn generated_files(repository_root: &Path) -> Result<Vec<(&'static str, Stri
     ])
 }
 
-/// The key one relay object names, and the signing input its own fields produce.
+/// The key a relay object names (`None` for a receipt, which states none) and the signing input
+/// its own fields produce.
 ///
-/// Every relay object states the key it is to be verified under, so a vector is only worth
+/// Every other relay object states the key it is to be verified under, so a vector is only worth
 /// publishing if that key is the one signing it and if the bytes signed are the ones the object
 /// itself produces. Both come from the typed object rather than from the document around it.
 fn relay_object_authority(
