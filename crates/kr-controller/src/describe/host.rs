@@ -1327,7 +1327,7 @@ pub(crate) fn models_dir(state_dir: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::privacy::Published;
     use kr_describe::profile::catalogue::Catalogue;
@@ -1403,6 +1403,38 @@ mod tests {
             ContextBinding::new("display-1/epoch-1"),
         );
         (directory, thread)
+    }
+
+    /// The handle a daemon holds on the host thread `host`, which a test turns by hand.
+    fn handle_of(host: &Thread) -> DescribeHost {
+        DescribeHost {
+            shared: Arc::clone(&host.shared),
+            thread: Mutex::new(None),
+        }
+    }
+
+    /// A host whose thread a test turns by hand, for the tests of what holds a handle on it.
+    pub(crate) struct ByHand {
+        _directory: tempfile::TempDir,
+        thread: Thread,
+    }
+
+    impl ByHand {
+        /// A host over a service that is never asked to start a process, with privacy mode off.
+        pub(crate) fn new() -> Self {
+            let (_directory, thread) = thread(Published::default());
+            Self { _directory, thread }
+        }
+
+        /// The handle a daemon holds on it.
+        pub(crate) fn handle(&self) -> DescribeHost {
+            handle_of(&self.thread)
+        }
+
+        /// One turn of its thread.
+        pub(crate) fn turn(&mut self) {
+            self.thread.turn();
+        }
     }
 
     /// A page of one session's facts, captured under `generation`.
@@ -1725,10 +1757,7 @@ mod tests {
             PowerSource::Mains,
             ThermalState::Nominal,
         ))));
-        let handle = DescribeHost {
-            shared: Arc::clone(&host.shared),
-            thread: Mutex::new(None),
-        };
+        let handle = handle_of(&host);
         handle.assets_held(true);
         host.turn();
         assert!(handle.snapshot().setup.is_some_and(|setup| setup.offered));
@@ -1757,10 +1786,7 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_does_not_turn_inside_the_bound_is_not_confirmed() {
         let (_directory, mut host) = thread(state(0, false));
-        let handle = DescribeHost {
-            shared: Arc::clone(&host.shared),
-            thread: Mutex::new(None),
-        };
+        let handle = handle_of(&host);
         assert!(
             !handle.turned_within(Duration::from_millis(10)).await,
             "no turn came inside the bound"
@@ -1914,10 +1940,7 @@ mod tests {
     #[test]
     fn a_purge_is_owed_until_the_host_has_made_it_and_a_host_that_is_gone_owes_nothing() {
         let (_directory, host) = thread(state(0, false));
-        let handle = DescribeHost {
-            shared: Arc::clone(&host.shared),
-            thread: Mutex::new(None),
-        };
+        let handle = handle_of(&host);
         assert!(
             handle.purge().is_err(),
             "nobody is making the purge, so it is not done in time"
@@ -2035,10 +2058,7 @@ mod tests {
     #[test]
     fn a_purge_of_a_host_that_has_stopped_empties_its_slots() {
         let (_directory, host) = thread(state(0, false));
-        let handle = DescribeHost {
-            shared: Arc::clone(&host.shared),
-            thread: Mutex::new(None),
-        };
+        let handle = handle_of(&host);
         handle.page(session(), Box::new(page(0)));
         handle.shared.running.store(false, Ordering::Release);
         assert_eq!(handle.purge(), Ok(()));

@@ -193,18 +193,24 @@ impl DescribeModule {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the host has not answered within the bound. What
-    /// was posted is not undone, and the host takes it at its next turn; the error says so, so that
-    /// a caller is not shown the pause from before the change as the state after it.
+    /// Returns [`ControllerError::Uncertain`] when the host has not answered within the bound: what
+    /// the host did with the change is not known. What was posted is not undone, and the host takes
+    /// it at its next turn; the error says so, so that a caller is not shown the pause from before
+    /// the change as the state after it, and a retry under the same action is answered as an
+    /// action whose outcome this host does not know, which is the instruction to read the state.
     pub(crate) async fn until_host_turns(&self) -> Result<()> {
+        self.until_host_turns_within(SETTINGS_WAIT).await
+    }
+
+    /// [`Self::until_host_turns`] with the bound given.
+    async fn until_host_turns_within(&self, bound: std::time::Duration) -> Result<()> {
         let Some(host) = self.host().filter(|host| host.runs()) else {
             return Ok(());
         };
-        if host.turned_within(SETTINGS_WAIT).await {
+        if host.turned_within(bound).await {
             return Ok(());
         }
-        Err(ControllerError::Refused {
-            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+        Err(ControllerError::Uncertain {
             detail: "the setting is written, and the description host has not confirmed it yet: \
                      it takes it at its next turn, and `kr host descriptions` shows the state \
                      once it has"
@@ -1087,6 +1093,35 @@ pub(crate) mod tests {
         let module = DescribeModule::open(root.path()).expect("the session-metadata store");
         let other = DescriptionStore::open(root.path()).expect("the same store");
         (root, module, other)
+    }
+
+    /// KR-REQ-22.01: a settings change the host does not confirm inside the bound is answered as
+    /// an outcome this host does not know, with the setting said to be written; one the host
+    /// confirms is not. The bound is the one the test passes.
+    #[tokio::test]
+    async fn a_setting_the_host_does_not_confirm_in_time_is_answered_as_unknown() {
+        let (_root, module, _other) = module();
+        let mut host = host::tests::ByHand::new();
+        module
+            .set_host(Arc::new(host.handle()))
+            .expect("the first host");
+
+        let error = module
+            .until_host_turns_within(std::time::Duration::from_millis(10))
+            .await
+            .expect_err("no turn came inside the bound");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::OutcomeUnknown,
+            "{error}"
+        );
+        assert!(error.to_string().contains("written"), "{error}");
+
+        let (confirmed, ()) = tokio::join!(
+            module.until_host_turns_within(std::time::Duration::from_secs(60)),
+            async { host.turn() }
+        );
+        confirmed.expect("a turn came");
     }
 
     /// KR-REQ-24.14: a pin that rename wrote is the environment's, not the session's, so it
