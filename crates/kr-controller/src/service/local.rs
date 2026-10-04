@@ -680,6 +680,17 @@ impl Controller {
             // freshness at all: a retry finds its receipt there, and a first admission is refused
             // there for the same reason it would have been refused here.
             Err(ControllerError::WindowExpired { .. }) if forwarded_to_worker(method) => None,
+            // The same holds for an exact repeat of a transfer action that claimed an effect and
+            // was interrupted before it settled. The repeat is the original request, window
+            // included, and on a replacement connection that window is not one this connection
+            // issued. The service finishes what the claim began and begins nothing.
+            Err(error)
+                if matches!(error, ControllerError::WindowExpired { .. })
+                    && crate::transfer::TransferModule::serves(method)
+                    && self.transfer.settles(actor_id, &mutation, method).await =>
+            {
+                None
+            }
             Err(error) => {
                 return ControlFrame::Response(Response {
                     request_id: mutation.request_id,
