@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "codexVersion": "0.155.1",
+  "checks": {
+    "sandbox.helpers": {
+      "id": "sandbox.helpers",
+      "category": "sandbox",
+      "status": "ok",
+      "summary": "sandbox configuration is readable",
+      "details": {
+        "approval policy": "OnRequest",
+        "codex-linux-sandbox helper": "none",
+        "denied-read glob rules": "0",
+        "denied-read restrictions": "false",
+        "denied-read rules": "0",
+        "execve wrapper helper": "none",
+        "filesystem sandbox": "restricted",
+        "glob scan max depth": "unbounded",
+        "managed filesystem source": "none",
+        "network sandbox": "restricted",
+        "sandbox backend": "disabled"
+      },
+      "remediation": null,
+      "durationMs": 0
+    }
+  }
+}

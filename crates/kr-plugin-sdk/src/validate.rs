@@ -148,6 +148,11 @@ pub enum FindingCode {
     /// A command integration names something other than a bare command of the package, adds a
     /// flag it may not, or sets a variable the contract does not permit.
     IntegrationInvalid,
+    /// The package declares a launch probe without requesting the capability to run it.
+    LaunchProbeWithoutCapability,
+    /// A launch probe passes an argument it may not, carries an option it may not or names a
+    /// mode pointer that is not one.
+    LaunchProbeInvalid,
 }
 
 impl FindingCode {
@@ -199,6 +204,8 @@ impl FindingCode {
         Self::QualificationInvalid,
         Self::IntegrationWithoutCapability,
         Self::IntegrationInvalid,
+        Self::LaunchProbeWithoutCapability,
+        Self::LaunchProbeInvalid,
     ];
 
     /// Returns the stable wire string.
@@ -251,6 +258,8 @@ impl FindingCode {
             Self::QualificationInvalid => "qualification_invalid",
             Self::IntegrationWithoutCapability => "integration_without_capability",
             Self::IntegrationInvalid => "integration_invalid",
+            Self::LaunchProbeWithoutCapability => "launch_probe_without_capability",
+            Self::LaunchProbeInvalid => "launch_probe_invalid",
         }
     }
 }
@@ -1097,6 +1106,24 @@ fn check_manifest(
         for problem in integration.problems(&manifest.match_rules) {
             report.push(Finding::at(
                 FindingCode::IntegrationInvalid,
+                MANIFEST_FILE,
+                problem,
+            ));
+        }
+    }
+    // A launch probe runs the application's own executable with arguments the package chose, so it
+    // has a capability of its own, and what it may declare is closed.
+    if let Some(probe) = &manifest.launch_probe {
+        if !manifest.requests(PluginCapability::LaunchProbe) {
+            report.push(Finding::at(
+                FindingCode::LaunchProbeWithoutCapability,
+                MANIFEST_FILE,
+                "the package declares a launch probe without requesting launch.probe",
+            ));
+        }
+        for problem in probe.problems() {
+            report.push(Finding::at(
+                FindingCode::LaunchProbeInvalid,
                 MANIFEST_FILE,
                 problem,
             ));

@@ -192,6 +192,7 @@ export type Predicate1 =
         | 'approval.respond'
         | 'native_bridge.install'
         | 'command_integration.launch'
+        | 'launch.probe'
       op: 'capability'
       /**
        * The state it must be in.
@@ -314,6 +315,7 @@ export type Predicate =
         | 'approval.respond'
         | 'native_bridge.install'
         | 'command_integration.launch'
+        | 'launch.probe'
       op: 'capability'
       /**
        * The state it must be in.
@@ -580,6 +582,8 @@ export type FindingCode =
   | 'qualification_invalid'
   | 'integration_without_capability'
   | 'integration_invalid'
+  | 'launch_probe_without_capability'
+  | 'launch_probe_invalid'
 /**
  * How messages are separated on the wire.
  */
@@ -655,6 +659,7 @@ export type PluginCapability =
   | 'approval.respond'
   | 'native_bridge.install'
   | 'command_integration.launch'
+  | 'launch.probe'
 /**
  * A fact about the current presentation that a control can depend on.
  */
@@ -1108,6 +1113,7 @@ export interface CapabilityRequest {
     | 'approval.respond'
     | 'native_bridge.install'
     | 'command_integration.launch'
+    | 'launch.probe'
   /**
    * Why the package needs it. Shown in the installation grant.
    */
@@ -1863,6 +1869,7 @@ export interface Control {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2028,6 +2035,7 @@ export interface Control {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2179,6 +2187,7 @@ export interface Control1 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2344,6 +2353,7 @@ export interface Control1 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2483,6 +2493,7 @@ export interface Control2 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2648,6 +2659,7 @@ export interface Control2 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2787,6 +2799,7 @@ export interface Control3 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2952,6 +2965,7 @@ export interface Control3 {
           | 'approval.respond'
           | 'native_bridge.install'
           | 'command_integration.launch'
+          | 'launch.probe'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3119,6 +3133,16 @@ export interface PluginManifest {
    * A short display name. One line, no control or bidirectional characters.
    */
   display_name: string
+  /**
+   * The launch probe, where the package declares one: the arguments the host runs the
+   * application's own executable with before a launch, and where in what it prints the mode the
+   * application runs in is.
+   *
+   * A package that declares none leaves the member out, so a manifest written before the member
+   * existed reads and hashes exactly as it did. A host runs one only from this verified manifest
+   * and only with `launch.probe` granted.
+   */
+  launch_probe?: LaunchProbe | null
   /**
    * The manifest format version.
    */
@@ -3331,6 +3355,33 @@ export interface IntegrationVariable {
   value: string
 }
 /**
+ * What a package declares about reading the mode its application runs in.
+ */
+export interface LaunchProbe {
+  /**
+   * The arguments the host passes to the application's executable, each one element of the
+   * argument vector, after the options it carries.
+   */
+  arguments: string[]
+  /**
+   * The option names, each taking one value, that the host copies with their values from the
+   * launch's own arguments in front of `arguments`.
+   */
+  carried_options: string[]
+  /**
+   * The package summary. One line, no control or bidirectional characters.
+   */
+  grant_statement: string
+  /**
+   * An RFC 6901 JSON Pointer to the mode in the JSON the probe prints on standard output.
+   */
+  mode: string
+  /**
+   * The modes the application cannot run with in a Windows service session.
+   */
+  refused_in_service_session: string[]
+}
+/**
  * A native bridge installation recipe.
  *
  * Bridge code runs under the application's own permissions, outside Wasmtime. The installation
@@ -3526,6 +3577,8 @@ export interface Finding {
     | 'qualification_invalid'
     | 'integration_without_capability'
     | 'integration_invalid'
+    | 'launch_probe_without_capability'
+    | 'launch_probe_invalid'
   /**
    * What exactly is wrong.
    */

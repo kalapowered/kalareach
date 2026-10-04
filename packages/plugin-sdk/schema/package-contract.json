@@ -97,6 +97,13 @@
       "required_right": null,
       "requires_installation_grant": true,
       "within_default_ceiling": false
+    },
+    {
+      "capability": "launch.probe",
+      "confirmed_on_every_release": true,
+      "required_right": null,
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
     }
   ],
   "command_integration": {
@@ -236,7 +243,9 @@
     "control_parameters_widen",
     "qualification_invalid",
     "integration_without_capability",
-    "integration_invalid"
+    "integration_invalid",
+    "launch_probe_without_capability",
+    "launch_probe_invalid"
   ],
   "index_bounds": {
     "max_qualified_builds": 256
@@ -251,6 +260,16 @@
     "observation_queue_bytes": "4194304",
     "output_bytes_per_call": "1048576",
     "snapshot_deadline_ms": "100"
+  },
+  "launch_probe": {
+    "max_argument_bytes": 256,
+    "max_arguments": 8,
+    "max_carried_options": 8,
+    "max_mode_bytes": 128,
+    "max_option_bytes": 32,
+    "max_pointer_bytes": 256,
+    "max_refused_words": 8,
+    "max_word_bytes": 64
   },
   "manifest_version": 1,
   "package_bounds": {
@@ -273,7 +292,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.3",
+  "sdk_version": "0.1.4",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [

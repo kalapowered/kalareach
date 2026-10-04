@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "codexVersion": "0.155.1",
+  "checks": {
+    "sandbox.helpers": {
+      "id": "sandbox.helpers",
+      "category": "sandbox",
+      "status": "warning",
+      "summary": "elevated Windows sandbox provisioning is incomplete or outdated",
+      "details": {
+        "approval policy": "OnRequest",
+        "codex-linux-sandbox helper": "none",
+        "denied-read glob rules": "0",
+        "denied-read restrictions": "false",
+        "denied-read rules": "0",
+        "execve wrapper helper": "none",
+        "filesystem sandbox": "restricted",
+        "glob scan max depth": "unbounded",
+        "managed filesystem source": "none",
+        "network sandbox": "restricted",
+        "sandbox backend": "elevated",
+        "sandbox provisioning": "incomplete"
+      },
+      "issues": [
+        {
+          "severity": "warning",
+          "cause": "elevated Windows sandbox provisioning is incomplete or outdated",
+          "measured": null,
+          "expected": null,
+          "remedy": "run codex sandbox setup --elevated --user <end-user> --codex-home <authoritative-home> from an elevated shell",
+          "fields": [
+            "sandbox provisioning"
+          ]
+        }
+      ],
+      "remediation": "run codex sandbox setup --elevated --user <end-user> --codex-home <authoritative-home> from an elevated shell",
+      "durationMs": 0
+    }
+  }
+}
