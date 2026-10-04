@@ -764,6 +764,7 @@ fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<Admi
                     executable: command,
                     directory: &[],
                     integration: Some(fixture::declaration(command, &flags, &[])),
+                    launch_probe: None,
                     native_bridge: false,
                     component: false,
                 },

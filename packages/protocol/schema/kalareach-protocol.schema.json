@@ -15619,13 +15619,21 @@
         "healthy": {
           "description": "True when no check failed.",
           "type": "boolean"
+        },
+        "launch_probes": {
+          "description": "What each admitted package's launch probe reads of its application, as this daemon runs it.\n\nSection 7 has a launch record the mode its application runs in, and a package declares how\nthat is read: the application's own diagnostic. The doctor runs the same declaration for\nthe executable this daemon's own search path names, in this daemon's own environment, which\na launch's may differ from, and says what it read, word for word.",
+          "items": {
+            "$ref": "#/$defs/LaunchProbeReport"
+          },
+          "type": "array"
         }
       },
       "required": [
         "checks",
         "healthy",
         "configuration",
-        "command_integrations"
+        "command_integrations",
+        "launch_probes"
       ],
       "type": "object"
     },
@@ -17275,6 +17283,91 @@
             "quoted_command"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "LaunchProbeReport": {
+      "additionalProperties": false,
+      "description": "What a package's launch probe read of its application, as `kr doctor` reports it.\n\nThe executable is this daemon's reading of it: the first its package's match rule names on the\ndaemon's own search path. The probe runs in the daemon's own environment and directory, so a\nlaunch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode, and\neach launch records the one it read.",
+      "properties": {
+        "executable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The executable the probe ran, where the daemon's search path named one."
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The word the application reported for its mode, exactly as it printed it, where the probe\nread one. The host interprets nothing: it names what the application said."
+        },
+        "plugin_id": {
+          "description": "The package, as `publisher/plugin`.",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why no mode was read, where none was."
+        },
+        "state": {
+          "$ref": "#/$defs/LaunchProbeState",
+          "description": "What the probe came to."
+        },
+        "version": {
+          "description": "Its installed release.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "version",
+        "state",
+        "executable",
+        "mode",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "LaunchProbeState": {
+      "description": "What one package's launch probe came to.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "The probe ran and read a mode.",
+          "type": "string"
+        },
+        {
+          "const": "not_read",
+          "description": "The probe ran, or could not, and read no mode: `reason` says why.",
+          "type": "string"
+        },
+        {
+          "const": "not_granted",
+          "description": "The release declares a probe and its installation does not hold `launch.probe`, so the\nprobe was not run.",
+          "type": "string"
+        },
+        {
+          "const": "no_executable",
+          "description": "The release declares a probe and the daemon's search path names no executable of its\napplication, so there was nothing to run it against.",
+          "type": "string"
         }
       ]
     },

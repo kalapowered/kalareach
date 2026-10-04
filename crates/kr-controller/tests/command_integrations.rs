@@ -492,6 +492,11 @@ async fn kr_req_07_45_the_doctor_reports_each_integration_and_what_a_new_session
         .find(|check| check.id() == "command-integrations")
         .expect("the command integrations are checked");
     assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        result.launch_probes.is_empty(),
+        "no installed package declares a launch probe, so none is reported or run: {:?}",
+        result.launch_probes
+    );
 }
 
 /// KR-REQ-11.42: the doctor's answer carries the check of the native bridges. A host whose

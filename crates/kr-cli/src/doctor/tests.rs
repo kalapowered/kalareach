@@ -310,6 +310,11 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
         for report in &result.command_integrations {
             only_asked_lines("kr doctor", &integration_lines(report, "", ""));
         }
+        // A probe's lines show only what was asked for: the package, the executable and the word
+        // the application printed; why none was read is said as its class and its length.
+        for report in &result.launch_probes {
+            only_asked_lines("kr doctor", &launch_probe_lines(report, "", ""));
+        }
         // A check's lines are the host's words, through the door and nowhere else.
         let said: usize = check_lines(&result, true)
             .iter()
@@ -400,6 +405,100 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
         );
     }
     assert!(!integrations.contains("command_integrations[].reason"));
+    // KR-REQ-07.64: what the doctor is asked to show of each launch probe.
+    for asked in [
+        "launch_probes[].plugin_id",
+        "launch_probes[].version",
+        "launch_probes[].executable",
+        "launch_probes[].mode",
+    ] {
+        assert!(
+            integrations.contains(asked),
+            "{asked} shows what was asked for"
+        );
+    }
+    assert!(!integrations.contains("launch_probes[].reason"));
+}
+
+/// One package's probe as each state of it is reported: a mode read, a mode that could not be
+/// read, a probe the installation did not grant, and an application the search path does not name.
+fn probed() -> HostDoctorResult {
+    use kr_protocol::hostinfo::{LaunchProbeReport, LaunchProbeState};
+    let report = |plugin: &str,
+                  state,
+                  executable: Option<&str>,
+                  mode: Option<&str>,
+                  reason: Option<&str>| {
+        LaunchProbeReport {
+            plugin_id: plugin.to_owned(),
+            version: "0.3.0".to_owned(),
+            state,
+            executable: Nullable(executable.map(str::to_owned)),
+            mode: Nullable(mode.map(str::to_owned)),
+            reason: Nullable(reason.map(str::to_owned)),
+        }
+    };
+    result().with_launch_probes(vec![
+        report(
+            "kalareach/codex",
+            LaunchProbeState::Read,
+            Some("/Users/someone/.local/bin/codex"),
+            Some("elevated"),
+            None,
+        ),
+        report(
+            "kalareach/one",
+            LaunchProbeState::NotRead,
+            Some("/opt/one/bin/one"),
+            None,
+            Some("it did not finish within 5000 ms"),
+        ),
+        report(
+            "kalareach/two",
+            LaunchProbeState::NotGranted,
+            None,
+            None,
+            None,
+        ),
+        report(
+            "kalareach/three",
+            LaunchProbeState::NoExecutable,
+            None,
+            None,
+            None,
+        ),
+    ])
+}
+
+/// KR-REQ-07.64: the doctor says what each package's probe read of its application, word for word,
+/// where the daemon read it from and that the daemon's own environment is what it ran in; for a
+/// probe that read nothing, that it read none; for one not granted, that it did not run; for an
+/// application the search path does not name, that there was none to ask.
+#[test]
+fn the_doctor_shows_what_each_launch_probe_read() {
+    let text = text(&doctor_lines(&probed(), false));
+    for shown in [
+        r#"kalareach/codex 0.3.0: mode "elevated" read from /Users/someone/.local/bin/codex"#,
+        "in its own environment, which a launch's may differ from",
+        "kalareach/one 0.3.0: no mode was read from /opt/one/bin/one",
+        "kalareach/two 0.3.0: not run, its installation does not hold launch.probe",
+        "kalareach/three 0.3.0: no executable of its application is on this daemon's search path",
+    ] {
+        assert!(text.contains(shown), "{shown} is missing: {text}");
+    }
+    assert!(
+        !text.contains("it did not finish within 5000 ms"),
+        "what arrived as the reason is said as its class and its length: {text}"
+    );
+    let document = doctor(&probed()).json();
+    let reported = document["launch_probes"]
+        .as_array()
+        .expect("the probes are in the document");
+    assert_eq!(reported.len(), 4);
+    assert_eq!(reported[0]["state"], "read");
+    assert_eq!(reported[0]["mode"], "elevated");
+    assert_eq!(reported[2]["state"], "not_granted");
+    assert_eq!(reported[3]["state"], "no_executable");
 }
 
 /// Section 26: each effective value is shown; one made of names the owner wrote down, the packages

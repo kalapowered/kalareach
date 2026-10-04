@@ -357,6 +357,13 @@ pub struct HostDoctorResult {
     ///
     /// Section 7: diagnostics show the resolved executable, flags, version and integration mode.
     pub command_integrations: Vec<CommandIntegrationReport>,
+    /// What each admitted package's launch probe reads of its application, as this daemon runs it.
+    ///
+    /// Section 7 has a launch record the mode its application runs in, and a package declares how
+    /// that is read: the application's own diagnostic. The doctor runs the same declaration for
+    /// the executable this daemon's own search path names, in this daemon's own environment, which
+    /// a launch's may differ from, and says what it read, word for word.
+    pub launch_probes: Vec<LaunchProbeReport>,
 }
 
 impl HostDoctorResult {
@@ -374,6 +381,7 @@ impl HostDoctorResult {
             healthy,
             configuration,
             command_integrations: Vec::new(),
+            launch_probes: Vec::new(),
         }
     }
 
@@ -385,6 +393,83 @@ impl HostDoctorResult {
     ) -> Self {
         self.command_integrations = command_integrations;
         self
+    }
+
+    /// The same result, reporting `launch_probes`.
+    #[must_use]
+    pub fn with_launch_probes(mut self, launch_probes: Vec<LaunchProbeReport>) -> Self {
+        self.launch_probes = launch_probes;
+        self
+    }
+}
+
+/// What a package's launch probe read of its application, as `kr doctor` reports it.
+///
+/// The executable is this daemon's reading of it: the first its package's match rule names on the
+/// daemon's own search path. The probe runs in the daemon's own environment and directory, so a
+/// launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode, and
+/// each launch records the one it read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchProbeReport {
+    /// The package, as `publisher/plugin`.
+    pub plugin_id: String,
+    /// Its installed release.
+    pub version: String,
+    /// What the probe came to.
+    pub state: LaunchProbeState,
+    /// The executable the probe ran, where the daemon's search path named one.
+    pub executable: Nullable<String>,
+    /// The word the application reported for its mode, exactly as it printed it, where the probe
+    /// read one. The host interprets nothing: it names what the application said.
+    pub mode: Nullable<String>,
+    /// Why no mode was read, where none was.
+    pub reason: Nullable<String>,
+}
+
+impl LaunchProbeReport {
+    /// Returns this report with every value of it held to its class: what it is in an answer to
+    /// anybody but the owner.
+    #[must_use]
+    pub fn withheld_form(&self) -> Self {
+        let class = |field| export::class("LaunchProbeReport", field);
+        Self {
+            plugin_id: export::carry(class("plugin_id"), &self.plugin_id),
+            version: export::carry(class("version"), &self.version),
+            state: self.state,
+            executable: export::carry_null(class("executable"), &self.executable),
+            mode: export::carry_null(class("mode"), &self.mode),
+            reason: export::carry_null(class("reason"), &self.reason),
+        }
+    }
+}
+
+/// What one package's launch probe came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchProbeState {
+    /// The probe ran and read a mode.
+    Read,
+    /// The probe ran, or could not, and read no mode: `reason` says why.
+    NotRead,
+    /// The release declares a probe and its installation does not hold `launch.probe`, so the
+    /// probe was not run.
+    NotGranted,
+    /// The release declares a probe and the daemon's search path names no executable of its
+    /// application, so there was nothing to run it against.
+    NoExecutable,
+}
+
+impl LaunchProbeState {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::NotRead => "not_read",
+            Self::NotGranted => "not_granted",
+            Self::NoExecutable => "no_executable",
+        }
     }
 }
 
@@ -557,6 +642,11 @@ impl export::ForExport for HostDoctorResult {
                 .command_integrations
                 .iter()
                 .map(CommandIntegrationReport::withheld_form)
+                .collect(),
+            launch_probes: self
+                .launch_probes
+                .iter()
+                .map(LaunchProbeReport::withheld_form)
                 .collect(),
         })
     }
@@ -4930,6 +5020,13 @@ pub mod export {
             "command_integrations",
             ContentClass::Structure,
         ),
+        field("HostDoctorResult", "launch_probes", ContentClass::Structure),
+        field("LaunchProbeReport", "plugin_id", ContentClass::Name),
+        field("LaunchProbeReport", "version", ContentClass::Name),
+        field("LaunchProbeReport", "state", ContentClass::Term),
+        field("LaunchProbeReport", "executable", ContentClass::Path),
+        field("LaunchProbeReport", "mode", ContentClass::Name),
+        field("LaunchProbeReport", "reason", ContentClass::Name),
         field("CommandIntegrationReport", "plugin_id", ContentClass::Name),
         field("CommandIntegrationReport", "version", ContentClass::Name),
         field("CommandIntegrationReport", "command", ContentClass::Name),
@@ -9425,6 +9522,42 @@ mod tests {
         ] {
             assert!(exported.contains(word), "{word} in {exported}");
         }
+    }
+
+    /// KR-REQ-07.64: a launch probe's report leaves this host as its classes allow. The owner's own
+    /// report names the package, the executable and the word the application printed; an export
+    /// carries each as its class and its length, and the state as this build's own word.
+    #[test]
+    fn a_launch_probe_report_leaves_as_its_classes_allow() {
+        use export::ForExport as _;
+
+        let report = LaunchProbeReport {
+            plugin_id: "kalareach/codex".to_owned(),
+            version: "0.2.1".to_owned(),
+            state: LaunchProbeState::Read,
+            executable: Nullable::some("/Users/someone/.local/bin/codex".to_owned()),
+            mode: Nullable::some("elevated".to_owned()),
+            reason: Nullable::some("it printed nothing at the pointer".to_owned()),
+        };
+        let result = HostDoctorResult::new(Vec::new(), EffectiveConfiguration::unread())
+            .with_launch_probes(vec![report.clone()]);
+        assert_eq!(
+            result.launch_probes,
+            [report],
+            "the owner's own report names everything"
+        );
+        let exported =
+            serde_json::to_string(result.for_export().get()).expect("the export serialises");
+        for private in [
+            "kalareach/codex",
+            "/Users/someone",
+            "elevated",
+            "0.2.1",
+            "printed nothing",
+        ] {
+            assert!(!exported.contains(private), "{private} left in: {exported}");
+        }
+        assert!(exported.contains(r#""state":"read""#), "{exported}");
     }
 
     /// KR-REQ-12.07: a disable edit keeps the host's list sorted, as an enable edit does, whatever
