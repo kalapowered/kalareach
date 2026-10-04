@@ -76,6 +76,10 @@ pub enum PluginCapability {
     /// interactive invocation of its command in a managed root shell.
     #[serde(rename = "command_integration.launch")]
     CommandIntegrationLaunch,
+    /// Run the application's own executable with the arguments the package's launch probe
+    /// declares, before a launch, and read the mode the application runs in from what it prints.
+    #[serde(rename = "launch.probe")]
+    LaunchProbe,
 }
 
 impl PluginCapability {
@@ -95,6 +99,7 @@ impl PluginCapability {
         Self::ApprovalRespond,
         Self::NativeBridgeInstall,
         Self::CommandIntegrationLaunch,
+        Self::LaunchProbe,
     ];
 
     /// The capabilities a newly enrolled repository permits without any further grant.
@@ -122,6 +127,7 @@ impl PluginCapability {
             Self::ApprovalRespond => "approval.respond",
             Self::NativeBridgeInstall => "native_bridge.install",
             Self::CommandIntegrationLaunch => "command_integration.launch",
+            Self::LaunchProbe => "launch.probe",
         }
     }
 
@@ -149,6 +155,7 @@ impl PluginCapability {
             self,
             Self::NativeBridgeInstall
                 | Self::CommandIntegrationLaunch
+                | Self::LaunchProbe
                 | Self::TerminalInput
                 | Self::FilesystemRead
                 | Self::NetworkOutbound
@@ -171,7 +178,8 @@ impl PluginCapability {
             | Self::ProcessObserve
             | Self::ApprovalDecode
             | Self::NativeBridgeInstall
-            | Self::CommandIntegrationLaunch => None,
+            | Self::CommandIntegrationLaunch
+            | Self::LaunchProbe => None,
             Self::TerminalStream | Self::TranscriptTail => Some(ActionRight::SessionView),
             Self::TerminalInput => Some(ActionRight::TerminalInput),
             Self::FilesystemRead => Some(ActionRight::FilesRead),
@@ -185,15 +193,16 @@ impl PluginCapability {
     /// confirmation of that exact release, whatever an earlier release was granted.
     ///
     /// Section 10 makes granting an executable or native-bridge capability the owner's decision.
-    /// What these two do is carried by the release itself, so it can change with every release
+    /// What these three do is carried by the release itself, so it can change with every release
     /// while the capability's name stays the same: a native bridge's files run under the
-    /// application's own permissions, and a command integration's flags and variables change how
-    /// the application runs. A grant held from an earlier release says nothing about this one.
+    /// application's own permissions, a command integration's flags and variables change how the
+    /// application runs, and a launch probe's arguments are what the host runs the application's
+    /// own executable with. A grant held from an earlier release says nothing about this one.
     #[must_use]
     pub const fn confirmed_on_every_release(self) -> bool {
         matches!(
             self,
-            Self::NativeBridgeInstall | Self::CommandIntegrationLaunch
+            Self::NativeBridgeInstall | Self::CommandIntegrationLaunch | Self::LaunchProbe
         )
     }
 }
@@ -630,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn a_native_bridge_and_a_command_integration_are_confirmed_on_every_release() {
+    fn a_native_bridge_a_command_integration_and_a_launch_probe_are_confirmed_on_every_release() {
         let confirmed: Vec<PluginCapability> = PluginCapability::ALL
             .iter()
             .copied()
@@ -640,7 +649,8 @@ mod tests {
             confirmed,
             [
                 PluginCapability::NativeBridgeInstall,
-                PluginCapability::CommandIntegrationLaunch
+                PluginCapability::CommandIntegrationLaunch,
+                PluginCapability::LaunchProbe
             ]
         );
         for capability in confirmed {
