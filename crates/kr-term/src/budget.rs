@@ -318,7 +318,8 @@ impl SessionBudget {
     /// well. The scrollback slots are in it because the rows of the history sit in the same array
     /// as the rows of the screen; what those rows *hold* is the row cache's own bound. The account
     /// of what each retained row costs is a slot a row too, in an array of its own, so it is
-    /// reserved beside them.
+    /// reserved beside them. A row is reserved one cell wider than the grid, for the character that
+    /// overhangs the last column.
     #[must_use]
     pub const fn footprint(
         &self,
@@ -326,8 +327,11 @@ impl SessionBudget {
         scrollback_rows: usize,
         cell_bytes: u64,
     ) -> Footprint {
-        let cells = (size.cols as u64).saturating_mul(size.rows as u64);
         let rows = size.rows as u64;
+        // A row is reserved one cell wider than the geometry. A wide character written in the last
+        // column overhangs the margin, and the row that holds it holds a cell more than the grid
+        // has columns.
+        let cells = (size.cols as u64 + 1).saturating_mul(rows);
         Footprint {
             cell_slots: 2u64
                 .saturating_mul(cells)
