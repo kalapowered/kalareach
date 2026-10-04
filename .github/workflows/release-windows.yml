@@ -114,10 +114,12 @@ jobs:
       contents: write
       id-token: write
     env:
-      # The vendored C library this workspace links ships no debug database, so the linker says so
-      # once per object file. LNK4098, which reports two objects disagreeing about the C runtime, is
-      # deliberately not silenced.
-      RUSTFLAGS: "-Clink-arg=/IGNORE:4099"
+      # What this job does not set is RUSTFLAGS. The link needs arguments about the vendored C
+      # library: leave the static C runtime out, and stop the linker naming the library's missing
+      # debug database once per object file. `.cargo/config.toml` carries them so that every Windows
+      # build gets them, and RUSTFLAGS in the environment replaces that file's flags rather than
+      # adding to them. LNK4098, which reports two C runtimes in one image, is deliberately not
+      # silenced: the step after the builds refuses it.
       CARGO_INCREMENTAL: "0"
     steps:
       # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
