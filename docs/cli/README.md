@@ -1637,7 +1637,7 @@ removed comes back when it is turned off.
 what had already left it before privacy mode was turned on: backup archives and notifications, each
 with whether this host holds any way to ask for its removal. It changes nothing. A paired device
 whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
-`docs/host/README.md` has what each step does and what privacy mode does not reach yet.
+`docs/host/README.md` has what each step does and what privacy mode does not reach.
 
 ## `kr host import-journals`
 
