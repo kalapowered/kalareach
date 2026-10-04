@@ -206,8 +206,8 @@ waits at most 30 days for an approval. The reviewer:
 If, for some reason, the reviewer rejects the deployment, go back to the run's page and click
 "Re-run" to ask the `publish` job for approval again. GitHub offers "Re-run" for 30 days after a run
 starts, which is as long as a run waits for approval, so a run whose approval expired cannot be
-re-run. In that case a new run can be started by hand from the Actions tab, with the tag as its ref.
-(This can also be done with the command line tool: `gh workflow run package-npm.yml --ref <tag>`.)
+re-run. In that case a new run can be started by hand, with the tag as its ref, using the command
+line tool: `gh workflow run package-npm.yml --ref <tag>`.
 
 Whether re-running the existing run or starting a new run, the action will run the version of the
 workflow as it was at the tagged commit. This means if a problem occurred because the workflow was
