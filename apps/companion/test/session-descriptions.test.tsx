@@ -169,6 +169,31 @@ describe("the desktop session list shows each session's description", () => {
     })
   })
 
+  // The host is asked about few sessions at a time and each once, however long it takes to answer:
+  // a round of reads that is not done is not started again, and a slow answer is shown when it comes.
+  it('asks about at most four sessions at once and none twice across rounds, and shows an answer that is slow', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { port, controls } = describedHost()
+    controls.addSessions(8)
+    const held = controls.hold('sessionDescribe')
+    open(port, { view: 'sessions' })
+    await waitFor(() => {
+      expect(held.count).toBe(4)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(95_000)
+    })
+    expect(held.count, 'no read begun beside the four on their way').toBe(4)
+    expect(controls.described.length).toBe(new Set(controls.described).size)
+
+    held.release()
+    const row = await screen.findByTestId('session-row-1')
+    await waitFor(() => {
+      expect(within(row).getByRole('heading', { level: 3 })).toHaveTextContent('KalaReach pairing')
+    })
+    expect(controls.described.length, 'every session, once, in the first round').toBeGreaterThanOrEqual(11)
+  })
+
   it('finds a session by the title the host gave it', async () => {
     const person = userEvent.setup()
     const { port } = describedHost()
