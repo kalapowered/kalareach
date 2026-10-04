@@ -2764,6 +2764,57 @@ fn a_finish_does_not_end_an_upload_under_an_identifier_another_request_took() {
     assert!(staged.exists(), "and its payload was not removed");
 }
 
+/// KR-REQ-24.09: a finish whose completion lost to another copy's is answered with what that copy
+/// recorded, not with the result it computed.
+///
+/// The first result recorded for an action is the one that stands, and every copy of the action is
+/// owed it. Here a copy has recorded the attachment as a draft bound it to a session, after this
+/// call read the row it computed its own handle from.
+#[test]
+fn a_finish_whose_completion_lost_returns_the_result_that_was_recorded() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let claim = action(&harness, "upload.finish", &bytes);
+    let (transfer_id, _) =
+        interrupted_publication(&harness, &bytes, "lost_completion.bin", Some(&claim));
+
+    let bound_to = SessionId::new(kr_ipc::new_uuid());
+    harness
+        .service
+        .set_completion_hook(move |store, action, computed| {
+            let mut recorded: kr_protocol::transfer::UploadFinishResult =
+                kr_cbor::from_canonical_slice(computed, &kr_cbor::Limits::DEFAULT)
+                    .expect("the computed result decodes");
+            recorded.handle.session_id = Nullable::some(bound_to);
+            let encoded = kr_cbor::to_canonical_vec(&recorded).expect("encodes");
+            assert!(
+                store
+                    .complete_action(
+                        &action.actor_id,
+                        action.action_id,
+                        &action.method,
+                        action.payload_digest,
+                        &encoded,
+                    )
+                    .expect("the other copy completes the claim"),
+                "the claim was open"
+            );
+        });
+    let answered = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect("the finish is answered");
+    harness.service.clear_completion_hook();
+    assert_eq!(
+        answered.handle.session_id,
+        Nullable::some(bound_to),
+        "the answer is the recorded one"
+    );
+    let repeated = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect("a repeat is answered");
+    assert_eq!(repeated, answered, "and a repeat is told the same");
+}
+
 /// KR-REQ-24.09: a copy of one action that finds the payload gone is answered by the row, not by
 /// the open that failed.
 ///
