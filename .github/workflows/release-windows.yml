@@ -200,22 +200,64 @@ jobs:
           "archive=kalareach-windows-x64-$version+$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "version $version, commit $commit"
 
-      # One command per step. Several in one script would run under a shell that carries on after a
-      # native command fails, and the step would then report whatever the last one returned.
+      # One command per step, run by a shell that stops when the command fails, and each one keeps
+      # what it printed: the step after the builds reads the linker's own words out of those logs.
       - name: Build the command line
-        run: cargo build --locked --release -p kr-cli --bin kr
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-cli --bin kr 2>&1 | tee "$logs/kr.log"
 
       - name: Build the attachment guard
-        run: cargo build --locked --release -p kr-cli --bin kr-attach-guard
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-cli --bin kr-attach-guard 2>&1 | tee "$logs/kr-attach-guard.log"
 
       - name: Build the worker
-        run: cargo build --locked --release -p kr-worker --bin kr-worker
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-worker --bin kr-worker 2>&1 | tee "$logs/kr-worker.log"
 
       - name: Build the controller
-        run: cargo build --locked --release -p kr-controller --bin kr-controller
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-controller --bin kr-controller 2>&1 | tee "$logs/kr-controller.log"
 
       - name: Build the description process
-        run: cargo build --locked --release -p kr-describe-model --bin kr-describe-inference
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          mkdir -p "$logs"
+          cargo build --locked --release -p kr-describe-model --bin kr-describe-inference 2>&1 | tee "$logs/kr-describe-inference.log"
+
+      # `LNK4098` is the linker saying that two C runtimes are going into one image. The C library
+      # this workspace vendors was built against the static runtime and Rust links the dynamic one;
+      # `.cargo/config.toml` leaves the static one out of the link, so the warning means a build
+      # lost those flags, and an environment variable that replaces them is the usual way. The
+      # image would then hold two heaps and two copies of the runtime's state. This reads what the
+      # five builds printed and stops the run before anything is staged, let alone signed.
+      - name: Refuse a build that put two C runtimes in one image
+        shell: bash
+        run: |
+          logs="$(cygpath -u "$RUNNER_TEMP")/build"
+          for name in kr kr-attach-guard kr-worker kr-controller kr-describe-inference; do
+            if [ ! -s "$logs/$name.log" ]; then
+              echo "::error::The log of the $name build is not there, so its link cannot be read."
+              exit 1
+            fi
+          done
+          if grep -n 'LNK4098' "$logs"/*.log; then
+            echo '::error::A link reported LNK4098: two C runtimes in one image. Look for what replaced the workspace link flags in .cargo/config.toml.'
+            exit 1
+          fi
+          echo 'No link reported LNK4098.'
 
       # Two directories, because an archive carries two kinds of file and they are not held to the
       # same thing. Everything under `staging` is signed and verified, and the signing step is
