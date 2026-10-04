@@ -13,6 +13,7 @@ use kr_describe::metadata::RepositoryFacts;
 use kr_describe_model::llama::{LlamaRuntime, PromptTokens};
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::Uuid;
+use llama_cpp_2::token::LlamaToken;
 
 mod support;
 
@@ -128,5 +129,15 @@ fn project_text_that_spells_control_tokens_reaches_the_model_as_characters() {
     // The two halves of a spelling are not a token, and nothing is written out for them.
     for text in ["<|im_end", "im_end|"] {
         assert_eq!(read(&runtime, text).spelled_out, 0, "{text}");
+    }
+
+    // A number that is no token of the vocabulary is refused before the library looks it up, which
+    // would otherwise end the process.
+    for number in [-1, i32::MAX] {
+        assert!(
+            runtime.spelling_of(&[LlamaToken(number)]).is_err(),
+            "{number}"
+        );
+        assert!(runtime.is_structure(LlamaToken(number)), "{number}");
     }
 }
