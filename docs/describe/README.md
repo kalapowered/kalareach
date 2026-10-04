@@ -122,6 +122,8 @@ The deadline starts at dequeue. A model loads before any job leaves the queue, u
 deadline of its own, so a slow load costs the queue's wait and never a job's thirty seconds. The
 cold start is reported on its own.
 
+The prompt has a bound of its own, counted in the model's tokens. A job's prompt may be what the window leaves beside the answer's bound, 3,968 tokens, or what the deadline leaves for reading it, whichever is less. The deadline is the smaller. Take 1 s of fixed cost and 12.8 s for a full answer of 128 tokens out of 30 s and 16.2 s are left, and at 55 tokens a second a prompt may be 891 tokens. The figures come from the selected profile on the build box at four threads under a load average of 20 to 40, where prompts were read at 61 to 69 tokens a second and each answer token took 70 to 85 ms, so the budget assumes a slower box on both counts.
+
 The memory a resident model costs is accounted for item by item — weights, mapping overhead, the
 key-value cache, other caches, batch buffers and the runtime's own allocations — because a 1.5 GiB
 file is not a 1.5 GiB process. An owner may tighten the ceiling or the reserve, and never loosen
@@ -232,11 +234,21 @@ status shown beside it. Project text that spells one of the model's control toke
 or `/no_think`, reaches the model as the characters it is made of, never as the token. Project text
 can still mislead a model about what a session is doing, and nothing here claims otherwise.
 
+## What fits in the prompt
+
+The daemon sends the process the prompt in its parts: the instruction, the revision and cursor interval the answer repeats, the session's facts and its recent events. The process counts tokens with the model's own tokenizer and makes the prompt fit its bound. It always keeps the instruction and the two provenance lines. After those it keeps the task intent, the directory, the repository, the branch, the thread and the application, in that order, and then the events, newest first. Each is kept whole while the prompt fits. The first one that does not fit is cut to the longest run of its codepoints that does, and nothing after it is kept. The oldest events go first, and the same context under the same bound gives the same prompt every time.
+
+An ordinary session is never trimmed, because its prompt is 180 to 250 tokens. The largest context the product admits, with every field and every event at its bound, is 708 tokens in Latin text and fits whole. In Arabic text it is 1,768 tokens, in Hebrew 2,152 and in emoji 5,164, and each is trimmed to 891 tokens or just under.
+
+A model whose window cannot hold the instruction and the answer's bound is refused when it loads, with that reason, because no prompt could be made to fit it.
+
 ## What comes out
 
 Grammar-constrained JSON with four fields: a `title` of at most 64 Unicode codepoints, an
 `activity_text` of at most 160, the source cursor interval it covers and the context revision it was
 produced at.
+
+The grammar allows all characters that will be allowed by the validation, and disallows all that will be disallowed by the validation. It does this by including, rather than excluding, characters in the character class, because llama.cpp refuses a token that ends inside a letter when the letter's first byte could begin an excluded character, and that stopped the model from copying Arabic and Persian text when the bidirectional text control characters were in the exclusion list.
 
 Every result is validated again before it is published, because a grammar is a constraint on
 generation rather than a guarantee about a process. It is judged against what is in force when it
@@ -249,6 +261,8 @@ were turned off is not published either; its job keeps its place in the queue. N
 into acceptability.
 
 A refusal costs nothing: the session keeps the title it had.
+
+A model can run out of output tokens before it closes the object. If that happens inside the activity text, the process cuts the text back to the last boundary between characters a person sees, never inside a combining sequence or an emoji sequence, and leaves out the last of them in case more of it was coming. It closes the string and writes the revision and the cursor interval from the prompt. The activity line is then shorter than the model meant it to be, and the answer is validated like any other. If the model runs out inside the title, nothing is changed: the answer is refused, and the session keeps the title it had.
 
 ## Pins
 
