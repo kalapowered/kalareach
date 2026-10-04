@@ -116,4 +116,38 @@ test.describe('the session rows ask the host about what is on the screen', () =>
     const searched = await whatWasAsked(page)
     expect(searched.asked.length, 'each session is asked about once').toBe(new Set(searched.asked).size)
   })
+
+  // The host's own words can be one long word, and the desktop's first column is not wide: the
+  // title and the line break where the column ends, and do not run over the directory beside it.
+  test('on the desktop list, a long word in what the host says stays in its column', async ({ page }) => {
+    await page.addInitScript(() => {
+      let held: Window['krTestHost']
+      Object.defineProperty(window, 'krTestHost', {
+        configurable: true,
+        get: () => held,
+        set: (controls: Window['krTestHost']) => {
+          held = controls
+          controls?.describe('8a7b6c50-22bb-4c3d-8e4f-000000000101', {
+            title: 'Pairing-code-entry-and-host-approval-flow-for-a-narrow-column',
+            source: 'generated',
+            activity_text: 'Checks/the/code-entry/flow/and/host/approval/screen/on/a/narrow/phone',
+            freshness: 'current'
+          })
+        }
+      })
+    })
+    await page.setViewportSize({ width: 1100, height: 800 })
+    await page.goto('/harness.html')
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    const row = page.getByTestId('session-row-1')
+    await expect(row.getByTestId('description-activity')).toBeVisible()
+    const over = await row.evaluate((element) => {
+      const cell = element.querySelector('[role="cell"]')?.getBoundingClientRect()
+      if (cell === undefined) return ['no first cell']
+      return [...element.querySelectorAll('h3, [data-testid="description-activity"]')]
+        .filter((line) => line.getBoundingClientRect().right > cell.right + 0.5)
+        .map((line) => line.textContent?.slice(0, 40) ?? '')
+    })
+    expect(over, 'lines that run past the first column').toEqual([])
+  })
 })
