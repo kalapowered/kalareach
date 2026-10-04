@@ -198,8 +198,12 @@ const REPLAY_WINDOW: usize = 64;
 /// it enforces. Every 64 reads is often enough that the cache overshoots by a fraction of itself.
 const ROW_CACHE_INTERVAL: u32 = 64;
 
-/// How many events the buffer a read collects them in keeps the room for between reads.
+/// How many events the buffer a read collects them in keeps the room for, however little the reads
+/// after a large one need.
 const SCRATCH_EVENTS: usize = 256;
+
+/// How many times what a read needed the buffer may hold before the room goes back.
+const SCRATCH_SLACK: usize = 4;
 
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
@@ -447,10 +451,19 @@ impl Engine {
     ///
     /// A read of nothing but controls is one event a byte, so a buffer that kept the room such a
     /// read grew it to would hold it for the rest of the session, outside every bound the session
-    /// keeps. Past [`SCRATCH_EVENTS`] the room goes back.
+    /// keeps. So the room goes back once a read needs a [`SCRATCH_SLACK`]th of it or less, down to
+    /// what that read needed and no lower than [`SCRATCH_EVENTS`].
+    ///
+    /// Not after every read: a buffer given back and grown again on the next read costs a
+    /// reallocation each way and the pages behind it, and a stream that keeps printing needs the
+    /// same room every time. Such a stream keeps its buffer, and what the buffer holds after a read
+    /// is never more than [`SCRATCH_SLACK`] times what that read needed, or [`SCRATCH_EVENTS`].
     fn keep_scratch(&mut self, mut events: Vec<Event>) {
+        let needed = events.len();
         events.clear();
-        events.shrink_to(SCRATCH_EVENTS);
+        if events.capacity() > SCRATCH_EVENTS && events.capacity() / SCRATCH_SLACK >= needed {
+            events.shrink_to(needed.max(SCRATCH_EVENTS));
+        }
         self.scratch = events;
     }
 
