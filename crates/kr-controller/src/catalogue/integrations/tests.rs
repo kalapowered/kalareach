@@ -41,6 +41,11 @@ impl Drop for Store {
     }
 }
 
+/// What a session gets where this host has no forwarder to write into a package's flags.
+fn fill(reading: &Reading, enabled: &[String]) -> Fill {
+    super::fill(reading, enabled, None)
+}
+
 fn plugin(name: &str) -> PluginId {
     PluginId::new(format!("kalareach/{name}")).expect("a plugin identifier")
 }
@@ -181,6 +186,7 @@ fn able(search_path: Vec<PathBuf>) -> Host {
         backends: true,
         backends_failure: None,
         launcher: true,
+        forwarder: None,
     }
 }
 
@@ -389,6 +395,7 @@ fn a_platform_whose_command_backends_run_reports_an_integration_with_a_launcher_
         backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
         backends_failure: kr_worker::broker::process::ManagedProcess::command_backends_failure(),
         launcher: true,
+        forwarder: None,
     };
     let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
     assert_eq!(reported.reports[0].state, CommandIntegrationState::On);

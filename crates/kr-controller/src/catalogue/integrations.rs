@@ -19,7 +19,7 @@
 //! the version a signed qualification record gives that executable's digest.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_protocol::admission::AdmittedPackage;
@@ -61,6 +61,27 @@ impl Integrations {
     }
 }
 
+/// The forwarder a package writes the path of where it registers it: this installation's `kr-hook`
+/// by the path an update keeps current (through the store's `current` link for a release of a store,
+/// and beside the daemon otherwise), where one is installed.
+///
+/// A session's flags, the doctor's reports and the registration files a bridge installs all name
+/// this path, and a worker reads the same one, so each says the same text.
+#[must_use]
+pub fn registered_forwarder() -> Option<PathBuf> {
+    kr_ipc::install::this_process()
+        .ok()
+        .map(|running| running.stable(kr_ipc::install::Program::Hook))
+        .filter(|path| path.is_file())
+}
+
+/// Returns `flags` written with the forwarder's path where a package names the forwarder, or as
+/// declared where that cannot be done here: a worker that cannot write them either runs every
+/// invocation as typed, and the doctor says why.
+fn written(flags: &[String], forwarder: Option<&Path>) -> Vec<String> {
+    kr_plugin_sdk::forwarder::expand_flags(flags, forwarder).unwrap_or_else(|_| flags.to_vec())
+}
+
 /// What a session launched with some admissions is given of their command integrations.
 #[derive(Debug, Default)]
 pub struct Fill {
@@ -80,9 +101,9 @@ pub struct Fill {
 /// under [`MAX_COMMAND_INTEGRATION_ENTRIES`] in command order: one that finds none only loses the
 /// record that an invocation of its command ran as typed because the integration is off.
 #[must_use]
-pub fn fill(reading: &Reading, enabled: &[String]) -> Fill {
+pub fn fill(reading: &Reading, enabled: &[String], forwarder: Option<&Path>) -> Fill {
     let (mut on, off): (Vec<CommandIntegration>, Vec<CommandIntegration>) =
-        entries(reading, enabled)
+        entries(reading, enabled, forwarder)
             .into_iter()
             .partition(|entry| entry.enabled);
     on.sort_by(|left, right| {
@@ -133,7 +154,11 @@ pub fn omission_note(session_id: SessionId, omitted: &[PluginId]) -> Option<Stri
 /// The entries a session launched with `reading`'s admissions gets: one for each connector whose
 /// integration applies, in command order, on where `enabled` names its package.
 #[must_use]
-fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration> {
+fn entries(
+    reading: &Reading,
+    enabled: &[String],
+    forwarder: Option<&Path>,
+) -> Vec<CommandIntegration> {
     let mut entries: Vec<CommandIntegration> = reading
         .packages
         .iter()
@@ -156,7 +181,7 @@ fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration> {
                 command: integration.command.clone(),
                 // An entry that is off adds nothing, so it carries nothing to add.
                 flags: if on {
-                    integration.flags.clone()
+                    written(&integration.flags, forwarder)
                 } else {
                     Vec::new()
                 },
@@ -218,6 +243,8 @@ pub struct Host {
     pub backends_failure: Option<&'static str>,
     /// Whether a launcher, `kr-hook`, is installed beside this host's worker.
     pub launcher: bool,
+    /// The forwarder a package writes the path of where it registers it, where one is installed.
+    pub forwarder: Option<PathBuf>,
 }
 
 /// What a report is built from: the command, flags and variables a release declares.
@@ -229,11 +256,11 @@ struct Declared {
 
 impl Declared {
     /// What the verified manifest of `connector` declares, whether or not its integration applies.
-    fn of(connector: &InstalledConnector) -> Option<Self> {
+    fn of(connector: &InstalledConnector, forwarder: Option<&Path>) -> Option<Self> {
         if let Some(integration) = connector.integration() {
             return Some(Self {
                 command: integration.command.clone(),
-                flags: integration.flags.clone(),
+                flags: written(&integration.flags, forwarder),
                 variables: integration.variables.clone(),
             });
         }
@@ -243,7 +270,7 @@ impl Declared {
             .as_ref()
             .map(|declared| Self {
                 command: declared.command.clone(),
-                flags: declared.flags.clone(),
+                flags: written(&declared.flags, forwarder),
                 variables: declared
                     .variables
                     .iter()
@@ -312,7 +339,13 @@ pub fn report(
                     reports.insert(
                         plugin_id.to_owned(),
                         (
-                            described(plugin_id, version, state, Declared::of(connector), None),
+                            described(
+                                plugin_id,
+                                version,
+                                state,
+                                Declared::of(connector, host.forwarder.as_deref()),
+                                None,
+                            ),
                             Some(Arc::clone(connector)),
                         ),
                     );
@@ -348,7 +381,7 @@ pub fn report(
                             plugin_id,
                             version,
                             CommandIntegrationState::Conflict,
-                            Declared::of(connector),
+                            Declared::of(connector, host.forwarder.as_deref()),
                             Some(why.clone()),
                         );
                         reports.insert(plugin_id.to_owned(), (report, Some(Arc::clone(connector))));
@@ -404,7 +437,9 @@ pub fn report(
         reports.insert(plugin_id.clone(), (report, None));
     }
     // What a session created now is launched without.
-    let too_large = reading.map_or_else(Vec::new, |reading| fill(reading, enabled).omitted);
+    let too_large = reading.map_or_else(Vec::new, |reading| {
+        fill(reading, enabled, host.forwarder.as_deref()).omitted
+    });
     // One answer carries so many reports and so many bytes of them, each whole: the packages the
     // configuration names first, then the others, each in package order, and the rest counted.
     let (named, others): (Vec<_>, Vec<_>) = reports

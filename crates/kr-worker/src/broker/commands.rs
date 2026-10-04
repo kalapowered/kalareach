@@ -369,6 +369,7 @@ pub struct CommandBackends {
     root: Mutex<Option<PathBuf>>,
     sources: Arc<ConnectorSources>,
     launcher: Option<PathBuf>,
+    registered_forwarder: Option<PathBuf>,
     handle: tokio::runtime::Handle,
     publishes_credential_file: bool,
     backends: Mutex<Vec<Arc<Backend>>>,
@@ -447,6 +448,11 @@ pub struct CommandBackendsConfig {
     pub sources: Arc<ConnectorSources>,
     /// The installation's `kr-hook`, which the shell runs an integrated invocation through.
     pub launcher: Option<PathBuf>,
+    /// The forwarder a package writes the path of where it registers it, by the path an update of
+    /// the installation keeps naming the current one: the path the control daemon writes into a
+    /// session's flags and into the registration files it installs. It is the same file as the
+    /// launcher where nothing has been updated since this worker started.
+    pub registered_forwarder: Option<PathBuf>,
 }
 
 impl CommandBackends {
@@ -471,6 +477,7 @@ impl CommandBackends {
             root: Mutex::new(None),
             sources: config.sources,
             launcher: config.launcher,
+            registered_forwarder: config.registered_forwarder,
             handle,
             publishes_credential_file: ManagedProcess::publishes_credential_file(),
             backends: Mutex::new(Vec::new()),
@@ -681,7 +688,18 @@ impl CommandBackends {
                 request.integration.plugin_id
             ));
         }
-        if declared.flags != request.integration.flags {
+        // What the package declares is written with the forwarder's path where it names the
+        // forwarder, as the daemon wrote it into the session's flags: the two have to be the same
+        // text, byte for byte, and a package that names a forwarder this worker cannot name is one
+        // whose flags this worker cannot compare.
+        let declared_flags = kr_plugin_sdk::forwarder::expand_flags(
+            &declared.flags,
+            self.registered_forwarder.as_deref(),
+        )
+        .map_err(|error| {
+            format!("the flags the installed connector declares cannot be written: {error}")
+        })?;
+        if declared_flags != request.integration.flags {
             return Err(format!(
                 "the flags this session integrates {command:?} with are not the ones its installed \
                  connector declares"
@@ -689,7 +707,7 @@ impl CommandBackends {
         }
         // The flags are whole argument elements in a fixed order, so they are added as one run or,
         // where the person typed them, not at all: a value is never added without its flag.
-        if !request.added.is_empty() && request.added != declared.flags.as_slice() {
+        if !request.added.is_empty() && request.added != declared_flags.as_slice() {
             return Err(format!(
                 "the answer adds only some of the flags {command:?} is integrated with, and they are \
                  added whole or not at all"
