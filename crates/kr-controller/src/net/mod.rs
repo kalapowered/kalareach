@@ -3335,15 +3335,20 @@ pub(crate) mod tests {
 
     /// The network's record task writes down the time the offline bound has spent, whether or not
     /// anything asked, so a reboot loses no more than one mark of it; and it raises no floor.
+    ///
+    /// On clocks the test moves by hand: the continuous clock passes the time to be written down
+    /// while the wall clock stands still, so a reading of the wall clock that anything else in the
+    /// daemon takes meanwhile reads what it read before, and cannot have raised the floor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_record_task_writes_down_the_time_an_offline_bound_has_spent() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
-        let synchronised = kr_ipc::now_ms().get();
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
         let floor = controller.policy().utc_floor_ms();
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         controller.keep_offline_time();
         assert!(
             recorded_offline_time(&controller, synchronised) >= 300,
