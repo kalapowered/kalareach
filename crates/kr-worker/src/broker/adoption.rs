@@ -46,7 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
+use kr_protocol::broker::{
+    AgentOwnership, AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile,
+};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, EnvironmentId};
 use kr_protocol::projection::AgentInstanceSummary;
@@ -382,6 +384,10 @@ impl Adoptions {
             arguments,
             authentication: AuthenticationState::Unknown,
             mode: IntegrationMode::NativeTerminal,
+            // Started by the person's shell, so held by whatever holds the session's own
+            // processes.
+            ownership: AgentOwnership::Full,
+            vendor_mode: Nullable::null(),
             resolved_at: now,
         };
         let application_instance_id =

@@ -168,6 +168,8 @@ fn agent_profile(arguments: &[&str]) -> LaunchProfile {
             .collect(),
         authentication: AuthenticationState::Authenticated,
         mode: IntegrationMode::Gateway,
+        ownership: kr_protocol::broker::AgentOwnership::Full,
+        vendor_mode: kr_protocol::scalars::Nullable::null(),
         resolved_at: TimestampMs::new(1),
     }
 }

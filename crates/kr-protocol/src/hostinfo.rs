@@ -1563,6 +1563,9 @@ pub mod configuration {
     /// How many packages one rung's `command_integrations` may name.
     pub const MAX_COMMAND_INTEGRATIONS: usize = 64;
 
+    /// How many packages the document's `agents` section may name.
+    pub const MAX_AGENT_ENTRIES: usize = 64;
+
     /// How many variables one rung's `environment_additions` may name.
     pub const MAX_ENVIRONMENT_ADDITIONS: usize = 64;
 
@@ -1796,6 +1799,23 @@ pub mod configuration {
         /// and ends the description process, and no restart is needed for either. No environment
         /// variable reaches them.
         pub descriptions: DescriptionsSelection,
+        /// What the owner or an administrator chose for the agents this host launches, by package
+        /// (`publisher/plugin`).
+        ///
+        /// Section 7 lets an agent whose own sandbox cannot nest under the session's job run under
+        /// an **explicitly selected** reduced-ownership profile, and this is where that selection
+        /// is made: an entry that names `reduced` for a package, and nothing else, puts that
+        /// package's agent in a job of its own instead of the session's. A package with no entry
+        /// runs under full ownership. Entries are read for the sessions created afterwards.
+        pub agents: BTreeMap<String, AgentChoice>,
+    }
+
+    /// What was chosen for one agent's launches.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentChoice {
+        /// How completely the session's closure accounts for what this agent starts.
+        pub ownership: crate::broker::AgentOwnership,
     }
 
     impl Default for ConfigurationDocument {
@@ -1816,6 +1836,7 @@ pub mod configuration {
                 voice: VoiceSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
+                agents: BTreeMap::new(),
             }
         }
     }
@@ -1825,6 +1846,17 @@ pub mod configuration {
         #[must_use]
         pub fn empty() -> Self {
             Self::default()
+        }
+
+        /// Returns how completely the session's closure accounts for the agent of one package: the
+        /// owner's explicit choice for it, and full ownership where there is none.
+        #[must_use]
+        pub fn agent_ownership(&self, package: &str) -> crate::broker::AgentOwnership {
+            self.agents
+                .get(package)
+                .map_or(crate::broker::AgentOwnership::Full, |choice| {
+                    choice.ownership
+                })
         }
 
         /// Returns the preference set a selected profile contributes, when it names one.
@@ -2782,6 +2814,29 @@ pub mod configuration {
                             .stated(" more than once"),
                     );
                 }
+            }
+        }
+        // The packages the owner chose an ownership profile for: each a package's identifier, and
+        // no more of them than a document may name. A misspelt package would be read as no choice
+        // and the agent would run under full ownership, so it is refused instead.
+        if document.agents.len() > MAX_AGENT_ENTRIES {
+            problems.push(
+                Sentence::new()
+                    .stated("agents names ")
+                    .number(document.agents.len() as u64)
+                    .stated(" packages, more than the ")
+                    .number(MAX_AGENT_ENTRIES as u64)
+                    .stated(" a document may name"),
+            );
+        }
+        for package in document.agents.keys() {
+            if !is_package_identifier(package) {
+                problems.push(
+                    Sentence::new()
+                        .stated("agents names ")
+                        .withheld(Name, package)
+                        .stated(", which is not a package's publisher/plugin identifier"),
+                );
             }
         }
         // The variables each rung adds to a session started with this host's environment: names a
@@ -4260,6 +4315,48 @@ pub mod configuration {
         ]
     }
 
+    /// The row the document's `agents` section contributes to the effective-value report.
+    ///
+    /// It lists the packages whose agent the document selects a reduced-ownership profile for, as
+    /// `publisher/plugin=reduced`, or `none`. The packages are names the owner wrote down, so an
+    /// export carries their class and length and never which agents this host runs. It applies to
+    /// the sessions created after the document says so, and nothing but the document supplies it.
+    #[must_use]
+    pub fn agents_row(
+        document: Option<&ConfigurationDocument>,
+        origin: &str,
+    ) -> super::EffectiveValue {
+        use super::export::Declared;
+
+        let empty = ConfigurationDocument::empty();
+        let chosen: Vec<String> = document
+            .unwrap_or(&empty)
+            .agents
+            .iter()
+            .map(|(package, choice)| format!("{package}={}", choice.ownership))
+            .collect();
+        super::EffectiveValue::new(
+            AGENTS_OWNERSHIP_KEY,
+            "the agents that run under an explicitly selected ownership profile",
+            &if chosen.is_empty() {
+                Declared::term("none")
+            } else {
+                Declared::names(chosen.iter().map(String::as_str))
+            },
+            if chosen.is_empty() {
+                ValueSource::Default
+            } else {
+                ValueSource::HostConfiguration
+            },
+            Nullable((!chosen.is_empty()).then(|| origin.to_owned())),
+            Nullable::null(),
+            ValueEffect::NewSessionsOnly,
+        )
+    }
+
+    /// The key of the row [`agents_row`] contributes.
+    pub const AGENTS_OWNERSHIP_KEY: &str = "agents.ownership";
+
     // ---------------------------------------------------------------------------------------
     // The environment
     // ---------------------------------------------------------------------------------------
@@ -4531,6 +4628,7 @@ pub mod configuration {
     pub fn is_known_term(value: &str) -> bool {
         PREFERENCES.iter().any(|preference| preference.key == value)
             || SELECTIONS.iter().any(|selection| selection.key == value)
+            || value == AGENTS_OWNERSHIP_KEY
             || SELECTION_WORDS.contains(&value)
             || CEILINGS.contains(&value)
             || BUDGETS.contains(&value)
@@ -8508,6 +8606,101 @@ mod tests {
             configuration::edit(&spelled, &off),
             Err(configuration::EditRefused::NotOurs(_))
         ));
+    }
+
+    /// KR-REQ-07.64: an agent runs under reduced ownership only where the document's `agents`
+    /// section chooses it for that package. A package with no entry is fully owned, an edit of
+    /// another setting leaves the section as it was, an entry that names no package, an ownership
+    /// this build does not have or more packages than a document may name is refused, and the
+    /// report lists the choices for the sessions created after the document says so.
+    #[test]
+    fn the_agents_section_chooses_reduced_ownership_for_a_package_and_nothing_else_does() {
+        use crate::broker::AgentOwnership;
+        use configuration::{AgentChoice, Change, ValueEffect};
+
+        let empty = ConfigurationDocument::empty();
+        assert_eq!(
+            empty.agent_ownership("kalareach/codex"),
+            AgentOwnership::Full,
+            "nothing chosen is full ownership"
+        );
+
+        let chosen = configuration::load(Some(
+            br#"{"version": 1, "revision": 4, "agents": {"kalareach/codex": {"ownership": "reduced"}}}"#,
+        ));
+        assert_eq!(chosen.status.state, DocumentState::Loaded);
+        let document = chosen.document.as_ref().expect("a usable document");
+        assert_eq!(
+            document.agent_ownership("kalareach/codex"),
+            AgentOwnership::Reduced
+        );
+        assert_eq!(
+            document.agent_ownership("kalareach/claude-code"),
+            AgentOwnership::Full,
+            "a choice for one package is a choice for that package alone"
+        );
+
+        // Another setting's edit keeps the choice: the document is rewritten whole.
+        let edited = configuration::edit(
+            &chosen,
+            &Change::Descriptions {
+                enabled: Some(false),
+                on_battery: None,
+            },
+        )
+        .expect("a validated edit");
+        assert_eq!(
+            edited.document.agents, document.agents,
+            "the section survives an edit that does not name it"
+        );
+        let reread = configuration::load(Some(edited.contents.as_bytes()));
+        assert_eq!(reread.document.as_ref(), Some(&edited.document));
+
+        // What a document may not say.
+        let refuses = |text: &str| {
+            let loaded = configuration::load(Some(text.as_bytes()));
+            assert_eq!(loaded.status.state, DocumentState::Invalid, "{text}");
+        };
+        refuses(r#"{"version": 1, "agents": {"codex": {"ownership": "reduced"}}}"#);
+        refuses(r#"{"version": 1, "agents": {"Kalareach/Codex": {"ownership": "reduced"}}}"#);
+        refuses(r#"{"version": 1, "agents": {"kalareach/codex": {"ownership": "partial"}}}"#);
+        refuses(
+            r#"{"version": 1, "agents": {"kalareach/codex": {"ownership": "reduced", "sandbox": "off"}}}"#,
+        );
+        refuses(r#"{"version": 1, "agents": {"kalareach/codex": {}}}"#);
+        let mut over = ConfigurationDocument::empty();
+        for index in 0..=configuration::MAX_AGENT_ENTRIES {
+            over.agents.insert(
+                format!("kalareach/agent-{index}"),
+                AgentChoice {
+                    ownership: AgentOwnership::Reduced,
+                },
+            );
+        }
+        assert!(configuration::validate(&over).is_err());
+        over.agents.remove("kalareach/agent-0");
+        assert!(configuration::validate(&over).is_ok());
+
+        // The report lists the choices, as names, for the sessions created afterwards.
+        let none = configuration::agents_row(None, "/config.json");
+        assert_eq!(
+            (none.key.as_str(), none.value(), none.source, none.effect),
+            (
+                "agents.ownership",
+                "none",
+                ValueSource::Default,
+                ValueEffect::NewSessionsOnly
+            )
+        );
+        let listed = configuration::agents_row(Some(document), "/config.json");
+        assert_eq!(listed.value(), "kalareach/codex=reduced");
+        assert_eq!(listed.source, ValueSource::HostConfiguration);
+        assert_eq!(listed.origin.0.as_deref(), Some("/config.json"));
+        assert_eq!(
+            listed.class(),
+            export::ContentClass::Name,
+            "which agents this host runs is the owner's to know, and an export carries a class"
+        );
     }
 
     /// The wire words a report names are exactly the ones the enumerations spell.

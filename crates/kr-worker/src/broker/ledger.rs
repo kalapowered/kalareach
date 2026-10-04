@@ -36,7 +36,9 @@
 //!   between: one transaction carries both, and the sequence the row is keyed by is the order
 //!   every observer is told in.
 
-use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
+use kr_protocol::broker::{
+    AgentOwnership, BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile,
+};
 use kr_protocol::gateway::{
     EvidenceGap, NativeClassification, PendingKind, PendingResource, PendingState,
 };
@@ -54,7 +56,7 @@ use crate::persistence::fault::JournalHealth;
 use crate::persistence::stores::ContentClass;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// How long the ledger waits for another connection to finish writing, outside prompt mode.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -819,6 +821,7 @@ impl Ledger {
                     .map_err(|error| self.fault(error))?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if version == SCHEMA_VERSION - 1 => self.bring_forward_from_seven()?,
             // Not every change this build has made is one a `CREATE TABLE IF NOT EXISTS` brings
             // forward: a table that already exists keeps the columns it was made with. So an
             // older ledger is refused by name rather than relabelled into a shape it does not
@@ -831,6 +834,75 @@ impl Ledger {
             }
         }
         Ok(())
+    }
+
+    /// Brings a ledger an earlier build wrote at schema version 7 forward to version 8.
+    ///
+    /// Version 8 records, in every launch profile, how completely the session's closure accounts
+    /// for what the launch starts and the word the application reported for its own mode. A
+    /// version-7 profile has neither, and a profile with no vendor mode read is a null, so each
+    /// row is recorded as it was with `ownership: "full"` (what every earlier launch ran under)
+    /// and `vendor_mode: null`. All of it is one immediate transaction with the version write: a
+    /// row that cannot be read leaves the ledger at version 7 and every row as it was.
+    ///
+    /// This step is deleted once no ledger written by a version-7 build can still be opened; a
+    /// profile row without the two fields is not read after it.
+    fn bring_forward_from_seven(&self) -> Result<()> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| self.fault(error))?;
+        let rows = {
+            let mut statement = transaction
+                .prepare("SELECT profile_id, profile FROM broker_profiles")
+                .map_err(|error| self.fault(error))?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|error| self.fault(error))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| self.fault(error))?
+        };
+        for (profile_id, bytes) in rows {
+            let unreadable = |detail: String| {
+                BrokerError::ledger(format!(
+                    "the launch profile {profile_id} could not be brought forward to schema \
+                     version {SCHEMA_VERSION}: {detail}"
+                ))
+            };
+            let kr_cbor::CanonicalValue::Map(map) =
+                kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| unreadable(error.to_string()))?
+            else {
+                return Err(unreadable("it is not a map".to_owned()));
+            };
+            let mut entries = map.into_entries();
+            entries.push((
+                "ownership".to_owned(),
+                kr_cbor::CanonicalValue::text(AgentOwnership::Full.as_str()),
+            ));
+            entries.push(("vendor_mode".to_owned(), kr_cbor::CanonicalValue::Null));
+            let brought = kr_cbor::CanonicalMap::from_entries(entries)
+                .map_err(|error| unreadable(error.to_string()))?;
+            transaction
+                .execute(
+                    "UPDATE broker_profiles SET profile = ?1 WHERE profile_id = ?2",
+                    params![
+                        kr_cbor::encode(&kr_cbor::CanonicalValue::Map(brought)),
+                        profile_id
+                    ],
+                )
+                .map_err(|error| self.fault(error))?;
+        }
+        transaction
+            .execute(
+                "UPDATE broker_schema SET version = ?1",
+                params![SCHEMA_VERSION],
+            )
+            .map_err(|error| self.fault(error))?;
+        transaction.commit().map_err(|error| self.fault(error))
     }
 
     // -- bindings -----------------------------------------------------------------------------
@@ -2415,6 +2487,143 @@ mod tests {
         );
     }
 
+    /// A launch profile as an earlier build wrote it: before a launch recorded how completely the
+    /// session's closure accounts for what it starts, and the word its application reported for
+    /// its own mode.
+    fn profile_as_version_seven_wrote_it(number: u8) -> (LaunchProfile, Vec<u8>) {
+        let profile = LaunchProfile {
+            profile_id: kr_protocol::ids::LaunchProfileId::new(format!("lp-{number}"))
+                .expect("valid"),
+            environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([1; 16])),
+            binary: kr_protocol::broker::BinaryIdentity {
+                resolved_path: "/usr/local/bin/codex".to_owned(),
+                digest: Digest256::from_bytes([3; 32]),
+                version: "0.155.1".to_owned(),
+                distribution: "npm".to_owned(),
+            },
+            arguments: vec!["app-server".to_owned()],
+            authentication: kr_protocol::broker::AuthenticationState::Authenticated,
+            mode: IntegrationMode::Gateway,
+            ownership: kr_protocol::broker::AgentOwnership::Full,
+            vendor_mode: Nullable::null(),
+            resolved_at: TimestampMs::new(10 + u64::from(number)),
+        };
+        let kr_cbor::CanonicalValue::Map(map) =
+            kr_cbor::to_canonical_value(&profile).expect("the profile is a value")
+        else {
+            panic!("a profile is a map");
+        };
+        let older = kr_cbor::CanonicalMap::from_entries(
+            map.into_entries()
+                .into_iter()
+                .filter(|(name, _)| name != "ownership" && name != "vendor_mode"),
+        )
+        .expect("the older shape is a map");
+        (
+            profile,
+            kr_cbor::encode(&kr_cbor::CanonicalValue::Map(older)),
+        )
+    }
+
+    /// Writes one profile row in the shape an earlier build wrote, and the version it carried.
+    fn put_version_seven_profile(file: &std::path::Path, number: u8, bytes: &[u8]) {
+        rusqlite::Connection::open(file)
+            .expect("the file opens")
+            .execute(
+                "INSERT INTO broker_profiles (profile_id, application_instance_id, profile, resolved_at_ms)
+                 VALUES (?1, NULL, ?2, ?3)",
+                params![format!("lp-{number}"), bytes, 10 + i64::from(number)],
+            )
+            .expect("the older row is written");
+    }
+
+    fn set_version(file: &std::path::Path, version: i64) {
+        rusqlite::Connection::open(file)
+            .expect("the file opens")
+            .execute("UPDATE broker_schema SET version = ?1", params![version])
+            .expect("a version is written");
+    }
+
+    fn recorded_version(file: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(file)
+            .expect("the file opens")
+            .query_row("SELECT version FROM broker_schema", [], |row| row.get(0))
+            .expect("a version is recorded")
+    }
+
+    /// A ledger an earlier build wrote at schema version 7 carries launch profiles with no
+    /// ownership and no vendor mode. Opening it records each as fully owned with no mode read, and
+    /// the version, in one step; opening it again changes nothing.
+    #[test]
+    fn a_version_seven_ledger_is_brought_forward_once_with_its_profiles_recorded_as_fully_owned() {
+        let file = ledger_path();
+        drop(Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens"));
+        let (first, first_bytes) = profile_as_version_seven_wrote_it(1);
+        let (second, second_bytes) = profile_as_version_seven_wrote_it(2);
+        put_version_seven_profile(&file, 1, &first_bytes);
+        put_version_seven_profile(&file, 2, &second_bytes);
+        set_version(&file, 7);
+
+        let ledger = Ledger::open(Some(&file), JournalHealth::shared()).expect("version 7 opens");
+        assert_eq!(
+            ledger.profiles().expect("the profiles read"),
+            vec![first.clone(), second.clone()],
+            "each profile reads with the two fields an older build did not write"
+        );
+        assert_eq!(recorded_version(&file), SCHEMA_VERSION);
+        drop(ledger);
+
+        let again = Ledger::open(Some(&file), JournalHealth::shared()).expect("it reopens");
+        assert_eq!(
+            again.profiles().expect("the profiles read"),
+            vec![first, second]
+        );
+    }
+
+    /// A migration is all of its rows or none: a row that cannot be read stops it with the version
+    /// still 7 and every row, the ones before it included, as it was.
+    #[test]
+    fn a_version_seven_ledger_with_a_row_that_cannot_be_read_is_left_exactly_as_it_was() {
+        let file = ledger_path();
+        drop(Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens"));
+        let (_, first_bytes) = profile_as_version_seven_wrote_it(1);
+        put_version_seven_profile(&file, 1, &first_bytes);
+        put_version_seven_profile(&file, 2, b"not a canonical value");
+        set_version(&file, 7);
+
+        let refused = Ledger::open(Some(&file), JournalHealth::shared())
+            .expect_err("a row that cannot be read stops the migration");
+        assert!(refused.to_string().contains("lp-2"), "{refused}");
+        assert_eq!(recorded_version(&file), 7, "the version was not written");
+        let stored: Vec<u8> = rusqlite::Connection::open(&file)
+            .expect("the file opens")
+            .query_row(
+                "SELECT profile FROM broker_profiles WHERE profile_id = 'lp-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the first row is there");
+        assert_eq!(stored, first_bytes, "the row before the failure went back");
+    }
+
+    /// There is no reader for both shapes: a profile row at the current version that lacks a field
+    /// is not read as though it had one.
+    #[test]
+    fn a_profile_row_without_ownership_is_not_read_at_the_current_version() {
+        let file = ledger_path();
+        drop(Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens"));
+        let (_, bytes) = profile_as_version_seven_wrote_it(1);
+        put_version_seven_profile(&file, 1, &bytes);
+        let ledger = Ledger::open(Some(&file), JournalHealth::shared()).expect("version 8 opens");
+        let refused = ledger
+            .profiles()
+            .expect_err("a row without the field does not read");
+        assert!(
+            refused.to_string().contains("could not be read"),
+            "{refused}"
+        );
+    }
+
     /// A ledger an earlier build wrote at schema version 6, whose binding table has none of the
     /// columns a binding's release is recorded in, is refused by name rather than read.
     #[test]
@@ -2430,7 +2639,7 @@ mod tests {
         assert!(
             refused
                 .to_string()
-                .contains("this ledger is at schema version 6; this build reads 7"),
+                .contains("this ledger is at schema version 6; this build reads 8"),
             "{refused}"
         );
     }
