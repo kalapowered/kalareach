@@ -68,6 +68,7 @@ pub mod image;
 pub mod ledger;
 pub mod listener;
 pub mod methods;
+pub mod probe;
 pub mod process;
 pub mod profiles;
 pub mod semantic;

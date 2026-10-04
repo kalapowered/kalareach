@@ -581,6 +581,9 @@ pub struct NativeGateway {
     registration: std::sync::OnceLock<Registration>,
     /// The native bridge the launched application was installed with, where it has one.
     bridge: Option<crate::broker::bridge::InstalledBridge>,
+    /// How the application's own package reads the mode it will run in, where the package
+    /// declares a probe and the installation holds the capability that runs it.
+    launch_probe: Option<kr_plugin_sdk::launch_probe::LaunchProbe>,
     runtime_directory: std::path::PathBuf,
     /// The session's job, which a launch is held by and which ends it when it closes.
     #[cfg(windows)]
@@ -792,6 +795,19 @@ fn refuse_what_a_vendor_sandbox_cannot_run_under(
     })
 }
 
+/// Returns whether this worker runs in a Windows service session: login session 0, which no
+/// person signs in to and a desktop is not shown in. There is no such session elsewhere.
+fn in_service_session() -> bool {
+    #[cfg(windows)]
+    {
+        kr_ipc::starter::current_session().is_ok_and(|session| session == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// One agent this host started, and what it started.
 #[derive(Debug)]
 pub struct Launched {
@@ -852,6 +868,7 @@ impl NativeGateway {
             launch,
             registration,
             bridge: None,
+            launch_probe: None,
             runtime_directory: runtime_directory.to_path_buf(),
             #[cfg(windows)]
             session_job: None,
@@ -929,6 +946,20 @@ impl NativeGateway {
         Ok(self)
     }
 
+    /// Declares how the application's own package reads the mode it will run in.
+    ///
+    /// The probe is given only while the installation holds `launch.probe`, which a connector
+    /// assembled from the installation's current grants answers
+    /// ([`crate::broker::connectors::InstalledConnector::launch_probe`]). A launch that has one
+    /// runs it before anything starts, records the mode it read in the launch's profile, and is
+    /// refused by name where the package says the application cannot run with that mode in a
+    /// Windows service session and this worker is in one.
+    #[must_use]
+    pub fn with_launch_probe(mut self, probe: kr_plugin_sdk::launch_probe::LaunchProbe) -> Self {
+        self.launch_probe = Some(probe);
+        self
+    }
+
     /// Starts the agent this launch names and publishes what its forwarder needs to reach here.
     ///
     /// This is the whole of the production order, and the order is the point.
@@ -1003,6 +1034,11 @@ impl NativeGateway {
             })?;
         #[cfg(windows)]
         refuse_what_a_vendor_sandbox_cannot_run_under(&session, intent.profile.ownership)?;
+        // What the application's own package reads of the mode it will run in, before anything
+        // starts: the profile records it, and a mode the package says cannot run in this session
+        // is a named failure now rather than a launch that hangs.
+        let probed = self.read_vendor_mode(intent)?;
+        let intent = &probed;
         crate::broker::process::check_private_directory(&self.runtime_directory)?;
         let credential = Credential::generate()?;
         // The launch's hold on its instance. Every failure from here gives back what it took, by
@@ -1085,6 +1121,43 @@ impl NativeGateway {
                 error,
             )),
         }
+    }
+
+    /// Runs the application's launch probe, where the package declares one and the installation
+    /// holds the capability, and returns the intent with the mode it read recorded in its profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] when the mode read is one the package refuses
+    /// in the session this worker runs in.
+    fn read_vendor_mode(
+        &self,
+        intent: &crate::broker::profiles::LaunchIntent,
+    ) -> Result<crate::broker::profiles::LaunchIntent> {
+        let mut intent = intent.clone();
+        let Some(probe) = self.launch_probe.as_ref() else {
+            return Ok(intent);
+        };
+        let probed = crate::broker::probe::run(
+            std::path::Path::new(&intent.profile.binary.resolved_path),
+            probe,
+            &intent.profile.arguments,
+            &self.launch.working_directory,
+        );
+        if let Some(mode) = probed.mode.as_deref()
+            && probe.refuses_in_service_session(mode)
+            && in_service_session()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "the application's own configuration selects the mode {mode:?}, which its \
+                     package says it cannot run in a Windows service session, and this worker \
+                     runs in one, so nothing was started"
+                ),
+            });
+        }
+        intent.profile.vendor_mode = kr_protocol::scalars::Nullable(probed.mode);
+        Ok(intent)
     }
 
     /// Undoes a launch that failed after its process started, in the order that keeps its hold.
