@@ -1665,6 +1665,225 @@ async fn kr_req_10_49_a_mutation_carries_the_devices_scope_only_to_a_worker_that
     }
 }
 
+/// Publishes one small attachment for `actor` and binds it to a new draft that names no session,
+/// and returns the draft.
+fn a_draft_holding_an_attachment(
+    controller: &crate::service::Controller,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    actor: &kr_protocol::ids::ActorId,
+    name: &str,
+) -> kr_protocol::ids::DraftId {
+    use kr_protocol::scalars::{Bytes, Digest256, U64};
+    use kr_protocol::transfer::{
+        AgentDraftAddAttachmentParams, AttachmentContribution, ChunkDescriptor, DraftCreateParams,
+        InsertionMethod, UploadBeginParams, UploadChunkParams, UploadFinishParams,
+    };
+
+    let service = controller.transfer().service();
+    let bytes = name.as_bytes().to_vec();
+    let digest = Digest256::from_bytes(kr_cbor::sha256(&bytes));
+    let begun = service
+        .upload_begin(
+            actor,
+            &UploadBeginParams {
+                environment_id,
+                session_id: Nullable::null(),
+                device_id: Nullable::null(),
+                declared_byte_len: U64::new(bytes.len() as u64),
+                declared_digest: digest,
+                declared_media_type: "application/octet-stream".to_owned(),
+                original_file_name: name.to_owned(),
+            },
+            None,
+        )
+        .expect("reserves the upload");
+    service
+        .upload_chunk(
+            actor,
+            &UploadChunkParams {
+                transfer_id: begun.transfer_id,
+                chunk: ChunkDescriptor {
+                    index: U64::new(0),
+                    byte_len: U64::new(bytes.len() as u64),
+                    digest,
+                },
+                bytes: Bytes::new(bytes.clone()),
+            },
+            None,
+        )
+        .expect("takes the chunk");
+    let handle = service
+        .upload_finish(
+            actor,
+            &UploadFinishParams {
+                transfer_id: begun.transfer_id,
+                declared_byte_len: U64::new(bytes.len() as u64),
+                declared_digest: digest,
+            },
+            None,
+        )
+        .expect("publishes the attachment")
+        .handle;
+    let draft = service
+        .draft_create(
+            actor,
+            &DraftCreateParams {
+                environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                text: "look at this".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    service
+        .draft_add_attachment(
+            actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                transfer_id: handle.transfer_id,
+                contribution: AttachmentContribution {
+                    operation_id: "attach".to_owned(),
+                    accepted_media_types: vec![handle.declared_media_type.clone()],
+                    max_byte_len: U64::new(1024),
+                    max_count: U64::new(4),
+                    insertion_method: InsertionMethod::TypedSubmission,
+                    external_destination: Nullable::null(),
+                    model_media_capability: false,
+                },
+            },
+            None,
+        )
+        .expect("binds the attachment");
+    draft.draft_id
+}
+
+/// KR-REQ-14.11: a prompt a device submits with a draft puts the draft's attachments under the
+/// session's retention once the session's worker has accepted it, and not before or without.
+///
+/// The draft names no session, so the session the prompt is submitted to is what holds what was
+/// submitted. A prompt the worker refuses submits nothing, and a draft this device does not hold
+/// has nothing for this host to retain, which is no failure of the prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_submitted_with_a_draft_puts_its_attachments_under_the_sessions_retention() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let device = paired(controller, 41, |grant| {
+        grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+            .into_iter()
+            .collect();
+    });
+    let connection = super::RemoteConnection::for_test(controller, device);
+    let actor = connection.device.principal();
+    let submitted = |draft_id| {
+        let controller = &world.controller;
+        controller
+            .transfer()
+            .service()
+            .draft(&actor, draft_id)
+            .expect("reads the draft")
+            .attachments[0]
+            .handle
+            .clone()
+    };
+    let prompt = |request_id: u64, draft_id: kr_protocol::ids::DraftId| {
+        let params = kr_protocol::agent::AgentPromptParams {
+            target: kr_protocol::agent::AgentMutationTarget {
+                subject: kr_protocol::agent::AgentSubject {
+                    session_id: world.session_id,
+                    application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                        kr_ipc::new_uuid(),
+                    ),
+                },
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            },
+            draft_id: Nullable::some(draft_id),
+            text: Nullable::null(),
+        };
+        device_mutation(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            request_id,
+            ParamsValue::from_typed(&params).expect("encodes"),
+        )
+    };
+
+    // The worker refuses the prompt: nothing was submitted, so the draft's attachment is not.
+    let refused_draft =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "refused.bin");
+    script.accepts_prompts(false);
+    let answer = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt(1, refused_draft))))
+        .await
+        .expect("the prompt is answered");
+    assert!(
+        matches!(
+            answer.frame(),
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(_),
+                ..
+            })
+        ),
+        "the worker refused the prompt: {:?}",
+        answer.frame()
+    );
+    assert!(!submitted(refused_draft).submitted);
+
+    // The worker accepts it: the attachment is submitted, to the session the prompt names.
+    let accepted_draft =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "accepted.bin");
+    script.accepts_prompts(true);
+    let answer = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt(2, accepted_draft))))
+        .await
+        .expect("the prompt is answered");
+    assert!(
+        matches!(
+            answer.frame(),
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the worker accepted the prompt: {:?}",
+        answer.frame()
+    );
+    let handle = submitted(accepted_draft);
+    assert!(handle.submitted);
+    assert_eq!(handle.session_id, Nullable::some(world.session_id));
+
+    // A draft this device does not hold is no failure of a prompt the worker accepted.
+    let answer = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt(
+            3,
+            kr_protocol::ids::DraftId::new(kr_ipc::new_uuid()),
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(
+        matches!(
+            answer.frame(),
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        answer.frame()
+    );
+    world.serving.abort();
+}
+
 /// KR-REQ-10.49: the daemon's own link to a worker, the one a close made at the local door and a
 /// supervised action go through, carries no history scope on the wire whatever the worker states:
 /// it acts as the owner, whom no scope bounds.
