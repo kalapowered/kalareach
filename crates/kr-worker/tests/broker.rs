@@ -143,6 +143,8 @@ fn profile(mode: IntegrationMode, digest: [u8; 32], version: &str) -> LaunchProf
         arguments: vec!["codex".to_owned(), "--resume".to_owned()],
         authentication: AuthenticationState::Authenticated,
         mode,
+        ownership: kr_protocol::broker::AgentOwnership::Full,
+        vendor_mode: kr_protocol::scalars::Nullable::null(),
         resolved_at: TimestampMs::new(10),
     }
 }

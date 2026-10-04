@@ -1011,6 +1011,8 @@ fn profile(number: u8, path: &str) -> LaunchProfile {
         arguments: vec![path.to_owned()],
         authentication: AuthenticationState::Authenticated,
         mode: IntegrationMode::NativeTerminal,
+        ownership: kr_protocol::broker::AgentOwnership::Full,
+        vendor_mode: kr_protocol::scalars::Nullable::null(),
         resolved_at: TimestampMs::new(10),
     }
 }

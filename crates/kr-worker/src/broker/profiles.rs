@@ -486,6 +486,8 @@ mod tests {
             arguments: vec!["codex".to_owned(), "--resume".to_owned()],
             authentication: AuthenticationState::Authenticated,
             mode,
+            ownership: kr_protocol::broker::AgentOwnership::Full,
+            vendor_mode: kr_protocol::scalars::Nullable::null(),
             resolved_at: TimestampMs::new(10),
         }
     }

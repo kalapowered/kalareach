@@ -525,6 +525,8 @@ impl Launch {
             arguments,
             authentication: AuthenticationState::Authenticated,
             mode: IntegrationMode::NativeBridge,
+            ownership: kr_protocol::broker::AgentOwnership::Full,
+            vendor_mode: kr_protocol::scalars::Nullable::null(),
             resolved_at: TimestampMs::new(1),
         };
         let intent = broker

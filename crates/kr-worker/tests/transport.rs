@@ -2240,6 +2240,8 @@ fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
         arguments: vec!["relay".to_owned()],
         authentication: kr_protocol::broker::AuthenticationState::Authenticated,
         mode: IntegrationMode::Gateway,
+        ownership: kr_protocol::broker::AgentOwnership::Full,
+        vendor_mode: kr_protocol::scalars::Nullable::null(),
         resolved_at: TimestampMs::new(1),
     }
 }
@@ -2271,6 +2273,8 @@ fn sleeping_profile() -> kr_protocol::broker::LaunchProfile {
         },
         authentication: kr_protocol::broker::AuthenticationState::Authenticated,
         mode: IntegrationMode::Gateway,
+        ownership: kr_protocol::broker::AgentOwnership::Full,
+        vendor_mode: kr_protocol::scalars::Nullable::null(),
         resolved_at: TimestampMs::new(1),
     }
 }
