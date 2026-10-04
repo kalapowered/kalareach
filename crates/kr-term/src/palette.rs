@@ -152,11 +152,9 @@ impl DynamicColour {
     }
 }
 
-/// The canonical palette: 256 indexed colours plus the dynamic colours.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Palette {
-    indexed: Vec<Rgb>,
-    defaults: Vec<Rgb>,
+/// The seven dynamic colours, which a palette holds twice: as they are, and as the session started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DynamicColours {
     foreground: Rgb,
     background: Rgb,
     cursor: Rgb,
@@ -164,6 +162,60 @@ pub struct Palette {
     pointer_background: Rgb,
     selection_background: Rgb,
     selection_foreground: Rgb,
+}
+
+impl DynamicColours {
+    /// The preset a source selects.
+    const fn preset(source: PaletteSource) -> Self {
+        let (foreground, background) = match source {
+            PaletteSource::LightPreset => (Rgb::new(0x1a, 0x1a, 0x1a), Rgb::new(0xff, 0xff, 0xff)),
+            _ => (Rgb::new(0xe5, 0xe5, 0xe5), Rgb::new(0x00, 0x00, 0x00)),
+        };
+        Self {
+            foreground,
+            background,
+            cursor: foreground,
+            pointer_foreground: foreground,
+            pointer_background: background,
+            selection_background: Rgb::new(0x44, 0x44, 0x44),
+            selection_foreground: foreground,
+        }
+    }
+
+    const fn get(&self, which: DynamicColour) -> Rgb {
+        match which {
+            DynamicColour::Foreground => self.foreground,
+            DynamicColour::Background => self.background,
+            DynamicColour::Cursor => self.cursor,
+            DynamicColour::PointerForeground => self.pointer_foreground,
+            DynamicColour::PointerBackground => self.pointer_background,
+            DynamicColour::SelectionBackground => self.selection_background,
+            DynamicColour::SelectionForeground => self.selection_foreground,
+        }
+    }
+
+    const fn set(&mut self, which: DynamicColour, colour: Rgb) {
+        match which {
+            DynamicColour::Foreground => self.foreground = colour,
+            DynamicColour::Background => self.background = colour,
+            DynamicColour::Cursor => self.cursor = colour,
+            DynamicColour::PointerForeground => self.pointer_foreground = colour,
+            DynamicColour::PointerBackground => self.pointer_background = colour,
+            DynamicColour::SelectionBackground => self.selection_background = colour,
+            DynamicColour::SelectionForeground => self.selection_foreground = colour,
+        }
+    }
+}
+
+/// The canonical palette: 256 indexed colours plus the dynamic colours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette {
+    indexed: Vec<Rgb>,
+    defaults: Vec<Rgb>,
+    dynamic: DynamicColours,
+    /// The dynamic colours the session started with, which a reset returns to. For a session that
+    /// adopted a client's colours these are the client's, not the preset's.
+    initial: DynamicColours,
     source: PaletteSource,
 }
 
@@ -211,20 +263,12 @@ impl Palette {
     #[must_use]
     pub fn new(source: PaletteSource) -> Self {
         let indexed = build_indexed();
-        let (foreground, background) = match source {
-            PaletteSource::LightPreset => (Rgb::new(0x1a, 0x1a, 0x1a), Rgb::new(0xff, 0xff, 0xff)),
-            _ => (Rgb::new(0xe5, 0xe5, 0xe5), Rgb::new(0x00, 0x00, 0x00)),
-        };
+        let dynamic = DynamicColours::preset(source);
         Self {
             defaults: indexed.clone(),
             indexed,
-            foreground,
-            background,
-            cursor: foreground,
-            pointer_foreground: foreground,
-            pointer_background: background,
-            selection_background: Rgb::new(0x44, 0x44, 0x44),
-            selection_foreground: foreground,
+            dynamic,
+            initial: dynamic,
             source,
         }
     }
@@ -233,12 +277,15 @@ impl Palette {
     #[must_use]
     pub fn from_client_preference(foreground: Rgb, background: Rgb) -> Self {
         let mut palette = Self::new(PaletteSource::ClientPreference);
-        palette.foreground = foreground;
-        palette.background = background;
-        palette.cursor = foreground;
-        palette.pointer_foreground = foreground;
-        palette.pointer_background = background;
-        palette.selection_foreground = foreground;
+        let mut adopted = palette.dynamic;
+        adopted.foreground = foreground;
+        adopted.background = background;
+        adopted.cursor = foreground;
+        adopted.pointer_foreground = foreground;
+        adopted.pointer_background = background;
+        adopted.selection_foreground = foreground;
+        palette.dynamic = adopted;
+        palette.initial = adopted;
         palette
     }
 
@@ -277,34 +324,24 @@ impl Palette {
     /// A dynamic colour.
     #[must_use]
     pub const fn dynamic(&self, which: DynamicColour) -> Rgb {
-        match which {
-            DynamicColour::Foreground => self.foreground,
-            DynamicColour::Background => self.background,
-            DynamicColour::Cursor => self.cursor,
-            DynamicColour::PointerForeground => self.pointer_foreground,
-            DynamicColour::PointerBackground => self.pointer_background,
-            DynamicColour::SelectionBackground => self.selection_background,
-            DynamicColour::SelectionForeground => self.selection_foreground,
-        }
+        self.dynamic.get(which)
     }
 
     /// Sets a dynamic colour.
     pub const fn set_dynamic(&mut self, which: DynamicColour, colour: Rgb) {
-        match which {
-            DynamicColour::Foreground => self.foreground = colour,
-            DynamicColour::Background => self.background = colour,
-            DynamicColour::Cursor => self.cursor = colour,
-            DynamicColour::PointerForeground => self.pointer_foreground = colour,
-            DynamicColour::PointerBackground => self.pointer_background = colour,
-            DynamicColour::SelectionBackground => self.selection_background = colour,
-            DynamicColour::SelectionForeground => self.selection_foreground = colour,
-        }
+        self.dynamic.set(which, colour);
     }
 
-    /// Resets a dynamic colour to the profile default for this palette's source.
-    pub fn reset_dynamic(&mut self, which: DynamicColour) {
-        let defaults = Self::new(self.source);
-        self.set_dynamic(which, defaults.dynamic(which));
+    /// Resets a dynamic colour to what the session started with.
+    pub const fn reset_dynamic(&mut self, which: DynamicColour) {
+        self.dynamic.set(which, self.initial.get(which));
+    }
+
+    /// Resets every colour to what the session started with: the indexed colours to the profile's
+    /// and the dynamic colours to the ones the session adopted.
+    pub fn reset_all(&mut self) {
+        self.reset_all_indexed();
+        self.dynamic = self.initial;
     }
 
     /// Parses a colour specification, naming the failure.
