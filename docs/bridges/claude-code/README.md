@@ -24,11 +24,11 @@ Code directory and one settings key:
 | File | What it registers |
 | --- | --- |
 | `skills/kalareach-channels/.claude-plugin/plugin.json` | The plugin `kalareach-channels`, off by default, whose channel is the server `kalareach` |
-| `skills/kalareach-channels/.mcp.json` | The server `kalareach`: `kr-hook claude-code channel` over standard input and output |
-| `skills/kalareach-channels/hooks/hooks.json` | `kr-hook claude-code hook` for `SessionStart`, `SessionEnd`, `PostToolUse`, `PostToolUseFailure` and `Notification`, with a one-second timeout for `SessionEnd` and five seconds for the rest |
+| `skills/kalareach-channels/.mcp.json` | The server `kalareach`: the forwarder with `claude-code channel`, over standard input and output |
+| `skills/kalareach-channels/hooks/hooks.json` | The forwarder with `claude-code hook` for `SessionStart`, `SessionEnd`, `PostToolUse`, `PostToolUseFailure` and `Notification`, with a one-second timeout for `SessionEnd` and five seconds for the rest |
 
 Every hook is registered in exec form, a `command` with its `args`, and runs in the foreground, so
-Claude Code starts `kr-hook` itself, with no shell between them, and waits for it. The settings key
+Claude Code starts the forwarder itself, with no shell between them, and waits for it. The settings key
 `enabledPlugins."kalareach-channels@skills-dir"` turns the plugin on, and removing it turns the
 plugin off. The core repository keeps a copy of the three files in
 `fixtures/bridges/claude-code/`, pinned by the SHA-256 digests the package's recipe records, and
@@ -42,11 +42,14 @@ committed, and removes it when the package is removed; `docs/plugins/catalogue.m
 checks before writing anything and what a removal leaves. One of those checks is Claude Code's
 version, which only a signed record naming its executable by digest establishes: a build the
 release's entry in the signed index names for this platform. No release names one yet, so the recipe
-is refused and nothing is written. The settings key is spliced into the
-person's own `settings.json`, so every other byte of it stays as it was. The registration names the
-forwarder as `kr-hook`, a bare command Claude Code finds on its own search path. The installation
-expects the `kr-hook` beside the daemon, and a connection running another copy is refused at
-admission, so the launched Claude Code has to find that one first.
+is refused and nothing is written. The settings key is spliced into the person's own
+`settings.json`, so every other byte of it stays as it was. The package writes the forwarder as
+`{kr_hook}`, and when the host writes each file it replaces that with the full path of the `kr-hook`
+its updates keep current. Claude Code therefore starts that file, and not a program of the same name
+found on its search path or, on Windows, in the folder it works in. The host records each installed
+file by the digest of what it wrote. A connection running another copy is refused at admission, and
+a registration written for a forwarder the host has since replaced is written again with the new
+path.
 
 The five hook events are the ones whose exit codes refuse nothing: the action has already happened,
 or the code is ignored. A hook here observes because the forwarder never answers anything but `{}`,
@@ -123,6 +126,15 @@ launcher exec Claude Code in place. The process keeps its identifier and its sta
 registration names Claude Code before Claude Code runs. A hook that connects while the commit is
 still under way waits for it, within its hello deadline, rather than being refused for arriving
 first.
+
+On Windows a command is looked up by the name the file system gives the program: the typed name in
+lower case, without a trailing `.exe` or `.com`, so `Claude`, `claude.exe` and `CLAUDE.COM` are the
+integrated `claude`. The vector the launcher runs keeps what was typed. A name that holds a
+directory separator, a backslash included, is a path and bypasses the integration. If the shell's
+first hit for the name is a shim (a `.cmd`, `.bat` or `.ps1`, as npm installs beside an agent), the
+worker establishes no backend and the command runs as typed, because the shim's process is its
+interpreter and not the agent. `kr doctor` says `first hit is` and the shim's path beside the
+integration.
 
 Anything short of that runs what was typed. On a refusal, on no answer within two seconds (counted
 from the launcher's start for the admission, and from `going` for the commit; on Windows six

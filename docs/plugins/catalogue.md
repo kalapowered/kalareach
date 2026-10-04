@@ -480,8 +480,16 @@ holds events, groups and handlers whose kind is `command`; a server file holds s
 program; a manifest holds text members, its channels and whether it is on by default, and is named
 for the directory it is in. A handler of another kind, a server that connects to an address, a
 dependency and any other member are refused. Every command in them is the forwarder, in a form this
-host reads: its name alone, with the application and the surface as the two arguments in a list, or
-one line of its name, the application and the surface, separated by single spaces.
+host reads: its name or the placeholder alone, with the application and the surface as the two
+arguments in a list, or one line of its name or the placeholder, the application and the surface,
+separated by single spaces.
+
+Where a file names the forwarder by the placeholder `{kr_hook}`, the host checks that the package's
+file is the bytes its signed recipe names, writes the file with the forwarder's path in place of the
+placeholder, and records the installed file by the digest of what it wrote. Removal and
+reapplication compare that digest. A release applied with one forwarder is removed and applied again
+when the host names another. A placeholder anywhere but at the start of a command is refused before
+anything is written.
 
 A bridge places only what this host names for its application. For Claude Code that is three files,
 `.claude-plugin/plugin.json`, `.mcp.json` and `hooks/hooks.json`, in one directory `skills/<name>/`,

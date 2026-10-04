@@ -70,7 +70,8 @@ stopping at the first.
 - **Actions.** Everything a control may invoke, each with its effect class and parameter schema.
 - **Attachments, native bridge and command integration.** Optional, and each needs its matching
   capability. A manifest with a command integration states `"sdk_range": ">=0.1.2, <0.2.0"`,
-  because a host on an earlier contract cannot read the member and refuses the package.
+  because a host on an earlier contract cannot read the member and refuses the package; one that
+  uses the forwarder's placeholder states `">=0.1.3, <0.2.0"`.
 
 ### Paths
 
@@ -137,6 +138,19 @@ written before the member existed reads and hashes as it did.
   adding a pair is a new contract version.
 - The declaration adds at least one flag or sets at least one variable, and the package requests
   `command_integration.launch`.
+
+### The forwarder's placeholder
+
+A package that has an application start the forwarder writes `{kr_hook}` where it runs it, and the
+host replaces that with the full path of the `kr-hook` it installed. The placeholder stands at the
+start of a JSON string. Alone, it names a program the application starts itself: a `command` with
+its `args`, or a flag whose value is a JSON document. Followed by a space, it begins a line an
+application runs through a shell, and the path is written as one word in single quotes. The package
+validator refuses a flag that holds it anywhere else, and the host refuses a registration file that
+does. The host writes the path as the text of a JSON string, so a path with spaces, quotes,
+backslashes or non-ASCII characters is still one path. A package that uses the placeholder states
+`"sdk_range": ">=0.1.3, <0.2.0"`, because a host on an earlier contract would write the text as it
+stands, and refuses a release it cannot read.
 
 The owner confirms `command_integration.launch` on every release, as for a native bridge, because
 the flags and variables are part of the release. The grant shows the package's `grant_statement`
