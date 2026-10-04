@@ -2309,6 +2309,47 @@ fn eviction_lands_under_the_bound_in_one_pass() {
     assert!(!engine.budget().row_cache_over_budget());
 }
 
+/// KR-REQ-08.79: what the historical cache keeps is limited by what the rows cost, so a burst of
+/// costly rows leaves it holding fewer of them, and cheap rows that follow are kept up to the
+/// bound again rather than up to what the burst left.
+#[test]
+fn the_history_grows_back_when_the_rows_that_forced_eviction_are_gone() {
+    let mut engine = engine();
+    let history = |engine: &Engine| engine.grid().scrollback_rows();
+    let limit = engine.budget().limits().row_cache_bytes;
+
+    let mut burst = String::from("\x1b[38;2;10;20;30;48;5;9m");
+    for _ in 0..400 {
+        for _ in 0..60 {
+            burst.push('\u{754c}');
+        }
+        burst.push_str("\r\n");
+    }
+    engine.feed(burst.as_bytes(), 0);
+    engine.quiesce(0);
+    let after_burst = history(&engine);
+    assert!(
+        engine.grid().history_bytes() > limit / 2,
+        "the burst fills the cache: {} bytes against {limit}",
+        engine.grid().history_bytes()
+    );
+    assert!(
+        after_burst < 400,
+        "the burst has to force eviction: {after_burst} rows kept"
+    );
+
+    engine.feed(b"\x1b[0m", 1);
+    let plain = "x\r\n".repeat(4_000);
+    engine.feed(plain.as_bytes(), 1);
+    engine.quiesce(1);
+    let later = history(&engine);
+    assert!(
+        later > 2 * after_burst,
+        "{later} rows are kept once the costly ones are gone, after {after_burst} behind the burst"
+    );
+    assert!(engine.grid().history_bytes() <= limit);
+}
+
 /// The measurement is exact, not an estimate: a screen of identical cells costs what those cells
 /// cost, counted one by one.
 #[test]
