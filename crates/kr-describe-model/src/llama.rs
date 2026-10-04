@@ -458,9 +458,19 @@ impl LlamaRuntime {
         Ok(spelled)
     }
 
-    /// Returns the bytes of one token's piece, with `special` choosing whether a structure token
-    /// spells its own text or nothing. A token with no text of its own spells nothing.
+    /// Returns the bytes of one token's piece. With `special` off a control token and the unknown
+    /// token spell nothing, and a token the vocabulary defines on top of its text spells its text;
+    /// with it on, every one of them spells its text. A token with no text of its own spells
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the token is not one of this vocabulary's or cannot be spelled.
     fn piece(&self, token: LlamaToken, special: bool) -> std::result::Result<Vec<u8>, String> {
+        // The library looks a token up by its number and does not check it.
+        if !(0..self.model.n_vocab()).contains(&token.0) {
+            return Err(format!("{} is not a token of this vocabulary", token.0));
+        }
         let mut size = PIECE_BYTES;
         loop {
             match self.model.token_to_piece_bytes(token, size, special, None) {
