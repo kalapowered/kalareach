@@ -709,6 +709,41 @@ fn powershell_forms_that_never_ask(session: &mut Session, probes: &Probes) {
         assert_eq!(probes.runs().len(), runs + 1, "{form} ran the program once");
     }
 
+    // A second command anywhere in the line's syntax tree, a subexpression included, means the line
+    // is not one command: the inner one runs first, and an answer for either would speak for the
+    // wrong one. Each line runs the program twice, and the line that follows is typed only once
+    // both are over.
+    let defined = print_assembled(ShellKind::PowerShell, "kr-held-set");
+    assert!(
+        session.run(&format!("$kr_held = 'kr-probe'; {defined}"), "kr-held-set"),
+        "the name was not held in a variable:\n{}",
+        session.terminal_output()
+    );
+    for (form, command) in [
+        (
+            "the name repeated in a subexpression",
+            "kr-probe $(kr-probe the-inner-one) the-outer-one",
+        ),
+        (
+            "a subexpression that runs a name held in a variable",
+            "kr-probe $(& $kr_held the-held-one) the-outer-one",
+        ),
+    ] {
+        let runs = probes.runs().len();
+        let asked = session.run_asking(command, "probe-ran");
+        assert!(asked.is_empty(), "{form} asked: {asked:?}");
+        assert!(
+            session.answered("kr-nested-over"),
+            "the shell did not come back after {form}:\n{}",
+            session.terminal_output()
+        );
+        assert_eq!(
+            probes.runs().len(),
+            runs + 2,
+            "{form} ran the program twice"
+        );
+    }
+
     // A command in the background runs in a job of its own, whose output is collected afterwards.
     let runs = probes.runs().len();
     let asked = session.run_asking(
@@ -994,6 +1029,27 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
 
+    // The answer that comes late, after the command has run as it was typed, is a refusal, and a
+    // refusal that answers a question is no detach's whenever it comes: it draws no hint and
+    // consumes no gesture. The command typed after it runs only once the shell is at a prompt
+    // again, which is after it has read the refusal.
+    let before = session.written();
+    let decisions = session.events.managed_decisions();
+    session.refuse_what_went_unanswered();
+    assert!(session.answered("kr-after-late-refusal"));
+    session.barrier();
+    let shown = session.shown_before(before, "kr-after-late-refusal");
+    assert!(
+        !shown.contains(DETACH_HINT),
+        "a late refusal was taken for a refused detach:\n{}",
+        session.terminal_output()
+    );
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
+        "a late refusal consumed a gesture"
+    );
+
     // A worker that answers what came after the unanswered question has caught up, so the next
     // command asks again.
     session.commands.policy = ResolvePolicy::default();
@@ -1044,6 +1100,20 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
 }
 
 impl Session {
+    /// Answers every question this side left unanswered with a refusal, after the shell has gone
+    /// on without the answer.
+    pub fn refuse_what_went_unanswered(&mut self) {
+        for id in std::mem::take(&mut self.commands.unanswered) {
+            self.answer_event(
+                id,
+                EventOutcome::Refused(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this invocation is not resolved",
+                )),
+            );
+        }
+    }
+
     /// Asks the reader something and waits for its answer.
     ///
     /// The reader writes what it has to say in order, so when the answer is here everything it

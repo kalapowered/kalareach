@@ -69,10 +69,14 @@ pub fn a_cancellation_while_the_worker_is_told_starts_nothing(kind: ShellKind) {
 
     // The worker never answers the line's own acceptance.
     session.commands.silent_acceptance = true;
-    let accepted = session.commands.accepted.len();
     let _ = session.submit("kr-probe cancelled-in-the-acceptance", "probe-ran");
-    session.until("the acceptance", |commands| {
-        commands.accepted.len() > accepted
+    // The line's block is reported after the shell has cleared a cancellation left at the prompt,
+    // so a Ctrl-C sent once it is here is one that arrives while the worker is being told, and is
+    // never taken for a stale one. The acceptance is reported before that clear.
+    session.until("the line's started block", |commands| {
+        commands.blocks.iter().any(|block| {
+            block.command == "kr-probe cancelled-in-the-acceptance" && block.exit_status.0.is_none()
+        })
     });
     session.type_bytes(CTRL_C);
     assert_eq!(
@@ -401,11 +405,15 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
         "False"
     ));
 
-    // A value of the wrong kind is no answer and no failure.
+    // A value of the wrong kind is no answer and no failure: the origin is refused first when it
+    // is the wrong one, so the name's kind is also tried at the origin the entry points act at.
     for line in [
         "Test-KalaReachCommand -Origin 1 -Name @(1,2)",
         "Test-KalaReachCommand -Origin $null -Name $null",
         "Test-KalaReachCommand -Origin @{a=1} -Name (Get-Date)",
+        "Test-KalaReachCommand -Origin Runspace -Name @(1,2)",
+        "Test-KalaReachCommand -Origin Runspace -Name $null",
+        "Test-KalaReachCommand -Origin Runspace -Name (Get-Date)",
     ] {
         let before = session.written();
         assert!(session.run(line, "False"), "{line}");
@@ -418,7 +426,23 @@ pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
         );
     }
     // Asking about a command with arguments that are not text is an answer of nothing, and the
-    // line still ends.
+    // line still ends: the one command of the line is `Resolve-KalaReachCommand` itself, so it is
+    // the line the entry point speaks for, and it answers nothing for every wrong kind.
+    for line in [
+        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments @(1,@{}) -Executable 5",
+        "Resolve-KalaReachCommand -Origin Runspace -Name Resolve-KalaReachCommand -Arguments $null -Executable $null",
+    ] {
+        let before = session.written();
+        session.type_line(line);
+        assert!(session.answered("kr-after-the-wrong-resolve"), "{line}");
+        assert!(
+            !session
+                .shown_before(before, "kr-after-the-wrong-resolve")
+                .to_lowercase()
+                .contains("exception"),
+            "{line} failed"
+        );
+    }
     assert!(session.answered("kr-after-the-wrong-kinds"));
 }
 
@@ -609,6 +633,33 @@ pub fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability(kind: ShellKin
             ))
             .collect::<Vec<_>>()
     );
+
+    // The same prompt opened by a line that is one command, which is the kind of line the entry
+    // points speak for. Typed at that prompt, the entry point refuses for the name of that one
+    // command, because what is typed there is not the line: without the level check it would
+    // answer for the outer line.
+    let define = format!(
+        "function Enter-KrNest {{ $Host.EnterNestedPrompt() }}; {}",
+        print_assembled(kind, "kr-nest-defined")
+    );
+    assert!(session.run(&define, "kr-nest-defined"));
+    let entries = session.commands.entries.len();
+    let _ = session.submit("Enter-KrNest", "never-printed-by-the-line");
+    session.until("the second nested prompt's entry", |commands| {
+        commands.entries[entries..]
+            .iter()
+            .any(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
+    });
+    assert!(
+        session.run(
+            "Test-KalaReachCommand -Origin Runspace -Name Enter-KrNest",
+            "False"
+        ),
+        "the entry point spoke for a line from a prompt the line opened:\n{}",
+        session.terminal_output()
+    );
+    session.type_line("exit");
+    assert!(session.answered("kr-after-the-second-nest"));
 }
 
 /// KR-REQ-07.84: a Ctrl-C that arrives while the worker has not answered a line's acceptance is
