@@ -176,8 +176,14 @@ impl Probes {
         );
         // A launcher that is an executable file the system cannot start.
         place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
+        // A launcher that starts and ends with a status of its own.
+        place(
+            &root.join("launcher").join("kr-hook-fails"),
+            b"#!/bin/sh\nexit 7\n",
+        );
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         std::fs::write(root.join("script.ps1"), "kr-probe from-a-script\n").expect("a script");
+        std::fs::write(root.join("exits.ps1"), "exit -1\n").expect("a script");
         Self {
             _directory: directory,
             root,
@@ -218,6 +224,12 @@ impl Probes {
     #[must_use]
     pub fn broken_launcher(&self) -> PathBuf {
         self.root.join("launcher").join("kr-hook-broken")
+    }
+
+    /// A launcher that starts, runs nothing and ends with a status of 7.
+    #[must_use]
+    pub fn failing_launcher(&self) -> PathBuf {
+        self.root.join("launcher").join("kr-hook-fails")
     }
 
     /// Another directory holding a program of the same name.
@@ -269,9 +281,74 @@ impl Default for Probes {
     }
 }
 
+/// A lookup handler of the case's own, standing in for the one a host installs for PowerShell.
+///
+/// The host's handler asks the module about a command typed alone on a line, and runs it through
+/// the launcher the answer names. This one does the same for a native command, and runs the
+/// command as typed when the module answers nothing or the launcher cannot start.
+///
+/// Two things a handler has to do that have nothing to do with the question. A lookup the handler
+/// makes itself calls the handler again, so it holds a flag while it runs. And it runs before the
+/// read-line entry point reads `$?`, which is the status of the line that has just run and which
+/// any script a lookup runs replaces: the handler reads it first and puts it back last, with a
+/// failure that adds no record of its own to `$Error`.
+const LOOKUP_STAND_IN: &str = r#"
+$ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+    param($CommandName, $EventArgs)
+    $kept = $?
+    try {
+        if ($global:KrLookupBusy) { return }
+        $global:KrLookupBusy = $true
+        try {
+            $origin = $EventArgs.CommandOrigin
+            if (-not (Test-KalaReachCommand -Origin $origin -Name $CommandName)) { return }
+            $application = $ExecutionContext.InvokeCommand.GetCommand($CommandName, [System.Management.Automation.CommandTypes]::Application)
+            if ($null -eq $application) { return }
+            $typed = $CommandName
+            $program = $application.Source
+        } finally {
+            $global:KrLookupBusy = $false
+        }
+        $EventArgs.CommandScriptBlock = {
+            $answer = Resolve-KalaReachCommand -Origin $origin -Name $typed -Arguments ([string[]]@($args)) -Executable $program
+            if ($null -eq $answer) { & $program @args; return }
+            $saved = @{}
+            foreach ($variable in $answer.Environment.Keys) {
+                $saved[$variable] = [Environment]::GetEnvironmentVariable($variable)
+                [Environment]::SetEnvironmentVariable($variable, $answer.Environment[$variable])
+            }
+            $started = $false
+            try {
+                try { & $answer.Launcher @($answer.Arguments); $started = $true } catch { }
+            } finally {
+                foreach ($variable in $saved.Keys) {
+                    $before = if ($null -eq $saved[$variable]) { [NullString]::Value } else { $saved[$variable] }
+                    [Environment]::SetEnvironmentVariable($variable, $before)
+                }
+            }
+            if (-not $started) { & $program @args }
+        }.GetNewClosure()
+        $EventArgs.StopSearch = $true
+    } finally {
+        if (-not $kept) { Write-Error 'the status before the lookup' -ErrorAction Ignore }
+    }
+}
+"#;
+
 /// A session of this package's own with the probes on its search path, at an answering prompt.
 pub(super) fn a_session_with_probes(package: &Package, probes: &Probes) -> Session {
-    let mut session = Session::start_with(package, &probes.environment());
+    let mut session = if package.kind == ShellKind::PowerShell {
+        Session::start_with_environment_and_profile(
+            package,
+            &probes.environment(),
+            Profile {
+                after_entry: LOOKUP_STAND_IN,
+                ..Profile::ORDINARY
+            },
+        )
+    } else {
+        Session::start_with(package, &probes.environment())
+    };
     session.first_prompt();
     session.forget_events();
     assert!(
@@ -334,7 +411,12 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
 
     // The control: the same program in a pipeline runs in a child the shell forks, and asks
     // nothing. What it was started with is what the shell passes a command it does not ask about.
-    let asked = session.run_asking("kr-probe control | cat", "probe-ran");
+    let through_a_pipe = if kind == ShellKind::PowerShell {
+        "kr-probe control | Out-String"
+    } else {
+        "kr-probe control | cat"
+    };
+    let asked = session.run_asking(through_a_pipe, "probe-ran");
     assert!(asked.is_empty(), "a pipeline asked: {asked:?}");
     let control = last_run(&probes);
 
@@ -368,16 +450,35 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
     );
 
     // A directory the line itself moved to is the one named, at the revision after the move.
+    // PowerShell's module asks only about a command that is the whole of its line, so there the
+    // move is the line before.
     let elsewhere = probes.elsewhere();
-    let asked = session.run_asking(
-        &format!("cd '{}' && kr-probe moved", told(&elsewhere)),
-        "probe-ran",
-    );
-    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
-    let entry = session.commands.last_line_reader().clone();
-    assert_eq!(asked[0].prompt_generation, entry.prompt_generation);
-    assert_eq!(asked[0].cwd, told(&elsewhere));
-    assert_eq!(asked[0].cwd_revision.get(), entry.cwd_revision.get() + 1);
+    if kind == ShellKind::PowerShell {
+        assert!(session.run(
+            &format!(
+                "Set-Location '{}'; {}",
+                told(&elsewhere),
+                print_assembled(kind, "kr-moved")
+            ),
+            "kr-moved"
+        ));
+        let asked = session.run_asking("kr-probe moved", "probe-ran");
+        assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+        let entry = session.commands.last_line_reader().clone();
+        assert_eq!(asked[0].prompt_generation, entry.prompt_generation);
+        assert_eq!(asked[0].cwd, told(&elsewhere));
+        assert_eq!(asked[0].cwd_revision, entry.cwd_revision);
+    } else {
+        let asked = session.run_asking(
+            &format!("cd '{}' && kr-probe moved", told(&elsewhere)),
+            "probe-ran",
+        );
+        assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+        let entry = session.commands.last_line_reader().clone();
+        assert_eq!(asked[0].prompt_generation, entry.prompt_generation);
+        assert_eq!(asked[0].cwd, told(&elsewhere));
+        assert_eq!(asked[0].cwd_revision.get(), entry.cwd_revision.get() + 1);
+    }
 
     // A session created with an integration for the name, and no backend behind it, is answered
     // as the worker answers it, and the command still runs as it was typed: no flag, no variable.
@@ -401,7 +502,10 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
     assert_eq!(ran.names(), control.names());
 
     // An argument that is not text cannot be named exactly in a request, so the command runs as
-    // it was typed without a question.
+    // it was typed without a question. PowerShell's strings are text whatever was typed.
+    if kind == ShellKind::PowerShell {
+        return;
+    }
     let not_text = if kind == ShellKind::Fish {
         "kr-probe \\xff"
     } else {
@@ -424,6 +528,10 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
     let mut session = a_session_with_probes(&package, &probes);
     let script = probes.script();
 
+    if kind == ShellKind::PowerShell {
+        powershell_forms_that_never_ask(&mut session, &probes);
+        return;
+    }
     let mut forms = if kind == ShellKind::Fish {
         fish_forms_that_never_ask(&script)
     } else {
@@ -525,6 +633,108 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
     assert_eq!(asked.len(), 1, "only the interpreter asks: {asked:?}");
     assert_eq!(asked[0].argv[0], "sh");
     assert_eq!(last_run(&probes).arguments, ["from-a-script"]);
+}
+
+/// The lines PowerShell's module declines to ask about, each of which starts the program once, and
+/// the ones it asks about.
+///
+/// The module asks about one thing: a native command that is the whole of the line the person
+/// typed, named by a constant. Anything else on the line, a second command, a pipeline, a
+/// redirection or a command inside a script block, is not asked about and runs as typed. A command
+/// that runs in a function, a script or `Invoke-Expression` is not typed at the prompt, which the
+/// origin of its lookup says.
+fn powershell_forms_that_never_ask(session: &mut Session, probes: &Probes) {
+    let script = told(&probes.path("script.ps1"));
+    let probe = told(&probes.probe());
+    let forms: Vec<(&str, String)> = vec![
+        (
+            "a pipeline",
+            "kr-probe in-a-pipeline | Out-String".to_owned(),
+        ),
+        (
+            "the last part of a pipeline",
+            "'x' | kr-probe in-the-last-part".to_owned(),
+        ),
+        (
+            "a subexpression",
+            "Write-Output $(kr-probe in-a-subexpression)".to_owned(),
+        ),
+        (
+            "a command in parentheses",
+            "(kr-probe in-parentheses)".to_owned(),
+        ),
+        (
+            "a function",
+            "function Invoke-KrProbe { kr-probe in-a-function }; Invoke-KrProbe".to_owned(),
+        ),
+        (
+            "an expression",
+            "Invoke-Expression 'kr-probe in-an-expression'".to_owned(),
+        ),
+        ("a sourced script", format!(". '{script}'")),
+        (
+            "an assignment",
+            "$kr_result = kr-probe in-an-assignment; Write-Output $kr_result".to_owned(),
+        ),
+        (
+            "a condition",
+            "if ($true) { kr-probe in-a-condition }".to_owned(),
+        ),
+        (
+            "a command after another",
+            "Write-Output kr-first; kr-probe after-another".to_owned(),
+        ),
+        (
+            "a redirection",
+            "kr-probe with-a-redirection 2>$null".to_owned(),
+        ),
+        (
+            "a stop-parsing marker",
+            "kr-probe --% after-the-marker".to_owned(),
+        ),
+        ("a path as the name", format!("& '{probe}' by-a-path")),
+        (
+            "a name that is a variable",
+            "$kr_name = 'kr-probe'; & $kr_name by-a-variable".to_owned(),
+        ),
+        (
+            "a chain",
+            "kr-probe one-of-a-chain && Write-Output kr-chained".to_owned(),
+        ),
+    ];
+    for (form, command) in forms {
+        let runs = probes.runs().len();
+        let asked = session.run_asking(&command, "probe-ran");
+        assert!(asked.is_empty(), "{form} asked: {asked:?}");
+        assert_eq!(probes.runs().len(), runs + 1, "{form} ran the program once");
+    }
+
+    // A command in the background runs in a job of its own, whose output is collected afterwards.
+    let runs = probes.runs().len();
+    let asked = session.run_asking(
+        "$kr_job = kr-probe in-the-background &; Receive-Job $kr_job -Wait -AutoRemoveJob",
+        "probe-ran",
+    );
+    assert!(asked.is_empty(), "a background job asked: {asked:?}");
+    assert_eq!(probes.runs().len(), runs + 1, "a background job ran once");
+
+    // What it does ask about: a native command that is the whole of its line, named by a constant,
+    // whether it is bare or called by a quoted name with the call operator.
+    for (form, command, argument) in [
+        ("a bare name", "kr-probe is-bare", "is-bare"),
+        ("a call operator", "& 'kr-probe' is-called", "is-called"),
+    ] {
+        let asked = session.run_asking(command, "probe-ran");
+        assert_eq!(asked.len(), 1, "{form} asks once: {asked:?}");
+        assert_eq!(asked[0].argv, ["kr-probe", argument]);
+        assert_eq!(last_run(probes).arguments, [argument]);
+    }
+    // The interpreter a script is started with is a command of the line, so it asks; nothing the
+    // script runs does.
+    let asked = session.run_asking(&format!("sh '{}'", told(&probes.script())), "probe-ran");
+    assert_eq!(asked.len(), 1, "only the interpreter asks: {asked:?}");
+    assert_eq!(asked[0].argv[0], "sh");
+    assert_eq!(last_run(probes).arguments, ["from-a-script"]);
 }
 
 /// The forms of a fish line whose commands the root shell does not start itself.
@@ -749,6 +959,13 @@ pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
     let mut session = a_session_with_probes(&package, &probes);
     let probe = told(&probes.probe());
 
+    if kind == ShellKind::PowerShell {
+        // A name that is a path is not one the module asks about, and runs as typed.
+        let asked = session.run_asking(&format!("& '{probe}' by-path"), "probe-ran");
+        assert!(asked.is_empty(), "a path asked: {asked:?}");
+        assert_eq!(last_run(&probes).arguments, ["by-path"]);
+        return;
+    }
     let asked = session.run_asking(&format!("'{probe}' by-path"), "probe-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     assert_eq!(asked[0].argv, [probe.clone(), "by-path".to_owned()]);
@@ -955,6 +1172,20 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
         assert_eq!(ran.names(), control.names(), "{launcher}");
     }
 
+    // An answer that renames the command is none the worker gives, and the command runs as typed.
+    session.commands.policy = ResolvePolicy::Renaming {
+        launcher: told(&probes.launcher()),
+    };
+    let launches = probes.launches().len();
+    let asked = session.run_asking("kr-probe not-renamed", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(
+        probes.launches().len(),
+        launches,
+        "the launcher was started"
+    );
+    assert_eq!(last_run(&probes).arguments, ["not-renamed"]);
+
     // A launcher that is an executable file the system cannot start leaves the command as it was
     // typed, with the shell's own environment.
     session.commands.policy = backend(told(&probes.broken_launcher()));
@@ -1002,6 +1233,18 @@ fn reading_through_the_editor(kind: ShellKind) -> &'static str {
     }
 }
 
+/// Reads the finished block of the line that proved the shell was answering, so that a case that
+/// counts blocks from here counts its own.
+pub(super) fn after_the_first_line(session: &mut Session, kind: ShellKind) {
+    let ready = print_assembled(kind, "kr-ready");
+    session.until("the first line's finished block", |commands| {
+        commands
+            .blocks
+            .iter()
+            .any(|block| block.command == ready && block.exit_status.0.is_some())
+    });
+}
+
 /// KR-REQ-25.05: each line reports one command block when it starts and again when it has
 /// finished, with the shell's own status for it, its duration and the directory it ran in. An
 /// empty line and the input a running command reads report none.
@@ -1009,6 +1252,7 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
+    after_the_first_line(&mut session, kind);
 
     let reported = session.commands.blocks.len();
     let command = "kr-probe block; sh -c 'exit 3'";
@@ -1059,9 +1303,36 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
     assert_eq!(blocks[1].exit_status.0.map(|status| status.get()), Some(0));
 
     // A continuation line is part of the line it continues: one block holds both.
+    let continuation = if kind == ShellKind::PowerShell {
+        "`"
+    } else {
+        "\\"
+    };
     let reported = session.commands.blocks.len();
-    session.type_line("kr-probe joined \\");
-    assert!(session.run("continued", "probe-ran"));
+    let start = session.written();
+    session.type_line(&format!("kr-probe joined {continuation}"));
+    if kind == ShellKind::PowerShell {
+        // The editor draws its own continuation prompt, and what is typed there is typed to the
+        // editor, which has not drawn the prompt a case waits for.
+        assert!(
+            session.drew_after(start, ">> ", REPLY).was_drawn(),
+            "the editor drew no continuation prompt:\n{}",
+            session.terminal_output()
+        );
+        let start = session.written();
+        session.type_bytes(b"continued\r");
+        assert!(
+            session.wait_for_output_after(start, "probe-ran", REPLY),
+            "the joined line did not run:\n{}",
+            session.terminal_output()
+        );
+        // The next prompt is the first one drawn after what the line printed.
+        session.mark = session
+            .last_shown("probe-ran")
+            .map_or_else(|| session.written(), |at| at + "probe-ran".len());
+    } else {
+        assert!(session.run("continued", "probe-ran"));
+    }
     session.until("the joined line's finished block", |commands| {
         commands.blocks[reported..]
             .iter()
@@ -1073,7 +1344,10 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
         .find(|block| block.exit_status.0.is_some())
         .cloned()
         .expect("a finished block");
-    assert_eq!(finished.command, "kr-probe joined \\\ncontinued");
+    assert_eq!(
+        finished.command,
+        format!("kr-probe joined {continuation}\ncontinued")
+    );
     assert_eq!(last_run(&probes).arguments, ["joined", "continued"]);
 
     // An empty line runs nothing and reports nothing: the next block is the next command's.
@@ -1093,7 +1367,11 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
     );
 
     // Input a running command reads through the editor is that command's, not a line of its
-    // own: the line that asked for it is the one block.
+    // own: the line that asked for it is the one block. This editor has no reader of that kind: a
+    // prompt a running line opens is the nested one the cases of its own drive.
+    if kind == ShellKind::PowerShell {
+        return controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
+    }
     let reported = session.commands.blocks.len();
     let reading = reading_through_the_editor(kind);
     session.type_line(reading);
@@ -1118,9 +1396,13 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
         "only the line that read the input is reported: {commands:?}"
     );
 
-    // What the shell cannot see into is still part of its line: a function, a pipeline, an `eval`
-    // and a sourced file each report the one block of the line that ran them.
-    for (what, line) in lines_the_shell_cannot_see_into(kind, &probes) {
+    controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
+}
+
+/// What the shell cannot see into is still part of its line: a function, a pipeline, an `eval` and
+/// a sourced file each report the one block of the line that ran them.
+fn controls_for_what_a_shell_cannot_see(session: &mut Session, kind: ShellKind, probes: &Probes) {
+    for (what, line) in lines_the_shell_cannot_see_into(kind, probes) {
         let reported = session.commands.blocks.len();
         assert!(session.run(&line, "probe-ran"), "{what}");
         session.until(&format!("{what}'s finished block"), |commands| {

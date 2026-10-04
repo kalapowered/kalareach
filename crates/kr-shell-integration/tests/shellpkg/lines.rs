@@ -10,7 +10,7 @@ use kr_protocol::root::ReaderContext;
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::qualification::ShellKind;
 
-use super::commands::{a_session_with_probes, last_run};
+use super::commands::{a_session_with_probes, after_the_first_line, last_run};
 use super::*;
 
 /// The status a line ended by a signal leaves: 128 plus the signal.
@@ -361,4 +361,275 @@ pub fn a_reader_a_line_starts_keeps_the_lines_block_and_capability(kind: ShellKi
         "the gesture at a reader the line started was taken as a detach"
     );
     assert!(session.alive(), "the gesture ended the shell");
+}
+
+// --------------------------------------------------------------------------------------------
+// PowerShell: what the module reports of a line, and the entry points a lookup handler calls.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.07: the entry points answer for the origin the lookup names and nothing else, and no
+/// argument makes them fail: a value of the wrong kind is an answer of nothing.
+pub fn the_entry_points_answer_by_origin_and_never_fail(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    // The same line, with the origin the only difference: the line is the command it asks about.
+    assert!(session.run(
+        "Test-KalaReachCommand -Origin Internal -Name Test-KalaReachCommand",
+        "False"
+    ));
+    assert!(session.run(
+        "Test-KalaReachCommand -Origin Runspace -Name Test-KalaReachCommand",
+        "True"
+    ));
+    // The name is compared as typed, ignoring case, and is a command name and not a path.
+    assert!(session.run(
+        "Test-KalaReachCommand -Origin Runspace -Name test-kalareachcommand",
+        "True"
+    ));
+    assert!(session.run(
+        "Test-KalaReachCommand -Origin Runspace -Name Test-KalaReachCommand.exe",
+        "False"
+    ));
+    assert!(session.run(
+        "Test-KalaReachCommand -Origin Runspace -Name ./Test-KalaReachCommand",
+        "False"
+    ));
+
+    // A value of the wrong kind is no answer and no failure.
+    for line in [
+        "Test-KalaReachCommand -Origin 1 -Name @(1,2)",
+        "Test-KalaReachCommand -Origin $null -Name $null",
+        "Test-KalaReachCommand -Origin @{a=1} -Name (Get-Date)",
+    ] {
+        let before = session.written();
+        assert!(session.run(line, "False"), "{line}");
+        assert!(
+            !session
+                .shown_before(before, "False")
+                .to_lowercase()
+                .contains("exception"),
+            "{line} failed"
+        );
+    }
+    // Asking about a command with arguments that are not text is an answer of nothing, and the
+    // line still ends.
+    assert!(session.answered("kr-after-the-wrong-kinds"));
+}
+
+/// KR-REQ-25.05: a line's status is the one the shell would show for it, read before anything of
+/// the module's own can change it.
+pub fn a_line_reports_the_status_the_shell_would_show(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    let exits = format!("& '{}'", told(&probes.path("exits.ps1")));
+    let cases: Vec<(&str, String, u64)> = vec![
+        // A native command that fails is its exit code, and one that succeeds is nothing.
+        ("a native failure", "sh -c 'exit 5'".to_owned(), 5),
+        ("a native success", "sh -c 'exit 0'".to_owned(), 0),
+        // The last native command of a pipeline decides.
+        (
+            "a failing last stage",
+            "kr-probe one | sh -c 'exit 3'".to_owned(),
+            3,
+        ),
+        // A negative code is the unsigned 32-bit value it is on the wire.
+        ("a negative exit code", exits, 4_294_967_295),
+        // A failure of another kind after a native failure is not about the exit code.
+        (
+            "a failing cmdlet after a native failure",
+            "sh -c 'exit 3'; Get-Item /kr-no-such-item".to_owned(),
+            1,
+        ),
+        (
+            "a failing cmdlet",
+            "Get-Item /kr-no-such-item".to_owned(),
+            1,
+        ),
+        // A native failure the shell raises as an error of its own is its exit code too.
+        (
+            "a native failure raised as an error",
+            "$PSNativeCommandUseErrorActionPreference = $true; sh -c 'exit 5'".to_owned(),
+            5,
+        ),
+    ];
+    for (what, line, status) in cases {
+        let _ = session.submit(&line, "never-printed-by-the-line");
+        assert_eq!(
+            session.status_of(&line),
+            Some(status),
+            "{what}: the status of {line:?}"
+        );
+    }
+}
+
+/// KR-REQ-25.05: the directory a block reports is the file system's, where a native command
+/// starts, and not the location of another provider the person has moved to.
+pub fn a_block_reports_the_file_system_directory(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    assert!(session.run(
+        &format!("Set-Location Env:; {}", print_assembled(kind, "kr-moved")),
+        "kr-moved"
+    ));
+    let reported = session.commands.blocks.len();
+    assert!(session.run("kr-probe in-another-provider", "probe-ran"));
+    session.until("the line's block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.command == "kr-probe in-another-provider")
+    });
+    let block = session.commands.blocks[reported..]
+        .iter()
+        .find(|block| block.command == "kr-probe in-another-provider")
+        .cloned()
+        .expect("the line's block");
+    assert_eq!(block.cwd, told(&session.home()));
+}
+
+/// KR-REQ-12.07: a line the lookup handler substituted a script block for has the status of the
+/// launcher it ran, which is what the program would have left.
+pub fn a_launcher_leaves_its_exit_status_as_the_lines(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: told(&probes.failing_launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let _ = session.submit(
+        "kr-probe through-a-failing-launcher",
+        "never-printed-by-the-line",
+    );
+    assert_eq!(
+        session.status_of("kr-probe through-a-failing-launcher"),
+        Some(7)
+    );
+    session.commands.policy = ResolvePolicy::default();
+    let _ = session.submit("kr-probe as-typed", "never-printed-by-the-line");
+    assert_eq!(session.status_of("kr-probe as-typed"), Some(0));
+}
+
+/// KR-REQ-07.84, KR-REQ-25.05: a prompt a running line opens ($Host.EnterNestedPrompt()) is not a
+/// new prompt of the root editor. It reports as the line's, at the line's prompt generation; a
+/// command typed at it asks nothing and carries the line's capability; and the line reports the
+/// one block.
+pub fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    after_the_first_line(&mut session, kind);
+    let line = "$Host.EnterNestedPrompt()";
+    let reported = session.commands.blocks.len();
+    let entries = session.commands.entries.len();
+    let _ = session.submit(line, "never-printed-by-the-line");
+    session.until("the nested prompt's entry", |commands| {
+        commands.entries[entries..]
+            .iter()
+            .any(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
+    });
+    let outer = session.commands.last_line_reader().clone();
+    let outer_token = session
+        .commands
+        .tokens
+        .last()
+        .cloned()
+        .flatten()
+        .expect("the line was answered with a capability");
+    let nested = session.commands.entries[entries..]
+        .iter()
+        .find(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
+        .cloned()
+        .expect("the nested reader entered");
+    assert_eq!(
+        nested.prompt_generation, outer.prompt_generation,
+        "a prompt the line opened advanced the prompt generation"
+    );
+    let (_, idle) = session.expect_event("the nested prompt's idle report", |event| {
+        matches!(
+            event,
+            BridgeEvent::ReaderIdle(idle) if idle.reader_context == ReaderContext::ReadBuiltin
+        )
+    });
+    let BridgeEvent::ReaderIdle(idle) = idle else {
+        unreachable!()
+    };
+    assert_eq!(idle.prompt_generation, outer.prompt_generation);
+
+    // A command typed at the nested prompt asks nothing and carries the outer line's capability.
+    let asked = session.commands.resolves.len();
+    assert!(session.run("kr-probe nested", "probe-ran"));
+    assert_eq!(
+        session.commands.resolves.len(),
+        asked,
+        "a command typed at a prompt the line opened asked"
+    );
+    assert_eq!(
+        last_run(&probes).environment.get("KR_DETACH_TOKEN"),
+        Some(&outer_token)
+    );
+
+    // Leaving it, the outer line ends with one block reported for it, and no nested line has one.
+    session.type_line("exit");
+    assert!(session.answered("kr-after-the-outer-line"));
+    session.until("the outer line's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.command == line && block.exit_status.0.is_some())
+    });
+    let blocks: Vec<_> = session.commands.blocks[reported..]
+        .iter()
+        .filter(|block| block.command == line)
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the line reported one block started and one finished: {blocks:?}"
+    );
+    assert!(
+        session.commands.blocks[reported..]
+            .iter()
+            .all(|block| block.command == line
+                || block.command == print_assembled(kind, "kr-after-the-outer-line")),
+        "a line typed at the nested prompt reported a block: {:?}",
+        session.commands.blocks[reported..]
+            .iter()
+            .map(|block| (
+                &block.command,
+                block.exit_status.0.map(|status| status.get())
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// KR-REQ-07.84: a Ctrl-C that arrives while the worker has not answered a line's acceptance is
+/// not taken by the module, and the prompt after the line reads through the editor as it did.
+///
+/// What the console does with the key while the module waits is not something this package can
+/// prove, so this case records what the line did and requires what the module owes: the line's
+/// block and a prompt that works.
+pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    session.commands.silent_acceptance = true;
+    let accepted = session.commands.accepted.len();
+    let line = "kr-probe cancelled-in-the-acceptance";
+    let _ = session.submit(line, "probe-ran");
+    session.until("the acceptance", |commands| {
+        commands.accepted.len() > accepted
+    });
+    session.type_bytes(CTRL_C);
+    let status = session.status_of(line);
+    session.commands.silent_acceptance = false;
+    assert!(session.answered("kr-after-the-acceptance"));
+    println!(
+        "a Ctrl-C during an unanswered acceptance: the line ran {} time(s) and its block finished with {status:?}",
+        probes.runs().len()
+    );
 }
