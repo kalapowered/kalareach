@@ -4,10 +4,9 @@ Every KalaReach session has a name and a status. Most of the time that name come
 host already has: the repository you are in, the branch you are on, the directory, the application.
 That part works on every host, with no model, no network and no account.
 
-On top of that floor, a host can run a small language model locally to say what a session is
-*doing* — `KalaReach pairing`, `Checks the code-entry flow and host approval screen` — instead of
-just where it is. This document is about how that works, what it costs and what it deliberately
-cannot do.
+On top of that floor, a host can run a small language model locally to say what a session is *doing*
+(`KalaReach pairing`, `Checks the code-entry flow and host approval screen`) instead of just where
+it is. This document is about how that works, what it costs and what it deliberately cannot do.
 
 ## The floor: deterministic titles
 
@@ -21,22 +20,23 @@ A session's title is a pure function of metadata the host holds:
 | A foreground application | `nvim` |
 | Nothing | `Session 4` |
 
-The status beside it — starting, running, unreachable, awaiting approval, awaiting input,
-completed, failed, closed — comes from the host's own lifecycle record. It is not text and it is
-never produced by a model. A description cannot claim a test passed, invent an approval or mark a
-session complete, because there is no function anywhere that turns generated text into a status.
+The status beside it (starting, running, unreachable, awaiting approval, awaiting input, completed,
+failed or closed) comes from the host's own lifecycle record. It is not text and it is never
+produced by a model. A description cannot claim a test passed, invent an approval or mark a session
+complete, because there is no function anywhere that turns generated text into a status.
 
 ## The model
 
-One shared inference process and one mapped model per execution environment. Never one per session.
+The host runs one shared inference process and one mapped model per execution environment, never one
+per session.
 
 - **The default profile** is `openbmb/MiniCPM5-2B`, quantised to Q4\_K\_M, about 1.5 GiB on disk and
   about 2 GiB resident.
-- **`HuggingFaceTB/SmolLM3-3B`** ships as a *candidate*, behind platform, resource and quality
-  gates - all three, and a candidate profile that declared fewer is refused. It is not a fallback:
-  memory pressure, a timeout and bad output never cause a switch to a larger model. The fallback is
-  always deterministic metadata. The gates are checked again where a profile is mapped, so a
-  candidate obtained some other way still cannot run without them.
+- **`HuggingFaceTB/SmolLM3-3B`** ships as a *candidate*, behind platform, resource and quality gates
+  (all three, and a candidate profile that declared fewer is refused). It is not a fallback: memory
+  pressure, a timeout and bad output never cause a switch to a larger model. The fallback is always
+  deterministic metadata. The gates are checked again where a profile is mapped, so a candidate
+  obtained some other way still cannot run without them.
 - **WSL** reaches a native-host broker only after somebody explicitly chooses to let local data
   cross. Without that choice a distribution runs no model, and shows deterministic titles.
 - **Mobile** never runs a model to label a host session.
@@ -59,12 +59,12 @@ digest pins. And the chat template is recorded rather than applied: this build s
 and the data section as a plain prompt, so the template digest is provenance for a profile's
 identity rather than a description of what the runtime does with it.
 
-There is one way to get a profile: a document plus a detached signature from a key the host
-accepts. The profiles shipped here are compiled in beside their signatures and the public half of
-the key that made them, and they are verified before use like any other. Against a document from
-outside the binary that is worth what a signature is normally worth. Against the built-in documents
-it is worth less, and it is honest to say so: the anchor ships beside them, so replacing one means
-rebuilding, and a rebuild can carry a new anchor. What it buys is one code path instead of two.
+There is one way to get a profile: a document plus a detached signature from a key the host accepts.
+The profiles shipped here are compiled in beside their signatures and the public half of the key
+that made them, and they are verified before use like any other. Against a document from outside the
+binary that is worth what a signature is normally worth. Against the built-in documents it is worth
+less: the anchor ships beside them, so replacing one means rebuilding, and a rebuild can carry a new
+anchor. What it buys is one code path instead of two.
 
 The profile-signing key is per build: it is generated, used, and not kept. Changing a shipped
 profile means generating a key, signing both documents again and committing the anchor with them,
@@ -124,18 +124,18 @@ cold start is reported on its own.
 
 The prompt has a bound of its own, counted in the model's tokens. A job's prompt may be what the window leaves beside the answer's bound, 3,968 tokens, or what the deadline leaves for reading it, whichever is less. The deadline is the smaller. Take 1 s of fixed cost and 12.8 s for a full answer of 128 tokens out of 30 s and 16.2 s are left, and at 55 tokens a second a prompt may be 891 tokens. The figures come from the selected profile on a 32-core x86-64 server at four threads under a load average of 20 to 40, where prompts were read at 61 to 69 tokens a second and each answer token took 70 to 85 ms, so the budget assumes a slower machine on both counts.
 
-The memory a resident model costs is accounted for item by item — weights, mapping overhead, the
-key-value cache, other caches, batch buffers and the runtime's own allocations — because a 1.5 GiB
+The memory a resident model costs is accounted for item by item (weights, mapping overhead, the
+key-value cache, other caches, batch buffers and the runtime's own allocations), because a 1.5 GiB
 file is not a 1.5 GiB process. An owner may tighten the ceiling or the reserve, and never loosen
 either.
 
 ## When inference runs, and when it does not
 
-Before loading, the host checks that the model's cost plus a reserve of **at least the larger of
-1 GiB or 20% of physical RAM** still fits in the memory it can actually see. A model that is already
-resident is not free either: the key-value cache, the other caches and the batch buffers are built
-again for every job, and that peak has to fit beside the reserve before the next job starts. If it does not, the
-state is `resource_paused`, the reason is named, and the deterministic titles are unaffected.
+Before loading, the host checks that the model's cost plus a reserve of **at least the larger of 1
+GiB or 20% of physical RAM** still fits in the memory it can see. A model that is already resident
+is not free either: the key-value cache, the other caches and the batch buffers are built again for
+every job, and that peak has to fit beside the reserve before the next job starts. If it does not,
+the state is `resource_paused`, the reason is named, and the deterministic titles are unaffected.
 
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
   as being on battery, because it has not been told otherwise.
@@ -188,8 +188,8 @@ the description it is looking at is current, delayed or stale. There is no state
 "probably current".
 
 Queue-wait and execution latency are published separately at 1, 5, 20 and 50 sessions. They answer
-different questions — one is what fairness costs, the other is what the host costs — and a single
-figure would hide the difference.
+different questions: one is what fairness costs, the other is what the host costs. A single figure
+would hide the difference.
 
 Every attempt is measured once, however it ended: published, refused, past its deadline, cancelled,
 or cut short when its process ended. Each one occupied the process, so each counts toward the
@@ -199,10 +199,10 @@ only its successes would report a cadence it cannot keep.
 ## What goes into a description
 
 The context revision advances on meaningful changes only: the working directory, the foreground
-application, the selected thread, the task intent and completion. Not tokens, not spinners, not
-keystrokes. Changes inside the debounce window collapse into one revision, and the window starts at
-the *first* pending change, so a long active turn still reaches a new revision every couple of
-seconds instead of waiting for a quiet moment that never arrives.
+application, the selected thread, the task intent and completion. It does not advance on tokens,
+spinners or keystrokes. Changes inside the debounce window collapse into one revision, and the
+window starts at the *first* pending change, so a long active turn still reaches a new revision
+every couple of seconds instead of waiting for a quiet moment that never arrives.
 
 A change that settles while the session's job is running moves the revision on, so that job's
 result, which describes the session as it was, is refused as a changed context. The job is cancelled
@@ -227,12 +227,13 @@ The input is bounded directory and repository metadata plus recent authorised se
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and
 there is no setting that admits them.
 
-Project text — a repository name, a branch, an intent somebody typed — is carried as data. It goes
+Project text (a repository name, a branch, an intent somebody typed) is carried as data. It goes
 inside a delimited section of the prompt that is labelled as data, and the output is constrained by
 a grammar, so an instruction inside a branch name cannot change the shape of the answer or the
-status shown beside it. Project text that spells one of the model's control tokens, such as `<|im_end|>`
-or `/no_think`, reaches the model as the characters it is made of, never as the token. Project text
-can still mislead a model about what a session is doing, and nothing here claims otherwise.
+status shown beside it. Project text that spells one of the model's control tokens, such as
+`<|im_end|>` or `/no_think`, reaches the model as the characters it is made of, never as the token.
+Project text can still mislead a model about what a session is doing, and nothing here claims
+otherwise.
 
 ## What fits in the prompt
 
@@ -289,17 +290,18 @@ once and cancels its job if one is running, takes back its queued job, and remov
 description and the context this host had captured for it, while keeping its pin.
 
 From the instant the fence goes up, that session's title comes from its pin or from deterministic
-metadata — there is no window in which a generated title is still shown — and nothing more is
+metadata (there is no window in which a generated title is still shown), and nothing more is
 captured for it, so a change made while it was private cannot reach a job after privacy ends. A job
 that was already running is counted as in flight, and the cleanup does not report complete until it
 has finished or until a removal this host could not make has been made. Its answer, when it arrives,
 is refused: publication happens under the same lock that raises the fence, re-checking the fence,
-the cancellation token and the whole-job deadline inside it, so a fence raised from another thread or a
-token that fired between generation and publication publishes nothing. The write itself goes through
-the job's token, so a cancellation that arrives while the description is being written waits for it
-and is told it was too late, rather than deleting the description an earlier, uncancelled job left
-for that session. The job counts as running, and as in flight, until its outcome is complete, the
-write included, so nobody is told a job is past cancelling before its description is in the store.
+the cancellation token and the whole-job deadline inside it, so a fence raised from another thread
+or a token that fired between generation and publication publishes nothing. The write itself goes
+through the job's token, so a cancellation that arrives while the description is being written waits
+for it and is told it was too late, rather than deleting the description an earlier, uncancelled job
+left for that session. The job counts as running, and as in flight, until its outcome is complete,
+the write included, so nobody is told a job is past cancelling before its description is in the
+store.
 
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.
@@ -420,8 +422,9 @@ every figure, and reports:
 - how many descriptions were produced, how many passed the deadline and how many were refused;
 - the resource-paused case, driven on the same host that has just been publishing.
 
-That last point matters: section 22 forbids passing the active-contention case by keeping inference
-switched off, so the pause is measured beside real production rather than instead of it.
+The last one is measured that way because section 22 forbids passing the active-contention case by
+keeping inference switched off, so the pause is measured beside real production rather than instead
+of it.
 
 Every figure is of one process, which holds the runtime, the harness and the terminal workload the
 contention case needs, and each line says so. What that process grew by over a baseline is reported
@@ -450,13 +453,13 @@ malicious project text, long active turns, rapid directory changes, cold start, 
 contention, cancellation, queue fairness and stale-result rejection, across the required host
 architectures.
 
-Each case names what stands behind it: a named test, on the targets the suite has been run on, or
-nothing yet with the owner that will run it. Each also names what its evidence does **not** cover,
-because a test against a deterministic runtime proves a rule and not the model, the library or the
-machine. A case is never recorded as evidence on a target
-nothing has run on, and the cases that need real weights stay outstanding until a benchmark run is
-recorded against a commit and a target. `Matrix::gaps` is that list, and it is a method rather than
-a comment so a report that prints the matrix prints the gaps with it.
+Each case names what stands behind it: a named test, on the targets the suite has been run on, or no
+run at all, with its owner named (`scripts/bench-descriptions.sh`). Each also names what its
+evidence does **not** cover, because a test against a deterministic runtime proves a rule and not
+the model, the library or the machine. A case is never recorded as evidence on a target nothing has
+run on, and the cases that need real weights stay outstanding until a benchmark run is recorded
+against a commit and a target. `Matrix::gaps` is that list, and it is a method rather than a comment
+so a report that prints the matrix prints the gaps with it.
 
 The smoke results reported on 13 September are preserved as reported. They have not been
 reproduced, the scripts and raw outputs behind them were not supplied, and they qualify no profile
