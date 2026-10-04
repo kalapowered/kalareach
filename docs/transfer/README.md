@@ -57,10 +57,14 @@ them; nothing in the protocol depends on the defaults.
 | one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
-submission is recorded rather than inferred from age. The host records it when the session's worker
-accepts a prompt that names the draft, whether the prompt is submitted or queued, and again for a
-repeat of that action, which is how a record that was not made the first time is made. The host
-tells the service which sessions its retention still covers; the service never guesses. An
+submission is recorded rather than inferred from age. The host records it whenever a prompt that
+names the draft, whether the prompt is submitted or queued, is forwarded to the session's worker,
+and before the worker answers. Once the host records the attachment, nothing the worker does
+afterwards, including a lost connection, can leave it on the seven-day window. If the worker refuses
+the prompt, the attachment is still moved to the session's retention; this is not optimal (the
+attachment may be retained longer than is necessary), but it cannot lose a file. A repeat of the
+action that the worker answers from what it kept sends nothing, and nothing is recorded. The host
+tells the service which sessions its retention still covers, and the service does not guess. An
 attachment uploaded without a session takes the draft's session when it is submitted to one, or the
 session the prompt names when the draft has none, so the retention that applies is the session's
 rather than the seven-day window that applied while nothing held it.
