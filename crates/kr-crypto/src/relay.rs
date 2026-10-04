@@ -663,6 +663,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_admission_key_is_kept_apart_from_the_instance_key_and_refused_when_not_a_seed() {
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        let first = ServiceAdmissionKeyPair::open(&directory).expect("a first open");
+        let again = ServiceAdmissionKeyPair::open(&directory).expect("a second open");
+
+        // The reason the function exists: a lease signed by the first run is still one the relay
+        // pins at the second.
+        assert_eq!(first.public(), again.public());
+
+        // The two files a host may keep in one directory hold two keys, so neither can stand in
+        // for the other.
+        let instance = RelayInstanceKeyPair::open(&directory).expect("an instance key beside it");
+        assert_ne!(first.public().as_bytes(), instance.public().as_bytes());
+
+        write_owner_only(&directory.join("truncated"), &[0x21; 16]).expect("a short file");
+        std::fs::rename(
+            directory.join("truncated"),
+            directory.join(ADMISSION_KEY_FILE),
+        )
+        .expect("a replaced key file");
+        match ServiceAdmissionKeyPair::open(&directory) {
+            Err(CryptoError::StoredSecretLength { name, .. }) => {
+                assert_eq!(name, ADMISSION_KEY_FILE, "the error names the file it read");
+            }
+            other => panic!("a short admission key was not refused as a bad length: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_directory_anybody_could_read_is_refused_rather_than_repaired() {
         use std::os::unix::fs::PermissionsExt as _;
 
