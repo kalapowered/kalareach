@@ -85,3 +85,35 @@ if (!('createObjectURL' in URL)) {
     value: () => 'blob:test'
   })
 }
+
+if (typeof globalThis.IntersectionObserver !== 'function') {
+  // jsdom has no layout, so nothing in a component test is scrolled out of view: every element an
+  // observer is given is on the screen. Which rows a scrolled list asks the host about is held in
+  // the browser engines by `e2e/session-descriptions.spec.ts`.
+  class EverythingIsOnScreen {
+    private readonly callback: IntersectionObserverCallback
+
+    constructor(callback: IntersectionObserverCallback) {
+      this.callback = callback
+    }
+
+    observe(target: Element): void {
+      queueMicrotask(() => {
+        this.callback(
+          [{ target, isIntersecting: true } as unknown as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver
+        )
+      })
+    }
+
+    unobserve(): void {}
+    disconnect(): void {}
+    takeRecords(): IntersectionObserverEntry[] {
+      return []
+    }
+  }
+  Object.defineProperty(globalThis, 'IntersectionObserver', {
+    configurable: true,
+    value: EverythingIsOnScreen
+  })
+}

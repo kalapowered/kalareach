@@ -39,6 +39,10 @@ applyPendingReset(window.localStorage, window.sessionStorage)
 const { port, controls } = fakeHost()
 window.krTestHost = controls
 
+// `?sessions=` lengthens the host's list past a screen, for a test of what a scrolled list asks.
+const longer = Number(new URLSearchParams(window.location.search).get('sessions'))
+if (Number.isInteger(longer) && longer > 0) controls.addSessions(longer)
+
 // Where the web view has the person's text size to give, before the first render.
 followTheSystemTextSize()
 
