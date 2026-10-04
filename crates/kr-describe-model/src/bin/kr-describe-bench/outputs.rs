@@ -4,9 +4,9 @@
 //! The grammar is a constraint on generation and the validation is a constraint on publication, and
 //! neither is trusted for the other. Each answer is therefore read three ways: it is produced under
 //! the grammar by the library, the library's own grammar machinery is asked afterwards whether it
-//! takes the finished text, and [`validate`] decides whether it could be published. A job that ends
-//! at its deadline or fails counts as a job, so a run that produced nothing cannot read as one that
-//! produced nothing wrong.
+//! takes the finished text, and [`kr_describe::output::validate`] decides whether it could be
+//! published. A job that ends at its deadline or fails counts as a job, so a run that produced
+//! nothing cannot read as one that produced nothing wrong.
 //!
 //! The sessions are fixed so two runs compare: plain work, names in several scripts, text that
 //! tries to steer the model or end its data section, and the largest context the product admits
