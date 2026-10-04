@@ -213,6 +213,24 @@ pub fn this_process() -> std::result::Result<&'static Running, &'static InstallE
         .as_ref()
 }
 
+/// Returns the forwarder a package registers, by the path an update keeps current, where one is
+/// installed: the `kr-hook` of this process's installation through its store's `current` link, and
+/// beside this process's own program for a build outside a store.
+///
+/// A package's flags, a native bridge's registration files, the doctor's reports and a session's
+/// worker all name this path, so each of them says the same text however an update moves the
+/// release `current` names.
+#[must_use]
+pub fn registered_forwarder() -> Option<PathBuf> {
+    this_process().ok().and_then(registered_forwarder_of)
+}
+
+/// Returns the forwarder a package registers for `running`, where the file is there.
+fn registered_forwarder_of(running: &Running) -> Option<PathBuf> {
+    let stable = running.stable(Program::Hook);
+    stable.is_file().then_some(stable)
+}
+
 /// What a process runs.
 #[derive(Debug)]
 pub enum Running {
@@ -1210,6 +1228,27 @@ mod tests {
             store,
             _root: TempRoot(root),
         }
+    }
+
+    /// The forwarder a package registers is the stable path of this installation's `kr-hook`, and
+    /// only where the file is there: the one answer the daemon, the worker and a bridge's
+    /// registration share.
+    #[test]
+    fn the_registered_forwarder_is_the_stable_path_where_the_file_exists() {
+        let directory = std::env::temp_dir().join(format!("kr-forwarder-{}", crate::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let running = Running::Loose {
+            directory: directory.clone(),
+        };
+        assert_eq!(
+            registered_forwarder_of(&running),
+            None,
+            "no file, no forwarder"
+        );
+        let path = directory.join(Program::Hook.file_name());
+        std::fs::write(&path, b"forwarder").expect("the forwarder stands in");
+        assert_eq!(registered_forwarder_of(&running), Some(path));
+        let _ = remove_tree(&directory);
     }
 
     fn release(name: &str) -> ReleaseName {

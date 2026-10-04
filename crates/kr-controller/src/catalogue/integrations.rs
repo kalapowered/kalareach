@@ -69,10 +69,7 @@ impl Integrations {
 /// this path, and a worker reads the same one, so each says the same text.
 #[must_use]
 pub fn registered_forwarder() -> Option<PathBuf> {
-    kr_ipc::install::this_process()
-        .ok()
-        .map(|running| running.stable(kr_ipc::install::Program::Hook))
-        .filter(|path| path.is_file())
+    kr_ipc::install::registered_forwarder()
 }
 
 /// Returns `flags` written with the forwarder's path where a package names the forwarder, or as

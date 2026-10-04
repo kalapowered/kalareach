@@ -129,10 +129,7 @@ impl BridgeHost {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
-            forwarder: kr_ipc::install::this_process()
-                .ok()
-                .map(|running| running.stable(kr_ipc::install::Program::Hook))
-                .filter(|path| path.is_file()),
+            forwarder: kr_ipc::install::registered_forwarder(),
             #[cfg(feature = "testing")]
             signed_records: Vec::new(),
         }
