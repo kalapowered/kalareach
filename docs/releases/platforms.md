@@ -3,10 +3,11 @@
 A KalaReach release runs on Windows 11, macOS 14 or later and Linux with glibc 2.35 or later, each
 on x86-64 and ARM64, and its companion application runs on iOS and iPadOS 17 and Android 10. Those
 are the baselines. `release-baselines.yml` builds the host's executables, which are listed below,
-for every one of those desktop targets (the description process is the one exception, below), and
-each one's own headers are read back to confirm it runs on its baseline. A macOS executable has to
-declare exactly the baseline; a Linux or Windows one may need less than its baseline, and never
-more.
+for every one of those desktop targets (the description process is the one exception, below) and
+reads each one's own headers for the oldest system it says it runs on. A header states what the
+executable declares, and the check holds that to the baseline; starting each executable on the
+runner that built it is a separate step. A macOS executable has to declare exactly the baseline; a
+Linux or Windows one may need less than its baseline, and never more.
 
 ## The baselines
 
@@ -95,7 +96,12 @@ nothing a runner image added. The host's full test suite runs on Ubuntu 24.04 on
 
 ## When it runs
 
-`.github/workflows/release-baselines.yml` does all of the above for all six targets. It runs every
+`.github/workflows/release-baselines.yml` runs the floor check's self-test, builds the executables
+for all six targets, reads each floor back, and starts each executable where it was built and, on
+the Linux targets, in the four distributions above. On the x86-64 targets it also fails when the
+description process's llama.cpp archives hold an AVX-512, AVX-VNNI or AMX instruction; on Windows
+the one exception is AVX-512 code that runs only after a test of MSVC's `__isa_available` shows that
+the processor has AVX-512. The WSL workflows and core-ci's test suite run separately. It runs every
 night and by hand:
 
 ```sh
