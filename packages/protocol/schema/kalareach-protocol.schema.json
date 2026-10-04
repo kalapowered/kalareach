@@ -1194,6 +1194,20 @@
       ],
       "type": "object"
     },
+    "AgentChoice": {
+      "additionalProperties": false,
+      "description": "What was chosen for one agent's launches.",
+      "properties": {
+        "ownership": {
+          "$ref": "#/$defs/AgentOwnership",
+          "description": "How completely the session's closure accounts for what this agent starts."
+        }
+      },
+      "required": [
+        "ownership"
+      ],
+      "type": "object"
+    },
     "AgentCommand": {
       "additionalProperties": false,
       "description": "One command a bound agent advertises.",
@@ -1493,6 +1507,21 @@
         "binding_revision"
       ],
       "type": "object"
+    },
+    "AgentOwnership": {
+      "description": "How completely the session's closure accounts for what an agent started.\n\nSection 7 requires a vendor's own sandbox, which nests a job of its own under the session's,\nto be held by the session's job, or to produce a named launch failure, or to run under a\nreduced-ownership profile that someone explicitly selected. This is that choice, recorded in\nthe launch's profile so a closure and a reader can tell which one a launch ran under.",
+      "oneOf": [
+        {
+          "const": "full",
+          "description": "The agent starts inside the session's job and in a job of its own, so the session's closure\nends it and every process it started, including a vendor sandbox's nested jobs.",
+          "type": "string"
+        },
+        {
+          "const": "reduced",
+          "description": "The agent starts in a job of its own that only this host holds, and in none of the\nsession's: tracked by process start identity, ended with the session, and never counted as\ncomplete coverage. It exists only because someone selected it for that agent.",
+          "type": "string"
+        }
+      ]
     },
     "AgentPromptParams": {
       "additionalProperties": false,
@@ -7730,6 +7759,14 @@
       "additionalProperties": false,
       "description": "One versioned per-user host configuration document.",
       "properties": {
+        "agents": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentChoice"
+          },
+          "default": {},
+          "description": "What the owner or an administrator chose for the agents this host launches, by package\n(`publisher/plugin`).\n\nSection 7 lets an agent whose own sandbox cannot nest under the session's job run under\nan **explicitly selected** reduced-ownership profile, and this is where that selection\nis made: an entry that names `reduced` for a package, and nothing else, puts that\npackage's agent in a job of its own instead of the session's. A package with no entry\nruns under full ownership. Entries are read for the sessions created afterwards.",
+          "type": "object"
+        },
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",
           "default": {
@@ -17295,6 +17332,10 @@
           "$ref": "#/$defs/IntegrationMode",
           "description": "How the launch will be integrated."
         },
+        "ownership": {
+          "$ref": "#/$defs/AgentOwnership",
+          "description": "How completely the session's closure accounts for what the launch starts."
+        },
         "profile_id": {
           "$ref": "#/$defs/LaunchProfileId",
           "description": "This profile's identity."
@@ -17302,6 +17343,17 @@
         "resolved_at": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When the profile was resolved."
+        },
+        "vendor_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The word the application's own package reads for the mode the application runs in, when\nthe host established the launch: whatever the package's probe printed, literally. Null\nwhere the package declares no probe, the probe could not read a mode, or the launch\nwas not one this host established."
         }
       },
       "required": [
@@ -17311,6 +17363,8 @@
         "arguments",
         "authentication",
         "mode",
+        "ownership",
+        "vendor_mode",
         "resolved_at"
       ],
       "type": "object"

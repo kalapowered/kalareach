@@ -1017,6 +1017,46 @@ pub struct BinaryIdentity {
     pub distribution: String,
 }
 
+/// How completely the session's closure accounts for what an agent started.
+///
+/// Section 7 requires a vendor's own sandbox, which nests a job of its own under the session's,
+/// to be held by the session's job, or to produce a named launch failure, or to run under a
+/// reduced-ownership profile that someone explicitly selected. This is that choice, recorded in
+/// the launch's profile so a closure and a reader can tell which one a launch ran under.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOwnership {
+    /// The agent starts inside the session's job and in a job of its own, so the session's closure
+    /// ends it and every process it started, including a vendor sandbox's nested jobs.
+    Full,
+    /// The agent starts in a job of its own that only this host holds, and in none of the
+    /// session's: tracked by process start identity, ended with the session, and never counted as
+    /// complete coverage. It exists only because someone selected it for that agent.
+    Reduced,
+}
+
+impl AgentOwnership {
+    /// Every choice, in declaration order.
+    pub const ALL: &'static [Self] = &[Self::Full, Self::Reduced];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Reduced => "reduced",
+        }
+    }
+}
+
+impl fmt::Display for AgentOwnership {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One resolved launch profile.
 ///
 /// Section 12 fixes the contents: "Each launch profile records the resolved executable,
@@ -1038,6 +1078,13 @@ pub struct LaunchProfile {
     pub authentication: AuthenticationState,
     /// How the launch will be integrated.
     pub mode: IntegrationMode,
+    /// How completely the session's closure accounts for what the launch starts.
+    pub ownership: AgentOwnership,
+    /// The word the application's own package reads for the mode the application runs in, when
+    /// the host established the launch: whatever the package's probe printed, literally. Null
+    /// where the package declares no probe, the probe could not read a mode, or the launch
+    /// was not one this host established.
+    pub vendor_mode: Nullable<String>,
     /// When the profile was resolved.
     pub resolved_at: TimestampMs,
 }

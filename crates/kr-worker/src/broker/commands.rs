@@ -44,11 +44,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
+use kr_protocol::broker::{
+    AgentOwnership, AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile,
+};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, EnvironmentId, LaunchProfileId, SessionId};
 use kr_protocol::root::{CommandBackend, CwdRevision, PromptGeneration};
-use kr_protocol::scalars::Uuid;
+use kr_protocol::scalars::{Nullable, Uuid};
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 
 use crate::broker::Broker;
@@ -1828,6 +1830,9 @@ fn launch_profile(
         arguments: backend.invocation.arguments.clone(),
         authentication: AuthenticationState::Unknown,
         mode: IntegrationMode::NativeBridge,
+        // The program inherits the shell's own job, so it is held by whatever holds the shell.
+        ownership: AgentOwnership::Full,
+        vendor_mode: Nullable::null(),
         resolved_at: kr_ipc::now_ms(),
     }
 }

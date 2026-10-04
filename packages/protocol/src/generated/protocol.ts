@@ -10461,6 +10461,19 @@ export interface CollectionKeyWrapContext {
  * One versioned per-user host configuration document.
  */
 export interface ConfigurationDocument {
+  /**
+   * What the owner or an administrator chose for the agents this host launches, by package
+   * (`publisher/plugin`).
+   *
+   * Section 7 lets an agent whose own sandbox cannot nest under the session's job run under
+   * an **explicitly selected** reduced-ownership profile, and this is where that selection
+   * is made: an entry that names `reduced` for a package, and nothing else, puts that
+   * package's agent in a job of its own instead of the session's. A package with no entry
+   * runs under full ownership. Entries are read for the sessions created afterwards.
+   */
+  agents?: {
+    [k: string]: AgentChoice
+  }
   ceilings?: ConfigurationCeilings
   /**
    * The profile selected when a request and the allowlist name none.
@@ -10491,6 +10504,15 @@ export interface ConfigurationDocument {
    */
   version?: number
   voice?: VoiceSelection
+}
+/**
+ * What was chosen for one agent's launches.
+ */
+export interface AgentChoice {
+  /**
+   * How completely the session's closure accounts for what this agent starts.
+   */
+  ownership: 'full' | 'reduced'
 }
 /**
  * The ceilings this host configures. They intersect; they never raise anything.
@@ -15369,6 +15391,10 @@ export interface LaunchProfile2 {
    */
   mode: 'native_terminal' | 'gateway' | 'native_bridge'
   /**
+   * How completely the session's closure accounts for what the launch starts.
+   */
+  ownership: 'full' | 'reduced'
+  /**
    * One resolved launch profile: its executable, distribution, version, arguments, authentication state and mode.
    */
   profile_id: string
@@ -15376,6 +15402,13 @@ export interface LaunchProfile2 {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   resolved_at: string
+  /**
+   * The word the application's own package reads for the mode the application runs in, when
+   * the host established the launch: whatever the package's probe printed, literally. Null
+   * where the package declares no probe, the probe could not read a mode, or the launch
+   * was not one this host established.
+   */
+  vendor_mode: string | null
 }
 /**
  * The executable, its digest, its version and how it was distributed.
