@@ -426,7 +426,7 @@
 
 .m-row-label {
   color: var(--muted);
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
@@ -436,8 +436,10 @@
   color: var(--muted);
 }
 
+/* On its own line: a line that is out of date is read apart from the text it is about. */
 .m-row-note {
-  font-size: 0.75rem;
+  display: block;
+  font-size: 0.8125rem;
   color: var(--faint);
 }
 
