@@ -2,9 +2,10 @@
 
 A KalaReach release runs on Windows 11, macOS 14 or later and Linux with glibc 2.35 or later, each
 on x86-64 and ARM64, and its companion application runs on iOS and iPadOS 17 and Android 10. Those
-are the baselines. Every executable the host ships is built for every one of those desktop targets
-(the description process is the one exception, below), and each one's own headers are read back to confirm it runs on its baseline. A macOS executable has
-to declare exactly the baseline; a Linux or Windows one may need less than its baseline, and never
+are the baselines. `release-baselines.yml` builds the host's executables, which are listed below,
+for every one of those desktop targets (the description process is the one exception, below), and
+each one's own headers are read back to confirm it runs on its baseline. A macOS executable has to
+declare exactly the baseline; a Linux or Windows one may need less than its baseline, and never
 more.
 
 ## The baselines
@@ -43,12 +44,15 @@ natively and then started on the machine that built it. None is only cross-built
 | `aarch64-pc-windows-msvc` | `windows-11-arm` |
 
 The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
-`kr-hook` and `kr-plugin-host`. Each one is built by a Cargo command of its own, as the Windows release builds
-them, so its dependencies resolve exactly as they do for the release. The description process is built for every
-target except `aarch64-pc-windows-msvc`, where llama.cpp's CPU backend does not build with MSVC and no model
-profile lists the target. On x86-64 the description process also needs a processor with the x86-64-v3 instruction sets (SSE4.2,
-POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT and MOVBE); `docs/describe/README.md` says what a host
-without them does.
+`kr-hook` and `kr-plugin-host`. `release-baselines.yml` builds each one by a Cargo command of its
+own, as `release-windows.yml` builds each of its five, so the dependencies of those five resolve
+exactly as they do for the release. `release-windows.yml` builds and signs five of the seven, for
+x86-64 Windows: `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller` and `kr-describe-inference`.
+It does not build `kr-hook` or `kr-plugin-host`. The description process is built for every target
+except `aarch64-pc-windows-msvc`, where llama.cpp's CPU backend does not build with MSVC and no
+model profile lists the target. On x86-64 the description process also needs a processor with the
+x86-64-v3 instruction sets (SSE4.2, POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT and MOVBE);
+`docs/describe/README.md` says what a host without them does.
 
 ## How each floor is read
 
