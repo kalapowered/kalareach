@@ -334,7 +334,8 @@ impl Registry {
     }
 
     /// Takes into a registry's own file what a write-ahead log or a rollback journal beside it
-    /// holds, as the daemon's clean stop does, and says whether it opened the registry to.
+    /// holds, as the daemon's clean stop does, and says whether it opened the registry to take a
+    /// log in.
     ///
     /// What a daemon that ended by a signal leaves behind: the records are in the log, and
     /// [`Registry::open_to_read`] refuses to read a file that has not taken them in. This changes no
