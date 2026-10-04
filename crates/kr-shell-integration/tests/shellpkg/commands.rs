@@ -1024,14 +1024,22 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
+    let entries = session.commands.entries.len();
     session.commands.policy = ResolvePolicy::Silent;
     let asked = session.run_asking("kr-probe unanswered", "probe-ran");
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
 
     // A worker that answers what came after the unanswered question has caught up, so the next
-    // command asks again.
+    // command asks again. A shell looks at its mailbox once before it asks, and does not wait for
+    // an answer while one is owed, so the answers have to be there first: the worker has answered
+    // what the shell sent at its next prompt once that entry has been read, and a request the shell
+    // answers in the order it reads proves it has read those answers.
     session.commands.policy = ResolvePolicy::default();
+    session.until("the prompt after the unanswered line", |commands| {
+        commands.entries.len() > entries
+    });
+    session.barrier();
     let asked = session.run_asking("kr-probe caught-up", "probe-ran");
     assert_eq!(
         asked.len(),
