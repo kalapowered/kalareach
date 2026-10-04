@@ -71,9 +71,7 @@ export interface DescriptionSetupState {
   readonly failure: string | null
   /** Why the last write was refused, in words, until the next one is made. */
   readonly refusal: string | null
-  /** Whether a read or a write is waiting for the host. */
-  readonly busy: boolean
-  /** Reads the setup again. */
+  /** Reads the setup again, as a person asks after the host did not answer. */
   readonly reload: () => void
   /** Turns descriptions on or off. */
   readonly enable: (next: boolean) => void
@@ -89,15 +87,18 @@ export interface DescriptionSetupState {
  *
  * Every write is followed by a read, because what a person is told is the host's answer and not the
  * request that was made. A read that answers after a newer one began, or after the screen has gone,
- * changes nothing.
+ * changes nothing. A write that is made while another is waiting for the host is ignored: the
+ * second press would be made from a card that does not yet show the first. No control is disabled
+ * while the host answers, so a person on the keyboard or with a screen reader is never moved off
+ * the control they pressed or are on.
  */
 export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
   const [setup, setSetup] = useState<DescriptionSetup | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
-  const [busy, setBusy] = useState(true)
   const newest = useRef(0)
   const mounted = useRef(true)
+  const writing = useRef(false)
 
   useEffect(() => {
     mounted.current = true
@@ -107,10 +108,10 @@ export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
   }, [])
 
   /** Reads the setup, showing the answer of the newest read only. */
-  const read = useCallback(() => {
+  const read = useCallback((): Promise<void> => {
     newest.current += 1
     const mine = newest.current
-    port
+    return port
       .descriptionSetup()
       .then((answer) => {
         if (!mounted.current || mine !== newest.current) return
@@ -122,34 +123,35 @@ export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
         setSetup(null)
         setFailure(failureMessage(error))
       })
-      .finally(() => {
-        if (mounted.current && mine === newest.current) setBusy(false)
-      })
   }, [port])
 
-  const reload = useCallback(() => {
-    setBusy(true)
-    read()
+  // The first read, begun as the card opens.
+  useEffect(() => {
+    void read()
   }, [read])
 
-  // The first read, begun as the card opens: it is already waiting for the host.
-  useEffect(() => {
-    read()
+  // A read a person asked for shows that it is being made: the words for a failure are the same
+  // each time, and are announced again only if they went away first.
+  const reload = useCallback(() => {
+    setFailure(null)
+    void read()
   }, [read])
 
   const write = useCallback(
     (ask: () => Promise<unknown>) => {
-      setBusy(true)
+      if (writing.current) return
+      writing.current = true
       setRefusal(null)
-      ask()
+      void ask()
         .catch((error: unknown) => {
           if (mounted.current) setRefusal(failureMessage(error))
         })
+        .then(read)
         .finally(() => {
-          if (mounted.current) reload()
+          writing.current = false
         })
     },
-    [reload]
+    [read]
   )
 
   const enable = useCallback(
@@ -175,11 +177,13 @@ export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
   const running = setup?.download === 'running'
   useEffect(() => {
     if (!running) return undefined
-    const timer = setTimeout(reload, PROGRESS_EVERY_MS)
+    const timer = setTimeout(() => {
+      void read()
+    }, PROGRESS_EVERY_MS)
     return () => {
       clearTimeout(timer)
     }
-  }, [running, setup, reload])
+  }, [running, setup, read])
 
-  return { setup, failure, refusal, busy, reload, enable, onBattery, download }
+  return { setup, failure, refusal, reload, enable, onBattery, download }
 }

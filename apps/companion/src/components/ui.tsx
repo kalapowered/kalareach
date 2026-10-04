@@ -244,9 +244,9 @@ export function Switch({
       className="switch-control"
       aria-checked={checked}
       aria-label={label}
-      disabled={disabled}
+      aria-disabled={disabled || undefined}
       onClick={() => {
-        onChange(!checked)
+        if (!disabled) onChange(!checked)
       }}
     >
       <span className="switch-thumb" />
