@@ -2816,6 +2816,75 @@ fn a_finish_whose_completion_lost_returns_the_result_that_was_recorded() {
     assert_eq!(repeated, answered, "and a repeat is told the same");
 }
 
+/// KR-REQ-24.09: a finish whose verification fails while a copy of its own action is publishing is
+/// answered by what became of the upload, not by an integrity refusal nothing records.
+///
+/// The copy claimed the publication between this call's checks and its invalidation. Two copies of
+/// one action must not be told different things, so this one finishes what the copy began and gives
+/// the answer the row says.
+#[test]
+fn a_finish_that_fails_verification_beside_a_copy_that_claimed_the_publication_is_answered_by_the_row()
+ {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "claimed_beside.bin")
+        .expect("reserves the upload");
+    let transfer_id = begun.transfer_id;
+    harness
+        .send_all(transfer_id, &bytes)
+        .expect("sends the chunks");
+    let finish = action(&harness, "upload.finish", &bytes);
+    let (staged, _) = payload_paths(&harness, transfer_id, "claimed_beside.bin");
+    rewrite_in_place(&staged, bytes.len());
+    let staged_identity = identity_of(&staged);
+
+    // The copy claims the publication after this call read the upload and before it verified the
+    // file, as a copy that verified the bytes before they were rewritten would.
+    let claim = kr_transfer::store::RetainedAction {
+        actor_id: finish.actor_id.clone(),
+        action_id: finish.action_id,
+        method: finish.method.clone(),
+        payload_digest: finish.payload_digest,
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+    };
+    let copy_digest = digest(&bytes);
+    harness
+        .service
+        .set_staged_open_race_hook(move |store, tid| {
+            store
+                .begin_publish(
+                    tid,
+                    &kr_transfer::store::Publication {
+                        content_digest: copy_digest,
+                        payload_identity: staged_identity,
+                        preview: None,
+                        preview_unavailable: None,
+                    },
+                    kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                    Some(&claim),
+                )
+                .expect("records the copy's publication and its claim");
+        });
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&finish))
+        .expect_err("the staged bytes are not the ones the copy verified");
+    harness.service.clear_staged_open_race_hook();
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+
+    // The answer was recorded on the action's claim, so a repeat is told the same and recovery has
+    // nothing left to settle.
+    let repeat = harness
+        .finish_as(transfer_id, &bytes, Some(&finish))
+        .expect_err("the repeat is answered from the record");
+    assert_eq!(repeat.code(), refusal.code());
+    assert_eq!(repeat.to_string(), refusal.to_string());
+    let recovery = harness.service.recover().expect("recovery runs");
+    assert_eq!(recovery.resolved_claims, 0);
+}
+
 /// KR-REQ-24.09: a copy of one action that finds the payload gone is answered by the row, not by
 /// the open that failed.
 ///
