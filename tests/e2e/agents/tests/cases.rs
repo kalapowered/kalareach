@@ -5087,6 +5087,37 @@ fn fresh_rows(stage: &Stage<'_, '_>, session: &Session) -> Vec<String> {
     rows
 }
 
+/// The screens `read` gives, read again until a row shows `shown`, and the last of them. An agent
+/// draws what was typed into it a moment after it takes it, so a screen read at once can lack it:
+/// after `reads` reads without it, what the last shows is what the agent shows.
+fn screen_until_shown(
+    mut read: impl FnMut() -> Vec<String>,
+    shown: &str,
+    reads: usize,
+    pause: impl Fn(),
+) -> Vec<String> {
+    let mut rows = read();
+    for _ in 1..reads {
+        if rows.iter().any(|row| row.contains(shown)) {
+            break;
+        }
+        pause();
+        rows = read();
+    }
+    rows
+}
+
+/// A fresh view of the session's screen, read again until it shows `shown`: at most 20 reads, 500 ms
+/// apart.
+fn screen_showing(logged: &Logged, stage: &Stage<'_, '_>, shown: &str) -> Vec<String> {
+    screen_until_shown(
+        || fresh_rows(stage, &logged.agent.session),
+        shown,
+        20,
+        || std::thread::sleep(Duration::from_millis(500)),
+    )
+}
+
 /// A keyboard attachment on the session's own connection, holding the input lease.
 fn keyboard(stage: &Stage<'_, '_>, session: &Session) -> Keyboard {
     let mut keyboard = Keyboard::attach(&session.remote, stage.runtime, session.session_id)
@@ -8282,8 +8313,8 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         let mark_b = format!("only-b-{mark}");
         first.type_text(stage, &mark_a);
         second.type_text(stage, &mark_b);
-        let rows_a = fresh_rows(stage, &first.agent.session);
-        let rows_b = fresh_rows(stage, &second.agent.session);
+        let rows_a = screen_showing(&first, stage, &mark_a);
+        let rows_b = screen_showing(&second, stage, &mark_b);
         let isolated = |rows_a: &[String], rows_b: &[String]| {
             rows_a.iter().any(|row| row.contains(&mark_a))
                 && rows_b.iter().any(|row| row.contains(&mark_b))
@@ -8292,21 +8323,13 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         };
         assert!(
             isolated(&rows_a, &rows_b),
-            "input marked for each session reaches that session alone"
+            "input marked for each session reaches that session alone; session A's screen:\n{}\nsession B's screen:\n{}",
+            rows_a.join("\n"),
+            rows_b.join("\n")
         );
         // The control: B's marker typed into A's session, and the check fails on it.
         first.type_text(stage, &format!(" {mark_b}"));
-        // The agent draws what was typed a moment after it takes it: session A's screen is read
-        // again, fresh each time, until it shows the marker that was typed into it (ten seconds at
-        // most, after which what it shows is the answer).
-        let shown_by = std::time::Instant::now() + Duration::from_secs(10);
-        let mut control_rows = fresh_rows(stage, &first.agent.session);
-        while !control_rows.iter().any(|row| row.contains(&mark_b))
-            && std::time::Instant::now() < shown_by
-        {
-            std::thread::sleep(Duration::from_millis(500));
-            control_rows = fresh_rows(stage, &first.agent.session);
-        }
+        let control_rows = screen_showing(&first, stage, &mark_b);
         let control = isolated(&control_rows, &rows_b);
         assert!(
             !control && control_rows.iter().any(|row| row.contains(&mark_b)),
@@ -9201,6 +9224,39 @@ fn a_long_text_that_holds_a_key_is_recorded_after_a_fixed_number_of_searches() {
         }
         assert!(held, "{text:?} holds the key");
     }
+}
+
+/// A screen that lacks what was just typed is read again until it shows it: the agent draws a
+/// typed marker a moment after it takes it, which a real run showed for each of two sessions.
+#[test]
+fn a_screen_is_read_again_until_it_shows_what_was_typed() {
+    let marker = "only-a-1234";
+    let mut reads = 0;
+    let rows = screen_until_shown(
+        || {
+            reads += 1;
+            vec![if reads < 3 {
+                "> ".to_owned()
+            } else {
+                format!("> {marker}")
+            }]
+        },
+        marker,
+        20,
+        || {},
+    );
+    assert_eq!((reads, rows), (3, vec![format!("> {marker}")]));
+    let mut reads = 0;
+    let rows = screen_until_shown(
+        || {
+            reads += 1;
+            vec![format!("> {reads}")]
+        },
+        marker,
+        20,
+        || {},
+    );
+    assert_eq!((reads, rows), (20, vec!["> 20".to_owned()]));
 }
 
 /// A colour code that is also a run of key characters, beside another that is not: each is read
