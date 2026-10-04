@@ -716,6 +716,16 @@ mod tests {
         inside != 0
     }
 
+    /// A program that is ended when the test is over however the test ends, so a failed check
+    /// leaves no suspended program holding the test's output open.
+    struct Ending(Program);
+
+    impl Drop for Ending {
+        fn drop(&mut self) {
+            self.0.end();
+        }
+    }
+
     /// A program the launcher creates is in the job that ends it with the launcher from the moment
     /// the creation returns, and is let go of by every way out of an unstarted program: ended, and
     /// started. One case, since a launcher is a member of every holder it makes.
@@ -723,26 +733,28 @@ mod tests {
     fn a_program_is_born_in_the_job_that_ends_it_with_the_launcher_until_it_is_let_go() {
         let (executable, vector) = quick();
 
-        let ended = Program::create(&executable, &vector, &[]).expect("a program is created");
+        let ended =
+            Ending(Program::create(&executable, &vector, &[]).expect("a program is created"));
         assert!(
-            holds(&ended.holder, &ended.process),
+            holds(&ended.0.holder, &ended.0.process),
             "the program is in the holder as soon as it exists"
         );
-        assert!(armed(&ended.holder), "which ends it with the launcher");
-        ended.end();
+        assert!(armed(&ended.0.holder), "which ends it with the launcher");
+        ended.0.end();
         assert!(
-            !armed(&ended.holder),
+            !armed(&ended.0.holder),
             "an ended program leaves the holder ending nothing, for the typed command that follows"
         );
 
-        let started = Program::create(&executable, &vector, &[]).expect("a program is created");
-        assert!(holds(&started.holder, &started.process));
-        assert!(armed(&started.holder));
-        started.resume().expect("the program is started");
+        let started =
+            Ending(Program::create(&executable, &vector, &[]).expect("a program is created"));
+        assert!(holds(&started.0.holder, &started.0.process));
+        assert!(armed(&started.0.holder));
+        started.0.resume().expect("the program is started");
         assert!(
-            !armed(&started.holder),
+            !armed(&started.0.holder),
             "a started program is never one that the launcher's end ends"
         );
-        assert_eq!(started.wait(), 0, "and it ran");
+        assert_eq!(started.0.wait(), 0, "and it ran");
     }
 }
