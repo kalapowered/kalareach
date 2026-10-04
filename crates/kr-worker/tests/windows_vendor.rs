@@ -181,16 +181,27 @@ impl Launch {
     }
 
     /// Waits until the vendor has set its sandbox up, and says what it did.
-    fn report(&self) -> Report {
+    fn report(&mut self) -> Report {
+        use std::io::Read as _;
+
         let started = Instant::now();
         let text = loop {
             if let Ok(text) = std::fs::read_to_string(&self.report) {
                 break text;
             }
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "the vendor never reported"
-            );
+            if started.elapsed() >= LIVENESS_DEADLINE {
+                let child = self.child.as_mut().expect("the agent's handle");
+                let status = child.try_wait().expect("the agent's status");
+                let mut said = String::new();
+                if status.is_some()
+                    && let Some(output) = child.stdout.as_mut()
+                {
+                    let _ = output.read_to_string(&mut said);
+                }
+                panic!(
+                    "the vendor never reported; the agent's status is {status:?} and it said {said:?}"
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         };
         let field = |name: &str| {
@@ -395,7 +406,7 @@ fn vendor_stand_in() {
 async fn kr_req_07_64_a_sandbox_that_nests_under_the_session_job_launches_and_the_closure_ends_all_of_it()
  {
     let session = Arc::new(SessionJob::create().expect("a session job"));
-    let launch = Launch::start(1, AgentOwnership::Full, &session).expect("the agent launches");
+    let mut launch = Launch::start(1, AgentOwnership::Full, &session).expect("the agent launches");
     let report = launch.report();
 
     assert!(
@@ -497,7 +508,7 @@ async fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_b
 async fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_its_own_and_never_reads_complete()
  {
     let session = Arc::new(SessionJob::create_restricting(DESKTOP).expect("a restricted job"));
-    let launch = Launch::start(3, AgentOwnership::Reduced, &session)
+    let mut launch = Launch::start(3, AgentOwnership::Reduced, &session)
         .expect("the explicitly selected profile starts the agent");
     let report = launch.report();
 
@@ -578,7 +589,7 @@ async fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_it
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_with_it() {
     let session = Arc::new(SessionJob::create().expect("a session job"));
-    let launch = Launch::start(4, AgentOwnership::Reduced, &session)
+    let mut launch = Launch::start(4, AgentOwnership::Reduced, &session)
         .expect("the selected profile starts the agent");
     let report = launch.report();
     let vendor_made = identity_of(report.nested);
@@ -709,7 +720,7 @@ fn start_native_codex(
 async fn native_codex_nests_under_the_session_job_and_the_closure_ends_everything_it_made() {
     let codex = native_codex().expect("KR_NATIVE_CODEX names the pinned codex.exe");
     let session = Arc::new(SessionJob::create().expect("a session job"));
-    let launch = start_native_codex(11, AgentOwnership::Full, &session, &codex)
+    let mut launch = start_native_codex(11, AgentOwnership::Full, &session, &codex)
         .expect("Codex launches under the session's job");
     let report = launch.report();
     let members = session.process_ids().expect("the session's processes");
@@ -766,7 +777,7 @@ async fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_r
             .is_empty()
     );
 
-    let launch = start_native_codex(13, AgentOwnership::Reduced, &session, &codex)
+    let mut launch = start_native_codex(13, AgentOwnership::Reduced, &session, &codex)
         .expect("the selected profile starts Codex");
     let report = launch.report();
     let agent = launch.agent_job();
