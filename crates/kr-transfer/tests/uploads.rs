@@ -939,6 +939,9 @@ fn expiry_runs_at_twenty_four_hours_seven_days_and_the_session_retention() {
 
 /// KR-REQ-14.11: a submitted attachment outlives the seven-day window while its session is
 /// retained, and goes when the session's retention ends.
+///
+/// The session is the one the upload and its draft were made for or, where they named none, the
+/// one the draft was submitted to: either way it is what holds the attachment from then on.
 #[test]
 fn a_submitted_attachment_follows_its_sessions_retention() {
     struct Retains(bool);
@@ -948,75 +951,73 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
         }
     }
 
-    let harness = Harness::create();
     let session_id = SessionId::new(Uuid::from_bytes([11; 16]));
-    let bytes = pattern(32);
-    let begun = harness
-        .begin_for(
-            &bytes,
-            "application/octet-stream",
-            "submitted.bin",
-            Nullable::some(session_id),
-        )
-        .expect("reserves the upload");
-    harness
-        .send_all(begun.transfer_id, &bytes)
-        .expect("sends every chunk");
-    let handle = harness
-        .finish(begun.transfer_id, &bytes)
-        .expect("publishes the attachment")
-        .handle;
-    let draft = harness
-        .service
-        .draft_create(
-            &harness.actor,
-            &kr_protocol::transfer::DraftCreateParams {
-                environment_id: harness.environment_id(),
-                device_id: Nullable::null(),
-                session_id: Nullable::some(session_id),
-                application_instance_id: Nullable::null(),
-                text: "look at this".to_owned(),
-            },
-            None,
-        )
-        .expect("creates the draft")
-        .draft;
-    harness
-        .service
-        .draft_add_attachment(
-            &harness.actor,
-            &kr_protocol::transfer::AgentDraftAddAttachmentParams {
-                draft_id: draft.draft_id,
-                expected_revision: draft.revision,
-                transfer_id: handle.transfer_id,
-                contribution: contribution(&handle),
-            },
-            None,
-        )
-        .expect("binds the attachment");
-    harness
-        .service
-        .mark_submitted(&harness.actor, draft.draft_id)
-        .expect("records the submission");
+    for named_before_submission in [true, false] {
+        let harness = Harness::create();
+        let carried = Nullable(named_before_submission.then_some(session_id));
+        let bytes = pattern(32);
+        let begun = harness
+            .begin_for(&bytes, "application/octet-stream", "submitted.bin", carried)
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        let handle = harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle;
+        let draft = harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: carried,
+                    application_instance_id: Nullable::null(),
+                    text: "look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft;
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: draft.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(&handle),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+        harness
+            .service
+            .mark_submitted(&harness.actor, draft.draft_id, session_id)
+            .expect("records the submission");
 
-    harness
-        .clock
-        .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
-    let sweep = harness.service.sweep(&Retains(true)).expect("runs a sweep");
-    assert_eq!(
-        sweep.expired_attachments, 0,
-        "a retained session keeps what was submitted to it"
-    );
-    harness
-        .service
-        .attachment_handle(&harness.actor, handle.transfer_id)
-        .expect("the handle is still there");
+        harness
+            .clock
+            .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
+        let sweep = harness.service.sweep(&Retains(true)).expect("runs a sweep");
+        assert_eq!(
+            sweep.expired_attachments, 0,
+            "a retained session keeps what was submitted to it: {named_before_submission}"
+        );
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .expect("the handle is still there");
 
-    let sweep = harness
-        .service
-        .sweep(&Retains(false))
-        .expect("runs a sweep");
-    assert_eq!(sweep.expired_attachments, 1);
+        let sweep = harness
+            .service
+            .sweep(&Retains(false))
+            .expect("runs a sweep");
+        assert_eq!(sweep.expired_attachments, 1, "{named_before_submission}");
+    }
 }
 
 /// KR-REQ-14.11: a session whose retention ends *before* the seven-day window takes what was
@@ -1083,7 +1084,7 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
         .expect("binds the attachment");
     harness
         .service
-        .mark_submitted(&harness.actor, draft.draft_id)
+        .mark_submitted(&harness.actor, draft.draft_id, session_id)
         .expect("records the submission");
 
     // One hour later, long before seven days, the session's retention ends.

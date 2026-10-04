@@ -1232,7 +1232,9 @@ impl Store {
         Ok(true)
     }
 
-    /// Records that a draft holding this attachment was submitted.
+    /// Records that a draft holding this attachment was submitted to a session.
+    ///
+    /// The first submission stands: a second one changes nothing and announces nothing.
     ///
     /// # Errors
     ///
@@ -1241,24 +1243,27 @@ impl Store {
         &mut self,
         transfer_id: TransferId,
         at_ms: TimestampMs,
-        session_id: Option<SessionId>,
+        session_id: SessionId,
     ) -> Result<()> {
         let transaction = self.begin()?;
-        transaction
+        let changed = transaction
             .execute(
                 // The session is recorded only where the upload had none. An attachment already
                 // bound to a session keeps that one; submission does not move it.
                 "UPDATE uploads
                  SET submitted_at_ms = ?2,
                      session_id = COALESCE(session_id, ?3)
-                 WHERE transfer_id = ?1",
+                 WHERE transfer_id = ?1 AND submitted_at_ms IS NULL",
                 params![
                     uuid_sql(transfer_id.get()),
                     as_i64(at_ms.get()),
-                    session_id.map(|value| uuid_sql(value.get())),
+                    uuid_sql(session_id.get()),
                 ],
             )
             .map_err(TransferError::store)?;
+        if changed == 0 {
+            return Ok(());
+        }
         record_event(
             &transaction,
             "upload.submitted",

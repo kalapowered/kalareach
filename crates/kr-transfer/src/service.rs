@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use kr_flush::NameKind;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, TransferId};
+use kr_protocol::ids::{
+    ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, SessionId, TransferId,
+};
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentHandle,
@@ -2192,25 +2194,35 @@ impl TransferService {
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))
     }
 
-    /// Records that a draft was submitted, which is what moves its attachments onto the session's
-    /// retention.
+    /// Records that a draft was submitted to a session, which is what moves its attachments onto
+    /// the session's retention.
     ///
     /// Submission itself is a separate action performed elsewhere: this records its consequence for
-    /// storage and nothing else.
+    /// storage and nothing else. Recording it again changes nothing, so a repeat of the submission
+    /// can settle a record the first attempt did not reach.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::UnknownDraft`] when nothing is named.
-    pub fn mark_submitted(&self, actor: &ActorId, draft_id: DraftId) -> Result<usize> {
+    pub fn mark_submitted(
+        &self,
+        actor: &ActorId,
+        draft_id: DraftId,
+        submitted_to: SessionId,
+    ) -> Result<usize> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
         let row = draft_of(&store, draft_id, actor)?;
         let bindings = store.bindings(draft_id)?;
+        // A draft composed for a session is held by that one. A draft that named none is held by
+        // the session it was submitted to, so that what was submitted never keeps the seven-day
+        // window of an attachment no session holds.
+        let session_id = row.session_id.unwrap_or(submitted_to);
         for binding in &bindings {
             // An attachment uploaded without a session takes the draft's when it is submitted to
             // one. Without that its retention would stay the seven-day window while the session
             // was the thing actually holding it.
-            store.mark_submitted(binding.transfer_id, now, row.session_id)?;
+            store.mark_submitted(binding.transfer_id, now, session_id)?;
         }
         Ok(bindings.len())
     }
