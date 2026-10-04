@@ -3313,8 +3313,7 @@ what it removes is exactly the thing a person cannot check for themselves.
   forgotten, since it ran no shell.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
-  daemon takes through the steps. No description process runs on this host, so there is no
-  inference in flight to take back: stored descriptions are removed and titles come from metadata.
+  daemon takes through the steps.
 * **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident
   window; the projection's own history is not reached, because removing rows from it while keeping
   the live screen needs an interface the task that owns the projection has to provide.
