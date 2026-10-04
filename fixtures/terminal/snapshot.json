@@ -302,6 +302,7 @@
       "hyperlinks": [
         {
           "end_col": 8,
+          "params": "",
           "row": 0,
           "start_col": 4,
           "uri": "https://example.invalid/"

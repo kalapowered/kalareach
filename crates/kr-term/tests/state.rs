@@ -1968,13 +1968,102 @@ fn a_refused_hyperlink_does_not_extend_the_one_before_it() {
     let linked: Vec<Option<String>> = rows[0]
         .runs
         .iter()
-        .map(|run| run.hyperlink.clone())
+        .map(|run| run.hyperlink.as_ref().map(|link| link.uri.clone()))
         .collect();
     assert_eq!(
         linked,
         vec![Some("https://old.invalid".to_owned()), None],
         "the text after the refused link is not inside the previous one"
     );
+}
+
+/// KR-REQ-08.29: two links to one target are two links when their identifiers differ, and one when
+/// they do not. A projected client draws and activates a link as one range, so the identifier is
+/// what says where one range ends and the next begins.
+#[test]
+fn adjacent_links_to_one_target_with_different_identifiers_stay_apart() {
+    let mut engine = engine();
+    engine.feed(
+        b"\x1b]8;id=a;https://example.invalid/\x1b\\ab\
+          \x1b]8;id=b;https://example.invalid/\x1b\\cd\
+          \x1b]8;id=b;https://example.invalid/\x1b\\ef\
+          \x1b]8;;\x1b\\",
+        0,
+    );
+    engine.quiesce(0);
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    let runs: Vec<(&str, u32, u32)> = snapshot.rows[0]
+        .runs
+        .iter()
+        .map(|run| (run.text.as_str(), run.column, run.cells))
+        .collect();
+    assert_eq!(
+        runs,
+        vec![("ab", 0, 2), ("cdef", 2, 4)],
+        "the identifier tells the first link from the second, and the second link continues"
+    );
+    let ranges: Vec<(u32, u32)> = snapshot
+        .hyperlinks
+        .iter()
+        .map(|range| (range.start_col, range.end_col))
+        .collect();
+    assert_eq!(ranges, vec![(0, 2), (2, 6)]);
+
+    // The link a cursor was saved inside is that link, identifier included, so text printed after a
+    // restore belongs to the link it was printed in before.
+    let mut saving = Engine::new(EngineConfig::default()).expect("engine");
+    saving.feed(
+        b"\x1b]8;x=1:id=a;https://example.invalid/\x1b\\\x1b7\x1b]8;;\x1b\\",
+        0,
+    );
+    let view = viewport(&saving);
+    let (snapshot, _) = saving.snapshot(view, 0);
+    let saved = snapshot.saved_cursors[0]
+        .as_ref()
+        .and_then(|cursor| cursor.hyperlink.clone())
+        .expect("the saved cursor holds the link");
+    assert_eq!(saved.uri, "https://example.invalid/");
+    assert_eq!(
+        saved.params, "id=a:x=1",
+        "the parameters are spelled in key order, however they arrived"
+    );
+}
+
+/// KR-REQ-08.79: a row's runs each hold a copy of the link they are inside, parameters included,
+/// so a row of many short runs in one link with a long identifier is cut at the row bound like any
+/// other row, instead of copying the identifier once for every run.
+#[test]
+fn a_row_of_runs_in_one_link_is_bounded_by_every_copy_of_its_parameters() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2_048, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let identifier = "i".repeat(1_900);
+    let mut input = format!("\x1b]8;id={identifier};https://example.invalid/\x1b\\");
+    // Bold and plain alternate, so every cell is a run of its own.
+    for _ in 0..1_024 {
+        input.push_str("a\x1b[1mb\x1b[0m");
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    let rows = engine.grid().visible_rows();
+    let carried: usize = rows[0]
+        .runs
+        .iter()
+        .map(|run| {
+            run.hyperlink
+                .as_ref()
+                .map_or(0, |link| link.uri.len() + link.params.len())
+        })
+        .sum();
+    let bound = kr_term::grid::GridConfig::DEFAULT.row_bytes;
+    assert!(
+        carried <= bound,
+        "the row carries {carried} bytes of link against a bound of {bound}"
+    );
+    assert!(rows[0].truncated, "and says it was cut");
 }
 
 /// The cursor style a report gives is the one the grid is using.
