@@ -18,8 +18,8 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::{ALPN, ClientOffer, HelloReply, PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{
-    ActorId, AttachmentId, BuildId, ConnectionId, ControllerGeneration, DeviceId, EnvironmentId,
-    SessionId,
+    ActorId, AttachmentId, AuthorityRevision, BuildId, ConnectionId, ControllerGeneration,
+    DeviceId, EnvironmentId, SessionId,
 };
 use kr_protocol::scalars::{CanonicalSet, EndpointKey, Nullable, Uuid};
 use kr_transport::codec::{FrameReader, FrameWriter};
@@ -73,6 +73,10 @@ impl PairedDirectory for TestHandler {
 impl HostHandler for TestHandler {
     fn principal_for(&self, device_id: &DeviceId) -> ActorId {
         kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
     }
 
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {

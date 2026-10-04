@@ -21,10 +21,12 @@
 //! the first protected read is the host's to fence. `NetworkHost::admit` therefore reads the
 //! device record and writes the connection into the daemon's authority store in one critical
 //! section, in the lock order a revocation also takes, so nothing can be admitted against authority
-//! that has already been replaced. The registration is the daemon's own, shared with its local
-//! callers, so one revocation fences both ingresses; and every read, subscription and dispatch
-//! checks it, which is what makes it revocable for the life of the session rather than only at the
-//! handshake.
+//! that has already been replaced. A revocation recorded before the connection was registered
+//! withdrew nothing of it, so the connection carries the revision the transport read before it
+//! could be told it was accepted, and one that is older than the revision in force is refused. The
+//! registration is the daemon's own, shared with its local callers, so one revocation fences both
+//! ingresses; and every read, subscription and dispatch checks it, which is what makes it
+//! revocable for the life of the session rather than only at the handshake.
 //!
 //! **Work that must complete is owned by something that outlives the connection.**
 //! `HostHandler::serve` is dropped when the control stream ends, and dropping a future is a
@@ -444,6 +446,18 @@ impl HostHandler for NetworkHost {
         kr_transport::listener::device_principal(device_id)
     }
 
+    fn authority_revision(&self) -> AuthorityRevision {
+        // The lease issuer adopts a revision inside the critical section that advances it, before
+        // the revocation is reported recorded, so a connection whose handshake finished before a
+        // revocation was recorded reads a revision older than the one that revocation installed.
+        // A daemon that has stopped registers nothing, and the zero revision is older than any.
+        self.controller
+            .upgrade()
+            .map_or_else(AuthorityRevision::default, |controller| {
+                controller.leases.authority_revision()
+            })
+    }
+
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
         Some(Arc::clone(&self.pairing) as Arc<dyn PairingSurface>)
     }
@@ -480,6 +494,17 @@ impl NetworkHost {
         controller.before_a_connection_is_registered.wait().await;
         let registry = controller.registry.lock().await;
         let admitted_revision = registry.authority_revision()?;
+        // The transport authorised this connection under the revision it read before the peer
+        // could be told it was accepted. A revocation recorded since found no registration here to
+        // withdraw, and registering the connection under the revision that revocation installed
+        // would give it authority nothing decided. It is refused, and the device connects again.
+        if session.authorised_under < admitted_revision {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the authority this connection was authorised under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            });
+        }
         // The final validation the transport's contract names. The handshake checked the record
         // when it selected it; this checks it where the registration is written, and it checks the
         // device the handshake actually proved rather than one the peer named.
