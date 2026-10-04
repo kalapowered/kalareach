@@ -24,7 +24,7 @@
  * shows what the host says it did.
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react'
 
 import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach/protocol'
 
@@ -928,6 +928,40 @@ function HostStep({
 }
 
 /**
+ * Keeps a person where they are in a card whose controls come and go with the host's answers.
+ *
+ * Where an answer removes the control that has focus (a fetch that ends, a retry that succeeds,
+ * a read that fails), focus would fall to the page. It goes to the first control the card still
+ * has instead. Focus the person moved away themselves, by a press elsewhere or by Tab, is theirs
+ * and is left alone.
+ */
+function useKeepFocusInCard(card: RefObject<HTMLElement | null>): void {
+  const focused = useRef<Element | null>(null)
+  useEffect(() => {
+    const track = (event: Event): void => {
+      const target = event.target as Node | null
+      focused.current =
+        event.type === 'focusin' && target !== null && card.current?.contains(target) === true
+          ? (target as Element)
+          : null
+    }
+    document.addEventListener('focusin', track)
+    document.addEventListener('pointerdown', track)
+    return () => {
+      document.removeEventListener('focusin', track)
+      document.removeEventListener('pointerdown', track)
+    }
+  }, [card])
+  // After each answer the card is drawn from.
+  useEffect(() => {
+    const gone = focused.current
+    if (gone === null || gone.isConnected || document.activeElement !== document.body) return
+    focused.current = null
+    card.current?.querySelector<HTMLElement>('[role="switch"], button')?.focus()
+  })
+}
+
+/**
  * Session descriptions: what this host offers, what it costs before anything is fetched, and the
  * controls the host has.
  *
@@ -937,6 +971,8 @@ function HostStep({
  */
 function DescriptionsCard({ descriptions }: { readonly descriptions: DescriptionSetupState }): ReactNode {
   const { setup, failure, refusal } = descriptions
+  const card = useRef<HTMLElement>(null)
+  useKeepFocusInCard(card)
   const status = setup === null ? null : statusOf(setup)
   const fraction = setup === null ? null : fetchedFraction(setup)
   const canStart =
@@ -947,7 +983,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
       setup.download === 'failed')
   // One button for the fetch, whichever way it can go: starting it, or stopping it. The same
   // element stays in the footer as its words change, so a person on it, by keyboard or screen
-  // reader, is still on it when the host's answer changes what it does, or the fetch ends.
+  // reader, is still on it when the host's answer changes what it does.
   const fetchButton =
     setup?.can_cancel === true
       ? ({ action: 'cancel', label: 'Cancel the download', testId: 'setup-model-cancel' } as const)
@@ -959,7 +995,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
           } as const)
         : null
   return (
-    <Card data-testid="setup-model">
+    <Card ref={card} data-testid="setup-model">
       <header className="card-header">
         <h2>Session descriptions</h2>
         {status ? (
