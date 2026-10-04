@@ -168,3 +168,44 @@ pub fn validate_answer(
     };
     validate(bytes, &produced_under, &expectation)
 }
+
+/// Sessions whose names the model copies into its answer in their own script, so an answer to one
+/// is text a cut can fall inside: an Arabic one, a Persian one with its zero-width non-joiner, and
+/// one with a family of three people joined by zero-width joiners.
+#[must_use]
+pub fn copied_names() -> Vec<(&'static str, DescriptionContext)> {
+    let text = |codepoints: &[u32]| -> String {
+        codepoints
+            .iter()
+            .filter_map(|codepoint| char::from_u32(*codepoint))
+            .collect()
+    };
+    let persian = text(&[
+        0x645, 0x6CC, 0x200C, 0x62E, 0x648, 0x627, 0x647, 0x645, 0x20, 0x62E, 0x637, 0x627, 0x20,
+        0x631, 0x627, 0x20, 0x631, 0x641, 0x639, 0x20, 0x6A9, 0x646, 0x645,
+    ]);
+    let family = text(&[0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467]);
+    vec![
+        (
+            "copied arabic",
+            builder(2, 12)
+                .directory("المشروع")
+                .intent("مراجعة شاشة موافقة المضيف")
+                .build(),
+        ),
+        (
+            "copied persian",
+            builder(3, 13)
+                .directory("پروژه")
+                .intent(&format!("بررسی صفحه تأیید میزبان و {persian}"))
+                .build(),
+        ),
+        (
+            "copied emoji family",
+            builder(4, 14)
+                .directory("family")
+                .intent(&format!("add the {family} emoji to the party planner"))
+                .build(),
+        ),
+    ]
+}

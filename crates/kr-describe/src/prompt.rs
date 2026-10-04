@@ -12,14 +12,17 @@
 //! has no description to ask for. After them the session's facts and events are taken in a fixed
 //! order of worth, and each is kept whole while the prompt fits:
 //!
-//! 1. the facts, the task intent first and then the directory, the repository, the branch, the
-//!    thread and the application, because what a session is for outweighs where it is;
-//! 2. the events, newest first, because a description is of what a session is doing now.
+//! 1. the task intent, the directory and the repository, because what a session is for and where
+//!    it is name it;
+//! 2. the newest event, because a description is of what a session is doing now, and the cursor
+//!    interval the answer repeats names events the prompt ought to show;
+//! 3. the branch, the thread and the application;
+//! 4. the other events, newest first.
 //!
-//! The first part that does not fit whole is cut to the longest run of its codepoints that does,
-//! and nothing after it is kept. So the prompt always holds a prefix of that order, the oldest
-//! events are the ones that go, and the same context under the same budget always gives the same
-//! prompt. The parts are shown in their usual order whatever was kept.
+//! The first part that does not fit whole is cut to a run of its codepoints that does, found by
+//! halving, and nothing after it is kept. So the prompt always holds a prefix of that order, the
+//! oldest events are the ones that go, and the same context under the same budget always gives the
+//! same prompt. The parts are shown in their usual order whatever was kept.
 //!
 //! Whether a prompt fits is asked of the whole text each time, so tokens that form across the end of
 //! one part and the start of the next are counted as the model will read them.
@@ -42,15 +45,11 @@ const INSTRUCTION: &str = "Name this terminal session and say what it is doing.\
      Do not claim a test passed, an approval was given or work finished. You cannot see any of \
      those.\n";
 
-/// The order in which the facts of a session are kept when they do not all fit.
-const FACT_WORTH: [&str; 6] = [
-    "intent",
-    "directory",
-    "repository",
-    "branch",
-    "thread",
-    "application",
-];
+/// The facts that come before the newest event when a prompt does not hold everything, in order.
+const FIRST_FACTS: [&str; 3] = ["intent", "directory", "repository"];
+
+/// The facts that come after it, in order.
+const LATER_FACTS: [&str; 3] = ["branch", "thread", "application"];
 
 /// One piece of project text, with the label it is shown under.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -170,7 +169,7 @@ impl Prompt {
         // number tried is asked of the whole prompt, and the one kept is one that was asked and
         // fit, so the answer fits even where adding text makes a count smaller.
         let (mut whole, mut text, mut tokens) = (0, base_text, base);
-        let (mut low, mut high) = (0, order.len() - 1);
+        let (mut low, mut high) = (0, order.len().saturating_sub(1));
         while low < high {
             let middle = (low + high).div_ceil(2);
             let candidate = self.render(&self.shown(&order, middle, None));
@@ -182,8 +181,10 @@ impl Prompt {
             }
         }
 
-        // The next part, cut to the longest run of its codepoints that fits.
-        let length = self.datum(order[whole]).text.chars().count();
+        // The next part, cut to a run of its codepoints that fits.
+        let length = order
+            .get(whole)
+            .map_or(0, |next| self.datum(*next).text.chars().count());
         let mut cut = None;
         let (mut low, mut high) = (0, length.saturating_sub(1));
         while low < high {
@@ -212,19 +213,32 @@ impl Prompt {
 
     /// Returns the parts in the order they are kept.
     fn worth(&self) -> Vec<Part> {
-        let mut facts: Vec<usize> = (0..self.facts.len()).collect();
-        facts.sort_by_key(|index| {
-            let label = self.facts[*index].label.as_str();
-            FACT_WORTH
+        let facts_named = |names: &[&str]| -> Vec<Part> {
+            names
                 .iter()
-                .position(|known| *known == label)
-                .unwrap_or(FACT_WORTH.len())
-        });
-        facts
-            .into_iter()
-            .map(Part::Fact)
-            .chain((0..self.events.len()).rev().map(Part::Event))
-            .collect()
+                .flat_map(|name| {
+                    self.facts
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, datum)| datum.label == *name)
+                        .map(|(index, _)| Part::Fact(index))
+                })
+                .collect()
+        };
+        let mut newest_first = (0..self.events.len()).rev().map(Part::Event);
+        let mut order = facts_named(&FIRST_FACTS);
+        order.extend(newest_first.next());
+        order.extend(facts_named(&LATER_FACTS));
+        // A fact with a label this build does not name is kept, after the ones it does.
+        order.extend(self.facts.iter().enumerate().filter_map(|(index, datum)| {
+            (!FIRST_FACTS
+                .iter()
+                .chain(&LATER_FACTS)
+                .any(|name| datum.label == *name))
+            .then_some(Part::Fact(index))
+        }));
+        order.extend(newest_first);
+        order
     }
 
     fn datum(&self, part: Part) -> &Datum {

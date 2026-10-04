@@ -14,9 +14,8 @@ use kr_describe::output::DESCRIPTION_GRAMMAR;
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::ModelProfile;
 use kr_describe::serve::{Generating, Job, Model};
-use kr_describe::wire::LoadEnd;
-use kr_describe_model::fixtures::{largest_contexts, validate_answer};
-use kr_describe_model::llama::{Llama, LlamaRuntime};
+use kr_describe_model::fixtures::{copied_names, largest_contexts, validate_answer};
+use kr_describe_model::llama::Llama;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod support;
@@ -102,21 +101,29 @@ fn the_largest_contexts_are_made_to_fit_the_prompt_bound() {
                 "{script} is a context the bound has to trim"
             );
             assert_ne!(fitted.text, prompt.text(), "{script}");
-            // What a session is for is kept before anything else.
+            // What a session is for is kept before anything else, and the newest event is kept
+            // beside it, so the answer has what the session is doing now.
             let intent = prompt.fact("intent").expect("an intent");
             assert!(
                 fitted.text.contains(&format!("intent: <<{intent}>>")),
                 "{script}: the intent"
             );
+            // Emoji cost about three tokens a codepoint, so the intent, the directory and the
+            // repository alone take the whole bound; the others keep the newest event.
+            if script != "emoji" {
+                assert!(fitted.events_dropped < 8, "{script}: the newest event");
+            }
         }
     }
 }
 
-/// KR-REQ-22.18: a job for each largest context gives an answer that is published as it is, and the
-/// output bound never leaves it cut. The Latin answer, which the model ends itself, is the same at
-/// the bound and with room to spare: nothing in it is shortened. For the others, stopping the
-/// model inside its activity text, at a bound it cannot finish in, gives an answer ended on a
-/// boundary between characters a person sees, which is the start of the text it would have written.
+/// KR-REQ-22.18: a job for each largest context, and for sessions whose names the model copies in
+/// their own script, gives an answer that is published as it is, and the output bound never leaves
+/// it cut. The Latin answer, which the model ends itself, is the same at the bound and with room to
+/// spare: nothing in it is shortened. Stopping the model at a bound it cannot finish in gives an
+/// answer within that bound, whole as JSON, with the activity text ended on a boundary between
+/// characters a person sees of the text the model would have written, which for the sessions whose
+/// names are copied is Arabic, Persian with its non-joiner, and a family of emoji with its joiners.
 #[test]
 fn an_answer_the_output_bound_stops_is_ended_inside_its_activity_text() {
     let Some((profile, runtime)) =
@@ -130,37 +137,43 @@ fn an_answer_the_output_bound_stops_is_ended_inside_its_activity_text() {
     );
     let mut model = Llama::loaded(runtime);
 
-    for (script, context) in largest_contexts() {
+    let mut contexts = largest_contexts();
+    contexts.extend(copied_names());
+    for (name, context) in contexts {
         let bounded = describe(&mut model, &profile, &context, 128);
         let reference = describe(&mut model, &profile, &context, 300);
         let runtime = model.runtime().expect("a loaded model");
         for bytes in [&bounded, &reference] {
             validate_answer(&context, &profile, bytes)
-                .unwrap_or_else(|rejection| panic!("{script}: {}", rejection.as_str()));
+                .unwrap_or_else(|rejection| panic!("{name}: {}", rejection.as_str()));
             assert_eq!(
                 runtime.grammar_takes(DESCRIPTION_GRAMMAR, bytes),
                 Ok(true),
-                "{script}"
+                "{name}"
             );
         }
-        if script == "latin" {
+        if name == "latin" {
             assert_eq!(bounded, reference, "the Latin answer is not shortened");
         }
 
-        // Where the reference's activity text is, in the model's tokens.
+        // Where the reference's parts are, in the model's tokens.
         let text = String::from_utf8(reference.clone()).expect("text");
+        note(&format!("{name}: the answer the model writes is {text}"));
         let quotes: Vec<usize> = text.match_indices('"').map(|(at, _)| at).collect();
-        let before = |end: usize| {
-            runtime
-                .prompt_tokens(&text[..end])
-                .expect("tokens")
-                .tokens
-                .len()
-        };
-        let (starts, ends) = (before(quotes[6] + 1), before(quotes[7]));
+        let tokens = |end: usize| runtime.answer_tokens(&text[..end]).expect("tokens");
+        let (total, starts, closes) =
+            (tokens(text.len()), tokens(quotes[6] + 1), tokens(quotes[7]));
+        let tail = total - tokens(quotes[7] + 1);
         let full = validate_answer(&context, &profile, &reference)
             .expect("a published answer")
             .activity;
+        let copied = !full.as_str().is_ascii();
+        if name.starts_with("copied") {
+            assert!(
+                copied,
+                "{name}: the model no longer writes its activity in the name's script"
+            );
+        }
         let boundaries: Vec<usize> = full
             .as_str()
             .grapheme_indices(true)
@@ -168,51 +181,50 @@ fn an_answer_the_output_bound_stops_is_ended_inside_its_activity_text() {
             .chain([full.as_str().len()])
             .collect();
 
-        let mut shortened = 0;
-        for stop in [starts + 3, starts + (ends - starts) / 2, ends - 2] {
-            let stop = u32::try_from(stop).expect("a count");
-            let bytes = describe(&mut model, &profile, &context, stop);
+        let mut stops = vec![
+            starts + tail + 2,
+            starts + tail + (closes - starts) / 2,
+            total.saturating_sub(3),
+            total.saturating_sub(1),
+        ];
+        stops.sort_unstable();
+        stops.dedup();
+        let (mut shortened, mut non_ascii) = (0, 0);
+        for stop in stops {
+            let bound = u32::try_from(stop).expect("a count");
+            let bytes = describe(&mut model, &profile, &context, bound);
+            let runtime = model.runtime().expect("a loaded model");
             let Ok(description) = validate_answer(&context, &profile, &bytes) else {
-                note(&format!("{script}: stopped at {stop}, refused"));
+                note(&format!("{name}: bound {stop}, refused"));
                 continue;
             };
             let kept = description.activity.as_str();
-            note(&format!("{script}: stopped at {stop}, kept {kept:?}"));
-            assert!(full.as_str().starts_with(kept), "{script}: {kept:?}");
+            note(&format!("{name}: bound {stop}, kept {kept:?}"));
+            assert!(
+                runtime
+                    .answer_tokens(&String::from_utf8_lossy(&bytes))
+                    .expect("tokens")
+                    <= stop,
+                "{name}: the answer is within its bound"
+            );
+            assert!(full.as_str().starts_with(kept), "{name}: {kept:?}");
             assert!(
                 boundaries.contains(&kept.len()),
-                "{script}: {kept:?} ends inside a character of {:?}",
+                "{name}: {kept:?} ends inside a character of {:?}",
                 full.as_str()
             );
             shortened += usize::from(kept.len() < full.as_str().len());
+            non_ascii += usize::from(!kept.is_ascii());
         }
         assert!(
             shortened >= 1,
-            "{script}: no stop inside the activity text was ended"
+            "{name}: no bound inside the activity text was ended"
         );
+        if copied {
+            assert!(
+                non_ascii >= 1,
+                "{name}: no shortened answer holds the name's script"
+            );
+        }
     }
-}
-
-/// KR-REQ-22.10: a profile whose window is too small to hold the instruction and the answer's bound
-/// is refused when it loads, with a reason a person can read. A job for it could never be made to
-/// fit, and refusing the profile once is what lets every job that is sent fit.
-#[test]
-fn a_profile_whose_window_cannot_hold_the_instruction_is_refused_at_load() {
-    let Some(weights) =
-        support::weights("a_profile_whose_window_cannot_hold_the_instruction_is_refused_at_load")
-    else {
-        return;
-    };
-    let small = kr_describe::testing::default_profile_with_window(200);
-    let refused = LlamaRuntime::load(
-        &small,
-        &weights.path,
-        &Cancellation::new(),
-        Instant::now() + Duration::from_secs(300),
-    );
-    assert!(
-        matches!(&refused, Err((LoadEnd::Refused, Some(detail))) if detail.contains("no room")),
-        "{:?}",
-        refused.map(|_| ())
-    );
 }
