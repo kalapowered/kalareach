@@ -1681,6 +1681,81 @@ pub fn a_reader_reports_itself_idle_again_when_the_worker_withholds_a_fence(kind
     );
 }
 
+/// A reader that still holds input it has taken does not report itself idle again when the worker
+/// withholds a fence, because the exchange that report starts would be withheld too, and that sends
+/// the frame which asks for the report again.
+///
+/// The reader is left partway through something its acknowledgement reports as input not yet
+/// acted on: the start of an escape sequence in Zsh and Bash, and a paste in fish, where an escape
+/// is resolved on a timer. The order of the endpoint decides the absence: the reader reads the
+/// withheld frame before it reads the exchange sent after it, so a report that frame brought would
+/// arrive before that exchange's answer. Once the reader lets go of what it held, its queues are
+/// clear.
+pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_withholds_a_fence(
+    kind: ShellKind,
+) {
+    let (setup, teardown): (&[&[u8]], &[&[u8]]) = match kind {
+        ShellKind::Fish => (&[b"\x1b[200~"], &[b"\x1b[201~"]),
+        ShellKind::Zsh | ShellKind::Bash => (&[ESCAPE], &[b"b"]),
+        ShellKind::PowerShell => panic!(
+            "this editor is not left holding input a handler can see, so this case is not one of \
+             its"
+        ),
+    };
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    let enter = session.first_prompt();
+    for bytes in setup {
+        session.type_bytes(bytes);
+    }
+    // The reader is holding input once an exchange finds it so, and every report it made on the way
+    // there was sent before the answer that says so.
+    let deadline = session.deadline_for(REPLY).0;
+    let mut held = session.fence_exchange_before(&enter, fence_id(30), deadline);
+    while held.queues.partial_key_drained && Instant::now() < deadline {
+        held = session.fence_exchange_before(&enter, fence_id(30), deadline);
+    }
+    assert!(
+        !held.queues.partial_key_drained,
+        "a reader holding the start of something reported its partial-key queue clear: {:?}",
+        held.queues
+    );
+    session.forget_events();
+
+    session.withhold(WithheldReason::QueuesNotDrained);
+    let after = session.fence_exchange_before(&enter, fence_id(31), deadline);
+    assert!(
+        !after.queues.partial_key_drained,
+        "what the reader was holding ended on its own: {:?}",
+        after.queues
+    );
+    assert!(
+        !session.saw_event(Duration::ZERO, |event| matches!(
+            event,
+            BridgeEvent::ReaderIdle(idle)
+                if idle.prompt_generation == enter.prompt_generation
+                    && idle.reader_revision == enter.reader_revision
+        )),
+        "a reader that still held input reported itself idle when the worker withheld its fence"
+    );
+
+    // Once the reader has let go of what it held, the exchange the worker asks for next is
+    // acknowledged with every queue clear: nothing the withheld frame did is left in the way.
+    for bytes in teardown {
+        session.type_bytes(bytes);
+    }
+    let mut recovered = session.fence_exchange_before(&enter, fence_id(32), deadline);
+    while !recovered.queues.all_drained() && Instant::now() < deadline {
+        recovered = session.fence_exchange_before(&enter, fence_id(32), deadline);
+    }
+    assert!(
+        recovered.queues.all_drained() && recovered.snapshot.is_drained(),
+        "the reader did not clear its queues once it let go of what it held: {:?} {:?}",
+        recovered.queues,
+        recovered.snapshot
+    );
+}
+
 /// A session that loses its bridge keeps the fail-safe answer to an eligible gesture.
 pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: ShellKind) {
     let package = Package::built(kind);

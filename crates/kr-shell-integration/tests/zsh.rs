@@ -129,6 +129,13 @@ fn a_reader_that_reported_idle_reports_again_when_its_fence_is_withheld() {
 /// KR-REQ-07.34
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_reader_that_holds_input_does_not_report_idle_when_its_fence_is_withheld() {
+    shellpkg::a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_withholds_a_fence(ZSH);
+}
+
+/// KR-REQ-07.34
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_shell_whose_bridge_has_gone_still_consumes_an_eligible_gesture() {
     shellpkg::a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(ZSH);
 }
