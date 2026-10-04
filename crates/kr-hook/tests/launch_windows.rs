@@ -264,6 +264,25 @@ impl Shell {
         env: &[(&str, &str)],
         cwd: &Path,
     ) -> Child {
+        let agent = AgentJob::create().expect("a job for the launcher's own children");
+        self.launcher_in(&agent, executable, vector, answer, name, env, cwd)
+    }
+
+    /// Starts the launcher with `agent` as the innermost job it runs in, inside the shell's own.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the launcher's start and the job it is placed in are each a thing a case names"
+    )]
+    fn launcher_in(
+        &self,
+        agent: &AgentJob,
+        executable: &Path,
+        vector: &[String],
+        answer: &CommandBackend,
+        name: &str,
+        env: &[(&str, &str)],
+        cwd: &Path,
+    ) -> Child {
         let mut arguments = vec!["launch".to_owned()];
         if let Some(barrier) = self.barrier.lock().expect("the barrier").as_ref() {
             arguments.push("--hold-before-exec".to_owned());
@@ -286,14 +305,13 @@ impl Shell {
             .iter()
             .map(|(name, value)| (*name, value.as_os_str()))
             .collect();
-        let agent = AgentJob::create().expect("a job for the launcher's own children");
         kr_worker::windows::launch::start(&Spec {
             program: &self.placed.forwarder,
             arguments: &arguments,
             directory: cwd,
             environment: &variables,
             session: Some(&self.job),
-            agent: &agent,
+            agent,
             pipe_input: false,
             pipe_output: false,
         })
@@ -895,6 +913,47 @@ fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
         .expect("the reason is kept on the backend");
     assert!(why.contains("the job limits the desktop"), "{why}");
     assert!(!Shell::registration(&answer).exists());
+    shell.commits_after_a_refusal(&answer);
+}
+
+/// KR-REQ-07.64: a launcher whose own job restricts desktops, which a vendor's own sandbox cannot
+/// run under, declines before it creates the program, says so by name to the backend, which keeps
+/// the reason on the launch attempt, and runs the typed command as typed, as the shell does without
+/// the integration. The control is the same invocation launched again under a job with no
+/// restriction, which is committed.
+#[test]
+fn kr_req_07_64_a_launcher_in_a_job_that_restricts_desktops_declines_and_the_typed_command_runs() {
+    /// The restriction on a job's user interface that a vendor's own desktop cannot be made under.
+    const DESKTOP: u32 = 0x40;
+
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let restricting = AgentJob::create_restricting(DESKTOP).expect("a restricting job");
+    let mut launcher = shell.launcher_in(
+        &restricting,
+        &shell.executable.clone(),
+        &[
+            "gemini".to_owned(),
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "exit /b 7".to_owned(),
+        ],
+        &answer,
+        "restricted",
+        &[],
+        shell.placed.host.root(),
+    );
+    let status = launcher.wait().expect("the launcher ends with the program");
+    assert_eq!(status.code(), Some(7), "the typed program ran and ended");
+    let why = shell
+        .backends
+        .launch_failure_of(shell.last_generation())
+        .expect("the reason is kept on the launch attempt");
+    assert!(why.contains("desktops"), "the restriction is named: {why}");
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "and nothing was registered for it"
+    );
     shell.commits_after_a_refusal(&answer);
 }
 
