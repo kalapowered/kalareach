@@ -473,7 +473,7 @@ pub fn install(
             keyboard: wire::keyboard_within(&snapshot.keyboard, snapshot.active_buffer, scope),
             title: wire::title(&snapshot.title),
             title_stack: snapshot.title_stack.iter().map(wire::saved_title).collect(),
-            hyperlink: Nullable(snapshot.hyperlink.clone()),
+            hyperlink: Nullable(snapshot.hyperlink.as_ref().map(|link| link.uri.clone())),
             palette: wire::palette(&snapshot.palette),
             oldest_retained_row: oldest,
             evicted: snapshot.evicted,
@@ -837,9 +837,9 @@ pub fn advance(
         ),
         charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
         hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
-        hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
+        hyperlink: Nullable(delta.hyperlink.as_ref().map(|link| {
             kr_protocol::projection::HyperlinkChange {
-                uri: Nullable(uri.clone()),
+                uri: Nullable(link.as_ref().map(|link| link.uri.clone())),
             }
         })),
         title: Nullable(delta.title.as_ref().map(wire::title)),
@@ -1183,7 +1183,10 @@ mod tests {
                 row: index % 6,
                 start_col: 0,
                 end_col: 1,
-                uri: format!("https://example.invalid/{index}/{target}"),
+                link: kr_term::grid::Link::new(
+                    format!("https://example.invalid/{index}/{target}"),
+                    "",
+                ),
             })
             .collect();
         let window = Viewport {

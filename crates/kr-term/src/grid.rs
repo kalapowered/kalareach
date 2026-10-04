@@ -522,6 +522,15 @@ pub struct Link {
 }
 
 impl Link {
+    /// A link to `uri` with the parameters `params`, which are spelled as the field documents.
+    #[must_use]
+    pub fn new(uri: impl Into<String>, params: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            params: params.into(),
+        }
+    }
+
     /// The link a grid object stands for.
     #[must_use]
     pub fn of(link: &Hyperlink) -> Self {
@@ -593,8 +602,8 @@ pub struct Run {
     pub cells: u32,
     /// The rendition.
     pub rendition: Rendition,
-    /// The hyperlink target, when the run is inside one.
-    pub hyperlink: Option<String>,
+    /// The hyperlink, when the run is inside one.
+    pub hyperlink: Option<Link>,
 }
 
 /// One canonical row.
@@ -1182,11 +1191,8 @@ impl CanonicalGrid {
 
     /// The hyperlink the next character printed would belong to.
     #[must_use]
-    pub fn pen_hyperlink(&self) -> Option<String> {
-        self.terminal
-            .pen()
-            .hyperlink()
-            .map(|link| link.uri().to_owned())
+    pub fn pen_hyperlink(&self) -> Option<Link> {
+        self.terminal.pen().hyperlink().map(|link| Link::of(link))
     }
 
     /// Evicts the oldest retained rows until the rest fit the byte bound.
@@ -1199,9 +1205,10 @@ impl CanonicalGrid {
     /// count kept is read off what the rows cost: the oldest are given up one at a time until what
     /// is left costs no more than the bound, and the library drops every row past that count. The
     /// configured scrollback size is put back afterwards, so the history can grow again when the
-    /// rows that arrive next cost less. Working it out from the average cost of a row would leave the answer wrong whenever the
-    /// rows are not all the same size, which is the usual case. Nothing is walked and no cell is
-    /// read: every one of those figures was taken where its row left the screen.
+    /// rows that arrive next cost less. Working it out from the average cost of a row would leave
+    /// the answer wrong whenever the rows are not all the same size, which is the usual case.
+    /// Nothing is walked and no cell is read: every one of those figures was taken where its row
+    /// left the screen.
     pub fn enforce_row_cache(&mut self, limit: u64) -> bool {
         if self.history.total <= limit {
             return false;
@@ -1454,7 +1461,7 @@ impl CanonicalGrid {
             },
             origin_mode: saved.dec_origin_mode,
             style: style_of(saved.position.shape),
-            hyperlink: saved.pen.hyperlink().map(|link| link.uri().to_owned()),
+            hyperlink: saved.pen.hyperlink().map(|link| Link::of(link)),
         })
     }
 
@@ -2334,43 +2341,46 @@ fn runs_of(line: &wezterm_term::Line, budget: usize) -> (Vec<Run>, bool) {
     let mut runs: Vec<Run> = Vec::new();
     let mut bytes = 0usize;
     let mut truncated = false;
+    // The link object the last cell was inside. A run goes on while the object does, or while the
+    // link it is stands for the same one: two objects with the same target and the same parameters
+    // are one link, and two with the same target and different identifiers are two.
+    let mut last_link: Option<Arc<Hyperlink>> = None;
     // A wide cell covers the column after it. Depending on how the library is storing the row at
     // the moment, that covered column may or may not come back as a cell of its own, so it is
     // skipped by position instead. Without this the same screen reads differently.
     let mut next_column = 0u32;
     for cell in line.visible_cells() {
         let rendition = rendition_of(cell.attrs());
-        let hyperlink = cell.attrs().hyperlink().map(|link| link.uri().to_owned());
+        let link = cell.attrs().hyperlink().cloned();
         let column = u32::try_from(cell.cell_index()).unwrap_or(0);
         let width = u32::try_from(cell.width()).unwrap_or(1);
         if column < next_column {
             continue;
         }
         next_column = column + width.max(1);
+        let same_link = match (&last_link, &link) {
+            (None, None) => true,
+            (Some(last), Some(this)) => Arc::ptr_eq(last, this) || **last == **this,
+            _ => false,
+        };
         // A row is bounded while it is built, not after. What a row costs is what its runs cost, so
         // a cell that joins the run before it costs its own text and nothing more: charging the
         // target and the run overhead for every cell would cut a row that fits comfortably.
         let joins_previous = runs.last().is_some_and(|last: &Run| {
-            last.rendition == rendition
-                && last.hyperlink == hyperlink
-                && last.column + last.cells == column
+            last.rendition == rendition && same_link && last.column + last.cells == column
         });
         bytes += cell.str().len()
             + if joins_previous {
                 0
             } else {
-                hyperlink.as_ref().map_or(0, String::len) + RUN_OVERHEAD_BYTES
+                link.as_ref().map_or(0, |link| link_text_bytes(link)) + RUN_OVERHEAD_BYTES
             };
         if bytes > budget {
             truncated = true;
             break;
         }
         match runs.last_mut() {
-            Some(last)
-                if last.rendition == rendition
-                    && last.hyperlink == hyperlink
-                    && last.column + last.cells == column =>
-            {
+            Some(last) if joins_previous => {
                 last.text.push_str(cell.str());
                 last.cells += width;
             }
@@ -2379,14 +2389,28 @@ fn runs_of(line: &wezterm_term::Line, budget: usize) -> (Vec<Run>, bool) {
                 column,
                 cells: width,
                 rendition,
-                hyperlink,
+                hyperlink: link.as_deref().map(Link::of),
             }),
         }
+        last_link = link;
     }
     (runs, truncated)
 }
 
-/// What one run costs beyond its text and its hyperlink target.
+/// What a run's copy of a link holds: the target and the parameters, as `Link::of` spells them.
+///
+/// Every run inside a link copies both, so a row of runs inside one long link is bounded by what
+/// all those copies hold and not by one target's length.
+fn link_text_bytes(link: &Hyperlink) -> usize {
+    let params = link.params();
+    link.uri().len()
+        + params
+            .iter()
+            .map(|(key, value)| key.len() + value.len() + 2)
+            .sum::<usize>()
+}
+
+/// What one run costs beyond its text and its hyperlink.
 pub(crate) const RUN_OVERHEAD_BYTES: usize = 24;
 
 /// Renders a cell rendition as SGR parameters, without the introducer or the final byte.

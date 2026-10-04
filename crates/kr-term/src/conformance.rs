@@ -920,7 +920,7 @@ fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
             "g0": saved.charsets.g0,
             "g1": saved.charsets.g1,
         },
-        "hyperlink": saved.hyperlink,
+        "hyperlink": saved.hyperlink.as_ref().map(|link| &link.uri),
         "rendition": {
             "foreground": format!("{:?}", saved.rendition.foreground),
             "background": format!("{:?}", saved.rendition.background),
@@ -1066,7 +1066,8 @@ pub fn summarise_grid(case: &GridCase) -> Value {
             "row": link.row,
             "start_col": link.start_col,
             "end_col": link.end_col,
-            "uri": link.uri,
+            "uri": link.link.uri,
+            "params": link.link.params,
         })).collect::<Vec<_>>(),
         "grid_writes": engine.grid().writer_log().bytes,
         "grid_unrecognised": engine.grid().unrecognised(),
