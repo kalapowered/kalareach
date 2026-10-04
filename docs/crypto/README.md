@@ -355,10 +355,11 @@ A paired device is authenticated, not trusted. Section 19 makes content data rat
 and section 20 says what follows: an authorisation-bearing payload is signed by its issuer **before**
 encryption, so pairwise message authentication never substitutes for an issuer's grant signature.
 
-`open_envelope` will not return an authority-bearing payload without a verification result. The
-check is a required argument rather than a later step a caller can forget, and
-`verify_authority_payload` is what a host passes. It resolves the issuer through
-`AuthorityDirectory`, which is the reader's own authority and answers two questions:
+`open_envelope` will not return an authority-bearing payload unless the verification callback it is
+given returns `Ok`. The callback is a required argument rather than a later step a caller can
+forget, and a caller calls `verify_authority_payload` inside it. That function resolves the issuer
+through `AuthorityDirectory`, which the caller implements, and which answers two questions from the
+reader's own authority:
 
 | Question | What it establishes |
 | --- | --- |
@@ -367,9 +368,9 @@ check is a required argument rather than a later step a caller can forget, and
 
 The identifier the object carries must be that resolved key's own identifier, so an object signed by
 one recorded key cannot name another device or another role and be accepted. The signature is then
-verified over the object's own domain-separated transcript. A host answers those two questions from
-its paired-device directory and its grant directory together; a test answers them from a map;
-nothing answers them from an envelope.
+verified over the object's own domain-separated transcript. The caller answers those two questions
+from its own records, a paired-device directory for the first and a grant directory for the second;
+the crate's tests answer them from a map; nothing answers them from an envelope.
 
 `ForwardedAuthority` is the closed set of objects this path carries: a signed revocation request and
 a host's ordered authority revision record. Those are the two objects the protocol gives a signature
