@@ -166,7 +166,7 @@ export function Sessions(): ReactNode {
           <input
             type="search"
             value={query}
-            placeholder="Search by number or directory"
+            placeholder="Search by number, name or directory"
             onChange={(event) => {
               setQuery(event.target.value)
             }}
@@ -207,9 +207,12 @@ export function Sessions(): ReactNode {
                   <h3>
                     {shownTitle(sessionDescription(session), described)}
                     {label ? (
-                      <Badge tone="neutral" data-testid="description-source">
-                        {label}
-                      </Badge>
+                      <>
+                        {' '}
+                        <Badge tone="neutral" data-testid="description-source">
+                          {label}
+                        </Badge>
+                      </>
                     ) : null}
                   </h3>
                   {activity ? (
