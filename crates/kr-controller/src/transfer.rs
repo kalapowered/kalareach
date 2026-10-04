@@ -79,6 +79,17 @@ pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
     }
 }
 
+/// What an exact repeat that arrived with no usable window is owed ([`TransferModule::settles`]).
+#[derive(Debug)]
+pub enum Settling {
+    /// Its action claimed an effect that is not finished: the service finishes it.
+    Open,
+    /// Its action's claim was settled, and this is the answer it was settled with.
+    Answered(ControlFrame),
+    /// Its action claimed nothing here, so the repeat is a first admission and has no window.
+    No,
+}
+
 /// The transfer service, as the daemon holds it.
 ///
 /// The module owns the expiry sweep and ends it when it is dropped. It does not own the
@@ -403,30 +414,38 @@ impl TransferModule {
         }
     }
 
-    /// Returns true when the action is an exact repeat of one that has claimed an effect this
-    /// daemon has not finished.
+    /// Says what an exact repeat of a transfer action that arrived with no usable window is owed.
     ///
     /// A publication and a cancellation are two commits with a claim recorded by the first. A
     /// repeat of such an action finishes what the claim began, which is no first admission and
-    /// needs no deadline of its own: a repeat is the original request, window and all, and on a
+    /// needs no deadline of its own: a repeat is the original request, window included, and on a
     /// replacement connection that window is one this connection never issued. What the caller is
     /// owed is the effect, not a refusal about a window the action was admitted under.
+    ///
+    /// A claim moves from open to settled and never back, so a claim that is no longer open is read
+    /// once more for the answer it was settled with.
     pub async fn settles(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> bool {
+    ) -> Settling {
         let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, actor_id) else {
-            return false;
+            return Settling::No;
         };
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
-        blocking(move || Ok(service.claim_is_open(&actor, action_id, name, digest)?))
-            .await
-            .unwrap_or(false)
+        let open =
+            blocking(move || Ok(service.claim_is_open(&actor, action_id, name, digest)?)).await;
+        if open == Ok(true) {
+            return Settling::Open;
+        }
+        match self.retained(actor_id, mutation, method).await {
+            Some(answer) => Settling::Answered(answer),
+            None => Settling::No,
+        }
     }
 
     /// Records that a prompt carrying a draft was submitted to a session, which moves the draft's
@@ -617,18 +636,7 @@ impl TransferModule {
                 // admission: another attempt may have recorded it since. It goes back under the
                 // same check, asked once the answer is in hand.
                 admission.check_retained()?;
-                return match retained {
-                    RetainedOutcome::Ok(result) => {
-                        kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                            .map(ParamsValue::new)
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                            })
-                    }
-                    RetainedOutcome::Error { code, detail } => {
-                        Err(ProtocolError::new(code, detail))
-                    }
-                };
+                return answer_of(retained);
             }
             // Nothing retained, so this is a first admission and it is about to act. The admission
             // is asked here rather than before the blocking task started: the task had to be
@@ -643,6 +651,13 @@ impl TransferModule {
             // its action already claimed, which is the one thing a lapsed window does not take
             // from it. Anything else it asks for is a first admission, and has none.
             if admission.settling && !service.claim_is_open(&actor, action_id, name, digest)? {
+                // A claim moves from open to settled and never back, so one that is not open
+                // now and was when the lookup above found it open has been settled since, and
+                // what it was settled with is the answer.
+                if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+                    admission.check_retained()?;
+                    return answer_of(retained);
+                }
                 return Err(admission.refused(&TransferAdmission::without_freshness()));
             }
             admission.check()?;
@@ -930,6 +945,16 @@ async fn answer<T>(queued: tokio::task::JoinHandle<Answer<T>>) -> Answer<T> {
             "the transfer service could not report what happened to this action",
         ))
     })
+}
+
+/// What a retained outcome answers with.
+fn answer_of(retained: RetainedOutcome) -> Answer<ParamsValue> {
+    match retained {
+        RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map(ParamsValue::new)
+            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
+        RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
+    }
 }
 
 fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
