@@ -46,8 +46,8 @@ pub struct CursorState {
 
 /// The character sets a saved cursor carries.
 ///
-/// DECSC saves the designations and not the locking shift, so a restore leaves whichever set was
-/// selected selected. A saved cursor therefore has no shift of its own to restore.
+/// These are the designations. The locking shift that selects one of them is a field of the saved
+/// cursor itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Designations {
     /// The set designated as G0.
@@ -75,6 +75,9 @@ pub struct SavedCursor {
     pub rendition: Rendition,
     /// The character sets that were designated when it was saved.
     pub charsets: Designations,
+    /// Whether the locking shift selected the shift-out set when it was saved. A restore puts the
+    /// shift back as it was then.
+    pub shift_out: bool,
     /// Whether origin mode was set when it was saved.
     pub origin_mode: bool,
     /// The DECSCUSR style that was saved with it.

@@ -227,6 +227,11 @@ pub struct Engine {
     dimensions_revision: u64,
     presentation_revision: u64,
     saved_revision: u64,
+    /// The locking shift each buffer's saved cursor was saved with, primary first.
+    ///
+    /// DECSC saves the shift beside the position, the rendition and the designations, and DECRC puts
+    /// it back. The pinned revision keeps no such record, so the session does.
+    saved_shift: [bool; 2],
     measure_now: bool,
     /// How many times what the hyperlink objects cost has been read.
     ///
@@ -279,6 +284,7 @@ impl Engine {
             dimensions_revision: 0,
             presentation_revision: 0,
             saved_revision: 0,
+            saved_shift: [false; 2],
             measure_now: false,
             link_readings: 0,
             link_read_at: None,
@@ -485,13 +491,23 @@ impl Engine {
             }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
-            // A cursor restore clears state in the reducer that a terminal would have kept, so what
-            // it clears is noted before the restore and put back after it.
-            let restore_state = (decision.apply_to_grid && restores_cursor(&event.kind))
-                .then(|| (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out()));
-            if decision.apply_to_grid && saves_cursor(&event.kind) {
+            // A cursor restore clears state in the reducer that a terminal would have kept, and the
+            // shift a cursor was saved with is one the reducer does not keep at all. So what was in
+            // force before is noted here, and put right once the sequence has been applied.
+            let cursor_moves = if decision.apply_to_grid && saves_cursor(&event.kind) {
                 self.saved_revision = self.next_revision();
-            }
+                cursor_moves(
+                    &event.kind,
+                    self.grid.alternate_active(),
+                    self.grid.margin_mode(),
+                )
+            } else {
+                Vec::new()
+            };
+            let before_the_cursor_moves =
+                (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out());
+            // Whether the grid performed the save or restore: a sequence it refused moved nothing.
+            let mut cursor_performed = false;
             // A measurement asked for part way through a read is taken there, not at the end of
             // it: one read can carry a session's worth of links, and the bound is only a bound if
             // something looks before the rest of them arrive.
@@ -539,6 +555,7 @@ impl Engine {
                         self.presentation_revision = self.next_revision();
                     }
                     self.report_truncation(event, &mut outcome, now_ms);
+                    cursor_performed = !adapted.unrecognised;
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
                         // Consuming it keeps the two screens in step.
@@ -557,8 +574,8 @@ impl Engine {
                 self.track(event, &mut outcome);
             }
             if decision.apply_to_grid {
-                if let Some(before) = restore_state {
-                    self.restore_after_cursor(before);
+                if cursor_performed && !cursor_moves.is_empty() {
+                    self.after_cursor_moves(&cursor_moves, before_the_cursor_moves);
                 }
                 self.sync_grid_modes();
             }
@@ -711,22 +728,40 @@ impl Engine {
         }
     }
 
-    /// Puts back the state the reducer clears when it restores a cursor.
+    /// Puts right the state a cursor save or restore leaves differently from a terminal.
     ///
     /// The pinned revision clears newline mode and the shift-out selection when it restores a
-    /// cursor. A terminal does not: DECRC restores the cursor, the rendition and the character-set
-    /// designations, and leaves the rest of the terminal's modes where they were. So whatever was
-    /// in force before the restore is put back afterwards, through the same sequences an
-    /// application would have used, and nothing else is disturbed. That is a qualified difference
-    /// in how the library is driven rather than a gap in what it exposes, so it is a note in
+    /// cursor. A terminal keeps newline mode, and restores the shift the cursor was saved with
+    /// along with the position, the rendition and the character-set designations. So the shift is
+    /// recorded for the buffer whose cursor is saved, and a restore applies the one recorded, while
+    /// newline mode is put back as it was. Both go through the same sequences an application would
+    /// have used, and nothing else is disturbed. That is a qualified difference in how the library
+    /// is driven rather than a gap in what it exposes, so it is a note in
     /// `crate::unicode::LIBRARY` and not an accessor the revision has to add.
-    fn restore_after_cursor(&mut self, before: (bool, bool)) {
-        let (newline, shift_out) = before;
+    fn after_cursor_moves(&mut self, moves: &[CursorMove], before: (bool, bool)) {
+        let (newline, mut shift_out) = before;
+        let mut restored = false;
+        for step in moves {
+            match *step {
+                CursorMove::Save(buffer) => self.saved_shift[buffer] = shift_out,
+                CursorMove::Restore(buffer) => {
+                    shift_out = self.saved_shift[buffer];
+                    restored = true;
+                }
+            }
+        }
+        if !restored {
+            return;
+        }
         if newline {
             self.grid.set_newline_mode();
         }
-        if shift_out && !self.grid.shift_out() {
-            self.grid.set_shift_out();
+        if shift_out != self.grid.shift_out() {
+            if shift_out {
+                self.grid.set_shift_out();
+            } else {
+                self.grid.set_shift_in();
+            }
         }
     }
 
@@ -1208,6 +1243,12 @@ impl Engine {
                 // DECSTR returns the primary screen, which resets the projection with it.
                 self.modes.soft_reset();
                 self.cursor_style = 1;
+                // The reset selects the first character set again, and the cursors it clears are
+                // the ones that held a shift.
+                self.saved_shift = [false; 2];
+                if self.grid.shift_out() {
+                    self.grid.set_shift_in();
+                }
                 self.advance_projection();
             }
             (None, [b' '], b'q') => {
@@ -1516,7 +1557,15 @@ impl Engine {
 
     /// The cursor each buffer has saved, primary first.
     fn saved_cursors(&self) -> [Option<crate::snapshot::SavedCursor>; 2] {
-        [self.grid.saved_cursor(false), self.grid.saved_cursor(true)]
+        let with_shift = |buffer: usize| {
+            self.grid
+                .saved_cursor(buffer == 1)
+                .map(|cursor| crate::snapshot::SavedCursor {
+                    shift_out: self.saved_shift[buffer],
+                    ..cursor
+                })
+        };
+        [with_shift(0), with_shift(1)]
     }
 
     fn active_buffer(&self) -> ActiveBuffer {
@@ -1776,6 +1825,71 @@ impl Engine {
     #[must_use]
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
+    }
+}
+
+/// One save or restore of a cursor, naming the buffer whose saved cursor it touches (0 for the
+/// primary buffer, 1 for the alternate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorMove {
+    Save(usize),
+    Restore(usize),
+}
+
+/// The saves and restores a sequence makes, in order, as the pinned revision performs them.
+///
+/// A save or a restore touches the buffer that is showing. Entering the alternate buffer with mode
+/// 1049 saves the primary buffer's cursor before it switches, and leaving it restores that one
+/// after, so those two name the primary buffer whichever is showing when they are met. `alternate`
+/// is the buffer showing before the sequence; one that switches buffers changes it as it goes.
+fn cursor_moves(kind: &EventKind, mut alternate: bool, margin_mode: bool) -> Vec<CursorMove> {
+    let showing = |alternate: bool| usize::from(alternate);
+    match kind {
+        EventKind::Esc {
+            intermediate: None,
+            final_byte: b'7',
+            ..
+        } => vec![CursorMove::Save(showing(alternate))],
+        EventKind::Esc {
+            intermediate: None,
+            final_byte: b'8',
+            ..
+        } => vec![CursorMove::Restore(showing(alternate))],
+        EventKind::Csi {
+            params, final_byte, ..
+        } => {
+            let csi = crate::classify::CsiView::new(params, *final_byte);
+            match (csi.private, csi.final_byte) {
+                // With left and right margins on, `CSI s` sets them instead.
+                (None, b's') if !margin_mode && csi.numbers.iter().all(Option::is_none) => {
+                    vec![CursorMove::Save(showing(alternate))]
+                }
+                (None, b'u') => vec![CursorMove::Restore(showing(alternate))],
+                (Some(b'?'), b'h' | b'l') => {
+                    let set = csi.final_byte == b'h';
+                    let mut moves = Vec::new();
+                    for mode in csi.numbers.iter().flatten() {
+                        match (*mode, set) {
+                            (1048, true) => moves.push(CursorMove::Save(showing(alternate))),
+                            (1048, false) => moves.push(CursorMove::Restore(showing(alternate))),
+                            (1049, true) if !alternate => {
+                                moves.push(CursorMove::Save(0));
+                                alternate = true;
+                            }
+                            (1049, false) if alternate => {
+                                alternate = false;
+                                moves.push(CursorMove::Restore(0));
+                            }
+                            (47 | 1047, _) => alternate = set,
+                            _ => {}
+                        }
+                    }
+                    moves
+                }
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
     }
 }
 

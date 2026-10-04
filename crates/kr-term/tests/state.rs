@@ -1846,6 +1846,57 @@ fn a_history_page_does_not_repeat_rows() {
     );
 }
 
+/// KR-REQ-08.78: the saved cursor of a buffer holds the character-set shift it was saved with, and
+/// restoring it puts that shift back, as a terminal does. A locking shift that changed after the
+/// save does not outlive the restore.
+#[test]
+fn a_cursor_restore_puts_back_the_character_set_shift_it_saved() {
+    let line_drawing = "\u{2500}";
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(10, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // G1 is line drawing; shift-out selects it. The cursor is saved while shifted out, the shift
+    // goes back in, and the restore has to shift out again.
+    engine.feed(b"\x1b)0\x0e\x1b7\x0f\x1b8q", 0);
+    engine.quiesce(0);
+    assert!(
+        engine.grid().shift_out(),
+        "the shift the cursor was saved with"
+    );
+    assert_eq!(
+        text_of(&engine.grid().visible_rows())[0].trim_end(),
+        line_drawing
+    );
+
+    // A cursor saved while shifted in restores to shifted in, whatever happened to the shift.
+    engine.feed(b"\x1b[2J\x1b[H\x0f\x1b7\x0e\x1b8q", 0);
+    engine.quiesce(0);
+    assert!(!engine.grid().shift_out());
+    assert_eq!(text_of(&engine.grid().visible_rows())[0].trim_end(), "q");
+
+    // The alternate buffer's own cursor save is the primary buffer's, and leaving the buffer is
+    // what restores it.
+    engine.feed(b"\x1b[2J\x1b[H\x0e\x1b[?1049h\x0f\x1b[?1049lq", 0);
+    engine.quiesce(0);
+    assert!(
+        engine.grid().shift_out(),
+        "the shift the primary buffer's cursor was saved with"
+    );
+    assert_eq!(
+        text_of(&engine.grid().visible_rows())[0].trim_end(),
+        line_drawing
+    );
+
+    // A restore the grid library refuses restores nothing, the shift included. `CSI 1 u` is one:
+    // the library takes the restore with no parameter and no other.
+    engine.feed(b"\x1b[2J\x1b[H\x0e\x1b7\x0f\x1b[1uq", 0);
+    engine.quiesce(0);
+    assert!(!engine.grid().shift_out());
+    assert_eq!(text_of(&engine.grid().visible_rows())[0].trim_end(), "q");
+}
+
 /// A cursor restore leaves the modes a terminal would have kept.
 #[test]
 fn a_cursor_restore_keeps_the_modes_around_it() {
