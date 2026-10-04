@@ -347,6 +347,75 @@ fn a_publication_past_the_ceiling_stands_and_the_pause_follows() {
     ));
 }
 
+/// KR-REQ-22.01: turning descriptions off puts inference in the disabled pause at the turn that
+/// stops the work in flight, and not at the turn after its answer: whatever a job or a load is
+/// being stopped for, and whether or not it is being stopped already, the state read after the
+/// change shows the pause the change causes. The control is the state before the change, which is
+/// not paused.
+#[test]
+fn turning_descriptions_off_shows_the_pause_while_the_work_it_stops_is_still_in_flight() {
+    let paused_for_the_owner = |service: &DescriptionService| {
+        matches!(
+            service.resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::Disabled,
+                ..
+            }
+        )
+    };
+    for case in [
+        "a job",
+        "a job that is already being stopped",
+        "a load",
+        "a load that is already being stopped",
+    ] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let load = case.starts_with("a load");
+        let stopped_already = case.ends_with("already being stopped");
+        let id = if load {
+            let Instruction::Load { id, .. } = service.next(&roomy(), at(3_000)).expect("a load")
+            else {
+                panic!("a load comes first");
+            };
+            id
+        } else {
+            let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+                panic!("the job is sent");
+            };
+            id
+        };
+        assert!(!paused_for_the_owner(&service), "{case}: before the change");
+        if stopped_already {
+            // Something else is stopping the work: a load whose session has gone, a job whose
+            // session moved on.
+            if load {
+                service.session_closed(&session(1), at(3_050));
+            } else {
+                change(&mut service, &session(1), "crates", at(3_050));
+                service.settle(&session(1), Priority::Ordinary, at(5_100));
+            }
+            let stop = service.next(&roomy(), at(5_100)).expect("an instruction");
+            assert!(
+                matches!(stop, Instruction::Cancel { .. }),
+                "{case}: {stop:?}"
+            );
+            assert!(
+                !paused_for_the_owner(&service),
+                "{case}: stopped for another reason"
+            );
+        }
+        service.set_enabled(false);
+        let _ = service.next(&roomy(), at(5_200)).expect("an instruction");
+        assert!(
+            paused_for_the_owner(&service),
+            "{case}: {:?}",
+            service.resource_state()
+        );
+        let _ = id;
+    }
+}
+
 /// A load is cancelled when the reason for it goes: inference turned off, paused, another profile
 /// selected, or no work left; each is sent once. The control is a load with its reason intact.
 #[test]

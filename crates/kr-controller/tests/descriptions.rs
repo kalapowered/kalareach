@@ -1707,6 +1707,53 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
     environment.stop().await;
 }
 
+/// KR-REQ-22.01: turning descriptions off while the model is loading, or while a job runs in the
+/// process, answers with the pause the change causes, though the work it stops has not ended: the
+/// answer is the host's state after the turn that took the change, and not the state from before
+/// it. The control is the answer before the change, which shows no pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_descriptions_off_with_work_in_the_process_answers_with_the_pause() {
+    for work in ["load", "job"] {
+        let environment = Environment::start(Setup {
+            script: Script {
+                load_until_cancelled: work == "load",
+                generate_until_cancelled: work == "job",
+                ..Script::default()
+            },
+            ..Setup::new()
+        })
+        .await;
+        let before = environment.setup().await;
+        assert_eq!(
+            before.paused.0, None,
+            "{work}: before the change: {before:?}"
+        );
+        environment.workers[0].report("make", "/home/a/kalareach", None);
+        until("the work in the process", || {
+            environment.began(work)
+                && if work == "load" {
+                    environment.figures().loading
+                } else {
+                    environment.figures().in_flight == 1
+                }
+        })
+        .await;
+
+        let off = environment.configure(Some(false), None).await;
+        assert_eq!(
+            off.paused.0,
+            Some(DescriptionPause::Disabled),
+            "{work}: {off:?}"
+        );
+        assert_eq!(
+            off.state,
+            DescriptionState::ResourcePaused,
+            "{work}: {off:?}"
+        );
+        environment.stop().await;
+    }
+}
+
 /// KR-REQ-22.01, KR-REQ-22.03: a host whose processor lacks an instruction set the description
 /// process's build uses offers no model and starts no process. Setup, the refusal of a fetch,
 /// `kr doctor` and the session's description each say so and name the sets, and the session keeps

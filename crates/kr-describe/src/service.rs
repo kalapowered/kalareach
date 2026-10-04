@@ -1576,9 +1576,15 @@ impl DescriptionService {
     }
 
     /// Decides whether the work in flight stops, and says to cancel it once when it does.
+    ///
+    /// While work is in flight the policy is asked at every turn, whether or not the work is being
+    /// stopped already, so that what the host publishes after the owner changes a setting shows the
+    /// pause the setting causes, and not the state from before it until the work's answer comes.
     fn stop_in_flight(&mut self, conditions: &HostConditions) -> Option<Instruction> {
         let enabled = self.settings.enabled;
-        if let Some(dispatched) = &self.job {
+        if self.job.is_some() {
+            let paused = self.paused_now(conditions, true) || !enabled;
+            let dispatched = self.job.as_ref()?;
             if dispatched.stopping.is_some() {
                 return None;
             }
@@ -1596,7 +1602,7 @@ impl DescriptionService {
                 Stop::Closed
             } else if self.revision(&session_id) != Some(ran_at) {
                 Stop::Superseded
-            } else if !enabled || self.paused_now(conditions, true) {
+            } else if paused {
                 Stop::Paused
             } else {
                 return None;
@@ -1609,19 +1615,14 @@ impl DescriptionService {
                 work: Work::Job,
             });
         }
-        if !matches!(
-            self.model,
-            Model::Loading {
-                cancel_sent: false,
-                ..
-            }
-        ) {
+        let Model::Loading { cancel_sent, .. } = self.model else {
+            return None;
+        };
+        let paused = self.paused_now(conditions, false);
+        if cancel_sent {
             return None;
         }
-        let stop = !enabled
-            || !self.assets_held
-            || self.paused_now(conditions, false)
-            || self.scheduler.queued() == 0;
+        let stop = !enabled || !self.assets_held || paused || self.scheduler.queued() == 0;
         if !stop {
             return None;
         }
