@@ -226,6 +226,9 @@ struct Shell {
     view: Option<View>,
     /// The admitted connector's package hash.
     package_digest: kr_protocol::scalars::Digest256,
+    /// The forwarder the installation registers, which a package that installs no bridge of its
+    /// own has its hooks run.
+    registered: PathBuf,
 }
 
 /// The process group every program a [`Shell`] launches runs in, led by a process of the test's
@@ -337,6 +340,37 @@ impl Shell {
         package: impl FnOnce(&Path, &Path) -> kr_worker::broker::connectors::ConnectorSource,
         viewed: bool,
     ) -> Self {
+        Self::registering(command, package, viewed, false)
+    }
+
+    /// A shell whose connector installs no bridge of its own and whose installation registers a
+    /// forwarder that is another copy of the launcher's file, as an update's `current` link names
+    /// one release's while a launch runs another's: a hook has to run the registered one.
+    fn registering_another_forwarder() -> Self {
+        Self::registering(
+            fixture::COMMAND,
+            |store, forwarder| {
+                fixture::package(
+                    store,
+                    forwarder,
+                    &fixture::Shape {
+                        native_bridge: false,
+                        ..fixture::Shape::claude_code()
+                    },
+                )
+                .expect("the package is written")
+            },
+            false,
+            true,
+        )
+    }
+
+    fn registering(
+        command: &str,
+        package: impl FnOnce(&Path, &Path) -> kr_worker::broker::connectors::ConnectorSource,
+        viewed: bool,
+        another_forwarder: bool,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -353,6 +387,22 @@ impl Shell {
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
         let source = package(&store, &placed.forwarder);
+        // The forwarder the installation registers: the launcher's own file, or a copy of it that
+        // is another file.
+        let registered = if another_forwarder {
+            let elsewhere = placed.host.root().join("registered").join(
+                placed
+                    .forwarder
+                    .file_name()
+                    .expect("the forwarder has a name"),
+            );
+            std::fs::create_dir_all(elsewhere.parent().expect("a directory"))
+                .expect("a directory for the registered forwarder");
+            kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-hook")), &elsewhere);
+            elsewhere
+        } else {
+            placed.forwarder.clone()
+        };
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
@@ -377,7 +427,7 @@ impl Shell {
                 runtime_dir,
                 sources: Arc::clone(&sources),
                 launcher: Some(placed.forwarder.clone()),
-                registered_forwarder: Some(placed.forwarder.clone()),
+                registered_forwarder: Some(registered.clone()),
             },
             runtime.handle().clone(),
         );
@@ -411,6 +461,7 @@ impl Shell {
             generation: std::sync::atomic::AtomicU64::new(1),
             view,
             package_digest,
+            registered,
         }
     }
 
@@ -1500,6 +1551,58 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
         "the hook of a program that is not the one hashed moves nothing"
     );
     let _ = finish(held);
+}
+
+/// KR-REQ-11.34: a package that installs no bridge of its own has the hook its program runs
+/// admitted when it runs the forwarder the installation registers, which an update keeps current,
+/// and not when it runs the launcher's own copy, which is another file: the bridge a launch admits
+/// is the registered forwarder's, not the launcher's. Control: the registered forwarder's hook moves
+/// the binding, which the launcher's copy, run the same way, does not.
+#[test]
+fn kr_req_11_34_a_hook_is_admitted_through_the_registered_forwarder_and_not_through_another_copy() {
+    let shell = Shell::registering_another_forwarder();
+    let registered = shell.registered.display().to_string();
+    let launcher = shell.placed.forwarder.display().to_string();
+    assert_ne!(
+        registered, launcher,
+        "the two forwarders are different files"
+    );
+
+    let answer = shell.establish();
+    let through_registered = shell.launch(
+        &answer,
+        "registered",
+        &[
+            ("HOOK", registered.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("LINGER", "3"),
+        ],
+    );
+    let instance = instance_of(&shell.report("registered"));
+    hooked(&shell, "registered");
+    eventually("the registered forwarder's hook selects the thread", || {
+        selected(&shell, instance).as_deref() == Some(THREAD)
+    });
+    let _ = finish(through_registered);
+
+    let answer = shell.establish();
+    let through_launcher = shell.launch(
+        &answer,
+        "launcher",
+        &[
+            ("HOOK", launcher.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("LINGER", "2"),
+        ],
+    );
+    let instance = instance_of(&shell.report("launcher"));
+    hooked(&shell, "launcher");
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "the hook of another copy of the forwarder moves nothing"
+    );
+    let _ = finish(through_launcher);
 }
 
 /// KR-REQ-05.09: a connection that says nothing holds only its own admission: the program's hook
