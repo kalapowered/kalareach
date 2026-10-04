@@ -458,12 +458,24 @@ impl Engine {
     /// reallocation each way and the pages behind it, and a stream that keeps printing needs the
     /// same room every time. Such a stream keeps its buffer, and what the buffer holds after a read
     /// is never more than [`SCRATCH_SLACK`] times what that read needed, or [`SCRATCH_EVENTS`].
+    ///
+    /// Only a read says how much room the next one needs. Settling and closing collect a held
+    /// scalar at most, and a session that settles after every batch of output, as one with a
+    /// projected attachment does, would give the room back after every batch and grow it again for
+    /// the next. They leave the buffer as it is, in [`Self::rest_scratch`].
     fn keep_scratch(&mut self, mut events: Vec<Event>) {
         let needed = events.len();
         events.clear();
         if events.capacity() > SCRATCH_EVENTS && events.capacity() / SCRATCH_SLACK >= needed {
             events.shrink_to(needed.max(SCRATCH_EVENTS));
         }
+        self.scratch = events;
+    }
+
+    /// Keeps the buffer a call that was not a read collected its events in, emptied and no
+    /// smaller.
+    fn rest_scratch(&mut self, mut events: Vec<Event>) {
+        events.clear();
         self.scratch = events;
     }
 
@@ -481,7 +493,7 @@ impl Engine {
         events.clear();
         self.lexer.flush_tail(&mut events);
         let mut outcome = self.consume(&events, now_ms);
-        self.keep_scratch(events);
+        self.rest_scratch(events);
         self.measure_now_unconditionally(now_ms);
         outcome.resident_pressure = self.resident_pressure();
         outcome
@@ -493,7 +505,7 @@ impl Engine {
         events.clear();
         self.lexer.close(&mut events);
         let outcome = self.consume(&events, now_ms);
-        self.keep_scratch(events);
+        self.rest_scratch(events);
         outcome
     }
 
