@@ -422,6 +422,16 @@ impl ModeState {
         }
     }
 
+    /// Whether a client is told about this mode, in a snapshot or in a change since one.
+    ///
+    /// Every mode except the backend's own input mode. Section 8 terminates mode 9001 at the
+    /// boundary that owns it and never broadcasts it to a remote client, so it is in neither
+    /// [`Self::tracked`] nor a delta.
+    #[must_use]
+    pub const fn is_told_to_clients(kind: ModeKind, mode: u16) -> bool {
+        !matches!(kind, ModeKind::Dec) || mode != MODE_WIN32_INPUT
+    }
+
     /// Every tracked mode and its value, for a snapshot.
     ///
     /// The backend's own input mode is **not** here. A snapshot is what a client is served and what

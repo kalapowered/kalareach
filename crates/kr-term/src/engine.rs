@@ -1643,7 +1643,9 @@ impl Engine {
     fn changed_modes(&self, since: u64) -> Vec<ModeEntry> {
         self.mode_revisions
             .iter()
-            .filter(|(_, revision)| **revision > since)
+            .filter(|((kind, mode), revision)| {
+                **revision > since && crate::modes::ModeState::is_told_to_clients(*kind, *mode)
+            })
             .map(|((kind, mode), _)| ModeEntry {
                 kind: *kind,
                 mode: *mode,
