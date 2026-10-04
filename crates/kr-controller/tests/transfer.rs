@@ -469,7 +469,7 @@ fn leave_a_publication_unrecorded(
     bytes: &[u8],
     name: &str,
     finish: &MutationRequest,
-) {
+) -> kr_protocol::ids::ActorId {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut store = kr_transfer::Store::open(
@@ -507,6 +507,7 @@ fn leave_a_publication_unrecorded(
         result: None,
         recorded_at_ms,
     };
+    let owner = claim.actor_id.clone();
     store
         .begin_publish(
             transfer_id,
@@ -523,6 +524,7 @@ fn leave_a_publication_unrecorded(
             Some(&claim),
         )
         .expect("records the publication and its claim");
+    owner
 }
 
 /// KR-REQ-14.12, KR-REQ-24.09: an exact repeat of a finish whose publication was begun and never
@@ -584,6 +586,67 @@ async fn an_exact_repeat_of_an_unfinished_finish_is_settled_on_a_new_connection(
             .expect("the call reaches the daemon"),
     );
     assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-14.12, KR-REQ-24.09: an exact repeat that found its action's claim open and had it settled
+/// by another copy before it began is answered with what that copy recorded, not refused for its
+/// window.
+///
+/// A claim moves from open to settled and never back. The repeat on a new connection looks for a
+/// retained answer, finds the claim open, and stops there; another copy then settles it; the repeat
+/// goes on and is refused for a window it never had to have.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_claim_was_settled_while_it_waited_is_answered_with_the_record() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let bytes = pattern(4096);
+    let (transfer_id, finish) =
+        upload_ready_to_finish(&host, &mut control, &mut chunks, &bytes, "settled.bin").await;
+    let owner = leave_a_publication_unrecorded(&host, transfer_id, &bytes, "settled.bin", &finish);
+
+    drop(control);
+    let mut resumed = client(&host).await;
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let repeated = finish.clone();
+    let repeating = tokio::spawn(async move { resumed.repeat(&repeated).await });
+    arrived.await.expect("the repeat has looked for an answer");
+
+    // Another copy of the action settles the claim before the repeat goes on.
+    let service = Arc::clone(host.controller.transfer().service());
+    let digest = kr_protocol::digest::mutation_digest(&finish, &owner).expect("digests it");
+    let action_id = finish.action_id.get();
+    let settled = tokio::task::spawn_blocking(move || {
+        service.upload_finish(
+            &owner,
+            &UploadFinishParams {
+                transfer_id,
+                declared_byte_len: U64::new(4096),
+                declared_digest: Digest256::from_bytes(kr_cbor::sha256(&pattern(4096))),
+            },
+            Some(&kr_transfer::service::Action {
+                actor_id: owner.clone(),
+                action_id,
+                method: Method::UploadFinish.as_str().to_owned(),
+                payload_digest: digest,
+                admission: kr_transfer::service::Admission::none(),
+            }),
+        )
+    })
+    .await
+    .expect("the task ran")
+    .expect("the other copy settles the claim");
+    let _ = go.send(());
+
+    let answered: UploadFinishResult = typed(
+        &repeating
+            .await
+            .expect("the repeat ran")
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered with what was recorded"),
+    );
+    assert_eq!(answered, settled);
 }
 
 /// KR-REQ-14.07: one action identifier used for two different payloads is a reused identifier,

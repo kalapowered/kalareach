@@ -671,12 +671,31 @@ impl Controller {
             // was interrupted before it settled. The repeat is the original request, window
             // included, and on a replacement connection that window is not one this connection
             // issued. The service finishes what the claim began and begins nothing.
-            Err(error)
-                if matches!(error, ControllerError::WindowExpired { .. })
-                    && crate::transfer::TransferModule::serves(method)
-                    && self.transfer.settles(actor_id, &mutation, method).await =>
+            Err(error @ ControllerError::WindowExpired { .. })
+                if crate::transfer::TransferModule::serves(method) =>
             {
-                None
+                match self.transfer.settles(actor_id, &mutation, method).await {
+                    crate::transfer::Settling::Open => None,
+                    // The claim was settled between the lookup above and this one, by another copy
+                    // of the action or by the sweep: what it recorded is the answer, under the
+                    // check any retained answer is owed.
+                    crate::transfer::Settling::Answered(answer) => {
+                        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+                            return error_reply(
+                                mutation.request_id,
+                                error.code(),
+                                error.to_string(),
+                            );
+                        }
+                        return answer;
+                    }
+                    crate::transfer::Settling::No => {
+                        return ControlFrame::Response(Response {
+                            request_id: mutation.request_id,
+                            outcome: Outcome::Error(error.to_protocol_error()),
+                        });
+                    }
+                }
             }
             Err(error) => {
                 return ControlFrame::Response(Response {
