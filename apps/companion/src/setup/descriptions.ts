@@ -113,9 +113,9 @@ export interface DescriptionSetupState {
  *
  * Every write is followed by a read, because what a person is told is the host's answer and not the
  * request that was made. A read that answers after a newer one began, or after the screen has gone,
- * changes nothing. A write that is made while another is waiting for the host is ignored: it would
- * be a second press of the same control. No control is disabled while the host answers, so a person
- * on the keyboard or with a screen reader is not made to leave the control they pressed.
+ * changes nothing. A press on any control is ignored while a write is waiting for the host, because
+ * the card does not yet show what that write did. No control is disabled while the host answers, so
+ * a person on the keyboard or with a screen reader is not made to leave the control they pressed.
  */
 export function useDescriptionSetup(port: HostPort): DescriptionSetupState {
   const [setup, setSetup] = useState<DescriptionSetup | null>(null)
