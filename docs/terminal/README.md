@@ -1429,7 +1429,7 @@ direct attachment depends on.
 | `byte-policy.json` | Raw C1, malformed UTF-8, nested passthrough, oversized strings and preludes, escape doubling | KR-ACC-024, KR-REQ-08.45 to 08.47 |
 | `broker.json` | Every query and the exact reply bytes | KR-ACC-001, KR-REQ-08.05 |
 | `width.json` | CJK, combining marks, emoji at both margins, emoji modifiers, regional indicators, keycap sequences, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
-| `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.40 |
+| `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.78, KR-REQ-08.81, KR-REQ-08.83 |
 | `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves, the same on every supported host | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
