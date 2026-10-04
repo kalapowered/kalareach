@@ -702,6 +702,16 @@ fn a_soft_reset_returns_the_primary_screen() {
         "and the tracked mode agrees with it"
     );
     assert!(outcome.projection_reset, "a client is told to start again");
+    assert!(
+        outcome.projection_required_at.is_some() && outcome.forward.is_empty(),
+        "a terminal reading it would stay on the alternate screen, so a direct attachment projects"
+    );
+
+    // From the primary screen the reset is the same in the library and in a terminal.
+    let mut shell = Engine::new(EngineConfig::default()).expect("engine");
+    let outcome = shell.feed(b"\x1b[!p", 0);
+    assert!(outcome.projection_required_at.is_none());
+    assert_eq!(outcome.forward.len(), 1, "and it is forwarded as it came");
 }
 
 /// A combined mode request keeps the modes that are not the backend's business.

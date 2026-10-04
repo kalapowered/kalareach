@@ -354,10 +354,10 @@ empty: the pinned revision exposes everything section 8 asks a snapshot to carry
 
 #### What constrains the direct compatibility profile
 
-There are three differences from xterm. The first two are not bugs in the canonical state, but mean
+There are four differences from xterm. The first two are not bugs in the canonical state, but mean
 that a physical terminal needs to be qualified against them in order for direct mode to be offered.
 The third is a difference in where the pinned library leaves the cursor; both terminals tested
-report a different column from the library's:
+report a different column from the library's. The fourth is where a soft reset leaves the buffer:
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -375,6 +375,9 @@ report a different column from the library's:
   reports the column the library leaves the cursor at). The differences with each terminal are
   described under `wide.wide-character-two-cells-from-the-edge` in the section on physical
   terminals.
+- **A soft reset keeps a terminal on its current buffer.** The library returns to the primary
+  buffer, so a direct attachment moves to projection when a soft reset arrives while the alternate
+  buffer is showing.
 
 ## The query broker
 

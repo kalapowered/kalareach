@@ -100,6 +100,9 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          character's first cell, one column short of the last, where xterm and the terminals \
          measured against the grid report the last column. The grid reports the library's \
          column, so the difference is recorded and not corrected.",
+        "A soft reset leaves a terminal on the buffer that is showing, where the library returns to \
+         the primary buffer. A direct attachment reading a soft reset while the alternate buffer is \
+         showing is moved to projection at that point, and the canonical grid is what it is shown.",
     ],
     qualified_additions: &[
         QualifiedAddition {
