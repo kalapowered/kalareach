@@ -551,21 +551,21 @@ pub const WIDTH_CASES: &[GridCase] = &[
 pub const SNAPSHOT_CASES: &[GridCase] = &[
     GridCase {
         id: "mid_output",
-        covers: "KR-REQ-08.40 snapshot mid-output",
+        covers: "KR-REQ-08.83 snapshot mid-output",
         cols: 12,
         rows: 4,
         input: b"line one\r\nline two\r\npart",
     },
     GridCase {
         id: "alternate_entry",
-        covers: "KR-REQ-08.40 alternate-screen transition",
+        covers: "KR-REQ-08.83 alternate-screen transition",
         cols: 12,
         rows: 4,
         input: b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halternate",
     },
     GridCase {
         id: "alternate_exit",
-        covers: "KR-REQ-08.40 alternate-screen transition",
+        covers: "KR-REQ-08.83 alternate-screen transition",
         cols: 12,
         rows: 4,
         input: b"primary\r\n\x1b[?1049halt\x1b[?1049l",
@@ -579,7 +579,7 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
     },
     GridCase {
         id: "mid_escape_sequence",
-        covers: "KR-REQ-08.40 parser-ground boundary",
+        covers: "KR-REQ-08.81 parser-ground boundary",
         cols: 12,
         rows: 4,
         input: b"text\x1b[1;3",
@@ -593,7 +593,7 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
     },
     GridCase {
         id: "alternate_holds_primary_content",
-        covers: "KR-REQ-08.40 both buffers are restored",
+        covers: "KR-REQ-08.83 both buffers are restored",
         cols: 12,
         rows: 3,
         // A shell leaves three rows behind, a full-screen application takes the alternate buffer
@@ -603,7 +603,7 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
     },
     GridCase {
         id: "saved_cursors_both_buffers",
-        covers: "KR-REQ-08.40 saved cursors of both buffers",
+        covers: "KR-REQ-08.78 saved cursors of both buffers",
         cols: 12,
         rows: 3,
         // A save in each buffer, with a different rendition and a different G1 designation, so a
@@ -612,7 +612,7 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
     },
     GridCase {
         id: "pending_wrap_at_margin",
-        covers: "KR-REQ-08.40 pending wrap",
+        covers: "KR-REQ-08.78 pending wrap",
         cols: 4,
         rows: 3,
         // The cursor sits in the final column with the wrap deferred: the same coordinates as a

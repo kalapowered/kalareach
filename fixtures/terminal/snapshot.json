@@ -4,7 +4,7 @@
       "active_buffer": "Primary",
       "at_ground": true,
       "cols": 12,
-      "covers": "KR-REQ-08.40 snapshot mid-output",
+      "covers": "KR-REQ-08.83 snapshot mid-output",
       "cursor": {
         "col": 4,
         "pending_wrap": false,
@@ -81,7 +81,7 @@
       "active_buffer": "Alternate",
       "at_ground": true,
       "cols": 12,
-      "covers": "KR-REQ-08.40 alternate-screen transition",
+      "covers": "KR-REQ-08.83 alternate-screen transition",
       "cursor": {
         "col": 9,
         "pending_wrap": false,
@@ -186,7 +186,7 @@
       "active_buffer": "Primary",
       "at_ground": true,
       "cols": 12,
-      "covers": "KR-REQ-08.40 alternate-screen transition",
+      "covers": "KR-REQ-08.83 alternate-screen transition",
       "cursor": {
         "col": 0,
         "pending_wrap": false,
@@ -364,7 +364,7 @@
       "active_buffer": "Primary",
       "at_ground": false,
       "cols": 12,
-      "covers": "KR-REQ-08.40 parser-ground boundary",
+      "covers": "KR-REQ-08.81 parser-ground boundary",
       "cursor": {
         "col": 4,
         "pending_wrap": false,
@@ -518,7 +518,7 @@
       "active_buffer": "Alternate",
       "at_ground": true,
       "cols": 12,
-      "covers": "KR-REQ-08.40 both buffers are restored",
+      "covers": "KR-REQ-08.83 both buffers are restored",
       "cursor": {
         "col": 7,
         "pending_wrap": false,
@@ -611,7 +611,7 @@
       "active_buffer": "Alternate",
       "at_ground": true,
       "cols": 12,
-      "covers": "KR-REQ-08.40 saved cursors of both buffers",
+      "covers": "KR-REQ-08.78 saved cursors of both buffers",
       "cursor": {
         "col": 1,
         "pending_wrap": false,
@@ -732,7 +732,7 @@
       "active_buffer": "Primary",
       "at_ground": true,
       "cols": 4,
-      "covers": "KR-REQ-08.40 pending wrap",
+      "covers": "KR-REQ-08.78 pending wrap",
       "cursor": {
         "col": 3,
         "pending_wrap": true,
