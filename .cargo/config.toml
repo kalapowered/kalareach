@@ -4,13 +4,15 @@
 
 # Windows, x86-64 and ARM64. Both linker arguments are about one dependency.
 #
-# libsodium reaches this workspace as the library's own prebuilt MSVC binaries. Those are built
-# against the *static* C runtime, and Rust's MSVC targets link the dynamic one, so an image that
-# links both ends up with two C runtimes in it: two heaps, two copies of the runtime's own state,
-# and a free in one of them for an allocation from the other. That is what `LNK4098` reports, and
-# leaving the static runtime out of the link is the remedy - the whole image, libsodium included,
-# then uses the dynamic runtime Rust brought. `LIBCMT` is its release name and `LIBCMTD` its debug
-# one, and neither is ever the right answer here.
+# libsodium reaches this workspace as the library's own prebuilt MSVC binaries. Their objects ask
+# for the *static* C runtime, and Rust's MSVC targets link the dynamic one. The linker reports the
+# disagreement as `LNK4098`. The warning says that two runtimes were asked for, not that both were
+# linked: an image that took code from both would have two heaps, two copies of the runtime's own
+# state, and a free in one of them for an allocation from the other. Leaving the static runtime out
+# of the link rules that out. The whole image, libsodium included, then uses the dynamic runtime
+# Rust brought, and the warning does not appear. `LIBCMT` is the static runtime's release name and
+# `LIBCMTD` its debug one, and neither is ever the right answer here. A link that still reports
+# `LNK4098` has something else asking for another runtime, and the release workflow refuses it.
 #
 # The same prebuilt binaries ship no debug database, so the linker says so once per object file:
 # several thousand `LNK4099` lines on every link that produces a binary, which is most of a build's
