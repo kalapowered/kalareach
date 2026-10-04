@@ -431,9 +431,10 @@ impl ModelProfile {
         {
             return refuse("an execution bound of nought");
         }
-        // A prompt is never more tokens than it is bytes, whatever the vocabulary, so a window that
-        // holds the instruction byte for byte, a token each for the start and the end of a sequence
-        // and the output bound has room for a prompt of any tokenizer. A profile with less would
+        // In a byte-level vocabulary, which both shipped profiles use, every token covers at least
+        // one byte, so a prompt is never more tokens than it is bytes. A window that holds the
+        // instruction byte for byte, a token each for the start and the end of a sequence and the
+        // output bound has room for the instruction in such a vocabulary. A profile with less would
         // have jobs that could not exist.
         let instruction = crate::prompt::Prompt::bare().text().len() as u64;
         if u64::from(fields.execution.context_tokens)

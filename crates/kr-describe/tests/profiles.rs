@@ -672,11 +672,12 @@ fn a_candidate_cannot_be_mapped_without_the_gates_it_declares() {
 }
 
 /// KR-REQ-22.10: the instruction fits every shipped profile's prompt bound byte for byte, which is
-/// the most tokens it can be in any tokenizer, so a job exists for every context whatever the
-/// vocabulary. A profile verification refuses a window with less room than that for the instruction
-/// and the output bound, and the smallest window that has it is accepted.
+/// the most tokens it can be in a vocabulary whose every token covers a byte, as both shipped
+/// profiles' are, so a job exists for every context. A profile verification refuses a window with
+/// less room than that for the instruction and the output bound, and the smallest window that has
+/// it is accepted.
 #[test]
-fn the_instruction_fits_every_prompt_bound_in_any_tokenizer() {
+fn the_instruction_fits_every_prompt_bound_byte_for_byte() {
     let instruction = kr_describe::prompt::Prompt::bare().text().len();
     for profile in built_in().profiles() {
         let bounds = Budgets::DEFAULTS.bounds(profile.execution());
