@@ -292,6 +292,37 @@ impl Resolver {
         )
     }
 
+    /// Returns how completely the session's closure accounts for the agent of one package: the
+    /// document's explicit choice for it, and full ownership where there is none or where this
+    /// host cannot use the document.
+    #[must_use]
+    pub fn agent_ownership(&self, package: &str) -> kr_protocol::broker::AgentOwnership {
+        self.loaded
+            .document
+            .as_ref()
+            .map_or(kr_protocol::broker::AgentOwnership::Full, |document| {
+                document.agent_ownership(package)
+            })
+    }
+
+    /// Returns the packages the document explicitly chooses reduced ownership for, in order.
+    #[must_use]
+    pub fn reduced_agents(&self) -> Vec<String> {
+        self.loaded
+            .document
+            .as_ref()
+            .map_or_else(Vec::new, |document| {
+                document
+                    .agents
+                    .iter()
+                    .filter(|(_, choice)| {
+                        choice.ownership == kr_protocol::broker::AgentOwnership::Reduced
+                    })
+                    .map(|(package, _)| package.clone())
+                    .collect()
+            })
+    }
+
     /// Resolves the runtime tree this installation uses.
     ///
     /// The allowlisted variable acts at the request rung, which is where
