@@ -20,6 +20,8 @@
         'Invoke-KalaReachPending'
         'Invoke-KalaReachGesture'
         'Test-KalaReachBridge'
+        'Test-KalaReachCommand'
+        'Resolve-KalaReachCommand'
         'Write-KalaReachLoss'
         'Publish-KalaReachQualification'
         'Remove-KalaReachHooks'
