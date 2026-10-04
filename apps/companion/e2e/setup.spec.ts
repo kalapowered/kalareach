@@ -276,6 +276,49 @@ test.describe('the first-start assistant', () => {
     await expect(card.getByRole('button', { name: 'Download it' })).toBeFocused()
   })
 
+  // KR-REQ-13.19: where an answer removes the control a person is on, focus goes to a control the
+  // card still has, and not to the page: a fetch that ends, a read that fails, and a retry that
+  // succeeds.
+  test('moves focus to a control the descriptions card still has when an answer removes the one the person is on', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'host')
+    const card = page.getByTestId('setup-model')
+    const enable = card.getByRole('switch', { name: 'Describe my sessions' })
+
+    // A fetch that ends while the person is on the button that stops it.
+    await card.getByTestId('setup-model-download').focus()
+    await page.keyboard.press('Enter')
+    const cancel = card.getByRole('button', { name: 'Cancel the download' })
+    await expect(cancel).toBeFocused()
+    await page.evaluate(() => {
+      window.krTestHost?.changeDescriptionSetup({
+        download: 'verified',
+        can_cancel: false,
+        fetched_bytes: '1561318368'
+      })
+    })
+    await expect(cancel).toHaveCount(0)
+    await expect(enable).toBeFocused()
+
+    // A read that fails while the person is on a switch they pressed.
+    await page.evaluate(() => {
+      window.krTestHost?.setConnected(false)
+    })
+    await page.keyboard.press('Space')
+    const again = card.getByRole('button', { name: 'Ask again' })
+    await expect(again).toBeFocused()
+
+    // A retry that succeeds, from the keyboard.
+    await page.evaluate(() => {
+      window.krTestHost?.setConnected(true)
+    })
+    await page.keyboard.press('Enter')
+    await expect(again).toHaveCount(0)
+    await expect(enable).toBeFocused()
+  })
+
   // KR-REQ-13.19: a switch is drawn smaller than a finger, and a press anywhere across a target of
   // the platform's size around it still lands on it, at the desktop's token and at 44 and 48 px.
   test('takes a press across the full target around each switch', async ({ page }) => {
