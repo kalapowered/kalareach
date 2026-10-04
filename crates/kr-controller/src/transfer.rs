@@ -104,7 +104,7 @@ pub struct TransferModule {
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Where this host's own tests stop a mutation that has passed the daemon's own check and not
     /// yet entered the service, so that its admission can lapse there and the service's own question
-    /// is what refuses it. Compiled away in every shipped build.
+    /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
 }
@@ -188,7 +188,7 @@ impl kr_transfer::service::AdmissionHook for TransferAdmission {
 /// Where a test stops one sweep: where its store work begins, once the daemon has answered it.
 ///
 /// A sweep carries one only when a test asked for that sweep ([`TransferModule::sweep_paused`]),
-/// so the daemon's own sweeps never stop. It exists only in test builds.
+/// so the daemon's own sweeps never stop. It exists only for this crate's unit tests.
 #[cfg(test)]
 #[derive(Debug)]
 struct StorePause {
@@ -696,8 +696,8 @@ impl TransferModule {
         (arrival, go, self.queue_sweep(daemon, Some(pause)))
     }
 
-    /// Queues the sweep [`TransferModule::sweep`] describes. In a test build it carries the
-    /// pause a test asked for, if any, and stops there.
+    /// Queues the sweep [`TransferModule::sweep`] describes. In this crate's unit tests it carries
+    /// the pause a test asked for, if any, and stops there.
     fn queue_sweep(
         &self,
         daemon: &Weak<Controller>,
