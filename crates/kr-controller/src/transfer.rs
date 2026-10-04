@@ -121,6 +121,9 @@ pub struct TransferModule {
 pub struct TransferAdmission {
     controller: Arc<Controller>,
     carried: crate::authority::AdmittedMutation,
+    /// True for an exact repeat that carries no freshness: it may finish what its action already
+    /// claimed and may begin nothing.
+    settling: bool,
     refusal: std::sync::Mutex<Option<ProtocolError>>,
 }
 
@@ -132,8 +135,40 @@ impl TransferAdmission {
         Arc::new(Self {
             controller,
             carried,
+            settling: false,
             refusal: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The admission of an exact repeat that carries no freshness.
+    ///
+    /// The connection's registration and the fence this host owes are asked as for any mutation. A
+    /// deadline is not, because the repeat began nothing: its action claimed its effect under an
+    /// admission that stood then, and what is left is to finish it. Every question the service asks
+    /// where an effect begins is refused, so a repeat that turned out to need a new effect writes
+    /// nothing.
+    pub(crate) fn settling(
+        controller: Arc<Controller>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            controller,
+            carried: crate::authority::AdmittedMutation {
+                deadline: None,
+                ..carried
+            },
+            settling: true,
+            refusal: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The refusal of a first admission that carries no freshness.
+    fn without_freshness() -> ControllerError {
+        ControllerError::WindowExpired {
+            detail: "this action carries no freshness, so it may finish what it has already begun \
+                     and may not begin anything"
+                .to_owned(),
+        }
     }
 
     /// Asks the check, and keeps its refusal.
@@ -175,10 +210,16 @@ impl TransferAdmission {
 
 impl kr_transfer::service::AdmissionHook for TransferAdmission {
     fn ask(&self) -> std::result::Result<(), ProtocolError> {
+        if self.settling {
+            return Err(self.refused(&Self::without_freshness()));
+        }
         self.check()
     }
 
     fn run(&self, commit: &mut dyn FnMut()) -> std::result::Result<(), ProtocolError> {
+        if self.settling {
+            return Err(self.refused(&Self::without_freshness()));
+        }
         self.controller
             .under_registration(&self.carried, commit)
             .map_err(|error| self.refused(&error))
@@ -376,6 +417,32 @@ impl TransferModule {
         }
     }
 
+    /// Returns true when the action is an exact repeat of one that has claimed an effect this
+    /// daemon has not finished.
+    ///
+    /// A publication and a cancellation are two commits with a claim recorded by the first. A
+    /// repeat of such an action finishes what the claim began, which is no first admission and
+    /// needs no deadline of its own: a repeat is the original request, window and all, and on a
+    /// replacement connection that window is one this connection never issued. What the caller is
+    /// owed is the effect, not a refusal about a window the action was admitted under.
+    pub async fn settles(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> bool {
+        let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, actor_id) else {
+            return false;
+        };
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        let action_id = mutation.action_id.get();
+        let name = method.as_str();
+        blocking(move || Ok(service.claim_is_open(&actor, action_id, name, digest)?))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Serves one transfer read and returns the frame it answers with.
     #[must_use]
     pub async fn read_frame(&self, actor_id: &ActorId, request: &Request) -> ControlFrame {
@@ -557,6 +624,12 @@ impl TransferModule {
             // retry of a completed action never reaches this, because the record above answered
             // it. The service asks again inside its own lock and around each commit, because
             // taking the lock and opening the transaction wait as well.
+            // An exact repeat that carries no freshness is only ever allowed to finish an effect
+            // its action already claimed, which is the one thing a lapsed window does not take
+            // from it. Anything else it asks for is a first admission, and has none.
+            if admission.settling && !service.claim_is_open(&actor, action_id, name, digest)? {
+                return Err(admission.refused(&TransferAdmission::without_freshness()));
+            }
             admission.check()?;
             #[cfg(feature = "testing")]
             after_the_outer_check.wait();

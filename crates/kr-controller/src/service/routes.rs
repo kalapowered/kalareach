@@ -301,19 +301,6 @@ impl Controller {
                     outcome: Outcome::Error(error),
                 });
             }
-            // A mutation carrying no freshness at all is refused here. This service answers its
-            // own retained actions before this point, so anything still travelling is a first
-            // admission, and a first admission needs a deadline it was admitted under.
-            let Some(accepted) = accepted else {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "this action carries no freshness, so it may be answered from \
-                                 what this host holds and may not write"
-                            .to_owned(),
-                    }),
-                );
-            };
             let Some(admitted_revision) = admitted else {
                 return error_reply(
                     mutation.request_id,
@@ -330,16 +317,20 @@ impl Controller {
             let carried = crate::authority::AdmittedMutation {
                 connection_id,
                 admitted_revision,
-                deadline: Some(accepted.deadline),
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            // This service answers its own retained actions before this point, so anything still
+            // travelling is a first admission, which needs the deadline it was admitted under, or
+            // an exact repeat of an action that claimed an effect and was interrupted. A mutation
+            // carrying no freshness is only ever the second: the service refuses it unless its
+            // action has such a claim, and lets it finish that and begin nothing.
+            let admission = match accepted {
+                Some(_) => crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
+                None => crate::transfer::TransferAdmission::settling(Arc::clone(self), carried),
             };
             return self
                 .transfer
-                .write_frame(
-                    actor_id,
-                    mutation,
-                    method,
-                    crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
-                )
+                .write_frame(actor_id, mutation, method, admission)
                 .await;
         }
         if crate::voice::VoiceModule::serves(method) {

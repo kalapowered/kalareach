@@ -17,7 +17,7 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
-use kr_protocol::envelope::{ActionTarget, ParamsValue};
+use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionEpoch, SessionId, TransferId};
@@ -412,6 +412,178 @@ async fn a_lost_reply_to_finish_is_answered_from_the_retained_record() {
             .transfer_id,
         first.handle.transfer_id
     );
+}
+
+/// Begins an upload of `bytes`, sends its one chunk and composes the finish that would publish it.
+async fn upload_ready_to_finish(
+    host: &Host,
+    control: &mut LocalClient,
+    chunks: &mut ChunkChannel,
+    bytes: &[u8],
+    name: &str,
+) -> (TransferId, MutationRequest) {
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &begin_params(host, bytes, name),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.begin succeeds"),
+    );
+    let (chunk, payload) = chunk_of(bytes, 0);
+    chunks
+        .send_chunk(
+            &ActionTarget::environment(host.environment_id),
+            begun.transfer_id,
+            chunk,
+            payload,
+        )
+        .await
+        .expect("upload.chunk succeeds");
+    let finish = control
+        .compose(
+            Method::UploadFinish,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &UploadFinishParams {
+                transfer_id: begun.transfer_id,
+                declared_byte_len: U64::new(bytes.len() as u64),
+                declared_digest: digest(bytes),
+            },
+        )
+        .await
+        .expect("composes the mutation");
+    (begun.transfer_id, finish)
+}
+
+/// Commits the claim a finish makes with its publication intent and nothing after it, as an
+/// interrupted finish leaves it: the journal says the publication began, and no handle is recorded.
+#[cfg(unix)]
+fn leave_a_publication_unrecorded(
+    host: &Host,
+    transfer_id: TransferId,
+    bytes: &[u8],
+    name: &str,
+    finish: &MutationRequest,
+) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut store = kr_transfer::Store::open(
+        kr_transfer::StagingArea::store_path(&host.temp.environment()),
+        host.environment_id,
+    )
+    .expect("opens the transfer journal");
+    let actor_id = store
+        .upload(transfer_id)
+        .expect("reads the upload")
+        .expect("the upload is there")
+        .actor_id;
+    let staged = host
+        .controller
+        .transfer()
+        .service()
+        .staging()
+        .incomplete()
+        .display_path()
+        .join(
+            kr_transfer::StorageName::derive(transfer_id, name)
+                .incomplete()
+                .expect("the payload's staged name")
+                .as_str(),
+        );
+    let metadata = std::fs::metadata(&staged).expect("the staged payload is there");
+    let recorded_at_ms = kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get());
+    let claim = kr_transfer::store::RetainedAction {
+        payload_digest: kr_protocol::digest::mutation_digest(finish, &actor_id)
+            .expect("digests the mutation"),
+        actor_id,
+        action_id: finish.action_id.get(),
+        method: Method::UploadFinish.as_str().to_owned(),
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms,
+    };
+    store
+        .begin_publish(
+            transfer_id,
+            &kr_transfer::store::Publication {
+                content_digest: digest(bytes),
+                payload_identity: kr_transfer::ObjectIdentity {
+                    device: metadata.dev(),
+                    file_id: metadata.ino(),
+                },
+                preview: None,
+                preview_unavailable: None,
+            },
+            recorded_at_ms,
+            Some(&claim),
+        )
+        .expect("records the publication and its claim");
+}
+
+/// KR-REQ-14.12, KR-REQ-24.09: an exact repeat of a finish whose publication was begun and never
+/// recorded is settled, on whichever connection carries it.
+///
+/// The first finish committed its claim and no handle was recorded for it. The repeat is the
+/// original request, window included, so on a new connection its window is one that connection
+/// never issued; the effect it asks for is already claimed, and the caller is owed the handle and
+/// not a refusal about a window. An action that claimed nothing gets no such allowance: the same
+/// repeat of a finish this daemon never admitted is refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_repeat_of_an_unfinished_finish_is_settled_on_a_new_connection() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let bytes = pattern(4096);
+    let (transfer_id, finish) =
+        upload_ready_to_finish(&host, &mut control, &mut chunks, &bytes, "claimed.bin").await;
+    leave_a_publication_unrecorded(&host, transfer_id, &bytes, "claimed.bin", &finish);
+    // A finish this daemon never admitted, composed on the same connection, for a second upload.
+    let other = pattern(2048);
+    let (_, never_admitted) =
+        upload_ready_to_finish(&host, &mut control, &mut chunks, &other, "other.bin").await;
+
+    drop(control);
+    let mut resumed = client(&host).await;
+    let again: UploadFinishResult = typed(
+        &resumed
+            .repeat(&finish)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat settles the publication"),
+    );
+    assert_eq!(again.handle.transfer_id, transfer_id);
+    assert_eq!(again.handle.content_digest, digest(&bytes));
+    let status: UploadStatusResult = typed(
+        &resumed
+            .request(Method::UploadStatus, &UploadStatusParams { transfer_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.status succeeds"),
+    );
+    assert_eq!(status.state, UploadState::Published);
+    // Settled once: a further repeat is answered from the record, with the same handle.
+    let settled: UploadFinishResult = typed(
+        &resumed
+            .repeat(&finish)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("a further repeat is answered"),
+    );
+    assert_eq!(settled, again);
+
+    let refusal = failure(
+        resumed
+            .repeat(&never_admitted)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
 }
 
 /// KR-REQ-14.07: one action identifier used for two different payloads is a reused identifier,

@@ -2642,6 +2642,36 @@ impl TransferService {
         })
     }
 
+    /// Returns whether this exact action has claimed an effect that has no recorded answer yet.
+    ///
+    /// A publication and a cancellation are each two commits, and the claim is recorded with the
+    /// first. An exact repeat of an action in that state is not a first admission: it carries out
+    /// what the claim began, which needs no new deadline, and the service finishes it from the
+    /// transfer's own state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::IdConflict`] when the same identifier carried a different payload,
+    /// or [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn claim_is_open(
+        &self,
+        actor: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+    ) -> Result<bool> {
+        let Some(record) = self.locked()?.retained_action(actor, action_id)? else {
+            return Ok(false);
+        };
+        if record.method != method || record.payload_digest != payload_digest {
+            return Err(TransferError::IdConflict {
+                action: action_id.to_string(),
+                method: record.method,
+            });
+        }
+        Ok(record.result.is_none() && record.error_code.is_none())
+    }
+
     /// Retains one mutation outcome so an exact repeat is answered rather than performed again.
     ///
     /// # Errors
