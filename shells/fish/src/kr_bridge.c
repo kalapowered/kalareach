@@ -1224,10 +1224,23 @@ kr_bridge_launch_pending(void)
 int
 kr_bridge_take_fence_retry(void)
 {
+    kr_reader_state state;
     int retry = kr.fence_retry;
 
     kr.fence_retry = 0;
-    return retry;
+    if (!retry) {
+        return 0;
+    }
+    /*
+     * Another report asks the worker for another exchange, and one that ends withheld sends
+     * another frame like this. That is a retry worth making only for a reader whose own
+     * acknowledgement would now be clear, the test the worker applies before it publishes a fence;
+     * a reader that still holds input has nothing new to report until it moves, and says so at its
+     * next boundary.
+     */
+    kr_shell_reader_state(&state);
+    return state.tty_typeahead_drained && state.macro_input_drained &&
+           state.partial_key_drained && state.pending_bytes == 0 && state.queued_keys == 0;
 }
 
 /* ---- events ---------------------------------------------------------------------------------- */
@@ -2057,6 +2070,7 @@ kr_take_publication(const kr_cbor_doc *doc, int publication)
             (unsigned long)kr_cbor_uint_or(doc, kr_cbor_get(doc, payload, "reader_revision"), 0);
         kr.fence_epoch = kr_cbor_uint_or(doc, kr_cbor_get(doc, payload, "input_epoch"), 0);
         kr.fence_live = 1;
+        kr.fence_retry = 0;
         return;
     }
     /* Withheld and invalidated both mean the bridge holds no fence, and that the worker is

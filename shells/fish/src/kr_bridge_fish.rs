@@ -920,15 +920,19 @@ pub fn service(reader: &mut Reader<'_>) -> bool {
     if !registered() {
         return false;
     }
-    with_reader(reader, || {
-        // Safety: the reader is parked for the whole of the call.
-        unsafe { kr_bridge_service() };
+    let retry = with_reader(reader, || {
+        // Safety: the reader is parked for the whole of the call, and the core reads its state
+        // while it answers the retry question.
+        unsafe {
+            kr_bridge_service();
+            kr_bridge_take_fence_retry() != 0
+        }
     });
-    // Safety: the core keeps this flag and asks nothing of ours to report it.
-    if unsafe { kr_bridge_take_fence_retry() } != 0 {
+    if retry {
         // The worker holds no fence for this reader and retries at its next idle report. An
         // exchange that was still open when the reader first reported idle ends withheld, and
-        // that report was dropped with it, so the wait the reader is in has to report again.
+        // that report was dropped with it, so the wait the reader is in has to report again,
+        // now that its queues are clear.
         state().idle_reported = false;
     }
     settle(reader)
