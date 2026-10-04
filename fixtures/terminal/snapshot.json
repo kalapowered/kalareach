@@ -150,6 +150,7 @@
             "vertical_align": "Baseline"
           },
           "row": 1,
+          "shift_out": false,
           "style": 0
         },
         null
@@ -254,6 +255,7 @@
             "vertical_align": "Baseline"
           },
           "row": 1,
+          "shift_out": false,
           "style": 0
         },
         null
@@ -579,6 +581,7 @@
             "vertical_align": "Baseline"
           },
           "row": 2,
+          "shift_out": false,
           "style": 0
         },
         null
@@ -671,6 +674,7 @@
             "vertical_align": "Baseline"
           },
           "row": 1,
+          "shift_out": false,
           "style": 0
         },
         {
@@ -699,6 +703,7 @@
             "vertical_align": "Baseline"
           },
           "row": 2,
+          "shift_out": false,
           "style": 0
         }
       ],

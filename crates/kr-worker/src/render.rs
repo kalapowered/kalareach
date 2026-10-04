@@ -700,9 +700,10 @@ impl Writer {
         let restore_pen = self.pen.unwrap_or_default();
         let restore_link = self.link.clone();
         self.csi(if cursor.origin_mode { b"?6h" } else { b"?6l" });
-        // A saved cursor carries the designations and not the locking shift, because `DECSC` saves
-        // the designations and a restore leaves whichever set was selected selected.
+        // `DECSC` saves the designations and the locking shift together, so both are put in force
+        // for the save. The shift the screen is drawn with is written last, by the cursor.
         self.designations(&cursor.charsets);
+        self.out.push(if cursor.shift_out { 0x0E } else { 0x0F });
         self.rendition(cursor.rendition);
         match cursor.hyperlink.as_ref() {
             Some(link) => self.open_link(link),
@@ -1857,6 +1858,7 @@ mod tests {
                         g0: "Ascii".to_owned(),
                         g1: "Ascii".to_owned(),
                     },
+                    shift_out: false,
                     origin_mode: false,
                     style: 1,
                     hyperlink: None,
@@ -1871,6 +1873,66 @@ mod tests {
         );
         assert_eq!(rendered.carried.other_saved_cursors, 1);
         assert!(!rendered.carried.complete());
+    }
+
+    /// KR-REQ-08.78: the shift a cursor was saved with is the shift in force when it is saved
+    /// again on the terminal being drawn into, and the shift the screen is drawn with comes last.
+    #[test]
+    fn a_saved_cursor_is_saved_with_its_shift_and_the_screen_keeps_its_own() {
+        let operations = vec![
+            RestoreOp::SetCharsets {
+                charsets: Charsets {
+                    g0: "Ascii".to_owned(),
+                    g1: "DecLineDrawing".to_owned(),
+                    shift_out: false,
+                },
+            },
+            RestoreOp::SetSavedCursor {
+                cursor: SavedCursor {
+                    buffer: ActiveBuffer::Primary,
+                    col: 0,
+                    row: 0,
+                    pending_wrap: false,
+                    rendition: Rendition::default(),
+                    charsets: Designations {
+                        g0: "Ascii".to_owned(),
+                        g1: "DecLineDrawing".to_owned(),
+                    },
+                    shift_out: true,
+                    origin_mode: false,
+                    style: 1,
+                    hyperlink: None,
+                },
+            },
+            RestoreOp::SetCursor {
+                cursor: CursorState {
+                    col: 0,
+                    row: 0,
+                    visible: true,
+                    style: 1,
+                    pending_wrap: false,
+                },
+            },
+        ];
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        let save = text.find("\x1b7").expect("a save");
+        let shifted_out = text.find('\x0e').expect("the cursor is saved shifted out");
+        assert!(
+            shifted_out < save,
+            "the shift is in force before the save: {text:?}"
+        );
+        assert!(
+            text.rfind('\x0f')
+                .expect("and the screen's own shift follows")
+                > save,
+            "{text:?}"
+        );
     }
 
     #[test]
