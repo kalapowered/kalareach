@@ -282,7 +282,10 @@ fn read_seed(path: &Path, owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>> 
     }
     if metadata.len() != RELAY_SEED_LEN as u64 {
         return Err(CryptoError::StoredSecretLength {
-            name: INSTANCE_KEY_FILE.to_owned(),
+            name: path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
             expected: RELAY_SEED_LEN,
             actual: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
         });
