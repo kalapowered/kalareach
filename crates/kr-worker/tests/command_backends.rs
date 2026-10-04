@@ -939,6 +939,19 @@ async fn kr_req_12_07_a_rule_whose_file_stem_ends_in_com_recognises_the_command_
             .backends
             .line_ended(PromptGeneration::new(1 + generation as u64));
     }
+    // The shell finds `agent.com.exe` for the typed `agent.com` where no `agent.com` is beside it.
+    let other = setup.directory.join("other");
+    std::fs::create_dir_all(&other).expect("a directory");
+    let found = other.join("agent.com.exe");
+    std::fs::copy(stand_in_program(), &found).expect("a program stands in");
+    let asked = EstablishRequest {
+        executable: found.to_str().expect("a text path"),
+        ..request(&setup, &invocation(&["agent.com"]), &integration, 9)
+    };
+    setup
+        .backends
+        .establish(&asked)
+        .unwrap_or_else(|why| panic!("agent.com found as agent.com.exe: {why}"));
 }
 
 /// KR-REQ-12.07: two packages whose integrated commands the platform reads as one name are both left
