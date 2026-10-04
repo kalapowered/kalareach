@@ -791,6 +791,39 @@ async fn kr_req_12_22_flags_that_name_the_forwarder_are_compared_after_it_is_wri
     assert!(without.backends.root().is_none(), "and nothing is created");
 }
 
+/// KR-REQ-12.22: flags that start the forwarder by its bare name, as the packages written before the
+/// placeholder do, are integrated where the application finds a program by its search path, and
+/// nowhere that it looks in its own working directory first: on Windows they establish nothing and the
+/// invocation runs as typed. The control is the same package's flags with the forwarder's path.
+#[tokio::test]
+async fn kr_req_12_22_flags_that_start_the_forwarder_by_its_bare_name_are_not_integrated_on_windows()
+ {
+    let declared = fixture::qoder_flags();
+    let bare: Vec<String> = declared
+        .iter()
+        .map(|flag| flag.replace(kr_plugin_sdk::forwarder::PLACEHOLDER, "kr-hook"))
+        .collect();
+    assert_ne!(bare, declared, "the placeholder is replaced");
+    let mut shape = fixture::Shape::qoder_cli();
+    shape.integration.as_mut().expect("an integration")["flags"] = serde_json::json!(bare);
+    let setup = Setup::shaped(&shape, &["bin", "qodercli"], |config| config);
+    let answered = invocation_adding(
+        &["qodercli"],
+        &bare.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let established =
+        setup
+            .backends
+            .establish(&request(&setup, &answered, &qoder(bare.clone()), 1));
+    if cfg!(windows) {
+        let why = established.expect_err("a bare name is searched for in the working directory");
+        assert!(why.contains("bare name"), "{why}");
+        assert!(setup.backends.root().is_none(), "nothing was created");
+    } else {
+        established.expect("where a program is found by the search path, the bare name stands");
+    }
+}
+
 /// KR-REQ-12.07: where the shell finds a shim and not a program, the invocation establishes nothing
 /// and the reason names it: `first hit is <the shim>`. A `.cmd`, a `.bat` and a `.ps1` are run by an
 /// interpreter whose identity is not the agent's, so no launch of one could name the agent. Where
@@ -870,6 +903,33 @@ async fn kr_req_12_07_a_command_is_looked_up_by_the_name_its_platform_gives_the_
         cfg!(windows) || setup.backends.root().is_none(),
         "a command of another name creates nothing"
     );
+}
+
+/// KR-REQ-12.07: a package whose rule names a program with a `.com` file stem recognises it by the
+/// name it declares, though a command is looked up without its `.com`.
+#[cfg(windows)]
+#[tokio::test]
+async fn kr_req_12_07_a_rule_whose_file_stem_ends_in_com_recognises_the_command_it_names() {
+    let shape = fixture::Shape {
+        executable: "agent.com",
+        integration: Some(fixture::declaration("agent.com", &fixture::FLAGS, &[])),
+        native_bridge: false,
+        ..fixture::Shape::claude_code()
+    };
+    let setup = Setup::shaped(&shape, &["bin", "agent.com"], |config| config);
+    let integration = CommandIntegration {
+        command: "agent.com".to_owned(),
+        ..Setup::integration()
+    };
+    setup
+        .backends
+        .establish(&request(
+            &setup,
+            &invocation(&["agent.com"]),
+            &integration,
+            1,
+        ))
+        .expect("the package that declares the name recognises it");
 }
 
 /// KR-REQ-12.07: two packages whose integrated commands the platform reads as one name are both left
