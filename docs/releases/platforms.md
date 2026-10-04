@@ -46,14 +46,14 @@ natively and then started on the machine that built it. None is only cross-built
 
 The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
 `kr-hook` and `kr-plugin-host`. `release-baselines.yml` builds each one by a Cargo command of its
-own, as `release-windows.yml` builds each of its five, so the dependencies of those five resolve
-exactly as they do for the release. `release-windows.yml` builds and signs five of the seven, for
-x86-64 Windows: `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller` and `kr-describe-inference`.
-It does not build `kr-hook` or `kr-plugin-host`. The description process is built for every target
-except `aarch64-pc-windows-msvc`, where llama.cpp's CPU backend does not build with MSVC and no
-model profile lists the target. On x86-64 the description process also needs a processor with the
-x86-64-v3 instruction sets (SSE4.2, POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT and MOVBE);
-`docs/describe/README.md` says what a host without them does.
+own, as `release-windows.yml` builds each of its seven, so the dependencies of those seven resolve
+exactly as they do for the release. The file `release-windows.yml` builds and signs all seven
+executables for the x86-64 Windows target, and will fail if any is missing from the archive it
+produces. For each of the targets, excluding `aarch64-pc-windows-msvc`, the description process will
+be built; that target is excluded because the CPU backend of llama.cpp doesn't build on MSVC, and
+it's not present in any model profiles. On x86-64, the description process requires the host to
+support the `x86-64-v3` instruction sets (SSE4.2, POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT
+and MOVBE); see `docs/describe/README.md` for what happens when it doesn't.
 
 ## How each floor is read
 
