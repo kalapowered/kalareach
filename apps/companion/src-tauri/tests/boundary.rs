@@ -562,7 +562,7 @@ fn session_descriptions_are_reached_through_four_named_commands_and_no_more() {
     let named_for_descriptions: Vec<&str> = NAMED_COMMANDS
         .iter()
         .map(|(command, _)| *command)
-        .filter(|command| command.contains("describ"))
+        .filter(|command| command.contains("describ") || command.contains("description"))
         .collect();
     let four: Vec<&str> = expected.iter().map(|(command, _)| *command).collect();
     assert_eq!(
