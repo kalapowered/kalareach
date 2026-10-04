@@ -25,9 +25,10 @@ name: package-npm
 # another archive under a version npm holds fails the check.
 #
 # A run started by hand on a branch rehearses the check job: it packs the checked-out commit with
-# the release script, checks the result, asks the registry about it and dry-runs it, and stops
-# there, because the environment's policy refuses the publish job a ref that is not a release tag
-# before any step of it runs.
+# the release script, checks the result, asks the registry about it and, for a version the registry
+# does not hold, dry-runs it. It stops there: the same archive under a version the registry holds
+# skips the publish job, and otherwise the environment's policy refuses the publish job a ref that
+# is not a release tag before any step of it runs.
 on:
   push:
     tags:
