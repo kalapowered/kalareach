@@ -216,7 +216,7 @@ export function Sessions(): ReactNode {
                     <p className="session-activity" data-testid="description-activity">
                       {activity}
                       {overtaken ? (
-                        <span className="faint" data-testid="description-freshness">
+                        <span className="faint session-note" data-testid="description-freshness">
                           {' '}
                           {overtaken}
                         </span>

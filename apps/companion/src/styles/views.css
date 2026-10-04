@@ -190,6 +190,10 @@
   margin-bottom: 4px;
   font-size: 0.75rem;
 }
+/* On its own line: a line that is out of date is read apart from the text it is about. */
+.session-row .session-note {
+  display: block;
+}
 .session-row h3 .badge {
   margin-inline-start: 8px;
   vertical-align: middle;
