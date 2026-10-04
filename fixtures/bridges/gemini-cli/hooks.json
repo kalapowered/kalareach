@@ -6,7 +6,7 @@
           {
             "type": "command",
             "name": "kalareach",
-            "command": "kr-hook gemini-cli hook",
+            "command": "{kr_hook} gemini-cli hook",
             "timeout": 5000
           }
         ]
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "name": "kalareach",
-            "command": "kr-hook gemini-cli hook",
+            "command": "{kr_hook} gemini-cli hook",
             "timeout": 1000
           }
         ]
@@ -30,7 +30,7 @@
           {
             "type": "command",
             "name": "kalareach",
-            "command": "kr-hook gemini-cli hook",
+            "command": "{kr_hook} gemini-cli hook",
             "timeout": 5000
           }
         ]

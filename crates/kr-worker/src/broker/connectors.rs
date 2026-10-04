@@ -720,13 +720,13 @@ pub mod fixture {
     /// The manifests of the released Claude Code, Gemini CLI and Qoder CLI packages, as core pins
     /// them: the test packages declare the command integrations these declare.
     const RELEASED_CLAUDE_CODE: &[u8] = include_bytes!(
-        "../../../../fixtures/plugins/released/kalareach/claude-code/0.4.0/plugin.json"
+        "../../../../fixtures/plugins/released/kalareach/claude-code/0.5.0/plugin.json"
     );
     const RELEASED_GEMINI_CLI: &[u8] = include_bytes!(
-        "../../../../fixtures/plugins/released/kalareach/gemini-cli/0.4.0/plugin.json"
+        "../../../../fixtures/plugins/released/kalareach/gemini-cli/0.5.0/plugin.json"
     );
     const RELEASED_QODER_CLI: &[u8] = include_bytes!(
-        "../../../../fixtures/plugins/released/kalareach/qoder-cli/0.4.0/plugin.json"
+        "../../../../fixtures/plugins/released/kalareach/qoder-cli/0.5.0/plugin.json"
     );
 
     /// The `command_integration` member of a released package's manifest.
