@@ -254,11 +254,14 @@ async fn reach_environment(
                 paths.open_environment_id()?,
                 crate::build_id(),
                 BridgeTarget::Controller,
-                // A machine step is put to the daemon that is already there; it starts nothing in
-                // the destination.
+                // A machine command is put to the daemon that is already there; it starts
+                // nothing in the destination.
                 false,
             )
             .map_err(bridge_failure)?;
+            // Running the helper in a stopped distribution starts it, and a machine command starts
+            // nothing: what the platform says of the environment is asked first.
+            crate::bridge::session::require_running(enrolment).await?;
             let invocation = opening.launch().await.map_err(bridge_failure)?;
             let window = invocation.acknowledgement().action_window.clone();
             Channel::Bridged {

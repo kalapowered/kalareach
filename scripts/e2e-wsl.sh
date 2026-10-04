@@ -19,10 +19,11 @@
 #      anything starts in it and it becomes an installation of its own.
 #   4. Windows reaches each distribution through the process bridge alone, learns that
 #      distribution's own environment identity, and gets an answer to a real read across it.
-#   5. A listing of stopped distributions comes from the cache and starts nothing. A refresh that
-#      was told to start one does. So does creating a session in one from Windows, which also has
-#      the distribution's own startup start the control daemon inside it, and so does attaching to
-#      a session there, which is told by the distribution that the session has closed.
+#   5. A listing of stopped distributions comes from the cache and starts nothing, and a machine
+#      group command for one is refused and starts nothing. A refresh that was told to start one
+#      does. So does creating a session in one from Windows, which also has the distribution's own
+#      startup start the control daemon inside it, and so does attaching to a session there, which
+#      is told by the distribution that the session has closed.
 #   6. The bridge behaves the same in NAT and in mirrored networking, which is what decides
 #      whether any automatic behaviour is needed. In each mode every distribution also has its own
 #      paired endpoint: a viewer paired with one distribution is let in there and refused by the
@@ -1723,6 +1724,22 @@ esac
 [ "$(state_of "$second")" = "Stopped" ] ||
   fail "the refresh started $second although it was not told to"
 pass "a refresh observed the stopped distribution and started nothing"
+
+# A machine group command reads or changes the record an environment keeps, and is not an action
+# that starts what it names: running the helper in the stopped distribution would start it, so the
+# command is refused, and the distribution stays as it was.
+machine_code=0
+"$kr_exe" --json host machine --environment second >"$run_dir/machine-stopped.json" 2>&1 ||
+  machine_code=$?
+[ "$machine_code" -ne 0 ] ||
+  fail "a machine group command succeeded for the stopped distribution $second: $(cat "$run_dir/machine-stopped.json")"
+case "$(compact <"$run_dir/machine-stopped.json")" in
+  *'"code":"ENVIRONMENT_UNAVAILABLE"'*) : ;;
+  *) fail "a machine group command for $second did not answer ENVIRONMENT_UNAVAILABLE: $(cat "$run_dir/machine-stopped.json")" ;;
+esac
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "a machine group command started $second, which it must never do"
+pass "a machine group command was refused for the stopped distribution and started nothing"
 
 "$kr_exe" --json bridge list >"$run_dir/list-while-stopped.json" 2>&1 ||
   fail "the listing failed: $(cat "$run_dir/list-while-stopped.json")"

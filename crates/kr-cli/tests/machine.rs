@@ -5,7 +5,8 @@
 //! `kr` is the real binary, copied to the internal disk and run with that tree's directories on
 //! plain pipes. An environment enrolled for a process bridge is reached through a stand-in for
 //! `wsl.exe`: a script that runs the real `kr bridge --stdio` against the other tree's directories,
-//! and that can be told to refuse to start, as a stopped distribution does.
+//! and that can be told to refuse to run the helper, as a distribution that cannot be reached does,
+//! or to say that the distribution is stopped.
 
 #![cfg(unix)]
 
@@ -328,8 +329,15 @@ async fn the_owner_shows_the_group_and_takes_each_step_against_the_record_they_s
     assert_eq!(elsewhere["code"], "HOST_NOT_CONFIGURED", "{elsewhere}");
 }
 
+/// The distribution the stand-in for `wsl.exe` answers for.
+const DISTRIBUTION: &str = "ubuntu-b";
+
 /// The stand-in for `wsl.exe`: it runs the real helper against `tree` while its fixture says it may
-/// start one, and says the distribution is stopped when it may not.
+/// start one, and refuses to when it may not.
+///
+/// Asked what is registered and what is running, it answers from the fixture's `stopped` file as the
+/// real command does, in UTF-16LE, and runs nothing. Anything else runs in the distribution, which
+/// starts a stopped one: the stand-in records that in the fixture's `started` file and goes on.
 fn stand_in(fixture: &Path, tree: &kr_ipc::testing::TempHost) -> String {
     let fixture = fixture.to_str().expect("a temporary path is text");
     let runtime = tree.paths().runtime_root().display().to_string();
@@ -344,9 +352,30 @@ fn stand_in(fixture: &Path, tree: &kr_ipc::testing::TempHost) -> String {
     format!(
         r##"#!/bin/sh
 fixture='{fixture}'
+if [ "$1" = "--list" ]; then
+  case "$*" in
+    "--list --all --quiet")
+      printf '{DISTRIBUTION}\r\n' | iconv -f UTF-8 -t UTF-16LE
+      ;;
+    "--list --running --quiet")
+      if [ ! -e "$fixture/stopped" ]; then
+        printf '{DISTRIBUTION}\r\n' | iconv -f UTF-8 -t UTF-16LE
+      fi
+      ;;
+    *)
+      echo "the stand-in for wsl.exe has no answer for: $*" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
+if [ -e "$fixture/stopped" ]; then
+  echo "$*" >>"$fixture/started"
+  rm -f "$fixture/stopped"
+fi
 allowed="$(cat "$fixture/allowed" 2>/dev/null || echo 0)"
 if [ "$allowed" -le 0 ]; then
-  echo "the distribution is stopped" >&2
+  echo "the helper did not start" >&2
   exit 1
 fi
 echo $((allowed - 1)) >"$fixture/allowed"
@@ -387,7 +416,7 @@ impl Pair {
                 "--label",
                 "bravo",
                 "--target",
-                "ubuntu-b",
+                DISTRIBUTION,
                 "--user",
                 "kala",
                 "--helper",
@@ -408,6 +437,20 @@ impl Pair {
             .trim()
             .parse()
             .expect("a number")
+    }
+
+    /// Stops the distribution: the platform says so, and running anything in it starts it.
+    fn stop(&self) {
+        std::fs::write(self.bridges.path().join("fixture/stopped"), "")
+            .expect("writes the stand-in's state");
+    }
+
+    /// The command lines that ran in the distribution while it was stopped, each of which started
+    /// it.
+    fn starts_of_a_stopped_distribution(&self) -> Vec<String> {
+        std::fs::read_to_string(self.bridges.path().join("fixture/started"))
+            .map(|lines| lines.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
     }
 
     /// How many more times the stand-in starts a helper.
@@ -506,6 +549,55 @@ async fn an_enrolled_environments_group_is_read_from_itself_through_its_bridge()
     );
 }
 
+/// KR-REQ-03.14: showing the group of an enrolled environment whose distribution is stopped, taking
+/// a step in it, and making a merge plan over it are each refused with `ENVIRONMENT_UNAVAILABLE`,
+/// and none of them starts the distribution, which running the helper in it would. The same
+/// commands are answered once the distribution runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_distribution_is_refused_and_not_started_by_a_machine_command() {
+    let pair = Pair::start().await;
+    let own = pair.b.group();
+    pair.stop();
+
+    let shown = pair.at_a_failing(&["host", "machine", "--environment", "bravo"]);
+    assert_eq!(shown["code"], "ENVIRONMENT_UNAVAILABLE", "{shown}");
+    let stepped = pair.at_a_failing(&[
+        "host",
+        "machine",
+        "split",
+        "--environment",
+        "bravo",
+        "--expect",
+        &own.expect(),
+    ]);
+    assert_eq!(stepped["code"], "ENVIRONMENT_UNAVAILABLE", "{stepped}");
+    let planned = pair.at_a_failing(&[
+        "host",
+        "machine",
+        "merge",
+        &a_group(),
+        "--from",
+        &own.machine_id,
+        "--environment",
+        "bravo",
+    ]);
+    assert_eq!(planned["code"], "ENVIRONMENT_UNAVAILABLE", "{planned}");
+
+    assert_eq!(
+        pair.starts_of_a_stopped_distribution(),
+        Vec::<String>::new(),
+        "nothing was run in the distribution, so nothing started it"
+    );
+    assert_eq!(pair.b.group(), own, "no step was taken");
+    assert!(!pair.a.plan_file().exists(), "no plan was kept");
+
+    // Once the distribution runs, the same command is answered.
+    std::fs::remove_file(pair.bridges.path().join("fixture/stopped"))
+        .expect("the distribution runs");
+    let running = pair.at_a(&["host", "machine", "--environment", "bravo"]);
+    assert_eq!(Group::of(&running["machine"]), own);
+}
+
 /// KR-REQ-03.07: a merge over independent environments is a plan the client keeps, owner-only
 /// under its own state directory and never an environment's, until each step has its result. One
 /// environment cannot be reached when its step comes, so its step stays pending and the plan is
@@ -542,7 +634,7 @@ async fn a_merge_over_independent_environments_is_a_plan_kept_until_each_step_ha
     assert!(!pair.a.plan_file().exists(), "no plan was kept");
     assert_eq!(pair.a.group().machine_id, shared.machine_id);
 
-    // The bridge starts once, to read B's group, and then B is stopped when its step comes.
+    // The bridge starts once, to read B's group, and then B cannot be reached when its step comes.
     pair.allow(1);
     let started = pair.a.failed(
         Some(pair.bridges.path()),
@@ -619,7 +711,7 @@ async fn a_merge_over_independent_environments_is_a_plan_kept_until_each_step_ha
     ]);
     assert_eq!(second["code"], "INVALID_ARGUMENT", "{second}");
 
-    // `finish` while B is still stopped leaves the step pending, and the plan.
+    // `finish` while B still cannot be reached leaves the step pending, and the plan.
     pair.allow(0);
     let (still_status, still) = pair
         .a
@@ -674,7 +766,8 @@ async fn a_merge_left_half_done_is_undone_by_putting_back_each_environment_that_
     assert_eq!(started["steps"][0]["state"], "done", "{started}");
     assert_eq!(pair.a.group().machine_id, into);
 
-    // B is still stopped. Undoing needs no bridge: A put itself back, and B's step was never sent.
+    // B still cannot be reached. Undoing needs no bridge: A put itself back, and B's step was never
+    // sent.
     pair.allow(0);
     let undone = pair.at_a(&["host", "machine", "undo"]);
     assert_eq!(undone["kept"], Value::Bool(false), "{undone}");
@@ -880,9 +973,9 @@ async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_
     );
 }
 
-/// Takes the plan to the point where A has taken its step and B, stopped, has not, and then has B's
-/// owner move B on to another group. Returns the group both were in, the group A was merged into,
-/// and the group B's owner moved it to.
+/// Takes the plan to the point where A has taken its step and B, which cannot be reached, has not,
+/// and then has B's owner move B on to another group. Returns the group both were in, the group A
+/// was merged into, and the group B's owner moved it to.
 fn merge_with_b_moved_on(pair: &Pair) -> (Group, String, String) {
     let shared = pair.together();
     let a_id = pair.a.environment_id();
@@ -1006,8 +1099,8 @@ fn merge_with_b_answer_lost(pair: &Pair, fault: impl FnOnce(&Host)) -> (Group, S
 }
 
 /// KR-REQ-03.07: a step is first sent on the connection that composes it, under the identity the
-/// plan has held since it was made. B is stopped when its step comes, so the plan keeps B's step
-/// unsent with its identity, and `finish` takes it under that identity and no other.
+/// plan has held since it was made. B cannot be reached when its step comes, so the plan keeps B's
+/// step unsent with its identity, and `finish` takes it under that identity and no other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_is_first_sent_under_the_identity_the_plan_holds_for_it() {
     let pair = Pair::start().await;
