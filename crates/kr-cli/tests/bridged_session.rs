@@ -961,17 +961,18 @@ async fn a_terminal_attached_through_a_bridge_reaches_the_shell_in_the_destinati
     let display = created["display_number"].to_string();
 
     let terminal = world.attach_on_a_terminal(&display);
-    terminal.types("printf 'in-%s %s\\n' destination \"$PWD\"\r");
-    terminal.expect_within(
-        "in-destination",
+    // The directory is read once its line is whole, which its closing `|` says. A terminal is read
+    // as the system hands it over, and a line the shell wrote in one piece can be handed over in two.
+    terminal.types("printf 'in-%s|%s|\\n' destination \"$PWD\"\r");
+    let printed = terminal.reported_within(
+        "in-destination|",
+        1,
         "what was typed reached the shell and its output came back",
     );
-    let text = terminal.text();
-    assert!(
-        text.contains(&world.home.display().to_string())
-            || text.contains(&resolved(&world.home).display().to_string()),
-        "the shell started in the destination's home: {}",
-        text.escape_debug()
+    assert_eq!(
+        resolved(Path::new(&printed[0])),
+        resolved(&world.home),
+        "the shell started in the destination's home"
     );
     // Ending the session from where it lives ends the attachment, and the command says it did.
     terminal.types("exit\r");
