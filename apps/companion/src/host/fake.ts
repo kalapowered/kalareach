@@ -240,6 +240,11 @@ export interface FakeHostControls {
   /** The sessions the interface asked the host to describe, in order. */
   readonly described: readonly string[]
   /**
+   * Adds `count` sessions to the host's list, each in a directory of its own, so a list can be
+   * longer than a screen.
+   */
+  addSessions(count: number): void
+  /**
    * Changes what description setup says, as the host would after something outside this device
    * changed it: its offer, its settings or how a fetch is going.
    */
@@ -1541,6 +1546,22 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       describedAs.set(sessionId, { ...current, ...change })
     },
     described: describedBy,
+    addSessions(count) {
+      const first = sessions().sessions[0]
+      for (let index = 0; index < count; index += 1) {
+        const summary = createdSession(
+          {
+            cwd: `/Users/rs/work/project-${String(created.length + 1)}`,
+            shell_mode: 'managed',
+            environment_id: first?.environment_id,
+            worker_profile: first?.worker_profile
+          } as unknown as SessionCreateParams,
+          created.length
+        )
+        created.push(summary)
+        records.startShell(summary.session_id)
+      }
+    },
     changeDescriptionSetup(change) {
       descriptionSetup = { ...descriptionSetup, ...change }
     },

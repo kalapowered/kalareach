@@ -23,7 +23,8 @@ import {
   freshnessNote,
   shownTitle,
   sourceLabel,
-  useDescriptions
+  useDescriptions,
+  useOnScreen
 } from '../model/describe'
 import { accountName } from './account-name'
 import { NewSession } from './NewSession'
@@ -98,9 +99,14 @@ export function Sessions(): ReactNode {
     }
   }, [load])
 
+  // The host is asked about the rows a person can see, and about every row while they search, since
+  // a search by title looks at the title of each.
+  const { onScreen, track } = useOnScreen()
   const descriptions = useDescriptions(
     port,
-    (list?.sessions ?? []).map((session) => session.session_id),
+    (list?.sessions ?? [])
+      .filter((session) => query.trim().length > 0 || onScreen.has(session.session_id))
+      .map((session) => session.session_id),
     list
   )
 
@@ -189,6 +195,8 @@ export function Sessions(): ReactNode {
               className="session-row"
               role="row"
               data-testid={`session-row-${session.display_number}`}
+              data-session={session.session_id}
+              ref={track}
               onClick={() => {
                 go({ view: 'session', sessionId: session.session_id, pane: 'semantic' })
               }}

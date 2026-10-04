@@ -19,7 +19,8 @@ import {
   freshnessNote,
   shownTitle,
   sourceLabel,
-  useDescriptions
+  useDescriptions,
+  useOnScreen
 } from '../../model/describe'
 import { ask } from '../model/call'
 import { minimumTarget, type Surface } from '../platform'
@@ -46,9 +47,11 @@ export function MobileSessions({
   const [rows, setRows] = useState<readonly Row[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const target = minimumTarget(surface)
+  // The host is asked about the rows a person can see, and the few either side of them.
+  const { onScreen, track } = useOnScreen()
   const descriptions = useDescriptions(
     port,
-    (rows ?? []).map((row) => row.id),
+    (rows ?? []).filter((row) => onScreen.has(row.id)).map((row) => row.id),
     rows
   )
 
@@ -106,6 +109,7 @@ export function MobileSessions({
                   className="m-row"
                   data-tone={row.tone}
                   data-session={row.id}
+                  ref={track}
                   style={{ minBlockSize: target }}
                   onClick={() => {
                     onOpen(row.id)

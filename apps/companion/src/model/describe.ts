@@ -13,7 +13,7 @@
  * directory the session is in.
  */
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { SessionDescribeResult } from '@kalareach/protocol'
 
@@ -77,41 +77,149 @@ export function shownTitle(directoryName: string, described: Described | undefin
 /** How many descriptions are read at one time. A list of sessions is short; the bound is the host's. */
 const READS_AT_ONCE = 4
 
+/** How far beyond the edge of the list's screen a row still counts as shown, in pixels: about two rows. */
+const SHOWN_MARGIN_PX = 160
+
+/** What a listing's reads have done: which sessions were asked about, and which are still to be. */
+interface Reads {
+  readonly port: HostPort
+  readonly listing: unknown
+  readonly asked: Set<string>
+  readonly queue: string[]
+  running: number
+  /** False once a newer listing, another host or the screen's going has replaced these reads. */
+  live: boolean
+}
+
+/** Starts reads from the queue until `READS_AT_ONCE` are waiting for the host. */
+function pump(reads: Reads, answered: (sessionId: string, answer: Described) => void): void {
+  while (reads.live && reads.running < READS_AT_ONCE) {
+    const sessionId = reads.queue.shift()
+    if (sessionId === undefined) return
+    reads.running += 1
+    ask(() => reads.port.sessionDescribe({ session_id: sessionId }))
+      .then((answer) => {
+        if (reads.live) answered(sessionId, answer)
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        reads.running -= 1
+        pump(reads, answered)
+      })
+  }
+}
+
 /**
- * Reads the host's description of each session listed, as the list is shown.
+ * Reads the host's description of each session in `wanted`, once for each listing.
  *
- * A read that fails leaves its row as it was, because every row has its directory to show. The
- * newest listing is the one whose rows are read: a read begun for sessions that are no longer
- * listed, or answering after the list has gone, changes nothing. The sessions are read again each
- * time `listing` is a new list, so a row follows what the host has published since the last one.
+ * `wanted` is the sessions a person can see (or is searching among), not every session listed: the
+ * host describes what is asked about, and a long list is asked about as it is scrolled. A session
+ * is asked about once for a listing, and again when `listing` is a new list, so a row follows what
+ * the host has published since the last one. A read that fails leaves its row as it was, because
+ * every row has its directory to show. The newest listing is the one whose rows are read: a read
+ * begun for an older one, or answering after the screen has gone, changes nothing.
  */
 export function useDescriptions(
   port: HostPort,
-  sessionIds: readonly string[],
+  wanted: readonly string[],
   listing: unknown
 ): ReadonlyMap<string, Described> {
   const [described, setDescribed] = useState<ReadonlyMap<string, Described>>(new Map())
-  const wanted = sessionIds.join(',')
+  const reads = useRef<Reads | null>(null)
+  const key = wanted.join(',')
 
   useEffect(() => {
-    let current = true
-    const queue = wanted.length === 0 ? [] : wanted.split(',')
-    const next = (): void => {
-      const sessionId = queue.shift()
-      if (sessionId === undefined || !current) return
-      ask(() => port.sessionDescribe({ session_id: sessionId }))
-        .then((answer) => {
-          if (!current) return
-          setDescribed((held) => new Map(held).set(sessionId, answer))
-        })
-        .catch(() => undefined)
-        .finally(next)
+    let current = reads.current
+    if (current === null || current.port !== port || current.listing !== listing) {
+      if (current !== null) current.live = false
+      current = { port, listing, asked: new Set(), queue: [], running: 0, live: true }
+      reads.current = current
     }
-    for (let started = 0; started < READS_AT_ONCE; started += 1) next()
-    return () => {
-      current = false
+    for (const sessionId of key.length === 0 ? [] : key.split(',')) {
+      if (current.asked.has(sessionId)) continue
+      current.asked.add(sessionId)
+      current.queue.push(sessionId)
     }
-  }, [port, wanted, listing])
+    pump(current, (sessionId, answer) => {
+      setDescribed((held) => new Map(held).set(sessionId, answer))
+    })
+  }, [port, listing, key])
+
+  useEffect(
+    () => () => {
+      if (reads.current !== null) reads.current.live = false
+      reads.current = null
+    },
+    []
+  )
 
   return described
+}
+
+/** The nearest ancestor that scrolls up and down, or null where the page itself does. */
+function scrollParent(element: Element): Element | null {
+  for (let node = element.parentElement; node !== null; node = node.parentElement) {
+    const { overflowY } = getComputedStyle(node)
+    if (overflowY === 'auto' || overflowY === 'scroll') return node
+  }
+  return null
+}
+
+/**
+ * Which session rows are on the screen, or within a small margin of it.
+ *
+ * `track` goes on each row as its `ref`, and the row names its session in `data-session`. The
+ * margin is measured from the edge of whatever scrolls the list, so a row about to come into view
+ * has been asked about by the time it does.
+ */
+export function useOnScreen(): {
+  readonly onScreen: ReadonlySet<string>
+  readonly track: (element: HTMLElement | null) => (() => void) | undefined
+} {
+  const [onScreen, setOnScreen] = useState<ReadonlySet<string>>(new Set())
+  const observers = useRef(new Map<Element | null, IntersectionObserver>())
+
+  const track = useCallback((element: HTMLElement | null) => {
+    const sessionId = element?.dataset.session
+    if (element === null || sessionId === undefined) return undefined
+    const root = scrollParent(element)
+    const observer =
+      observers.current.get(root) ??
+      new IntersectionObserver(
+        (entries) => {
+          setOnScreen((held) => {
+            const next = new Set(held)
+            for (const entry of entries) {
+              const id = (entry.target as HTMLElement).dataset.session
+              if (id === undefined) continue
+              if (entry.isIntersecting) next.add(id)
+              else next.delete(id)
+            }
+            return next
+          })
+        },
+        { root, rootMargin: `${String(SHOWN_MARGIN_PX)}px 0px` }
+      )
+    observers.current.set(root, observer)
+    observer.observe(element)
+    return () => {
+      observer.unobserve(element)
+      setOnScreen((held) => {
+        if (!held.has(sessionId)) return held
+        const next = new Set(held)
+        next.delete(sessionId)
+        return next
+      })
+    }
+  }, [])
+
+  useEffect(() => {
+    const held = observers.current
+    return () => {
+      for (const observer of held.values()) observer.disconnect()
+      held.clear()
+    }
+  }, [])
+
+  return { onScreen, track }
 }
