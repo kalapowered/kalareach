@@ -1383,3 +1383,68 @@ fn derivations() -> Result<Value> {
         },
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::relay::{RELAY_LEASE_DOMAIN, RelayLease};
+    use kr_protocol::scalars::to_base64url;
+
+    use super::*;
+
+    /// A repository root whose relay fixtures hold one lease naming `issuer`, with canonical bytes
+    /// that say the same, and no other relay object.
+    fn root_with_a_lease_issued_by(issuer: &[u8; 32]) -> tempfile::TempDir {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let published = read_fixture(&repository, "fixtures/relay/leases.json")
+            .expect("the published leases are readable");
+        let mut json = published["cases"][0]["json"].clone();
+        json["issuer_key"] = Value::String(to_base64url(issuer));
+        let lease: RelayLease = serde_json::from_value(json.clone()).expect("a lease");
+        let signing_input = lease.signing_input().expect("a signing input");
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let relay = root.path().join("fixtures/relay");
+        std::fs::create_dir_all(&relay).expect("a fixtures directory");
+        let document = |cases: Value| serde_json::to_string(&json!({ "cases": cases }));
+        let leases = document(json!([{
+            "id": "lease_under_test",
+            "description": "A lease whose issuer the vectors may or may not sign with.",
+            "domain": RELAY_LEASE_DOMAIN,
+            "signing_input_hex": hex::encode(signing_input),
+            "json": json,
+        }]));
+        for (name, text) in [
+            ("leases.json", leases),
+            ("receipts.json", document(json!([]))),
+            ("instances.json", document(json!([]))),
+        ] {
+            std::fs::write(relay.join(name), text.expect("serialised")).expect("a fixture");
+        }
+        root
+    }
+
+    #[test]
+    fn a_lease_naming_a_key_the_vectors_do_not_sign_with_is_refused() {
+        let admission =
+            crate::relay::ServiceAdmissionKeyPair::from_seed_bytes(&SERVICE_ADMISSION_SEED)
+                .expect("libsodium is available");
+
+        // The control: the same lease, whose canonical bytes agree with its representation, issued
+        // by the key the vectors sign leases with.
+        let signed = root_with_a_lease_issued_by(admission.public().as_bytes());
+        relay_signatures(signed.path()).expect("the vectors sign a lease their own key issued");
+
+        // An all-zero key is a value a default-built object could carry. With canonical bytes that
+        // match it, nothing but the comparison with the signer stops a vector from publishing a
+        // signature that authorises nothing.
+        let zeroed = root_with_a_lease_issued_by(&[0; 32]);
+        match relay_signatures(zeroed.path()) {
+            Err(CryptoError::SecretStore { message }) => assert!(
+                message.contains("names a key the vectors do not sign with"),
+                "{message}"
+            ),
+            Err(other) => panic!("refused for another reason: {other:?}"),
+            Ok(_) => panic!("a lease naming an all-zero key was not refused"),
+        }
+    }
+}
