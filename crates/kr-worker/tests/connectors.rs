@@ -8,6 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else; its command, flags and variables are the verified manifest's, and apply only while `command_integration.launch` is granted |
+//! | KR-REQ-07.64 | a package's launch probe is the verified manifest's, and applies only while `launch.probe` is granted |
 //! | KR-REQ-11.34 | the table a channel is served with is the installed package's own |
 //! | KR-REQ-12.22 | Qoder CLI's launch flags give its launch a hook bridge on this installation's own forwarder, for Qoder CLI and nothing else |
 //! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | the test packages declare the command integrations the released packages declare |
@@ -469,6 +470,38 @@ fn kr_req_12_07_a_withdrawn_integration_grant_keeps_the_connector_and_integrates
     assert!(sources.replace(vec![source]).is_empty());
     assert!(sources.for_command(fixture::COMMAND).is_none());
     assert!(!sources.is_empty(), "the connector is still held");
+}
+
+/// KR-REQ-07.64: a launch probe is the verified manifest's, and runs only while the installation
+/// holds `launch.probe`. Without it the connector is still read and matched, and a launch of it
+/// reads no mode.
+#[test]
+fn kr_req_07_64_a_launch_probe_runs_only_while_launch_probe_is_granted() {
+    let store = Store::new("probing");
+    let source = store.shaped(&fixture::probing(fixture::codex_probe(&[
+        "doctor", "--json",
+    ])));
+    let connector =
+        InstalledConnector::read(source.clone()).expect("the installed package is read");
+    let probe = connector.launch_probe().expect("the probe is granted");
+    assert_eq!(probe.arguments, ["doctor", "--json"]);
+    assert_eq!(
+        probe.carried_options,
+        ["-c", "--config", "--enable", "--disable"]
+    );
+    assert!(
+        connector.integration().is_none(),
+        "a probe is not a command integration"
+    );
+
+    let mut withdrawn = source;
+    withdrawn.granted.remove(&PluginCapability::LaunchProbe);
+    let connector = InstalledConnector::read(withdrawn).expect("the installed package is read");
+    assert!(connector.launch_probe().is_none());
+    assert!(
+        connector.manifest().launch_probe.is_some(),
+        "the declaration is still the manifest's, so a doctor can say it is not granted"
+    );
 }
 
 /// Connectors that declare no command integration are held, however many there are,

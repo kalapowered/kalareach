@@ -585,7 +585,7 @@ fn described(
 }
 
 /// The first executable `command` names on `search_path`, as a shell's search finds it.
-fn resolve(command: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
+pub(super) fn resolve(command: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
     let pathext = std::env::var("PATHEXT").ok();
     resolve_with(
         command,
