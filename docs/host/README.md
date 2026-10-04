@@ -3378,16 +3378,19 @@ directory it started in. Generated text, with its activity line and its provenan
 while privacy mode is off, only when it was produced under the generation in force, and only to a
 caller whose history reaches the whole session: the owner at this machine, or a device whose grant's
 history bound is at or before the session's start. A grant with no history bound retains no history,
-so its device is shown the pin or the metadata title. This daemon runs no description process, so
-the answer says inference is paused because no model runs here, and has no queue age.
-`session.rename` needs `session.rename`: it pins a title of at most 64 codepoints, or clears the pin
-with no title, records who set it, and answers the title it now shows: the pin, or the title built
-from the session's metadata after a clearing. It never answers generated text, which is
-`session.describe`'s, under its own right and filter, so the record a rename's action keeps for a
-retry holds none and the removal privacy mode makes has nothing of it to reach. The right to rename
-a session is not the right to view it, so a device that may rename and may not view is answered the
-first time and is not answered again from the record: a retry, whether the rename was done or
-refused, goes back only under present view authority over the session it names.
+so its device is shown the pin or the metadata title. The answer also carries the state of inference
+on the host, the reason it is paused when it is, the cadence the host runs at and the age of the
+session's queued job. These come from the description host the daemon starts when it starts; a
+daemon whose description host did not start says that inference is paused because this environment
+runs no model, and carries no queue age. `session.rename` needs `session.rename`: it pins a title of
+at most 64 codepoints, or clears the pin with no title, records who set it, and answers the title it
+now shows: the pin, or the title built from the session's metadata after a clearing. It never
+answers generated text, which is `session.describe`'s, under its own right and filter, so the record
+a rename's action keeps for a retry holds none and the removal privacy mode makes has nothing of it
+to reach. The right to rename a session is not the right to view it, so a device that may rename and
+may not view is answered the first time and is not answered again from the record: a retry, whether
+the rename was done or refused, goes back only under present view authority over the session it
+names.
 
 ## What an idle session wakes for
 
