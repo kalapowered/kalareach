@@ -198,6 +198,9 @@ const REPLAY_WINDOW: usize = 64;
 /// it enforces. Every 64 reads is often enough that the cache overshoots by a fraction of itself.
 const ROW_CACHE_INTERVAL: u32 = 64;
 
+/// How many events the buffer a read collects them in keeps the room for between reads.
+const SCRATCH_EVENTS: usize = 256;
+
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
 
@@ -438,8 +441,19 @@ impl Engine {
         self.lexer.feed(bytes, &mut events);
         self.feeds = self.feeds.wrapping_add(1);
         let outcome = self.consume(&events, now_ms);
-        self.scratch = events;
+        self.keep_scratch(events);
         outcome
+    }
+
+    /// Keeps the buffer a read collected its events in for the next read, up to a bound.
+    ///
+    /// A read of nothing but controls is one event a byte, so a buffer that kept the room such a
+    /// read grew it to would hold it for the rest of the session, outside every bound the session
+    /// keeps. Past [`SCRATCH_EVENTS`] the room goes back.
+    fn keep_scratch(&mut self, mut events: Vec<Event>) {
+        events.clear();
+        events.shrink_to(SCRATCH_EVENTS);
+        self.scratch = events;
     }
 
     /// Settles the screen when the stream has gone quiet.
@@ -456,7 +470,7 @@ impl Engine {
         events.clear();
         self.lexer.flush_tail(&mut events);
         let mut outcome = self.consume(&events, now_ms);
-        self.scratch = events;
+        self.keep_scratch(events);
         self.measure_now_unconditionally(now_ms);
         outcome.resident_pressure = self.resident_pressure();
         outcome
@@ -468,7 +482,7 @@ impl Engine {
         events.clear();
         self.lexer.close(&mut events);
         let outcome = self.consume(&events, now_ms);
-        self.scratch = events;
+        self.keep_scratch(events);
         outcome
     }
 
