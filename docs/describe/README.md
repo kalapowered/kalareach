@@ -282,14 +282,16 @@ revision, at which context revision, over which cursor interval and when.
 
 ## Privacy mode
 
-Privacy mode is a session's state, not the host's: one private session sits beside one that is not,
-and everything below reaches the first only.
+Privacy mode's generation is the environment's. The daemon takes the descriptions through the steps
+below for every session it tracks at once, and each session's worker applies the generation to the
+facts it records at its own moment, when it is told.
 
-Enabling it records a generation, then, in order: fences that session's description processing at
-once and cancels its job if one is running, takes back its queued job, and removes its generated
-description and the context this host had captured for it, while keeping its pin.
+Enabling it records a generation, then, in order: raises the fence of every session's description
+processing at once and cancels the job running for it, removes every generated description while
+keeping the pins, and has the host forget what it holds in memory (its queue, its contexts and the
+pages waiting for it), which takes back every queued job.
 
-From the instant the fence goes up, that session's title comes from its pin or from deterministic
+From the instant a session's fence goes up, its title comes from its pin or from deterministic
 metadata (there is no window in which a generated title is still shown), and nothing more is
 captured for it, so a change made while it was private cannot reach a job after privacy ends. A job
 that was already running is counted as in flight, and the cleanup does not report complete until it
