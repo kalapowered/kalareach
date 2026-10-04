@@ -932,16 +932,16 @@ fn kr_req_07_64_a_launcher_in_a_job_that_restricts_desktops_declines_and_the_typ
     let mut launcher = shell.launcher_in(
         &restricting,
         &shell.executable.clone(),
-        &[
-            "gemini".to_owned(),
-            "/d".to_owned(),
-            "/c".to_owned(),
-            "exit /b 7".to_owned(),
-        ],
+        &shell.typed(),
         &answer,
         "restricted",
-        &[],
+        &[("EXIT_WITH", "7")],
         shell.placed.host.root(),
+    );
+    let report = shell.report_from("restricted", &mut launcher);
+    assert_eq!(
+        report["relaunch"], "%GEMINI_CLI_NO_RELAUNCH%",
+        "the typed program ran in the person's own environment: {report:?}"
     );
     let status = launcher.wait().expect("the launcher ends with the program");
     assert_eq!(status.code(), Some(7), "the typed program ran and ended");
