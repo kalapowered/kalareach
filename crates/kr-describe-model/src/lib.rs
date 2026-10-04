@@ -11,6 +11,7 @@
 //! | --- | --- |
 //! | [`llama`] | The llama.cpp runtime, CPU only, as the model the description process runs |
 //! | [`assets`] | The check that a downloaded model file is the one its signed profile records |
+//! | [`fixtures`] | The sessions the benchmark and the tests describe, the largest context in four scripts |
 //!
 //! The `kr-describe-inference` binary is the description process the daemon starts: the serving
 //! code in `kr_describe::serve` over [`llama::Llama`]. The `kr-describe-bench` binary checks real
@@ -18,4 +19,5 @@
 //! fetches the weights and runs it.
 
 pub mod assets;
+pub mod fixtures;
 pub mod llama;
