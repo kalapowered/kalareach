@@ -29,15 +29,18 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::{
@@ -464,6 +467,61 @@ impl Admitted {
     }
 }
 
+/// Returns why the program cannot run where this launcher is, when the job this launcher is in
+/// restricts access to desktops.
+///
+/// The program is the launcher's own child, so it runs in the job the launcher is in, and a
+/// vendor's own sandbox makes a desktop of its own, which a job that restricts desktops refuses.
+/// There is no reduced-ownership profile on this route (the program runs in the person's own
+/// shell's job and no other), so the launcher says so and the typed command runs as typed, which
+/// is what the shell does without the integration. Only the innermost job can be read: what a job
+/// above it carries is not visible from here.
+///
+/// A job whose restrictions cannot be read is declined too: a program is not started on the
+/// strength of a limit nobody could look at.
+fn desktop_refusal() -> Option<String> {
+    let mut inside = 0_i32;
+    // SAFETY: the pseudo-handle names this process, a null job asks about any job, and the answer
+    // is a local this thread owns.
+    let asked =
+        unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut inside) };
+    if asked == 0 {
+        return Some(format!(
+            "the launcher cannot tell whether it is in a job: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if inside == 0 {
+        return None;
+    }
+    let mut restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+        UIRestrictionsClass: 0,
+    };
+    let mut written = 0_u32;
+    // SAFETY: a null handle names the caller's own job; the structure and the count are locals
+    // this thread owns, and the declared size is the structure's own.
+    let read = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicUIRestrictions,
+            std::ptr::from_mut(&mut restrictions).cast(),
+            u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>()).unwrap_or(0),
+            &raw mut written,
+        )
+    };
+    if read == 0 {
+        return Some(format!(
+            "the limits of the job the launcher is in cannot be read: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    (restrictions.UIRestrictionsClass & JOB_OBJECT_UILIMIT_DESKTOP != 0).then(|| {
+        "the job this launcher is in restricts access to desktops, which a vendor's own sandbox \
+         needs to make one of its own, and the program would run in that job"
+            .to_owned()
+    })
+}
+
 /// Presents this process to the backend and waits for its admission, all within
 /// [`ADMISSION_DEADLINE`] of the launcher's start.
 fn present(
@@ -585,6 +643,16 @@ pub(super) fn run(
     };
     if let Some(hold) = hold_after_admission {
         std::thread::sleep(hold);
+    }
+    // Where the program could not run its own sandbox, nothing is created: the backend is told why
+    // and the typed command runs as typed.
+    if let Some(why) = desktop_refusal() {
+        admitted.decline(&why);
+        drop(admitted);
+        crate::report(&format!(
+            "the program cannot run in this job ({why}), so it runs as typed"
+        ));
+        return exec_after(hold_before_exec, executable, &typed, Route::AsTyped);
     }
     // The program is created before the backend is told, so that the backend can name it; it does
     // not run until the backend says the launch is committed.

@@ -248,6 +248,22 @@ impl AgentJob {
         Ok(Self { job })
     }
 
+    /// Creates an agent's job that also carries user-interface restrictions, for this host's own
+    /// tests: the innermost job of a launcher a restricted job holds.
+    ///
+    /// It is compiled away in every shipped build.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::create`] does, and the operating system's failure when the
+    /// restrictions cannot be set.
+    #[cfg(feature = "testing")]
+    pub fn create_restricting(ui_restrictions: u32) -> std::io::Result<Self> {
+        let created = Self::create()?;
+        created.job.restrict_ui(ui_restrictions)?;
+        Ok(created)
+    }
+
     /// Creates the job an agent runs in under the reduced-ownership profile: unnamed, breakaway
     /// disabled, and kill-on-close with this the only handle to it.
     ///
