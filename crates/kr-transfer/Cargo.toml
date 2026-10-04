@@ -48,6 +48,9 @@ rustix = { workspace = true, features = ["fs", "mount"] }
 # This crate's own tests, with the removal's steps reachable: a test stands at each step at the end
 # of a directory's removal, which no timing reaches reliably.
 kr-transfer = { path = ".", features = ["testing"] }
+# The WebP decoder, which the daemon and the worker link through the terminal engine: the preview
+# tests run with it linked, so a WebP that is withheld is withheld by the module's allowlist.
+image = { workspace = true, features = ["webp"] }
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
 # The tests read a file identity the way the service does, through an opened directory.

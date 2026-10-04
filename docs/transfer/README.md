@@ -613,29 +613,38 @@ widened and no file is placed in a repository. A typed submission needs no path 
 
 Section 14 fixes four numbers and a format list: 40 megapixels of input, 256 MiB of decode memory, a
 16 MiB decoded-thumbnail budget, and PNG, JPEG, WebP and the first frame of a GIF. The `image` crate
-is pinned at 0.25.10 with only the decoders named below compiled in.
+is pinned at 0.25.10, and the module runs only the decoders named below.
 
-WebP is on that list and is withheld. The pinned lossless decoder takes its Huffman group count from
-a sixteen-bit metadata field and allocates a table set per group, so a file of a few kilobytes can
-ask for hundreds of megabytes that no bound on pixels can catch. The decoder is therefore not
-compiled in at all; a WebP is recognised from its twelve-byte container signature and publishes with
-no preview and the reason `no preview for this format`. The transfer itself succeeds, because an
-attachment without a preview is still an attachment. WebP previews return when the pin bounds that
-allocation.
+WebP is on that list and is withheld, as it’s possible to create a file of a few kilobytes that will
+make the lossless decoder allocate hundreds of megabytes that no bound on pixels can catch, as the
+number of Huffman groups it needs is read directly from a 16-bit field in the metadata and a set of
+tables is allocated for each group. As such, the preview module doesn’t pass WebP images to the
+decoder at all, but instead directly returns that there’s no preview available for the image and the
+reason `no preview for this format`. The transfer itself succeeds, because an attachment without a
+preview is still an attachment. The preview module runs only PNG, JPEG, and the first frame of GIF
+images, and is able to detect WebP images from the file container’s 12-byte signature.
+
+That refusal does not depend on what is linked, as the terminal engine depends on the `image` crate
+with the default set of formats, and the crate will only be compiled once due to how cargo resolves
+dependencies. This means the daemon and worker both have the WebP decoder available. Terminal output
+cannot reach it: the terminal profile classes the three sequences that carry an image (an iTerm2
+file, sixel and the Kitty graphics protocol) as extensions and withholds them, so none of them gets
+to the grid that would decode it. WebP previews return when WebP decoding is bounded in what it
+allocates.
 
 Two of those numbers need this crate's own enforcement rather than the library's. `image` documents
 its allocation limit as advisory, and its decoders hold more than the output while they work, so the
 limit is set on the decoder *and* the decode is refused in advance on a charge this crate makes: the
-declared pixels at sixteen bytes each. Sixteen is the worst case among the decoders compiled in
-here, a PNG decoded to sixteen-bit RGBA and a compositing decoder holding its output, its frame and
+declared pixels at sixteen bytes each. Sixteen is the worst case among the decoders the module
+runs, a PNG decoded to sixteen-bit RGBA and a compositing decoder holding its output, its frame and
 its canvas at once. The charge belongs to the pins in the manifest and is re-derived when they
 move.
 
 It bounds the *pixel* buffers, which is what image dimensions decide. It does not bound every
 structure a codec can allocate from its own metadata, and where a pinned decoder does that the
-answer here is not to run it: that is why WebP is withheld above. Among the decoders that are
-compiled in, the pixel charge is the bound, and a decoder whose metadata could allocate past it is
-one this host does not link.
+answer here is not to run it: that is why WebP is withheld above. Among the decoders it runs, the
+pixel charge is the bound, and a decoder whose metadata could allocate past it is one this host
+does not run.
 
 An image whose charge is above the budget publishes as a file. What that establishes is a bound on
 the *pixel* buffers of an accepted image, not a proof that an accepted image cannot make a decoder
