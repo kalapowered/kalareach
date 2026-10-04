@@ -476,6 +476,8 @@ impl NetworkHost {
     /// order a revocation uses, so neither can interleave with the other.
     async fn admit(&self, session: &AuthorisedSession) -> Result<DeviceRecord> {
         let controller = self.daemon()?;
+        #[cfg(feature = "testing")]
+        controller.before_a_connection_is_registered.wait().await;
         let registry = controller.registry.lock().await;
         let admitted_revision = registry.authority_revision()?;
         // The final validation the transport's contract names. The handshake checked the record

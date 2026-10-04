@@ -155,6 +155,19 @@ impl Controller {
         self.after_the_retained_lookup.arm()
     }
 
+    /// Arms the pause the next network connection stops at once the transport has authorised it,
+    /// before this host registers it. Returns the end that says the connection has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_connection_registration(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_a_connection_is_registered.arm()
+    }
+
     /// Answers an action this daemon has already admitted for this caller, if it has.
     ///
     /// The de-duplication key is the actor and the action together, and the payload digest decides

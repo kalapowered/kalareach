@@ -2406,6 +2406,16 @@ async fn a_materialisation_asked_for_by_a_device_whose_authority_has_gone_is_not
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(&recorded.host, &device, &recorded.owner, proposal).await;
     let session = net_support::connect(&recorded.host, &device, &record).await;
+    // The host registers a connection after the transport has authorised it, so a device that has
+    // just connected is not yet known to hold a registration. An answer is what shows it does, and
+    // it is what this waits for.
+    session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &read_of(recorded.plain),
+        )
+        .await
+        .expect("the device's connection is registered once the host answers it");
     // The environment's authority is withdrawn, and every registration admitted under it goes
     // with it, this device's connection included.
     recorded
@@ -2450,6 +2460,74 @@ async fn a_materialisation_asked_for_by_a_device_whose_authority_has_gone_is_not
     )
     .await
     .expect("the device admitted again has the version written out");
+    again.close();
+    session.close();
+    recorded.stop().await;
+}
+
+/// KR-REQ-23.44 and section 9: a connection the transport authorised before the environment's
+/// authority was withdrawn is not served after it, although the host registers it only afterwards.
+///
+/// The host writes a connection into its authority store after the handshake has finished, so a
+/// withdrawal can land between the two and find no registration to take away. The host holds the
+/// connection there, withdraws authority, and lets it go: the registration that follows is made
+/// under a revision that did not exist when the connection was authorised, and nothing the device
+/// then asks is performed. A connection authorised after the withdrawal is served, as the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_authorised_before_authority_was_withdrawn_is_not_served_after_it() {
+    let recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let mut proposal = net_support::proposal(VERSION_RIGHTS);
+    proposal.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(1));
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(&recorded.host, &device, &recorded.owner, proposal).await;
+    let (arrived, release) = recorded.host.controller().pause_connection_registration();
+    let session = net_support::connect(&recorded.host, &device, &record).await;
+    arrived
+        .await
+        .expect("the host holds the connection before it registers it");
+    recorded
+        .host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the revocation is recorded");
+    release
+        .send(())
+        .expect("the host is still holding the connection");
+    remote_mutation(
+        &session,
+        env,
+        Method::ChangesetMaterialize,
+        &materialise_of(recorded.plain),
+    )
+    .await
+    .expect_err("a connection authorised before the withdrawal writes nothing");
+    // The owner's own connection went with the rest, so it reads on a new one.
+    let mut owners_own = recorded.host.client().await;
+    let owners: kr_protocol::changeset::ChangesetReadResult = locally(
+        &mut owners_own,
+        Method::ChangesetRead,
+        &kr_protocol::changeset::ChangesetReadParams {
+            change_set_id: recorded.plain.change_set_id,
+            version: Nullable::some(recorded.plain.version),
+        },
+    )
+    .await;
+    assert!(
+        owners.materialisations.is_empty(),
+        "nothing was written out under the withdrawn authority"
+    );
+    // The control: a connection authorised after the withdrawal writes the version out.
+    let again = net_support::connect(&recorded.host, &device, &record).await;
+    remote_mutation(
+        &again,
+        env,
+        Method::ChangesetMaterialize,
+        &materialise_of(recorded.plain),
+    )
+    .await
+    .expect("a connection authorised after the withdrawal has the version written out");
     again.close();
     session.close();
     recorded.stop().await;
