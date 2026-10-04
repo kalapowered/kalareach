@@ -6,7 +6,7 @@ is tested against the declarations a real release makes rather than against ones
 | | |
 | --- | --- |
 | Source | `kalareach-plugins`, `snapshots/development/targets/packages/kalareach/<package>/<version>/plugin.json` |
-| Commit | `9f003bb6b31899e0c59b6e24d0b10756a16ff7ab` |
+| Commit | `bb50ebb41f7ebe4e5fb8cb388b816c849007306d` |
 | Packages | `claude-code`, `gemini-cli` and `qoder-cli`, each at 0.5.0 |
 
 ## What it is
