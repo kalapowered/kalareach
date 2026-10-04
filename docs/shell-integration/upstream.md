@@ -167,7 +167,8 @@ A `.zshrc` that loads a few modules of its own pays about a quarter of a millise
    target release date and the status.
 
 The fish patch `0004-fish-command-resolve` patches the `exec_external_command` function in
-`src/exec.rs` as well as the interactive loop in `src/reader/reader.rs`. To check if the patch still
+`src/exec.rs`, the closure that runs the body of a block process in the same file, which counts that body as
+not being a second line, as well as the interactive loop in `src/reader/reader.rs`. To check if the patch still
 applies after moving to a new release of fish, run
 `bash scripts/build-shells.sh --fish --check-patches`. To check if it still asks, run the test case
 named `a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed` in
