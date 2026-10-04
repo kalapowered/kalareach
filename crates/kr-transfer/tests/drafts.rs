@@ -172,7 +172,11 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
     assert_eq!(
         harness
             .service
-            .mark_submitted(&harness.actor, created.draft_id)
+            .mark_submitted(
+                &harness.actor,
+                created.draft_id,
+                created.session_id.0.expect("a session")
+            )
             .expect("records the submission"),
         1
     );
