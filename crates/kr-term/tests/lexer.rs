@@ -324,6 +324,39 @@ fn an_oversized_control_string_is_discarded_whole() {
     assert_eq!(events[0].disposition, DirectDisposition::Withhold);
 }
 
+/// KR-REQ-08.13: the bound counts every payload byte, the separators between the parts of an
+/// operating system command included, wherever in the string the last byte over it falls.
+#[test]
+fn a_separator_counts_towards_the_control_string_bound() {
+    let bound = LexLimits::DEFAULT.max_control_string;
+    // A title whose payload is `0;`, a filler and a closing `;`, `total` bytes in all.
+    let ending_in_a_separator = |total: usize| {
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b'a', total - 3));
+        input.extend_from_slice(b";\x1b\\");
+        input
+    };
+    let at_the_bound = lex(&ending_in_a_separator(bound));
+    assert_eq!(classes(&at_the_bound), "M", "a string at its bound is kept");
+    for events in [
+        lex(&ending_in_a_separator(bound + 1)),
+        lex_byte_by_byte(&ending_in_a_separator(bound + 1)),
+    ] {
+        assert_eq!(classes(&events), "X");
+        assert!(
+            matches!(
+                events[0].kind,
+                EventKind::Discarded {
+                    cause: DiscardCause::Oversized,
+                    ..
+                }
+            ),
+            "a separator one byte past the bound is discarded like any other byte: {:?}",
+            events[0].kind
+        );
+    }
+}
+
 /// KR-REQ-08.13: the suffix of an oversized payload never executes as a fresh control sequence.
 #[test]
 fn an_oversized_payload_suffix_does_not_execute() {
