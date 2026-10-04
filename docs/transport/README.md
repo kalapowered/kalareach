@@ -469,9 +469,9 @@ consumer's call, because only the consumer knows which stream it asked about.
 
 Receiving an event is not applying it. The session records what arrived; a consumer records what it
 folded into its state, and only that moves the position a reconnect subscribes from. An event that
-was delivered and never applied arrives again rather than being skipped. A gap in the sequence, or a
-`RESYNC_REQUIRED` from the host, leaves the stream owing a snapshot: nothing it delivers establishes
-a position until one is installed.
+was delivered and never applied arrives again rather than being skipped. A gap in the sequence
+leaves the stream owing a snapshot: nothing it delivers establishes a position until one is
+installed.
 
 Receipts are carried across, and so are the actions that were sent without any receipt arriving,
 which is the one case a receipt tracker cannot name. Each of those carries the intent it was
