@@ -85,6 +85,39 @@ impl HistoryReach {
     }
 }
 
+/// What a model on this host wrote of a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedText {
+    /// The title it gave the session.
+    pub title: String,
+    /// What it said the session is doing.
+    pub activity: String,
+}
+
+/// Something the host observed of a session, and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed {
+    /// What was observed.
+    pub text: String,
+    /// When the host first observed it as it stands, on the wall clock, in milliseconds.
+    pub at_ms: u64,
+}
+
+/// What the description host says of one session to voice context, apart from what the daemon
+/// itself knows of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoiceDescription {
+    /// The name a person pinned, when there is one.
+    pub pinned: Option<String>,
+    /// What a model wrote, when this environment may read it now: not while privacy mode is on, not
+    /// beside a pin, and only of the generation in force.
+    pub generated: Option<GeneratedText>,
+    /// The directory the host last observed the session in.
+    pub directory: Option<Observed>,
+    /// The program the host last observed in the foreground.
+    pub application: Option<Observed>,
+}
+
 /// The session-metadata store, as this daemon serves it.
 #[derive(Debug)]
 pub struct DescribeModule {
@@ -616,6 +649,66 @@ impl DescribeModule {
                 source: LabelSource::Metadata,
                 generated: None,
             },
+        })
+    }
+
+    /// Reads what voice context says of one session from the description host and the store: the
+    /// name a person pinned, what a model wrote, and what the host observed.
+    ///
+    /// Read under the environment's privacy state as it stands, held until the read is decided,
+    /// so a change of privacy mode waits for it. Nothing generated or observed is read while
+    /// privacy mode is on, and nothing of an earlier generation after it; a model's text is not
+    /// read beside a pin, which wins as it does for [`Self::describe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn voice_description(
+        &self,
+        session_id: SessionId,
+        facts: &SessionFacts,
+        privacy: &PrivacyState,
+    ) -> Result<VoiceDescription> {
+        let store = self.store();
+        let reading = privacy.reading();
+        let published = reading.published();
+        let named = self.shown(&store, session_id, facts, HistoryReach::Partial, published)?;
+        let pinned = (named.source == LabelSource::Pinned).then(|| named.title.as_str().to_owned());
+        let generated = if pinned.is_some() {
+            None
+        } else {
+            self.shown(
+                &store,
+                session_id,
+                facts,
+                HistoryReach::WholeSession,
+                published,
+            )?
+            .generated
+            .map(|record| GeneratedText {
+                title: record.title.as_str().to_owned(),
+                activity: record.activity.as_str().to_owned(),
+            })
+        };
+        let seen = if published.private {
+            None
+        } else {
+            self.host()
+                .filter(|host| host.runs())
+                .and_then(|host| host.snapshot().seen.get(&session_id).cloned())
+        };
+        let current = |seen: Option<&host::SeenText>| {
+            seen.filter(|held| held.generation == published.generation)
+                .map(|held| Observed {
+                    text: held.text.clone(),
+                    at_ms: held.at_ms,
+                })
+        };
+        Ok(VoiceDescription {
+            pinned,
+            generated,
+            directory: current(seen.as_ref().and_then(|seen| seen.directory.as_ref())),
+            application: current(seen.as_ref().and_then(|seen| seen.application.as_ref())),
         })
     }
 

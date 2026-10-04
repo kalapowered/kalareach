@@ -249,6 +249,31 @@ impl Worker {
         }
     }
 
+    /// Tells the session what the shell resolved the line it is about to run to, as the shell
+    /// integration's hook does before the line's block: the program is named only from a file the
+    /// shell found, and this test's own executable is one.
+    fn resolve(&self, program: &str, cwd: &str) {
+        let invocation = kr_protocol::root::RootCommandResolveParams {
+            session_id: self.session_id,
+            prompt_generation: PromptGeneration::new(1),
+            argv: vec![program.to_owned()],
+            executable: std::env::current_exe()
+                .expect("this test's own executable")
+                .to_string_lossy()
+                .into_owned(),
+            interactive: true,
+            cwd: cwd.to_owned(),
+            cwd_revision: CwdRevision::new(0),
+        };
+        let _ = self.runtime.session().apply_fence_effects(Effects {
+            steps: vec![Step::CommandHook(
+                RequestId::new(1),
+                Box::new(CommandHook::Resolve(invocation)),
+            )],
+            ..Effects::default()
+        });
+    }
+
     /// Reports a command block to the session as the shell integration's hook does.
     fn report(&self, command: &str, cwd: &str, status: Option<u64>) {
         let block = RootCommandBlockParams {
@@ -1187,6 +1212,22 @@ impl Environment {
         read.items
     }
 
+    /// Reads one session's summary at the daemon's local socket.
+    async fn summary_of(&self, session_id: SessionId) -> kr_protocol::session::SessionSummary {
+        let mut client = self.host.client().await;
+        let read: kr_protocol::session::SessionReadResult = client
+            .request(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the session reads")
+            .to_typed()
+            .expect("decodes");
+        read.session
+    }
+
     /// Reads one session at the daemon's local socket.
     async fn state_of(&self, session_id: SessionId) -> SessionState {
         let mut client = self.host.client().await;
@@ -1752,6 +1793,130 @@ async fn turning_descriptions_off_with_work_in_the_process_answers_with_the_paus
         );
         environment.stop().await;
     }
+}
+
+/// A paired device's grant that reaches back to `lower_bound_ms`, as voice context reads a
+/// session under it.
+fn voice_grant(lower_bound_ms: u64) -> kr_protocol::grant::Grant {
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+    Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([1; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::SessionView].into_iter().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(lower_bound_ms)),
+            include_live_screen: true,
+            named_questions: kr_protocol::scalars::CanonicalSet::from_iter([]),
+            named_approvals: kr_protocol::scalars::CanonicalSet::from_iter([]),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    }
+}
+
+/// KR-REQ-15.20: voice context carries what the description host holds of a session: what a model
+/// wrote, labelled, placed at the session's start and shown only to a grant that reaches it; the
+/// directory and the program the host observed, each at the moment it observed them, which a
+/// grant that does not reach the start still sees; and nothing of either while privacy mode is on
+/// or after it, because what the host held went with it. The control is the same session read
+/// before the host has described it, which carries neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_context_carries_what_the_host_holds_of_a_session_each_at_its_own_moment() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let controller = Arc::clone(environment.controller());
+    let started = environment.summary_of(session_id).await.created_at_ms.get();
+
+    // The control: nothing has happened in the session, so nothing was observed or written.
+    let before = controller
+        .voice_session_snapshot(session_id)
+        .await
+        .expect("the snapshot");
+    assert!(before.generated.is_none() && before.active_application.is_none());
+
+    let before_the_report = kr_ipc::now_ms().get();
+    assert!(
+        started < before_the_report,
+        "the session started before it did anything"
+    );
+    environment.workers[0].resolve("make", "/home/a/kalareach");
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let described = environment
+        .describe_until("the description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    let snapshot = controller
+        .voice_session_snapshot(session_id)
+        .await
+        .expect("the snapshot");
+
+    let model = snapshot.generated.clone().expect("what the model wrote");
+    assert_eq!(
+        model.produced_at_ms, started,
+        "placed at the session's start"
+    );
+    assert!(model.text.contains(&described.title), "{model:?}");
+    let directory = snapshot.working_directory.clone().expect("the directory");
+    assert!(directory.text.contains("kalareach"), "{directory:?}");
+    assert!(
+        directory.produced_at_ms >= before_the_report,
+        "observed after the report, not at the session's start: {directory:?}"
+    );
+    let application = snapshot.active_application.clone().expect("the program");
+    assert_eq!(application.text, "make");
+    assert!(
+        application.produced_at_ms >= before_the_report,
+        "{application:?}"
+    );
+
+    // A grant that reaches the session's start is shown what the model wrote, and one that begins
+    // after it, before the report, is shown what was observed and not that.
+    let whole = kr_controller::voice::filtered(snapshot.clone(), &voice_grant(started));
+    assert!(
+        whole
+            .session_description
+            .expect("the description")
+            .text
+            .contains(&described.title)
+    );
+    let partial = kr_controller::voice::filtered(snapshot.clone(), &voice_grant(started + 1));
+    assert!(
+        partial
+            .session_description
+            .is_none_or(|description| !description.text.contains(&described.title)),
+        "a grant that does not reach the session's start is not shown what the model wrote"
+    );
+    assert!(partial.working_directory.is_some() && partial.active_application.is_some());
+
+    // While privacy mode is on nothing the host held is carried, and nothing returns after it.
+    environment.privacy(true).await;
+    environment.until_privacy_settled().await;
+    let private = controller
+        .voice_session_snapshot(session_id)
+        .await
+        .expect("the snapshot");
+    assert!(private.generated.is_none() && private.active_application.is_none());
+    environment.privacy(false).await;
+    environment.until_privacy_settled().await;
+    let after = controller
+        .voice_session_snapshot(session_id)
+        .await
+        .expect("the snapshot");
+    assert!(
+        after.generated.is_none() && after.active_application.is_none(),
+        "{after:?}"
+    );
+    environment.stop().await;
 }
 
 /// KR-REQ-22.01, KR-REQ-22.03: a host whose processor lacks an instruction set the description

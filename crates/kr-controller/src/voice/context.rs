@@ -24,6 +24,10 @@ use kr_worker::history_filter::{HistoryFilter, Surface, Timed, ViewerScope};
 pub struct SessionSnapshot {
     /// The session's description, with the moment it describes.
     pub description: Option<ContextItem>,
+    /// What a model on this host wrote of the session, labelled as that, placed at the session's
+    /// start because it summarises the session from its start. Apart from the description, so that
+    /// a bound that withholds one does not decide the other.
+    pub generated: Option<ContextItem>,
     /// The current working directory.
     pub working_directory: Option<ContextItem>,
     /// The active application.
@@ -54,24 +58,11 @@ pub fn snapshot_of(summary: &SessionSummary, session_id: SessionId) -> SessionSn
     let created_at_ms = summary.created_at_ms.get();
     let at_creation = |text: String| ContextItem::new(text, created_at_ms);
     SessionSnapshot {
+        generated: None,
         // The session's own description is the shell it runs and where it runs it. Both are facts
         // this daemon holds itself, so the description never rests on something it would have to
         // ask a worker for.
-        description: (!summary.shell_path.is_empty()).then(|| {
-            // A closed session ran its shell; it does not run it. The tense is part of the fact,
-            // and a summary built from this must not say a session that ended is still going.
-            at_creation(if summary.state == SessionState::Closed {
-                format!(
-                    "session {} ran {}",
-                    summary.display_number, summary.shell_path
-                )
-            } else {
-                format!(
-                    "session {} running {}",
-                    summary.display_number, summary.shell_path
-                )
-            })
-        }),
+        description: description_text(summary, None, false).map(at_creation),
         working_directory: (!summary.cwd.is_empty()).then(|| at_creation(summary.cwd.clone())),
         active_application: None,
         pending_decisions: Vec::new(),
@@ -89,6 +80,82 @@ pub fn snapshot_of(summary: &SessionSummary, session_id: SessionId) -> SessionSn
             },
         ],
     }
+}
+
+/// What this host can say about one session, with what the description host says of it.
+///
+/// Each part keeps its own moment, because that is what a grant's history bound is checked
+/// against:
+///
+/// - What a model wrote is placed at the session's start. It summarises the session from its
+///   start, so a grant whose history begins after the start is not shown it, and it is carried
+///   apart from the description, labelled as written by a model that may be wrong.
+/// - A name a person pinned is part of the description, from the moment the session started.
+/// - The directory and the program the description host observed carry the moment it observed
+///   them. Where the session started stays with the description, and is read as the working
+///   directory only while nothing has been observed, and the foreground is reported unavailable
+///   only then.
+#[must_use]
+pub fn snapshot_with(
+    summary: &SessionSummary,
+    session_id: SessionId,
+    described: &crate::describe::VoiceDescription,
+) -> SessionSnapshot {
+    let created_at_ms = summary.created_at_ms.get();
+    let mut snapshot = snapshot_of(summary, session_id);
+    snapshot.description = description_text(
+        summary,
+        described.pinned.as_deref(),
+        described.directory.is_some(),
+    )
+    .map(|text| ContextItem::new(text, created_at_ms));
+    snapshot.generated = described.generated.as_ref().map(|written| {
+        ContextItem::new(
+            format!(
+                "described by a local model, which may be wrong: \"{}\": {}",
+                written.title, written.activity
+            ),
+            created_at_ms,
+        )
+    });
+    if let Some(directory) = &described.directory {
+        snapshot.working_directory = Some(ContextItem::new(&directory.text, directory.at_ms));
+    }
+    if let Some(application) = &described.application {
+        snapshot.active_application = Some(ContextItem::new(&application.text, application.at_ms));
+        snapshot
+            .unavailable
+            .retain(|run| !run.reason.contains("foreground"));
+    }
+    snapshot
+}
+
+/// What a session is, from what this daemon holds of it: its number, a name a person pinned, the
+/// shell it runs, and where it started when `started_in` asks for that.
+fn description_text(
+    summary: &SessionSummary,
+    pinned: Option<&str>,
+    started_in: bool,
+) -> Option<String> {
+    if summary.shell_path.is_empty() {
+        return None;
+    }
+    // A closed session ran its shell; it does not run it. The tense is part of the fact, and a
+    // summary built from this must not say a session that ended is still going.
+    let tense = if summary.state == SessionState::Closed {
+        "ran"
+    } else {
+        "running"
+    };
+    let mut text = format!("session {}", summary.display_number);
+    if let Some(name) = pinned {
+        text.push_str(&format!(", named \"{name}\","));
+    }
+    text.push_str(&format!(" {tense} {}", summary.shell_path));
+    if started_in && !summary.cwd.is_empty() {
+        text.push_str(&format!(", started in {}", summary.cwd));
+    }
+    Some(text)
 }
 
 /// Where the session facts come from.
@@ -194,8 +261,22 @@ pub fn filtered(snapshot: SessionSnapshot, grant: &Grant) -> GatheredContext {
         }
     }
 
+    // What a model wrote is admitted on its own moment and joined to the description only when it
+    // is admitted: a bound that keeps one back says nothing of the other.
+    let description = admit_one(&filter, snapshot.description, &mut withheld);
+    let written = admit_one(&filter, snapshot.generated, &mut withheld);
+    let session_description = match (description, written) {
+        (Some(mut description), Some(written)) => {
+            description.text.push_str("; ");
+            description.text.push_str(&written.text);
+            Some(description)
+        }
+        (None, Some(written)) => Some(written),
+        (description, None) => description,
+    };
+
     GatheredContext {
-        session_description: admit_one(&filter, snapshot.description, &mut withheld),
+        session_description,
         working_directory: admit_one(&filter, snapshot.working_directory, &mut withheld),
         active_application: admit_one(&filter, snapshot.active_application, &mut withheld),
         pending_decisions: admit(&filter, snapshot.pending_decisions, &mut withheld),
@@ -381,6 +462,159 @@ mod tests {
             gathered.withheld.iter().any(|run| run.count > 0),
             "what was kept back is counted: {:?}",
             gathered.withheld
+        );
+    }
+
+    /// KR-REQ-15.20: what a model wrote of a session is shown, labelled, only to a grant whose
+    /// history reaches the session's start, and is gated apart from the description: a bound that
+    /// keeps the description back does not decide it, and one that admits the description does not
+    /// carry it. The control is the grant that reaches the start, which is shown both.
+    #[tokio::test]
+    async fn generated_text_is_shown_only_to_a_grant_that_reaches_the_sessions_start() {
+        let facts = Facts(SessionSnapshot {
+            // A description from a later moment than the session's start, so that a bound between
+            // the two admits the one and not the other.
+            description: Some(ContextItem::new("session 3 running /bin/zsh", 2_000)),
+            generated: Some(ContextItem::new(
+                "described by a local model, which may be wrong: \"Pairing\": checks the flow",
+                1_000,
+            )),
+            ..SessionSnapshot::default()
+        });
+        let source = FilteredContext::new(Arc::new(facts));
+        let gather = |lower_bound_ms: u64| {
+            let request = ContextRequest {
+                session_id: session_id(),
+                grant: device_grant(lower_bound_ms),
+                selected: CanonicalSet::from_iter([]),
+            };
+            let source = &source;
+            async move { source.gather(&request).await.expect("the gathering runs") }
+        };
+
+        let whole = gather(1_000).await;
+        let text = whole.session_description.expect("described").text;
+        assert!(text.contains("session 3 running /bin/zsh"), "{text}");
+        assert!(
+            text.contains("local model") && text.contains("checks the flow"),
+            "{text}"
+        );
+
+        let partial = gather(1_500).await;
+        let text = partial.session_description.expect("the description").text;
+        assert_eq!(
+            text, "session 3 running /bin/zsh",
+            "the description a bound admits carries nothing the model wrote"
+        );
+        assert!(
+            partial.withheld.iter().any(|run| run.count > 0),
+            "what was kept back is counted: {:?}",
+            partial.withheld
+        );
+    }
+
+    /// KR-REQ-15.20: what a model wrote of a session is placed at the session's start, because it
+    /// summarises the session from its start, and is carried apart from the description. A pinned
+    /// name is in the description, and the model's text is not carried beside it. The control is
+    /// the session with no description from the host, which keeps what this daemon holds.
+    #[test]
+    fn what_a_model_wrote_is_placed_at_the_sessions_start_and_apart_from_the_description() {
+        use crate::describe::{GeneratedText, VoiceDescription};
+        let generated = VoiceDescription {
+            generated: Some(GeneratedText {
+                title: "KalaReach pairing".to_owned(),
+                activity: "Checks the code-entry flow".to_owned(),
+            }),
+            ..VoiceDescription::default()
+        };
+        let snapshot = snapshot_with(&summary(1_000), session_id(), &generated);
+        let model = snapshot.generated.expect("what the model wrote");
+        assert_eq!(model.produced_at_ms, 1_000, "the session's start");
+        assert!(
+            model.text.contains("local model")
+                && model.text.contains("KalaReach pairing")
+                && model.text.contains("Checks the code-entry flow"),
+            "{model:?}"
+        );
+        let description = snapshot.description.expect("a description");
+        assert!(
+            !description.text.contains("KalaReach pairing"),
+            "the description is not the model's: {description:?}"
+        );
+
+        let pinned = VoiceDescription {
+            pinned: Some("Release 1.0".to_owned()),
+            ..VoiceDescription::default()
+        };
+        let snapshot = snapshot_with(&summary(1_000), session_id(), &pinned);
+        assert!(snapshot.generated.is_none());
+        assert!(
+            snapshot
+                .description
+                .expect("a description")
+                .text
+                .contains("Release 1.0")
+        );
+
+        let held = snapshot_with(&summary(1_000), session_id(), &VoiceDescription::default());
+        assert_eq!(held, snapshot_of(&summary(1_000), session_id()));
+    }
+
+    /// KR-REQ-15.20: the directory and the application the description host observed carry the
+    /// moments it observed them, which is what a grant's history bound is checked against, and
+    /// the foreground is no longer reported as unavailable when it was observed. The control is the
+    /// session the host has observed nothing of, which keeps the directory it started in at its
+    /// creation and reports the foreground unavailable.
+    #[test]
+    fn the_observed_directory_and_application_carry_the_moments_they_were_observed() {
+        use crate::describe::{Observed, VoiceDescription};
+        let observed = VoiceDescription {
+            directory: Some(Observed {
+                text: "kalareach (main)".to_owned(),
+                at_ms: 3_000,
+            }),
+            application: Some(Observed {
+                text: "cargo".to_owned(),
+                at_ms: 3_500,
+            }),
+            ..VoiceDescription::default()
+        };
+        let snapshot = snapshot_with(&summary(1_000), session_id(), &observed);
+        let directory = snapshot.working_directory.expect("a directory");
+        assert_eq!(directory.produced_at_ms, 3_000);
+        assert!(directory.text.contains("kalareach"), "{directory:?}");
+        let application = snapshot.active_application.expect("an application");
+        assert_eq!(application.produced_at_ms, 3_500);
+        assert_eq!(application.text, "cargo");
+        assert!(
+            !snapshot
+                .unavailable
+                .iter()
+                .any(|run| run.reason.contains("foreground")),
+            "{:?}",
+            snapshot.unavailable
+        );
+        // Where the session started stays with the description, from the moment it started.
+        let description = snapshot.description.expect("a description");
+        assert!(
+            description.text.contains("/work/kalareach") && description.produced_at_ms == 1_000,
+            "{description:?}"
+        );
+
+        let nothing = snapshot_with(&summary(1_000), session_id(), &VoiceDescription::default());
+        assert_eq!(
+            nothing
+                .working_directory
+                .expect("a directory")
+                .produced_at_ms,
+            1_000
+        );
+        assert!(nothing.active_application.is_none());
+        assert!(
+            nothing
+                .unavailable
+                .iter()
+                .any(|run| run.reason.contains("foreground"))
         );
     }
 

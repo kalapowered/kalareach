@@ -88,15 +88,36 @@ impl Controller {
     /// it started in are fixed when the session is created, so the creation time is theirs; a fact
     /// this daemon cannot place in time is withheld rather than stamped with the moment it was
     /// read, which would let a retained summary of a session that closed long ago pass a bound
-    /// written after it.
-    pub(crate) async fn voice_session_snapshot(
+    /// written after it. What the description host holds of the session is read beside it: the
+    /// directory and the program it observed, each with the moment it observed them, and what a
+    /// model wrote, placed at the session's start ([`crate::voice::snapshot_with`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of the session read, and [`ControllerError::RegistryUnavailable`] when
+    /// the description store cannot be read.
+    pub async fn voice_session_snapshot(
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<crate::voice::SessionSnapshot> {
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
-        Ok(crate::voice::snapshot_of(&read.session, session_id))
+        let descriptions = Arc::clone(&self.descriptions);
+        let privacy = self.privacy.state();
+        let facts = crate::describe::facts_of(&read.session);
+        let described = tokio::task::spawn_blocking(move || {
+            descriptions.voice_description(session_id, &facts, &privacy)
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the session's description could not be read".to_owned(),
+        })??;
+        Ok(crate::voice::snapshot_with(
+            &read.session,
+            session_id,
+            &described,
+        ))
     }
 
     /// Performs one voice proposal under the method the registry lists for its effect.
