@@ -36,6 +36,8 @@
 //! * [`paths`] admits only paths that mean one unambiguous file on Linux, macOS and Windows.
 //! * [`integration`] adds only whole flags a person confirmed to the command it names, and sets
 //!   only environment variables the contract permits by exact name and value.
+//! * [`launch_probe`] runs only the arguments a person confirmed, and reads one string from what
+//!   the application prints.
 //!
 //! # Modules
 //!
@@ -56,6 +58,7 @@
 //! | [`connector`] | The declarative native-proxy table |
 //! | [`plugin`] | The `plugin.json` manifest |
 //! | [`integration`] | A package's command integration: its command, flags and variables |
+//! | [`launch_probe`] | A package's launch probe: how the host reads the mode an application will run in |
 //! | [`forwarder`] | The placeholder a package writes for the forwarder, and how the host replaces it |
 //! | [`catalogue`] | The signed catalogue index |
 //! | [`package`] | The on-disk package layout |
@@ -101,6 +104,7 @@ pub mod forwarder;
 pub mod identity;
 pub mod ids;
 pub mod integration;
+pub mod launch_probe;
 pub mod limits;
 pub mod matching;
 pub mod package;

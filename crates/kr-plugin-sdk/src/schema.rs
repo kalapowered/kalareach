@@ -155,8 +155,8 @@ fn vocabulary(generator: &mut SchemaGenerator) -> Schema {
 ///
 /// Consumers that are not written in Rust read this file instead of re-deriving the tables. It
 /// carries the effect classes with the rights each one needs, the capabilities with their default
-/// ceiling, the node union, the execution limits, the repository budgets and what a command
-/// integration may declare.
+/// ceiling, the node union, the execution limits, the repository budgets, and what a command
+/// integration and a launch probe may declare.
 #[must_use]
 pub fn package_contract() -> Value {
     let effects: Vec<Value> = EffectClass::ALL
@@ -218,6 +218,16 @@ pub fn package_contract() -> Value {
         "predicate_bounds": {
             "max_depth": crate::predicate::MAX_PREDICATE_DEPTH,
             "max_terms": crate::predicate::MAX_PREDICATE_TERMS,
+        },
+        "launch_probe": {
+            "max_arguments": crate::launch_probe::MAX_ARGUMENTS,
+            "max_argument_bytes": crate::launch_probe::MAX_ARGUMENT_BYTES,
+            "max_carried_options": crate::launch_probe::MAX_CARRIED_OPTIONS,
+            "max_option_bytes": crate::launch_probe::MAX_OPTION_BYTES,
+            "max_pointer_bytes": crate::launch_probe::MAX_POINTER_BYTES,
+            "max_refused_words": crate::launch_probe::MAX_REFUSED_WORDS,
+            "max_word_bytes": crate::launch_probe::MAX_WORD_BYTES,
+            "max_mode_bytes": crate::launch_probe::MAX_MODE_BYTES,
         },
         "command_integration": {
             "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,

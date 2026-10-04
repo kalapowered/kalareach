@@ -127,7 +127,11 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         .collect();
     assert_eq!(
         confirmed,
-        ["native_bridge.install", "command_integration.launch"]
+        [
+            "native_bridge.install",
+            "command_integration.launch",
+            "launch.probe"
+        ]
     );
 
     // What a command integration may declare: its bounds, and the variables it may set, by exact
@@ -145,6 +149,17 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         integration["permitted_variables"].as_array().map(Vec::len),
         Some(1)
     );
+
+    // What a launch probe may declare: its bounds.
+    let probe = &contract["launch_probe"];
+    assert_eq!(probe["max_arguments"], 8);
+    assert_eq!(probe["max_argument_bytes"], 256);
+    assert_eq!(probe["max_carried_options"], 8);
+    assert_eq!(probe["max_option_bytes"], 32);
+    assert_eq!(probe["max_pointer_bytes"], 256);
+    assert_eq!(probe["max_refused_words"], 8);
+    assert_eq!(probe["max_word_bytes"], 64);
+    assert_eq!(probe["max_mode_bytes"], 128);
 }
 
 /// KR-REQ-23.53: every effect class in the generated plugin contract names the rights it needs,
