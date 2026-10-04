@@ -3028,9 +3028,9 @@ storage is off, and a pass with no work asks the service nothing.
 ### What it does not do
 
 It serves no method. `storage.*` and `backup.manifest` are *service* methods, which this host calls
-rather than answers. The daemon does not start the uploader, and it holds no source
-for the account token that spends an account's storage beside the host's signature, so a running
-host still carries nothing to a service.
+rather than answers. The daemon does not start the uploader, and it holds no source for the account
+token that spends an account's storage beside the host's signature, so a running host sends nothing
+to a service.
 
 ## Privacy mode
 
