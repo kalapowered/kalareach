@@ -462,10 +462,10 @@ left unacknowledged is reported as an interruption, not resent.
 The client restores state through cursors and receipts. `Restoration` enforces the order, and
 refuses a step taken out of it: subscribe from the cursor *first*, then install the snapshot the
 subscription returned, then apply the queued updates. The steps are the consumer's to take: the
-session tracks positions and delivers events, and the consumer calls `Session::applied`,
-`Session::installed_snapshot` and `Session::discard_stream` as it folds them into its state. A
-`RESYNC_REQUIRED` answer is returned as `ClientError::ResyncRequired`; discarding the stream it
-names is the consumer's call, because only the consumer knows which stream it asked about.
+session tracks positions and delivers events, and the consumer calls `Session::applied` and
+`Session::installed_snapshot` as it folds them into its state. A `RESYNC_REQUIRED` answer is
+returned as `ClientError::ResyncRequired`; what to do about the stream it names is the
+consumer's call, because only the consumer knows which stream it asked about.
 
 Receiving an event is not applying it. The session records what arrived; a consumer records what it
 folded into its state, and only that moves the position a reconnect subscribes from. An event that
