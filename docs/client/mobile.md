@@ -104,16 +104,18 @@ An address names where the shell opens: `?tab=attention`, `?tab=account`,
 
 ## The attention inbox
 
-The attention inbox is the primary surface, across every host and every session. It has four states,
-told apart three ways at once (a word, a tone and the sentence underneath), because one way is never
-enough:
+The attention inbox is the primary surface, across every host and every session. It has five kinds
+of item. Four of them are told apart three ways at once (a word, a tone and the sentence
+underneath), because one way is never enough. An application notice has the same muted tone as a
+host that is out of contact, so only its word and its sentence tell it apart from that row:
 
-| State | What it means |
+| Kind | What it means |
 | --- | --- |
 | Waiting for you | A decision the person can take here |
-| Action failed | An action that did not happen, with the host's own error code |
+| Did not finish | A command that ended with a failure, an integration that stopped working, or an automation that stopped at one of its own limits |
 | Ready to review | Finished work waiting to be looked at |
 | Out of contact | A host this device cannot reach |
+| Application notice | A notice that a program in a session printed, which is never a decision and never shown as the host's |
 
 The fourth has a rule in it. Losing contact with a host says nothing about what that host's
 processes are doing, so the row says exactly that and nothing more, is never counted among the
