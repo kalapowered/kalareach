@@ -539,7 +539,7 @@ describe("the phone's lists show their newest read", () => {
     await waitFor(() => {
       expect(titles()).toEqual(['Session 1', 'Session 2', 'Session 3'])
     })
-    expect(screen.getByText('Live · 2 views attached')).toBeInTheDocument()
+    expect(screen.getByText('Agent · Live · 2 views attached')).toBeInTheDocument()
   })
 
   it('keeps the newer host list when two reads answer in reverse order', async () => {

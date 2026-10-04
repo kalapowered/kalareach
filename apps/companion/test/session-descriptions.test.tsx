@@ -359,6 +359,25 @@ describe("the phone's session list shows each session's description", () => {
     )
     expect(screen.getByTestId('description-freshness')).toHaveTextContent('Out of date')
   })
+
+  // KR-REQ-13.10: a row shows the application, as the desktop's list does.
+  it('names the application in the foreground of each session', async () => {
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <MobileSessions surface="ios" onOpen={() => undefined} />
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(
+        [...document.querySelectorAll('.m-row-detail')].map((row) => row.textContent)
+      ).toEqual([
+        'Agent · Live · 2 views attached',
+        'Agent · Live · 1 view attached',
+        'Shell · Live · 0 views attached'
+      ])
+    })
+  })
 })
 
 // KR-REQ-13.10: the session's own screen names it as the list does.

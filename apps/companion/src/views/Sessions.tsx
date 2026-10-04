@@ -19,6 +19,7 @@ import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import {
   activityLine,
+  applicationName,
   directoryName,
   freshnessNote,
   shownTitle,
@@ -245,10 +246,7 @@ export function Sessions(): ReactNode {
                 {session.cwd}
               </span>
               <span className="agent-column" role="cell">
-                {/* A root shell at its prompt is the shell in the foreground, not an agent. */}
-                {session.application_state === null || session.application_state === 'shell_ready'
-                  ? 'Shell'
-                  : 'Agent'}
+                {applicationName(session)}
               </span>
               <span className="agent-column" role="cell" data-testid="attachment-count">
                 {session.attachment_count}

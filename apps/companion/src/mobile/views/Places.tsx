@@ -15,6 +15,7 @@ import { Banner } from '../../components/ui'
 import { accountName } from '../../views/account-name'
 import {
   activityLine,
+  applicationName,
   directoryName,
   freshnessNote,
   shownTitle,
@@ -71,11 +72,12 @@ export function MobileSessions({
               title: `Session ${session.display_number}`,
               directory: directoryName(session.cwd),
               where: session.cwd,
-              // A stock shell is labelled wherever the session is listed.
+              // The application in the foreground comes first, as it does in the desktop's list. A
+              // stock shell is labelled wherever the session is listed.
               detail:
                 session.shell_mode === 'native_compat'
-                  ? `${describeSessionState(session.state, session.attachment_count)} · Stock shell`
-                  : describeSessionState(session.state, session.attachment_count),
+                  ? `${applicationName(session)} · ${describeSessionState(session.state, session.attachment_count)} · Stock shell`
+                  : `${applicationName(session)} · ${describeSessionState(session.state, session.attachment_count)}`,
               tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
             }))
           )
