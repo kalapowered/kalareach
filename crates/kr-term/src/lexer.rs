@@ -1051,9 +1051,16 @@ impl Lexer {
     }
 
     /// Adds one payload byte, applying the string's bounds.
+    ///
+    /// A separator is a payload byte like any other as far as the bound goes: the bound is on what
+    /// the string carries, and what divides it into parts is part of that.
     fn push_string_payload(&mut self, byte: u8, family: SequenceFamily) {
         self.string_seen = self.string_seen.saturating_add(1);
         if self.string_discarding.is_some() {
+            return;
+        }
+        if self.string_seen > self.string_limit {
+            self.begin_discarding(DiscardCause::Oversized);
             return;
         }
         if family == SequenceFamily::Osc && byte == b';' {
@@ -1067,10 +1074,6 @@ impl Lexer {
                 self.string_limit = self.limits.max_osc52_string;
             }
             self.string_parts.push(part);
-            return;
-        }
-        if self.string_seen > self.string_limit {
-            self.begin_discarding(DiscardCause::Oversized);
             return;
         }
         self.string_buf.push(byte);
