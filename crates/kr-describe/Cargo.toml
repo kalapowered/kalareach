@@ -45,6 +45,8 @@ thiserror.workspace = true
 # Background scheduling for the inference thread, through the one mechanism this build can apply
 # on each platform. What it cannot apply, it reports as unqualified rather than assuming.
 thread-priority.workspace = true
+# The end of an answer that ran out of room falls on a boundary between characters a person sees.
+unicode-segmentation.workspace = true
 
 # The description process's environment lock: an exclusive advisory lock the operating system
 # releases when the process ends, as the daemon's own singleton lock is.

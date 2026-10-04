@@ -55,6 +55,7 @@ use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token_type::LlamaTokenAttr;
 
 use kr_describe::budget::Budgets;
+use kr_describe::output::end_cut_answer;
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::{Asset, ModelProfile};
 use kr_describe::prompt::{FitError, Prompt};
@@ -730,6 +731,7 @@ impl LlamaRuntime {
         let mut sampling_ms = 0_u64;
         let mut decode_ms = 0_u64;
         let mut peak_rss_bytes = own_rss_bytes().unwrap_or(0);
+        let mut finished = false;
         for step in 0..job.max_output_tokens {
             if token.is_cancelled() {
                 return Ok(stopped(JobEnd::Cancelled));
@@ -757,6 +759,7 @@ impl LlamaRuntime {
             let chosen = sampler.sample(&context, -1);
             sampling_ms = sampling_ms.saturating_add(elapsed_ms(sampling_started));
             if self.model.is_eog_token(chosen) {
+                finished = true;
                 break;
             }
             // Bytes rather than text, and assembled at the end: one token can be half of a
@@ -777,6 +780,10 @@ impl LlamaRuntime {
             decode_ms = decode_ms.saturating_add(elapsed_ms(decode_started));
         }
         peak_rss_bytes = peak_rss_bytes.max(own_rss_bytes().unwrap_or(0));
+        if !finished {
+            // The output bound stopped the answer before the model ended it.
+            produced = end_cut_answer(&produced, job.prompt);
+        }
         Ok(Generating::Produced {
             bytes: produced,
             phases: Phases {

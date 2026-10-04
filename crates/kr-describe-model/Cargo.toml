@@ -36,6 +36,8 @@ kr-crypto.workspace = true
 # Places the description process on the internal disk before a test starts it.
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+# Where an answer ended early may end: on a boundary between characters a person sees.
+unicode-segmentation.workspace = true
 
 [lints.rust]
 missing_docs = "warn"
