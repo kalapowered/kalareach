@@ -124,21 +124,22 @@ SDK archive and `SHA512SUMS` file from the release, and performs a number of che
 release workflow will be running at the same time, and the release may not be published yet, the job
 will wait up to 50 minutes for the release to become available. The job requires the release to be
 immutable. The checks confirm that the archive in the release matches the hash listed in
-`SHA512SUMS`, and that it matches an archive created by `npm pack` from the same commit. It also
-runs `npm publish --dry-run` on the archive to see what npm would publish. Finally, it records the
-sha512 of the archive so that it can be checked again in the `publish` job. The `publish` job runs
-only if the `check` job succeeds and npm does not already have the version, and it waits until
-someone has approved the deployment. It downloads the release again, and refuses any archive whose
-sha512 is not the recorded value. It then publishes the archive to the npm registry, using
-`npm publish --provenance --access public` to attach provenance information identifying the workflow
-and the commit from which it was published. It authenticates to the npm registry using the
-workflow's own identity, via OpenID Connect, so this repository holds no npm token.
+`SHA512SUMS`, and that it matches an archive created by `npm pack` from the same commit. When npm
+does not already have the version, it also runs `npm publish --dry-run` on the archive to see what
+npm would publish. Finally, it records the sha512 of the archive so that it can be checked again in
+the `publish` job. The `publish` job runs only if the `check` job succeeds and npm does not already
+have the version, and it waits until someone has approved the deployment. It downloads the release
+again, and refuses any archive whose sha512 is not the recorded value. It then publishes the archive
+to the npm registry, using `npm publish --provenance --access public` to attach provenance
+information identifying the workflow and the commit from which it was published. It authenticates to
+the npm registry using the workflow's own identity, via OpenID Connect, so this repository holds no
+npm token.
 
 It is possible to run the workflow on a branch to test the `check` job. In that case, it will not
 use an archive from a release, but will use the `scripts/release-packages.sh` script to pack the
-checked-out commit, and then run the same checks and the dry run. The `publish` job will fail, due
-to the deployment policy on the environment it uses, but it will not run any of its steps, so will
-not publish anything.
+checked-out commit, and then run the same checks and the dry run. If npm does not already have the
+version, the `publish` job will fail, due to the deployment policy on the environment it uses, but
+it will not run any of its steps, so will not publish anything.
 
 ### The `npm-publish` environment
 
@@ -216,8 +217,8 @@ the version is absent.
 ### Approving a deployment to the npm registry
 
 Once a tag of the form `packages/v*` has been pushed, the workflow will run. When the `check` job
-passes, the `publish` job waits, and GitHub asks the environment's reviewer to approve it. A run
-waits at most 30 days for an approval. The reviewer:
+passes and npm does not already have the version, the `publish` job waits, and GitHub asks the
+environment's reviewer to approve it. A run waits at most 30 days for an approval. The reviewer:
 
 1. Opens the run from the repository's Actions tab and confirms that `check` passed, which means the
    archive matches the release's sums and what `npm pack` makes.
