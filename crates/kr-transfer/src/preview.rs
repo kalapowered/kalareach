@@ -56,11 +56,10 @@ const NEVER_DECODED: &[&str] = &[
 /// runs:
 ///
 /// * a PNG decoded to sixteen-bit RGBA is eight bytes per pixel of output;
-/// * a decoder that composites holds the output, the frame it decoded and the canvas it draws
-///   onto, which is three four-byte buffers at once;
 /// * a GIF holds its frame buffer and the image it crops into.
 ///
-/// Sixteen covers each of those with room left. What it does not bound is a structure a codec
+/// Sixteen covers each of those with room left, enough for a decoder that composites as well: that
+/// holds its output, the frame it decoded and the canvas it draws onto, three four-byte buffers. What it does not bound is a structure a codec
 /// allocates from its own metadata rather than from its dimensions; the answer to a decoder that
 /// does that is not to run it, which is why WebP is withheld. The number belongs to the pins in the
 /// manifest: it is re-derived when `image` or one of its codecs moves.
