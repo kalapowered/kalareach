@@ -311,9 +311,9 @@ produces the writer's. A file this host writes is this host's own reading of its
 The rule that holds for both is one sentence: an export quotes text as this build's own words only
 where this process composed it from literals in this source, and everything else is typed, measured
 or withheld. It is the value that answers, not the caller. Every field whose class says it carries
-the product's own words holds a type that knows where its text came from - `export::Stated` for a
+the product's own words holds a type that knows where its text came from (`export::Stated` for a
 literal, `export::Sentence` for one composed from literals, numbers, identifiers this host generated
-and the measure of everything else - and reading clears that mark, because a document, a reply or a
+and the measure of everything else), and reading clears that mark, because a document, a reply or a
 bundle somebody else wrote is not this build. So a value that arrived already claiming to be this
 host's own leaves as its length rather than as itself, whichever field it arrived in, and a plain
 string has nowhere in such a field to go at all.
@@ -326,9 +326,9 @@ another structure is measured like everything else.
 
 What the types establish is where a value was composed, not that nobody worked to defeat them.
 Leaking a runtime string gives it the lifetime a literal has, and a caller determined to launder
-text through `Stated::new` can. The guarantee is against the mistake that happens - a value read off
-the wire or out of a library repeated as though this host had written it - and the constructors are
-what make that mistake impossible rather than merely discouraged. Taking an already exported value
+text through `Stated::new` can. The guarantee is against the mistake that happens: a value read off
+the wire or out of a library repeated as though this host had written it. The constructors are what
+make that mistake impossible rather than merely discouraged. Taking an already exported value
 through the boundary a second time is possible as well, and what it costs is meaning rather than
 safety: a path measured twice reports the length of its own placeholder.
 
@@ -399,19 +399,18 @@ that variable is not set, says where a state directory belongs on every Linux ho
 path says where this one person's is. The rule is what survives an export, because the resolved
 path carries their account name to say it.
 
-The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
-assertion under; `worker_profile` is the execution context a create request gets when it does not
-choose one, which is what `kr new` without `--desktop` or `--headless` uses. `command_integrations`
-names the installed packages, as `publisher/plugin`, whose command integration a session applies.
-The host fills a session's integrations in when the session is launched: one entry for each
-admitted package whose integration applies there, on where this list names the package and off
-where it does not. A create request that names one is refused, and an entry that is off carries no
-flags. A session carries at most 256 KiB of flags and 128 entries. Past that, and wherever its
-launch message cannot carry them beside the create request, the largest integrations turned on
-are left out, and one note in the doctor's catalogue check names the session and each of them. A
-profile's list replaces the host's, and an empty list turns every integration off at that level.
-`kr plugin integration enable` and `disable` edit the host's list, and the change reaches the
-sessions created afterwards.
+The preferences are what this host applies. `sleep_inhibition` is what the daemon holds an assertion
+under; `worker_profile` is the execution context a create request gets when it does not choose one,
+which is what `kr new` without `--desktop` or `--headless` uses. `command_integrations` names the
+installed packages, as `publisher/plugin`, whose command integration a session applies. The host
+fills a session's integrations in when the session is launched: one entry for each admitted package
+whose integration applies there, on where this list names the package and off where it does not. A
+create request that names one is refused, and an entry that is off carries no flags. A session
+carries at most 256 KiB of flags and 128 entries. Past that, and wherever its launch message cannot
+carry them beside the create request, the largest integrations turned on are left out, and one note
+in the doctor's catalogue check names the session and each of them. A profile's list replaces the
+host's, and an empty list turns every integration off at that level. `kr plugin integration enable`
+and `disable` edit the host's list, and the change reaches the sessions created afterwards.
 
 `kr doctor` reports each package the list names, with its state, and each integration an admitted
 release declares: what a new session gets of it and why, the mode its command runs in, the flags
@@ -487,14 +486,14 @@ force is refused and reported as refused.
 | `disable_policy` | not an intersection but the administrator's own setting: what happens to a live binding whose release its repository revokes. `warn_only` (the default), `disable_at_next_admission` or `disable_at_once` |
 | `enrolment` | section 11's own budgets: what one repository's metadata, kept generations and cached payloads may cost, how large one package may be and how many bytes one synchronisation may transfer; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
 
-A ceiling is applied where the thing it restricts reads it, and an edit whose value the
-intersection would refuse is refused before it is written rather than recorded and then quietly
-read back narrower. `session_limit` becomes the number this host admits a create against, at
-startup and again after every acceptance. A document this host can use decides that number whether
-it names one or leaves it to the product default, because removing a ceiling is a choice. A
-document that is absent and one this build cannot read decide nothing at all, and then the number
-already in force stays and is what the report prints: a restriction an owner accepted is never
-lifted, or reported as lifted, because a later build could not read the file it was in.
+A ceiling is applied where the thing it restricts reads it, and an edit whose value the intersection
+would refuse is refused before it is written rather than recorded and then silently read back
+narrower. `session_limit` becomes the number this host admits a create against, at startup and again
+after every acceptance. A document this host can use decides that number whether it names one or
+leaves it to the product default, because removing a ceiling is a choice. A document that is absent
+and one this build cannot read decide nothing at all, and then the number already in force stays and
+is what the report prints: a restriction an owner accepted is never lifted, or reported as lifted,
+because a later build could not read the file it was in.
 
 `grant_rights` is applied where a paired device's request is decided. Every request a device sends
 goes through one decision: its grant, intersected with this host's policy (the organisation lease a
@@ -566,15 +565,15 @@ from. The plugin runtime reference describes the layout and how the copy is made
 The host compiles the bundle in and checks every byte against the lock when it reads the bundle in,
 before anything is parsed. A bundle whose files do not all match its lock is refused whole.
 
-At every start the daemon seeds the catalogue from the bundle, before it binds its local
-endpoints. A build trusts the bundle's root only if the root's key identifiers are ones it commits: a
-shipped build commits no production root yet, so it refuses the bundle, and a build with debug
-assertions also trusts the development lineage and seeds only when it is started with `--seed`.
-Where the root is trusted, the seed enrols the official repository against it, activates the bundled
-generation without the network, and installs each bundled package once, enabled and with an empty
-grant. A later start finishes what an earlier one did not reach and takes a newer bundled generation
-after an update. It never replaces an installation that is already there, and an uninstall or a
-disable by the owner is never undone.
+At every start the daemon seeds the catalogue from the bundle, before it binds its local endpoints.
+A build trusts the bundle's root only if the root's key identifiers are ones it commits: a shipped
+build commits no production root, so it refuses the bundle, and a build with debug assertions also
+trusts the development lineage and seeds only when it is started with `--seed`. Where the root is
+trusted, the seed enrols the official repository against it, activates the bundled generation
+without the network, and installs each bundled package once, enabled and with an empty grant. A
+later start finishes what an earlier one did not reach and takes a newer bundled generation after an
+update. It never replaces an installation that is already there, and an uninstall or a disable by
+the owner is never undone.
 
 What the bundle is not: a catalogue or a grant. It carries one generation, frozen at the commit it
 was copied from, and a package's capability requests, grants and repository ceiling are applied to
@@ -598,7 +597,7 @@ Nothing in a descriptor is acted on until the worker behind the endpoint has ans
 
 ## Identity and verification
 
-Four proofs, each with a job.
+There are four proofs, and each has its own job.
 
 | Proof | Who signs | What it settles |
 | --- | --- | --- |
@@ -694,7 +693,7 @@ singleton lock, and the network keys only when the environment selects a network
 each takes the store it always took: the identity follows the `.store-kind` record this host made,
 and the network keys take the platform's credential store where there is one and the owner-only
 directory where there is not. On a Linux host whose secret service appeared after it recorded the
-directory, that is two different stores, which is what an installed host has today.
+directory, that is two different stores, which is what an installed host has.
 
 Under `file` both go in the environment's own `secrets` directory. `file` names where the keys go
 and nothing else: it allocates no directory and deletes nothing afterwards, so a run that wants its
@@ -754,10 +753,11 @@ Linux places a job in no login session at all: a user service manager started at
 display, no compositor socket and no session message bus, because those belong to a graphical login
 that happened later. So a desktop-bound worker's transient unit is given the selected session's own
 handles explicitly, read from that session's leader, and every other login-session handle is removed
-from what the unit would otherwise inherit. Both halves matter on a host where one user is logged in
-twice: the manager holds one environment for the whole user, so what it offers is used only when it
-says which session it describes and says the selected one, and a handle that was not collected is
-cleared rather than left to arrive from the other login. A headless worker is given none of them.
+from what the unit would otherwise inherit. Both halves are needed on a host where one user is
+logged in twice: the manager holds one environment for the whole user, so what it offers is used
+only when it says which session it describes and says the selected one, and a handle that was not
+collected is cleared rather than left to arrive from the other login. A headless worker is given
+none of them.
 
 The fallback supervisor, which a host with no service manager uses, has no domains to choose
 between: a worker it starts is in whatever login context this daemon is in, and a headless worker
@@ -1006,7 +1006,7 @@ The worker records where three things came from, and the session's summary says 
 
 Where a session is shown and where its processes run are different questions. `kr new --invisible`
 answers the first. The execution profile answers the second, and it decides which display, which
-message bus and which operating-system permissions a command inside the session actually has.
+message bus and which operating-system permissions a command inside the session has.
 
 | Profile | What it is bound to | What ends it |
 | --- | --- | --- |
@@ -1032,8 +1032,8 @@ permission that selecting a desktop does not carry, and `environment.capabilitie
 them separately, in the shared capability-evidence shape, saying what produced the answer and what
 makes it stale. Nothing there performs the operation a capability is: a platform query can refuse
 either of them and cannot establish one, so an answer nothing has run says exactly that. There is no
-general desktop-control interface here either: desktop automation means the user's own tools
-running in the selected context under the permissions they were actually granted.
+general desktop-control interface here either: desktop automation means the user's own tools running
+in the selected context under the permissions they were granted.
 
 ## First-start permissions
 
@@ -1099,10 +1099,10 @@ An operating system files a permission under a signed application, which is why 
 identity before it guides you anywhere: the bundle identifier, the file it is running from, and the
 signature on that file as the platform's own signing tool reports it.
 
-What matters is not whether there is a signature but whether it is one the operating system will
-recognise again. An ad-hoc signature is one the machine made for that file; the next build carries
-a different one, and every grant given to the old one stays with it. The same goes for a bundle
-inside a build directory, which the next build overwrites. Install a signed build first.
+Having a signature is not enough: it has to be one the operating system will recognise again. An
+ad-hoc signature is one the machine made for that file; the next build carries a different one, and
+every grant given to the old one stays with it. The same goes for a bundle inside a build directory,
+which the next build overwrites. Install a signed build first.
 
 ### Running the demonstration
 
@@ -1233,15 +1233,15 @@ A session never claims to have preserved writes it was never handed.
 
 **The job object.** The worker holds the sole owning handle for one job object per session, with
 kill-on-close, and every process it starts joins that job *before* it runs: the shell is created
-suspended, assigned, confirmed to be held, and only then resumed. Both limits are read back from
-the kernel rather than taken from what was asked for. Default breakaway stays disabled, so a child
+suspended, assigned, confirmed to be held, and only then resumed. Both limits are read back from the
+kernel rather than taken from what was asked for. Default breakaway stays disabled, so a child
 cannot leave by asking. A vendor sandbox that creates a job of its own nests inside this one;
-nesting and breakaway are separate questions, and disabling the second says nothing about the
-first. Where the job cannot be created, cannot hold what it must, or does not hold the shell, the
-**launch fails by name**: no session is quietly given a weaker boundary instead. Section 7's other
-permitted outcome, an explicitly selected reduced-ownership execution profile, is not something
-this build offers, because nothing selects one. A GUI resource that has to outlive the session is
-created outside the job and is never ended by closing one.
+nesting and breakaway are separate questions, and disabling the second says nothing about the first.
+Where the job cannot be created, cannot hold what it must, or does not hold the shell, the **launch
+fails by name**: no session is silently given a weaker boundary instead. Section 7's other permitted
+outcome, an explicitly selected reduced-ownership execution profile, is not something this build
+offers, because nothing selects one. A GUI resource that has to outlive the session is created
+outside the job and is never ended by closing one.
 
 A closure says what it could not establish. A job that stops answering, a process the operating
 system will not describe, and a termination the kernel refused are each carried into the closure
@@ -1264,14 +1264,14 @@ with `CSI ?9001l`. Both stop here: neither is forwarded to a client, and neither
 snapshot or in a restoration, which are the other two ways bytes reach one. The worker records what
 its own backend asked for.
 
-The encoding is `CSI Vk;Sc;Uc;Kd;Cs;Rc_` - a final underscore, not an APC string - carrying the
+The encoding is `CSI Vk;Sc;Uc;Kd;Cs;Rc_` (a final underscore, not an APC string), carrying the
 virtual key, the scan code the console reported, one UTF-16 code unit, the key-down flag, the
 control-key state and the repeat count, with all six fields written every time. A reader fills in
 `0,0,0,0,0,1` for any that were omitted. Nothing decodes a record and encodes it again with a scan
 code this host chose. A client that sends no records sends legacy VT input, which is accepted
 without any claim about scan-code fidelity.
 
-What a console inside the session does - `wsl.exe`, an `ssh` client, a nested ConPTY - happens on
+What a console inside the session does (`wsl.exe`, an `ssh` client or a nested ConPTY) happens on
 the boundary between that console and the one this worker owns, below this host: what arrives here
 is whatever the owned console chose to send, and what this host records is that. Restoring the
 *client's* console to the modes it had before an attachment is the attach client's own saved mode
@@ -1705,9 +1705,9 @@ A backup carries the sessions' data, the device configuration, the checkpoints a
 A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch
 advances, the previous holder's undelivered bytes are dropped, and nothing waits for that holder to
 agree. What has already reached the application cannot be recalled, so the count of discarded bytes
-is the honest limit of what a takeover undoes. A write at any other epoch, or from any other
-attachment, is `LEASE_LOST`, and it never takes the lease as a side effect: acquiring is something a
-controller asks for.
+is the limit of what a takeover undoes. A write at any other epoch, or from any other attachment, is
+`LEASE_LOST`, and it never takes the lease as a side effect: acquiring is something a controller
+asks for.
 
 Whether it may hold the lease is a comparison rather than a label. The canonical grid knows which
 keyboard encoding the application has negotiated (the ordinary one, `modifyOtherKeys` at a level,
@@ -1733,18 +1733,18 @@ is not a terminal: what `tmux` forwards depends on its own extended-keys setting
 outside it, so it claims only the ordinary encoding. A controller that advertised a protocol and
 then sent another is exactly what section 8 refuses to allow.
 
-A controller that builds its own keys is declared for the flags this build's encoder actually
-produces, which is not all of them: alternate-key reporting asks for the shifted and base forms of a
-key beside the one that was pressed, and the encoder reports the key it was given. An application
-that asks for that flag is served by no controller here, and says so, rather than being sent an
-encoding one of them only advertises.
+A controller that builds its own keys is declared for the flags this build's encoder produces, which
+is not all of them: alternate-key reporting asks for the shifted and base forms of a key beside the
+one that was pressed, and the encoder reports the key it was given. An application that asks for
+that flag is served by no controller here, and says so, rather than being sent an encoding one of
+them only advertises.
 
-One limit of that encoder is worth stating rather than implying. The Kitty keyboard protocol
-identifies a key by the code point of its unshifted form, so a client that reports a shifted
-character has to say which key produced it; one that does not is refused that form rather than
-served a guess at its layout. What the encoder cannot detect is a character a *lock* transformed -
-a capital produced by Caps Lock reports no modifier at all - so a client that has a layout supplies
-the base key whether or not it thinks a modifier was held.
+The encoder has one more limit. The Kitty keyboard protocol identifies a key by the code point of
+its unshifted form, so a client that reports a shifted character has to say which key produced it;
+one that does not is refused that form rather than served a guess at its layout. What the encoder
+cannot detect is a character a *lock* transformed (a capital produced by Caps Lock reports no
+modifier at all), so a client that has a layout supplies the base key whether or not it thinks a
+modifier was held.
 
 The comparison is made again whenever the application changes the negotiation, which it can do at
 any moment and without telling anybody. Parsing the output is what tells the host, so an application
@@ -2323,9 +2323,8 @@ was checked against, capability by capability:
 
 The table is `kr_protocol::rights::attachment_capability_right`, beside the action vocabulary, so a
 right added to the vocabulary has to be decided for the capabilities rather than defaulting into
-one. The intersection is made in the worker, where the attachment is admitted, because that is
-where the attachment's own record is written, and the summary the caller is given then says what it
-actually holds.
+one. The intersection is made in the worker, where the attachment is admitted, because that is where
+the attachment's own record is written, and the summary the caller is given then says what it holds.
 
 Every later operation on that attachment (resizing, transferring the size, acquiring the lease,
 writing input) passes two checks, not one. The daemon checks the grant's current rights for the
@@ -2392,7 +2391,7 @@ authorised, which `docs/project/README.md` describes.
 What a resolution establishes, for the owner, is that the directory it opened is the one the effect
 writes into, by the identity it recorded, so nothing is substituted underneath it.
 
-One further limit, stated rather than implied.
+There is one further limit.
 
 * **`action.read` does not answer for a create or a project mutation.** A receipt lives in the
   journal of the session an action was performed on, and a create or a repository mutation belongs
@@ -2404,14 +2403,15 @@ One further limit, stated rather than implied.
   that shape, and `action.read` answers them.
 
 The admission a project mutation carries is asked about three times, and the third is the one
-section 9 is about. Once where the daemon accepts it, under the registry lock. Once inside the
-service's own blocking work, immediately after it has failed to find a retained record and
-immediately before it acts. And once **inside the transaction that begins the effect**: the
-transaction that writes the operation row, the one that writes the workspace row, and the one that
-reserves a removal. Each reads the fence this host owes, the registration and the clock from memory,
-so asking costs nothing. A withdrawal whose fence could not be raised leaves every registration
-standing, which is why the fence is asked there too. Every service that acts after such a wait asks
-this same check. A retry never reaches any of them, because the retained record answered first.
+section 9 is about. It is asked once where the daemon accepts it, under the registry lock. It is
+asked once inside the service's own blocking work, immediately after it has failed to find a
+retained record and immediately before it acts. And it is asked once **inside the transaction that
+begins the effect**: the transaction that writes the operation row, the one that writes the
+workspace row, and the one that reserves a removal. Each reads the fence this host owes, the
+registration and the clock from memory, so asking costs nothing. A withdrawal whose fence could not
+be raised leaves every registration standing, which is why the fence is asked there too. Every
+service that acts after such a wait asks this same check. A retry never reaches any of them, because
+the retained record answered first.
 
 The third answer is what covers the service's own preparation. Resolving a destination, probing it,
 opening a repository and surveying it, and taking the journal's lock all happen after the second
@@ -2498,12 +2498,12 @@ outcome moves a receipt, and an inferred screen never does: a screen is what the
 what the interface that owns the subject said. "Observed" in a user interface means evidence was
 observed.
 
-A new action identifier cannot quietly take an uncertain outcome's place. The journal stores a
+A new action identifier cannot silently take an uncertain outcome's place. The journal stores a
 **subject digest** beside the payload digest: the method and version, the complete target and the
 parameters, and nothing that differs between a first attempt and the later request that supersedes
-it. So a fresh identifier for a subject that already carries an uncertain outcome is refused
-unless its preconditions name that action and the receipt revision the caller read it at. A service
-that wanted to hide the uncertainty would have to name the receipt it was hiding.
+it. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
+its preconditions name that action and the receipt revision the caller read it at. A service that
+wanted to hide the uncertainty would have to name the receipt it was hiding.
 
 One actor holds at most eight admitted, unsettled mutations at once, lowered by whatever the
 connection negotiated. That is section 9's figure, and what it bounds is durable admissions this
@@ -2532,13 +2532,13 @@ The archive follows the same rule for a closed session: its receipts go whole to
 
 ### What each store promises
 
-`kr_worker::persistence::stores::STORES` is that table as data. Each entry says how much of a
-crash its store survives, what it keeps and for how long, what class of content it holds, what
-protects it where it lies, who removes what it no longer needs, how it is brought back into
-agreement after a restart, whether a history byte cap may evict it and whether the archive serves
-it afterwards. It is data rather than prose because the rules that matter are checkable: a test
-walks the journal's own tables and refuses one with no declaration, and another refuses a
-declaration that would let a byte cap reach authority or dispatch data.
+`kr_worker::persistence::stores::STORES` is that table as data. Each entry says how much of a crash
+its store survives, what it keeps and for how long, what class of content it holds, what protects it
+where it lies, who removes what it no longer needs, how it is brought back into agreement after a
+restart, whether a history byte cap may evict it and whether the archive serves it afterwards. It is
+data rather than prose because the rules it states are checkable: a test walks the journal's own
+tables and refuses one with no declaration, and another refuses a declaration that would let a byte
+cap reach authority or dispatch data.
 
 The rule that does the most work is that last one. **Authority, dispatch and causal-budget data
 cannot be evicted under a history byte cap.** A host under output pressure that dropped a dispatch
@@ -2563,11 +2563,11 @@ fsync, and this host goes further with the first two: a keystroke and an output 
 durable row at all. The live parser is in worker memory and the retained output is a bounded indexed
 spool.
 
-Grouping is the transaction. A receipt transition writes three rows - the receipt, its event and
-its outbox record - in one transaction, so three rows share one flush and either all three are
-durable or none of them is. That is what section 24 permits by "safe grouped commits may share a
-flush", and the invariant that makes it safe is that a commit point is never grouped with work
-nobody is waiting on.
+Grouping is the transaction. A receipt transition writes three rows (the receipt, its event and its
+outbox record) in one transaction, so three rows share one flush and either all three are durable or
+none of them is. That is what section 24 permits by "safe grouped commits may share a flush", and
+the invariant that makes it safe is that a commit point is never grouped with work nobody is waiting
+on.
 
 ### The outbox, and what reads it
 
@@ -2649,16 +2649,16 @@ looking at a gap is told; it does not mean checking one instead of the others.
 The session cap is the spool's own capacity, and it holds before the write: an append gives up the
 oldest segments to make room for each piece before that piece is written, so no append stands over
 the bound, and the range it gave up reads as a gap whose cause is the session cap. A spool that
-cannot make room - a segment it cannot remove, a boundary it cannot write - or cannot open or write
+cannot make room (a segment it cannot remove or a boundary it cannot write) or cannot open or write
 a segment stops taking output at that cursor rather than writing past the cap. It keeps everything
 it holds: those segments are still counted, still served, collected by every retention pass and
 removed by a purge, and a pass that could not remove one says so. While it is stopped, the resident
-window keeps new output only within the room the spool has left, so the two together stay within
-the cap, and the range neither keeps reads as a gap with the cause `spool_unavailable`. A retention
-pass that finds the spool can make room again writes what the window still holds past the stop and
-lets the spool take output again. A boundary that could not be written is tried again by the next
-append as well, which does not wait for it, because another program can hold that file for a moment:
-the first append after it is let go writes it and gives up the oldest segments.
+window keeps new output only within the room the spool has left, so the two together stay within the
+cap, and the range neither keeps reads as a gap with the cause `spool_unavailable`. A retention pass
+that finds the spool can make room again writes what the window still holds past the stop and lets
+the spool take output again. A boundary that could not be written is tried again by the next append
+as well, which does not wait for it, because another program can hold that file for a moment: the
+first append after it is let go writes it and gives up the oldest segments.
 
 The host bound is applied on the worker's maintenance tick, from a reading of the environment's
 whole spool directory, so two sessions writing at once can take the host past it until the next
@@ -2686,12 +2686,12 @@ resident window hold together, counted once, and the archive's own account names
 the range before the oldest cursor.
 
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
-that cannot prove its wall clock does not do it. The caps still apply, because they are about
-bytes rather than about time. The seven-day line is approached from the safe side: a spool segment
-goes only when its newest byte is past the deadline, and the resident window advances only to an
-interval whose newest byte is past it. Both a segment and a resident interval are bounded in how
-long they go on for - an hour and a minute - so what is kept past the deadline is bounded by that
-rather than removed early.
+that cannot prove its wall clock does not do it. The caps still apply, because they are about bytes
+rather than about time. The seven-day line is approached from the safe side: a spool segment goes
+only when its newest byte is past the deadline, and the resident window advances only to an interval
+whose newest byte is past it. Both a segment and a resident interval are bounded in how long they go
+on for (an hour and a minute), so what is kept past the deadline is bounded by that rather than
+removed early.
 
 An eviction publishes the boundary before it deletes what supports it, and a boundary this host
 could not write stops the eviction rather than losing the record of where the output reached. A
@@ -2707,12 +2707,12 @@ A closed or crashed session's history, final receipts and retained resource refe
 the environment archive service, which is a controller module and not a surviving worker.
 
 **Ownership is taken, and only after the worker is gone.** The archive asks the kernel whether the
-recorded process is the process that was recorded - both the identifier and the start value,
-because the kernel reuses identifiers - and only a confirmed ending is death. Then it removes the
-worker's published endpoint and descriptor, and only then is anything opened. The order is that
-way round because the answer can be *no*: a daemon that fenced before it asked would delete a
-working session's socket on the way to finding out that it was working. A query the platform
-declines is not death either, and the archive leaves the session alone.
+recorded process is the process that was recorded (both the identifier and the start value, because
+the kernel reuses identifiers), and only a confirmed ending is death. Then it removes the worker's
+published endpoint and descriptor, and only then is anything opened. The order is that way round
+because the answer can be *no*: a daemon that fenced before it asked would delete a working
+session's socket on the way to finding out that it was working. A query the platform declines is not
+death either, and the archive leaves the session alone.
 
 The removal is best effort, and the answer is one value: whether either half went. It does not
 say which. What makes the stores safe to open is the death this host confirmed, not the socket
@@ -2731,30 +2731,29 @@ leaves the fence reported as taken with one of its two halves undone.
 disk. A history request never starts an execution, and a retried create is answered from the
 reservation the first one made.
 
-**A lost or corrupt journal produces an explicit incomplete archive.** Not an error and not an
-empty success: the archive names what it could not account for - a missing journal, one it could
-not read, a closure or summary that did not survive, a range of output that is gone, an interval
-durable writing was lost - so a reader is told the record has holes rather than reading continuity
-into it. "This session kept nothing" and "this host cannot say what this session kept" are
-different answers and a reader is owed the second one.
+**A lost or corrupt journal produces an explicit incomplete archive.** Not an error and not an empty
+success: the archive names what it could not account for: a missing journal, one it could not read,
+a closure or summary that did not survive, a range of output that is gone, or an interval durable
+writing was lost, so a reader is told the record has holes rather than reading continuity into it.
+"This session kept nothing" and "this host cannot say what this session kept" are different answers
+and a reader is owed the second one.
 
-**A worker crash closes the session.** The controller takes recovery ownership, runs section 9's
-two recovery rules over the journal the worker left - a dispatch marker with no authoritative
-outcome becomes `unknown` and is never dispatched again, and an accepted intent with no marker is
-rejected - then asks what is still owned, and only then records the closure. The closure record
-carries the terminated process identities, whatever the fence reached, the resources known to
-survive, and an ownership-coverage flag that never claims every application was discovered.
-Nothing is rebuilt from terminal history.
+**A worker crash closes the session.** The controller takes recovery ownership, runs section 9's two
+recovery rules over the journal the worker left (a dispatch marker with no authoritative outcome
+becomes `unknown` and is never dispatched again, and an accepted intent with no marker is rejected),
+then asks what is still owned, and only then records the closure. The closure record carries the
+terminated process identities, whatever the fence reached, the resources known to survive, and an
+ownership-coverage flag that never claims every application was discovered. Nothing is rebuilt from
+terminal history.
 
-**What the fence reaches is nothing, and it says so.** A worker's descendants join the
-process group it led, and once the worker has gone the kernel is free to give its number to an
-unrelated process whose group would answer to it; the root shell also starts a session of its own,
-so its jobs need not be in the worker's group even while the worker lives. Stopping what such a
-group held would be stopping somebody else's processes on the strength of a coincidence. The
-boundary that would work is the one the platform keeps - the transient unit or Job the supervisor
-started the worker in, named from the reservation and unable to name anything else - and this host
-does not stop one. So the coverage is incomplete and the record says which part of it this
-host could not account for.
+**What the fence reaches is nothing, and it says so.** A worker's descendants join the process group
+it led, and once the worker has gone the kernel is free to give its number to an unrelated process
+whose group would answer to it; the root shell also starts a session of its own, so its jobs need
+not be in the worker's group even while the worker lives. Stopping what such a group held would be
+stopping somebody else's processes on the strength of a coincidence. The boundary that would work is
+the one the platform keeps (the transient unit or Job the supervisor started the worker in, named
+from the reservation and unable to name anything else), and this host does not stop one. So the
+coverage is incomplete and the record says which part of it this host could not account for.
 
 **A closed session can be collected.** A session with no worker has no maintenance tick, so the
 archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging
@@ -3115,17 +3114,17 @@ on the gateway has finished, is taken back rather than presented: nothing of it 
 it is settled as cancelled. Anything the outbox has on the wire when privacy mode is turned on stays
 outstanding until its answer arrives, and is then listed among what left.
 
-Content-history retention, description inference, sync production and backup production are
-disabled prospectively, together. What this host holds itself is removed with them: the retained
-output goes, the spool with it, and the content a settled receipt carries - the intent envelope
-the caller sent and the result the action produced - is taken out of the journal while the
-receipt's own metadata stays. A receipt that has *not* settled keeps its envelope, because
-recovery reads it and a retry of an action this host may already have performed is answered from
-it; when it settles later, the host's own maintenance takes its content then.
+Content-history retention, description inference, sync production and backup production are disabled
+prospectively, together. What this host holds itself is removed with them: the retained output goes,
+the spool with it, and the content a settled receipt carries (the intent envelope the caller sent
+and the result the action produced) is taken out of the journal while the receipt's own metadata
+stays. A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
+an action this host may already have performed is answered from it; when it settles later, the
+host's own maintenance takes its content then.
 
-Two stores privacy mode does not reach yet. The canonical grid keeps its own scrollback, which a
-client can still page through, and there is no semantic-history cache or generated-title store in
-the worker at all. Neither is described here as though it were done.
+Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
+can still page through, and there is no semantic-history cache or generated-title store in the
+worker at all. Neither is described here as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
@@ -3135,13 +3134,12 @@ session reopened under privacy mode, or one whose privacy state this host could 
 both, because an enabling that was interrupted leaves content behind and nothing on disk says
 whether it did.
 
-What stays is named rather than quietly retained: the receipt journal's operation metadata, the
+What stays is named rather than silently retained: the receipt journal's operation metadata, the
 minimal local authority this host holds, the envelope of an action that has not settled, live
-pending questions and approvals, which keep working under the grants they already have without
-their bodies being exported as historical content, and user-pinned labels, which are kept locally
-unless explicitly cleared and excluded from later sync while privacy mode is on. A host that
-claimed a functioning durable control system wrote no state at all would be claiming something
-untrue.
+pending questions and approvals, which keep working under the grants they already have without their
+bodies being exported as historical content, and user-pinned labels, which are kept locally unless
+explicitly cleared and excluded from later sync while privacy mode is on. A host that claimed a
+functioning durable control system wrote no state at all would be claiming something untrue.
 
 The same boundary applies when exporting session content as part of a support bundle:
 
@@ -3213,13 +3211,12 @@ nothing else: a generation whose descriptor was published keeps its record, so d
 outcome this host could not establish, and so does one whose ciphertext a service acknowledged
 before privacy mode cancelled its production. All three are copies somewhere else, and a host that
 deleted the acknowledgements with the production would have nothing left to show a person. What a
-cleanup pass reports is what it actually did:
-bytes it unlinked and rows it deleted, and the two counts are independent. A pass that keeps a
-retained artifact's record reports its bytes and no records at all. A pass can equally report
-records and no bytes: a removal whose file went before the store could record it is finished by a
-later pass, which finds the file already absent and takes only the rows, and a staging walk that
-was blocked can release a generation's bookkeeping long after its bytes went. Absent bytes
-therefore never imply that nothing more will be reported.
+cleanup pass reports is what it did: bytes it unlinked and rows it deleted, and the two counts are
+independent. A pass that keeps a retained artifact's record reports its bytes and no records at all.
+A pass can equally report records and no bytes: a removal whose file went before the store could
+record it is finished by a later pass, which finds the file already absent and takes only the rows,
+and a staging walk that was blocked can release a generation's bookkeeping long after its bytes
+went. Absent bytes therefore never imply that nothing more will be reported.
 
 An acknowledgement that arrives late ends no transfer. It records what a service holds of one
 object, and a complete set of them says the ciphertext is there and says nothing about whether the
@@ -3322,7 +3319,7 @@ what it removes is exactly the thing a person cannot check for themselves.
 
 Every session has a name from the moment it exists, and it costs nothing: the repository and branch,
 the directory, the application, or the display number a person types to reach it. The status beside
-it - starting, running, unreachable, awaiting approval, awaiting input, completed, failed, closed -
+it (starting, running, unreachable, awaiting approval, awaiting input, completed, failed or closed)
 is the host's own lifecycle record. Neither is text a model produced, and no model can set either.
 
 A host may also run a small CPU-only model locally to say what a session is *doing*. One shared
@@ -3333,8 +3330,8 @@ session. Grouping machines together for display grants nothing: two environments
 mapping and their own context.
 
 Nothing about this is on the shell's input, query or resize path. The only way a description job is
-created is a meaningful context change - the working directory, the foreground application, the
-selected thread, the task intent, completion - and those are the only five things that exist to
+created is a meaningful context change (the working directory, the foreground application, the
+selected thread, the task intent or completion), and those are the only five things that exist to
 send. Changes inside a two-second window become one revision, so a long active turn still receives
 text rather than invalidating every job.
 
@@ -3562,15 +3559,15 @@ that caller is promised and what it is not.
 
 Where a guarantee cannot be enforced from outside Git at all, the operation that needs it is refused
 rather than run under checks that notice afterwards. Two cases are the exception, and
-`crates/kr-project/README.md` names them: a directory Git is given by name is answered by the
-declared honest result after the fact rather than prevented, and a directory put at an unrecorded
-name inside a tree the operation owns is outside the guarantee, because no filesystem confinement
-that grants a tree can refuse part of it. A kernel too old to mediate the filesystem rights this
-rests on runs no Git; one too old to say which addresses a process may reach runs no remote
-operation; and **Windows runs no Git at all**, because an application container
-cannot keep a repository from being executed from and cannot bound which ports a remote operation
-reaches. The platform task that qualifies this host on Windows is what changes that.
-`crates/kr-project/README.md` says exactly what each platform enforces and what it leaves.
+`crates/kr-project/README.md` names them: a directory Git is given by name is answered after the
+fact, with the result the service declares for a changed root, rather than prevented, and a
+directory put at an unrecorded name inside a tree the operation owns is outside the guarantee,
+because no filesystem confinement that grants a tree can refuse part of it. A kernel too old to
+mediate the filesystem rights this rests on runs no Git; one too old to say which addresses a
+process may reach runs no remote operation; and **Windows runs no Git at all**, because an
+application container cannot keep a repository from being executed from and cannot bound which ports
+a remote operation reaches. The platform task that qualifies this host on Windows is what changes
+that. `crates/kr-project/README.md` says exactly what each platform enforces and what it leaves.
 
 `docs/project/` and `crates/kr-project/README.md` say which mechanism holds which guarantee on each
 platform, and what a platform refuses rather than pretends.
@@ -3701,8 +3698,8 @@ authenticated retrust. An ordinary paired peer's clock is never a time authority
 ### The platform time adapter
 
 The adapter records the synchronisation source, its status and a bounded uncertainty, using the
-interface the platform actually supports. Nothing here opens a socket, contacts a time server or
-signs anything.
+interface the platform supports. Nothing here opens a socket, contacts a time server or signs
+anything.
 
 | Platform | What is read |
 | --- | --- |
@@ -3757,22 +3754,22 @@ build reads record when something happened and not where that moment sat on the 
 are measured on. The reminder is late by however long a record waited to be read; the next
 paragraph is why that is the direction to err in.
 
-One clock measures every interval, and it is not the wall clock. A wall clock can be set, and a
-host that trusts one still trusts it after somebody moves it forward an hour, so two readings it
-vouches for are not two readings on one scale. Intervals are measured on the machine's continuous
-clock instead: it only goes forward, nobody can set it, and it counts the time the machine spent
-asleep. It means nothing outside its own boot, so every interval the host writes down is kept as the
+One clock measures every interval, and it is not the wall clock. A wall clock can be set, and a host
+that trusts one still trusts it after somebody moves it forward an hour, so two readings it vouches
+for are not two readings on one scale. Intervals are measured on the machine's continuous clock
+instead: it only goes forward, nobody can set it, and it counts the time the machine spent asleep.
+It means nothing outside its own boot, so every interval the host writes down is kept as the
 continuous reading it starts from *and* the boot that reading was taken in, and one whose boot has
-ended starts again rather than being worked out across the gap - once, because opening the store is
-what restarts it and opening the store writes the new start down, so the next open finds an
-interval this boot can measure. An event brings an anchor of its own when its producer read that
-clock, separately for each moment it carries, because a request can become pending long before the
-record of it is written. Every one of those answers is nought or less than the true wait, never
-more: a reminder that comes late is still a reminder, and one raised seconds after a request because
-somebody corrected a clock is an interruption nobody earned. The wall clock keeps the two jobs it
-can do: deciding quiet hours, and saying when something happened for a person reading the record.
-The store keeps the host time contract's own record beside it, so a daemon that restarts still
-knows whether the wall clock was ever rolled back.
+ended starts again rather than being worked out across the gap. It starts again once, because
+opening the store is what restarts it and opening the store writes the new start down, so the next
+open finds an interval this boot can measure. An event brings an anchor of its own when its producer
+read that clock, separately for each moment it carries, because a request can become pending long
+before the record of it is written. Every one of those answers is nought or less than the true wait,
+never more: a reminder that comes late is still a reminder, and one raised seconds after a request
+because somebody corrected a clock is an interruption nobody earned. The wall clock keeps the two
+jobs it can do: deciding quiet hours, and saying when something happened for a person reading the
+record. The store keeps the host time contract's own record beside it, so a daemon that restarts
+still knows whether the wall clock was ever rolled back.
 
 ### A session that ends
 
@@ -3804,9 +3801,9 @@ runs out of budget, the journal commits one attention record with the pause, and
 revision is enabled again it commits one that ends the pause's item. The daemon reads these records
 as the journal's registered attention consumer, at its start and every two seconds after. It
 registers again before every pass, which also tells it how far the journal records it as having
-read. Registering matters to the journal: it removes a record of an attention type only once every
-consumer registered for that type has passed it, and never removes a type nobody has registered
-for. The store removes nothing from the journal.
+read. The journal depends on the registration: it removes a record of an attention type only once
+every consumer registered for that type has passed it, and never removes a type nobody has
+registered for. The store removes nothing from the journal.
 
 A pass reads the records past the store's own cursor, commits what they raise or end, and only then
 tells the journal how far the store has read; the journal keeps the furthest position it is told. A
@@ -3976,30 +3973,30 @@ it before a row of the state has been read. Every write reads the claim again, i
 transaction it writes in, so an owner whose store was taken while it was away replaces nothing: it
 is told the store is no longer its to write, and whoever opens the store next reads it fresh.
 
-Letting the store go removes that one claim and nothing else - not the state, and not a claim
-somebody else now holds - so the next opener does not have to work out that nobody is holding it.
+Letting the store go removes that one claim and nothing else (not the state, and not a claim
+somebody else now holds), so the next opener does not have to work out that nobody is holding it.
 That removal is the best the daemon can do rather than a promise: a file that has gone, or another
 holder of it that keeps the write waiting, leaves the claim where it is. An owner that ends without
-letting go, one that was killed or a machine that stopped, leaves its claim behind too, and the
-next opener is what clears it. A claim from a boot that has ended is not standing, because that
-boot's processes are gone with it. A claim from this boot is weighed on the process it names: the
-owner records the pair the kernel describes, its number and the start value that tells it apart
-from whoever holds that number next, so a claim whose process has gone is taken the moment the
-next daemon asks. Where the platform will not answer, the claim's own lease decides instead, and
-it stands for ten minutes unrefreshed against an owner that refreshes it on every write and a
-maintenance loop that writes at least once a minute. A process the kernel says is running keeps
-its store however long it has been idle.
+letting go, one that was killed or a machine that stopped, leaves its claim behind too, and the next
+opener is what clears it. A claim from a boot that has ended is not standing, because that boot's
+processes are gone with it. A claim from this boot is weighed on the process it names: the owner
+records the pair the kernel describes, its number and the start value that tells it apart from
+whoever holds that number next, so a claim whose process has gone is taken the moment the next
+daemon asks. Where the platform will not answer, the claim's own lease decides instead, and it
+stands for ten minutes unrefreshed against an owner that refreshes it on every write and a
+maintenance loop that writes at least once a minute. A process the kernel says is running keeps its
+store however long it has been idle.
 
 A database is journalled under the name it was opened by, so one file that two names reach can be
 journalled twice over by two processes that never see each other's work. The store refuses such a
 file outright and says how many names reach it. The count is of the file the store has open rather
 than of whatever a name reaches now: on Windows it comes from the store's own handle on the file,
 and on the Unix family, where nothing safe describes an open file, the name is described without
-opening it - a second descriptor there would drop every lock this process holds on the file - and
-the store then asks its own database whether the file it has open is still the one that name
-reaches. Those are two answers rather than one, so a name swapped between them is not ruled out;
-what is ruled out is every ordinary second name. A host that cannot answer at all is refused rather
-than admitted.
+opening it (a second descriptor there would drop every lock this process holds on the file), and the
+store then asks its own database whether the file it has open is still the one that name reaches.
+Those are two answers rather than one, so a name swapped between them is not ruled out; what is
+ruled out is every ordinary second name. A host that cannot answer at all is refused rather than
+admitted.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
@@ -4010,14 +4007,14 @@ attention until it is started again and opens the store afresh.
 A decided announcement stays written down until a delivery consumer says it has taken durable
 responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding
 without forgetting it, and forgets it only once the consumer has settled it by its own identity,
-which is the item and the announcement's number. That number comes from a counter of the store's
-own that only goes forward, so it outlives the item it was given for: a condition that ends and
-returns is a new item, and an identity a consumer already recorded can never settle a decision made
-after the condition came back. A host that died at any point before the settlement offers the
-announcement again. What becomes of it afterwards - the destinations, the attempts, the receipts -
-belongs to the delivery journal. An announcement names its item's text by where to read it, and a
-consumer that sends the text reads it under the same release as a reader does (see *Privacy mode
-and the text an item carries* below).
+which is the item and the announcement's number. That number comes from a counter of the store's own
+that only goes forward, so it outlives the item it was given for: a condition that ends and returns
+is a new item, and an identity a consumer already recorded can never settle a decision made after
+the condition came back. A host that died at any point before the settlement offers the announcement
+again. What becomes of it afterwards (the destinations, the attempts and the receipts) belongs to
+the delivery journal. An announcement names its item's text by where to read it, and a consumer that
+sends the text reads it under the same release as a reader does (see *Privacy mode and the text an
+item carries* below).
 
 An item holds one outstanding decision at a time. A later announcement about the same condition
 replaces the identity waiting to be taken, and the condition ending takes it away, because an
@@ -4041,8 +4038,8 @@ its decision has gone out, been recorded by a consumer, and outlived the minute 
 condition would be folded into it rather than announced again. Weighing what is left by level and
 age is what stops a fresh notice displacing an urgent approval.
 
-What the bound never lets go of is a condition somebody or something is still waiting on - an
-unanswered approval, an unanswered request, an adapter still down, a host still out of contact - or
+What the bound never lets go of is a condition somebody or something is still waiting on (an
+unanswered approval, an unanswered request, an adapter still down or a host still out of contact) or
 a decision about one that is still in flight: one no consumer has settled, one quiet hours are
 holding, one nobody has made yet, and one whose sixty-second window is still running, because the
 item is the whole of what the host remembers that window by and letting go of it would announce the
@@ -4050,7 +4047,7 @@ same condition twice inside it. When the whole inbox is those, it goes over its 
 answering that nothing is waiting or losing an announcement nothing will offer again, and it comes
 back inside its bound on the next timer pass, against what that pass decided and what a consumer
 settled meanwhile. A host whose notifications nobody is taking therefore keeps them rather than
-quietly dropping them.
+silently dropping them.
 
 Review state has no retention at all. A subject nobody has acknowledged is outstanding review work,
 and deleting it would answer that there is none; a subject somebody has acknowledged is that
@@ -4089,10 +4086,10 @@ serving it from one of those would serve text written before a privacy transitio
 after it.
 
 Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
-moment in time to an item's text, which is why it refuses a retained history page to a paired
-device outright. An attention item is not a history page, so it is narrowed rather than refused: a
-caller that did not arrive over the local socket is served the host's own record of a condition -
-which rule, at what level, how often, when - with the text left out and said to be left out, and no
+moment in time to an item's text, which is why it refuses a retained history page to a paired device
+outright. An attention item is not a history page, so it is narrowed rather than refused: a caller
+that did not arrive over the local socket is served the host's own record of a condition (which
+rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either.
 
 An item's key carries none of that text either. A key has to be derived rather than allocated, so
@@ -4146,17 +4143,17 @@ waits for the daemon, as below.
 The daemon checks the release before every write to a transport, not once per answer. An answer to
 the owner goes to its connection one non-blocking write at a time, each made under the shared lock
 right after the check and handing over at most 64 KiB, and the wait for room happens with the lock
-let go. The bound matters on Windows, where a named pipe takes whatever it is offered whole and
-finishes sending it on its own: what can still go after a check fails is the one piece that check
-admitted, as on the Unix family it is what the socket already took. When the check fails, an answer
-none of which has gone is taken back and the same answer goes without its text; one the reader
-already has part of is not finished, and the connection ends, so the reader asks again. A read with
-text from several sessions is stopped by a transition in any of them, and a read that outlasts the
-lease of the text it carries is cut the same way. So is text from a session closed over a worker the
-host could not account for, from the moment that closure is recorded: such a worker may still be
-running and changing its privacy state where the daemon cannot see. The margin the check keeps
-before a lease ends, one second, is the time it allows between reading the clock and the write it
-admits; a daemon thread held off the processor for longer than that between the two, or a machine
+let go. On Windows the bound is what limits that: a named pipe takes whatever it is offered whole
+and finishes sending it on its own, so what can still go after a check fails is the one piece that
+check admitted, as on the Unix family it is what the socket already took. When the check fails, an
+answer none of which has gone is taken back and the same answer goes without its text; one the
+reader already has part of is not finished, and the connection ends, so the reader asks again. A
+read with text from several sessions is stopped by a transition in any of them, and a read that
+outlasts the lease of the text it carries is cut the same way. So is text from a session closed over
+a worker the host could not account for, from the moment that closure is recorded: such a worker may
+still be running and changing its privacy state where the daemon cannot see. The margin the check
+keeps before a lease ends, one second, is the time it allows between reading the clock and the write
+it admits; a daemon thread held off the processor for longer than that between the two, or a machine
 suspended in that instant, is the one case a lease cannot order. A delivery consumer releases the
 same way: each transport write of session text is made through the daemon's release, which refuses
 it once the check fails, and a consumer whose transport would send held bytes later on its own
@@ -4180,12 +4177,11 @@ An attention decision is not a notification. The engine decides that something w
 offers the decision; the delivery journal takes it, records it durably, and only then tells a
 destination.
 
-The order matters and the store is what keeps it. A notification row names the event row it was
-produced from, and the reference is a foreign key: a notification for an event nothing has taken
-cannot be written. Taking an event and producing from it are two transactions, so a host that stops
-between them has the event and no notification, and the pending work is still where a person can
-see it. The event row carries the notice it was taken with, so the next pass finishes what the last
-one started.
+The store keeps that order. A notification row names the event row it was produced from, and the
+reference is a foreign key: a notification for an event nothing has taken cannot be written. Taking
+an event and producing from it are two transactions, so a host that stops between them has the event
+and no notification, and the pending work is still where a person can see it. The event row carries
+the notice it was taken with, so the next pass finishes what the last one started.
 
 Each source keeps its own cursor, per store rather than per kind: a position in one session's
 outbox says nothing about another's. The cursor and the de-duplication record are committed in the
@@ -4222,10 +4218,10 @@ credential names, the address a webhook's owner configured, or Slack's, Discord'
 Mail goes to the submission server the owner's account names, over TLS the operating system's
 verifier checks.
 
-External destinations are different in the way that matters: their recipients can read what
-arrives, every message says so, and nothing in this host claims otherwise. A destination needs a
-configured address **and** an explicit rule or grant, and the content is intersected with the
-recipient's own authority rather than assumed from the address.
+External destinations are different in one respect: their recipients can read what arrives, every
+message says so, and nothing in this host claims otherwise. A destination needs a configured address
+**and** an explicit rule or grant, and the content is intersected with the recipient's own authority
+rather than assumed from the address.
 
 A Slack, Discord, Telegram or email destination sends with a credential: a webhook address that is
 itself a bearer secret, a bot token, or a mail submission account. The owner hands it over with
@@ -4336,7 +4332,7 @@ per method. Nothing here restates that table: a second copy drifts, and the copy
 always the one an authorisation check happens to read.
 
 **Expiry does not downgrade.** A grant whose deadline has passed refuses the request. It does not
-quietly keep serving reads, because continued reads still need valid authority and a narrower grant
+silently keep serving reads, because continued reads still need valid authority and a narrower grant
 is something the person chooses.
 
 **A grant's issuing revision is provenance, not a deadline.** Somebody else's revocation advancing
@@ -4758,10 +4754,9 @@ The terminal is watched as a process, for as long as it runs. A socket reaching 
 process behind it exiting are two events in either order, and neither bounds the other: a terminal
 can close its connection and go on running for an hour, and a terminal whose connection stays open
 can exit at once. So what decides is the process, and the watch outlives the connection: a terminal
-that exits long after its attachment closed still ends its instance and still stops the backend
-this host dedicated to it. The backend is asked to stop, given the grace period, forced if it has
-not gone, and then waited for, so what is reported is what actually happened rather than what was
-signalled.
+that exits long after its attachment closed still ends its instance and still stops the backend this
+host dedicated to it. The backend is asked to stop, given the grace period, forced if it has not
+gone, and then waited for, so what is reported is what happened rather than what was signalled.
 
 On Windows, a dedicated backend this host started is held by a job, and the stop is of that job. The
 end of the backend's standard input that this host writes is closed, which is how an agent is told
@@ -4837,9 +4832,9 @@ from the connection and the launch behind it, never from the request, so a reque
 at another application, another environment or another user. How it is performed is described under
 [Reverse operations](#reverse-operations).
 
-Every action records how it actually reached the upstream: a typed remote procedure call, an
-authenticated hook response, or terminal input. Terminal input is never an authoritative typed
-result, and the vocabulary says so rather than leaving it to a caller's judgement.
+Every action records how it reached the upstream: a typed remote procedure call, an authenticated
+hook response, or terminal input. Terminal input is never an authoritative typed result, and the
+vocabulary says so rather than leaving it to a caller's judgement.
 
 ## The connection owner
 
@@ -4869,10 +4864,10 @@ becomes `UPSTREAM_UNAVAILABLE` rather than a growing buffer.
 
 No reader waits for the other end. A frame bound for a terminal that has stopped reading holds up
 that terminal's writer and nothing else: the upstream reader goes on correlating the
-acknowledgements behind it, and what the write turns out to be is work the writer does, in the
-order the frames were written. That is where a resource is settled from an answer's write, where a
-client request's intent is marked with what became of it, and where a write that did not finish
-ends the connection rather than quietly losing every frame after it.
+acknowledgements behind it, and what the write turns out to be is work the writer does, in the order
+the frames were written. That is where a resource is settled from an answer's write, where a client
+request's intent is marked with what became of it, and where a write that did not finish ends the
+connection rather than silently losing every frame after it.
 
 The native terminal's own traffic has a route. A frame it writes that names a method is its own
 request or notification, not an answer, and it goes through the same native admission an upstream
@@ -5030,19 +5025,19 @@ responses passed through it, how many rich operations it refused, and how many c
 it carried.
 
 Recovery is two steps because it can fail, and rich work comes back at the end of the second. The
-host's maintenance drives both. When the store takes writes again the journal writes its own gap
-and only then calls the condition healthy; the broker then commits its gap and every resource the
-gap touched, in whatever state each actually reached, including the ones the upstream withdrew
-inside it. The broker's half runs off the session's lock and the dispatch barrier, and it writes
-through a connection of its own, off the broker's lock, while the fence stays up: native work goes
-on while the store takes the write, and what that work changed is written by another pass before
-the fence comes down. A failure part way leaves the fence in place, and the next pass starts again.
-The gateway is then *recovering*, which admits no rich work; what ends that is
-reconciling the pending identifiers with **every** upstream that still had one, and rich work
-returns with the last of them, after the gap's final accounting is written. The reconciliations and
-that final accounting are written under the broker's lock, because they and the fence coming down
-are one decision, and they take the store's lock without waiting for it: a store another connection
-is writing refuses them at once, is not counted as failed, and leaves the finish to a later pass.
+host's maintenance drives both. When the store takes writes again the journal writes its own gap and
+only then calls the condition healthy; the broker then commits its gap and every resource the gap
+touched, in whatever state each reached, including the ones the upstream withdrew inside it. The
+broker's half runs off the session's lock and the dispatch barrier, and it writes through a
+connection of its own, off the broker's lock, while the fence stays up: native work goes on while
+the store takes the write, and what that work changed is written by another pass before the fence
+comes down. A failure part way leaves the fence in place, and the next pass starts again. The
+gateway is then *recovering*, which admits no rich work; what ends that is reconciling the pending
+identifiers with **every** upstream that still had one, and rich work returns with the last of them,
+after the gap's final accounting is written. The reconciliations and that final accounting are
+written under the broker's lock, because they and the fence coming down are one decision, and they
+take the store's lock without waiting for it: a store another connection is writing refuses them at
+once, is not counted as failed, and leaves the finish to a later pass.
 
 A connection that stayed open through the whole gap has carried every frame of it in both
 directions, so what its upstream still holds is what the host holds for it, unresolved; the host
@@ -5070,13 +5065,13 @@ machine could reach is refused before it is published rather than filtered after
 keeps the listener off iroh.
 
 Binding the socket, accepting on it and serving what connects is one composition. It binds the
-endpoint, builds the registration from the address it actually bound, reads the connecting bridge's
-first frame under a deadline, refuses anything a browser would have added, authenticates the owner,
-the process and the private exchange, opens the gateway connection against the tables this host
-pinned, registers that connection's transport as the instance's own, subscribes the connection to
-the resolutions of the instance it speaks for, and serves both ends until one closes. Teardown
-closes admission on both ends, lets the writers finish what was already queued, joins them, takes
-the transport back, closes the connection and withdraws the subscription. It stops nothing of the
+endpoint, builds the registration from the address it bound, reads the connecting bridge's first
+frame under a deadline, refuses anything a browser would have added, authenticates the owner, the
+process and the private exchange, opens the gateway connection against the tables this host pinned,
+registers that connection's transport as the instance's own, subscribes the connection to the
+resolutions of the instance it speaks for, and serves both ends until one closes. Teardown closes
+admission on both ends, lets the writers finish what was already queued, joins them, takes the
+transport back, closes the connection and withdraws the subscription. It stops nothing of the
 terminal's: what the terminal does is the terminal's own supervision's, and that is still running
 when the connection has gone.
 
@@ -5084,14 +5079,14 @@ Launching is the other half of the same composition. It first asks everything th
 without starting anything: whether this platform can publish the credential file, whether the
 runtime directory is the owner's alone, whether a private exchange can be drawn, and whether the
 launch intent still holds against the foreground it was prepared against. Only then does it start
-the executable the profile names, with the registration and credential paths in its environment
-and nothing secret in its arguments, read back from the kernel what it actually started, write the
-owner-only credential file, register the instance against that record, and write the registration
-file last, so a forwarder that reads it reads a complete one and the credential it names already
-exists. A launch that fails after the start leaves nothing running and nothing reserved: the process
-is ended and waited for before the launch returns, the credential file it wrote is removed, and
-the broker gives back the instance and the conversation the launch took, so a retry is not refused
-for a launch that never happened.
+the executable the profile names, with the registration and credential paths in its environment and
+nothing secret in its arguments, read back from the kernel what it started, write the owner-only
+credential file, register the instance against that record, and write the registration file last, so
+a forwarder that reads it reads a complete one and the credential it names already exists. A launch
+that fails after the start leaves nothing running and nothing reserved: the process is ended and
+waited for before the launch returns, the credential file it wrote is removed, and the broker gives
+back the instance and the conversation the launch took, so a retry is not refused for a launch that
+never happened.
 
 On Windows the spawned programs must be `.exe` or `.com`: a batch file, a PowerShell script or a
 script that a runtime runs is refused by name, because the process that would start is the
@@ -5322,10 +5317,10 @@ connection.
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
 cancellation names the turn it acts on and is refused rather than redirected when that turn is not
-the one running. An approval answer names a resource that is still open, inside the
-upstream's own deadline, interpreted at the current source generation by a decoder that still holds
-the approval-interpreter grant, with a decision that interpretation actually offered; it is checked
-against the retained list before the claim is taken, and it happens once.
+the one running. An approval answer names a resource that is still open, inside the upstream's own
+deadline, interpreted at the current source generation by a decoder that still holds the
+approval-interpreter grant, with a decision that interpretation offered; it is checked against the
+retained list before the claim is taken, and it happens once.
 
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
