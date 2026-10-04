@@ -29,8 +29,8 @@ libc.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
 [features]
-# What this crate's own tests use to act at each step at the end of a directory's removal. It
-# compiles to nothing without this feature, and no shipped build enables it.
+# What this crate's own tests use to act at each step at the end of a directory's removal and to
+# stop a finish between two of its own steps. Without this feature none of it is compiled.
 testing = []
 
 [target.'cfg(windows)'.dependencies]
@@ -45,8 +45,8 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
-# This crate's own tests, with the removal's steps reachable: a test stands at each step at the end
-# of a directory's removal, which no timing reaches reliably.
+# This crate's own tests, with those steps reachable: a test stands at each of them, which no
+# timing reaches reliably.
 kr-transfer = { path = ".", features = ["testing"] }
 # The WebP decoder, which the daemon and the worker link through the terminal engine: the preview
 # tests run with it linked, so a WebP that is withheld is withheld by the module's allowlist.
