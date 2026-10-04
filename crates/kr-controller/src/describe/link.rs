@@ -126,12 +126,17 @@ async fn read(
     let mut after = 0_u64;
     let mut named: Option<u64> = None;
     let mut request = 0_u64;
+    // The first request of a connection is answered at once, with the facts the worker kept from
+    // before it, when it has any: those were produced at a moment nothing here knows, and the host
+    // is told so. Every request after it is held until something changes, so what answers it was
+    // produced while it was held.
+    let mut found = true;
     loop {
         request += 1;
         let asked = DescriptionFactsRequest {
             request_id: RequestId::new(request),
             after: U64::new(after),
-            wait_ms: U64::new(HOLD_MS),
+            wait_ms: U64::new(if found { 0 } else { HOLD_MS }),
             generation: Nullable(named.map(U64::new)),
         };
         if client
@@ -162,6 +167,6 @@ async fn read(
         let Some(host) = host.upgrade().filter(|host| host.runs()) else {
             return;
         };
-        host.page(session_id, page);
+        host.page(session_id, page, std::mem::take(&mut found));
     }
 }

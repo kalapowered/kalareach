@@ -133,6 +133,16 @@ pub(crate) struct CheckRequest {
     pub deadline_ms: u64,
 }
 
+/// A page of facts waiting for the host's thread.
+#[derive(Debug)]
+struct Waiting {
+    page: Box<DescriptionFactsPage>,
+    /// Whether it is what the worker answered a new connection with at once: facts it kept from
+    /// before the connection, whose moment nothing here knows. A page that replaces one that was
+    /// not read keeps the mark, since it holds those facts as well as what came after.
+    found: bool,
+}
+
 /// What the host publishes about the service after each turn, for a reader of `session.describe`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Snapshot {
@@ -173,6 +183,10 @@ pub(crate) struct SeenText {
     pub at_ms: u64,
     /// The privacy generation it was captured under: nothing of another generation is read.
     pub generation: PrivacyGeneration,
+    /// Whether it came in a page the worker answered a new connection with at once, which holds the
+    /// facts it kept from before: they were produced at a moment nothing here knows, and the
+    /// moment the host saw them says nothing of it.
+    pub inherited: bool,
 }
 
 /// What the host has done, counted, for this crate's own tests and for the doctor.
@@ -275,7 +289,7 @@ struct Shared {
     /// for every one of them from a thread that is not the host's.
     known: Mutex<BTreeSet<SessionId>>,
     /// The newest page of facts of each session, which the thread takes.
-    slots: Mutex<BTreeMap<SessionId, Box<DescriptionFactsPage>>>,
+    slots: Mutex<BTreeMap<SessionId, Waiting>>,
     snapshot: RwLock<Snapshot>,
     /// How many purges were posted and not yet done.
     purges_owed: AtomicU64,
@@ -580,8 +594,9 @@ impl DescribeHost {
         self.post(Message::Closed { session_id });
     }
 
-    /// Hands the host the newest page of a session's facts, replacing one it has not read.
-    pub(crate) fn page(&self, session_id: SessionId, page: Box<DescriptionFactsPage>) {
+    /// Hands the host the newest page of a session's facts, replacing one it has not read. `found`
+    /// says the page is what the worker answered a new connection with at once.
+    pub(crate) fn page(&self, session_id: SessionId, page: Box<DescriptionFactsPage>, found: bool) {
         {
             let mut slots = self
                 .shared
@@ -593,7 +608,8 @@ impl DescribeHost {
             if !self.shared.running.load(Ordering::Acquire) {
                 return;
             }
-            slots.insert(session_id, page);
+            let found = found || slots.get(&session_id).is_some_and(|older| older.found);
+            slots.insert(session_id, Waiting { page, found });
         }
         self.shared.waker.wake();
     }
@@ -1044,14 +1060,27 @@ impl Thread {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        for (session_id, page) in pages {
-            self.apply(session_id, &page, now);
+        for (session_id, waiting) in pages {
+            self.apply_page(session_id, &waiting.page, waiting.found, now);
         }
     }
 
-    /// Applies one page of a session's facts under privacy mode's admission at the generation it
-    /// was captured under, or drops it when none admits it.
+    /// Applies a page that was not found on a new connection, for this crate's own tests.
+    #[cfg(test)]
     fn apply(&mut self, session_id: SessionId, page: &DescriptionFactsPage, now: Reading) {
+        self.apply_page(session_id, page, false, now);
+    }
+
+    /// Applies one page of a session's facts under privacy mode's admission at the generation it
+    /// was captured under, or drops it when none admits it. `found` says it is what the worker
+    /// answered a new connection with at once.
+    fn apply_page(
+        &mut self,
+        session_id: SessionId,
+        page: &DescriptionFactsPage,
+        found: bool,
+        now: Reading,
+    ) {
         let Some(facts) = page.facts.0.as_ref() else {
             return;
         };
@@ -1087,6 +1116,7 @@ impl Thread {
             facts,
             generation,
             now.wall_ms().get(),
+            found,
         );
         drop(admission);
     }
@@ -1184,11 +1214,16 @@ impl Thread {
 /// Records what a page of facts says of a session's directory and program, keeping the moment each
 /// was first observed as it stands: a page that repeats what is held moves nothing, and one that
 /// changes it, or that is of another privacy generation, starts its moment again.
+///
+/// The program is held only while its command runs. The worker keeps the program of the newest
+/// command in its record when the command ends, and records how it ended beside it, so a record
+/// with an ending is a program that is no longer in the foreground.
 fn note_seen(
     seen: &mut Seen,
     facts: &kr_protocol::describe::DescriptionFacts,
     generation: PrivacyGeneration,
     at_ms: u64,
+    found: bool,
 ) {
     let directory = facts
         .directory
@@ -1203,9 +1238,14 @@ fn note_seen(
             },
             None => name.clone(),
         });
+    let running = facts
+        .application
+        .0
+        .clone()
+        .filter(|_| facts.completion.0.is_none());
     for (held, text) in [
         (&mut seen.directory, directory),
-        (&mut seen.application, facts.application.0.clone()),
+        (&mut seen.application, running),
     ] {
         *held = match (held.take(), text) {
             (Some(was), Some(text)) if was.text == text && was.generation == generation => {
@@ -1215,6 +1255,7 @@ fn note_seen(
                 text,
                 at_ms,
                 generation,
+                inherited: found,
             }),
             (_, None) => None,
         };
@@ -1594,21 +1635,28 @@ pub(crate) mod tests {
 
     /// What the host observed of a session's directory and program carries the moment it first
     /// observed each as it stands: a page that repeats what is held keeps it, a change starts the
-    /// moment again for what changed and for nothing else, and what was captured under another
-    /// generation is not kept. The control is the first page, which sets both.
+    /// moment again for what changed and for nothing else, and the program is held only while its
+    /// command runs. What a page found on a new connection held is marked as found and not seen to
+    /// change, since a worker answers a new connection with the facts it kept from before. The
+    /// control is the first page, which sets both.
     #[test]
     fn what_was_observed_keeps_the_moment_it_was_first_observed_as_it_stands() {
         let (_directory, mut host) = thread(state(0, false));
         let seen = |host: &Thread| host.seen.get(&session()).cloned().expect("a record");
-        host.apply(session(), &page(0), Reading::new(1_000, 1_700_000_001_000));
+        host.apply_page(
+            session(),
+            &page(0),
+            true,
+            Reading::new(1_000, 1_700_000_001_000),
+        );
         let first = seen(&host);
         assert_eq!(
-            first.directory.as_ref().map(|d| d.at_ms),
-            Some(1_700_000_001_000)
+            first.directory.as_ref().map(|d| (d.at_ms, d.inherited)),
+            Some((1_700_000_001_000, true))
         );
         assert_eq!(
-            first.application.as_ref().map(|a| a.at_ms),
-            Some(1_700_000_001_000)
+            first.application.as_ref().map(|a| (a.at_ms, a.inherited)),
+            Some((1_700_000_001_000, true))
         );
 
         // The same facts again, with another revision: nothing moves.
@@ -1619,7 +1667,7 @@ pub(crate) mod tests {
         );
         assert_eq!(seen(&host), first);
 
-        // A program that changes moves its moment and not the directory's.
+        // A program that changes moves its moment, and is seen to change; the directory's stays.
         host.apply(
             session(),
             &page_with(0, 3, |facts| {
@@ -1631,18 +1679,37 @@ pub(crate) mod tests {
         assert_eq!(changed.directory, first.directory);
         let application = changed.application.expect("a program");
         assert_eq!(
-            (application.text.as_str(), application.at_ms),
-            ("make", 1_700_000_003_000)
+            (
+                application.text.as_str(),
+                application.at_ms,
+                application.inherited
+            ),
+            ("make", 1_700_000_003_000, false)
         );
 
-        // A program that is no longer reported is no longer held.
+        // A command that has ended is no longer held, and the same program run again is a new
+        // observation with its own moment.
         host.apply(
             session(),
-            &page_with(0, 4, |facts| facts.application = Nullable::null()),
+            &page_with(0, 4, |facts| {
+                facts.application = Nullable::some("make".to_owned());
+                facts.completion = Nullable::some(DescriptionCompletion::Succeeded);
+            }),
             Reading::new(4_000, 1_700_000_004_000),
         );
         assert_eq!(seen(&host).application, None);
         assert_eq!(seen(&host).directory, first.directory);
+        host.apply(
+            session(),
+            &page_with(0, 5, |facts| {
+                facts.application = Nullable::some("make".to_owned());
+            }),
+            Reading::new(5_000, 1_700_000_005_000),
+        );
+        assert_eq!(
+            seen(&host).application.map(|held| held.at_ms),
+            Some(1_700_000_005_000)
+        );
     }
 
     /// A session's fence is lowered at the first page admitted at a newer non-private generation
@@ -1937,7 +2004,7 @@ pub(crate) mod tests {
                 shared: Arc::clone(&host.shared),
                 thread: Mutex::new(None),
             };
-            handle.page(session(), Box::new(page(0)));
+            handle.page(session(), Box::new(page(0)), false);
             let held = host
                 .shared
                 .slots
@@ -2119,7 +2186,7 @@ pub(crate) mod tests {
                 shared: Arc::clone(&host.shared),
                 thread: Mutex::new(None),
             };
-            handle.page(session(), Box::new(page(0)));
+            handle.page(session(), Box::new(page(0)), false);
             if purged {
                 std::thread::scope(|scope| {
                     let purging = scope.spawn(|| handle.purge());
@@ -2160,7 +2227,7 @@ pub(crate) mod tests {
             shared: Arc::clone(&shared),
             thread: Mutex::new(None),
         };
-        handle.page(session(), Box::new(page(0)));
+        handle.page(session(), Box::new(page(0)), false);
         shared
             .inbox
             .lock()
@@ -2188,7 +2255,7 @@ pub(crate) mod tests {
     fn a_purge_of_a_host_that_has_stopped_empties_its_slots() {
         let (_directory, host) = thread(state(0, false));
         let handle = handle_of(&host);
-        handle.page(session(), Box::new(page(0)));
+        handle.page(session(), Box::new(page(0)), false);
         handle.shared.running.store(false, Ordering::Release);
         assert_eq!(handle.purge(), Ok(()));
         assert!(

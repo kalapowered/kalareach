@@ -660,6 +660,12 @@ impl DescribeModule {
     /// privacy mode is on, and nothing of an earlier generation after it; a model's text is not
     /// read beside a pin, which wins as it does for [`Self::describe`].
     ///
+    /// What this host found in a session's facts when it started, or after privacy mode, is not
+    /// dated by the moment it was found: the worker kept it from before, and nothing here knows when
+    /// it was produced. For a session that began before this host started, such an observation is
+    /// not carried until the host has seen it change. `session_started_ms` is when the session
+    /// began.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
@@ -667,6 +673,7 @@ impl DescribeModule {
         &self,
         session_id: SessionId,
         facts: &SessionFacts,
+        session_started_ms: u64,
         privacy: &PrivacyState,
     ) -> Result<VoiceDescription> {
         let store = self.store();
@@ -690,15 +697,22 @@ impl DescribeModule {
                 activity: record.activity.as_str().to_owned(),
             })
         };
-        let seen = if published.private {
-            None
+        let (seen, host_started_ms) = if published.private {
+            (None, 0)
         } else {
             self.host()
                 .filter(|host| host.runs())
-                .and_then(|host| host.snapshot().seen.get(&session_id).cloned())
+                .map(|host| host.snapshot())
+                .map_or((None, 0), |snapshot| {
+                    (
+                        snapshot.seen.get(&session_id).cloned(),
+                        snapshot.started_wall_ms,
+                    )
+                })
         };
         let current = |seen: Option<&host::SeenText>| {
             seen.filter(|held| held.generation == published.generation)
+                .filter(|held| !(held.inherited && session_started_ms < host_started_ms))
                 .map(|held| Observed {
                     text: held.text.clone(),
                     at_ms: held.at_ms,

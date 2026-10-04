@@ -253,9 +253,14 @@ impl Worker {
     /// integration's hook does before the line's block: the program is named only from a file the
     /// shell found, and this test's own executable is one.
     fn resolve(&self, program: &str, cwd: &str) {
+        self.resolve_at(1, program, cwd);
+    }
+
+    /// [`Self::resolve`] for the line accepted at prompt generation `generation`.
+    fn resolve_at(&self, generation: u64, program: &str, cwd: &str) {
         let invocation = kr_protocol::root::RootCommandResolveParams {
             session_id: self.session_id,
-            prompt_generation: PromptGeneration::new(1),
+            prompt_generation: PromptGeneration::new(generation),
             argv: vec![program.to_owned()],
             executable: std::env::current_exe()
                 .expect("this test's own executable")
@@ -276,9 +281,14 @@ impl Worker {
 
     /// Reports a command block to the session as the shell integration's hook does.
     fn report(&self, command: &str, cwd: &str, status: Option<u64>) {
+        self.report_at(1, command, cwd, status);
+    }
+
+    /// [`Self::report`] for the line accepted at prompt generation `generation`.
+    fn report_at(&self, generation: u64, command: &str, cwd: &str, status: Option<u64>) {
         let block = RootCommandBlockParams {
             session_id: self.session_id,
-            prompt_generation: PromptGeneration::new(1),
+            prompt_generation: PromptGeneration::new(generation),
             command: command.to_owned(),
             started_at_ms: TimestampMs::new(1),
             duration_ms: Nullable(status.map(|_| DurationMs::new(1))),
@@ -1915,6 +1925,136 @@ async fn voice_context_carries_what_the_host_holds_of_a_session_each_at_its_own_
     assert!(
         after.generated.is_none() && after.active_application.is_none(),
         "{after:?}"
+    );
+    environment.stop().await;
+}
+
+/// Polls the daemon's voice snapshot of a session until `holds` says it does.
+async fn until_voice_snapshot(
+    environment: &Environment,
+    what: &str,
+    session_id: SessionId,
+    holds: impl Fn(&kr_controller::voice::SessionSnapshot) -> bool,
+) -> kr_controller::voice::SessionSnapshot {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let snapshot = environment
+            .controller()
+            .voice_session_snapshot(session_id)
+            .await
+            .expect("the snapshot");
+        if holds(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} did not happen in time: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-15.20: what a restarted host finds in a worker's retained facts is not dated by the
+/// moment it found it, because it was produced earlier, at a moment nothing here knows: a grant
+/// whose history begins between the command and the restart must not be shown the program or the
+/// directory the restart found. They are named unavailable until the host sees them change, and a
+/// change made after the restart is dated by the moment it was seen. The control is the same
+/// session before the restart, whose observations are dated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_does_not_date_the_facts_it_finds_by_the_moment_it_found_them() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let started = environment.summary_of(session_id).await.created_at_ms.get();
+    environment.workers[0].resolve("make", "/home/a/kalareach");
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let before = until_voice_snapshot(&environment, "the observation", session_id, |snapshot| {
+        snapshot.active_application.is_some()
+    })
+    .await;
+    assert!(
+        before
+            .active_application
+            .expect("the program")
+            .produced_at_ms
+            > started
+    );
+
+    let environment = environment.restart().await;
+    until("the host described the session again", || {
+        environment.figures().jobs.published >= 1
+    })
+    .await;
+    let after = environment
+        .controller()
+        .voice_session_snapshot(session_id)
+        .await
+        .expect("the snapshot");
+    assert!(
+        after.active_application.is_none(),
+        "the program the restart found has no moment: {after:?}"
+    );
+    assert_eq!(
+        after.working_directory.expect("a directory").produced_at_ms,
+        started,
+        "the directory the session started in, from the moment it started"
+    );
+
+    let before_the_change = kr_ipc::now_ms().get();
+    // The next line the shell accepts, which is a new command.
+    environment.workers[0].resolve_at(2, "cargo", "/home/a/other");
+    environment.workers[0].report_at(2, "cargo", "/home/a/other", None);
+    let changed = until_voice_snapshot(&environment, "the change", session_id, |snapshot| {
+        snapshot.active_application.is_some()
+    })
+    .await;
+    assert_eq!(
+        changed.active_application.expect("the program").text,
+        "cargo"
+    );
+    assert!(
+        changed
+            .working_directory
+            .expect("a directory")
+            .produced_at_ms
+            >= before_the_change,
+        "a change seen after the restart is dated by when it was seen"
+    );
+    environment.stop().await;
+}
+
+/// KR-REQ-15.20: a command that has ended is not the active application: the worker keeps the
+/// program of the newest command in its record when the command ends and records how it ended
+/// beside it, and voice context reports the foreground unavailable once it has. The control is the
+/// same command while it runs, which is the active application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_that_has_ended_is_not_the_active_application() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].resolve("make", "/home/a/kalareach");
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let running = until_voice_snapshot(
+        &environment,
+        "the command running",
+        session_id,
+        |snapshot| snapshot.active_application.is_some(),
+    )
+    .await;
+    assert_eq!(
+        running.active_application.expect("the program").text,
+        "make"
+    );
+
+    environment.workers[0].report("make", "/home/a/kalareach", Some(0));
+    let ended = until_voice_snapshot(&environment, "the command ended", session_id, |snapshot| {
+        snapshot.active_application.is_none()
+    })
+    .await;
+    assert!(
+        ended
+            .unavailable
+            .iter()
+            .any(|run| run.reason.contains("foreground")),
+        "{ended:?}"
     );
     environment.stop().await;
 }

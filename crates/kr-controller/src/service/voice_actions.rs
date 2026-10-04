@@ -106,8 +106,9 @@ impl Controller {
         let descriptions = Arc::clone(&self.descriptions);
         let privacy = self.privacy.state();
         let facts = crate::describe::facts_of(&read.session);
+        let started_ms = read.session.created_at_ms.get();
         let described = tokio::task::spawn_blocking(move || {
-            descriptions.voice_description(session_id, &facts, &privacy)
+            descriptions.voice_description(session_id, &facts, started_ms, &privacy)
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
