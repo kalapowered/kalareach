@@ -489,7 +489,8 @@ file is the bytes its signed recipe names, writes the file with the forwarder's 
 placeholder, and records the installed file by the digest of what it wrote. Removal and
 reapplication compare that digest. A release applied with one forwarder is removed and applied again
 when the host names another. A placeholder anywhere but at the start of a command is refused before
-anything is written.
+anything is written, and so is one in a hooks file in the form its application does not start: for
+Gemini CLI one line a shell runs, for the other applications a program with its arguments in a list.
 
 A bridge places only what this host names for its application. For Claude Code that is three files,
 `.claude-plugin/plugin.json`, `.mcp.json` and `hooks/hooks.json`, in one directory `skills/<name>/`,

@@ -46,7 +46,7 @@ is refused and nothing is written. The settings key is spliced into the person's
 `settings.json`, so every other byte of it stays as it was. The package writes the forwarder as
 `{kr_hook}`, and when the host writes each file it replaces that with the full path of the `kr-hook`
 its updates keep current. Claude Code therefore starts that file, and not a program of the same name
-found on its search path or, on Windows, in the folder it works in. The host records each installed
+found on its search path. The host records each installed
 file by the digest of what it wrote. A connection running another copy is refused at admission, and
 a registration written for a forwarder the host has since replaced is written again with the new
 path.
