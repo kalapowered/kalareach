@@ -660,11 +660,11 @@ impl DescribeModule {
     /// privacy mode is on, and nothing of an earlier generation after it; a model's text is not
     /// read beside a pin, which wins as it does for [`Self::describe`].
     ///
-    /// What this host found in a session's facts when it started, or after privacy mode, is not
-    /// dated by the moment it was found: the worker kept it from before, and nothing here knows when
-    /// it was produced. For a session that began before this host started, such an observation is
-    /// not carried until the host has seen it change. `session_started_ms` is when the session
-    /// began.
+    /// What this host found in a session's facts on a new connection to the worker is not dated by
+    /// the moment it was found: the worker kept it from before, and nothing here knows when it was
+    /// produced. It is dated at the session's start, `session_started_ms`, the earliest it can have
+    /// been produced, so a grant whose history begins after the start is not shown it, whatever the
+    /// order of a restart, a lost connection and the grant.
     ///
     /// # Errors
     ///
@@ -697,25 +697,22 @@ impl DescribeModule {
                 activity: record.activity.as_str().to_owned(),
             })
         };
-        let (seen, host_started_ms) = if published.private {
-            (None, 0)
+        let seen = if published.private {
+            None
         } else {
             self.host()
                 .filter(|host| host.runs())
-                .map(|host| host.snapshot())
-                .map_or((None, 0), |snapshot| {
-                    (
-                        snapshot.seen.get(&session_id).cloned(),
-                        snapshot.started_wall_ms,
-                    )
-                })
+                .and_then(|host| host.snapshot().seen.get(&session_id).cloned())
         };
         let current = |seen: Option<&host::SeenText>| {
             seen.filter(|held| held.generation == published.generation)
-                .filter(|held| !(held.inherited && session_started_ms < host_started_ms))
                 .map(|held| Observed {
                     text: held.text.clone(),
-                    at_ms: held.at_ms,
+                    at_ms: if held.inherited {
+                        session_started_ms
+                    } else {
+                        held.at_ms
+                    },
                 })
         };
         Ok(VoiceDescription {
@@ -1209,9 +1206,7 @@ pub(crate) mod tests {
     async fn a_setting_the_host_does_not_confirm_in_time_is_answered_as_unknown() {
         let (_root, module, _other) = module();
         let mut host = host::tests::ByHand::new();
-        module
-            .set_host(Arc::new(host.handle()))
-            .expect("the first host");
+        module.set_host(host.handle()).expect("the first host");
 
         let error = module
             .until_host_turns_within(std::time::Duration::from_millis(10))
@@ -1229,6 +1224,42 @@ pub(crate) mod tests {
             async { host.turn() }
         );
         confirmed.expect("a turn came");
+    }
+
+    /// KR-REQ-15.20: what the host found on a new connection to a worker is dated at the session's
+    /// start, whenever it was found: a program the worker kept from before a restart, and one that
+    /// changed while a connection was down and was found on the next, are both dated before any
+    /// grant that begins after the session started. A change seen on a connection that was held is
+    /// dated by when it was seen. The control is the second.
+    #[test]
+    fn what_a_new_connection_found_is_dated_at_the_sessions_start() {
+        let (_root, module, _other) = module();
+        let mut host = host::tests::ByHand::new();
+        module.set_host(host.handle()).expect("the first host");
+        let session_id = host.session_id();
+        let started = 1_000;
+        let read = |module: &DescribeModule| {
+            module
+                .voice_description(session_id, &facts(), started, &off())
+                .expect("the description")
+                .application
+                .expect("a program")
+        };
+
+        host.observes("make", true);
+        let found = read(&module);
+        assert_eq!((found.text.as_str(), found.at_ms), ("make", started));
+
+        // The same session on a later connection, a different program found there.
+        host.observes("cargo", true);
+        let again = read(&module);
+        assert_eq!((again.text.as_str(), again.at_ms), ("cargo", started));
+
+        // The control: a change seen on a held request.
+        host.observes("rustc", false);
+        let seen = read(&module);
+        assert_eq!(seen.text, "rustc");
+        assert!(seen.at_ms > started, "dated by when it was seen: {seen:?}");
     }
 
     /// KR-REQ-24.14: a pin that rename wrote is the environment's, not the session's, so it

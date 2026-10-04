@@ -1955,11 +1955,12 @@ async fn until_voice_snapshot(
 }
 
 /// KR-REQ-15.20: what a restarted host finds in a worker's retained facts is not dated by the
-/// moment it found it, because it was produced earlier, at a moment nothing here knows: a grant
-/// whose history begins between the command and the restart must not be shown the program or the
-/// directory the restart found. They are named unavailable until the host sees them change, and a
-/// change made after the restart is dated by the moment it was seen. The control is the same
-/// session before the restart, whose observations are dated.
+/// moment it found it, because it was produced earlier, at a moment nothing here knows: it is dated
+/// at the session's start, the earliest it can have been produced, so a grant whose history begins
+/// between the command and the restart is not shown the program or the directory the restart
+/// found, and a grant that reaches the start is. A command run after the restart is dated by when
+/// it was seen. The control is the same session before the restart, whose observations are dated
+/// by when they were seen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_does_not_date_the_facts_it_finds_by_the_moment_it_found_them() {
     let environment = Environment::start(Setup::new()).await;
@@ -1984,37 +1985,47 @@ async fn a_restart_does_not_date_the_facts_it_finds_by_the_moment_it_found_them(
         environment.figures().jobs.published >= 1
     })
     .await;
-    let after = environment
-        .controller()
-        .voice_session_snapshot(session_id)
-        .await
-        .expect("the snapshot");
-    assert!(
-        after.active_application.is_none(),
-        "the program the restart found has no moment: {after:?}"
+    let after = until_voice_snapshot(&environment, "the program found", session_id, |snapshot| {
+        snapshot.active_application.is_some()
+    })
+    .await;
+    let program = after.active_application.clone().expect("the program");
+    assert_eq!(program.text, "make");
+    assert_eq!(
+        program.produced_at_ms, started,
+        "dated at the session's start"
     );
     assert_eq!(
-        after.working_directory.expect("a directory").produced_at_ms,
+        after
+            .working_directory
+            .clone()
+            .expect("a directory")
+            .produced_at_ms,
         started,
-        "the directory the session started in, from the moment it started"
+        "so is the directory it found"
     );
+    // A grant whose history begins after the session started is shown neither; one that reaches
+    // the start is shown both.
+    let late = kr_controller::voice::filtered(after.clone(), &voice_grant(started + 1));
+    assert!(late.active_application.is_none(), "{late:?}");
+    let whole = kr_controller::voice::filtered(after, &voice_grant(started));
+    assert_eq!(whole.active_application.expect("the program").text, "make");
 
     let before_the_change = kr_ipc::now_ms().get();
     // The next line the shell accepts, which is a new command.
     environment.workers[0].resolve_at(2, "cargo", "/home/a/other");
     environment.workers[0].report_at(2, "cargo", "/home/a/other", None);
     let changed = until_voice_snapshot(&environment, "the change", session_id, |snapshot| {
-        snapshot.active_application.is_some()
+        snapshot
+            .active_application
+            .as_ref()
+            .is_some_and(|program| program.text == "cargo")
     })
     .await;
-    assert_eq!(
-        changed.active_application.expect("the program").text,
-        "cargo"
-    );
     assert!(
         changed
-            .working_directory
-            .expect("a directory")
+            .active_application
+            .expect("the program")
             .produced_at_ms
             >= before_the_change,
         "a change seen after the restart is dated by when it was seen"

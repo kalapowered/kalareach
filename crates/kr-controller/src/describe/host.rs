@@ -1060,8 +1060,42 @@ impl Thread {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        let live = self.driver.service().live_session_ids();
         for (session_id, waiting) in pages {
-            self.apply_page(session_id, &waiting.page, waiting.found, now);
+            if live.contains(&session_id) {
+                self.apply_page(session_id, &waiting.page, waiting.found, now);
+            } else if self
+                .shared
+                .known
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&session_id)
+            {
+                // The session is open and the message that says so has not been taken yet: the page
+                // waits for it. Dropped here, the page would take with it the mark that the facts
+                // it holds were kept from before, and the next page would carry the same facts as
+                // seen now.
+                self.wait_for_session(session_id, waiting);
+            }
+        }
+    }
+
+    /// Puts a page back in its session's slot until the session is taken, unless a newer page has
+    /// come meanwhile, which keeps the mark of the one it replaces.
+    fn wait_for_session(&mut self, session_id: SessionId, waiting: Waiting) {
+        let mut slots = self
+            .shared
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.shared.running.load(Ordering::Acquire) {
+            return;
+        }
+        match slots.get_mut(&session_id) {
+            Some(newer) => newer.found |= waiting.found,
+            None => {
+                slots.insert(session_id, waiting);
+            }
         }
     }
 
@@ -1530,27 +1564,49 @@ pub(crate) mod tests {
         }
     }
 
-    /// A host whose thread a test turns by hand, for the tests of what holds a handle on it.
+    /// A host whose thread a test turns by hand, for the tests of what holds a handle on it. It
+    /// holds the one handle, which ends the host when the last reference to it goes.
     pub(crate) struct ByHand {
         _directory: tempfile::TempDir,
         thread: Thread,
+        handle: Arc<DescribeHost>,
     }
 
     impl ByHand {
         /// A host over a service that is never asked to start a process, with privacy mode off.
         pub(crate) fn new() -> Self {
             let (_directory, thread) = thread(Published::default());
-            Self { _directory, thread }
+            let handle = Arc::new(handle_of(&thread));
+            Self {
+                _directory,
+                thread,
+                handle,
+            }
         }
 
         /// The handle a daemon holds on it.
-        pub(crate) fn handle(&self) -> DescribeHost {
-            handle_of(&self.thread)
+        pub(crate) fn handle(&self) -> Arc<DescribeHost> {
+            Arc::clone(&self.handle)
         }
 
         /// One turn of its thread.
         pub(crate) fn turn(&mut self) {
             self.thread.turn();
+        }
+
+        /// The session its thread tracks.
+        pub(crate) fn session_id(&self) -> SessionId {
+            session()
+        }
+
+        /// Hands the host a page that names `program` as the foreground, as the worker answers a
+        /// new connection (`found`) or as it answers a request that was held, and turns once.
+        pub(crate) fn observes(&mut self, program: &str, found: bool) {
+            let page = page_with(0, 2, |facts| {
+                facts.application = Nullable::some(program.to_owned());
+            });
+            self.handle.page(session(), Box::new(page), found);
+            self.turn();
         }
     }
 
@@ -1710,6 +1766,62 @@ pub(crate) mod tests {
             seen(&host).application.map(|held| held.at_ms),
             Some(1_700_000_005_000)
         );
+    }
+
+    /// A page that reaches the host before the message that opens its session is taken waits for
+    /// the session, and keeps what it found: a page the host dropped for want of the session would
+    /// take with it the mark that the facts it held were kept from before, and the next page would
+    /// carry the same facts as seen at that moment. A page for a session that is not open is
+    /// dropped, as it was.
+    #[test]
+    fn a_page_that_comes_before_its_session_is_opened_waits_and_keeps_its_mark() {
+        let now = Reading::new(1_000, 1_700_000_001_000);
+        let (_directory, mut host) = thread(state(0, false));
+        let handle = handle_of(&host);
+        let other = SessionId::new(Uuid::from_bytes([8; 16]));
+        let stranger = SessionId::new(Uuid::from_bytes([9; 16]));
+        let slot = |host: &Thread, session_id: &SessionId| {
+            host.shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(session_id)
+        };
+
+        // The session is open, and the message that says so is not taken yet.
+        handle.session_opened(
+            other,
+            SessionEpoch::V1,
+            ContextBinding::new("display-2/epoch-1"),
+        );
+        let mut found = page(0);
+        found.session_id = other;
+        handle.page(other, Box::new(found), true);
+        let mut unknown = page(0);
+        unknown.session_id = stranger;
+        handle.page(stranger, Box::new(unknown), true);
+        host.take_pages(now);
+        assert!(slot(&host, &other), "the page waits for its session");
+        assert!(
+            !slot(&host, &stranger),
+            "a page for no open session is dropped"
+        );
+
+        // A newer page arrives while it waits; the session is taken, and the page is applied.
+        let mut newer = page_with(0, 2, |facts| {
+            facts.application = Nullable::some("make".to_owned());
+        });
+        newer.session_id = other;
+        handle.page(other, Box::new(newer), false);
+        host.take_messages(now);
+        host.take_pages(now);
+        let seen = host
+            .seen
+            .get(&other)
+            .cloned()
+            .expect("the session's record");
+        assert_eq!(seen.directory.map(|held| held.inherited), Some(true));
+        assert_eq!(seen.application.map(|held| held.inherited), Some(true));
     }
 
     /// A session's fence is lowered at the first page admitted at a newer non-private generation
