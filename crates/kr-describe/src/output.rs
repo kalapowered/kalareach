@@ -414,9 +414,17 @@ pub fn end_cut_answer(
         prompt.revision.get()
     );
     let (activity, whole) = if quotes.len() >= 8 {
-        // What the model wrote after the activity text has to be the start of the tail.
+        // What the model wrote after the activity text has to be the start of the tail, and a
+        // number it had finished, by a space or a comma after it, has to be the prompt's number.
+        let written_tail = &text[quotes[7] + 1..];
         let spaceless = |text: &str| text.replace(' ', "");
-        if !spaceless(&tail).starts_with(&spaceless(&text[quotes[7] + 1..])) {
+        let (expected, begun) = (spaceless(&tail), spaceless(written_tail));
+        let continues = expected[begun.len().min(expected.len())..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit());
+        let finished = written_tail.ends_with(' ') && begun.ends_with(|c: char| c.is_ascii_digit());
+        if !expected.starts_with(&begun) || (finished && continues) {
             return unchanged();
         }
         (&text[quotes[6] + 1..quotes[7]], true)
@@ -444,22 +452,13 @@ pub fn end_cut_answer(
             clusters[..kept].concat()
         )
     };
-    // The most clusters that leave the answer within the bound, found by halving; the one kept is
-    // one that was counted and fit.
-    let candidates: Vec<usize> = (1..=clusters.len())
+    // The most clusters that leave the answer within the bound: the longest run first, so that a
+    // tokenizer whose count of a longer text is smaller than a shorter one's still finds the one
+    // that fits. The one kept is one that was counted and fit.
+    (1..=clusters.len())
+        .rev()
         .filter(|kept| ends_in_text(*kept))
-        .collect();
-    let (mut low, mut high) = (0, candidates.len());
-    let mut best = None;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let candidate = answer(candidates[middle]);
-        if count(&candidate) <= max_tokens {
-            best = Some(candidate);
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    best.map_or_else(unchanged, String::into_bytes)
+        .map(answer)
+        .find(|candidate| count(candidate) <= max_tokens)
+        .map_or_else(unchanged, String::into_bytes)
 }

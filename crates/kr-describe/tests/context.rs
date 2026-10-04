@@ -798,6 +798,25 @@ fn what_the_model_wrote_wrongly_is_left_as_it_is() {
         "a wrong echo of the interval"
     );
 
+    // A number the model had finished, by the space after it, that is not the prompt's: `1` is the
+    // start of the interval's end, 11, but not the whole of it.
+    let finished = format!(
+        "{}\"to\":1 ",
+        wrong[..wrong.find("\"to\"").expect("a field")].replace("\"from\": 7", "\"from\": 3")
+    );
+    assert_eq!(
+        end_cut_answer(finished.as_bytes(), &prompt, usize::MAX, stand_in),
+        finished.as_bytes(),
+        "a finished number that is not the prompt's"
+    );
+    // The same digit with nothing after it is only begun, and the prompt's number completes it.
+    let begun = finished.trim_end();
+    let ended = end_cut_answer(begun.as_bytes(), &prompt, usize::MAX, stand_in);
+    assert!(
+        validate(&ended, &produced_under(), &expectation(2)).is_ok(),
+        "a number begun, as the prompt's number starts"
+    );
+
     let mut broken = full.clone().into_bytes();
     let at = full.find("flow").expect("a word");
     broken[at] = 0xFF;
@@ -830,4 +849,34 @@ fn white_space_inside_a_character_is_not_trimmed_from_the_end_of_a_cut_activity_
         .expect("an answer that ends")
         .activity;
     assert_eq!(kept.as_str(), "A");
+}
+
+/// KR-REQ-22.18: a tokenizer whose count of a longer text is smaller than a shorter text's, as a
+/// word becomes one token, still gets the longest run that fits: no run that was never counted is
+/// passed over, and the answer is refused only when every run is over the bound.
+#[test]
+fn a_counter_that_is_not_steady_still_finds_the_run_that_fits() {
+    let prompt = prompt_at_two();
+    let full = answer_with("Checks the code entry flow");
+    let written = &full.as_bytes()[..full.find("flow").expect("a word") + 2];
+    let unsteady = |text: &str| -> usize {
+        // The three longest runs count 129 tokens, and the next 128, as a merge would.
+        let activity = text
+            .split("\"activity_text\": \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        match activity.chars().count() {
+            0..=19 => 128,
+            _ => 129,
+        }
+    };
+    let ended = end_cut_answer(written, &prompt, 128, unsteady);
+    let kept = validate(&ended, &produced_under(), &expectation(2))
+        .expect("the run that fits is found")
+        .activity;
+    assert!(kept.as_str().chars().count() <= 19);
+    assert!(kept.as_str().chars().count() >= 14, "{kept}");
+    // Every run over the bound: refused.
+    assert_eq!(end_cut_answer(written, &prompt, 100, unsteady), written);
 }

@@ -214,7 +214,7 @@ fn an_answer_the_output_bound_stops_is_ended_inside_its_activity_text() {
                 full.as_str()
             );
             shortened += usize::from(kept.len() < full.as_str().len());
-            non_ascii += usize::from(!kept.is_ascii());
+            non_ascii += usize::from(kept.len() < full.as_str().len() && !kept.is_ascii());
         }
         assert!(
             shortened >= 1,
