@@ -279,6 +279,16 @@ a pin is always shown first. A description stopped by a pin is not counted as a 
 The same store holds each generated description's provenance: which profile produced it, at which
 revision, at which context revision, over which cursor interval and when.
 
+## What voice context reads
+
+Voice context carries what the daemon holds of a session. Each part has its own moment, because a grant's history bound is checked against the moment a thing was produced.
+
+What a model wrote of a session is placed at the session's start, since it summarises the session from there. It is carried apart from the description and labelled as a local model's text, which may be wrong. A grant whose history begins after the session started is not shown it, and the filter counts what it held back. Beside a pin the model's text is not read at all: the pinned name goes into the description instead.
+
+The directory and the program the host observed carry the moment it observed them. That is the first time the host saw each one as it now stands. A page that repeats what the host holds moves nothing, and a change starts the moment again for that field alone. Until the host has observed a directory, the working directory is the one the session started in, stamped when it started, and the foreground is reported as unavailable.
+
+While privacy mode is on none of this is read. The host keeps each observation under the privacy generation it was captured under, so a read after privacy mode ends finds nothing from before it.
+
 ## Privacy mode
 
 Privacy mode is a session's state, not the host's: one private session sits beside one that is not,
