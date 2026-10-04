@@ -340,7 +340,8 @@ impl Default for GridConfig {
 ///
 /// The scrollback size is one of those. Section 8 bounds the historical row cache in bytes, and the
 /// library bounds it in rows, so the engine converts: when the retained rows pass the byte bound it
-/// lowers the row count here and bumps the generation, and the library evicts on its next append.
+/// lowers the row count here and bumps the generation so the library evicts, and then puts the
+/// configured count back.
 #[derive(Debug)]
 struct KrVtConfiguration {
     config: GridConfig,
@@ -1112,7 +1113,7 @@ impl CanonicalGrid {
             .map(|link| link.uri().to_owned())
     }
 
-    /// Lowers the scrollback row count so the retained rows fit the byte bound.
+    /// Evicts the oldest retained rows until the rest fit the byte bound.
     ///
     /// Returns whether the rows were over it. The caller applies it while the primary buffer is
     /// showing: the library drops the rows it is told to drop as it appends, and nothing appends
@@ -1120,8 +1121,9 @@ impl CanonicalGrid {
     ///
     /// One pass is enough, and it lands under the bound rather than converging towards it. The row
     /// count kept is read off what the rows cost: the oldest are given up one at a time until what
-    /// is left costs no more than the bound, and that count becomes the library's scrollback size.
-    /// Working it out from the average cost of a row would leave the answer wrong whenever the
+    /// is left costs no more than the bound, and the library drops every row past that count. The
+    /// configured scrollback size is put back afterwards, so the history can grow again when the
+    /// rows that arrive next cost less. Working it out from the average cost of a row would leave the answer wrong whenever the
     /// rows are not all the same size, which is the usual case. Nothing is walked and no cell is
     /// read: every one of those figures was taken where its row left the screen.
     pub fn enforce_row_cache(&mut self, limit: u64) -> bool {
@@ -1151,6 +1153,19 @@ impl CanonicalGrid {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.trim_scrollback();
+        // The lowered count is how the oldest rows were given up, not a limit to live under from
+        // here on. What bounds the history is what its rows cost, and every row that arrives is
+        // charged against that, so the count goes back to what the session was configured with:
+        // rows that cost less than the ones just dropped are kept again, up to the byte bound.
+        let configured = self.config.scrollback_rows;
+        if self.configuration.scrollback_rows.load(Ordering::Relaxed) != configured {
+            self.configuration
+                .scrollback_rows
+                .store(configured, Ordering::Relaxed);
+            self.configuration
+                .generation
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.sync_history();
         true
     }
