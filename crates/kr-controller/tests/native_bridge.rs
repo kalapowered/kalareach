@@ -669,6 +669,10 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
             r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "{kr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
         ),
         (
+            "spelt with a JSON escape",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "\u007bkr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
             "as a key",
             r#"{"hooks": {"{kr_hook}": [{"hooks": [{"type": "command", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
         ),
@@ -689,6 +693,53 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
         );
         assert_eq!(site.tree(), before, "{name}: nothing was written");
     }
+}
+
+/// KR-REQ-11.42: the placeholder is written in the form its application starts a command in. Gemini
+/// CLI runs a handler's command as a line in a shell, so the path is written there as one quoted
+/// word, and a handler of the program form would hand the shell an unquoted path: a directory named
+/// `$(touch PLANTED)` would run. Claude Code starts a command as a program, and a line there is a
+/// program with a name that is no program's. Each is refused before anything is written, and each
+/// application's own form is applied.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_command_in() {
+    let gemini_line = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook} gemini-cli hook", "timeout": 5000}]}]}}"#;
+    let gemini_program = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook}", "args": ["gemini-cli", "hook"], "timeout": 5000}]}]}}"#;
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let target = gemini_target_with_hooks(&site, gemini_program.as_bytes());
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&target))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("starts a command as one line"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+    let site = GeminiSite::new();
+    let target = gemini_target_with_hooks(&site, gemini_line.as_bytes());
+    assert_eq!(
+        site.bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles"),
+        Settled::Applied,
+        "the control: Gemini CLI's own form"
+    );
+
+    let site = Site::new();
+    let before = site.tree();
+    let line = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "{kr_hook} claude-code hook", "timeout": 5}]}]}}"#;
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release_with_hooks("line", line)))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("starts a command as a program"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// KR-REQ-11.42: a release applied with one forwarder is not the release wanted once this host names
