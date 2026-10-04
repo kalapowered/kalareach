@@ -5193,12 +5193,12 @@ before it can be told, is ended with everything in its job, and so is a program 
 when the launch fails after it. Until the worker commits the launch, a job of the launcher's own
 holds the program from the moment it exists and ends it if the launcher ends. A launcher that stops
 for any reason before the worker has looked at the program therefore leaves nothing suspended
-behind. The launcher lets that job go when the commit arrives, before it starts the program, so
-ending the launcher after the program has started ends nothing the program started. A program the
-launcher runs as typed also gives the launcher its whole 32-bit exit code. If anything goes wrong
-before the commit, the program never ran: the launcher ends it and runs the command as typed. A
-launcher that cannot create its program says why in its frame, and the worker keeps the reason on
-the backend, because no instance exists to keep it.
+behind. The launcher lets that job go when the commit arrives, before it starts the program, so once
+the launcher has said that it started the program, ending the launcher ends nothing the program
+started. A program the launcher runs as typed also gives the launcher its whole 32-bit exit code. If
+anything goes wrong before the commit, the program never ran: the launcher ends it and runs the
+command as typed. A launcher that cannot create its program says why in its frame, and the worker
+keeps the reason on the backend, because no instance exists to keep it.
 
 A program the integration did not launch is adopted, never given a gateway after the fact. Four
 times a second, while a command has the terminal, the worker reads the terminal's foreground group,
