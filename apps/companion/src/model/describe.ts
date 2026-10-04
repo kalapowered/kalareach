@@ -17,6 +17,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { SessionDescribeResult } from '@kalareach/protocol'
 
+import { readOnCadence, type Cadence } from '../app/cadence'
 import { ask } from '../mobile/model/call'
 import type { HostPort } from '../host/port'
 
@@ -87,17 +88,29 @@ const READ_AGAIN_MS = 30_000
 /** How far beyond the edge of the list's screen a row still counts as shown, in pixels: about two rows. */
 const SHOWN_MARGIN_PX = 160
 
-/** What a listing's reads have done: which sessions were asked about, and which are still to be. */
+/** What a screen's reads have done: which sessions were asked about, and which are still to be. */
 interface Reads {
   readonly port: HostPort
-  readonly listing: unknown
-  /** How many times the shown rows have been read again since the screen opened. */
-  readonly round: number
+  /** The sessions asked about in the round that is running, so a session is asked once in it. */
   readonly asked: Set<string>
+  /** The sessions waiting to be asked about or waiting for the host, whichever round asked. */
+  readonly pending: Set<string>
   readonly queue: string[]
   running: number
-  /** False once a newer listing, another host or the screen's going has replaced these reads. */
+  /** False once another host or the screen's going has replaced these reads. */
   live: boolean
+  /** Callers waiting for every read to have answered. */
+  readonly settled: (() => void)[]
+}
+
+function startReads(port: HostPort): Reads {
+  return { port, asked: new Set(), pending: new Set(), queue: [], running: 0, live: true, settled: [] }
+}
+
+/** Lets the callers waiting for the reads go, once none is left. */
+function release(reads: Reads): void {
+  if (reads.pending.size > 0 && reads.live) return
+  for (const done of reads.settled.splice(0)) done()
 }
 
 /** Starts reads from the queue until `READS_AT_ONCE` are waiting for the host. */
@@ -113,73 +126,97 @@ function pump(reads: Reads, answered: (sessionId: string, answer: Described) => 
       .catch(() => undefined)
       .finally(() => {
         reads.running -= 1
+        reads.pending.delete(sessionId)
         pump(reads, answered)
+        release(reads)
       })
   }
 }
 
 /**
- * Reads the host's description of each session in `wanted`, once for each listing and each round.
+ * Asks about each of `ids` that has not been asked about in this round. A session whose read from
+ * an earlier round has not answered is not asked about twice: that read's answer serves.
+ */
+function want(
+  reads: Reads,
+  ids: readonly string[],
+  answered: (sessionId: string, answer: Described) => void
+): void {
+  for (const sessionId of ids) {
+    if (reads.asked.has(sessionId)) continue
+    reads.asked.add(sessionId)
+    if (reads.pending.has(sessionId)) continue
+    reads.pending.add(sessionId)
+    reads.queue.push(sessionId)
+  }
+  pump(reads, answered)
+}
+
+/**
+ * Reads the host's description of each session in `ids`, and again as long as the list is shown.
  *
- * `wanted` is the sessions a person can see (or is searching among), not every session listed: the
+ * `ids` is the sessions a person can see (or is searching among), not every session listed: the
  * host describes what is asked about, and a long list is asked about as it is scrolled. A session
- * is asked about once for a listing, and again when `listing` is a new list or the host's cooldown
- * has passed on a screen left open, so a row follows what the host has published since the last
- * read and says when its line has aged. A read that fails leaves its row as it was, because every
- * row has its directory to show. The newest reads are the ones whose rows are shown: a read begun
- * for an older listing, or answering after the screen has gone, changes nothing.
+ * is asked about once in a round. A round starts when the list is first shown, when `listing` is a
+ * new list, and a cooldown after the last read of the one before has answered, while the page is
+ * shown (`readOnCadence`), so a row follows what the host has published and says when its line has
+ * aged. At most four reads wait for the host at any time, a slow answer is shown when it comes, and
+ * a session whose read is still on its way is not asked about again. A read that fails leaves its
+ * row as it was, because every row has its directory to show. A read for another host, or
+ * answering after the screen has gone, changes nothing.
  */
 export function useDescriptions(
   port: HostPort,
-  wanted: readonly string[],
+  ids: readonly string[],
   listing: unknown
 ): ReadonlyMap<string, Described> {
   const [described, setDescribed] = useState<ReadonlyMap<string, Described>>(new Map())
-  const reads = useRef<Reads | null>(null)
-  const [round, setRound] = useState(0)
-  const key = wanted.join(',')
-  const idle = key.length === 0
-
-  // Nothing is read again while no row is wanted.
+  const reading = useRef<{ readonly reads: Reads; readonly cadence: Cadence } | null>(null)
+  const latest = useRef(ids)
+  const listed = useRef(listing)
+  const key = ids.join(',')
   useEffect(() => {
-    if (idle) return undefined
-    const timer = setInterval(() => {
-      setRound((past) => past + 1)
-    }, READ_AGAIN_MS)
+    latest.current = ids
+  })
+
+  const answered = useCallback((sessionId: string, answer: Described): void => {
+    setDescribed((held) => new Map(held).set(sessionId, answer))
+  }, [])
+
+  // The reads of one host, and the rounds that start them. Another host starts them over.
+  useEffect(() => {
+    const reads = startReads(port)
+    const cadence = readOnCadence(
+      () =>
+        new Promise<void>((resolve) => {
+          reads.asked.clear()
+          want(reads, latest.current, answered)
+          reads.settled.push(resolve)
+          release(reads)
+        }),
+      READ_AGAIN_MS
+    )
+    reading.current = { reads, cadence }
+    cadence.now()
     return () => {
-      clearInterval(timer)
+      reads.live = false
+      cadence.stop()
+      release(reads)
+      reading.current = null
     }
-  }, [idle])
+  }, [port, answered])
 
+  // A new list is read at once.
   useEffect(() => {
-    let current = reads.current
-    if (
-      current === null ||
-      current.port !== port ||
-      current.listing !== listing ||
-      current.round !== round
-    ) {
-      if (current !== null) current.live = false
-      current = { port, listing, round, asked: new Set(), queue: [], running: 0, live: true }
-      reads.current = current
-    }
-    for (const sessionId of key.length === 0 ? [] : key.split(',')) {
-      if (current.asked.has(sessionId)) continue
-      current.asked.add(sessionId)
-      current.queue.push(sessionId)
-    }
-    pump(current, (sessionId, answer) => {
-      setDescribed((held) => new Map(held).set(sessionId, answer))
-    })
-  }, [port, listing, round, key])
+    if (listed.current === listing) return
+    listed.current = listing
+    reading.current?.cadence.now()
+  }, [listing])
 
-  useEffect(
-    () => () => {
-      if (reads.current !== null) reads.current.live = false
-      reads.current = null
-    },
-    []
-  )
+  // A row that has come near the screen is read at once.
+  useEffect(() => {
+    if (reading.current !== null) want(reading.current.reads, latest.current, answered)
+  }, [key, answered])
 
   return described
 }
