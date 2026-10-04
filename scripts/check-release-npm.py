@@ -17,17 +17,19 @@ and compares it with the release archive:
     scoped package, not marked private, naming the repository the release runs in, publishing with
     provenance, and pointing its entry points into files the archive holds;
   * a Node that installs the archive under `node_modules` imports the package by its name, reaches
-    its schema through the export map, and gets the validator and the SDK version;
-  * `npm publish --dry-run` on the release archive itself accepts it.
+    its schema through the export map, and gets the validator and the SDK version.
 
 Nothing here publishes. The publishing job runs the real command on the archive this check
 approved, after it has held that archive to the digest the check recorded.
 
 npm takes each version once, and two releases can name the same version because a tag names the
 commit as well as the version. `registry` asks npm what it holds under the archive's version: nothing,
-so the release goes on to publishing; this very archive, so there is nothing left to publish and
-the run ends with a notice; or another archive, which can never be published, so it is refused with
-both integrities named. A registry that cannot be read is an error and never an absence.
+so `npm publish --dry-run` on the release archive itself must accept it and the release goes on to
+publishing; this very archive, so there is nothing left to publish and the run ends with a notice;
+or another archive, which can never be published, so it is refused with both integrities named. A
+registry that cannot be read is an error and never an absence. The dry run belongs to the first
+case alone, because npm 11 refuses to dry-run a publish over a version it holds, so nothing that
+`check` does depends on what the registry holds.
 
     python3 scripts/check-release-npm.py check --archive <archive> [--source <package directory>]
     python3 scripts/check-release-npm.py registry --archive <archive> [--github-output <file>]
@@ -38,8 +40,9 @@ it ends without refusing.
 
 `self-test` puts the check through a package it must pass and through each way of going wrong it
 must refuse, so a check that agrees with everything cannot pass for one that agrees with the
-release. It also puts `registry` through the real `npm view` against the registry's own recorded
-document for the package, once for each of the three answers and once for a registry that fails.
+release. It also puts `registry` through the real `npm`, the dry run included, against the
+registry's own recorded document for the package, once for each of the three answers and once for a
+registry that fails, and runs `check` with the package's own version already on that registry.
 """
 
 import argparse
@@ -253,14 +256,6 @@ def check(archive_path, source):
         problems += compare_problems(archive, packed)
         problems += manifest_problems(manifest_of(packed, "npm's archive"), packed)
         problems += load_problems(archive_path, source)
-        published = dry_run_publish(archive_path)
-        if published.get("name") != manifest.get("name") or (
-            published.get("version") != manifest.get("version")
-        ):
-            problems.append(
-                f"npm would publish {published.get('name')} {published.get('version')}, "
-                f"not {manifest.get('name')} {manifest.get('version')}"
-            )
     return problems
 
 
@@ -307,7 +302,18 @@ def check_registry(archive_path):
     ours = archive_integrity(archive_path)
     theirs = registry_integrity(name, version)
     if theirs is None:
-        return False, f"npm has no {name} {version}, so the release goes on to publishing."
+        # Only a version the registry does not hold can be dry-run: npm 11 refuses to dry-run a
+        # publish over a version it holds, so the archive checks must not depend on this answer.
+        published = dry_run_publish(archive_path)
+        if published.get("name") != name or published.get("version") != version:
+            raise SystemExit(
+                f"npm would publish {published.get('name')} {published.get('version')}, "
+                f"not {name} {version}"
+            )
+        return False, (
+            f"npm has no {name} {version} and a dry-run publish accepts the archive, so the "
+            f"release goes on to publishing."
+        )
     if theirs != ours:
         raise SystemExit(
             f"npm already has {name} {version} with integrity {theirs}, and this release's archive "
@@ -354,6 +360,38 @@ def registry_serving(status, document):
         thread.join()
 
 
+def run_against_registry(scratch, label, status, document, arguments):
+    """Runs this script with `arguments`, its npm pointed at a loopback registry serving `document`."""
+    with registry_serving(status, document) as url:
+        environment = dict(
+            os.environ,
+            npm_config_registry=url,
+            npm_config_cache=os.path.join(scratch, f"{label}.cache"),
+            npm_config_update_notifier="false",
+            npm_config_fetch_retries="0",
+            npm_config_noproxy="127.0.0.1",
+            NO_PROXY="127.0.0.1",
+        )
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *arguments],
+                              env=environment, capture_output=True, text=True, check=False)
+
+
+def registry_document(recorded, version, integrity):
+    """The recorded document with one more version, which carries the given integrity."""
+    document = copy.deepcopy(recorded)
+    entry = copy.deepcopy(document["versions"]["0.0.0"])
+    entry["version"] = version
+    entry["_id"] = f"@kalareach/plugin-sdk@{version}"
+    entry["dist"]["integrity"] = integrity
+    document["versions"][version] = entry
+    return json.dumps(document).encode()
+
+
+def recorded_document():
+    with open(PACKUMENT, "rb") as fixture:
+        return json.load(fixture)
+
+
 def registry_self_test(failures):
     """Puts the registry check through the real `npm view` and the registry's own document.
 
@@ -363,17 +401,7 @@ def registry_self_test(failures):
     go on, the same archive under a version it has must end the run quietly, another archive under
     a version it has must refuse, and a registry that fails must be neither.
     """
-    with open(PACKUMENT, "rb") as fixture:
-        recorded = json.load(fixture)
-
-    def served_with(version, integrity):
-        document = copy.deepcopy(recorded)
-        entry = copy.deepcopy(document["versions"]["0.0.0"])
-        entry["version"] = version
-        entry["_id"] = f"@kalareach/plugin-sdk@{version}"
-        entry["dist"]["integrity"] = integrity
-        document["versions"][version] = entry
-        return json.dumps(document).encode()
+    recorded = recorded_document()
 
     with tempfile.TemporaryDirectory(prefix="kalareach-registry-self-") as scratch:
         def archive_of(version):
@@ -388,20 +416,9 @@ def registry_self_test(failures):
         def ask(label, archive, status, document):
             """Runs the registry command against a served document; returns the run and `published`."""
             output = os.path.join(scratch, f"{label}.output")
-            with registry_serving(status, document) as url:
-                environment = dict(
-                    os.environ,
-                    npm_config_registry=url,
-                    npm_config_cache=os.path.join(scratch, f"{label}.cache"),
-                    npm_config_update_notifier="false",
-                    npm_config_fetch_retries="0",
-                    npm_config_noproxy="127.0.0.1",
-                    NO_PROXY="127.0.0.1",
-                )
-                result = subprocess.run(
-                    [sys.executable, os.path.abspath(__file__), "registry", "--archive", archive,
-                     "--github-output", output],
-                    env=environment, capture_output=True, text=True, check=False)
+            result = run_against_registry(
+                scratch, label, status, document,
+                ["registry", "--archive", archive, "--github-output", output])
             published = None
             if os.path.exists(output):
                 with open(output) as written:
@@ -411,7 +428,7 @@ def registry_self_test(failures):
         fresh = archive_of("0.64.0")
         ours = archive_integrity(fresh)
 
-        result, published = ask("equal", fresh, 200, served_with("0.64.0", ours))
+        result, published = ask("equal", fresh, 200, registry_document(recorded, "0.64.0", ours))
         if result.returncode != 0 or published != "published=true":
             failures.append(f"a version npm holds with the same integrity: expected a quiet end, "
                             f"got exit {result.returncode}, {published!r}, {result.stderr[-300:]}")
@@ -469,6 +486,17 @@ def self_test():
         good = os.path.join(pnpm_dir, name)
 
         expect("the unedited archive", check(good, source), None)
+
+        # A version the registry already holds must not stop the archive checks that come before the
+        # registry is asked: npm 11 refuses a dry-run publish of a version it holds.
+        held = run_against_registry(
+            scratch, "held", 200,
+            registry_document(recorded_document(), manifest_of(read_archive(good), good)["version"],
+                              archive_integrity(good)),
+            ["check", "--archive", good, "--source", source])
+        if held.returncode != 0:
+            failures.append(f"the archive checks, with its version already on the registry: "
+                            f"expected a pass, got exit {held.returncode}, {held.stderr[-300:]}")
 
         def rewritten(label, edit):
             """Repacks the good archive with one edit to its members and returns its path."""
