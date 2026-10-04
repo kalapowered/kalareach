@@ -1224,22 +1224,24 @@ int
 kr_bridge_take_fence_retry(void)
 {
     kr_reader_state state;
-    int retry = kr.fence_retry;
 
-    kr.fence_retry = 0;
-    if (!retry) {
+    if (!kr.fence_retry) {
         return 0;
     }
     /*
-     * Another report asks the worker for another exchange, and one that ends withheld sends
-     * another frame like this. That is a retry worth making only for a reader whose own
-     * acknowledgement would now be clear, the test the worker applies before it publishes a fence;
-     * a reader that still holds input has nothing new to report until it moves, and says so at its
-     * next boundary.
+     * Another idle report asks the worker for another exchange, and one that ends withheld sends
+     * another frame like this. So the retry is taken only by a reader whose own queues are clear,
+     * the test the worker applies before it publishes a fence: a reader that still holds input
+     * would only be withheld again and would ask again for ever. It stays owed until the reader
+     * is clear, so the next time the reader's mailbox is read and its state allows, it is taken.
      */
     kr_shell_reader_state(&state);
-    return state.tty_typeahead_drained && state.macro_input_drained &&
-           state.partial_key_drained && state.pending_bytes == 0 && state.queued_keys == 0;
+    if (!(state.tty_typeahead_drained && state.macro_input_drained &&
+          state.partial_key_drained && state.pending_bytes == 0 && state.queued_keys == 0)) {
+        return 0;
+    }
+    kr.fence_retry = 0;
+    return 1;
 }
 
 /* ---- events ---------------------------------------------------------------------------------- */

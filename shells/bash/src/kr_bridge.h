@@ -222,7 +222,8 @@ int kr_bridge_launch_pending(void);
  * Non-zero once, after the worker has said it holds no fence for this reader (an exchange that
  * ended with none, or a fence that has gone) and the reader's own queues are all clear. The worker
  * then waits for the reader's next idle report, so a reader that reports idle once per wait
- * reports again. Call it where the reader's state can be read, as the mailbox is.
+ * reports again. Until the queues are clear it returns zero and the retry stays owed, so call it
+ * each time the mailbox is read, where the reader's state can be read.
  */
 int kr_bridge_take_fence_retry(void);
 
