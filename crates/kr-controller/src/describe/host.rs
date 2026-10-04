@@ -93,6 +93,8 @@ enum Message {
     Settings {
         enabled: Option<bool>,
         on_battery: Option<bool>,
+        /// Told once the turn that applied them has published what it found, when asked to.
+        done: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Forget everything held in memory, and answer when it is done.
     Purge { done: SyncSender<()> },
@@ -575,7 +577,24 @@ impl DescribeHost {
         self.post(Message::Settings {
             enabled,
             on_battery,
+            done: None,
         });
+    }
+
+    /// Applies the owner's settings, and returns what completes once the turn that applied them
+    /// has published what it found, so that an answer built after it shows the pause they cause.
+    pub(crate) fn settings_and_wait(
+        &self,
+        enabled: Option<bool>,
+        on_battery: Option<bool>,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (done, taken) = tokio::sync::oneshot::channel();
+        self.post(Message::Settings {
+            enabled,
+            on_battery,
+            done: Some(done),
+        });
+        taken
     }
 
     /// Stops description processing for every session the host tracks, from the thread that
@@ -736,20 +755,7 @@ impl Thread {
         // mode nothing, holds nothing in its slots and says it is not running.
         let _exit = Exit(Arc::clone(&self.shared));
         while self.shared.running.load(Ordering::Acquire) {
-            let now = self.clock.now();
-            self.take_messages(now);
-            self.follow_privacy();
-            self.take_pages(now);
-            self.settle_sessions(now);
-            let conditions = self.conditions();
-            let reports = self.driver.turn(&conditions, now).unwrap_or_default();
-            self.answer_checks(reports);
-            self.offer_check(now);
-            self.sync_marker();
-            self.publish_snapshot(now);
-            for done in std::mem::take(&mut self.held.acks) {
-                let _ = done.send(());
-            }
+            self.turn();
             self.rest();
         }
         // The process goes with the host: the driver ends it when it is dropped, unless a test
@@ -760,6 +766,25 @@ impl Thread {
         }
         #[cfg(not(feature = "testing"))]
         let _ = self.abandon;
+    }
+
+    /// One turn: takes what arrived, drives the service, publishes what it reads, and then tells
+    /// everyone who asked to be told that the turn is done.
+    fn turn(&mut self) {
+        let now = self.clock.now();
+        self.take_messages(now);
+        self.follow_privacy();
+        self.take_pages(now);
+        self.settle_sessions(now);
+        let conditions = self.conditions();
+        let reports = self.driver.turn(&conditions, now).unwrap_or_default();
+        self.answer_checks(reports);
+        self.offer_check(now);
+        self.sync_marker();
+        self.publish_snapshot(now);
+        for done in std::mem::take(&mut self.held.acks) {
+            let _ = done.send(());
+        }
     }
 
     /// Ends a turn: sleeps until something wakes the thread or something is due, unless a message
@@ -824,6 +849,7 @@ impl Thread {
                 Message::Settings {
                     enabled,
                     on_battery,
+                    done,
                 } => {
                     if let Some(enabled) = enabled {
                         self.driver.service_mut().set_enabled(enabled);
@@ -831,6 +857,9 @@ impl Thread {
                     if let Some(allowed) = on_battery {
                         self.driver.service_mut().set_on_battery(allowed);
                     }
+                    // Told once the turn has published what it found, so the answer the caller
+                    // builds next shows the pause the setting causes.
+                    self.held.acks.extend(done);
                 }
                 Message::Purge { done } => {
                     let _ = self.driver.service_mut().forget_content();
@@ -1660,6 +1689,7 @@ mod tests {
             .send(Message::Settings {
                 enabled: Some(false),
                 on_battery: None,
+                done: None,
             })
             .expect("the message is posted");
         host.shared.waker.wake();
@@ -1676,6 +1706,48 @@ mod tests {
             !host.driver.service().setup_state().enabled,
             "the message was read before the thread slept"
         );
+    }
+
+    /// A settings change is acknowledged after the turn that applies it, and that turn's snapshot
+    /// shows the pause the change causes: an answer built when the acknowledgement arrives never
+    /// shows the pause from before it. The control is the snapshot before the change, which shows
+    /// no pause.
+    #[test]
+    fn a_settings_change_is_acknowledged_after_the_turn_that_shows_its_pause() {
+        use kr_describe::budget::GIB;
+        use kr_describe::resource::{PowerSource, ThermalState};
+
+        let (_directory, mut host) = thread(state(0, false));
+        host.conditions = Some(Arc::new(Mutex::new(HostConditions::measured(
+            16 * GIB,
+            12 * GIB,
+            PowerSource::Mains,
+            ThermalState::Nominal,
+        ))));
+        let handle = DescribeHost {
+            shared: Arc::clone(&host.shared),
+            thread: Mutex::new(None),
+        };
+        handle.assets_held(true);
+        host.turn();
+        assert!(handle.snapshot().setup.is_some_and(|setup| setup.offered));
+        assert_eq!(
+            handle.snapshot().paused,
+            None,
+            "nothing pauses it to begin with"
+        );
+
+        let mut acknowledged = handle.settings_and_wait(Some(false), None);
+        assert!(
+            acknowledged.try_recv().is_err(),
+            "not acknowledged before the host has turned"
+        );
+        host.turn();
+        assert!(
+            acknowledged.try_recv().is_ok(),
+            "acknowledged by the turn that applied it"
+        );
+        assert_eq!(handle.snapshot().paused, Some(DescriptionPause::Disabled));
     }
 
     /// A page that arrives for a host that has stopped is dropped, where a page for one that runs

@@ -46,6 +46,9 @@ use kr_worker::privacy::{
 use crate::error::{ControllerError, Result};
 use crate::privacy::{Admitted, PrivacyState, Published};
 
+/// How long the answer to a settings change waits for the host to have applied it.
+const SETTINGS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) mod assets;
 #[cfg(feature = "testing")]
 pub mod hooks;
@@ -181,6 +184,18 @@ impl DescribeModule {
         if was_enabled && !settings.enabled {
             self.fetches.cancel();
         }
+    }
+
+    /// Waits until the host has taken `settings` and published the turn that applied them, so that
+    /// an answer built after it shows the pause they cause and not the one from before. A host
+    /// that does not run, or does not answer in time, is not waited for: the answer then shows
+    /// what it last published.
+    pub(crate) async fn settings_applied(&self, settings: kr_describe::resource::ResourceSettings) {
+        let Some(host) = self.host().filter(|host| host.runs()) else {
+            return;
+        };
+        let taken = host.settings_and_wait(Some(settings.enabled), Some(settings.on_battery));
+        let _ = tokio::time::timeout(SETTINGS_WAIT, taken).await;
     }
 
     /// Wakes the host, for this crate's own tests that change what it reads.
@@ -665,6 +680,9 @@ impl crate::service::Controller {
                 if params.enabled.0 == Some(false) {
                     self.descriptions.fetches.cancel();
                 }
+                self.descriptions
+                    .settings_applied(self.description_settings())
+                    .await;
                 self.description_setup()
             }
             Method::DescriptionDownload => {
