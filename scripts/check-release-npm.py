@@ -23,16 +23,31 @@ and compares it with the release archive:
 Nothing here publishes. The publishing job runs the real command on the archive this check
 approved, after it has held that archive to the digest the check recorded.
 
+npm takes each version once, and two releases can name the same version because a tag names the
+commit as well as the version. `registry` asks npm what it holds under the archive's version: nothing,
+so the release goes on to publishing; this very archive, so there is nothing left to publish and
+the run ends with a notice; or another archive, which can never be published, so it is refused with
+both integrities named. A registry that cannot be read is an error and never an absence.
+
     python3 scripts/check-release-npm.py check --archive <archive> [--source <package directory>]
+    python3 scripts/check-release-npm.py registry --archive <archive> [--github-output <file>]
     python3 scripts/check-release-npm.py self-test
+
+`registry` appends `published=true` or `published=false` to the file `--github-output` names when
+it ends without refusing.
 
 `self-test` puts the check through a package it must pass and through each way of going wrong it
 must refuse, so a check that agrees with everything cannot pass for one that agrees with the
-release.
+release. It also puts `registry` through the real `npm view` against the registry's own recorded
+document for the package, once for each of the three answers and once for a registry that fails.
 """
 
 import argparse
+import base64
+import contextlib
+import copy
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -41,6 +56,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import urllib.parse
 
 REPOSITORY = "git+https://github.com/kalapowered/kalareach.git"
 
@@ -247,6 +264,177 @@ def check(archive_path, source):
     return problems
 
 
+def archive_integrity(archive_path):
+    """The archive's subresource integrity string, which is what the registry records as `dist.integrity`."""
+    with open(archive_path, "rb") as archive:
+        digest = hashlib.sha512(archive.read()).digest()
+    return "sha512-" + base64.b64encode(digest).decode()
+
+
+def registry_integrity(name, version):
+    """Returns the integrity the registry records for name@version, or None when it holds none.
+
+    `npm view` asks the registry the way `npm publish` will, through the same configuration. Its JSON
+    error answer tells a package or version the registry does not hold from a registry that is down
+    or an answer that cannot be read, and only the first is an absence; the others end the run.
+    """
+    command = ["npm", "view", f"{name}@{version}", "dist.integrity", "--json"]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        answer = json.loads(result.stdout)
+    except ValueError:
+        answer = None
+    if result.returncode == 0 and isinstance(answer, str) and answer:
+        return answer
+    error = answer.get("error") if isinstance(answer, dict) else None
+    if result.returncode != 0 and isinstance(error, dict) and error.get("code") == "E404":
+        return None
+    sys.stderr.write(f"$ {' '.join(command)}\n{result.stdout}{result.stderr}")
+    raise SystemExit(f"npm view gave no integrity for {name} {version} (exit {result.returncode})")
+
+
+def check_registry(archive_path):
+    """Returns (published, what to tell the reader) for the archive's version on the registry.
+
+    npm takes each version once. A version the registry does not hold goes on to publishing. The
+    same archive under a version it holds is published already, so nothing is left to approve.
+    Another archive under that version can never be published, so it is refused.
+    """
+    manifest = manifest_of(read_archive(archive_path), archive_path)
+    name, version = manifest.get("name"), manifest.get("version")
+    if not name or not version:
+        raise SystemExit(f"{archive_path} names no package or version")
+    ours = archive_integrity(archive_path)
+    theirs = registry_integrity(name, version)
+    if theirs is None:
+        return False, f"npm has no {name} {version}, so the release goes on to publishing."
+    if theirs != ours:
+        raise SystemExit(
+            f"npm already has {name} {version} with integrity {theirs}, and this release's archive "
+            f"has integrity {ours}. npm takes a version once, so this archive cannot be published "
+            f"under it; a release that is meant for npm needs a version npm does not hold."
+        )
+    return True, (
+        f"npm already has {name} {version} with this archive's integrity ({ours}), so there is "
+        f"nothing to publish and no approval is asked."
+    )
+
+
+# The document the registry served for @kalareach/plugin-sdk on 2026-10-04, when the package held the
+# placeholder `0.0.0` and npm's own `0.0.0-stage` record.
+PACKUMENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures",
+                         "npm-registry", "plugin-sdk-packument.json")
+
+
+@contextlib.contextmanager
+def registry_serving(status, document):
+    """Serves `document` as the registry's answer for the SDK's package on the loopback address."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            found = urllib.parse.unquote(self.path) == "/@kalareach/plugin-sdk"
+            body = document if found else b"{}"
+            self.send_response(status if found else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def registry_self_test(failures):
+    """Puts the registry check through the real `npm view` and the registry's own document.
+
+    The fixture is the document the registry served for the package, with its placeholder `0.0.0`.
+    A server on the loopback address hands it to npm, so what runs is the npm that the workflow
+    installs and the script's own command line. A release version the registry has not got must
+    go on, the same archive under a version it has must end the run quietly, another archive under
+    a version it has must refuse, and a registry that fails must be neither.
+    """
+    with open(PACKUMENT, "rb") as fixture:
+        recorded = json.load(fixture)
+
+    def served_with(version, integrity):
+        document = copy.deepcopy(recorded)
+        entry = copy.deepcopy(document["versions"]["0.0.0"])
+        entry["version"] = version
+        entry["_id"] = f"@kalareach/plugin-sdk@{version}"
+        entry["dist"]["integrity"] = integrity
+        document["versions"][version] = entry
+        return json.dumps(document).encode()
+
+    with tempfile.TemporaryDirectory(prefix="kalareach-registry-self-") as scratch:
+        def archive_of(version):
+            manifest = json.dumps({"name": "@kalareach/plugin-sdk", "version": version}).encode()
+            path = os.path.join(scratch, f"sdk-{version}.tgz")
+            with tarfile.open(path, "w:gz") as out:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest)
+                out.addfile(info, io.BytesIO(manifest))
+            return path
+
+        def ask(label, archive, status, document):
+            """Runs the registry command against a served document; returns the run and `published`."""
+            output = os.path.join(scratch, f"{label}.output")
+            with registry_serving(status, document) as url:
+                environment = dict(
+                    os.environ,
+                    npm_config_registry=url,
+                    npm_config_cache=os.path.join(scratch, f"{label}.cache"),
+                    npm_config_update_notifier="false",
+                    npm_config_fetch_retries="0",
+                    npm_config_noproxy="127.0.0.1",
+                    NO_PROXY="127.0.0.1",
+                )
+                result = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), "registry", "--archive", archive,
+                     "--github-output", output],
+                    env=environment, capture_output=True, text=True, check=False)
+            published = None
+            if os.path.exists(output):
+                with open(output) as written:
+                    published = written.read().strip()
+            return result, published
+
+        fresh = archive_of("0.64.0")
+        ours = archive_integrity(fresh)
+
+        result, published = ask("equal", fresh, 200, served_with("0.64.0", ours))
+        if result.returncode != 0 or published != "published=true":
+            failures.append(f"a version npm holds with the same integrity: expected a quiet end, "
+                            f"got exit {result.returncode}, {published!r}, {result.stderr[-300:]}")
+
+        placeholder = archive_of("0.0.0")
+        theirs = recorded["versions"]["0.0.0"]["dist"]["integrity"]
+        result, published = ask("different", placeholder, 200, json.dumps(recorded).encode())
+        if (result.returncode == 0 or published is not None or theirs not in result.stderr
+                or archive_integrity(placeholder) not in result.stderr):
+            failures.append(f"a version npm holds with another integrity: expected a refusal naming "
+                            f"both, got exit {result.returncode}, {published!r}, {result.stderr[-300:]}")
+
+        result, published = ask("absent", fresh, 200, json.dumps(recorded).encode())
+        if result.returncode != 0 or published != "published=false":
+            failures.append(f"a version npm does not hold: expected the run to go on, "
+                            f"got exit {result.returncode}, {published!r}, {result.stderr[-300:]}")
+
+        result, published = ask("failing", fresh, 500, b'{"error":"internal"}')
+        if result.returncode == 0 or published is not None or "E500" not in result.stderr:
+            failures.append(f"a registry that fails: expected a refusal naming npm's error, "
+                            f"got exit {result.returncode}, {published!r}, {result.stderr[-300:]}")
+
+
 def self_test():
     """Runs the check on the source tree's own package and on each way it must refuse."""
     source = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "packages", "plugin-sdk"))
@@ -270,6 +458,8 @@ def self_test():
             failures.append(f"{label} was not read as the package record")
     if published_package({"error": {"code": "E401"}}).get("name") is not None:
         failures.append("an answer that names no package was read as one")
+
+    registry_self_test(failures)
 
     with tempfile.TemporaryDirectory(prefix="kalareach-npm-self-") as scratch:
         pnpm_dir = os.path.join(scratch, "pnpm")
@@ -357,6 +547,18 @@ def self_test():
     return 0
 
 
+def registry(archive_path, github_output):
+    published, message = check_registry(archive_path)
+    if published and os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::notice title=Already on npm::{message}")
+    else:
+        print(message)
+    if github_output:
+        with open(github_output, "a") as output:
+            output.write(f"published={'true' if published else 'false'}\n")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -365,11 +567,16 @@ def main():
     checking.add_argument("--source", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "packages", "plugin-sdk"),
         help="the package directory of the commit the archive was packed from")
+    asking = commands.add_parser("registry", help="ask npm whether it already has the archive's version")
+    asking.add_argument("--archive", required=True, help="the release's SDK archive")
+    asking.add_argument("--github-output", help="a file to append `published=true|false` to")
     commands.add_parser("self-test", help="put the check through a pass and its refusals")
     arguments = parser.parse_args()
 
     if arguments.command == "self-test":
         return self_test()
+    if arguments.command == "registry":
+        return registry(arguments.archive, arguments.github_output)
 
     problems = check(arguments.archive, os.path.abspath(arguments.source))
     if problems:
