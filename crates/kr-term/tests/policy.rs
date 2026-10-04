@@ -735,13 +735,73 @@ fn the_keypad_state_has_one_owner() {
     assert!(!engine.modes().keypad_application());
 }
 
+/// KR-REQ-08.16: the repeat request draws the last character again as text is drawn, so it honours
+/// a wrap that is pending, and it follows a character and nothing else.
+#[test]
+fn a_repeat_request_draws_the_last_character_as_text_is() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(4, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // The last column is filled, so the cursor waits at the edge for the next character to wrap.
+    engine.feed(b"abcd\x1b[2b", 0);
+    engine.quiesce(0);
+    let rows = screen(&engine).rows;
+    assert_eq!(
+        rows[0].trim_end(),
+        "abcd",
+        "the row it was sent on is as it was"
+    );
+    assert_eq!(
+        rows[1].trim_end(),
+        "dd",
+        "the repeats wrapped, as text does"
+    );
+
+    // After something that is not a character there is nothing to repeat.
+    engine.feed(b"\x1b[3;1H\x1b[1b", 0);
+    engine.quiesce(0);
+    assert_eq!(screen(&engine).rows[2].trim_end(), "");
+
+    // A designated character set maps the repeated scalar as it mapped the first.
+    engine.feed(b"\x1b[3;1H\x1b(0q\x1b[2b\x1b(B", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        screen(&engine).rows[2].trim_end(),
+        "\u{2500}\u{2500}\u{2500}"
+    );
+
+    // A replacement character for a malformed byte is a character like any other, whether it comes
+    // in the same read as the request or an earlier one.
+    let separate: [&[u8]; 2] = [b"a\xff", b"\x1b[2b"];
+    let together: [&[u8]; 1] = [b"a\xff\x1b[2b"];
+    for reads in [&separate[..], &together[..]] {
+        let mut malformed = Engine::new(EngineConfig::default()).expect("engine");
+        for read in reads {
+            malformed.feed(read, 0);
+        }
+        malformed.quiesce(0);
+        assert_eq!(
+            screen(&malformed).rows[0].trim_end(),
+            "a\u{fffd}\u{fffd}\u{fffd}",
+            "{reads:?}"
+        );
+    }
+
+    // A count as large as the screen holds is drawn, and does not grow the screen.
+    engine.feed(b"\x1b[Hx\x1b[999999b", 0);
+    engine.quiesce(0);
+    assert_eq!(screen(&engine).rows.len(), 3);
+}
+
 /// A parameter no grid could act on is clamped before anything tries.
 #[test]
 fn an_enormous_parameter_is_bounded_before_the_grid_sees_it() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");
     let started = std::time::Instant::now();
-    // Forward tabulation, insert characters and repeat: each one loops per unit in the reducer.
-    engine.feed(b"\x1b[4294967295I\x1b[4294967295@\x1b[4294967295b", 0);
+    // Forward tabulation and insert characters: each one loops per unit in the reducer.
+    engine.feed(b"\x1b[4294967295I\x1b[4294967295@", 0);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "a few bytes of input must not buy unbounded work"
