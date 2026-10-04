@@ -115,19 +115,19 @@ fn servers(application: &str, value: &Value) -> Checked {
     Ok(())
 }
 
-/// Whether the application runs a command it is given as a line in a shell. Gemini CLI does: a
-/// handler's command is one line, and a program it starts is a word of that line. The others start
-/// the command as a program, with its arguments in a list beside it, and so does every application
-/// a server of a server file is started by.
+/// Whether this host registers the forwarder for the application as a line a shell runs. Gemini CLI
+/// runs a handler's command as one line, and a program it starts is a word of that line. The others
+/// are registered as a program with its arguments in a list beside it, as is every server of a
+/// server file.
 fn runs_a_line(application: &str) -> bool {
     application == "Gemini CLI"
 }
 
-/// Checks that a command that starts with the forwarder's placeholder is in the form its
-/// application starts a command in. The host writes the forwarder's path for the form the command
-/// is written in, one word in single quotes in a line and the plain path in a program's name, so a
-/// form the application does not start would hand a shell an unquoted path, or a program a name
-/// that is not one.
+/// Checks that a command that starts with the forwarder's placeholder is in the form this host
+/// registers the forwarder in for its application. The host writes the forwarder's path for the
+/// form the command is written in, one word in single quotes in a line and the plain path in a
+/// program's name, so the other form would hand a shell an unquoted path, or a program a name that
+/// is not one.
 fn placeholder_form(application: &str, command: &Value, arguments: Option<&Value>) -> Checked {
     if !command
         .as_str()
@@ -137,13 +137,17 @@ fn placeholder_form(application: &str, command: &Value, arguments: Option<&Value
     }
     let line = runs_a_line(application);
     if line == arguments.is_some() {
-        let (written, started) = if line {
-            ("a program with its arguments in a list", "one line")
+        let (written, registered) = if line {
+            (
+                "a program with its arguments in a list",
+                "one line a shell runs",
+            )
         } else {
             ("one line", "a program with its arguments in a list")
         };
         return Err(format!(
-            "the forwarder is written as {written}, and {application} starts a command as {started}"
+            "the forwarder is written as {written}, and this host registers it for {application} \
+             as {registered}"
         ));
     }
     Ok(())

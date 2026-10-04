@@ -701,12 +701,13 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
     }
 }
 
-/// KR-REQ-11.42: the placeholder is written in the form its application starts a command in. Gemini
-/// CLI runs a handler's command as a line in a shell, so the path is written there as one quoted
-/// word, and a handler of the program form would hand the shell an unquoted path: a directory named
-/// `$(touch PLANTED)` would run. Claude Code starts a command as a program, and a line there is a
-/// program with a name that is no program's. Each is refused before anything is written, and each
-/// application's own form is applied.
+/// KR-REQ-11.42: the placeholder is written in the form this host registers the forwarder in for its
+/// application. Gemini CLI runs a handler's command as a line in a shell, so the path is written
+/// there as one quoted word, and a handler of the program form would hand the shell an unquoted
+/// path: a directory named `$(touch PLANTED)` would run. Claude Code's hooks and servers are
+/// registered as a program with its arguments in a list, and a line there would write a quoted
+/// word as the program's name. Each is refused before anything is written, and each application's
+/// own form is applied.
 #[cfg(unix)]
 #[test]
 fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_command_in() {
@@ -720,7 +721,7 @@ fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_
         .reconcile(&gemini(), Some(&target))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("starts a command as one line"),
+        refused(&settled).contains("as one line a shell runs"),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -742,7 +743,7 @@ fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_
         .reconcile(&plugin(), Some(&site.release_with_hooks("line", line)))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("starts a command as a program"),
+        refused(&settled).contains("as a program with its arguments in a list"),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -785,7 +786,7 @@ fn kr_req_11_42_the_placeholder_is_written_in_the_form_its_application_starts_a_
         .reconcile(&plugin(), Some(&release))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("starts a command as a program"),
+        refused(&settled).contains("as a program with its arguments in a list"),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
