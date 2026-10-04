@@ -330,3 +330,58 @@ fn environment_additions_resolve_on_the_ladder() {
         assert_eq!(resolved.source, source, "{profile}");
     }
 }
+
+/// KR-REQ-07.64: the ownership an agent's launch runs under is the document's explicit choice for
+/// that package, read when the resolver is opened, and full ownership for every other package and
+/// for a host with no document or no usable one.
+#[test]
+fn an_agents_entry_chooses_reduced_ownership_for_its_package_only() {
+    use kr_protocol::broker::AgentOwnership;
+    use kr_protocol::hostinfo::configuration::AgentChoice;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let absent = Resolver::open(&environment);
+    assert_eq!(
+        absent.agent_ownership("kalareach/codex"),
+        AgentOwnership::Full
+    );
+    assert!(absent.reduced_agents().is_empty());
+
+    let mut document = ConfigurationDocument::empty();
+    document.agents.insert(
+        "kalareach/codex".to_owned(),
+        AgentChoice {
+            ownership: AgentOwnership::Reduced,
+        },
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &document_path(&environment),
+        configuration::contents(&document).as_bytes(),
+    )
+    .expect("writes the document");
+    let chosen = Resolver::open(&environment);
+    assert_eq!(
+        chosen.agent_ownership("kalareach/codex"),
+        AgentOwnership::Reduced
+    );
+    assert_eq!(
+        chosen.agent_ownership("kalareach/claude-code"),
+        AgentOwnership::Full
+    );
+    assert_eq!(chosen.reduced_agents(), vec!["kalareach/codex".to_owned()]);
+
+    // A document this host cannot use chooses nothing: an agent is never put under reduced
+    // ownership by a document it did not read.
+    kr_ipc::paths::write_owner_only_file(
+        &document_path(&environment),
+        br#"{"version": 1, "agents": {"kalareach/codex": {"ownership": "reduced"}, "x": {}}}"#,
+    )
+    .expect("writes the document");
+    let unusable = Resolver::open(&environment);
+    assert_eq!(unusable.status().state, DocumentState::Invalid);
+    assert_eq!(
+        unusable.agent_ownership("kalareach/codex"),
+        AgentOwnership::Full
+    );
+}

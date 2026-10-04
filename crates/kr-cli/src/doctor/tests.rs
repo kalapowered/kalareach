@@ -228,6 +228,60 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
     );
 }
 
+/// KR-REQ-07.64: a package the document chooses reduced ownership for is named with what the choice
+/// costs its closure, one line each; a host that chose for no package prints no such line.
+#[test]
+fn an_agent_chosen_for_reduced_ownership_is_named_with_what_it_costs() {
+    use kr_protocol::broker::AgentOwnership;
+    use kr_protocol::hostinfo::configuration::{self, AgentChoice};
+
+    let lines_of = |document: &ConfigurationDocument| {
+        let mut effective = configured();
+        effective.values.push(configuration::agents_row(
+            Some(document),
+            "/tmp/kalareach/config.json",
+        ));
+        configurable_lines(&effective)
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let none = lines_of(&ConfigurationDocument::empty());
+    assert!(
+        none.iter()
+            .all(|line| !line.trim_start().starts_with("agents ")),
+        "{none:?}"
+    );
+
+    let mut document = ConfigurationDocument::empty();
+    for package in ["kalareach/qoder-cli", "kalareach/codex"] {
+        document.agents.insert(
+            package.to_owned(),
+            AgentChoice {
+                ownership: AgentOwnership::Reduced,
+            },
+        );
+    }
+    let chosen = lines_of(&document);
+    for package in ["kalareach/codex", "kalareach/qoder-cli"] {
+        assert!(
+            chosen.iter().any(|line| line.trim_start()
+                == format!(
+                    "agents {package}: reduced ownership; a launch is tracked by start identity \
+                     and its closure never reads complete; the command route does not apply it"
+                )),
+            "{package}: {chosen:?}"
+        );
+    }
+    assert!(
+        chosen.iter().any(|line| line.contains(
+            "agents.ownership = kalareach/codex=reduced, kalareach/qoder-cli=reduced from \
+             host_configuration"
+        ) && line.contains("applies to new sessions only")),
+        "{chosen:?}"
+    );
+}
+
 /// KR-REQ-23.25, KR-REQ-26.44: planted text in the diagnostics shows only where the person asked
 /// `kr doctor` for it, this host's own locations, where each value came from and each value by its
 /// class, and where the host's own export text is said through its door: a check's words and the

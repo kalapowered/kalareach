@@ -860,6 +860,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
                 effect
             ),
         });
+        lines.extend(reduced_agent_lines(value));
     }
     for ceiling in &effective.ceilings {
         let refused = if ceiling.refused {
@@ -899,6 +900,35 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
         });
     }
     lines
+}
+
+/// One line for each package the document chooses reduced ownership for, naming what the choice
+/// costs.
+///
+/// Section 7 allows the profile only where it is explicitly selected, so a person who selected it
+/// is told what they gave up: the agent's launch is held by a job of its own instead of the
+/// session's, its processes are tracked by start identity, and the session's closure never reads
+/// its ownership coverage as complete. The program a command route starts runs in the shell's own
+/// job and has no such profile, so the line says that too. The packages are names the person wrote
+/// in their own document, which they asked this command to show.
+fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Line> {
+    if value.key != kr_protocol::hostinfo::configuration::AGENTS_OWNERSHIP_KEY
+        || value.class() != kr_protocol::hostinfo::export::ContentClass::Name
+    {
+        return Vec::new();
+    }
+    value
+        .value()
+        .split(", ")
+        .filter_map(|entry| entry.strip_suffix("=reduced"))
+        .map(|package| {
+            stdout_line!(
+                "  agents {}: reduced ownership; a launch is tracked by start identity and its \
+                 closure never reads complete; the command route does not apply it",
+                Asked::text(Request::Diagnostics, package)
+            )
+        })
+        .collect()
 }
 
 /// The software versions a support bundle carries.
