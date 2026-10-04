@@ -518,6 +518,13 @@ impl Engine {
             };
             let before_the_cursor_moves =
                 (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out());
+            // The library returns to the primary buffer on a soft reset, and a terminal stays in
+            // the alternate one. A direct terminal reading the same bytes would be showing a
+            // different buffer from the canonical grid from here on, so the attachment projects.
+            if decision.apply_to_grid && is_soft_reset(&event.kind) && self.grid.alternate_active()
+            {
+                disposition = DirectDisposition::RequireProjection;
+            }
             // Whether the grid performed the save or restore: a sequence it refused moved nothing.
             let mut cursor_performed = false;
             // A measurement asked for part way through a read is taken there, not at the end of
@@ -1833,6 +1840,20 @@ impl Engine {
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
     }
+}
+
+/// Whether a sequence is a soft terminal reset.
+fn is_soft_reset(kind: &EventKind) -> bool {
+    let EventKind::Csi {
+        params,
+        truncated,
+        final_byte,
+    } = kind
+    else {
+        return false;
+    };
+    let csi = crate::classify::CsiView::with_truncation(params, *final_byte, *truncated);
+    csi.private.is_none() && csi.intermediates == b"!" && csi.final_byte == b'p'
 }
 
 /// One save or restore of a cursor, naming the buffer whose saved cursor it touches (0 for the
