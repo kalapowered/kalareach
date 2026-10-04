@@ -449,14 +449,6 @@ impl Session {
             .installed_snapshot(stream_id, sequence);
     }
 
-    /// Discards what this client held for one stream, which is what a resynchronisation means.
-    ///
-    /// The stream then owes a snapshot: nothing it delivers establishes a position until one is
-    /// installed.
-    pub async fn discard_stream(&self, stream_id: &StreamId) {
-        self.state.cursors.lock().await.discard(stream_id);
-    }
-
     /// Calls a read method and parses its result.
     ///
     /// A read the registry marks idempotent is sent again when the host refuses it with a
