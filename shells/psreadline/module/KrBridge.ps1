@@ -408,7 +408,8 @@ function Send-KrBytes {
     $socket = $script:Kr.Socket
     if ($null -eq $socket) { return $false }
     $sent = 0
-    $deadline = (Get-KrNowMs) + $BudgetMs
+    # The clock that only goes forward: the time of day can be set while a send waits for room.
+    $deadline = (Get-KrTickMs) + $BudgetMs
     while ($sent -lt $Bytes.Length) {
         try {
             if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
@@ -425,7 +426,7 @@ function Send-KrBytes {
                 Disconnect-KrEndpoint
                 return $false
             }
-            if ((Get-KrNowMs) -gt $deadline) { Disconnect-KrEndpoint; return $false }
+            if ((Get-KrTickMs) -gt $deadline) { Disconnect-KrEndpoint; return $false }
             [System.Threading.Thread]::Sleep(1)
         } catch {
             Disconnect-KrEndpoint
@@ -1346,6 +1347,7 @@ function Invoke-KrAskResolve {
     }
     # One monotonic budget covers the send and the wait.
     $deadline = (Get-KrTickMs) + $BudgetMs
+    $sendBudget = [uint64][Math]::Max([int64]0, [int64]$deadline - [int64](Get-KrTickMs))
     Send-KrEvent 'command_resolve' @{
         cwd               = $Cwd
         argv              = [string[]]@($Argv)
@@ -1354,7 +1356,7 @@ function Invoke-KrAskResolve {
         interactive       = $true
         cwd_revision      = $CwdRevision
         prompt_generation = $PromptGeneration
-    } $BudgetMs
+    } $sendBudget
     if (-not $script:Kr.Registered) { return $null }
     $script:Kr.ResolveId = $script:Kr.LastEventId
     $script:Kr.ResolveAnswered = $false
@@ -1376,7 +1378,12 @@ function Invoke-KrFrame {
     switch ($variant.Name) {
         'fence_published' { Read-KrPublication $variant.Payload; return }
         'launch_revoked' { Read-KrRevocation $variant.Payload; return }
-        'event_result' { Read-KrEventResult ([uint64]$variant.Payload['id']) $variant.Payload['result']; return }
+        'event_result' {
+            $answered = try { [uint64]$variant.Payload['id'] } catch { $null }
+            if ($null -eq $answered) { Disconnect-KrEndpoint; return }
+            Read-KrEventResult $answered $variant.Payload['result']
+            return
+        }
         'request' {
             $id = [uint64]$variant.Payload['id']
             $request = Get-KrVariant $variant.Payload['request']
