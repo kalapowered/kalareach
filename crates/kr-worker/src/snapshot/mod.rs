@@ -1297,6 +1297,72 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.26: mode 9001 is the pseudo-console's own input mode, and no update tells a client
+    /// about it. A snapshot already leaves it out; the update that follows a snapshot has to as
+    /// well, or a client learns of it one change later.
+    #[test]
+    fn an_update_never_carries_the_backends_own_input_mode() {
+        use kr_term::engine::{Engine, EngineConfig};
+        use kr_term::policy::{Backend, Policy};
+
+        let mut engine = Engine::new(EngineConfig {
+            policy: Policy {
+                backend: Backend::ConPty,
+                ..Policy::DEFAULT
+            },
+            ..EngineConfig::DEFAULT
+        })
+        .expect("an engine");
+        let window = Viewport {
+            top_row: 0,
+            rows: 40,
+            left_col: 0,
+            cols: 120,
+        };
+        let (base, _) = engine.snapshot(window, 0);
+        // The backend asks for its input mode, and a mode every client is told about changes with
+        // it, so the update has something to carry either way.
+        engine.feed(b"\x1b[?9001h\x1b[?25l", 0);
+        assert!(
+            engine.modes().win32_input(),
+            "the session recorded what its backend asked for"
+        );
+        let delta = engine
+            .delta(base.output_cursor, base.projection_generation)
+            .expect("the base is inside the window");
+        let Owed::Update(update) = advance(
+            &delta,
+            ActiveBuffer::Primary,
+            window,
+            window.top_row,
+            0,
+            false,
+            false,
+            crate::render::Scope::WholeScreen,
+            Some(window),
+        )
+        .expect("an answer") else {
+            panic!("a mode change is an update");
+        };
+        let carried = update
+            .events
+            .iter()
+            .find_map(|outgoing| match &outgoing.event {
+                ProjectionEvent::Delta(delta) => Some(delta),
+                _ => None,
+            })
+            .expect("the update carries a delta");
+        let modes: Vec<u64> = carried.modes.iter().map(|mode| mode.mode.get()).collect();
+        assert!(
+            modes.contains(&25),
+            "the change a client is told of: {modes:?}"
+        );
+        assert!(
+            !modes.contains(&9001),
+            "the backend's own input mode is not one: {modes:?}"
+        );
+    }
+
     /// KR-REQ-08.44: each form a creation can name records its own provenance.
     #[test]
     fn a_create_requests_palette_becomes_the_choice_that_records_it() {
