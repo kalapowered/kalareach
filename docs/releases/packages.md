@@ -125,13 +125,13 @@ release workflow will be running at the same time, and the release may not be pu
 will wait up to 50 minutes for the release to become available. The job requires the release to be
 immutable. The checks confirm that the archive in the release matches the hash listed in
 `SHA512SUMS`, and that it matches an archive created by `npm pack` from the same commit. It also
-uses `npm publish --dry-run` to confirm that the archive would be publishable to the npm registry.
-Finally, it records the sha512 of the archive so that it can be checked again in the `publish` job.
-The `publish` job will only run if the `check` job is successful, and it will wait until someone has
-approved the deployment. It downloads the release again, and refuses any archive whose sha512 is not
-the recorded value. It then publishes the archive to the npm registry, using
-`npm publish --provenance --access public` to attach provenance information identifying the
-workflow and the commit from which it was published. It authenticates to the npm registry using the
+runs `npm publish --dry-run` on the archive to see what npm would publish. Finally, it records the
+sha512 of the archive so that it can be checked again in the `publish` job. The `publish` job will
+only run if the `check` job is successful, and it will wait until someone has approved the
+deployment. It downloads the release again, and refuses any archive whose sha512 is not the recorded
+value. It then publishes the archive to the npm registry, using
+`npm publish --provenance --access public` to attach provenance information identifying the workflow
+and the commit from which it was published. It authenticates to the npm registry using the
 workflow's own identity, via OpenID Connect, so this repository holds no npm token.
 
 It is possible to run the workflow on a branch to test the `check` job. In that case, it will not
@@ -203,12 +203,17 @@ waits at most 30 days for an approval. The reviewer:
 4. When the job finishes, runs `npm view @kalareach/plugin-sdk version` and checks that the package
    page shows the provenance for that version.
 
-If the deployment is rejected, or if it waited 30 days without approval, the run can be started
-again by selecting "Re-run" from the run page, and the `publish` job will wait for someone to
-approve the deployment again. Note that the run will use the version of the workflow from the commit
-that was tagged, so if the workflow needs to be changed, a new tag will need to be created. However,
-if something needs to be changed about the package, such as the trusted publisher, then the run can
-be restarted without creating a new tag.
+If, for some reason, the reviewer rejects the deployment, go back to the run's page and click
+"Re-run" to ask the `publish` job for approval again. GitHub offers "Re-run" for 30 days after a run
+starts, which is as long as a run waits for approval, so a run whose approval expired cannot be
+re-run. In that case a new run can be started by hand from the Actions tab, with the tag as its ref.
+(This can also be done with the command line tool: `gh workflow run package-npm.yml --ref <tag>`.)
+
+Whether re-running the existing run or starting a new run, the action will run the version of the
+workflow as it was at the tagged commit. This means if a problem occurred because the workflow was
+incorrect, then a new tag is needed to fix it. If, however, the problem was with the package's
+settings on npm (e.g. the trusted publisher field has a typo), then simply fix the problem and run
+the action again.
 
 ## How a consumer pins a release
 
