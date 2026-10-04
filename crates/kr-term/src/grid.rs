@@ -177,8 +177,8 @@ struct RowsBytes {
 ///
 /// The bound in section 8 is on bytes, and a row can carry a hundred times what the row beside it
 /// carries, so the cache cannot be enforced by counting rows. Walking the whole history for every
-/// row that joins it is what the bound used to cost, and it grows with the history: a session
-/// printing steadily paid a scan of everything it had retained on every read.
+/// row that joins it would cost a scan of everything retained, and that grows with the history: a
+/// session printing steadily would pay it on every read.
 ///
 /// So the figure is carried instead. A row is charged once, where it leaves the screen, and its
 /// charge is given back once, where the row is dropped.
@@ -197,9 +197,8 @@ struct RowsBytes {
 /// hyperlinks hold walks every row of both buffers wherever it sits, and it runs inside a read; so
 /// does a snapshot of the history, when one is asked for. Neither is proportional to the reads: the
 /// measurement runs every sixty-fourth read, or when the rows have grown by a page, or when
-/// something asked for it. What this account removes is the walk a *single row leaving the screen*
-/// used to cost, which is the one that grew with the history and happened thousands of times a
-/// read.
+/// something asked for it. What this account avoids is the walk a *single row leaving the screen*
+/// would otherwise cost, which grows with the history and happens thousands of times a read.
 ///
 /// [`CanonicalGrid::measure_history_bytes`] is the same figure worked out the long way, and the
 /// two agree after every operation.
