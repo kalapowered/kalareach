@@ -233,6 +233,9 @@ pub struct Engine {
     /// A reading replaces what was charged for the links a session opened, so where one happens
     /// decides whether a charge survives it. The count is what holds that.
     link_readings: u64,
+    /// The read that last took such a reading, so one read that carries many links turned away
+    /// reads what the session holds once rather than once for each of them.
+    link_read_at: Option<u32>,
     alternate_seen: bool,
     title_truncated: bool,
     dropped_marks: u64,
@@ -278,6 +281,7 @@ impl Engine {
             saved_revision: 0,
             measure_now: false,
             link_readings: 0,
+            link_read_at: None,
             alternate_seen: false,
             title_truncated: false,
             dropped_marks: 0,
@@ -305,6 +309,16 @@ impl Engine {
     fn mark_mode(&mut self, kind: ModeKind, mode: u16) {
         let revision = self.next_revision();
         self.mode_revisions.insert((kind, mode), revision);
+    }
+
+    /// How many distinct hyperlinks the session holds at the moment.
+    ///
+    /// The table counts the links a screen or the history still holds, the one the pen is inside
+    /// and the ones a saved cursor carries. A link that has left all of them stops counting at the
+    /// next reading of what the session holds.
+    #[must_use]
+    pub fn distinct_links(&self) -> usize {
+        self.links.len()
     }
 
     /// Returns whether the application has bracketed paste on.
@@ -748,6 +762,10 @@ impl Engine {
             return Some("a hyperlink with no target carries no parameters");
         }
         let parameters = String::from_utf8_lossy(&parts[1]).into_owned();
+        // What the link is, as the session tells one link from another: the same spelling the
+        // table is rebuilt in from the objects the grid holds. What it costs is worked out from
+        // what arrived.
+        let key = crate::grid::Link::from_osc(&parts[1], &uri).payload();
         let uri = format!("{parameters};{}", String::from_utf8_lossy(&uri));
         // One link has a length bound of its own, separate from how many distinct links a session
         // keeps. Every cell inside a link holds a reference to it, so an application that opens a
@@ -762,28 +780,22 @@ impl Engine {
         // noticed at the next measurement. One read can carry a session's worth of links.
         let parameters = parts[1].iter().filter(|byte| **byte == b':').count() + 1;
         let resident = crate::grid::link_cost(&uri, parameters);
-        // What the table will cost for this entry, worked out the way the measurement works it
-        // out, so admission and measurement cannot disagree about the same entry. The first target
-        // pays for the node it opens, which the measurement charges once the set is not empty.
-        let known = self.links.contains(&uri);
-        let cost = if known {
-            0
-        } else {
-            crate::grid::link_table_entry_bytes(&uri)
-                + if self.links.is_empty() {
-                    crate::grid::LINK_TABLE_NODE_BYTES
-                } else {
-                    0
-                }
-        };
-        self.read_links_if_the_charge_would_not_fit(resident.saturating_add(cost));
+        let (mut known, mut cost) = self.link_table_cost(&key);
+        let readings_before = self.link_readings;
+        self.read_links_if_the_charge_would_not_fit(resident.saturating_add(cost), !known);
+        if self.link_readings != readings_before {
+            // The reading replaced the table with the links the grid holds. A link the table knew
+            // may have no object left, and the first entry of an emptied table pays for its node,
+            // so what the entry costs is worked out again against the table as it now is.
+            (known, cost) = self.link_table_cost(&key);
+        }
         // From here to the end of this decision nothing may read the hyperlink state again: a
         // reading replaces the account with what the grid is holding, and the object this link is
         // being admitted for is not on a row yet, so a reading taken between the two charges below
         // would erase the first of them. The count is checked at the end rather than described in
         // a comment alone.
         let readings = self.link_readings;
-        let refusal = self.charge_link(uri, resident, cost, known);
+        let refusal = self.charge_link(key, resident, cost, known);
         debug_assert_eq!(
             self.link_readings, readings,
             "the hyperlink state was read again while a link was being charged for"
@@ -791,10 +803,30 @@ impl Engine {
         refusal
     }
 
+    /// Whether the table of distinct links holds `key`, and what an entry for it would cost.
+    ///
+    /// Worked out the way the measurement works it out, so admission and measurement cannot
+    /// disagree about the same entry. The first target pays for the node it opens, which the
+    /// measurement charges once the set is not empty.
+    fn link_table_cost(&self, key: &String) -> (bool, u64) {
+        if self.links.contains(key) {
+            return (true, 0);
+        }
+        let node = if self.links.is_empty() {
+            crate::grid::LINK_TABLE_NODE_BYTES
+        } else {
+            0
+        };
+        (
+            false,
+            crate::grid::link_table_entry_bytes(key).saturating_add(node),
+        )
+    }
+
     /// Charges an admitted link, or names why it is refused after all.
     fn charge_link(
         &mut self,
-        uri: String,
+        key: String,
         resident: u64,
         cost: u64,
         known: bool,
@@ -815,26 +847,35 @@ impl Engine {
             return Some("the session hyperlink table is full");
         }
         self.budget.add_links(cost);
-        self.links.insert(uri);
+        self.links.insert(key);
         None
     }
 
-    /// Reads what the hyperlink state holds when `bytes` more of it would not fit the envelope.
+    /// Reads what the hyperlink state holds when `bytes` more of it would not fit the envelope, or
+    /// when the table of distinct links is full and this link would need a place in it.
     ///
     /// Every hyperlink is charged what it will cost where it arrives, because one read can carry a
     /// session's worth of them and a bound that is only checked afterwards is not a bound. What is
     /// charged is at or above what the object turns out to hold, and a row that is dropped gives
     /// nothing back until the objects on it are measured again, so the charged figure drifts above
-    /// the truth while a session prints. A refusal against the envelope on that figure would refuse
-    /// a link the session has room for, so the truth is read first. Only then: a link whose charge
-    /// fits the drifted figure fits the truth as well, and reading for it would buy nothing.
+    /// the truth while a session prints. The table drifts the same way: a link whose last cell has
+    /// scrolled out of the history is still in it until the objects are read. A refusal against
+    /// either on that figure would refuse a link the session has room for, so the truth is read
+    /// first. Only then: a link that fits the drifted figure fits the truth as well, and reading
+    /// for it would buy nothing.
+    ///
+    /// Once a read. A reading walks every row of both buffers, and a read that carries a flood of
+    /// links the session has no room for would otherwise take one for each of them, to learn each
+    /// time what it learned the first time.
     ///
     /// `bytes` is the whole of what this link will cost, the object and the table entry together,
     /// and the reading happens before either is charged. A reading replaces the account with what
     /// the grid is holding, and the object this link is being admitted for is not on a row yet, so
     /// one taken between the two charges would erase the first of them.
-    fn read_links_if_the_charge_would_not_fit(&mut self, bytes: u64) {
-        if !self.budget.links_fit(bytes) {
+    fn read_links_if_the_charge_would_not_fit(&mut self, bytes: u64, needs_a_place: bool) {
+        let table_is_full = needs_a_place && self.links.len() >= self.budget.limits().unique_links;
+        if (table_is_full || !self.budget.links_fit(bytes)) && self.link_read_at != Some(self.feeds)
+        {
             self.measure_links();
         }
     }
@@ -966,13 +1007,17 @@ impl Engine {
     }
 
     /// Measures what the session's hyperlink state holds, which replaces what was charged for it.
+    ///
+    /// The table of distinct links is read from the objects the grid holds, as the bytes are. A
+    /// link is in it for as long as something holds it, a cell on a screen or in the history, the
+    /// pen or a saved cursor, and not for as long as the session lasts.
     fn measure_links(&mut self) {
         self.link_readings = self.link_readings.wrapping_add(1);
-        self.budget.set_links(
-            self.grid
-                .link_bytes()
-                .saturating_add(self.link_table_bytes()),
-        );
+        self.link_read_at = Some(self.feeds);
+        let census = self.grid.link_census();
+        self.links = census.links;
+        self.budget
+            .set_links(census.bytes.saturating_add(self.link_table_bytes()));
     }
 
     /// What the table of distinct hyperlink targets holds.

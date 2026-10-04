@@ -1664,6 +1664,49 @@ fn a_link_is_never_admitted_past_the_envelope() {
     );
 }
 
+/// KR-REQ-08.79: a link the table knew, whose last cell is gone, is entered in the table again when
+/// it comes back, even when the reading that finds it gone is the one the link's own admission
+/// asks for. The table is read from what the grid holds, so what an entry costs and whether there
+/// is one has to be worked out against the table after that reading and not before it.
+#[test]
+fn a_link_that_came_back_after_its_cell_was_erased_is_in_the_table_again() {
+    const LINKS: u32 = 4_005;
+    const LONG_TARGET: usize = 2_034;
+
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(640, 96),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let envelope = engine.budget().reserved().links;
+    let long = "a".repeat(LONG_TARGET);
+    let link =
+        |index: u32| format!("\u{1b}]8;;https://{index:04}/{long}\u{1b}\\x\u{1b}]8;;\u{1b}\\");
+    for index in 0..LINKS {
+        engine.feed(link(index).as_bytes(), 0);
+    }
+    // Short links until less room is left than the first link needs, so that admitting it again
+    // takes a reading even though the table knows it.
+    let needs = kr_term::grid::link_cost(&format!(";https://0000/{long}"), 1);
+    let mut shorts = 0;
+    while envelope - engine.budget().usage().links >= needs {
+        let input = format!("\u{1b}]8;;https://s{shorts}\u{1b}\\x\u{1b}]8;;\u{1b}\\");
+        engine.feed(input.as_bytes(), 0);
+        shorts += 1;
+        assert!(shorts < 64, "the room left does not shrink");
+    }
+    let held = engine.distinct_links();
+
+    // The first link's only cell is erased, so no object holds it, and then it comes back.
+    engine.feed(b"\x1b[H\x1b[X", 0);
+    engine.feed(format!("\x1b[2;640H{}", link(0)).as_bytes(), 0);
+    assert_eq!(
+        engine.distinct_links(),
+        held,
+        "every link a cell holds is in the table, the one that came back included"
+    );
+}
+
 /// A mark joins the cell it belongs to when the run before it was cut at every cell.
 ///
 /// A run that is not plain ASCII is drawn a cell at a time, because the profile's width model and
@@ -1829,6 +1872,60 @@ fn a_cursor_restore_keeps_the_modes_around_it() {
     shifted.feed(b"\x1b)0\x0e\x1b7\x1b8q", 0);
     shifted.quiesce(0);
     assert!(shifted.grid().shift_out(), "the character set survived");
+}
+
+/// KR-REQ-08.79: the table of distinct hyperlink targets holds the targets a session still has,
+/// not every target it has ever seen. A session that prints links for long enough passes the
+/// table's size in targets, and the ones that scrolled out of its history stop counting.
+#[test]
+fn links_that_left_the_history_stop_counting_towards_the_table() {
+    let mut engine = engine();
+    let limit = engine.budget().limits().unique_links;
+    let retained = engine.grid().size().rows as usize + 3_500;
+    assert!(
+        retained < limit,
+        "the rows a session keeps hold fewer targets than the table does"
+    );
+    for index in 0..limit + 1_500 {
+        let input = format!("\x1b]8;;https://example.invalid/{index}\x1b\\x\x1b]8;;\x1b\\\r\n");
+        engine.feed(input.as_bytes(), index as u64);
+    }
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().truncations(),
+        0,
+        "no link was refused for want of room in a table the session had long since emptied"
+    );
+}
+
+/// KR-REQ-08.79: a link the session has no room for costs the session one reading of what it
+/// holds, not one for every link that is turned away. A read that carries more links than the
+/// table has room for reads the screens once, whatever the flood is made of.
+#[test]
+fn links_turned_away_in_one_read_cost_one_reading() {
+    let mut engine = engine();
+    let limit = engine.budget().limits().unique_links;
+    let mut flood = String::new();
+    // Every target is its own, and every one is on the screen, so none of them has gone anywhere
+    // to make room for the next.
+    for index in 0..limit + 500 {
+        flood.push_str(&format!(
+            "\x1b]8;;https://example.invalid/{index}\x1b\\x\x1b]8;;\x1b\\"
+        ));
+    }
+    let before = engine.grid().rows_read();
+    engine.feed(flood.as_bytes(), 0);
+    assert!(
+        engine.budget().truncations() >= 500,
+        "the table fills, and the links past it are refused: {} of them",
+        engine.budget().truncations()
+    );
+    let read = engine.grid().rows_read() - before;
+    let rows = u64::from(engine.grid().size().rows);
+    assert!(
+        read <= 4 * 2 * rows,
+        "{read} rows were read for one read of links, against {rows} on each of the two screens"
+    );
 }
 
 /// A session that fills its screen with hyperlinks is bounded by the session budget.

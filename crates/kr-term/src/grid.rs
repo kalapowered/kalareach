@@ -16,7 +16,7 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -504,6 +504,82 @@ struct PrintOrigin {
     row: i64,
     stable_top: i64,
     cursor_seqno: usize,
+}
+
+/// A hyperlink as the grid holds it: where it points, and the parameters that tell one link to
+/// that place from another.
+///
+/// Two links are the same link when both are equal. The identifier an application gives a link is
+/// what makes a link that wraps onto the next row one link, and what makes two links to the same
+/// target two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// The target.
+    pub uri: String,
+    /// The parameters, as `key=value` pairs in key order separated by `:`, which is the one
+    /// spelling every spelling of the same parameters has. Empty when there are none.
+    pub params: String,
+}
+
+impl Link {
+    /// The link a grid object stands for.
+    #[must_use]
+    pub fn of(link: &Hyperlink) -> Self {
+        let mut pairs: Vec<(&String, &String)> = link.params().iter().collect();
+        pairs.sort_unstable();
+        let params = pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        Self {
+            uri: link.uri().to_owned(),
+            params,
+        }
+    }
+
+    /// The link an OSC 8 sequence names, from its parameter field and its target as they arrived.
+    ///
+    /// Spelled as [`Self::of`] spells the object the grid builds from the same fields, so the link
+    /// a session admits and the link it finds on a row afterwards are equal. A field the grid
+    /// would not take, because a pair has no `=`, is kept as it came: no object is ever built from
+    /// it, so nothing is found to compare it with.
+    #[must_use]
+    pub(crate) fn from_osc(params: &[u8], uri: &[u8]) -> Self {
+        let text =
+            |bytes: &[u8]| String::from_utf8_lossy(&crate::adapter::sanitise(bytes)).into_owned();
+        let (params, uri) = (text(params), text(uri));
+        let mut pairs: BTreeMap<&str, &str> = BTreeMap::new();
+        if !params.is_empty() {
+            for pair in params.split(':') {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return Self { uri, params };
+                };
+                pairs.insert(key, value);
+            }
+        }
+        let params = pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        Self { uri, params }
+    }
+
+    /// What follows `8;` in the sequence that opens this link: the parameters, a `;`, the target.
+    #[must_use]
+    pub fn payload(&self) -> String {
+        format!("{};{}", self.params, self.uri)
+    }
+}
+
+/// What the hyperlink objects a grid holds cost, and the distinct links they stand for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkCensus {
+    /// What every object costs, each counted once.
+    pub bytes: u64,
+    /// The payload of every distinct link, as [`Link::payload`] spells it.
+    pub links: BTreeSet<String>,
 }
 
 /// A run of cells sharing one rendition and one hyperlink.
@@ -1705,30 +1781,59 @@ impl CanonicalGrid {
     /// when a row scrolls off.
     #[must_use]
     pub fn link_bytes(&self) -> u64 {
-        let mut seen = BTreeSet::new();
-        let mut links = 0u64;
+        let mut bytes = 0u64;
+        self.each_link_object(|link| bytes = bytes.saturating_add(link_object_bytes(link)));
+        bytes
+    }
+
+    /// What the hyperlink objects cost, and the distinct links they stand for.
+    ///
+    /// The same walk as [`Self::link_bytes`], which is why the two are taken together when the
+    /// session measures its hyperlink state: the links the grid holds are the links the session
+    /// has, and a link no object holds any more is one it no longer has.
+    #[must_use]
+    pub fn link_census(&self) -> LinkCensus {
+        let mut census = LinkCensus::default();
+        self.each_link_object(|link| {
+            census.bytes = census.bytes.saturating_add(link_object_bytes(link));
+            census.links.insert(Link::of(link).payload());
+        });
+        census
+    }
+
+    /// Hands `visit` every distinct hyperlink object the grid holds, wherever it sits.
+    fn each_link_object<F: FnMut(&Hyperlink)>(&self, mut visit: F) {
+        let mut seen: BTreeSet<*const Hyperlink> = BTreeSet::new();
+        let mut once = |link: &Arc<Hyperlink>| {
+            if seen.insert(Arc::as_ptr(link)) {
+                visit(link);
+            }
+        };
         // The pen's link and the saved cursors' links come first, because they are on no row: a
         // link that is opened and then saved, or opened over an empty screen, is held by the pen
         // alone, and a measurement that only walked rows would report it as free.
         if let Some(link) = self.terminal.pen().hyperlink() {
-            add_link_object(link, &mut seen, &mut links);
+            once(link);
         }
         for alternate in [false, true] {
             if let Some(saved) = self.terminal.saved_cursor(alternate)
                 && let Some(link) = saved.pen.hyperlink()
             {
-                add_link_object(link, &mut seen, &mut links);
+                once(link);
             }
         }
         let mut read = 0u64;
         for screen in [self.terminal.screen(), self.terminal.inactive_screen()] {
             screen.for_each_phys_line(|_, line| {
                 read += 1;
-                count_row_links(line, &mut seen, &mut links);
+                for cell in line.visible_cells() {
+                    if let Some(link) = cell.attrs().hyperlink() {
+                        once(link);
+                    }
+                }
             });
         }
         self.rows_read.fetch_add(read, Ordering::Relaxed);
-        links
     }
 
     /// The screen the history belongs to, wherever it is.
@@ -1927,18 +2032,6 @@ impl CanonicalGrid {
 fn history_row_bytes(line: &wezterm_term::Line) -> u64 {
     let cells = line.len() as u64;
     row_content_bytes(line).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
-}
-
-/// Adds one link object, if it has not been counted already.
-///
-/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
-/// than its text. Each distinct object is counted once and no more: the cells of one link share
-/// it, one link can be used in cells that are not next to each other and on rows that are not next
-/// to each other, and two links that happen to have the same target share nothing.
-fn add_link_object(link: &Arc<Hyperlink>, seen: &mut BTreeSet<*const Hyperlink>, bytes: &mut u64) {
-    if seen.insert(Arc::as_ptr(link)) {
-        *bytes = bytes.saturating_add(link_object_bytes(link));
-    }
 }
 
 /// What a link of this length will cost once the grid holds it.
@@ -2159,30 +2252,6 @@ fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
         }
     }
     bytes
-}
-
-/// Adds the link objects one row's cells hold to the session's running total.
-///
-/// Separate from what the row costs, because the two are counted against different things and at
-/// different moments. What a row costs is its own and is charged once, where the row moves. A link
-/// object is shared: the cells of one link hold the same object, one link can appear on rows that
-/// are not next to each other, and one envelope covers both screens and the retained rows
-/// together, so a row moving between them moves no charge. So the objects are gathered by the walk
-/// that measures the session's links, wherever the rows sit.
-///
-/// A row carries a flag saying whether any of its cells is inside a link, and it is the row's flag
-/// rather than the cells', so a row built from cells that hold links does not have it set. Reading
-/// the cells is the answer that cannot be wrong.
-fn count_row_links(
-    line: &wezterm_term::Line,
-    seen: &mut BTreeSet<*const Hyperlink>,
-    links: &mut u64,
-) {
-    for cell in line.visible_cells() {
-        if let Some(link) = cell.attrs().hyperlink() {
-            add_link_object(link, seen, links);
-        }
-    }
 }
 
 /// The count a repeat request carries, when the actions are one.

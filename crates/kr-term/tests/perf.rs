@@ -843,18 +843,27 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
 /// object being admitted is not on a row yet.
 #[test]
 fn the_link_envelope_holds_across_a_measurement() {
-    /// Links opened, printed into and closed, one to a read, each with a target of its own.
+    /// Reads, each carrying a row of links opened, printed into and closed, each with a target of
+    /// its own.
     ///
-    /// Enough of them to fill both the envelope and the table of distinct targets a session keeps,
-    /// so the reading that decides a refusal is taken and the refusals after it are taken against
-    /// it. The same count on every build, because what it checks is a bound rather than a rate.
-    const READS: u32 = 4_352;
+    /// Enough of them for the links the history holds to fill the envelope, so the reading that
+    /// decides a refusal is taken and the refusals after it are taken against it. The same count on
+    /// every build, because what it checks is a bound rather than a rate.
+    const READS: u32 = 1_000;
+    /// Links on one row, so that a history of a few hundred rows holds the thousands of links the
+    /// envelope takes, and the reading of every row a refusal calls for is not the whole of the
+    /// run's cost.
+    const LINKS_PER_READ: u32 = 8;
     /// Characters of target, which with the parameter field and the scheme is the most one link may
     /// hold, so the envelope is reached in the fewest reads.
     const TARGET_CHARS: usize = 2_000;
 
     let mut engine = Engine::new(EngineConfig {
-        size: GridSize::new(120, 40),
+        size: GridSize::new(48, 40),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 500,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
@@ -862,24 +871,46 @@ fn the_link_envelope_holds_across_a_measurement() {
     let target: String = std::iter::repeat_n('a', TARGET_CHARS).collect();
     let mut admitted = 0usize;
     let mut refused = 0usize;
+    // Links admitted in reads after a link the grid held had left it, once a link had been
+    // refused: admission resuming because links left the history.
+    let mut resumed = 0usize;
+    let mut left_since_a_refusal = false;
+    // How many distinct links the grid held after the read before.
+    let mut held = 0usize;
     let mut seen = 0u64;
     let mut peak = 0u64;
 
-    // One target for every read, so the table of distinct targets fills as well as the envelope,
-    // and the cells of every link scroll off the screen so the objects on them are given up.
+    // Every target is its own, so the links the rows still hold fill the envelope, and the cells of
+    // every link scroll off the screen so the objects on them are given up.
     for index in 0..READS {
-        let input = format!("\x1b]8;;https://{index:05}/{target}\x1b\\link\x1b]8;;\x1b\\ text\r\n");
+        let mut input = String::new();
+        for link in 0..LINKS_PER_READ {
+            input.push_str(&format!(
+                "\x1b]8;;https://{index:05}{link}/{target}\x1b\\link\x1b]8;;\x1b\\ "
+            ));
+        }
+        input.push_str("\r\n");
         engine.feed(input.as_bytes(), u64::from(index));
         // Counted from the truncations the budget records rather than from the diagnostics, which
         // are rate limited: a refusal that was suppressed is still a refusal.
         let truncations = engine.budget().truncations();
-        if truncations > seen {
-            refused += 1;
-            seen = truncations;
-        } else {
-            admitted += 1;
+        let turned_away = usize::try_from(truncations - seen).expect("a count");
+        let taken = LINKS_PER_READ as usize - turned_away.min(LINKS_PER_READ as usize);
+        if left_since_a_refusal {
+            resumed += taken;
         }
+        refused += turned_away;
+        admitted += taken;
+        seen = truncations;
         let links = engine.budget().usage().links;
+        // Every link is its own, so each one admitted adds one to what the grid holds. A total that
+        // is smaller than that means links the grid held have left it, whatever the figure the
+        // session charges for them says.
+        let now = engine.grid().link_census().links.len();
+        if refused > 0 && now < held + taken {
+            left_since_a_refusal = true;
+        }
+        held = now;
         peak = peak.max(links);
         assert!(
             links <= envelope,
@@ -898,6 +929,7 @@ fn the_link_envelope_holds_across_a_measurement() {
     println!("  reads             {READS}");
     println!("  links admitted    {admitted}");
     println!("  links refused     {refused}");
+    println!("  admitted after links left  {resumed}");
     println!("  envelope          {envelope} bytes");
     println!("  peak holding      {peak} bytes");
     println!(
@@ -925,8 +957,8 @@ fn the_link_envelope_holds_across_a_measurement() {
         "the run has to reach a refusal, which is the decision a reading is taken for"
     );
     assert!(
-        admitted > READS as usize / 4,
-        "a session that scrolls its links away has to keep admitting them: {admitted} admitted, \
-         {refused} refused"
+        resumed > 0,
+        "a session that scrolls its links away has to admit links again once a measurement has \
+         found them gone after a refusal: {admitted} admitted, {refused} refused"
     );
 }
