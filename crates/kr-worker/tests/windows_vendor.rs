@@ -112,6 +112,9 @@ struct Report {
     nested: u32,
     /// What a try at breaking away from every job did.
     breakaway: String,
+    /// Whether the process that reported runs under a restricted token, as a vendor sandbox's
+    /// command does.
+    restricted: Option<bool>,
 }
 
 /// An agent this host started, ended with everything in its jobs when the test ends, however it
@@ -220,6 +223,10 @@ impl Launch {
         Report {
             nested: field("nested").parse().expect("a process identifier"),
             breakaway: field("breakaway"),
+            restricted: text
+                .lines()
+                .find_map(|line| line.strip_prefix("restricted="))
+                .map(|word| word == "true"),
         }
     }
 
@@ -362,6 +369,25 @@ fn assign(job: windows_sys::Win32::Foundation::HANDLE, child: &std::process::Chi
         "the vendor's job nests under the session's: {}",
         std::io::Error::last_os_error()
     );
+}
+
+#[expect(
+    unsafe_code,
+    reason = "reading whether a token is restricted has no safe form"
+)]
+fn this_token_is_restricted() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{IsTokenRestricted, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the pseudo-handle names this process and the out-parameter is a local.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
+    assert_ne!(opened, 0, "this process's token opens");
+    // SAFETY: the token is open for the call and closed once afterwards.
+    let restricted = unsafe { IsTokenRestricted(token) } != 0;
+    // SAFETY: the handle is the one the call above opened.
+    unsafe { CloseHandle(token) };
+    restricted
 }
 
 fn waiting_program() -> std::process::Command {
@@ -655,7 +681,11 @@ fn native_codex_sandboxed_command() {
     let partial = report.with_extension("partial");
     std::fs::write(
         &partial,
-        format!("nested={}\nbreakaway={breakaway}\n", held.id()),
+        format!(
+            "nested={}\nbreakaway={breakaway}\nrestricted={}\n",
+            held.id(),
+            this_token_is_restricted()
+        ),
     )
     .expect("the report is written");
     std::fs::rename(&partial, &report).expect("the report is published");
@@ -746,7 +776,13 @@ async fn native_codex_nests_under_the_session_job_and_the_closure_ends_everythin
         .expect("Codex launches under the session's job");
     launch.close_input();
     let report = launch.report();
+    assert_eq!(
+        report.restricted,
+        Some(true),
+        "Codex's own sandbox ran the command, under its restricted token: {report:?}"
+    );
     let members = session.process_ids().expect("the session's processes");
+    println!("native Codex under the session's job: {report:?}; the job holds {members:?}");
     assert!(
         members.contains(&report.nested),
         "the command Codex's sandbox ran is held by the session's job: {members:?}"
@@ -804,8 +840,14 @@ async fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_r
         .expect("the selected profile starts Codex");
     launch.close_input();
     let report = launch.report();
+    assert_eq!(
+        report.restricted,
+        Some(true),
+        "Codex's own sandbox ran the command, under its restricted token: {report:?}"
+    );
     let agent = launch.agent_job();
     let held = agent.process_ids().expect("the agent's processes");
+    println!("native Codex under reduced ownership: {report:?}; its own job holds {held:?}");
     assert!(
         held.contains(&report.nested),
         "the command Codex's sandbox ran is held by the agent's job: {held:?}"
