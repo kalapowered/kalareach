@@ -1708,9 +1708,9 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
 }
 
 /// KR-REQ-22.01: turning descriptions off while the model is loading, or while a job runs in the
-/// process, answers with the pause the change causes, though the work it stops has not ended: the
-/// answer is the host's state after the turn that took the change, and not the state from before
-/// it. The control is the answer before the change, which shows no pause.
+/// process, answers with the pause the change causes: the answer is the host's state after the
+/// turn that took the change, and not the state from before it. The control is the answer before
+/// the change, which shows no pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turning_descriptions_off_with_work_in_the_process_answers_with_the_pause() {
     for work in ["load", "job"] {

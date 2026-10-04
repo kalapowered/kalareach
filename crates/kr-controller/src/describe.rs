@@ -188,14 +188,28 @@ impl DescribeModule {
 
     /// Waits until the host has taken everything posted to it so far and published the turn that
     /// took it, so that an answer built after it shows the pause a setting just changed causes, and
-    /// not the one from before it. A host that does not run is not waited for. When the host does
-    /// not answer within the bound, what it last published is what the answer shows: that is its
-    /// state, and it takes the setting at its next turn.
-    pub(crate) async fn until_host_turns(&self) {
+    /// not the one from before it. A host that does not run, or that stops before it answers, is
+    /// not waited for: the answer then says it generates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the host has not answered within the bound. What
+    /// was posted is not undone, and the host takes it at its next turn; the error says so, so that
+    /// a caller is not shown the pause from before the change as the state after it.
+    pub(crate) async fn until_host_turns(&self) -> Result<()> {
         let Some(host) = self.host().filter(|host| host.runs()) else {
-            return;
+            return Ok(());
         };
-        let _ = tokio::time::timeout(SETTINGS_WAIT, host.turned()).await;
+        if host.turned_within(SETTINGS_WAIT).await {
+            return Ok(());
+        }
+        Err(ControllerError::Refused {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            detail: "the setting is written, and the description host has not confirmed it yet: \
+                     it takes it at its next turn, and `kr host descriptions` shows the state \
+                     once it has"
+                .to_owned(),
+        })
     }
 
     /// Wakes the host, for this crate's own tests that change what it reads.
@@ -682,7 +696,7 @@ impl crate::service::Controller {
                 }
                 // The settings were posted to the host, in order, when the document was accepted;
                 // the answer waits for the turn that took them.
-                self.descriptions.until_host_turns().await;
+                self.descriptions.until_host_turns().await?;
                 self.description_setup()
             }
             Method::DescriptionDownload => {

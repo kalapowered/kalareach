@@ -592,6 +592,12 @@ impl DescribeHost {
         taken
     }
 
+    /// Waits up to `bound` for what [`Self::turned`] returns, and says whether the host answered,
+    /// or ended and so will answer nothing; `false` says only that the bound passed first.
+    pub(crate) async fn turned_within(&self, bound: Duration) -> bool {
+        tokio::time::timeout(bound, self.turned()).await.is_ok()
+    }
+
     /// Stops description processing for every session the host tracks, from the thread that
     /// enabled privacy mode: raises each session's fence at `generation` and cancels the job
     /// running for it. The host cancels a load when it next turns, with the queue purged.
@@ -1744,6 +1750,25 @@ mod tests {
             "acknowledged by the turn that took the change"
         );
         assert_eq!(handle.snapshot().paused, Some(DescriptionPause::Disabled));
+    }
+
+    /// A host that has not turned when the bound passes is not confirmed, and one that turns inside
+    /// it is. The control is the host that turns.
+    #[tokio::test]
+    async fn a_host_that_does_not_turn_inside_the_bound_is_not_confirmed() {
+        let (_directory, mut host) = thread(state(0, false));
+        let handle = DescribeHost {
+            shared: Arc::clone(&host.shared),
+            thread: Mutex::new(None),
+        };
+        assert!(
+            !handle.turned_within(Duration::from_millis(10)).await,
+            "no turn came inside the bound"
+        );
+        let (confirmed, ()) = tokio::join!(handle.turned_within(Duration::from_secs(60)), async {
+            host.turn();
+        });
+        assert!(confirmed, "a turn came");
     }
 
     /// A page that arrives for a host that has stopped is dropped, where a page for one that runs
