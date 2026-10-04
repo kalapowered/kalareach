@@ -28,9 +28,9 @@ relative path and the application module depends on it. Nothing in it touches an
 `./gradlew :krnative:test` runs on a developer's machine with no device.
 
 `apps/companion/native/android/android/src/main/java` is not a module. It holds the classes that do
-need the framework — the push receiver, the background worker, the keystore reader, the audio
-session and the share sheet — and it reaches the application as a source directory of the
-application module's own `main` source set, named in `app/build.gradle.kts`.
+need the framework (the push receiver, the background worker, the keystore reader, the audio session
+and the share sheet), and it reaches the application as a source directory of the application
+module's own `main` source set, named in `app/build.gradle.kts`.
 
 Two checks hold that second path:
 
@@ -104,8 +104,9 @@ An address names where the shell opens: `?tab=attention`, `?tab=account`,
 
 ## The attention inbox
 
-The primary surface, across every host and every session. Four states, told apart three ways at
-once — a word, a tone and the sentence underneath — because one way is never enough:
+The attention inbox is the primary surface, across every host and every session. It has four states,
+told apart three ways at once (a word, a tone and the sentence underneath), because one way is never
+enough:
 
 | State | What it means |
 | --- | --- |
@@ -116,21 +117,21 @@ once — a word, a tone and the sentence underneath — because one way is never
 
 The fourth has a rule in it. Losing contact with a host says nothing about what that host's
 processes are doing, so the row says exactly that and nothing more, is never counted among the
-failures, and offers nothing to decide. Elapsed time is reported as elapsed time.
+failures, and offers nothing to decide. The row states how long contact has been lost as plain
+elapsed time.
 
 ## Input
 
-- The Camera, photo library, and files items are provided by the platform, and there are buttons
-  that will open them. When these buttons are pressed, they open a file input that has already been
-  mapped to the correct picker in the webview, and is hidden from assistive technology. This means
-  that a screen reader will see one button for each item, with the appropriate name. `capture` opens
-  the camera; an image filter opens the photo library; no filter opens the file browser. A picked
-  file is uploaded, not held in the screen: the page hands its bytes to native code, which sends
-  them through the transfer service, and the file stays on the draft, uploading, uploaded or failed,
-  until the person removes it. The phone takes a picked file of up to 1,020 KB, what its connection
-  carries in one chunk; a larger one is refused with that reason. A prompt sent from the phone
-  carries its text inline and cannot carry the file, so a draft that holds one is not sent until the
-  person removes it.
+- The Camera, photo library, and files items are provided by the platform, and a button opens each
+  one through a file input that is already mapped to the correct picker in the webview and hidden
+  from assistive technology, so a screen reader sees one button for each item, with the appropriate
+  name. `capture` opens the camera; an image filter opens the photo library; no filter opens the
+  file browser. A picked file is uploaded, not held in the screen: the page hands its bytes to
+  native code, which sends them through the transfer service, and the file stays on the draft,
+  uploading, uploaded or failed, until the person removes it. The phone takes a picked file of up to
+  1,020 KB, what its connection carries in one chunk; a larger one is refused with that reason. A
+  prompt sent from the phone carries its text inline and cannot carry the file, so a draft that
+  holds one is not sent until the person removes it.
 - **The accessory row** carries the keys a software keyboard buries: escape, tab, control, alt, the
   arrows, home, end and the punctuation a shell needs. A modifier has three states (off, held for
   one key, and held) and says which one it is in rather than leaving it to a colour. A tap on a key
@@ -146,13 +147,13 @@ failures, and offers nothing to decide. Elapsed time is reported as elapsed time
 
 ## The raw terminal
 
-Control mode and view mode, as on the desktop. In control mode the program inside the terminal owns
-the touch, exactly as it owns the wheel, and the view's own pan does not exist: a pan control that
-took a one-finger drag would make a pager or an editor unusable. A pinch zooms in either mode,
-because nothing on the wire carries a pinch, so zooming takes nothing from anyone. The text scales
-with the fingers while they pinch and follows them back if they reverse; when they lift, the zoom
-takes the step nearest where they ended, and a pinch that comes back to where it began changes
-nothing.
+The raw terminal has control mode and view mode, as on the desktop. In control mode the program
+inside the terminal owns the touch, exactly as it owns the wheel, and the view's own pan does not
+exist: a pan control that took a one-finger drag would make a pager or an editor unusable. A pinch
+zooms in either mode, because nothing on the wire carries a pinch, so zooming takes nothing from
+anyone. The text scales with the fingers while they pinch and follows them back if they reverse;
+when they lift, the zoom takes the step nearest where they ended, and a pinch that comes back to
+where it began changes nothing.
 
 ## Coming back
 
@@ -188,13 +189,14 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 
 ## Targets, type and motion
 
-- 44 points on iOS, 48 density-independent pixels on Android, in both dimensions.
+- Every control is at least 44 points on iOS and 48 density-independent pixels on Android, in both
+  dimensions.
 - **Text follows the person's text size**, from the smallest setting to the largest accessibility
   size, and spacing is in `rem` so the layout grows with it. Android's web view multiplies the root
   by the font scale itself, and the system restarts the activity when the scale changes, which
   reloads the page at the new size. The activity does not take the change itself, because its web
-  view would then keep the old size. iOS's leaves the root at 16px, so the page reads the size of an
-  element set in `-apple-system-body`, a font keyword WebKit ties to Dynamic Type, and
+  view would then keep the old size. iOS's web view leaves the root at 16px, so the page reads the
+  size of an element set in `-apple-system-body`, a font keyword WebKit ties to Dynamic Type, and
   multiplies the root by its ratio to the size at the default setting, as `--text-scale`. That
   follows a change made while the application runs. Sizes on iOS reach three times the base size, so
   there the two bars stop growing at one and a half times it and the terminal grid at twice it, and
@@ -202,8 +204,9 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 - **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
   finished", and never by its identifier. A kind this build does not know is called "Update from the
   agent", and its identifier stays on the entry as data.
-- Safe-area insets on every edge that can be under a notch, a home indicator or a rounded corner.
-- Transitions of 120 to 200 ms; navigation does not animate at all, and neither does streamed text
+- Every edge that can be under a notch, a home indicator or a rounded corner is padded by the
+  platform's safe-area inset.
+- Transitions take 120 to 200 ms; navigation does not animate at all, and neither does streamed text
   or a repeated key.
 - A sheet is dragged one to one with the finger, decides on the velocity at release, and can be
   caught and reversed mid-flight. With reduced motion nothing moves by itself: it cross-fades in
@@ -217,7 +220,7 @@ with no application and no JavaScript context anywhere. Each makes one decision,
 tests; neither is connected to a registration with the gateway. A push message carries only strings,
 so the iOS extension reads the sealed preview as the JSON text the gateway puts under `preview`. On
 Android, the receiver reads from keys which are not sent by the gateway, so it always shows the
-generic alert. Both make the same decision in the same order:
+generic alert. Both make the same decision in the same order.
 
 On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
 where the payload alone decides the content; work it hands to the scheduler finishes without
@@ -299,9 +302,9 @@ universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml
 
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
 what it started, and changes a device's settings only on one it started itself. A platform that is
-not available exits 3 and says so rather than passing quietly. It opens each screen and
-photographs it; it does not assert what is on the screen, drive typing, rotate a device or
-exercise suspension. Screenshots go to `/tmp`; everything else goes to
+not available exits 3 and says so rather than exiting 0. It opens each screen and photographs it; it
+does not assert what is on the screen, drive typing, rotate a device or exercise suspension.
+Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` and `KR_ANDROID_AVD` choose the
 device.
 
@@ -386,11 +389,11 @@ the test, so no setting of the phone is touched.
 
 ## The boundary on a phone
 
-The same one the desktop window has, with one addition. `capabilities/mobile.json` grants the file
-picker and nothing else, applies to iOS and Android only, and is held to that by
-`src-tauri/tests/boundary.rs`. There is no shell, no filesystem path, no general HTTP request, and
-the page may listen for an event without being able to emit one. The interface is bundled: no
-mobile build loads its own code from the managed service.
+The boundary on a phone is the same one the desktop window has, with one addition.
+`capabilities/mobile.json` grants the file picker and nothing else, applies to iOS and Android only,
+and is held to that by `src-tauri/tests/boundary.rs`. There is no shell, no filesystem path, no
+general HTTP request, and the page may listen for an event without being able to emit one. The
+interface is bundled: no mobile build loads its own code from the managed service.
 
 The account screen offers signing in and shows usage. Signing in hands the passkey ceremony to the
 system browser on `reach.kala.to`: iOS's authentication session (an HTTPS callback from iOS 17.4, a
