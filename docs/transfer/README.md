@@ -58,11 +58,12 @@ them; nothing in the protocol depends on the defaults.
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
 submission is recorded rather than inferred from age. The host records it when the session's worker
-accepts a prompt that names the draft, and again for a repeat of that action. The host tells the
-service which sessions its retention still covers; the service never guesses. An attachment uploaded
-without a session takes the draft's session when it is submitted to one, or the session the prompt
-names when the draft has none, so the retention that applies is the session's rather than the
-seven-day window that applied while nothing held it.
+accepts a prompt that names the draft, whether the prompt is submitted or queued, and again for a
+repeat of that action, which is how a record that was not made the first time is made. The host
+tells the service which sessions its retention still covers; the service never guesses. An
+attachment uploaded without a session takes the draft's session when it is submitted to one, or the
+session the prompt names when the draft has none, so the retention that applies is the session's
+rather than the seven-day window that applied while nothing held it.
 
 The sweep asks the archive which sessions still keep what was submitted to them. A session is
 considered to be covered if there exists a reservation or worker for that session in the session
