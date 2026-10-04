@@ -3275,7 +3275,7 @@ A session reopened with privacy mode on does not start retaining again, and one 
 state this host could not read does not either: not knowing whether privacy mode is on is not a
 reason to keep output.
 
-### What privacy mode does not reach yet
+### What privacy mode does not reach
 
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
