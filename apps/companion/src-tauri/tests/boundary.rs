@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use companion_tauri::commands::NAMED_COMMANDS;
+use companion_tauri::commands::{NAMED_COMMANDS, NATIVE_METHODS};
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -489,10 +489,12 @@ fn the_mobile_bundle_names_a_platform_floor_and_no_release_identity() {
 }
 
 #[test]
-fn first_start_setup_reaches_three_named_commands_and_no_more() {
-    // Setup reads what may be done on this desktop, reads the identity a grant would be filed
-    // under, and opens a settings pane by name. That is the whole of its surface: there is no
-    // command here that grants a permission, writes a setting or opens an address the page chose.
+fn first_start_setup_has_two_commands_of_its_own_and_reads_the_capability_records() {
+    // Setup's own commands read the identity a grant would be filed under and open a settings pane
+    // by name; the capability records it shows are read through a named command of the host's. No
+    // command of its own grants a permission, writes a setting or opens an address the page chose.
+    // The description card on the same screen reaches the host through the four commands of the
+    // next test.
     let named: Vec<&str> = NAMED_COMMANDS.iter().map(|(command, _)| *command).collect();
     let setup: Vec<&&str> = named
         .iter()
@@ -540,17 +542,35 @@ fn session_descriptions_are_reached_through_four_named_commands_and_no_more() {
         ("description_configure", Method::DescriptionConfigure),
         ("description_download", Method::DescriptionDownload),
     ];
-    let about_descriptions: Vec<&str> = NAMED_COMMANDS
+    // The commands that perform one of the four methods, whatever they are called, and the commands
+    // whose names are about descriptions, are the same four.
+    let performing: Vec<&str> = NAMED_COMMANDS
+        .iter()
+        .filter(|(_, method)| expected.iter().any(|(_, wanted)| *method == Some(*wanted)))
+        .map(|(command, _)| *command)
+        .chain(
+            NATIVE_METHODS
+                .iter()
+                .filter(|(_, methods)| {
+                    methods
+                        .iter()
+                        .any(|method| expected.iter().any(|(_, wanted)| method == wanted))
+                })
+                .map(|(command, _)| *command),
+        )
+        .collect();
+    let named_for_descriptions: Vec<&str> = NAMED_COMMANDS
         .iter()
         .map(|(command, _)| *command)
-        .filter(|command| command.contains("describ") || command.contains("description"))
+        .filter(|command| command.contains("describ"))
         .collect();
+    let four: Vec<&str> = expected.iter().map(|(command, _)| *command).collect();
     assert_eq!(
-        about_descriptions,
-        expected
-            .iter()
-            .map(|(command, _)| *command)
-            .collect::<Vec<_>>(),
+        performing, four,
+        "only these four commands perform a description method"
+    );
+    assert_eq!(
+        named_for_descriptions, four,
         "descriptions are reached through these four commands and no others"
     );
     for (command, method) in expected {
