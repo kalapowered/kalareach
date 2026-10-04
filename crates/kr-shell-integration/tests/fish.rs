@@ -183,3 +183,122 @@ fn ordinary_commands_and_agent_names_run_as_they_do_without_the_integration() {
 fn an_alias_that_changes_an_agent_name_is_reported_by_the_comparison() {
     shellpkg::a_planted_alias_that_changes_an_agent_name_is_reported_not_hidden(FISH);
 }
+
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_interactive_command_asks_once_before_it_starts_and_a_bypass_runs_it_as_typed() {
+    shellpkg::an_interactive_command_asks_once_and_runs_as_typed(FISH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_pipeline_group_substitution_background_job_sourced_file_function_event_or_script_never_asks() {
+    shellpkg::forms_the_root_shell_does_not_start_itself_never_ask(FISH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn assignments_in_front_of_a_command_keep_it_out_of_the_questions_and_run_with_them() {
+    shellpkg::assignments_in_front_of_a_command_run_what_they_select(FISH);
+}
+
+/// KR-REQ-07.44
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn diagnostics_that_cannot_be_written_never_hold_a_command_up() {
+    shellpkg::diagnostics_that_cannot_be_written_never_hold_a_command_up(FISH);
+}
+
+/// KR-REQ-07.34, KR-REQ-07.35
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn frames_that_arrive_while_a_command_waits_reach_the_reader_once() {
+    shellpkg::frames_that_arrive_while_a_command_waits_reach_the_reader_once(FISH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_absolute_path_invocation_runs_as_typed() {
+    shellpkg::an_absolute_path_invocation_runs_as_typed(FISH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_worker_that_does_not_answer_leaves_the_command_as_typed_after_the_deadline() {
+    shellpkg::an_unanswered_question_runs_the_command_as_typed_after_the_deadline(FISH);
+}
+
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_backend_runs_the_command_through_the_launcher_it_names() {
+    shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(FISH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn each_line_reports_its_command_block_with_status_duration_and_directory() {
+    shellpkg::each_line_reports_its_block_with_status_duration_and_directory(FISH);
+}
+
+/// KR-REQ-07.84
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_line_exports_the_capability_minted_for_it_and_no_other() {
+    shellpkg::a_line_exports_the_capability_minted_for_it(FISH);
+}
+
+/// KR-REQ-01.06, KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_enabled_integration_flags_only_the_named_agents_interactive_invocation() {
+    shellpkg::an_enabled_integration_adds_its_flags_only_to_the_agents_interactive_invocation(FISH);
+}
+
+/// KR-REQ-12.07, KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_cancellation_while_the_worker_is_told_of_a_line_starts_nothing() {
+    shellpkg::a_cancellation_while_the_worker_is_told_starts_nothing(FISH);
+}
+
+/// KR-REQ-12.07, KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_termination_while_the_worker_is_asked_starts_no_command_and_ends_the_shell() {
+    shellpkg::a_termination_while_the_worker_is_asked_starts_nothing_and_ends_the_shell(FISH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_cancellation_left_at_the_prompt_skips_no_line() {
+    shellpkg::a_cancellation_left_at_the_prompt_skips_no_line(FISH);
+}
+
+/// KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_line_that_ends_the_shell_finishes_its_block() {
+    shellpkg::a_line_that_ends_the_shell_finishes_its_block(FISH);
+}
+
+/// KR-REQ-07.84
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_capability_reaches_a_lines_commands_and_nothing_around_them() {
+    shellpkg::the_capability_reaches_a_lines_commands_and_nothing_around_them(FISH);
+}
+
+/// KR-REQ-07.84, KR-REQ-25.05
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_reader_a_line_starts_keeps_the_lines_block_and_capability() {
+    shellpkg::a_reader_a_line_starts_keeps_the_lines_block_and_capability(FISH);
+}

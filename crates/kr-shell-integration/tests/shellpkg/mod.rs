@@ -462,6 +462,8 @@ pub struct Commands {
     pub withhold_tokens: bool,
     /// Whether the worker side has stopped answering anything at all.
     pub stuck: bool,
+    /// Whether an acceptance goes unanswered while every other event is still answered.
+    pub silent_acceptance: bool,
     /// Frames written ahead of the next answer to a resolve, as a worker's other traffic can be.
     pub before_resolve_answer: Vec<BridgeFrame>,
     /// Frames written ahead of the next answer to an acceptance.
@@ -618,6 +620,11 @@ pub struct Session {
     /// that redrew: an observation made before a lifecycle event is about a reader that is no
     /// longer the one a later key would reach.
     reader_lifetime: u64,
+    /// How many idle reports the reader has sent, and whether the last one said its buffer was
+    /// empty. A report is the reader saying what it holds between two keys, so one that arrives
+    /// after a key was typed is about a reader that has dealt with that key.
+    idle_reports: u64,
+    last_idle_empty: bool,
     /// The reader the last successful probe found inside its read.
     reading_reader: Option<stacks::ReaderMark>,
     pending: Vec<u8>,
@@ -902,6 +909,8 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
+            idle_reports: 0,
+            last_idle_empty: false,
             reading_reader: None,
             pending: Vec::new(),
             events: Inbox::default(),
@@ -1244,6 +1253,10 @@ impl Session {
                         self.reader_lifetime += 1;
                     }
                     self.commands.arrivals.push(Arrival::Event(name_of(&event)));
+                    if let BridgeEvent::ReaderIdle(idle) = &event {
+                        self.idle_reports += 1;
+                        self.last_idle_empty = idle.editor.buffer_empty;
+                    }
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
                         // What a case put ahead of this answer goes first, in the same write, so
@@ -1320,6 +1333,9 @@ impl Session {
             })),
             BridgeEvent::CommandAccepted(params) => {
                 self.commands.accepted.push(params.clone());
+                if self.commands.silent_acceptance {
+                    return None;
+                }
                 // The capability a real worker mints for the line it has just recorded. This
                 // harness stands in for the worker, so it mints one the same way.
                 let token =
@@ -2460,6 +2476,7 @@ mod commands;
 mod dialect;
 mod identity;
 mod inbox;
+mod lines;
 mod stacks;
 
 // Each test binary that includes this module uses one part of it: the four package suites use the
@@ -2472,5 +2489,7 @@ pub use commands::*;
 pub use dialect::*;
 #[allow(unused_imports)]
 pub use inbox::*;
+#[allow(unused_imports)]
+pub use lines::*;
 #[allow(unused_imports)]
 pub use stacks::*;
