@@ -20,7 +20,7 @@ use kr_describe::environment::{
     DataAccessChoice, EnvironmentKind, ExecutionEnvironment, Placement, PlacementRefusal,
 };
 use kr_describe::metadata::{LabelSource, RepositoryFacts, SessionFacts, Title, VerifiedStatus};
-use kr_describe::output::{Expectation, ProducedUnder, Rejection, prompt, validate};
+use kr_describe::output::{Expectation, ProducedUnder, Rejection, validate};
 use kr_describe::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, RunningJob,
 };
@@ -1138,7 +1138,7 @@ fn a_private_session_captures_no_context_at_all() {
         .scheduler()
         .jobs()
         .first()
-        .map(|job| job.context.data_section())
+        .map(|job| job.context.prompt().text())
         .expect("a job");
     for private in ["a private task", "a task from before", "an earlier command"] {
         assert!(
@@ -1396,7 +1396,7 @@ fn project_text_that_gives_instructions_is_carried_as_data_and_changes_nothing()
     )
     .directory(malicious)
     .build();
-    let rendered = prompt(&context);
+    let rendered = context.prompt().text();
     let data_start = rendered.find("directory: <<").expect("a data section");
     let instruction_end = rendered.find("context_revision:").expect("the instruction");
     assert!(

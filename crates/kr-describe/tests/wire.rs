@@ -3,6 +3,7 @@
 
 use std::io::Cursor;
 
+use kr_describe::prompt::{Datum, Prompt};
 use kr_describe::wire::{
     Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
     WIRE_VERSION, WireError, frame_of, read_frame, read_message, same_release, write_message,
@@ -29,11 +30,21 @@ fn every_request() -> Vec<Request> {
         },
         Request::Generate {
             id: U64::new(2),
-            prompt: "context_revision: 3\n".to_owned(),
+            prompt: Prompt {
+                revision: U64::new(3),
+                cursor_from: U64::new(1),
+                cursor_to: U64::new(4),
+                facts: vec![Datum {
+                    label: "directory".to_owned(),
+                    text: "kalareach".to_owned(),
+                }],
+                events: Vec::new(),
+            },
             grammar: "root ::= \"{\"".to_owned(),
             limits: JobLimits {
                 context_tokens: U64::new(4_096),
                 max_output_tokens: U64::new(128),
+                prompt_tokens: U64::new(891),
                 cpu_threads: U64::new(4),
             },
             deadline_ms: U64::new(30_000),

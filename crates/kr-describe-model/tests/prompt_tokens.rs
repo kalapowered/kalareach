@@ -10,7 +10,6 @@ use kr_describe::context::{
     SemanticEvent, SemanticEventKind,
 };
 use kr_describe::metadata::RepositoryFacts;
-use kr_describe::output::prompt;
 use kr_describe_model::llama::{LlamaRuntime, PromptTokens};
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::Uuid;
@@ -71,7 +70,7 @@ fn structure_in(runtime: &LlamaRuntime, read: &PromptTokens) -> usize {
 /// tokens, how many structure tokens were written out as characters, and whether what remains
 /// spells the prompt back.
 fn read(runtime: &LlamaRuntime, text: &str) -> PromptTokens {
-    let prompt = prompt(&context_naming(text));
+    let prompt = context_naming(text).prompt().text();
     let read = runtime.prompt_tokens(&prompt).expect("a prompt");
     assert!(
         runtime.spelling_of(&read.tokens).expect("spelling") == prompt.as_bytes(),

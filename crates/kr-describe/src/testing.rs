@@ -19,7 +19,8 @@ use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, Signature64, U64};
 
 use crate::priority::Cancellation;
 use crate::profile::catalogue::Catalogue;
-use crate::profile::{Asset, ProfileDocument, ProfileTrust, SignedProfile};
+use crate::profile::{Asset, ModelProfile, ProfileDocument, ProfileTrust, SignedProfile};
+use crate::prompt::Prompt;
 use crate::serve::{Generating, Job, LoadWork, Loading, Model, Options, Verifying};
 use crate::wire::{
     Answer, Background, JobEnd, Phases, Request, VerifyResult, WIRE_VERSION, frame_of,
@@ -502,7 +503,7 @@ impl Model for StubModel {
         Generating::Produced {
             bytes: answer_of(job.prompt, &self.script.output),
             phases: Phases {
-                prompt_tokens: U64::new((job.prompt.len() / 4) as u64),
+                prompt_tokens: U64::new((job.prompt.text().len() / 4) as u64),
                 prompt_ms: U64::new(elapsed / 2),
                 sampling_ms: U64::new(0),
                 decode_ms: U64::new(elapsed - elapsed / 2),
@@ -576,64 +577,26 @@ fn check_file(asset: &Asset, path: &Path) -> Verifying {
     }
 }
 
-/// Reads a field out of the prompt's data section.
-fn data_field<'a>(prompt: &'a str, label: &str) -> Option<&'a str> {
-    prompt.lines().find_map(|line| {
-        let rest = line.strip_prefix(label)?.strip_prefix(": <<")?;
-        rest.strip_suffix(">>")
-    })
-}
-
-/// Reads the revision the prompt states.
-fn prompt_revision(prompt: &str) -> u64 {
-    prompt
-        .lines()
-        .find_map(|line| line.strip_prefix("context_revision: "))
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// Reads the cursor interval the prompt states.
-fn prompt_cursor(prompt: &str) -> (u64, u64) {
-    let Some(line) = prompt
-        .lines()
-        .find_map(|line| line.strip_prefix("source_cursor: "))
-    else {
-        return (0, 0);
-    };
-    let number = |label: &str| -> u64 {
-        line.split_once(label)
-            .and_then(|(_, rest)| {
-                rest.trim_start()
-                    .trim_start_matches(':')
-                    .trim_start()
-                    .split(|character: char| !character.is_ascii_digit())
-                    .find(|piece| !piece.is_empty())
-                    .and_then(|digits| digits.parse().ok())
-            })
-            .unwrap_or(0)
-    };
-    (number("\"from\""), number("\"to\""))
-}
-
 /// Builds the answer a job's prompt gets.
 ///
 /// The subject is taken from the data section, which is the whole of what a real model has to
 /// work with. A stub that invented a title from nothing would pass a test that a real model with
 /// an empty context would fail.
 #[must_use]
-pub fn answer_of(prompt: &str, output: &Output) -> Vec<u8> {
+pub fn answer_of(prompt: &Prompt, output: &Output) -> Vec<u8> {
     let revision = match output {
         Output::WrongRevision(claimed) => *claimed,
-        _ => prompt_revision(prompt),
+        _ => prompt.revision.get(),
     };
-    let (from, to) = prompt_cursor(prompt);
-    let subject = data_field(prompt, "repository")
-        .or_else(|| data_field(prompt, "directory"))
-        .or_else(|| data_field(prompt, "application"))
+    let (from, to) = (prompt.cursor_from.get(), prompt.cursor_to.get());
+    let subject = prompt
+        .fact("repository")
+        .or_else(|| prompt.fact("directory"))
+        .or_else(|| prompt.fact("application"))
         .unwrap_or("Session");
-    let doing = data_field(prompt, "intent")
-        .or_else(|| data_field(prompt, "thread"))
+    let doing = prompt
+        .fact("intent")
+        .or_else(|| prompt.fact("thread"))
         .unwrap_or("Working in this session");
     let (title, activity) = match output {
         Output::Claims => (
@@ -812,6 +775,31 @@ impl TestProfile {
         document["execution"]["resident_estimate"]["weights_bytes"] = total.into();
         document.to_string()
     }
+}
+
+/// The default profile this build ships, with a context window of `context_tokens`, signed with a
+/// key of its own: what a profile whose window is too small for a description looks like.
+///
+/// # Panics
+///
+/// Panics when the shipped document is not what this expects, which is a mistake in this build.
+#[must_use]
+pub fn default_profile_with_window(context_tokens: u32) -> ModelProfile {
+    let mut document: serde_json::Value =
+        serde_json::from_str(crate::profile::catalogue::DEFAULT_PROFILE_DOCUMENT)
+            .expect("a shipped profile is JSON");
+    document["execution"]["context_tokens"] = context_tokens.into();
+    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a test key");
+    let document = ProfileDocument::new(document.to_string().into_bytes());
+    let transcript = document.transcript().expect("a transcript");
+    let signature = kr_crypto::sign::sign(&keys, &transcript).expect("a signature");
+    ProfileTrust::new(vec![*keys.public()])
+        .verify(&SignedProfile {
+            document,
+            key: *keys.public(),
+            signature,
+        })
+        .expect("a profile signed with the key it is verified under")
 }
 
 /// A catalogue a test signs with a key of its own, for a daemon and for the stub executable it

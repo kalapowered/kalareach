@@ -16,6 +16,7 @@
 //! | [`profile`] | The signed model profile, its assets, the catalogue and the download policy |
 //! | [`context`] | The context revision, what advances it, and the bounded input a job is built from |
 //! | [`output`] | The grammar, the validated result and every reason one is rejected |
+//! | [`prompt`] | The prompt a job is generated from, and how it is made to fit a token budget |
 //! | [`budget`] | Section 22's defaults, and what a resident model actually costs |
 //! | [`resource`] | The memory reserve, power and pressure, and `resource_paused` |
 //! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
@@ -89,6 +90,7 @@ pub mod priority;
 pub mod privacy;
 pub mod processor;
 pub mod profile;
+pub mod prompt;
 pub mod qualification;
 pub mod queue;
 pub mod resource;

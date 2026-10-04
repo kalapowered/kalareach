@@ -70,7 +70,7 @@ pub fn weights(test: &str) -> Option<Weights> {
 
 /// Loads the selected profile's real weights, after checking the file by its digest and not only
 /// its size, or says that `test` did not run.
-pub fn runtime(test: &str) -> Option<LlamaRuntime> {
+pub fn loaded(test: &str) -> Option<(ModelProfile, LlamaRuntime)> {
     let Weights { profile, path } = weights(test)?;
     let asset = profile
         .assets()
@@ -78,13 +78,17 @@ pub fn runtime(test: &str) -> Option<LlamaRuntime> {
         .find(|asset| asset.role == "weights")
         .expect("the profile names its weights");
     verify_file(asset, &path).expect("the cached weights are the profile's");
-    Some(
-        LlamaRuntime::load(
-            &profile,
-            &path,
-            &Cancellation::new(),
-            Instant::now() + Duration::from_secs(300),
-        )
-        .expect("the real weights load"),
+    let runtime = LlamaRuntime::load(
+        &profile,
+        &path,
+        &Cancellation::new(),
+        Instant::now() + Duration::from_secs(300),
     )
+    .expect("the real weights load");
+    Some((profile, runtime))
+}
+
+/// The same, for a test that needs only the runtime.
+pub fn runtime(test: &str) -> Option<LlamaRuntime> {
+    loaded(test).map(|(_, runtime)| runtime)
 }

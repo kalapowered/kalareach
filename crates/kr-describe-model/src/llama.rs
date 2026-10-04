@@ -54,8 +54,10 @@ use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token_type::LlamaTokenAttr;
 
+use kr_describe::budget::Budgets;
 use kr_describe::priority::Cancellation;
 use kr_describe::profile::{Asset, ModelProfile};
+use kr_describe::prompt::{FitError, Prompt};
 use kr_describe::serve::{Generating, Job, LoadWork, Loading, Model, Verifying, own_rss_bytes};
 use kr_describe::wire::{JobEnd, LoadEnd, Phases, VerifyResult};
 use kr_protocol::scalars::U64;
@@ -325,11 +327,32 @@ impl LlamaRuntime {
             drop(model);
             return Err((LoadEnd::DeadlineExceeded, None));
         }
-        Ok(Self {
+        let runtime = Self {
             model,
             context_tokens: profile.execution().context_tokens,
             weights_path: weights.to_path_buf(),
-        })
+        };
+        // A job exists for every context only if the instruction alone, with the longest numbers the
+        // answer repeats, is within what a prompt may be. A profile whose window is too small for
+        // that cannot serve a description, whatever the project text is.
+        let bounds = Budgets::DEFAULTS.bounds(profile.execution());
+        let base = runtime
+            .prompt_tokens(&Prompt::bare().text())
+            .map_err(|detail| (LoadEnd::Failed, Some(detail)))?
+            .tokens
+            .len();
+        if base > bounds.prompt_tokens as usize {
+            return Err((
+                LoadEnd::Refused,
+                Some(format!(
+                    "{} has no room for a description: the instruction alone is {base} tokens, \
+                     and a prompt may be {}",
+                    profile.profile_id(),
+                    bounds.prompt_tokens
+                )),
+            ));
+        }
+        Ok(runtime)
     }
 
     /// Returns the file this model was loaded from.
@@ -608,9 +631,25 @@ impl LlamaRuntime {
             .new_context(backend, parameters)
             .map_err(|error| format!("a context could not be created: {error}"))?;
 
-        let tokens = self.prompt_tokens(job.prompt)?.tokens;
-        // The prompt is bounded by construction, but a model with a short context is not this
-        // host's to fix: refusing is better than silently describing the tail of a prompt.
+        // The prompt is made to fit what the job may spend on it: the bound the daemon sent, and
+        // what the window leaves beside the answer. Project text is what gives way, and the oldest
+        // events first, so a job that cannot fit does not exist: the only prompt that cannot be
+        // made to fit is one whose instruction alone is more than the window leaves, which is a
+        // fault of the profile and is refused when it loads.
+        let room = (context_tokens as usize).saturating_sub(job.max_output_tokens as usize);
+        let budget = (job.prompt_tokens as usize).min(room);
+        let fitted = job
+            .prompt
+            .fit(budget, |text| {
+                self.prompt_tokens(text).map(|read| read.tokens.len())
+            })
+            .map_err(|error| match error {
+                FitError::Count(detail) => detail,
+                FitError::Base { tokens, budget } => format!(
+                    "the instruction alone is {tokens} tokens, and a prompt may be {budget}"
+                ),
+            })?;
+        let tokens = self.prompt_tokens(&fitted.text)?.tokens;
         if tokens.len() + job.max_output_tokens as usize > context_tokens as usize {
             return Err(format!(
                 "a prompt of {} tokens and {} of output do not fit in {context_tokens}",

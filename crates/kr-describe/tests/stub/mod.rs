@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use kr_describe::context::{ContextBuilder, ContextRevision};
-use kr_describe::output::{DESCRIPTION_GRAMMAR, prompt};
+use kr_describe::output::DESCRIPTION_GRAMMAR;
 use kr_describe::profile::ModelProfile;
 use kr_describe::testing::{SCRIPT_VARIABLE, Script};
 use kr_describe::wire::{
@@ -320,11 +320,12 @@ pub fn generate(id: u64, revision: u64, deadline_ms: u64) -> Request {
     .build();
     Request::Generate {
         id: U64::new(id),
-        prompt: prompt(&context),
+        prompt: context.prompt(),
         grammar: DESCRIPTION_GRAMMAR.to_owned(),
         limits: JobLimits {
             context_tokens: U64::new(4_096),
             max_output_tokens: U64::new(128),
+            prompt_tokens: U64::new(891),
             cpu_threads: U64::new(4),
         },
         deadline_ms: U64::new(deadline_ms),

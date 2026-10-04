@@ -315,7 +315,7 @@ fn run_outputs(profile: &ModelProfile, cache: &Path, rounds: u32) -> Result<bool
         "cold_start_load_ms: {} [{machine}]",
         cold.elapsed().as_millis()
     );
-    let limits = outputs::Limits::of(profile);
+    let limits = Budgets::DEFAULTS.bounds(profile.execution());
     let fixtures = outputs::fixtures();
     println!(
         "limits: {} threads, {} tokens in, {} out, {} ms per job, {} sessions fixed [{machine}]",
@@ -329,7 +329,7 @@ fn run_outputs(profile: &ModelProfile, cache: &Path, rounds: u32) -> Result<bool
     let records = outputs::run(&mut model, profile, limits, &fixtures, rounds, |record| {
         println!("{}", outputs::job_line(record));
     });
-    for line in outputs::report(&records, limits.deadline_ms, limits.room_tokens(), &machine) {
+    for line in outputs::report(&records, limits.deadline_ms, limits.prompt_tokens, &machine) {
         println!("{line}");
     }
     Ok(outputs::count(&records, limits.deadline_ms).all_held())
@@ -880,6 +880,7 @@ fn turn(
                         grammar: request.grammar,
                         context_tokens: request.context_tokens,
                         max_output_tokens: request.max_output_tokens,
+                        prompt_tokens: request.prompt_tokens,
                         cpu_threads: request.cpu_threads,
                         sampler: profile.sampler(),
                         ceiling_bytes: request.ceiling_bytes,
