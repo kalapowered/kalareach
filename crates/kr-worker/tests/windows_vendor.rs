@@ -216,6 +216,14 @@ impl Launch {
         }
     }
 
+    /// Closes the end of the agent's standard input this host writes, so an agent that reads it
+    /// reads the end of its input: `codex sandbox` runs its command once it has none to wait for.
+    fn close_input(&self) {
+        if let Some(input) = self.child.as_ref().and_then(|child| child.stdin.as_ref()) {
+            input.close().expect("the agent's input closes");
+        }
+    }
+
     fn agent_job(&self) -> Arc<AgentJob> {
         kr_worker::windows::job::agent_job(&self.process).expect("the launch's job is kept")
     }
@@ -722,6 +730,7 @@ async fn native_codex_nests_under_the_session_job_and_the_closure_ends_everythin
     let session = Arc::new(SessionJob::create().expect("a session job"));
     let mut launch = start_native_codex(11, AgentOwnership::Full, &session, &codex)
         .expect("Codex launches under the session's job");
+    launch.close_input();
     let report = launch.report();
     let members = session.process_ids().expect("the session's processes");
     assert!(
@@ -779,6 +788,7 @@ async fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_r
 
     let mut launch = start_native_codex(13, AgentOwnership::Reduced, &session, &codex)
         .expect("the selected profile starts Codex");
+    launch.close_input();
     let report = launch.report();
     let agent = launch.agent_job();
     let held = agent.process_ids().expect("the agent's processes");
