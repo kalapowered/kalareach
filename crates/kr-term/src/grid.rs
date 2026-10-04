@@ -1169,20 +1169,6 @@ impl CanonicalGrid {
             .collect()
     }
 
-    /// Debug dump.
-    pub fn dump_row0(&self) {
-        let screen = self.terminal.screen();
-        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..1)));
-        for cell in lines[0].visible_cells() {
-            println!(
-                "   idx={} width={} str={:?}",
-                cell.cell_index(),
-                cell.width(),
-                cell.str()
-            );
-        }
-    }
-
     /// The current graphic rendition.
     #[must_use]
     pub fn pen(&self) -> Rendition {
