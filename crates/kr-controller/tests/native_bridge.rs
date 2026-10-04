@@ -669,6 +669,10 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
             r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "{kr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
         ),
         (
+            "as a key",
+            r#"{"hooks": {"{kr_hook}": [{"hooks": [{"type": "command", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}]}}"#,
+        ),
+        (
             "beside another command",
             r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "{kr_hook} claude-code hook; other", "timeout": 5}]}]}}"#,
         ),
