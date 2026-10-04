@@ -555,15 +555,21 @@ configured startup, and says what to set up when none is configured. A listing, 
 `--start`, an enrolment and an export start nothing.
 
 Sessions started in this way will have an initial working directory of the home directory of the
-user that the kr helper process is running as in the environment, unless `--cwd` is specified with a
-path that exists in the environment. Their environment variables will consist of a small allowlisted
-subset of the environment variables that the kr helper process itself has access to, with the `HOME`
-environment variable set to the resolved path to that user's home directory. The `--terminal` option
-is not supported for sessions in enrolled environments, as there is no way to start a terminal
-application in an enrolled environment from the host. If the connection to the enrolled environment
-is lost while waiting for a `kr new` action to complete, kr will report that it doesn't know whether
-the session has been created and will not retry; it will also report the identifier of the action it
-was asked as. To determine whether a session has been created in this case, use `kr attach`.
+user that the kr helper process is running as in the environment, or of the root where the
+destination has none, unless `--cwd` is specified with a path that exists in the environment. A
+session the person is shown (`--attach`) starts with a small allowlisted subset of the environment
+variables that the kr helper process itself has access to, with the `HOME` environment variable set
+to the resolved path to that user's home directory, or to the root where the destination has none. A
+session created with `--invisible` sends no variables with the create: it starts with the
+destination host's environment, as an invisible session does on any host, and `HOME` in it is an
+absolute path, unless the destination's owner has configured a `HOME` of their own. The section *The
+environment a session starts with* of `docs/host/README.md` says what that environment holds. The
+`--terminal` option is not supported for sessions in enrolled environments, as there is no way to
+start a terminal application in an enrolled environment from the host. If the connection to the
+enrolled environment is lost while waiting for a `kr new` action to complete, kr will report that it
+doesn't know whether the session has been created and will not retry; it will also report the
+identifier of the action it was asked as. To determine whether a session has been created in this
+case, use `kr attach`.
 
 Attempting to attach to a session that has already closed will fail, before attempting to connect to
 the session's terminal, with the reason that the session closed. This behaviour is the same as for
