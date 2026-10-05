@@ -552,6 +552,29 @@ impl Controller {
                     ));
                 }
             }
+            // A prompt acts on the session its target names, and its parameters name the draft or
+            // the text and the session's agent. A prompt addressed to one session and carrying the
+            // subject of another would be sent to the one nobody addressed.
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                let named = mutation
+                    .target
+                    .session_id
+                    .as_ref()
+                    .copied()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidArgument(format!(
+                            "{} names the session it acts on",
+                            entry.name
+                        ))
+                    })?;
+                let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
+                if params.target.subject.session_id != named {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different sessions"
+                            .to_owned(),
+                    ));
+                }
+            }
             Method::SessionCreate => {
                 if mutation.target.session_id.as_ref().is_some() {
                     return Err(ControllerError::InvalidArgument(

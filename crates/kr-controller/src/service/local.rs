@@ -780,5 +780,8 @@ impl Controller {
 /// retained action here, and a window that admits nothing has already been past it; one it
 /// forwards has its retained action in the worker's journal, which only the worker can read.
 const fn forwarded_to_worker(method: Method) -> bool {
-    matches!(method, Method::SessionClose)
+    matches!(
+        method,
+        Method::SessionClose | Method::AgentPromptSubmit | Method::AgentPromptQueue
+    )
 }

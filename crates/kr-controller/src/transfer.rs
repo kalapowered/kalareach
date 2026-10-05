@@ -1013,6 +1013,24 @@ fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 
+/// The draft a prompt names, when the mutation is a prompt that names a draft.
+///
+/// A queued prompt counts with a submitted one: the session's agent holds it from the moment the
+/// worker takes it and may run it long after, and this host is not told when it does.
+pub(crate) fn prompted_draft(mutation: &MutationRequest) -> Option<kr_protocol::ids::DraftId> {
+    if !matches!(
+        mutation.method.method(),
+        Some(Method::AgentPromptSubmit | Method::AgentPromptQueue)
+    ) {
+        return None;
+    }
+    mutation
+        .params
+        .to_typed::<kr_protocol::agent::AgentPromptParams>()
+        .ok()
+        .and_then(|params| params.draft_id.0)
+}
+
 /// Returns the stored object a transfer mutation acts on, where it names one.
 fn subject_of(params: &ParamsValue, method: Method) -> Answer<Option<Subject>> {
     Ok(match method {

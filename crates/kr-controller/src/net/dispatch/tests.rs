@@ -2065,6 +2065,105 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     world.serving.abort();
 }
 
+/// KR-REQ-14.11: a prompt that names a draft, made by a caller at this machine, is recorded as the
+/// draft sent to the session before the worker is asked, exactly as a paired device's is, and
+/// reaches the worker through this daemon as the local owner's own action.
+///
+/// The worker is still deciding when the check is made, so the record cannot be something the
+/// worker's answer, or the connection that hears it, decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_naming_a_draft_is_recorded_before_the_worker_is_asked() {
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "local.bin");
+
+    let window = controller
+        .windows
+        .issue(admission.connection_id, controller.boot_epoch)
+        .expect("a window");
+    let params = kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_protocol::agent::AgentSubject {
+                session_id: world.session_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::some(draft_id),
+        text: Nullable::null(),
+    };
+    let mutation = MutationRequest {
+        request_id: RequestId::new(1),
+        method: Method::AgentPromptSubmit.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: world.environment_id,
+            session_id: Nullable::some(world.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(params.target.subject.application_instance_id),
+            agent_binding_revision: Nullable::some(params.target.binding_revision),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: window.action_window_id,
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&params).expect("encodes"),
+    };
+
+    let (arrived, go) = script.hold_the_next_prompt();
+    let mut performing = tokio::spawn({
+        let controller = std::sync::Arc::clone(controller);
+        let actor = actor.clone();
+        async move {
+            controller
+                .perform(&actor, admission.connection_id, None, mutation)
+                .await
+        }
+    });
+    tokio::select! {
+        answered = &mut performing => panic!("the worker was holding the prompt: {answered:?}"),
+        reached = arrived => reached.expect("the prompt reaches the worker"),
+    }
+    assert!(
+        is_submitted(controller, &actor, draft_id),
+        "recorded before the worker has answered"
+    );
+    let handle = the_attachments_of(controller, &actor, draft_id).remove(0);
+    assert_eq!(handle.session_id, Nullable::some(world.session_id));
+    let _ = go.send(());
+    let answer = performing.await.expect("the prompt is answered");
+    assert!(
+        matches!(
+            answer,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
+    let forwarded = script.forwarded();
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(
+        forwarded[0].actor.ingress,
+        kr_protocol::actor::ActorIngress::LocalIpc
+    );
+    world.serving.abort();
+}
+
 /// KR-REQ-14.11: a sweep judges an attachment only against a view of retention taken after the
 /// attachment was read, so a draft sent to a session that began while the sweep was asking is left
 /// for the next sweep and is not expired as the attachment of a session nobody knew.
