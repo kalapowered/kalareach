@@ -50,6 +50,30 @@ use crate::privacy::{Admitted, PrivacyState, Published};
 /// How long the answer to a settings change waits for the host to have applied it.
 const SETTINGS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the answer to a start of the fetch waits for the host to show it as running.
+const FETCH_SHOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits up to `bound` for the host to take a fetch's first progress and publish it, which is
+/// what `taken` completes with. A host that ends before it does is not waited for.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Uncertain`] when the bound passes first: the fetch is started, and
+/// what the host shows of it is not known, so the answer is not the setup it would have been.
+async fn until_fetch_shows_within(
+    taken: tokio::sync::oneshot::Receiver<()>,
+    bound: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(bound, taken).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(ControllerError::Uncertain {
+            detail: "the fetch is started, and the description host has not shown it yet: \
+                     `kr host descriptions` shows its progress once it has"
+                .to_owned(),
+        }),
+    }
+}
+
 pub(crate) mod assets;
 #[cfg(feature = "testing")]
 pub mod hooks;
@@ -955,7 +979,7 @@ impl crate::service::Controller {
         })?;
         // Waited for, so the answer that follows shows the fetch as running.
         if let Some(taken) = taken {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), taken).await;
+            until_fetch_shows_within(taken, FETCH_SHOWN_WAIT).await?;
         }
         Ok(())
     }
@@ -1301,6 +1325,41 @@ pub(crate) mod tests {
             async { host.turn() }
         );
         confirmed.expect("a turn came");
+    }
+
+    /// KR-REQ-22.01: the answer to a start of the fetch waits for the host to show it as running,
+    /// and a host that does not within the bound leaves the answer as an outcome this host does not
+    /// know, with the fetch said to be started; one that does is not. The bound is the one the test
+    /// passes.
+    #[tokio::test]
+    async fn a_fetch_the_host_does_not_show_in_time_is_answered_as_unknown() {
+        let (_root, module, _other) = module();
+        let mut host = host::tests::ByHand::new();
+        module.set_host(host.handle()).expect("the first host");
+        let progress = || {
+            host.handle()
+                .progress_and_wait(kr_describe::service::DownloadProgress::Running {
+                    fetched_bytes: 0,
+                    total_bytes: 1,
+                })
+        };
+
+        let error = until_fetch_shows_within(progress(), std::time::Duration::from_millis(10))
+            .await
+            .expect_err("the host showed nothing inside the bound");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::OutcomeUnknown,
+            "{error}"
+        );
+        assert!(error.to_string().contains("started"), "{error}");
+
+        let taken = progress();
+        let (shown, ()) = tokio::join!(
+            until_fetch_shows_within(taken, std::time::Duration::from_secs(60)),
+            async { host.turn() }
+        );
+        shown.expect("the host showed it");
     }
 
     /// KR-REQ-15.20: what the host found on a new connection to a worker is dated at the session's
