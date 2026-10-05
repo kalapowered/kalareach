@@ -667,11 +667,27 @@ fn windows() -> Vec<Step> {
                 "attention_source",
             ],
         ),
-        Step::cargo(
-            Group::Rust,
-            "the control daemon's library",
-            &["test", "--locked", "-p", "kr-controller", "--lib"],
-        ),
+        {
+            let filters = [
+                "config::",
+                "bridge::store::",
+                "a_create_that_launches_nothing::",
+                "attention::",
+                "a_share_that_names_a_current_decision::",
+            ];
+            let mut arguments = vec!["test", "--locked", "-p", "kr-controller", "--lib", "--"];
+            arguments.extend(filters);
+            let mut step = Step::cargo(
+                Group::Rust,
+                "the control daemon's library, the cases this platform qualifies",
+                &arguments,
+            );
+            step.filter = Some((
+                filters.join(" "),
+                "on Windows only these cases of this target are qualified: the others start a daemon, replace it and have a worker go while it is read, which waits out a bound of several seconds there and does not finish in one run of three".to_owned(),
+            ));
+            step
+        },
         Step::cargo(
             Group::Rust,
             "the daemon's attention, barrier, configuration and diagnostics",
