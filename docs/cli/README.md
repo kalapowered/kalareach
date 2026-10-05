@@ -659,11 +659,9 @@ a `native_compat` session, which records no origin at all. The refusal says `Use
 One remaining terminal is not proof that it is the one the command came from, so it is not treated
 as one.
 
-The Zsh and Bash packages export the capability. It reaches them in the answer to
-`root.command.accepted`, which they send, and they put it in the environment of the command they are
-about to run. The fish and PowerShell packages do not export it, so `kr detach` inside a managed
-fish or PowerShell shell names its attachment with `--attachment <id>`, and a bare `kr detach` there
-is answered with that instruction rather than with an attachment the host cannot stand behind.
+The Zsh, Bash, fish and PowerShell packages all export the capability. It reaches each of them in the
+answer to `root.command.accepted`, which they send, and each puts it in the environment of the
+command it is about to run.
 
 ## `kr export`
 
