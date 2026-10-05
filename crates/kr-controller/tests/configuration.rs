@@ -2034,12 +2034,7 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
     // A worker this daemon cannot reach and cannot account for: durably recorded, never verified,
     // and its process still running. It is exactly the worker section 9 will not let a revocation
     // report as done, because work admitted under the withdrawn authority may still be in it.
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        // A directory on the internal disk, never the workspace this test was built in.
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     let session_id = record_unreachable_worker(controller.paths(), unreachable.id());
 
     let refused = controller
@@ -2196,12 +2191,7 @@ async fn a_fence_no_worker_answered_survives_a_restart() {
     // A worker this daemon cannot reach and cannot account for: durably recorded, never verified,
     // and its process still running. Recorded before the first daemon starts, so it is the
     // membership both daemons read.
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        // A directory on the internal disk, never the workspace this test was built in.
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     let session_id = record_unreachable_worker(&environment, unreachable.id());
 
     let controller = start_controller(&environment, environment_id).await;
@@ -2291,11 +2281,7 @@ async fn a_failed_effect_and_an_unusable_document_leave_the_fence_owed() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     let session_id = record_unreachable_worker(&environment, unreachable.id());
     let controller = start_controller(&environment, environment_id).await;
 
@@ -2384,11 +2370,7 @@ async fn two_revisions_in_succession_owe_the_later_fence() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     record_unreachable_worker(&environment, unreachable.id());
     let controller = start_controller(&environment, environment_id).await;
 
@@ -2443,11 +2425,7 @@ async fn a_document_written_and_never_applied_goes_through_acceptance() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     let session_id = record_unreachable_worker(&environment, unreachable.id());
 
     // Exactly what the write half of an edit leaves behind: revision 1, a grant ceiling that
@@ -2517,11 +2495,7 @@ async fn an_edit_that_keeps_the_revision_is_accepted_after_a_restart() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let mut unreachable = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("a process this daemon can be told about");
+    let mut unreachable = a_process_that_waits();
     let session_id = record_unreachable_worker(&environment, unreachable.id());
 
     let controller = start_controller(&environment, environment_id).await;
@@ -3062,6 +3036,34 @@ async fn evidence_revision(
         .map(|record| record.revision)
         .max()
         .expect("this host publishes capability records")
+}
+
+/// A process that does nothing for two minutes, for a test to end: the one a recorded worker that
+/// cannot be reached still has running. It starts in a directory on the internal disk, never the
+/// workspace this test was built in.
+fn a_process_that_waits() -> std::process::Child {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("120");
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new(kr_worker::testing::powershell());
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 120",
+        ]);
+        command
+    };
+    command
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about")
 }
 
 /// Records a live worker this daemon has never reached, and returns its session.
