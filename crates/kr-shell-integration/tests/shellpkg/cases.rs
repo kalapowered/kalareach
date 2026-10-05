@@ -1147,6 +1147,15 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     assert!(session.alive());
 }
 
+/// The budget a case gives a launch whose subject is not the deadline.
+///
+/// The product's budget is 200 ms of the reader's own clock, from reading the request to deciding
+/// it, and a reader that the scheduler has not run for that long answers `timeout` whatever else
+/// the request holds. A case about what the reader installs, or about why it refuses a request,
+/// would then pass or fail by the load of the machine. A day is a budget no run reaches, and the
+/// deadline itself is decided by a request whose budget is none, which is over on arrival.
+const LAUNCH_BUDGET_NOT_UNDER_TEST: DurationMs = DurationMs::new(86_400_000);
+
 /// KR-REQ-07.34, KR-REQ-07.35, and `launch-installed`.
 pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) {
     let package = Package::built(kind);
@@ -1182,7 +1191,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
         expected_prompt_generation: enter.prompt_generation,
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
-        deadline_ms: LAUNCH_READER_BUDGET,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
     }));
 
     let BridgeAnswer::Launch(decision) = session.answer(id) else {
@@ -1276,7 +1285,7 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
         expected_prompt_generation: enter.prompt_generation,
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
-        deadline_ms: LAUNCH_READER_BUDGET,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
     };
 
     let refuse =
