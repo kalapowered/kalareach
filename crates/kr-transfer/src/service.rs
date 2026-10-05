@@ -1046,7 +1046,10 @@ impl TransferService {
                 if outcome == ActionOutcome::AlreadyPerformed {
                     return self.retained_result(action);
                 }
-                self.discard_payloads(&row)?;
+                // The refusal is what was recorded, so it is what this call returns whatever the
+                // removal does. The row is marked for cleanup and its bytes stay charged until the
+                // payload is gone; a removal that fails is retried by the next recovery or sweep.
+                let _ = self.discard_payloads(&row);
                 return Err(refusal);
             }
         }
