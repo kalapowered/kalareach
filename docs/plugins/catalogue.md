@@ -445,9 +445,10 @@ A recipe is applied only where a signed record names the application's executabl
 below reads the builds the release's entry in the repository's signed index names for this host's
 operating system and architecture, each an executable's SHA-256 digest with its version. Records
 arrive with a synchronisation, so every package's bridge is followed after every sync as well as
-after every plugin change. No published release names a build yet, so every recipe is still refused
-and nothing is written; the package's journal records why, and the check runs again after every
-plugin change, every synchronisation and each time the daemon starts.
+after every plugin change. A release whose entry names no build for this host's operating system and
+architecture gives the version check no record to read, so its recipe is refused and nothing is
+written. The package's journal records why, and the check runs again after every plugin change,
+every synchronisation and each time the daemon starts.
 
 Before anything is written, everything the recipe needs is checked, and a failed check is a refusal
 that writes nothing:
