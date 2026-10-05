@@ -2175,11 +2175,8 @@ impl Served {
         std::fs::create_dir_all(&package).expect("the store's directory");
         let connector = Arc::new(
             InstalledConnector::read(
-                fixture::claude_code_package(
-                    &package,
-                    std::path::Path::new("/opt/kalareach/bin/kr-hook"),
-                )
-                .expect("the package is written"),
+                fixture::claude_code_package(&package, std::path::Path::new(fixture::FORWARDER))
+                    .expect("the package is written"),
             )
             .expect("the installed package reads"),
         );
