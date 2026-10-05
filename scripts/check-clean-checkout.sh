@@ -348,10 +348,27 @@ refuse_links() {
 }
 
 # Prints the local workspace section of the .gitignore the clone holds: the lines from its
-# "# Local workspace files" heading to the next blank line. Prints nothing when it has none.
+# "# Local workspace files" heading to the next blank line. Prints nothing when it has none. The
+# file is read as bytes, because Git reads a line that holds a NUL byte whole and the awk that macOS
+# ships cuts it at the NUL, which would end the section at a line that starts with one.
 local_section() {
-  awk '/^# Local workspace files$/ { found = 1 } found && /^[[:space:]]*$/ { exit } found { print }' \
-    "$1/.gitignore" 2> /dev/null
+  clean python3 - "$1/.gitignore" <<'PYTHON'
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        lines = handle.read().split(b"\n")
+except OSError:
+    sys.exit(0)
+found = False
+for line in lines:
+    if line == b"# Local workspace files":
+        found = True
+    if found and not line.strip():
+        break
+    if found:
+        sys.stdout.buffer.write(line + b"\n")
+PYTHON
 }
 
 # Asks `git check-ignore` about each name in `local_names`, created in the clone and removed again,
@@ -816,6 +833,18 @@ self_test() {
   commit_fixture "$directory" "Move a pattern out of the section"
   expect "a pattern moved out of the section is refused" refuse \
     "  .codex/config.toml" --no-steps
+
+  # A line that starts with a NUL byte does not end the section: Git reads the patterns on both
+  # sides of it, so the tracked-file check has to read them too, whichever awk the machine has.
+  directory="$work/ignore-section-nul"
+  make_fixture "$directory"
+  printf '\0\nlocal-notes.txt\n' >> "$directory/.gitignore"
+  printf 'notes\n' > "$directory/local-notes.txt"
+  fixture_git -C "$directory" add .gitignore
+  fixture_git -C "$directory" add -f local-notes.txt
+  fixture_git -C "$directory" commit -q -m "Track a file the section matches after a NUL line"
+  expect "a pattern after a line that starts with a NUL byte is still the section's" refuse \
+    "the commit tracks files that the .gitignore's local workspace section matches" --no-steps
 
   for planted in "root=AGENTS-project.md" "nested=src/AGENTS.md" "directory=.claude/other.json" \
     "exact=CLAUDE.md"; do
