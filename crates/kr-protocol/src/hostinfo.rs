@@ -8048,7 +8048,14 @@ mod tests {
             pkarr_publisher_url: Nullable::some("https://discovery.example.com/pkarr".to_owned()),
             pkarr_resolver_url: Nullable::some("http://127.0.0.1:8080/pkarr".to_owned()),
             dns_origin: Nullable::some("discovery.example.com".to_owned()),
-            relay_trust_anchors: Nullable::some(vec!["/etc/kalareach/relay-ca.der".to_owned()]),
+            relay_trust_anchors: Nullable::some(vec![
+                if cfg!(windows) {
+                    r"C:\ProgramData\kalareach\relay-ca.der"
+                } else {
+                    "/etc/kalareach/relay-ca.der"
+                }
+                .to_owned(),
+            ]),
             relay_only: Nullable::some(true),
             local_discovery: Nullable::some(false),
             mainline_dht: Nullable::some(false),
