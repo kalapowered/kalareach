@@ -75,6 +75,7 @@ impl Page {
                 companion_tauri::commands::agent_approval_respond,
                 companion_tauri::commands::session_agents,
                 companion_tauri::commands::history_page,
+                companion_tauri::commands::action_read,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -734,5 +735,71 @@ async fn a_live_sessions_history_is_read_on_its_worker_and_an_ended_ones_from_th
     assert!(
         !worker.connected(),
         "the ended session's page did not go to a worker"
+    );
+}
+
+/// KR-REQ-09.07: the receipt of an action on a live session is read on that session's own worker,
+/// which holds it, with the action and the session the page names; a session with no worker here, and
+/// an action that names no session, are read from the host, which this test's application is not
+/// connected to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_sessions_receipt_is_read_on_its_worker_and_every_other_from_the_host() {
+    use kr_protocol::ids::{ActionId, ActorId};
+    use kr_protocol::method::MethodVersion;
+    use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt, ReceiptState};
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let asked = page.call(
+        "action_read",
+        json!({ "params": {
+            "action_id": action_id.to_string(),
+            "session_id": worker.session_id.to_string()
+        } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::ActionRead).await;
+    assert_eq!(call.kind, CallKind::Request);
+    let params: ActionReadParams = call.params();
+    assert_eq!(params.action_id, action_id);
+    assert_eq!(params.session_id, Some(worker.session_id));
+    let receipt = ActionReadResult {
+        receipt: Receipt {
+            action_id,
+            actor_id: ActorId::new("local:1").expect("a principal"),
+            method: Method::AgentPromptSubmit.into(),
+            method_version: MethodVersion::V1,
+            revision: U64::new(2),
+            state: ReceiptState::Applied,
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(5),
+        },
+        result: Nullable::null(),
+    };
+    link.answer(&call, &receipt).await;
+    let answer = answered(asked).await.expect("the page");
+    assert_eq!(answer, serde_json::to_value(&receipt).expect("JSON"));
+
+    let ended = SessionId::new(kr_ipc::new_uuid());
+    for named in [Some(ended), None] {
+        let refused = answered(page.call(
+            "action_read",
+            json!({ "params": {
+                "action_id": ActionId::new(kr_ipc::new_uuid()).to_string(),
+                "session_id": named.map(|session| session.to_string())
+            } }),
+        ))
+        .await
+        .expect_err("the host is not configured here");
+        assert_eq!(code_of(&refused), "HOST_NOT_CONFIGURED", "{named:?}");
+    }
+    assert!(
+        !worker.connected(),
+        "neither read went to the live session's worker"
     );
 }
