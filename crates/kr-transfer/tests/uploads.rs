@@ -1325,6 +1325,62 @@ fn a_replaced_staging_directory_is_refused() {
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }
 
+/// KR-REQ-14.10: the staging directory on a filesystem that is numbered differently since it was
+/// recorded, as a container's is when it starts again, is still the recorded one, and an attachment
+/// published before is still the object that was published. Another directory is refused under any
+/// number.
+#[test]
+fn a_staging_directory_found_under_another_device_number_is_still_the_recorded_one() {
+    let harness = support::Harness::create();
+    let handle = harness.publish(&pattern(64), "application/octet-stream", "notes.bin");
+    let Harness {
+        host,
+        service,
+        actor,
+        ..
+    } = harness;
+    drop(service);
+
+    // What the service recorded was recorded under the number this filesystem had.
+    let record = |statements: &str| {
+        rusqlite::Connection::open(kr_transfer::StagingArea::store_path(&host.environment()))
+            .expect("opens the store")
+            .execute_batch(statements)
+            .expect("rewrites the record");
+    };
+    record(
+        "UPDATE environment SET staging_device = staging_device + 1;
+         UPDATE uploads SET payload_device = payload_device + 1;",
+    );
+    let clock = Arc::new(ManualClock::new(support::START_MS));
+    let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+        .expect("the recorded staging directory is accepted under its new number");
+    service
+        .download_begin(
+            &actor,
+            &kr_protocol::transfer::DownloadBeginParams {
+                environment_id: host.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(kr_protocol::transfer::DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("the attachment is the object that was published");
+    drop(service);
+
+    // A different directory is not the recorded one because its number moved as well.
+    record(
+        "UPDATE environment SET staging_device = staging_device + 1,
+                                staging_file_id = staging_file_id + 1;",
+    );
+    let clock = Arc::new(ManualClock::new(support::START_MS));
+    let refusal = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+        .expect_err("refuses a staging directory that is not the recorded object");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
 /// KR-REQ-24.09, KR-REQ-14.12: a daemon that dies mid-publish resolves the transfer by
 /// identifier, and the completed file's identity and bytes survive.
 ///

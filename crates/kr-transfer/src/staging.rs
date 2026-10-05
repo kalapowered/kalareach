@@ -80,6 +80,8 @@ const MAX_EXTENSION_LEN: usize = 16;
 pub struct StagingArea {
     environment_id: EnvironmentId,
     identity: crate::authority::ObjectIdentity,
+    /// The directory the staging directory lives in, as it was when this area was opened.
+    parent: crate::authority::ObjectIdentity,
     incomplete: AuthorisedDirectory,
     complete: AuthorisedDirectory,
     snapshots: AuthorisedDirectory,
@@ -149,6 +151,7 @@ impl StagingArea {
         Ok(Self {
             environment_id: root.environment_id(),
             identity: staging.identity(),
+            parent: root.identity(),
             incomplete: subdirectory(&staging, INCOMPLETE_DIRECTORY)?,
             complete: subdirectory(&staging, COMPLETE_DIRECTORY)?,
             snapshots: subdirectory(&staging, SNAPSHOTS_DIRECTORY)?,
@@ -169,23 +172,36 @@ impl StagingArea {
 
     /// Checks that this area is the one whose identity was recorded earlier.
     ///
+    /// The directory's own number decides. The device number does not, because it names one
+    /// mounting of a filesystem and not the filesystem: a container's root filesystem comes back
+    /// under another number when the container starts again after another has started, and so
+    /// does a volume that is attached again. A directory found under another device number is the
+    /// recorded one when it is on the filesystem of the directory it was created in, which a
+    /// mount over it is not, and the answer is the device number the identity was recorded under,
+    /// for the caller to replace. `None` says the identity is as it was recorded.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::Escape`] when the identities differ.
-    pub fn check_identity(&self, expected: crate::authority::ObjectIdentity) -> Result<()> {
+    pub fn check_identity(
+        &self,
+        expected: crate::authority::ObjectIdentity,
+    ) -> Result<Option<u64>> {
         if expected == self.identity {
-            Ok(())
-        } else {
-            Err(TransferError::from(
-                crate::authority::Escape::IdentityChanged {
-                    detail: format!(
-                        "this environment's staging directory was recorded as {expected} and now \
-                         names {}",
-                        self.identity
-                    ),
-                },
-            ))
+            return Ok(None);
         }
+        if expected.file_id == self.identity.file_id && self.identity.device == self.parent.device {
+            return Ok(Some(expected.device));
+        }
+        Err(TransferError::from(
+            crate::authority::Escape::IdentityChanged {
+                detail: format!(
+                    "this environment's staging directory was recorded as {expected} and now \
+                     names {}",
+                    self.identity
+                ),
+            },
+        ))
     }
 
     /// Returns the area uploads receive chunks into.
@@ -482,6 +498,44 @@ mod tests {
         // Opening the same area again finds the same directories rather than making new ones.
         let again = StagingArea::open(&authority, &staging_name).expect("opens the areas");
         assert_eq!(again.incomplete().identity(), area.incomplete().identity());
+    }
+
+    #[test]
+    fn a_staging_directory_is_the_recorded_one_by_its_own_number_and_its_filesystem() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let authority = AuthorisedDirectory::open_root(
+            EnvironmentId::new(Uuid::from_bytes([1; 16])),
+            root.path(),
+        )
+        .expect("opens the root");
+        let mut area =
+            StagingArea::open(&authority, &StagingArea::random_name()).expect("opens the areas");
+        let found = area.identity();
+        assert_eq!(area.check_identity(found).expect("as recorded"), None);
+
+        // The filesystem was recorded under another device number: the same directory.
+        let renumbered = crate::authority::ObjectIdentity {
+            device: found.device.wrapping_add(1),
+            file_id: found.file_id,
+        };
+        assert_eq!(
+            area.check_identity(renumbered).expect("the same directory"),
+            Some(renumbered.device)
+        );
+
+        // Another directory is refused under either number.
+        for device in [found.device, renumbered.device] {
+            let other = crate::authority::ObjectIdentity {
+                device,
+                file_id: found.file_id.wrapping_add(1),
+            };
+            assert!(area.check_identity(other).is_err(), "{other}");
+        }
+
+        // A directory that is not on the filesystem of the one it was created in has been mounted
+        // over, and a recorded number it does not carry does not make it the recorded one.
+        area.parent.device = found.device.wrapping_add(2);
+        assert!(area.check_identity(renumbered).is_err());
     }
 
     #[test]

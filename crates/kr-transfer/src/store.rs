@@ -805,6 +805,35 @@ impl Store {
         Ok(())
     }
 
+    /// Records that the filesystem holding the staging area is numbered `now` where it was
+    /// numbered `was`: the staging directory's identity and every payload's.
+    ///
+    /// A device number names one mounting of a filesystem, so a filesystem mounted again can come
+    /// back under another one. The objects are the same and keep their numbers within it. Both
+    /// kinds of record change in one transaction, so a start never finds some under each number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the rows cannot be written.
+    pub fn renumber_device(&mut self, was: u64, now: u64) -> Result<()> {
+        let environment = uuid_sql(self.environment_id.get());
+        let transaction = self.begin()?;
+        transaction
+            .execute(
+                "UPDATE environment SET staging_device = ?3
+                 WHERE environment_id = ?1 AND staging_device = ?2",
+                params![environment, identity_sql(was), identity_sql(now)],
+            )
+            .map_err(TransferError::store)?;
+        transaction
+            .execute(
+                "UPDATE uploads SET payload_device = ?2 WHERE payload_device = ?1",
+                params![identity_sql(was), identity_sql(now)],
+            )
+            .map_err(TransferError::store)?;
+        transaction.commit().map_err(TransferError::store)
+    }
+
     /// Returns how many bytes this environment has staged.
     ///
     /// Receiving uploads, published attachments that still exist and open snapshots share one
