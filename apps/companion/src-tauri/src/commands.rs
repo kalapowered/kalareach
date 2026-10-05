@@ -88,7 +88,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("question_answer", Some(Method::QuestionAnswer)),
     // The agent. Each goes to the session's own worker, which checks the caller itself: the page
     // supplies the method's parameters, and the link, the envelope and its target are native
-    // code's.
+    // code's. A prompt that names a draft goes through the host's daemon, which holds the draft.
     ("agent_capabilities", Some(Method::AgentCapabilities)),
     ("agent_snapshot", Some(Method::AgentSnapshot)),
     ("agent_commands", Some(Method::AgentCommands)),
@@ -479,6 +479,88 @@ macro_rules! agent_mutate_command {
     };
 }
 
+/// Declares a command that sends one prompt to a session's agent.
+///
+/// A prompt that carries its text goes to the session's own worker, as every agent call does. A
+/// prompt that names a draft goes through the host's control daemon instead, which holds the draft
+/// and its attachments: the daemon records that the draft is sent to the session before it passes
+/// the prompt to the worker, so what was submitted follows the session's retention. The worker
+/// serves a prompt that names a draft to nothing else.
+macro_rules! agent_prompt_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            state: State<'_, AppState>,
+            links: State<'_, crate::agent::WorkerLinks>,
+            params: Value,
+        ) -> Result<Settled> {
+            let typed: kr_protocol::agent::AgentPromptParams = decode(params)?;
+            typed.validate().map_err(CommandError::invalid)?;
+            let target = typed.target;
+            if typed.draft_id.is_present() {
+                return send_draft_prompt(&state, $method, &typed).await;
+            }
+            submitted(
+                links
+                    .mutate(
+                        target.subject.session_id,
+                        target.subject.application_instance_id,
+                        target.binding_revision,
+                        $method,
+                        &typed,
+                    )
+                    .await?,
+            )
+        }
+    };
+}
+
+/// Sends a prompt that names a draft through the host's control daemon.
+///
+/// The envelope's target is built here from the session the daemon reports and the instance and
+/// revision the parameters name, so the two cannot disagree.
+async fn send_draft_prompt(
+    state: &AppState,
+    method: Method,
+    params: &kr_protocol::agent::AgentPromptParams,
+) -> Result<Settled> {
+    let session = state.session()?;
+    let session_id = params.target.subject.session_id;
+    let read: kr_protocol::session::SessionReadResult = session
+        .read(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await?;
+    let target = kr_protocol::envelope::ActionTarget {
+        environment_id: state.environment_id()?,
+        session_id: kr_protocol::scalars::Nullable::some(session_id),
+        session_epoch: kr_protocol::scalars::Nullable::some(read.session.session_epoch),
+        application_instance_id: kr_protocol::scalars::Nullable::some(
+            params.target.subject.application_instance_id,
+        ),
+        agent_binding_revision: kr_protocol::scalars::Nullable::some(
+            params.target.binding_revision,
+        ),
+    };
+    target
+        .validate()
+        .map_err(|error| CommandError::invalid(error.to_string()))?;
+    submitted(
+        session
+            .mutate(
+                method,
+                target,
+                None,
+                &NoPreconditions {},
+                params,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
+
 read_command!(
     /// Reads what the host is.
     host_info, Method::HostInfo, () => kr_protocol::hostinfo::HostInfoResult
@@ -645,16 +727,14 @@ agent_read_command!(
     agent_approval_inspect, Method::AgentApprovalInspect,
     kr_protocol::agent::AgentApprovalInspectParams => kr_protocol::agent::AgentApprovalInspectResult
 );
-agent_mutate_command!(
+agent_prompt_command!(
     /// Submits a prompt to the bound agent: a draft or inline text, and never both.
-    agent_prompt_submit, Method::AgentPromptSubmit, kr_protocol::agent::AgentPromptParams,
-    kr_protocol::agent::AgentPromptParams::validate
+    agent_prompt_submit, Method::AgentPromptSubmit
 );
-agent_mutate_command!(
+agent_prompt_command!(
     /// Queues a prompt behind the bound agent's current turn: a draft or inline text, and never
     /// both.
-    agent_prompt_queue, Method::AgentPromptQueue, kr_protocol::agent::AgentPromptParams,
-    kr_protocol::agent::AgentPromptParams::validate
+    agent_prompt_queue, Method::AgentPromptQueue
 );
 agent_mutate_command!(
     /// Steers the turn the bound agent is running.

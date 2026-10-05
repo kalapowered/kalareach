@@ -394,6 +394,27 @@ async fn a_prompt_that_names_both_a_draft_and_text_or_neither_reaches_nothing() 
     assert_eq!(page.links(), 0);
 }
 
+/// KR-REQ-14.11: a prompt that names a draft never goes to the session's worker on a link of this
+/// application's own. It goes through the host's control daemon, which records where the draft's
+/// attachments go before it passes the prompt on, so with no connection to that daemon the prompt
+/// is refused and the worker is sent nothing and is not even connected to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_that_names_a_draft_never_goes_to_the_worker_directly() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let draft = "55555555-5555-4555-8555-555555555555";
+    for command in ["agent_prompt_submit", "agent_prompt_queue"] {
+        let params = json!({ "target": target(&worker), "draft_id": draft, "text": null });
+        let refused = answered(page.call(command, json!({ "params": params })))
+            .await
+            .expect_err("there is no host to record the draft with");
+        assert_eq!(code_of(&refused), "HOST_NOT_CONFIGURED", "{command}");
+    }
+    tokio::time::sleep(QUIET).await;
+    assert!(!worker.connected(), "nothing reached the worker");
+    assert_eq!(page.links(), 0);
+}
+
 /// Section 13's boundary: a worker that cannot prove the key its descriptor names is refused, and
 /// nothing is sent to it; a session with no worker on this computer is an unknown session.
 #[tokio::test(flavor = "multi_thread")]

@@ -5,7 +5,9 @@
 //! daemon on this machine does not carry these methods for this computer, so the application
 //! reaches each session's worker over a link of its own, opened the way a raw terminal view opens
 //! one ([`crate::worker::reach`]): the worker proves it holds its descriptor's key before anything
-//! else crosses the link.
+//! else crosses the link. A prompt that names a draft is the one call that does not travel here:
+//! the draft and its attachments are the control daemon's, so that prompt goes through it, which
+//! records where the attachments go before it passes the prompt to the worker.
 //!
 //! One link is held for each session and every agent call about that session goes over it, so a
 //! mutation and the read that follows it travel the same connection. The client library keeps the

@@ -10,7 +10,9 @@
 //!   ─────────────────────────   invoke     ──────────────────   kr-client  ────
 //!   session_list            ────────────▶  Method::SessionList ──────────▶ session.list
 //!   agent_prompt_submit     ────────────▶  Method::AgentPromptSubmit ────▶ agent.prompt.submit,
-//!                                                                          on the session's worker
+//!                                                                          on the session's worker,
+//!                                                                          or through the host's
+//!                                                                          daemon for a draft
 //!   open_external           ────────────▶  scheme policy, then the platform opener
 //!   …one command per operation, and nothing that names a method itself
 //! ```
