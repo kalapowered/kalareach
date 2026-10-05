@@ -485,17 +485,17 @@ impl Engine {
     /// still joins it. This releases that scalar. The session loop calls it when a read returns
     /// nothing, and a snapshot calls it itself, so a quiet stream never leaves a character held.
     ///
-    /// The resident state is measured here too, after the held scalar has been applied. This is
-    /// the moment a caller asks what the session is holding, and it is the moment the screen is
-    /// settled, so a figure taken here is the whole of what is on it rather than most of it.
+    /// The resident state is measured here too, after the held scalar has been applied, so the
+    /// figures for the screens and the historical cache are the whole of what is on them rather
+    /// than most of it. What the hyperlink objects cost is read on the schedule a read keeps, not
+    /// on every call: a session that settles after every batch of output, as one with a projected
+    /// attachment does, would otherwise read every retained row after every batch.
     pub fn quiesce(&mut self, now_ms: u64) -> FeedOutcome {
         let mut events = core::mem::take(&mut self.scratch);
         events.clear();
         self.lexer.flush_tail(&mut events);
-        let mut outcome = self.consume(&events, now_ms);
+        let outcome = self.consume(&events, now_ms);
         self.rest_scratch(events);
-        self.measure_now_unconditionally(now_ms);
-        outcome.resident_pressure = self.resident_pressure();
         outcome
     }
 
@@ -1053,7 +1053,11 @@ impl Engine {
     /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
         self.measure_screens();
-        if core::mem::take(&mut self.measure_now) || self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
+        // The schedule counts reads, and a call that is not one leaves the count where it was, so
+        // the reading a scheduled read took is not taken again by every call that follows it.
+        let scheduled =
+            self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) && self.link_read_at != Some(self.feeds);
+        if core::mem::take(&mut self.measure_now) || scheduled {
             self.measure_links();
         }
         if self.grid.alternate_active() {

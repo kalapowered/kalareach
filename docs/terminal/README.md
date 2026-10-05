@@ -929,8 +929,10 @@ bound is free besides, to reduce how often evictions come, then puts the configu
 the history grows again when later rows cost less. That happens after
 every grid mutation, so the bound is enforced where the rows arrive rather than at whichever read
 comes next: two rows can carry more than the whole of it. Reading every retained row's cells is a
-separate thing, needed for what the hyperlink objects cost, and it happens when the stream goes
-quiet, when something asks, and every 64 reads otherwise.
+separate thing, needed for what the hyperlink objects cost, and it happens when something asks (a
+resize, a reset or a swap of the buffers) and every 64 reads otherwise. Settling the screen when the
+stream goes quiet does not read them, so a session that settles after every batch of output reads
+every retained row no more often than one that does not.
 
 Enforcing it needs the primary buffer to be the one showing, because the library drops the rows it
 is told to drop as it appends to them and it appends only to the buffer that is showing. Rows can

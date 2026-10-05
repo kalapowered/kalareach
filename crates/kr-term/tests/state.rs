@@ -2886,12 +2886,14 @@ fn a_rebuilt_row_still_shows_the_links_its_cells_hold() {
         0,
     );
     engine.feed(b"\x1b[2;1H", 0);
-    engine.quiesce(0);
+    // The link is charged where it arrives, and what its object costs is read off the row once
+    // something asks: a geometry change does, so asking at the geometry it already has is the
+    // figure to compare the rebuilt row against.
+    engine.resize(GridSize::new(4, 2), 0).expect("admitted");
     let before = engine.budget().usage().links;
     assert!(before > 0, "the link the row holds is resident state");
 
     engine.resize(GridSize::new(2, 2), 0).expect("admitted");
-    engine.quiesce(0);
     assert_eq!(
         engine.budget().usage().links,
         before,
