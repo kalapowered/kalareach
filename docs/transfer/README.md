@@ -311,8 +311,10 @@ The no-escape policy is qualified as follows:
   leaves it.
 - A directory handle's identity is recorded when it is opened. A scope reopened after a restart is
   refused unless it finds the same object, so a rename, a case alias or a replacement directory at
-  the same path does not extend the grant to an unrelated tree. The handle is the authority; the
-  recorded path is for diagnostics and for reopening.
+  the same path does not extend the grant to an unrelated tree. The inode decides: a directory
+  found under another device number, on the filesystem of the one above it, is the same object, and
+  the record takes the number; any filesystem that gives it the recorded inode is taken for it. The
+  handle is the authority; the recorded path is for diagnostics and for reopening.
 - An environment identity travels with every handle. A handle from one environment is never accepted
   by another, which is how a Windows path and a WSL path stay separate rather than aliasing.
 

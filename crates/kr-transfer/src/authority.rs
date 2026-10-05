@@ -461,6 +461,30 @@ impl std::fmt::Display for ObjectIdentity {
     }
 }
 
+/// How a directory found where an identity was recorded compares with that record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityCheck {
+    /// The directory has the device and the inode that were recorded.
+    AsRecorded,
+    /// The directory has the recorded inode and is on the filesystem of the directory above it,
+    /// which is numbered differently from when the identity was recorded.
+    Renumbered {
+        /// The device number the record carries.
+        was: u64,
+    },
+}
+
+/// Whether a directory found under another device number is the recorded one: it has the recorded
+/// inode, and it is on the filesystem of the directory above it, which a mount over it is not.
+/// `above` is that directory's device number, where it could be read.
+const fn renumbered(recorded: ObjectIdentity, found: ObjectIdentity, above: Option<u64>) -> bool {
+    recorded.file_id == found.file_id
+        && match above {
+            Some(device) => device == found.device,
+            None => false,
+        }
+}
+
 /// Which mount an opened directory was resolved through.
 ///
 /// Two parts, because one platform answers more than another. Linux names the mount itself, which
@@ -824,10 +848,11 @@ impl AuthorisedDirectory {
         }
     }
 
-    /// Checks that this handle names the object whose identity a store recorded earlier.
+    /// Checks that this handle names the object whose identity was read earlier in this run, by
+    /// its device and its inode.
     ///
-    /// This is what a scope reopened after a restart is checked against: a rename, a case alias or
-    /// a replacement directory at the same path finds a different object and is refused.
+    /// What a store recorded before a restart is checked by [`Self::check_recorded`] instead,
+    /// because a device number does not outlive the mounting it was read under.
     ///
     /// # Errors
     ///
@@ -843,6 +868,50 @@ impl AuthorisedDirectory {
                 ),
             })
         }
+    }
+
+    /// Checks that this handle names the object whose identity a store recorded earlier.
+    ///
+    /// This is what a scope reopened after a restart is checked against: a rename, a case alias or
+    /// a replacement directory at the same path finds a different object and is refused.
+    ///
+    /// The directory's own inode decides. The device number does not, because it names one mounting
+    /// of a filesystem and not the filesystem: a container's root filesystem comes back under
+    /// another number when the container starts again after another has started, and so does a
+    /// volume that is attached again. A directory found under another device number is the
+    /// recorded one when it is on the filesystem of the directory above it, which a mount over it
+    /// is not, and the answer says which number the record carries, for the caller to replace in
+    /// the record it came from.
+    ///
+    /// What this settles is that the directory has the inode the record names, on the filesystem of
+    /// the directory above it. It is there for a directory replaced by the account's own
+    /// processes with another directory of the same filesystem. It does not tell one filesystem
+    /// from another: any filesystem that gives the directory at that place the recorded inode is
+    /// taken for the first one, as a copy of the disk or of the volume does, and so does a new one
+    /// filled in the same order. Nothing but the inode and the device is recorded to tell them
+    /// apart, and a device number is what does not survive a mounting. The directory itself being
+    /// a mount point, which is the root of its own filesystem and has the inode every such root
+    /// has, is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::IdentityChanged`] when it is not the recorded object.
+    pub fn check_recorded(&self, expected: ObjectIdentity) -> Result<IdentityCheck, Escape> {
+        if expected == self.identity {
+            return Ok(IdentityCheck::AsRecorded);
+        }
+        let above = device_above(&self.directory, &self.display.display().to_string()).ok();
+        if renumbered(expected, self.identity, above) {
+            return Ok(IdentityCheck::Renumbered {
+                was: expected.device,
+            });
+        }
+        Err(Escape::IdentityChanged {
+            detail: format!(
+                "this authority was recorded for {expected} and now names {}",
+                self.identity
+            ),
+        })
     }
 
     /// Checks that this directory's access rules still meet the policy.
@@ -2412,6 +2481,38 @@ fn mount_of_file(file: &File, what: &str) -> Result<MountId, Escape> {
     })
 }
 
+/// Reads the device number of the directory an open directory is in, through the open directory
+/// itself. Reading it needs search permission on the directory and no descriptor.
+#[cfg(unix)]
+fn device_above(directory: &Dir, what: &str) -> Result<u64, Escape> {
+    use std::os::fd::AsFd as _;
+
+    rustix::fs::statat(
+        directory.as_fd(),
+        "..",
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    // Converted as the standard library converts the device of a file's metadata, which is what
+    // the identity of a directory records.
+    .map(|found| found.st_dev as _)
+    .map_err(|error| Escape::Unopenable {
+        component: what.to_owned(),
+        detail: error.to_string(),
+    })
+}
+
+/// Reports that this platform does not read the device of the directory an open directory is in
+/// from its own handle.
+#[cfg(not(unix))]
+fn device_above(_directory: &Dir, what: &str) -> Result<u64, Escape> {
+    Err(Escape::Unopenable {
+        component: what.to_owned(),
+        detail: "this host does not read the device of the directory an open directory is in \
+                 from its own handle"
+            .to_owned(),
+    })
+}
+
 /// Opens the directory one open directory is in, from its own descriptor.
 #[cfg(unix)]
 fn parent_of(directory: &Dir, what: &str) -> Result<Dir, Escape> {
@@ -3177,13 +3278,107 @@ mod tests {
         let second =
             AuthorisedDirectory::open_root(environment(), &original).expect("opens the root");
         assert!(matches!(
-            second.check_identity(recorded),
+            second.check_recorded(recorded),
             Err(Escape::IdentityChanged { .. })
         ));
         // The same tree under its new name is the one the grant was recorded for.
         let moved = AuthorisedDirectory::open_root(environment(), &parent.path().join("moved"))
             .expect("opens the root");
-        moved.check_identity(recorded).expect("the same object");
+        moved.check_recorded(recorded).expect("the same object");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_under_another_device_number_is_the_recorded_one_by_its_inode() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let authority =
+            AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
+        let found = authority.identity();
+        assert!(matches!(
+            authority.check_recorded(found),
+            Ok(IdentityCheck::AsRecorded)
+        ));
+
+        // The filesystem was recorded under another device number: the same directory.
+        let renumbered = ObjectIdentity {
+            device: found.device.wrapping_add(1),
+            file_id: found.file_id,
+        };
+        assert!(matches!(
+            authority.check_recorded(renumbered),
+            Ok(IdentityCheck::Renumbered { was }) if was == renumbered.device
+        ));
+
+        // Another directory is refused under either number.
+        for device in [found.device, renumbered.device] {
+            let other = ObjectIdentity {
+                device,
+                file_id: found.file_id.wrapping_add(1),
+            };
+            assert!(
+                matches!(
+                    authority.check_recorded(other),
+                    Err(Escape::IdentityChanged { .. })
+                ),
+                "{other}"
+            );
+        }
+    }
+
+    /// The device of the directory above is read through the directory itself, which needs search
+    /// permission on it and not read permission: a scope root in a directory its account may pass
+    /// through and not list is still found on the filesystem of the one above it.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_above_gives_its_device_without_being_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let above = tempfile::tempdir().expect("a temporary directory");
+        let root = above.path().join("scope");
+        std::fs::create_dir(&root).expect("creates the root");
+        let authority =
+            AuthorisedDirectory::open_root(environment(), &root).expect("opens the root");
+        let found = authority.identity();
+        // A directory that is searchable and not readable: write and search, for its owner.
+        std::fs::set_permissions(above.path(), std::fs::Permissions::from_mode(0o300))
+            .expect("takes the read permission away");
+        let unreadable = std::fs::read_dir(above.path()).is_err();
+        let checked = authority.check_recorded(ObjectIdentity {
+            device: found.device.wrapping_add(1),
+            file_id: found.file_id,
+        });
+        std::fs::set_permissions(above.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("gives it back");
+        // An account that reads whatever it likes (root) cannot show the difference.
+        if unreadable {
+            assert!(matches!(
+                checked,
+                Ok(IdentityCheck::Renumbered { was }) if was == found.device.wrapping_add(1)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_not_on_the_filesystem_of_the_one_above_it_is_not_taken_for_renumbered() {
+        // A directory that is not on the filesystem of the one it is in has been mounted over, or
+        // its parent cannot be read, and a recorded number it does not carry does not make it the
+        // recorded one.
+        let found = ObjectIdentity {
+            device: 7,
+            file_id: 42,
+        };
+        let recorded = ObjectIdentity {
+            device: 5,
+            file_id: 42,
+        };
+        assert!(renumbered(recorded, found, Some(7)));
+        assert!(!renumbered(recorded, found, Some(6)));
+        assert!(!renumbered(recorded, found, None));
+        let other = ObjectIdentity {
+            device: 5,
+            file_id: 43,
+        };
+        assert!(!renumbered(other, found, Some(7)));
     }
 
     #[test]

@@ -286,7 +286,7 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
     let reopened =
         AuthorisedDirectory::open_root(environment(), &original).expect("opens the new tree");
     assert!(matches!(
-        reopened.check_identity(recorded),
+        reopened.check_recorded(recorded),
         Err(Escape::IdentityChanged { .. })
     ));
 }
