@@ -524,6 +524,103 @@ fn paired_with_every_right(
     device
 }
 
+/// KR-REQ-15.20: the receipt of a voice read of a session names the session as the voice context
+/// does, with the name a person pinned, under the bound the voice grant's device has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
+    use std::sync::Arc;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = fake::fake_worker(Some(recorded)).await;
+    let controller = &world.controller;
+    fake::acknowledged(controller, world.session_id);
+    // A device paired under every right but the voice right, and a voice grant of its own: the
+    // ordinary grant a voice grant narrows.
+    let device = paired(controller, 8, |grant| {
+        grant.actions = kr_protocol::rights::ActionRight::ALL
+            .iter()
+            .copied()
+            .filter(|right| *right != kr_protocol::rights::ActionRight::VoiceUse)
+            .collect();
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+    });
+    let voice_grant = kr_protocol::grant::Grant {
+        grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+        issuer_device_id: controller.sharing().host_device_id(),
+        actions: [
+            kr_protocol::rights::ActionRight::VoiceUse,
+            kr_protocol::rights::ActionRight::SessionView,
+        ]
+        .into_iter()
+        .collect(),
+        ..device.grant.clone()
+    };
+    let voice_grant_id = voice_grant.grant_id;
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: voice_grant,
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a live voice grant");
+    controller
+        .descriptions()
+        .rename(
+            world.session_id,
+            Some("Release prep"),
+            "local:501",
+            &kr_describe::metadata::SessionFacts::default(),
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+            &|write| write(),
+        )
+        .expect("a name is pinned");
+    let voice_session_id = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let delegation_id =
+        kr_protocol::voice::VoiceDelegationId::new("a-delegation").expect("an identifier");
+    let action = kr_protocol::voice::VoiceAction::Status;
+    let proposal = kr_voice::Proposal {
+        voice_session_id,
+        device_id: device.device_id,
+        voice_grant_id,
+        environment_id: world.environment_id,
+        action,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        session_id: Some(world.session_id),
+        delegation_id: delegation_id.clone(),
+        plan: kr_protocol::voice::VoiceActionPlan {
+            voice_session_id,
+            action,
+            session_id: Nullable::some(world.session_id),
+            delegation_id: Nullable::some(delegation_id),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+        },
+        approval: None,
+        turn_id: None,
+        destination: None,
+    };
+    let receipt = controller
+        .voice_perform(Method::SessionRead, &proposal)
+        .await
+        .expect("the daemon performs the read");
+    assert!(receipt.performed);
+    assert!(
+        receipt.summary.contains("named \"Release prep\""),
+        "{}",
+        receipt.summary
+    );
+    world.serving.abort();
+}
+
 /// Every read the method table admits for a paired device is served, or refused by name for a
 /// reason the device can act on. None reaches the refusal the routing keeps for a method the
 /// table does not admit for a device, which names no reason.
