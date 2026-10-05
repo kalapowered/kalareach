@@ -24,6 +24,7 @@ use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry, QualifiedBuild, RevocationRecord};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::{PluginId, PublisherId};
+use kr_plugin_sdk::matching::PlatformSupport;
 use kr_plugin_sdk::plugin::PayloadRole;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::EnvironmentId;
@@ -173,11 +174,34 @@ pub enum NotAdmittedReason {
         what: Unsupported,
         /// This host's platform, named for a person.
         host: String,
+        /// The platforms the package's own manifest lists, which are what the decision was made
+        /// from, so the reason can say what the release does support.
+        supported: Vec<PlatformSupport>,
     },
     /// Its package is not whole in the store.
     Incomplete(String),
     /// Its package is past one of the package limits in force, which this names.
     PastALimit(ResourceLimit),
+}
+
+/// Names the platforms a manifest lists, as the sentence that says what a release supports reads
+/// them: each operating system with its architectures, `linux (x86_64, aarch64); mac_os (aarch64)`.
+fn describe(platforms: &[PlatformSupport]) -> String {
+    if platforms.is_empty() {
+        return "no platform".to_owned();
+    }
+    platforms
+        .iter()
+        .map(|platform| {
+            let architectures: Vec<&str> = platform
+                .architectures
+                .iter()
+                .map(|architecture| architecture.as_str())
+                .collect();
+            format!("{} ({})", platform.os.as_str(), architectures.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One installation that is not admitted, and why.
@@ -205,14 +229,23 @@ impl NotAdmitted {
                 "{subject} was revoked by its repository: {}",
                 record.statement.as_str()
             ),
-            NotAdmittedReason::Unsupported { what, host } => match what {
-                Unsupported::OperatingSystem => {
-                    format!("{subject} does not support this host's operating system ({host})")
+            NotAdmittedReason::Unsupported {
+                what,
+                host,
+                supported,
+            } => {
+                let offered = describe(supported);
+                match what {
+                    Unsupported::OperatingSystem => format!(
+                        "{subject} does not support this host's operating system ({host}); it \
+                         supports {offered}"
+                    ),
+                    Unsupported::Architecture => format!(
+                        "{subject} does not support this host's architecture ({host}); it \
+                         supports {offered}"
+                    ),
                 }
-                Unsupported::Architecture => {
-                    format!("{subject} does not support this host's architecture ({host})")
-                }
-            },
+            }
             NotAdmittedReason::Incomplete(detail) => {
                 format!("{subject} is not whole in this host's store: {detail}")
             }
@@ -330,6 +363,7 @@ impl AdmissionPlan {
                 not_admitted.push(refuse(NotAdmittedReason::Unsupported {
                     what,
                     host: self.host.name(),
+                    supported: manifest.platforms.clone(),
                 }));
                 continue;
             }

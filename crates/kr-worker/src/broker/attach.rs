@@ -734,9 +734,7 @@ fn start_agent(
     if reduced {
         // Before the process exists: the closure reads the session's record, and an agent it did
         // not know of would be one it could not end.
-        session
-            .adopt_reduced(Arc::clone(&job))
-            .map_err(|_| session_is_closing())?;
+        session.adopt_reduced(Arc::clone(&job));
     }
     let forget = || {
         if reduced {

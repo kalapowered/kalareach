@@ -80,9 +80,7 @@ pub struct SessionJob {
     ///
     /// Kept for as long as the session is: the session's closure lists what the jobs hold and ends
     /// it, and a worker that dies takes them down because they are kill-on-close and this is where
-    /// the last handle to each of them is. The two share one lock so that an agent is registered
-    /// before the session is closed or not at all: a launch that registers after the closure has
-    /// begun is refused, and one that registered before it is ended by it.
+    /// the last handle to each of them is.
     reduced: Mutex<Reduced>,
 }
 
@@ -160,21 +158,12 @@ impl SessionJob {
     /// Records an agent that will run under the reduced-ownership profile, before its process is
     /// created, so this session's closure reads what its job holds and ends it, and never reads the
     /// session's coverage as complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this session has been closed: nothing is started for a session that
-    /// is ending.
-    pub fn adopt_reduced(&self, agent: Arc<AgentJob>) -> std::io::Result<()> {
-        let mut reduced = self
-            .reduced
+    pub fn adopt_reduced(&self, agent: Arc<AgentJob>) {
+        self.reduced
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reduced.closed {
-            return Err(std::io::Error::other("this session is closing"));
-        }
-        reduced.agents.push(agent);
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents
+            .push(agent);
     }
 
     /// Forgets an agent that was recorded and never ran, because its launch failed.
