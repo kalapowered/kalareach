@@ -730,6 +730,14 @@ pub mod fixture {
     /// The command Claude Code's released integration resolves.
     pub const COMMAND: &str = "claude";
 
+    /// The absolute path to the forwarder that a test package's native bridge names, in the form
+    /// this platform calls absolute. Nothing starts it.
+    pub const FORWARDER: &str = if cfg!(windows) {
+        r"C:\opt\kalareach\bin\kr-hook.exe"
+    } else {
+        "/opt/kalareach/bin/kr-hook"
+    };
+
     /// The flag and value that load the package's channel, each one element, as Claude Code's
     /// released integration declares them.
     pub const FLAGS: [&str; 2] = [

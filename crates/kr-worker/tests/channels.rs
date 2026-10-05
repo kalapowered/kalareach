@@ -107,7 +107,7 @@ impl Package {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("kr-channels-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&root).expect("the store's directory");
-        let source = fixture::claude_code_package(&root, Path::new("/opt/kalareach/bin/kr-hook"))
+        let source = fixture::claude_code_package(&root, Path::new(fixture::FORWARDER))
             .expect("the package is written");
         let connector =
             Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
@@ -1006,7 +1006,7 @@ async fn kr_req_12_18_answering_follows_the_installations_grants() {
     register(&broker, 2);
     let root = std::env::temp_dir().join(format!("kr-channels-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&root).expect("the store's directory");
-    let mut source = fixture::claude_code_package(&root, Path::new("/opt/kalareach/bin/kr-hook"))
+    let mut source = fixture::claude_code_package(&root, Path::new(fixture::FORWARDER))
         .expect("the package is written");
     source
         .granted
