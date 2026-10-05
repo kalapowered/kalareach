@@ -694,7 +694,18 @@ mod tests {
         )
         .expect("a replaced key file");
 
-        assert!(RelayInstanceKeyPair::open(&directory).is_err());
+        let refused = RelayInstanceKeyPair::open(&directory).expect_err("a short seed is refused");
+        assert!(
+            matches!(
+                refused,
+                CryptoError::StoredSecretLength {
+                    expected: RELAY_SEED_LEN,
+                    actual: 16,
+                    ..
+                }
+            ),
+            "refused for its length: {refused:?}"
+        );
     }
 
     #[cfg(unix)]
