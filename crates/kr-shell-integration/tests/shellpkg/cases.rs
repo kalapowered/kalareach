@@ -1816,6 +1816,65 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
     );
 }
 
+/// A gesture typed while the editor waits for the terminal's answer to a question of its own is
+/// the person's gesture: it is consumed like any other that no fence attributes, not left to end
+/// the shell as a native end of file.
+///
+/// An editor that has asked the terminal something does not act on keys until the answer comes, so
+/// it keeps what the person types in its own queue meanwhile. The terminal here is made slow to
+/// answer, and the key is typed once the editor has taken it, so the editor is waiting whatever
+/// the speed of the machine.
+pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+
+    session.hold_terminal_answers();
+    let before_command = session.written();
+    assert!(session.answered("kr-ready"));
+    let enter = session.next_prompt();
+    // The prompt after the command asks the terminal where the cursor is and what it is, and the
+    // editor waits for the answer to the last of those.
+    assert!(
+        session
+            .drew_after(before_command, "\x1b[0c", REPLY)
+            .was_drawn(),
+        "the editor asked the terminal nothing at its next prompt:\n{}",
+        session.terminal_output()
+    );
+
+    let before_key = session.written();
+    session.type_bytes(CTRL_D);
+    // The editor's own report of its queue says when it has the key: asking is an exchange the
+    // editor answers while it waits for the terminal.
+    let deadline = session.deadline_for(REPLY).0;
+    loop {
+        let held = session.fence_exchange_before(&enter, fence_id(41), deadline);
+        if held.snapshot.queued_keys > U64::new(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the editor never took the key it was typed:\n{}",
+            session.terminal_output()
+        );
+    }
+
+    session.release_terminal_answers();
+    assert!(
+        session
+            .drew_after(before_key, DETACH_HINT, REPLY)
+            .was_drawn(),
+        "a gesture typed while the editor waited for the terminal printed no hint:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.alive(),
+        "a gesture typed while the editor waited for the terminal ended the shell"
+    );
+}
+
 /// `takeover-partial-escape` and `takeover-quoted-insertion`: the cancellation the contract needs.
 pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) {
     // A reader with no key wait a takeover can end is not one this case is for, and a suite that

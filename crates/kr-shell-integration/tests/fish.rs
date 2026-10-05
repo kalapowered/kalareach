@@ -134,6 +134,13 @@ fn a_shell_whose_bridge_has_gone_still_consumes_an_eligible_gesture() {
     shellpkg::a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(FISH);
 }
 
+/// KR-REQ-07.36, KR-REQ-07.73
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture() {
+    shellpkg::a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture(FISH);
+}
+
 /// KR-REQ-07.36
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

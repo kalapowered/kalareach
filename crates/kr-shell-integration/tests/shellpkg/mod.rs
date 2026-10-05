@@ -1975,6 +1975,17 @@ impl Session {
         endpoint_break(self.shut, self.peer_write_gone, self.peer_read_gone).unwrap_or("whole")
     }
 
+    /// Has the terminal say nothing to the editor's questions from here on, as a terminal that is
+    /// slow to answer does.
+    pub fn hold_terminal_answers(&self) {
+        self.terminal.hold_answers();
+    }
+
+    /// Gives the editor the answers the terminal kept, and has it answer at once again.
+    pub fn release_terminal_answers(&self) {
+        self.terminal.release_answers();
+    }
+
     /// Ends the endpoint the way a worker that has gone would.
     ///
     /// Nothing is written or read afterwards: the worker is gone, and what the shell does from
@@ -2092,6 +2103,8 @@ fn name_of(event: &BridgeEvent) -> &'static str {
 struct TerminalInput {
     typing: mpsc::Sender<Typing>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Where the terminal's answers wait while it is told to say nothing: `None` answers at once.
+    held: Mutex<Option<Vec<u8>>>,
 }
 
 /// Bytes to type, and where to say that they went in.
@@ -2118,7 +2131,11 @@ impl TerminalInput {
                 let _ = next.typed.send(outcome);
             }
         });
-        Self { typing, writer }
+        Self {
+            typing,
+            writer,
+            held: Mutex::new(None),
+        }
     }
 
     /// Types `bytes`, and says by `deadline` whether they went in.
@@ -2142,11 +2159,39 @@ impl TerminalInput {
         }
     }
 
-    /// Answers a query the editor is waiting on, from the thread that read it.
+    /// Answers a query the editor is waiting on, from the thread that read it, or keeps the answer
+    /// for [`TerminalInput::release_answers`] while the terminal is told to say nothing.
     fn answer_now(&self, bytes: &[u8]) {
+        if let Ok(mut held) = self.held.lock() {
+            if let Some(kept) = held.as_mut() {
+                kept.extend_from_slice(bytes);
+                return;
+            }
+        }
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
+        }
+    }
+}
+
+impl TerminalInput {
+    /// Keeps every answer the terminal gives from now on, until [`TerminalInput::release_answers`].
+    fn hold_answers(&self) {
+        if let Ok(mut held) = self.held.lock() {
+            held.get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// Gives the editor the answers kept since [`TerminalInput::hold_answers`], and answers at
+    /// once from here on.
+    fn release_answers(&self) {
+        let kept = self.held.lock().ok().and_then(|mut held| held.take());
+        if let Some(kept) = kept.filter(|kept| !kept.is_empty()) {
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(&kept);
+                let _ = writer.flush();
+            }
         }
     }
 }
