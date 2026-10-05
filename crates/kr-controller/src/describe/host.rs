@@ -608,6 +608,15 @@ impl DescribeHost {
             if !self.shared.running.load(Ordering::Acquire) {
                 return;
             }
+            // A reply with no facts says only that nothing is newer than what the link has read,
+            // and the host applies none: it never takes the place of a page that has facts.
+            if page.facts.0.is_none()
+                && slots
+                    .get(&session_id)
+                    .is_some_and(|older| older.page.facts.0.is_some())
+            {
+                return;
+            }
             let found = found || slots.get(&session_id).is_some_and(|older| older.found);
             slots.insert(session_id, Waiting { page, found });
         }
@@ -1064,12 +1073,13 @@ impl Thread {
         for (session_id, waiting) in pages {
             if live.contains(&session_id) {
                 self.apply_page(session_id, &waiting.page, waiting.found, now);
-            } else if self
-                .shared
-                .known
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&session_id)
+            } else if waiting.page.facts.0.is_some()
+                && self
+                    .shared
+                    .known
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&session_id)
             {
                 // The session is open and the message that says so has not been taken yet: the page
                 // waits for it. Dropped here, the page would take with it the mark that the facts
@@ -1092,7 +1102,16 @@ impl Thread {
             return;
         }
         match slots.get_mut(&session_id) {
-            Some(newer) => newer.found |= waiting.found,
+            // A newer page with facts replaces it and keeps its mark; one without facts says only
+            // that nothing is newer, and the waiting page stays.
+            Some(newer) if newer.page.facts.0.is_some() => newer.found |= waiting.found,
+            Some(newer) => {
+                let found = newer.found || waiting.found;
+                *newer = Waiting {
+                    page: waiting.page,
+                    found,
+                };
+            }
             None => {
                 slots.insert(session_id, waiting);
             }
@@ -1807,12 +1826,12 @@ pub(crate) mod tests {
             "a page for no open session is dropped"
         );
 
-        // A newer page arrives while it waits; the session is taken, and the page is applied.
-        let mut newer = page_with(0, 2, |facts| {
-            facts.application = Nullable::some("make".to_owned());
-        });
-        newer.session_id = other;
-        handle.page(other, Box::new(newer), false);
+        // A reply with no facts arrives while it waits, and the session is taken: the page is
+        // applied, with its mark.
+        let mut empty = page(0);
+        empty.session_id = other;
+        empty.facts = Nullable::null();
+        handle.page(other, Box::new(empty), false);
         host.take_messages(now);
         host.take_pages(now);
         let seen = host
@@ -1821,7 +1840,100 @@ pub(crate) mod tests {
             .cloned()
             .expect("the session's record");
         assert_eq!(seen.directory.map(|held| held.inherited), Some(true));
-        assert_eq!(seen.application.map(|held| held.inherited), Some(true));
+    }
+
+    /// A page put back to wait for its session is not replaced by a reply with no facts that came
+    /// while the host held it, and a newer page with facts replaces it and keeps its mark: the
+    /// race this decides is between the host taking the slots and putting a page back.
+    #[test]
+    fn a_page_put_back_to_wait_is_replaced_only_by_a_newer_page_with_facts() {
+        let (_directory, mut host) = thread(state(0, false));
+        let held = |host: &Thread| {
+            let slots = host
+                .shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slots
+                .get(&session())
+                .map(|waiting| (waiting.page.facts.0.is_some(), waiting.found))
+        };
+        let mut empty = page(0);
+        empty.facts = Nullable::null();
+        host.shared
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                session(),
+                Waiting {
+                    page: Box::new(empty),
+                    found: false,
+                },
+            );
+        host.wait_for_session(
+            session(),
+            Waiting {
+                page: Box::new(page(0)),
+                found: true,
+            },
+        );
+        assert_eq!(held(&host), Some((true, true)), "the page with facts stays");
+
+        host.wait_for_session(
+            session(),
+            Waiting {
+                page: Box::new(page_with(0, 2, |_| {})),
+                found: false,
+            },
+        );
+        assert_eq!(held(&host), Some((true, true)), "and keeps its mark");
+    }
+
+    /// A reply that carries no facts never replaces a page that does, because it says only that
+    /// nothing is newer than what the link has read: a worker answers a held request with one when
+    /// its wait ends, and a page with facts that was not read yet and was replaced by it would take
+    /// with it the mark that the facts were kept from before. The control is a reply with facts,
+    /// which does replace the page and keeps its mark.
+    #[test]
+    fn a_reply_without_facts_does_not_replace_a_page_with_facts() {
+        let now = Reading::new(1_000, 1_700_000_001_000);
+        let (_directory, mut host) = thread(state(0, false));
+        let handle = handle_of(&host);
+        let mut empty = page(0);
+        empty.facts = Nullable::null();
+
+        handle.page(session(), Box::new(page(0)), true);
+        handle.page(session(), Box::new(empty), false);
+        host.take_pages(now);
+        let seen = host
+            .seen
+            .get(&session())
+            .cloned()
+            .expect("the facts were applied");
+        assert_eq!(seen.directory.map(|held| held.inherited), Some(true));
+
+        let (_directory, mut host) = thread(state(0, false));
+        let handle = handle_of(&host);
+        handle.page(session(), Box::new(page(0)), true);
+        handle.page(
+            session(),
+            Box::new(page_with(0, 2, |facts| {
+                facts.application = Nullable::some("make".to_owned());
+            })),
+            false,
+        );
+        host.take_pages(now);
+        let seen = host
+            .seen
+            .get(&session())
+            .cloned()
+            .expect("the facts were applied");
+        assert_eq!(
+            seen.application.map(|held| (held.text, held.inherited)),
+            Some(("make".to_owned(), true)),
+            "the newer facts replace the older, and keep the mark"
+        );
     }
 
     /// A session's fence is lowered at the first page admitted at a newer non-private generation
