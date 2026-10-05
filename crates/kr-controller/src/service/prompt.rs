@@ -62,7 +62,22 @@ impl Controller {
                 session: session_id.to_string(),
             },
         )?;
-        let mut link = self.worker_client(&worker).await?;
+        // One budget for the whole exchange, started before the wait for the link: a worker that
+        // stops answering while its link is opened, or a caller queued behind one that has, waits
+        // exactly as long as one talking to a worker that answers slowly.
+        let budget = tokio::time::Instant::now()
+            + accepted.map_or(REPEAT_EXCHANGE, |accepted| {
+                accepted
+                    .deadline
+                    .saturating_duration_since(self.clock.now())
+            });
+        let mut link = tokio::time::timeout_at(budget, self.worker_client(&worker))
+            .await
+            .map_err(|_| ControllerError::Uncertain {
+                detail: "the connection to the worker that owns this session did not come free \
+                         in the time this prompt was given, so nothing was sent"
+                    .to_owned(),
+            })??;
         // The admission is asked once the link is held, because holding it is where the wait was.
         // A deadline that ran out while this prompt queued is refused, and nothing is recorded or
         // sent for it. An exact repeat carries no deadline and goes on to the worker, which is
@@ -79,7 +94,7 @@ impl Controller {
             link.give_back();
             return Err(error);
         }
-        let (deadline_boot_ms, exchange) = match accepted {
+        let deadline_boot_ms = match accepted {
             Some(accepted) => {
                 let Some(deadline) =
                     remaining_deadline(&*self.shared_clock, &*self.clock, accepted.deadline, None)
@@ -89,14 +104,9 @@ impl Controller {
                         detail: "the deadline this prompt was admitted under has passed".to_owned(),
                     });
                 };
-                (
-                    deadline,
-                    accepted
-                        .deadline
-                        .saturating_duration_since(self.clock.now()),
-                )
+                deadline
             }
-            None => (U64::new(0), REPEAT_EXCHANGE),
+            None => U64::new(0),
         };
         // The record is made for a first admission only, before the worker is asked. A draft this
         // caller does not hold has no attachments for this host to retain, so naming one is not a
@@ -112,8 +122,8 @@ impl Controller {
             return Err(ControllerError::refused(&error));
         }
         let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-        let answered = tokio::time::timeout(
-            exchange,
+        let answered = tokio::time::timeout_at(
+            budget,
             link.client().forward(
                 mutation,
                 &actor,
