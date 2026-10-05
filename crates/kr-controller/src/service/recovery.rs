@@ -324,7 +324,7 @@ impl Controller {
     /// Challenges a worker against a key this daemon already holds, presents its generation, and
     /// then asks the worker to describe its session ([`crate::directory::describe`]), which it may
     /// not do.
-    async fn challenge(
+    pub(super) async fn challenge(
         &self,
         endpoint: &Endpoint,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,

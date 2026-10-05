@@ -17,6 +17,7 @@ use kr_protocol::ids::AuthorityRevision;
 use kr_protocol::session::SessionState;
 
 use super::a_close_a_worker_never_answers::Silent;
+use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
 use crate::error::ControllerError;
 use crate::registry::WorkerRecord;
@@ -378,7 +379,7 @@ async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
 /// What the daemon holds of the session's worker: its entry in the directory, its slot in the
 /// connection table, its place in the set the plugin admissions wait for, and its published
 /// descriptor. The locks are taken, so the answer is never that something could not be read.
-async fn held_by_the_daemon(world: &Silent) -> [bool; 4] {
+async fn held_by_the_daemon(world: &Served) -> [bool; 4] {
     let in_the_directory = world
         .controller
         .directory
@@ -402,11 +403,11 @@ async fn held_by_the_daemon(world: &Silent) -> [bool; 4] {
     ]
 }
 
-/// Starts an adoption of the world's worker on a task of its own, and holds it where it has
-/// recorded the worker and not yet published it. The daemon has not reached the worker before
-/// that: nothing is in its directory.
+/// Starts an adoption of a real worker on a task of its own, on the proof and the description the
+/// worker gave to a challenge, and holds it where it has recorded the worker and not yet published
+/// it. The daemon has not reached the worker before that: nothing is in its directory.
 async fn an_adoption_held_before_its_publication(
-    world: &Silent,
+    world: &Served,
 ) -> (
     tokio::task::JoinHandle<crate::error::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
@@ -417,9 +418,17 @@ async fn an_adoption_held_before_its_publication(
         .lock()
         .await
         .remove(world.session_id);
-    let (arrived, go) = world.controller.before_a_worker_is_published.arm();
     let descriptor = world.worker.descriptor.clone();
-    let proof = a_proof_of(world);
+    let (proof, described) = world
+        .controller
+        .challenge(
+            &world.worker.endpoint,
+            &descriptor.worker_public_key,
+            world.session_id,
+        )
+        .await
+        .expect("the worker answers its challenge");
+    let (arrived, go) = world.controller.before_a_worker_is_published.arm();
     let endpoint = world.worker.endpoint.clone();
     let controller = std::sync::Arc::clone(&world.controller);
     let adopting = tokio::spawn(async move {
@@ -429,7 +438,7 @@ async fn an_adoption_held_before_its_publication(
                 &descriptor.worker_public_key,
                 &proof,
                 &endpoint,
-                None,
+                described,
             )
             .await
     });
@@ -440,11 +449,11 @@ async fn an_adoption_held_before_its_publication(
 /// KR-REQ-09.12: a worker whose row is recorded and that is not yet published is pending in a
 /// revocation, never absent from it: the barrier's members are the registry's, which an adoption
 /// writes before it publishes anything a dispatch could reach the worker through. Once the adoption
-/// has published the worker it is held in every place the daemon holds a worker.
+/// has published the worker it is held in every place the daemon holds a worker, and the next
+/// revocation reaches it and holds when it has acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
-    let script = Scripted::new();
-    let world = scripted(&script).await;
+    let world = Served::start().await;
     let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 
@@ -465,7 +474,12 @@ async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
     // publication, and a round they send is entitled to open it.
     let [in_the_directory, _, in_the_admissions, described] = held_by_the_daemon(&world).await;
     assert!(in_the_directory && in_the_admissions && described);
-    world.serving.abort();
+    let barrier = world
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the announcement is made");
+    assert!(barrier.holds(), "{barrier:?}");
 }
 
 /// KR-REQ-09.12: an adoption that a closure overtakes between its row and its publication
@@ -474,8 +488,7 @@ async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
 /// adoption with no closure, above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
-    let script = Scripted::new();
-    let world = scripted(&script).await;
+    let world = Served::start().await;
     let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
 
     world
@@ -506,7 +519,6 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
         .expect("the announcement is made");
     assert!(report.holds(), "{report:?}");
     assert!(report.workers.is_empty(), "{report:?}");
-    world.serving.abort();
 }
 
 /// No connection is opened to a worker whose session has closed, by a caller that took the worker
@@ -515,8 +527,7 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
 /// call before the closure, which gives the link and keeps its slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_connection_is_opened_to_a_worker_whose_session_closed() {
-    let script = Scripted::new();
-    let world = scripted(&script).await;
+    let world = Served::start().await;
     let stale = world.worker.clone();
 
     let mut link = world
@@ -555,5 +566,4 @@ async fn no_connection_is_opened_to_a_worker_whose_session_closed() {
             .contains_key(&world.session_id),
         "the connection table holds nothing for a closed session"
     );
-    world.serving.abort();
 }
