@@ -362,7 +362,7 @@ impl Controller {
             crate::catalogue::integrations::fill(
                 &integrations.read(&packages),
                 &enabled,
-                crate::catalogue::integrations::registered_forwarder().as_deref(),
+                kr_ipc::install::registered_forwarder().as_deref(),
             )
         });
         match tokio::time::timeout(WORKER_EXCHANGE, read).await {

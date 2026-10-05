@@ -61,17 +61,6 @@ impl Integrations {
     }
 }
 
-/// The forwarder a package writes the path of where it registers it: this installation's `kr-hook`
-/// by the path an update keeps current (through the store's `current` link for a release of a store,
-/// and beside the daemon otherwise), where one is installed.
-///
-/// A session's flags, the doctor's reports and the registration files a bridge installs all name
-/// this path, and a worker reads the same one, so each says the same text.
-#[must_use]
-pub fn registered_forwarder() -> Option<PathBuf> {
-    kr_ipc::install::registered_forwarder()
-}
-
 /// Returns `flags` written with the forwarder's path where a package names the forwarder, or as
 /// declared where that cannot be done here: a worker that cannot write them either runs every
 /// invocation as typed, and the doctor says why.
