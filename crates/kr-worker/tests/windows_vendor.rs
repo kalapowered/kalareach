@@ -408,11 +408,15 @@ fn waiting_program() -> std::process::Command {
 /// attempt to leave every job that the jobs it runs under refuse.
 #[test]
 #[ignore = "a process the tests below start as the launched vendor"]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the vendor's own processes are left for the job to end, as a vendor's are"
+)]
 fn vendor_stand_in() {
     use std::os::windows::process::CommandExt as _;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    let report = PathBuf::from(std::env::args().last().expect("the report's path"));
+    let report = PathBuf::from(std::env::args().next_back().expect("the report's path"));
     let job = vendor_job_with_limits();
     let nested = waiting_program()
         .spawn()
@@ -660,7 +664,7 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
 #[test]
 #[ignore = "a process the test below starts inside a job of its own"]
 fn a_worker_in_a_job_tries_both_profiles() {
-    let report = PathBuf::from(std::env::args().last().expect("the report's path"));
+    let report = PathBuf::from(std::env::args().next_back().expect("the report's path"));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -759,11 +763,15 @@ fn native_codex() -> Option<PathBuf> {
 /// break away, says what happened and stays until it is ended.
 #[test]
 #[ignore = "a process the native tests start inside Codex's own sandbox"]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the sandboxed command's own processes are left for the job to end, as a vendor's are"
+)]
 fn native_codex_sandboxed_command() {
     use std::os::windows::process::CommandExt as _;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    let report = PathBuf::from(std::env::args().last().expect("the report's path"));
+    let report = PathBuf::from(std::env::args().next_back().expect("the report's path"));
     let held = waiting_program()
         .spawn()
         .expect("a process of its own starts");

@@ -132,6 +132,15 @@ mod tests {
     /// A directory of the test's own, removed when it is dropped.
     struct Store(PathBuf);
 
+    /// The pointer to the mode in what the stand-in application prints.
+    const MODE: &str = "/m";
+
+    /// What the stand-in application prints.
+    const PRINTED: &str = r#"{"m":"elevated"}"#;
+
+    /// The file the stand-in application writes in the directory it runs in, which says it ran.
+    const RAN: &str = "ran";
+
     impl Store {
         fn new(name: &str) -> Self {
             let root = std::env::temp_dir()
@@ -140,39 +149,82 @@ mod tests {
             Self(root)
         }
 
-        /// One Codex-shaped package whose probe reads the sandbox backend, as an admission hands
-        /// it over, with what `installed` makes of its installation.
+        /// One Codex-shaped package whose probe runs `arguments` and reads [`MODE`], as an
+        /// admission hands it over, with what `installed` makes of its installation.
         fn admitted(
             &self,
+            arguments: &[&str],
             installed: impl FnOnce(&mut kr_worker::broker::connectors::ConnectorSource),
         ) -> AdmittedPackage {
-            let mut source = fixture::package(
-                &self.0,
-                &self.0.join("kr-hook"),
-                &fixture::probing(fixture::codex_probe(&["doctor", "--json"])),
-            )
-            .expect("the package is written");
+            let mut probe = fixture::codex_probe(arguments);
+            probe["mode"] = serde_json::json!(MODE);
+            let mut source =
+                fixture::package(&self.0, &self.0.join("kr-hook"), &fixture::probing(probe))
+                    .expect("the package is written");
             installed(&mut source);
             admitted(&source)
         }
 
-        /// A directory on the search path holding `name`, a program that prints `output` and exits
-        /// with the status 1 a diagnostic exits with when it reports a problem.
+        /// A directory on the search path holding `codex`, a program that writes [`RAN`] beside
+        /// where it runs and prints [`PRINTED`], and the arguments a package's probe gives it.
+        ///
+        /// On Unix it is a script that exits 1 as a diagnostic does when it reports a problem; on
+        /// Windows a copy of Windows PowerShell, since a batch file is not a program a probe starts.
         #[cfg(unix)]
-        fn application(&self, name: &str, output: &str) -> PathBuf {
+        fn application(&self) -> (PathBuf, Vec<String>) {
             use std::os::unix::fs::PermissionsExt as _;
 
             let directory = self.0.join("bin");
             std::fs::create_dir_all(&directory).expect("a directory");
-            let path = directory.join(name);
+            let path = directory.join("codex");
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\nprintf '%s' '{output}'\nexit 1\n"),
+                format!("#!/bin/sh\ntouch {RAN}\nprintf '%s' '{PRINTED}'\nexit 1\n"),
             )
             .expect("the application is written");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("the application is made executable");
-            directory
+            (directory, vec!["doctor".to_owned(), "--json".to_owned()])
+        }
+
+        #[cfg(windows)]
+        fn application(&self) -> (PathBuf, Vec<String>) {
+            let directory = self.0.join("bin");
+            std::fs::create_dir_all(&directory).expect("a directory");
+            kr_ipc::testing::place_program(
+                &Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+                    .join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+                &directory.join("codex.exe"),
+            );
+            // The script as Windows PowerShell reads an encoded command: base64 of its UTF-16 text.
+            let script = format!("'x' | Out-File {RAN}; [Console]::Out.Write('{PRINTED}')");
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut encoded = String::new();
+            for chunk in bytes.chunks(3) {
+                let word = u32::from(chunk[0]) << 16
+                    | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+                    | u32::from(*chunk.get(2).unwrap_or(&0));
+                for index in 0..4 {
+                    encoded.push(if index <= chunk.len() {
+                        char::from(alphabet[(word >> (18 - 6 * index) & 63) as usize])
+                    } else {
+                        '='
+                    });
+                }
+            }
+            let arguments = [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded.as_str(),
+            ];
+            (
+                directory,
+                arguments.iter().map(|word| (*word).to_owned()).collect(),
+            )
         }
     }
 
@@ -181,9 +233,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-
-    const ELEVATED: &str =
-        r#"{"checks":{"sandbox.helpers":{"details":{"sandbox backend":"elevated"}}}}"#;
 
     fn reported(
         store: &Store,
@@ -194,58 +243,57 @@ mod tests {
         report(&reading, search, &store.0)
     }
 
+    fn words(arguments: &[String]) -> Vec<&str> {
+        arguments.iter().map(String::as_str).collect()
+    }
+
     /// KR-REQ-07.64: the doctor runs a granted package's probe against the executable its search
     /// path names, and reports the application's own word for its mode, whatever status the
     /// application exits with.
-    #[cfg(unix)]
     #[test]
     fn kr_req_07_64_the_doctor_reports_the_mode_the_application_prints() {
         let store = Store::new("read");
-        let bin = store.application("codex", ELEVATED);
-        let reports = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&bin));
+        let (bin, arguments) = store.application();
+        let reports = reported(
+            &store,
+            store.admitted(&words(&arguments), |_| {}),
+            std::slice::from_ref(&bin),
+        );
         assert_eq!(reports.len(), 1, "{reports:?}");
         let report = &reports[0];
         assert_eq!(report.plugin_id, "kalareach/codex");
-        assert_eq!(report.state, LaunchProbeState::Read);
+        assert_eq!(report.state, LaunchProbeState::Read, "{report:?}");
         assert_eq!(report.mode.0.as_deref(), Some("elevated"));
-        assert_eq!(
-            report.executable.0.as_deref(),
-            Some(bin.join("codex").display().to_string().as_str())
+        assert!(
+            report
+                .executable
+                .0
+                .as_deref()
+                .is_some_and(|path| path.starts_with(&bin.display().to_string())),
+            "{report:?}"
         );
         assert_eq!(report.reason.0, None);
     }
 
     /// KR-REQ-07.64: a probe the installation did not grant is not run, and the doctor says so;
     /// the control is the same package and search path with the grant, which reads a mode.
-    #[cfg(unix)]
     #[test]
     fn kr_req_07_64_a_probe_not_granted_is_not_run_and_the_doctor_says_so() {
         let store = Store::new("ungranted");
-        let marker = store.0.join("ran");
-        let bin = store.0.join("bin");
-        std::fs::create_dir_all(&bin).expect("a directory");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let path = bin.join("codex");
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\ntouch '{}'\nprintf '%s' '{ELEVATED}'\n",
-                    marker.display()
-                ),
-            )
-            .expect("the application is written");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
-        }
-        let granted = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&bin));
-        assert_eq!(granted[0].state, LaunchProbeState::Read);
-        assert!(marker.exists(), "the control ran the application");
-        std::fs::remove_file(&marker).expect("the marker is removed");
+        let (bin, arguments) = store.application();
+        let ran = store.0.join(RAN);
+        let granted = reported(
+            &store,
+            store.admitted(&words(&arguments), |_| {}),
+            std::slice::from_ref(&bin),
+        );
+        assert_eq!(granted[0].state, LaunchProbeState::Read, "{:?}", granted[0]);
+        assert!(ran.exists(), "the control ran the application");
+        std::fs::remove_file(&ran).expect("the marker is removed");
 
         let withheld = reported(
             &store,
-            store.admitted(|source| {
+            store.admitted(&words(&arguments), |source| {
                 source.granted.remove(&PluginCapability::LaunchProbe);
             }),
             &[bin],
@@ -253,7 +301,7 @@ mod tests {
         assert_eq!(withheld[0].state, LaunchProbeState::NotGranted);
         assert_eq!(withheld[0].mode.0, None);
         assert_eq!(withheld[0].executable.0, None);
-        assert!(!marker.exists(), "an ungranted probe ran the application");
+        assert!(!ran.exists(), "an ungranted probe ran the application");
     }
 
     /// KR-REQ-07.64: a package whose application the search path does not name is reported as
@@ -263,7 +311,11 @@ mod tests {
         let store = Store::new("none");
         let empty = store.0.join("empty");
         std::fs::create_dir_all(&empty).expect("a directory");
-        let reports = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&empty));
+        let reports = reported(
+            &store,
+            store.admitted(&["doctor"], |_| {}),
+            std::slice::from_ref(&empty),
+        );
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, LaunchProbeState::NoExecutable);
 
