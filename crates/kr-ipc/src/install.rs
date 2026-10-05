@@ -1251,6 +1251,46 @@ mod tests {
         let _ = remove_tree(&directory);
     }
 
+    /// For a release of a store the forwarder is the path through `current`, which an update keeps
+    /// pointing at the newest release, and not the release's own file; and none while `current`
+    /// names no release.
+    #[test]
+    fn the_registered_forwarder_of_a_store_is_the_path_through_current() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let image = install(&test.store, &one);
+        let running = Running::of_image(&image).expect("a release of the store");
+        let own = test
+            .store
+            .release_directory(&one)
+            .join("bin")
+            .join(Program::Hook.file_name());
+        std::fs::write(&own, b"forwarder").expect("the forwarder stands in");
+        assert_eq!(
+            registered_forwarder_of(&running),
+            None,
+            "no release is current, so the path an update keeps current names nothing"
+        );
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let held = test
+            .store
+            .try_lock_install()
+            .expect("locks")
+            .expect("nothing starts a daemon");
+        test.store.switch(&one, &update, &held).expect("switches");
+        let through_current = test
+            .store
+            .root()
+            .join("current/bin")
+            .join(Program::Hook.file_name());
+        assert_eq!(registered_forwarder_of(&running), Some(through_current));
+        assert_ne!(registered_forwarder_of(&running), Some(own));
+    }
+
     fn release(name: &str) -> ReleaseName {
         ReleaseName::new(name).expect("a release name")
     }
