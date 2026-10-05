@@ -281,7 +281,7 @@ The host keeps at most 8 summaries for each session, indexed by the session, int
 
 A summary covers all the changes within its interval, and so is only ever sent to a caller whose history reaches back to the earliest change. The owner's always does, and a paired device's does if its grant's history begins at or before the earliest change. A grant without a lower bound retains no history, is sent no summaries, and the daemon does not ask the host for one on its behalf.
 
-What a model wrote leaves the daemon only while the privacy state it was read under holds, so an answer that carries a summary, or a description from `session.describe`, is checked before each write. If privacy mode was enabled while the answer was being held, the answer is taken back and the same answer without the generated text is written instead.
+What a model wrote leaves the daemon only while the privacy state it was read under holds. On a local connection, an answer that carries a summary, or a description from `session.describe`, is checked before each write. If privacy mode has been turned on while the answer was held, and none of the answer has been written yet, the answer will be taken back and instead the same answer without the generated text will be written. If the reader already has part of the answer, the answer will not be finished and the connection will be ended so that the reader has to ask again. For answers from paired devices, the check is only done once, when the read ends.
 
 ## Pins
 
