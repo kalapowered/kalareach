@@ -412,6 +412,225 @@ fn a_shared_workspace_is_the_users_own_tree_and_nothing_is_relocated() {
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
 }
 
+/// A registered repository on a filesystem that is numbered differently since it was registered, as
+/// a container's root filesystem is when the container starts again, is the repository that was
+/// registered, and its record takes the numbers it has now. A repository that is another object is
+/// refused under any number.
+#[cfg(unix)]
+#[test]
+fn a_registered_repository_found_under_another_device_number_is_still_the_registered_one() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "renumbered");
+    let journal = || {
+        rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the journal opens")
+    };
+    let devices = || -> (i64, i64) {
+        journal()
+            .query_row(
+                "SELECT git_dir_device, work_tree_device FROM projects",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the repository's record reads")
+    };
+    let preview = |seed: u8| {
+        fixture.service().workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "in place".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: true,
+            },
+            Some(&action("workspace.create", seed)),
+        )
+    };
+    let numbers = devices();
+
+    // What the record carries was recorded under other numbers than the filesystem has now.
+    journal()
+        .execute_batch(
+            "UPDATE projects SET git_dir_device = git_dir_device + 1,
+                                 work_tree_device = work_tree_device + 2;",
+        )
+        .expect("the record is rewritten");
+    preview(60).expect("the repository is the registered one under its new numbers");
+    assert_eq!(
+        devices(),
+        numbers,
+        "the record takes the numbers the filesystem has now"
+    );
+
+    // A different working tree is not the registered one because its number moved as well.
+    journal()
+        .execute_batch(
+            "UPDATE projects SET work_tree_device = work_tree_device + 1,
+                                 work_tree_file_id = work_tree_file_id + 1;",
+        )
+        .expect("the record is rewritten");
+    let refusal = preview(61).expect_err("another working tree is not the registered one");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+}
+
+/// A linked worktree's removal prunes the repository it was made from, and takes into the record
+/// the numbers that repository has now when the filesystem is numbered differently since it was
+/// registered.
+#[cfg(unix)]
+#[test]
+fn a_worktree_removal_finds_the_repository_it_prunes_under_another_device_number() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "pruned");
+    let journal = || {
+        rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the journal opens")
+    };
+    let devices = || -> (i64, i64) {
+        journal()
+            .query_row(
+                "SELECT git_dir_device, work_tree_device FROM projects",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the repository's record reads")
+    };
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "pruned".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "pruned-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 65)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let numbers = devices();
+    journal()
+        .execute_batch(
+            "UPDATE projects SET git_dir_device = git_dir_device + 1,
+                                 work_tree_device = work_tree_device + 2;",
+        )
+        .expect("the record is rewritten");
+    fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
+            },
+            Some(&action("workspace.remove", 66)),
+        )
+        .expect("the worktree is removed");
+    assert_eq!(
+        devices(),
+        numbers,
+        "the repository that was pruned is the registered one, and its record takes its numbers"
+    );
+}
+
+/// A workspace whose tree was recorded under another device number than its filesystem has now is
+/// still the tree this host made, and its removal takes it away. Another directory is not removed
+/// under any number.
+#[cfg(unix)]
+#[test]
+fn a_workspace_tree_found_under_another_device_number_is_removed_as_the_recorded_one() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "renumbered-tree");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "renumbered".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "renumbered-tree-copy",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 62)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let remove = |seed: u8| {
+        fixture.service().workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
+            },
+            Some(&action("workspace.remove", seed)),
+        )
+    };
+
+    // Another directory is refused although its number moved as well as the recorded one's.
+    journal
+        .execute(
+            "UPDATE workspaces SET tree_device = tree_device + 1, tree_file_id = tree_file_id + 1
+              WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+        )
+        .expect("the record is rewritten");
+    let refusal = remove(63).expect_err("this host does not remove another directory");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        fixture
+            .work()
+            .join("renumbered-tree-copy/README.md")
+            .is_file()
+    );
+
+    // The recorded tree on a filesystem numbered differently since is the one this host made.
+    journal
+        .execute(
+            "UPDATE workspaces SET tree_file_id = tree_file_id - 1 WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+        )
+        .expect("the record is rewritten");
+    remove(64).expect("the tree is the recorded one under its new number");
+    support::assert_absent(
+        &fixture.work().join("renumbered-tree-copy"),
+        "the removed workspace",
+    );
+}
+
 #[test]
 fn a_read_never_deletes() {
     // KR-REQ-23.43: view and read never imply deletion.

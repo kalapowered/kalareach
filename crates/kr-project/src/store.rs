@@ -44,7 +44,7 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use kr_transfer::ObjectIdentity;
 
 use crate::error::{ProjectError, Result};
-use crate::identity::RepositoryIdentity;
+use crate::identity::{Renumbered, RepositoryIdentity};
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
@@ -773,7 +773,7 @@ impl Store {
         self.connection.transaction().map_err(ProjectError::store)
     }
 
-    /// Returns the connection, for a read that is one statement.
+    /// Returns the connection, for a read or a write that is one statement.
     pub(crate) const fn connection(&self) -> &Connection {
         &self.connection
     }
@@ -3021,6 +3021,34 @@ pub(crate) fn set_project_source(
             project: id.to_string().into(),
         });
     }
+    Ok(())
+}
+
+/// Replaces the device numbers a repository was recorded under with the ones it has now: those of
+/// both its directories, in one statement, and only while the row still carries the numbers they
+/// replace.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn renumber_project(
+    connection: &Connection,
+    id: ProjectRepositoryId,
+    renumbered: Renumbered,
+) -> Result<()> {
+    connection
+        .execute(
+            "UPDATE projects SET git_dir_device = ?2, work_tree_device = ?3
+              WHERE project_repository_id = ?1 AND git_dir_device = ?4 AND work_tree_device = ?5",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(renumbered.now.git_dir.device),
+                i64_of(renumbered.now.work_tree.device),
+                i64_of(renumbered.was.git_dir.device),
+                i64_of(renumbered.was.work_tree.device),
+            ],
+        )
+        .map_err(ProjectError::store)?;
     Ok(())
 }
 

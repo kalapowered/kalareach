@@ -70,10 +70,11 @@ use kr_protocol::project::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, Uuid};
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity, RelativeName};
+use kr_transfer::{AuthorisedDirectory, IdentityCheck, ObjectIdentity, RelativeName};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ProjectError, Result};
+use crate::identity::{Renumbered, RepositoryIdentity};
 use crate::service::ProjectService;
 use crate::store::{Action, LocatedName, Performed, ProjectRow};
 
@@ -1560,7 +1561,10 @@ impl ProjectService {
         )?;
         let relative = relative_beneath(&held.row.path, &project.display_path, "the repository")?;
         let tree = held.handle.subdirectory(&relative)?;
-        if tree.identity() != project.identity.work_tree {
+        // The tree is the recorded one under another device number when it is on the filesystem of
+        // the directory it is in. The record takes the number it has now when the binding is
+        // committed, in the transaction that writes the binding.
+        if tree.check_recorded(project.identity.work_tree).is_err() {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "the repository's record names the working tree {} and {} beneath location \
@@ -1631,13 +1635,29 @@ impl ProjectService {
                         admitting: Admitting::OwnerDecision,
                     },
                 )?;
-                if resolved.tree.identity() != project.identity.work_tree {
-                    return Err(ProjectError::IdentityChanged {
-                        detail: "the working tree the binding was proved against is no longer the \
-                                 one the repository's record names"
-                            .to_owned()
-                            .into(),
-                    });
+                // The record of a tree on a filesystem that is numbered differently since it was
+                // made takes the number the tree has now, in this transaction.
+                match resolved.tree.check_recorded(project.identity.work_tree) {
+                    Ok(IdentityCheck::AsRecorded) => {}
+                    Ok(IdentityCheck::Renumbered { .. }) => crate::store::renumber_project(
+                        &transaction,
+                        project_repository_id,
+                        Renumbered {
+                            was: project.identity,
+                            now: RepositoryIdentity {
+                                git_dir: project.identity.git_dir,
+                                work_tree: resolved.tree.identity(),
+                            },
+                        },
+                    )?,
+                    Err(_) => {
+                        return Err(ProjectError::IdentityChanged {
+                            detail: "the working tree the binding was proved against is no longer \
+                                     the one the repository's record names"
+                                .to_owned()
+                                .into(),
+                        });
+                    }
                 }
                 Some(LocatedName {
                     location_id: resolved.held.location_id(),

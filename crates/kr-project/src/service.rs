@@ -45,7 +45,7 @@ use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
 use crate::git::ReadAdmission;
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
-use crate::identity::{OpenedRepository, wire_identity};
+use crate::identity::{OpenedRepository, Renumbered, wire_identity};
 use crate::operation::{
     Cleanup, Destination, Reconciliation, STAGED_TREE, STAGING_PREFIX, StagedWitness,
     StagingSibling, publish, reconcile, remove_staging_directory, stage_clone, stage_init,
@@ -291,6 +291,26 @@ impl ProjectService {
     /// helper that takes the same lock would wait for itself.
     pub(crate) fn writable(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         self.locked()
+    }
+
+    /// Takes in the device numbers a registered repository was found under, when they are not the
+    /// ones its record carries.
+    ///
+    /// A repository on a filesystem that is numbered differently since it was registered, as a
+    /// container's is when it starts again, is the repository that was registered. Its record
+    /// takes the numbers it has now, so that the old ones are not taken for it if another
+    /// filesystem is given them. The journal's guard is taken here, so the caller holds none.
+    fn renumber_project(
+        &self,
+        project: ProjectRepositoryId,
+        renumbered: Option<Renumbered>,
+    ) -> Result<()> {
+        match renumbered {
+            Some(renumbered) => {
+                crate::store::renumber_project(self.writable()?.connection(), project, renumbered)
+            }
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn check_environment(&self, named: EnvironmentId) -> Result<()> {
@@ -1124,7 +1144,7 @@ impl ProjectService {
                 (
                     bound.location_id,
                     RelativeName::parse(&bound.relative_path)?,
-                    Some(project.identity),
+                    Some((project.project_repository_id, project.identity)),
                 )
             }
         };
@@ -1136,8 +1156,8 @@ impl ProjectService {
         let held = self.locations().admit(location_id, &wanted)?;
         let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
         let opened = self.open_through(&held, &relative, admission)?;
-        if let Some(expected) = expected {
-            opened.require_identity(expected)?;
+        if let Some((project, expected)) = expected {
+            self.renumber_project(project, opened.require_identity(expected)?)?;
         }
         let remote = self.brokers.validate(&RemoteSpecification {
             remote_name: "origin".to_owned(),
@@ -2240,12 +2260,16 @@ impl ProjectService {
             None if performed.grant().is_some() => {
                 self.open_through_source(&project, admitting, &mut reach)?
             }
-            None => OpenedRepository::open_recorded(
-                &self.profile,
-                self.environment_id,
-                Path::new(&project.display_path),
-                project.identity,
-            )?,
+            None => {
+                let (opened, renumbered) = OpenedRepository::open_recorded(
+                    &self.profile,
+                    self.environment_id,
+                    Path::new(&project.display_path),
+                    project.identity,
+                )?;
+                self.renumber_project(project.project_repository_id, renumbered)?;
+                opened
+            }
         };
         let admission = admission_for(self.locations(), reach);
         let (head_revision, head_reference) = repository.head(&self.profile)?;
@@ -3045,7 +3069,10 @@ impl ProjectService {
             &RelativeName::parse(&bound.relative_path)?,
             admission_for(self.locations(), reach.clone()),
         )?;
-        opened.require_identity(project.identity)?;
+        self.renumber_project(
+            project.project_repository_id,
+            opened.require_identity(project.identity)?,
+        )?;
         Ok(opened)
     }
 
@@ -3245,8 +3272,11 @@ impl ProjectService {
         };
         // The identity is checked before anything is removed: a record whose object has been
         // replaced does not authorise removing whatever now holds its path.
+        // The recorded tree under another device number is the recorded one: it is on the
+        // filesystem of the directory it is in, which a mount over it is not. It is removed next,
+        // so there is no record left to renumber.
         let here = parent.subdirectory(&name)?;
-        if here.identity() != expected {
+        if here.check_recorded(expected).is_err() {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "this workspace was recorded as {expected} and {} now holds {}; nothing is \
@@ -3290,12 +3320,15 @@ impl ProjectService {
             // and a later prune clears; running Git under an unaudited configuration would be
             // worse than that.
             let top = PathBuf::from(&project.display_path);
-            if let Ok(opened) = OpenedRepository::open_recorded(
+            if let Ok((opened, renumbered)) = OpenedRepository::open_recorded(
                 &self.profile,
                 self.environment_id,
                 &top,
                 project.identity,
-            ) && opened.recheck(&self.profile).is_ok()
+            ) && self
+                .renumber_project(project.project_repository_id, renumbered)
+                .is_ok()
+                && opened.recheck(&self.profile).is_ok()
             {
                 let arguments: [&OsStr; 2] = [OsStr::new("worktree"), OsStr::new("prune")];
                 let _ = self.profile.run(&opened.write(&arguments));
