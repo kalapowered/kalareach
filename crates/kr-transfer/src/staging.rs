@@ -180,6 +180,12 @@ impl StagingArea {
     /// mount over it is not, and the answer is the device number the identity was recorded under,
     /// for the caller to replace. `None` says the identity is as it was recorded.
     ///
+    /// The record is a row of the journal, which lives in the directory above the staging
+    /// directory, so what this settles is that the directory is the one that journal was written
+    /// for. It does not make a tree genuine: whoever can put another filesystem under that
+    /// directory can put a journal beside it, which is a privilege this check does not defend
+    /// against. It is there for a directory replaced by the account's own processes.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::Escape`] when the identities differ.
