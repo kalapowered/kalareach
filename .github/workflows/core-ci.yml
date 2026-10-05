@@ -605,6 +605,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --lib catalogue::integrations
 
+      # What the doctor reads of each package's launch probe: the application's own word for the mode it
+      # runs in, read by running the declared diagnostic against the executable the daemon's search path
+      # names, and nothing run for a package whose installation does not hold the capability.
+      - name: Test the doctor's reading of the launch probes
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib catalogue::launch_probes
+
       # The settings-sync store's locks on this platform. It takes an exclusive lock on the store
       # and one on each request, and a request one process is holding is refused to another, which
       # is the operating system's lock and not a compiled-in one. The suite proves that by starting
