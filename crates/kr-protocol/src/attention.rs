@@ -629,9 +629,10 @@ pub struct ChangeSummary {
     /// changes had reached when it was asked for. It can be before this view's own, since the
     /// session goes on changing, and the changes after it are in the view beside the summary.
     pub to_cursor: U64,
-    /// When the first change in the interval was recorded.
+    /// When the earliest change the session's log holds in the interval happened. The log holds
+    /// changes in the order they were recorded, which is not always the order they happened in.
     pub from_ms: TimestampMs,
-    /// When the last change in the interval was recorded.
+    /// When the latest change the session's log holds in the interval happened.
     pub to_ms: TimestampMs,
     /// The model that produced it, as the host recorded it: its profile identifier and revision.
     pub model: String,
@@ -853,7 +854,7 @@ pub struct VisitChangedParams {
     /// cursor and ends at or before the head, and a client that asks again later is answered with
     /// it once it is; asking again never restarts the work. A host that runs no model, or has not
     /// selected one, or is in privacy mode, answers none, and a grant that does not reach back to
-    /// the first change of the interval is answered none.
+    /// the earliest change of the interval is answered none.
     pub summarise: bool,
 }
 

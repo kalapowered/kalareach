@@ -6515,7 +6515,7 @@
         },
         "from_ms": {
           "$ref": "#/$defs/TimestampMs",
-          "description": "When the first change in the interval was recorded."
+          "description": "When the earliest change the session's log holds in the interval happened. The log holds\nchanges in the order they were recorded, which is not always the order they happened in."
         },
         "model": {
           "description": "The model that produced it, as the host recorded it: its profile identifier and revision.",
@@ -6531,7 +6531,7 @@
         },
         "to_ms": {
           "$ref": "#/$defs/TimestampMs",
-          "description": "When the last change in the interval was recorded."
+          "description": "When the latest change the session's log holds in the interval happened."
         }
       },
       "required": [
@@ -34454,7 +34454,7 @@
           "description": "The session to compare."
         },
         "summarise": {
-          "description": "Whether to ask the host's model to summarise what changed, and to be answered with the\nnewest summary it has written.\n\nThe interval is frozen when it is asked for: from the cursor this actor has acknowledged to\nthe cursor the session's changes have reached. The answer does not wait for the model. It\ncarries a summary when one has been written for an interval that starts at the same first\ncursor and ends at or before the head, and a client that asks again later is answered with\nit once it is; asking again never restarts the work. A host that runs no model, or has not\nselected one, or is in privacy mode, answers none, and a grant that does not reach back to\nthe first change of the interval is answered none.",
+          "description": "Whether to ask the host's model to summarise what changed, and to be answered with the\nnewest summary it has written.\n\nThe interval is frozen when it is asked for: from the cursor this actor has acknowledged to\nthe cursor the session's changes have reached. The answer does not wait for the model. It\ncarries a summary when one has been written for an interval that starts at the same first\ncursor and ends at or before the head, and a client that asks again later is answered with\nit once it is; asking again never restarts the work. A host that runs no model, or has not\nselected one, or is in privacy mode, answers none, and a grant that does not reach back to\nthe earliest change of the interval is answered none.",
           "type": "boolean"
         }
       },

@@ -1546,6 +1546,12 @@ pub(crate) mod tests {
 
     /// A host thread over a service that is never asked to start a process, in `state`.
     fn thread(state: Published) -> (tempfile::TempDir, Thread) {
+        thread_selecting(state, false)
+    }
+
+    /// A host thread as [`thread`] makes it, which has selected the profile its catalogue lists
+    /// for this build when `selected`.
+    fn thread_selecting(state: Published, selected: bool) -> (tempfile::TempDir, Thread) {
         let directory = tempfile::tempdir().expect("a directory on the internal disk");
         let privacy = PrivacyState::at(state);
         let handles = Handles::default();
@@ -1565,6 +1571,11 @@ pub(crate) mod tests {
             DescriptionStore::in_memory().expect("a store in memory"),
             handles.clone(),
         );
+        let profile = if selected {
+            service.selection().profile().cloned()
+        } else {
+            None
+        };
         let driver = Driver::new(
             service,
             Launch {
@@ -1588,7 +1599,10 @@ pub(crate) mod tests {
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             reading: Mutex::new(None),
-            files: Files::default(),
+            files: Files {
+                profile,
+                ..Files::default()
+            },
         });
         let mut thread = Thread {
             shared,
@@ -1637,6 +1651,30 @@ pub(crate) mod tests {
                 thread,
                 handle,
             }
+        }
+
+        /// A host as [`Self::new`] makes it, which has selected the model profile this build lists,
+        /// so that a summary is read under it and asked for.
+        pub(crate) fn selecting() -> Self {
+            let (_directory, thread) = thread_selecting(Published::default(), true);
+            let handle = Arc::new(handle_of(&thread));
+            Self {
+                _directory,
+                thread,
+                handle,
+            }
+        }
+
+        /// The summaries the daemon has asked this host for and its thread has not yet taken, in
+        /// the order they were asked.
+        pub(crate) fn asked_summaries(&mut self) -> Vec<SummaryAsk> {
+            let mut asked = Vec::new();
+            while let Ok(message) = self.thread.inbox.try_recv() {
+                if let Message::Summarise { ask } = message {
+                    asked.push(*ask);
+                }
+            }
+            asked
         }
 
         /// The handle a daemon holds on it.
