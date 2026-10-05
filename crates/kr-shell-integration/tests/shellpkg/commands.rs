@@ -87,17 +87,26 @@ fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
 /// check can outlast a reply window. It is paid here, outside every timed wait, rather than by the
 /// shell a case is timing.
 pub fn run_once(path: &Path, record: &Path) {
-    let status = std::process::Command::new(path)
+    start_once(path, 0);
+    let _ = std::fs::remove_file(record);
+}
+
+/// Starts a program that has just been placed once, here, and requires the status it ends with.
+///
+/// A program that is meant to end with a status of its own is started once for the reason
+/// [`run_once`] gives, which is that the first start is the slow one.
+fn start_once(path: &Path, status: i32) {
+    let ended = std::process::Command::new(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap_or_else(|error| panic!("{} does not start: {error}", path.display()));
-    assert!(
-        status.success(),
-        "{} failed its first start",
+    assert_eq!(
+        ended.code(),
+        Some(status),
+        "{} did not end with {status} on its first start",
         path.display()
     );
-    let _ = std::fs::remove_file(record);
 }
 
 /// Reads what a recording program wrote, one start at a time.
@@ -177,10 +186,9 @@ impl Probes {
         // A launcher that is an executable file the system cannot start.
         place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
         // A launcher that starts and ends with a status of its own.
-        place(
-            &root.join("launcher").join("kr-hook-fails"),
-            b"#!/bin/sh\nexit 7\n",
-        );
+        let failing = root.join("launcher").join("kr-hook-fails");
+        place(&failing, b"#!/bin/sh\nexit 7\n");
+        start_once(&failing, 7);
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         std::fs::write(root.join("script.ps1"), "kr-probe from-a-script\n").expect("a script");
         std::fs::write(root.join("exits.ps1"), "exit -1\n").expect("a script");
