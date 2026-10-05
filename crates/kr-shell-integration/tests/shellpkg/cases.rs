@@ -1150,9 +1150,10 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
 /// The budget a case gives a launch whose subject is not the deadline.
 ///
 /// The product's budget is 200 ms of the reader's own clock, from reading the request to deciding
-/// it, and a reader that the scheduler has not run for that long answers `timeout` whatever else
-/// the request holds. A case about what the reader installs, or about why it refuses a request,
-/// would then pass or fail by the load of the machine. A day is a budget no run reaches, and the
+/// it, and a reader that the scheduler has not run for that long answers `timeout` to every
+/// request that passes the checks before it (a launch not revoked, a fence still live, a primary
+/// reader). A case about what the reader installs, or about why it refuses a request, would then
+/// pass or fail by the load of the machine. A day is a budget no run reaches, and the
 /// deadline itself is decided by a request whose budget is none, which is over on arrival.
 const LAUNCH_BUDGET_NOT_UNDER_TEST: DurationMs = DurationMs::new(86_400_000);
 
