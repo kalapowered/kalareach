@@ -594,8 +594,9 @@ impl DescribeHost {
         self.post(Message::Closed { session_id });
     }
 
-    /// Hands the host the newest page of a session's facts, replacing one it has not read. `found`
-    /// says the page is what the worker answered a new connection with at once.
+    /// Hands the host the newest page of a session's facts, replacing one it has not read, except
+    /// that a page without facts never replaces one that has them. `found` says the page is what
+    /// the worker answered a new connection with at once.
     pub(crate) fn page(&self, session_id: SessionId, page: Box<DescriptionFactsPage>, found: bool) {
         {
             let mut slots = self
@@ -608,8 +609,10 @@ impl DescribeHost {
             if !self.shared.running.load(Ordering::Acquire) {
                 return;
             }
-            // A reply with no facts says only that nothing is newer than what the link has read,
-            // and the host applies none: it never takes the place of a page that has facts.
+            // A reply without facts (a wait that ended with nothing newer, or a session in privacy
+            // mode) carries nothing the host applies, so it never takes the place of a page that
+            // has facts. When privacy mode is on, the page kept is of an older generation, which
+            // the host's admission refuses.
             if page.facts.0.is_none()
                 && slots
                     .get(&session_id)
@@ -1090,8 +1093,9 @@ impl Thread {
         }
     }
 
-    /// Puts a page back in its session's slot until the session is taken, unless a newer page has
-    /// come meanwhile, which keeps the mark of the one it replaces.
+    /// Puts a page back in its session's slot until the session is taken. A newer page with facts
+    /// that has come meanwhile stays and takes the mark of the page put back; one without facts
+    /// does not take its place.
     fn wait_for_session(&mut self, session_id: SessionId, waiting: Waiting) {
         let mut slots = self
             .shared
@@ -1102,8 +1106,8 @@ impl Thread {
             return;
         }
         match slots.get_mut(&session_id) {
-            // A newer page with facts replaces it and keeps its mark; one without facts says only
-            // that nothing is newer, and the waiting page stays.
+            // A newer page with facts replaces it and keeps its mark; one without facts carries
+            // nothing to apply, and the waiting page, which has facts, stays.
             Some(newer) if newer.page.facts.0.is_some() => newer.found |= waiting.found,
             Some(newer) => {
                 let found = newer.found || waiting.found;
@@ -1848,29 +1852,43 @@ pub(crate) mod tests {
     #[test]
     fn a_page_put_back_to_wait_is_replaced_only_by_a_newer_page_with_facts() {
         let (_directory, mut host) = thread(state(0, false));
+        let put = |host: &Thread, page: DescriptionFactsPage, found: bool| {
+            host.shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    session(),
+                    Waiting {
+                        page: Box::new(page),
+                        found,
+                    },
+                );
+        };
+        // The revision of the facts that the slot holds and whether it is marked as found.
         let held = |host: &Thread| {
             let slots = host
                 .shared
                 .slots
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            slots
-                .get(&session())
-                .map(|waiting| (waiting.page.facts.0.is_some(), waiting.found))
+            slots.get(&session()).map(|waiting| {
+                (
+                    waiting
+                        .page
+                        .facts
+                        .0
+                        .as_ref()
+                        .map(|facts| facts.revision.get()),
+                    waiting.found,
+                )
+            })
         };
+
+        // A reply with no facts came meanwhile: the page put back takes its place, with its mark.
         let mut empty = page(0);
         empty.facts = Nullable::null();
-        host.shared
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                session(),
-                Waiting {
-                    page: Box::new(empty),
-                    found: false,
-                },
-            );
+        put(&host, empty, false);
         host.wait_for_session(
             session(),
             Waiting {
@@ -1878,23 +1896,33 @@ pub(crate) mod tests {
                 found: true,
             },
         );
-        assert_eq!(held(&host), Some((true, true)), "the page with facts stays");
+        assert_eq!(
+            held(&host),
+            Some((Some(1), true)),
+            "the page with facts stays"
+        );
 
+        // A newer page with facts came meanwhile: it stays, and takes the mark of the page put
+        // back.
+        put(&host, page_with(0, 2, |_| {}), false);
         host.wait_for_session(
             session(),
             Waiting {
-                page: Box::new(page_with(0, 2, |_| {})),
-                found: false,
+                page: Box::new(page(0)),
+                found: true,
             },
         );
-        assert_eq!(held(&host), Some((true, true)), "and keeps its mark");
+        assert_eq!(
+            held(&host),
+            Some((Some(2), true)),
+            "the newer page stays, and keeps the mark"
+        );
     }
 
-    /// A reply that carries no facts never replaces a page that does, because it says only that
-    /// nothing is newer than what the link has read: a worker answers a held request with one when
-    /// its wait ends, and a page with facts that was not read yet and was replaced by it would take
-    /// with it the mark that the facts were kept from before. The control is a reply with facts,
-    /// which does replace the page and keeps its mark.
+    /// A reply that carries no facts never replaces a page that does. A worker answers a held
+    /// request with one when its wait ends with nothing newer, and a page with facts that was not
+    /// read yet and was replaced by it would take with it the mark that the facts were kept from
+    /// before. The control is a reply with facts, which does replace the page and keeps its mark.
     #[test]
     fn a_reply_without_facts_does_not_replace_a_page_with_facts() {
         let now = Reading::new(1_000, 1_700_000_001_000);
