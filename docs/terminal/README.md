@@ -354,10 +354,11 @@ empty: the pinned revision exposes everything section 8 asks a snapshot to carry
 
 #### What constrains the direct compatibility profile
 
-There are four differences from xterm. The first two are not bugs in the canonical state, but mean
+There are five differences from xterm. The first two are not bugs in the canonical state, but mean
 that a physical terminal needs to be qualified against them in order for direct mode to be offered.
 The third is a difference in where the pinned library leaves the cursor; both terminals tested
-report a different column from the library's. The fourth is where a soft reset leaves the buffer:
+report a different column from the library's. The fourth is where a soft reset leaves the buffer,
+and the fifth is what it leaves saved:
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -378,6 +379,25 @@ report a different column from the library's. The fourth is where a soft reset l
 - **A soft reset keeps a terminal on its current buffer.** The library returns to the primary
   buffer, so a direct attachment moves to projection when a soft reset arrives while the alternate
   buffer is showing.
+- **A soft reset clears the saved cursor of both buffers.** xterm saves a fresh cursor in the buffer
+  that is showing, at home and with whatever wrap was pending, and keeps the other buffer's. The
+  product follows the library. A restore in the buffer the reset leaves showing goes home with the
+  ASCII sets and the shift in, in both. What differs is a wrap that was pending at the reset (xterm's
+  fresh cursor keeps it, so the next character goes to the second row; here it goes to the first),
+  the faint, crossed-out and doubly underlined states of the rendition (xterm's reset leaves them
+  set and its save keeps them, where the library clears the whole pen), a cursor that a program
+  saved in the other buffer before the reset and has not saved again since (xterm gives it back
+  there; here a restore goes home), and the cursor a program restores on leaving the alternate
+  buffer after a soft reset, which has already moved a direct attachment to projection. Putting
+  these right would need the engine to put a saved cursor back, rendition and character sets
+  included, and nothing but a sequence that moves the screen can.
+
+A full reset is not among the differences. The library keeps whatever was saved across it, which
+leaves a program that restores a cursor after a reset at a position it saved before it, and a
+terminal that follows xterm somewhere else. So the engine saves a fresh cursor in the buffer the
+reset leaves showing, as xterm does, from the cursor the reset has just homed: a restore after a
+full reset finds the terminal as it starts. The buffer that is not showing keeps what it saved,
+which is also what xterm does.
 
 ## The query broker
 
@@ -543,7 +563,8 @@ whole palette with its source, and paged rows with stable identifiers and wrap m
 It also carries the pending wrap, the saved cursor of each buffer with the rendition and character
 sets that were saved with it, and the rows of the buffer that is not showing. A saved cursor is
 `None` only when that buffer has saved none, so a restoration never invents one: a client told a
-saved cursor is at the origin would restore it there.
+saved cursor is at the origin would restore it there. A full reset saves one in the buffer it leaves
+showing, and a soft reset leaves none, as the compatibility profile describes.
 
 A hyperlink, wherever the wire carries one (a run's, a range's, the open link and a saved cursor's),
 is its target together with the parameters the application gave it, spelled as `key=value` pairs in

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use wezterm_escape_parser::csi::{CSI, Edit, Mode, TerminalMode, TerminalModeCode};
 use wezterm_escape_parser::osc::OperatingSystemCommand;
-use wezterm_escape_parser::{Action, ControlCode};
+use wezterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 
 use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_surface::CursorShape;
@@ -1384,6 +1384,16 @@ impl CanonicalGrid {
             .perform_actions(vec![Action::OperatingSystemCommand(Box::new(
                 OperatingSystemCommand::SetHyperlink(None),
             ))]);
+        self.sync_history();
+    }
+
+    /// Saves the cursor as it stands, as `ESC 7` does, in the buffer that is showing.
+    ///
+    /// For a full reset, after which a terminal has a fresh cursor saved and the library has the
+    /// one that was saved before.
+    pub fn save_cursor(&mut self) {
+        self.terminal
+            .perform_actions(vec![Action::Esc(Esc::Code(EscCode::DecSaveCursorPosition))]);
         self.sync_history();
     }
 

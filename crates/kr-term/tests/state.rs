@@ -1922,6 +1922,114 @@ fn a_cursor_restore_puts_back_the_character_set_shift_it_saved() {
     assert_eq!(text_of(&engine.grid().visible_rows())[0].trim_end(), "q");
 }
 
+/// KR-REQ-08.18: a full reset leaves a fresh cursor saved, as xterm does, so a program that
+/// restores a cursor after one finds a terminal as it starts.
+///
+/// Whatever was saved before is gone: home, the plain rendition, the ASCII sets and the shift in.
+/// The pinned library keeps the saved cursor across a full reset, which a terminal that follows
+/// xterm does not, and a direct attachment would then restore somewhere else than the canonical
+/// screen does.
+#[test]
+fn a_full_reset_leaves_the_saved_cursor_as_a_new_terminal_has_it() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(10, 4),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // A cursor saved away from home, in red, with line drawing in G1 and the shift out, and another
+    // saved in the alternate buffer with the shift out there too.
+    engine.feed(b"\x1b)0\x0e\x1b[3;5H\x1b[31m\x1b7", 0);
+    // The reset arrives while the alternate buffer is showing.
+    engine.feed(b"\x1b[?1049h\x1b[2;3H\x1b[32m\x1b7", 0);
+    assert!(engine.grid().alternate_active());
+    engine.feed(b"\x1bc", 0);
+    engine.quiesce(0);
+
+    let (snapshot, _) = engine.snapshot(viewport(&engine), 0);
+    let saved = snapshot.saved_cursors[0]
+        .as_ref()
+        .expect("a full reset saves a cursor for the buffer it leaves showing");
+    assert_eq!(
+        (
+            saved.col,
+            saved.row,
+            saved.rendition,
+            saved.shift_out,
+            saved.charsets.g1.as_str()
+        ),
+        (0, 0, kr_term::grid::Rendition::default(), false, "Ascii"),
+        "a client restoring from the snapshot restores the same fresh cursor"
+    );
+    let other = snapshot.saved_cursors[1]
+        .as_ref()
+        .expect("the buffer that was not showing keeps what it saved, as xterm's does");
+    assert_eq!(
+        (other.col, other.row, other.shift_out),
+        (2, 1, true),
+        "with the position and the shift it was saved with"
+    );
+
+    engine.feed(b"\x1b[3;3H\x1b[32m\x1b8q", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        text_of(&engine.grid().visible_rows())[0].trim_end(),
+        "q",
+        "the restore went home and printed through the ASCII set, with the shift in"
+    );
+    assert!(!engine.grid().shift_out());
+    assert_eq!(engine.grid().pen(), kr_term::grid::Rendition::default());
+}
+
+/// KR-REQ-08.18: a soft reset leaves no cursor saved in either buffer, so a restore after one finds
+/// the initial state in whichever buffer is showing.
+///
+/// xterm saves a fresh cursor in the buffer that is showing and keeps the other buffer's. The two
+/// agree on where a restore in the buffer a reset leaves showing puts the cursor, and on the shift
+/// and the character sets. They differ in a wrap that was pending at the reset, which xterm's fresh
+/// cursor keeps and this does not, and for a program that restores a cursor in the other buffer
+/// that it saved there before the reset and has not saved again since.
+#[test]
+fn a_soft_reset_leaves_no_cursor_saved_in_either_buffer() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(10, 4),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // A cursor saved in the primary buffer, and another in the alternate one, which is showing.
+    engine.feed(
+        b"\x1b[3;5H\x1b[31m\x1b7\x1b[?1049h\x1b[2;2H\x1b[32m\x1b7",
+        0,
+    );
+    assert!(engine.grid().alternate_active());
+    engine.quiesce(0);
+    let (before, _) = engine.snapshot(viewport(&engine), 0);
+    assert!(
+        before.saved_cursors.iter().all(Option::is_some),
+        "each buffer holds a cursor before the reset: {:?}",
+        before.saved_cursors
+    );
+    engine.feed(b"\x1b[!p", 0);
+    engine.quiesce(0);
+
+    let (snapshot, _) = engine.snapshot(viewport(&engine), 0);
+    assert!(
+        snapshot.saved_cursors.iter().all(Option::is_none),
+        "neither buffer holds a saved cursor: {:?}",
+        snapshot.saved_cursors
+    );
+
+    // A wrap pending at the reset: the last column of a row is written, and then the cursor is
+    // restored from nothing, which goes home and wraps nothing.
+    engine.feed(b"\x1b[1;10Hz\x1b[!p\x1b8q", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        text_of(&engine.grid().visible_rows())[0].trim_end(),
+        format!("q{}z", " ".repeat(8)),
+        "a restore with nothing saved goes home, and the wrap that was pending is gone"
+    );
+    assert_eq!(engine.grid().pen(), kr_term::grid::Rendition::default());
+}
+
 /// A cursor restore leaves the modes a terminal would have kept.
 #[test]
 fn a_cursor_restore_keeps_the_modes_around_it() {

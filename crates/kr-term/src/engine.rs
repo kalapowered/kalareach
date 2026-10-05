@@ -1263,6 +1263,14 @@ impl Engine {
                     self.palette.reset_all();
                     self.title_revision = self.next_revision();
                     self.palette_revision = self.next_revision();
+                    // A terminal that follows xterm leaves a fresh cursor saved after a full
+                    // reset, where the library keeps what was saved before it. So the buffer the
+                    // reset leaves showing gets one, from the cursor the reset has just homed, and
+                    // a restore after it finds the terminal as it starts. The buffer that is not
+                    // showing keeps what it saved, as it does in xterm.
+                    self.grid.save_cursor();
+                    self.saved_shift[0] = false;
+                    self.saved_revision = self.next_revision();
                     self.advance_projection();
                 }
                 b'=' => {

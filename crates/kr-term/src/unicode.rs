@@ -103,6 +103,13 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
         "A soft reset leaves a terminal on the buffer that is showing, where the library returns to \
          the primary buffer. A direct attachment reading a soft reset while the alternate buffer is \
          showing is moved to projection at that point, and the canonical grid is what it is shown.",
+        "A soft reset clears the saved cursor of both buffers, where xterm saves a fresh cursor in \
+         the buffer that is showing, at home and with the wrap that was pending, and keeps the \
+         other buffer's. A restore in the buffer the reset leaves showing goes home with the ASCII \
+         sets and the shift in, in both. They differ in a wrap pending at the reset, in the faint, \
+         crossed-out and doubly underlined states of the rendition, which xterm's reset leaves \
+         set, and in a cursor saved in the other buffer before the reset and not saved again \
+         since, which xterm gives back there.",
     ],
     qualified_additions: &[
         QualifiedAddition {
