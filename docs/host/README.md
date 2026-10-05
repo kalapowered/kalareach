@@ -1363,9 +1363,10 @@ A launch that meets a session already closing is refused by name before anything
 closure that begins while a launch is creating its agent ends what the launch made, and the launch
 fails by name, because a process created in a job that has been ended is not ended with it. The
 launch records a reduced agent's job on the session before its process exists, so a closure that
-begins at any point reads it. A closure waits for every launch admitted before it began, and a launch
-still under way when that wait ends keeps the closure's coverage incomplete, with the reason in the
-receipt.
+begins at any point reads it. A launch is in flight on its session from the moment the session admits
+it, before the application's own configuration is read, until it has committed or undone everything
+it made. A closure waits for every launch admitted before it began, and a launch still under way
+when that wait ends keeps the closure's coverage incomplete, with the reason in the receipt.
 
 ### Running the Windows tests
 

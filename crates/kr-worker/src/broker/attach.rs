@@ -630,13 +630,16 @@ pub type AgentChild = crate::windows::launch::Child;
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchStage {
-    /// The session has admitted the launch; the agent's job is not made and nothing is recorded.
+    /// The session has admitted the launch; nothing else has been done.
     Admitted,
     /// The agent's job is made, and recorded on the session where the profile is reduced; its
     /// process is not created.
     JobRecorded,
     /// The agent's process exists and the launch has not yet asked whether the session is closing.
     ProcessCreated,
+    /// The launch has found the session open with its process created, and has not yet handed the
+    /// agent over.
+    Checked,
 }
 
 /// A pause a test armed: where it stops the launch, how it says the launch arrived and what lets
@@ -723,9 +726,8 @@ fn start_agent(
 /// holds and ends it. Nothing else changes about the launch, and the vendor's own sandbox is left
 /// exactly as the vendor made it.
 ///
-/// The launch is in flight on the session from its admission until it returns, and a session's
-/// closure waits for every launch in flight before it reads what the session held. A session that
-/// is closing admits none.
+/// The launch is in flight on the session, admitted by [`NativeGateway::launch`] and held by the
+/// caller, for as long as this runs and after it: the session's closure waits for it.
 #[cfg(windows)]
 fn start_agent(
     program: &str,
@@ -741,10 +743,6 @@ fn start_agent(
     let session_is_closing = || BrokerError::PreconditionFailed {
         detail: format!("this session is closing, so {program} was not started"),
     };
-    let Some(_in_flight) = session.admit_launch() else {
-        return Err(session_is_closing());
-    };
-    pause(LaunchStage::Admitted);
     let reduced = ownership == AgentOwnership::Reduced;
     let job = Arc::new(
         if reduced {
@@ -807,6 +805,7 @@ fn start_agent(
             )));
         }
     };
+    pause(LaunchStage::Checked);
     crate::windows::job::keep_agent(started.clone(), job, child.stdin.clone());
     Ok((child, started))
 }
@@ -1069,6 +1068,11 @@ impl NativeGateway {
     /// launch that never happened. What it gives back is its own: a gateway launches one instance,
     /// and a launch for an instance that is already live is refused before anything is executed.
     ///
+    /// On Windows the launch is in flight on its session from the moment the session admits it,
+    /// before the application's own configuration is probed, until it has committed or undone
+    /// everything it made, and the session's closure waits for it. A session that is closing
+    /// admits none.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the instance is already live,
@@ -1117,6 +1121,21 @@ impl NativeGateway {
                 detail: "this launch has no session job to be held by, so nothing was started"
                     .to_owned(),
             })?;
+        // In flight from here until this returns, whether the launch commits or undoes what it
+        // made: the session's closure waits for it, so it reads the session only once nothing
+        // this launch made is left running outside what it reads. A session that is closing
+        // admits none.
+        #[cfg(windows)]
+        let _in_flight = session
+            .admit_launch()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!(
+                    "this session is closing, so {} was not started",
+                    intent.profile.binary.resolved_path
+                ),
+            })?;
+        #[cfg(windows)]
+        self.pause_if_armed(LaunchStage::Admitted);
         #[cfg(windows)]
         refuse_what_a_vendor_sandbox_cannot_run_under(&session, intent.profile.ownership)?;
         // What the application's own package reads of the mode it will run in, before anything
@@ -1295,15 +1314,15 @@ impl NativeGateway {
             let _ = arrived.send(());
             let _ = go.recv();
         }
-        // An agent that did not stay is not one the session ran: its record goes with its process.
+        // The agent's job is read before it is let go of. An agent that did not stay is not one the
+        // session ran, but its record stays on the session for as long as its process might run.
         #[cfg(windows)]
-        if let (Some(session), Some(job)) = (
-            self.session_job.as_ref(),
-            crate::windows::job::agent_job(started),
-        ) {
-            session.release_reduced(&job);
-        }
+        let agent = crate::windows::job::agent_job(started);
         stop_started(child, started);
+        #[cfg(windows)]
+        if let (Some(session), Some(agent)) = (self.session_job.as_ref(), agent) {
+            session.release_reduced(&agent);
+        }
         if let Some(credential_path) = credential_path {
             // Best effort: a file that cannot be removed now is refused as a stale name by the
             // next launch's create, which is the safe way round.
