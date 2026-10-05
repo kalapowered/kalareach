@@ -3613,6 +3613,11 @@ mod tests {
         );
         assert_eq!(ask.generation, generation);
         assert_eq!(ask.changes.len(), kr_describe::summary::MAX_SUMMARY_CHANGES);
+        assert_eq!(
+            ask.earlier,
+            77 - kr_describe::summary::MAX_SUMMARY_CHANGES as u64,
+            "the changes of the interval the request does not carry"
+        );
         let text_of = |cursor: u64| {
             ask.changes
                 .iter()

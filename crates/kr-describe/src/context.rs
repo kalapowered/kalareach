@@ -416,6 +416,7 @@ impl DescriptionContext {
             revision: U64::new(self.revision.get()),
             cursor_from: U64::new(self.cursor.from),
             cursor_to: U64::new(self.cursor.to),
+            earlier: U64::ZERO,
             facts: [
                 fact("directory", self.directory.as_ref()),
                 fact("repository", self.repository.as_ref()),

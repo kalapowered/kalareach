@@ -35,6 +35,7 @@ fn every_request() -> Vec<Request> {
                 revision: U64::new(3),
                 cursor_from: U64::new(1),
                 cursor_to: U64::new(4),
+                earlier: U64::ZERO,
                 facts: vec![Datum {
                     label: "directory".to_owned(),
                     text: "kalareach".to_owned(),
@@ -58,6 +59,7 @@ fn every_request() -> Vec<Request> {
                 revision: U64::new(0),
                 cursor_from: U64::new(10),
                 cursor_to: U64::new(14),
+                earlier: U64::new(2),
                 facts: Vec::new(),
                 events: vec![Datum {
                     label: "change command_completed".to_owned(),

@@ -867,8 +867,12 @@ fn a_summary_prompt_keeps_a_changes_text_as_data_and_lets_the_oldest_go() {
     // Fit: with room for the instruction and the newest change only, the oldest is the one that
     // goes.
     let count = |text: &str| -> Result<usize, ()> { Ok(text.len().div_ceil(4)) };
-    let bare = count(&Prompt::bare_summary().text()).expect("a count");
-    let fitted = prompt.fit(bare + 12, count).expect("a prompt that fits");
+    let bare = Prompt {
+        events: Vec::new(),
+        ..prompt.clone()
+    };
+    let room = count(&bare.text()).expect("a count") + 20;
+    let fitted = prompt.fit(room, count).expect("a prompt that fits");
     assert!(fitted.events_dropped >= 1, "{fitted:?}");
     assert!(
         fitted.text.contains("change turn_completed"),
@@ -904,6 +908,76 @@ fn a_request_keeps_the_newest_changes_it_may_carry() {
     );
 }
 
+/// KR-REQ-18.02: a summary reads only the newest changes of its interval, and the prompt says how
+/// many earlier ones it does not show: those the request left out because it carries no more than
+/// its bound, those retention had taken before the request was made, and those the fit leaves out
+/// to hold the prompt to its bound, which are the oldest it carries. A description's prompt says
+/// nothing of the kind.
+#[test]
+fn a_summary_prompt_says_how_many_earlier_changes_it_does_not_show() {
+    let line = |text: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix("earlier_changes_not_shown: "))
+            .and_then(|count| count.parse().ok())
+    };
+
+    // Ten past the bound, and five more that retention had taken from the front of the interval.
+    let many = SummaryAsk::new(
+        session(1),
+        CursorInterval::new(0, MAX_SUMMARY_CHANGES as u64 + 15),
+        0,
+        0,
+        None,
+        (5..MAX_SUMMARY_CHANGES as u64 + 15)
+            .map(|cursor| SummaryChange {
+                cursor,
+                kind: "command_completed",
+                at_ms: cursor,
+                text: ProjectText::new(&format!("command {cursor}")),
+            })
+            .collect(),
+    )
+    .expect("a request");
+    assert_eq!(many.changes.len(), MAX_SUMMARY_CHANGES);
+    assert_eq!(many.earlier, 15);
+    assert_eq!(line(&many.prompt().text()), Some(15));
+    assert_eq!(
+        line(&ask(session(1), 3, 6).prompt().text()),
+        Some(0),
+        "a request that carries every change says so"
+    );
+
+    // The fit leaves out the oldest of what is carried, and the count follows what it left out.
+    let count = |text: &str| -> Result<usize, ()> { Ok(text.len().div_ceil(4)) };
+    let bare = count(&Prompt::bare_summary().text()).expect("a count");
+    let fitted = many
+        .prompt()
+        .fit(bare + 100, count)
+        .expect("a prompt that fits");
+    assert!(fitted.events_dropped > 0, "{fitted:?}");
+    assert_eq!(
+        line(&fitted.text),
+        Some(15 + fitted.events_dropped as u64),
+        "{}",
+        fitted.text
+    );
+    assert!(fitted.tokens <= bare + 100);
+
+    // The longest count the line can hold is one the least a job can be.
+    let bare = Prompt::bare_summary().text();
+    assert!(line(&bare).is_some());
+}
+
+/// A description's prompt has no such line.
+#[test]
+fn a_description_prompt_does_not_count_earlier_changes() {
+    assert!(
+        !Prompt::bare().text().contains("earlier_changes_not_shown"),
+        "{}",
+        Prompt::bare().text()
+    );
+}
+
 /// A summary's answer is ended where the output bound stopped it, as a description's is, in the
 /// text and nowhere else: what it had written of the interval it repeats has to be the prompt's.
 #[test]
@@ -913,6 +987,7 @@ fn a_summary_the_output_bound_stopped_is_ended_in_its_text() {
         revision: kr_protocol::scalars::U64::new(0),
         cursor_from: kr_protocol::scalars::U64::new(10),
         cursor_to: kr_protocol::scalars::U64::new(14),
+        earlier: kr_protocol::scalars::U64::ZERO,
         facts: Vec::new(),
         events: Vec::new(),
     };
