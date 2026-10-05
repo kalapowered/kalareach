@@ -104,10 +104,25 @@ impl Controller {
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+        self.voice_snapshot_of(&read.session).await
+    }
+
+    /// What this host can say about a session it has already read, with what the description host
+    /// holds of it: the second half of [`Self::voice_session_snapshot`], for a path that reads the
+    /// session itself and says no more of it than the context does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the description store cannot be read.
+    async fn voice_snapshot_of(
+        &self,
+        session: &kr_protocol::session::SessionSummary,
+    ) -> Result<crate::voice::SessionSnapshot> {
         let descriptions = Arc::clone(&self.descriptions);
         let privacy = self.privacy.state();
-        let facts = crate::describe::facts_of(&read.session);
-        let started_ms = read.session.created_at_ms.get();
+        let facts = crate::describe::facts_of(session);
+        let session_id = session.session_id;
+        let started_ms = session.created_at_ms.get();
         let described = tokio::task::spawn_blocking(move || {
             descriptions.voice_description(session_id, &facts, started_ms, &privacy)
         })
@@ -115,11 +130,7 @@ impl Controller {
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the session's description could not be read".to_owned(),
         })??;
-        Ok(crate::voice::snapshot_with(
-            &read.session,
-            session_id,
-            &described,
-        ))
+        Ok(crate::voice::snapshot_with(session, session_id, &described))
     }
 
     /// Performs one voice proposal under the method the registry lists for its effect.
@@ -148,6 +159,9 @@ impl Controller {
             let params = ParamsValue::from_typed(&SessionReadParams { session_id })
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+            // What the context says of the session, with the name a person pinned and where the
+            // description host saw it run, so a receipt names the session as the context does.
+            let snapshot = self.voice_snapshot_of(&read.session).await?;
             let narrowed = self.voice_authority_now(proposal, session_id)?;
             // The same bound the context path applies, and the answer is built from what it
             // admitted and from nothing else. A session's description carries its number and the
@@ -157,10 +171,7 @@ impl Controller {
             // so it travels with a description the bound admitted.
             let live = read.session.state != kr_protocol::session::SessionState::Closed;
             let state = read.session.state.as_str().to_owned();
-            let filtered = crate::voice::filtered(
-                crate::voice::snapshot_of(&read.session, session_id),
-                &narrowed,
-            );
+            let filtered = crate::voice::filtered(snapshot, &narrowed);
             let summary = match (filtered.session_description, filtered.working_directory) {
                 (None, _) => "this grant's history does not reach that session".to_owned(),
                 (Some(description), directory) => {
