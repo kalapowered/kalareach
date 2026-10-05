@@ -667,27 +667,59 @@ fn windows() -> Vec<Step> {
                 "attention_source",
             ],
         ),
-        {
-            let filters = [
-                "config::",
+        qualified_only(
+            "the configuration lock",
+            &["test", "--locked", "-p", "kr-controller", "--lib", "config::"],
+            "config::",
+        ),
+        qualified_only(
+            "the bridge store's records",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
                 "bridge::store::",
+            ],
+            "bridge::store::",
+        ),
+        qualified_only(
+            "the host environment a session takes",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
                 "a_create_that_launches_nothing::",
+            ],
+            "a_create_that_launches_nothing::",
+        ),
+        qualified_only(
+            "the attention inbox's transport",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
                 "attention::",
+            ],
+            "attention::",
+        ),
+        qualified_only(
+            "the decision a device reads",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
                 "a_share_that_names_a_current_decision::",
-            ];
-            let mut arguments = vec!["test", "--locked", "-p", "kr-controller", "--lib", "--"];
-            arguments.extend(filters);
-            let mut step = Step::cargo(
-                Group::Rust,
-                "the control daemon's library, the cases this platform qualifies",
-                &arguments,
-            );
-            step.filter = Some((
-                filters.join(" "),
-                "on Windows only these cases of this target are qualified: the others start a daemon, replace it and have a worker go while it is read, which waits out a bound of several seconds there and does not finish in one run of three".to_owned(),
-            ));
-            step
-        },
+            ],
+            "a_share_that_names_a_current_decision::",
+        ),
         Step::cargo(
             Group::Rust,
             "the daemon's attention, barrier, configuration and diagnostics",
