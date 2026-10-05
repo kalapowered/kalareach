@@ -5,8 +5,9 @@
 //! its closure would never be ended by anything. So a record is made only by a bind taken under the
 //! registry's lock, and only for a session that has no closure there; the closure tells the
 //! barrier in the section that records it, so the two cannot pass each other; a recovery that
-//! reaches a worker after its closure leaves the closure as it is; and a revocation's answer is
-//! about the workers that are recorded and not closed.
+//! reaches a worker after its closure leaves the closure as it is, and one that a closure overtakes
+//! publishes nothing; no connection is opened to a worker whose session has closed; and a
+//! revocation's answer is about the workers that are recorded and not closed.
 
 use std::future::Future;
 use std::task::Poll;
@@ -212,6 +213,20 @@ async fn an_announcement_that_began_before_a_closure_holds_the_worker_until_it_i
     );
 }
 
+/// The proof a worker's challenge answers with, as far as an adoption reads it.
+fn a_proof_of(world: &Silent) -> kr_protocol::worker::WorkerVerifyProof {
+    let descriptor = &world.worker.descriptor;
+    kr_protocol::worker::WorkerVerifyProof {
+        session_id: descriptor.session_id,
+        session_epoch: descriptor.session_epoch,
+        boot_identity: descriptor.boot_identity.clone(),
+        process_start_identity: descriptor.process_start_identity.clone(),
+        protocol_version: descriptor.protocol_version,
+        endpoint: descriptor.endpoint.clone(),
+        signature: kr_protocol::scalars::Signature64::from_bytes([0; 64]),
+    }
+}
+
 /// A recovery that reached a worker, and found its closure recorded while it waited for the
 /// worker's answer, writes no row for it and publishes nothing. The control is the same adoption
 /// before any closure, which writes the row and puts the worker in the directory.
@@ -220,15 +235,7 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
     let script = Scripted::new();
     let world = scripted(&script).await;
     let descriptor = world.worker.descriptor.clone();
-    let proof = kr_protocol::worker::WorkerVerifyProof {
-        session_id: descriptor.session_id,
-        session_epoch: descriptor.session_epoch,
-        boot_identity: descriptor.boot_identity.clone(),
-        process_start_identity: descriptor.process_start_identity.clone(),
-        protocol_version: descriptor.protocol_version,
-        endpoint: descriptor.endpoint.clone(),
-        signature: kr_protocol::scalars::Signature64::from_bytes([0; 64]),
-    };
+    let proof = a_proof_of(&world);
     let adopt = |controller: std::sync::Arc<crate::service::Controller>| {
         let (descriptor, proof, endpoint) = (
             descriptor.clone(),
@@ -365,5 +372,158 @@ async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
     assert!(report.holds(), "{report:?}");
     assert!(report.workers.is_empty(), "{report:?}");
     assert_eq!(world.controller.leases.workers_held(), 0);
+    world.serving.abort();
+}
+
+/// Starts an adoption of the world's worker on a task of its own, and holds it where it has
+/// recorded the worker and not yet published it. The daemon has not reached the worker before
+/// that: nothing is in its directory.
+async fn an_adoption_held_before_its_publication(
+    world: &Silent,
+) -> (
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    let (arrived, go) = world.controller.before_a_worker_is_published.arm();
+    let descriptor = world.worker.descriptor.clone();
+    let proof = a_proof_of(world);
+    let endpoint = world.worker.endpoint.clone();
+    let controller = std::sync::Arc::clone(&world.controller);
+    let adopting = tokio::spawn(async move {
+        controller
+            .adopt(
+                descriptor.display_number,
+                &descriptor.worker_public_key,
+                &proof,
+                &endpoint,
+                None,
+            )
+            .await
+    });
+    arrived.await.expect("the adoption reaches its publication");
+    (adopting, go)
+}
+
+/// KR-REQ-09.12: a worker whose row is recorded and that is not yet published is pending in a
+/// revocation, never absent from it: the barrier's members are the registry's, which an adoption
+/// writes before it publishes anything a dispatch could reach the worker through. Once the adoption
+/// has published the worker it is held in every place the daemon holds a worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
+    assert_eq!(
+        super::a_closure_that_is_cancelled::held_of(&world),
+        Some([false; 4])
+    );
+
+    let barrier = world
+        .controller
+        .revoke_authority()
+        .await
+        .expect("the revocation is raised");
+    assert!(!barrier.holds(), "{barrier:?}");
+    assert_eq!(barrier.pending(), vec![world.session_id]);
+
+    go.send(()).expect("the adoption is waiting");
+    adopting
+        .await
+        .expect("the adoption's task ends")
+        .expect("the adoption is made");
+    assert_eq!(
+        super::a_closure_that_is_cancelled::held_of(&world),
+        Some([true, false, true, true])
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-09.12: an adoption that a closure overtakes between its row and its publication
+/// publishes nothing: no directory entry, no descriptor, no place in the plugin admissions' set,
+/// and the revocation that follows holds with no worker to wait for. The control is the same
+/// adoption with no closure, above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
+
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    go.send(()).expect("the adoption is waiting");
+    adopting
+        .await
+        .expect("the adoption's task ends")
+        .expect("an adoption that finds the closure has nothing to do");
+
+    assert_eq!(
+        super::a_closure_that_is_cancelled::held_of(&world),
+        Some([false; 4])
+    );
+    let report = world
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the announcement is made");
+    assert!(report.holds(), "{report:?}");
+    assert!(report.workers.is_empty(), "{report:?}");
+    world.serving.abort();
+}
+
+/// No connection is opened to a worker whose session has closed, by a caller that took the worker
+/// from the directory before the closure and asks for its connection after it: the caller is told
+/// the session is unknown and the connection table holds nothing for it. The control is the same
+/// call before the closure, which gives the link and keeps its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_connection_is_opened_to_a_worker_whose_session_closed() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let stale = world.worker.clone();
+
+    let mut link = world
+        .controller
+        .worker_client(&stale)
+        .await
+        .expect("a worker that is not closed is given its link");
+    link.give_back();
+    drop(link);
+    assert!(
+        world
+            .controller
+            .connections
+            .lock()
+            .await
+            .contains_key(&world.session_id)
+    );
+
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    let refused = world
+        .controller
+        .worker_client(&stale)
+        .await
+        .expect_err("a worker whose session closed is given no link");
+    assert!(matches!(refused, ControllerError::UnknownSession { .. }));
+    assert!(
+        !world
+            .controller
+            .connections
+            .lock()
+            .await
+            .contains_key(&world.session_id),
+        "the connection table holds nothing for a closed session"
+    );
     world.serving.abort();
 }

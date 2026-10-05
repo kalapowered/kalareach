@@ -411,6 +411,8 @@ impl Controller {
                     .map(|summary| &summary.desktop),
             )?;
         }
+        #[cfg(test)]
+        self.before_a_worker_is_published.wait().await;
         let descriptor = WorkerDescriptor {
             session_id: proof.session_id,
             session_epoch: proof.session_epoch,
@@ -424,16 +426,14 @@ impl Controller {
             worker_profile: WorkerProfile::HeadlessUser,
             published_at_ms: kr_ipc::now_ms(),
         };
-        kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
-        self.add_worker(
+        self.publish_worker(
             KnownWorker {
                 descriptor,
                 endpoint: endpoint.clone(),
             },
             described,
         )
-        .await;
-        Ok(())
+        .await
     }
 }
 
