@@ -198,8 +198,8 @@ own build carries, and holds nothing already in the store to it. A release insta
 build with fewer programs in its manifest can still be started, is still shown by `kr host
 versions`, and can be updated to a release with all the programs that the host now needs. A program
 is added to the list in the release that starts needing it. It's trickier to remove programs from
-the list though: if a new release no longer needs a program that previous releases needed, then that
-new release will not be allowed on any host that has a build that needs that program.
+the list though: a release that stops carrying a program is refused by every host whose current
+release was built with that program in its list.
 
 A release that carries no update channel root can be installed with `kr host install`, which takes
 the release's own word for what it is, and a host whose current release carries none has no key to
