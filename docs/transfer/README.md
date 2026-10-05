@@ -73,9 +73,10 @@ the worker on its own socket. A draft is sent to one session, and an attachment 
 attachments the draft holds, and any it gets later, can only be held by the session it was sent to.
 An attachment uploaded without a session takes that session. A prompt that names a draft for another
 session, or a draft that holds an attachment belonging to another session, is refused before
-anything is sent. A prompt the worker refuses was still sent to its session, so the attachments stay
-with it. The host tells the service which sessions its retention still covers; the service never
-guesses.
+anything is sent. A prompt the worker takes and then refuses was still sent to its session, so the
+attachments stay with it. A prompt made under an identifier already used for another prompt is
+refused before the draft is recorded. The host tells the service which sessions its retention still
+covers; the service never guesses.
 
 The sweep works by first reading the published attachments. It then asks the archive which of the
 sessions that the submitted ones name still keep what was submitted to them, so the answer is taken

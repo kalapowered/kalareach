@@ -89,10 +89,20 @@ pub(super) struct Scripted {
     accepts_prompts: AtomicBool,
     /// Where it holds the next prompt submission it is forwarded, once a test has set one.
     holding_a_prompt: std::sync::Mutex<Option<End>>,
-    /// The prompts it has accepted, by the action they came under: the digest of what was sent,
-    /// which is what a repeat is compared with.
-    accepted_prompts: std::sync::Mutex<BTreeMap<ActionId, kr_protocol::scalars::Digest256>>,
+    /// What it holds for the prompts it was forwarded, by the actor and the action: the digest of
+    /// what was sent, and the failure its receipt records where the prompt was refused (none for
+    /// one it accepted).
+    prompt_receipts: std::sync::Mutex<BTreeMap<PromptKey, PromptReceipt>>,
+    /// Whether it cannot read its receipts, as a worker whose journal is failing.
+    receipts_unreadable: AtomicBool,
 }
+
+/// The actor and the action a scripted worker keeps a prompt's receipt under.
+type PromptKey = (kr_protocol::ids::ActorId, ActionId);
+
+/// What a scripted worker keeps of a prompt: the digest of what was sent, and the failure the
+/// receipt records where the prompt was refused.
+type PromptReceipt = (kr_protocol::scalars::Digest256, Option<ProtocolError>);
 
 /// Where a scripted worker goes: at the next read it is sent.
 struct End {
@@ -126,7 +136,8 @@ impl Scripted {
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
             accepts_prompts: AtomicBool::new(false),
             holding_a_prompt: std::sync::Mutex::new(None),
-            accepted_prompts: std::sync::Mutex::new(BTreeMap::new()),
+            prompt_receipts: std::sync::Mutex::new(BTreeMap::new()),
+            receipts_unreadable: AtomicBool::new(false),
         })
     }
 
@@ -190,52 +201,88 @@ impl Scripted {
     }
 
     /// How this worker answers a prompt it is forwarded with no lifetime left, which it never
-    /// admits: from the receipt it holds for the action, with the result it kept or as the receipt
-    /// stands, with `ID_CONFLICT` where the action was used with another payload, and otherwise
-    /// with the refusal of a first admission that has no lifetime, keeping nothing.
+    /// admits: from the receipt it holds for the actor's action, with the result it kept or as the
+    /// receipt stands, with `ID_CONFLICT` where the action was used with another payload, and
+    /// otherwise with the refusal of a first admission that has no lifetime, keeping nothing. A
+    /// worker that cannot read its receipts says so, and says nothing of whether it holds one.
     fn prompt_without_a_lifetime(
         &self,
-        request_id: kr_protocol::ids::RequestId,
-        action_id: ActionId,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        actor_id: &kr_protocol::ids::ActorId,
         digest: kr_protocol::scalars::Digest256,
     ) -> ControlFrame {
-        let accepted = self
-            .accepted_prompts
+        let request_id = mutation.request_id;
+        let action_id = mutation.action_id;
+        let held = self
+            .prompt_receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&action_id)
-            .copied();
-        let kept = self
-            .receipts_only
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&action_id)
+            .get(&(actor_id.clone(), action_id))
             .cloned();
-        let outcome = match (accepted, kept) {
-            (Some(held), _) if held != digest => Outcome::Error(ProtocolError::new(
-                ErrorCode::IdConflict,
-                format!("action {action_id} was already used with a different request"),
-            )),
-            (Some(_), _) => {
-                Outcome::Ok(ParamsValue::from_typed(&Self::accepted_prompt()).expect("encodes"))
+        let outcome = if self.receipts_unreadable.load(Ordering::Acquire) {
+            Outcome::Error(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "this worker's journal cannot be read",
+            ))
+        } else {
+            match held {
+                Some((held, _)) if held != digest => Outcome::Error(ProtocolError::new(
+                    ErrorCode::IdConflict,
+                    format!("action {action_id} was already used with a different request"),
+                )),
+                Some((_, None)) => {
+                    Outcome::Ok(ParamsValue::from_typed(&Self::accepted_prompt()).expect("encodes"))
+                }
+                Some((held, Some(failure))) => {
+                    let mut receipt = self.receipt_of(
+                        action_id,
+                        mutation.method.method().expect("a listed method"),
+                        Some(failure),
+                    );
+                    receipt.actor_id = actor_id.clone();
+                    receipt.payload_digest = held;
+                    Outcome::Ok(
+                        ParamsValue::from_typed(&kr_protocol::receipt::ReceiptResponse {
+                            request_id,
+                            receipt,
+                        })
+                        .expect("encodes"),
+                    )
+                }
+                None => Outcome::Error(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the accepted deadline for this action had passed before it reached this \
+                     worker, so it cannot be admitted for the first time",
+                )),
             }
-            (None, Some((method, failure))) => Outcome::Ok(
-                ParamsValue::from_typed(&kr_protocol::receipt::ReceiptResponse {
-                    request_id,
-                    receipt: self.receipt_of(action_id, method, Some(failure)),
-                })
-                .expect("encodes"),
-            ),
-            (None, None) => Outcome::Error(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "the accepted deadline for this action had passed before it reached this worker, \
-                 so it cannot be admitted for the first time",
-            )),
         };
         ControlFrame::Response(Response {
             request_id,
             outcome,
         })
+    }
+
+    /// Has this worker hold a receipt for `mutation` made by `actor_id` that records `failure`,
+    /// as its journal holds a prompt it refused.
+    pub(super) fn holds_a_refused_prompt(
+        &self,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        actor_id: &kr_protocol::ids::ActorId,
+        failure: ProtocolError,
+    ) {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).expect("a digest");
+        self.prompt_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (actor_id.clone(), mutation.action_id),
+                (digest, Some(failure)),
+            );
+    }
+
+    /// Has this worker fail to read its receipts, as a worker whose journal cannot be read does.
+    pub(super) fn cannot_read_its_receipts(&self) {
+        self.receipts_unreadable.store(true, Ordering::Release);
     }
 
     /// What this worker answers a prompt it accepts.
@@ -633,8 +680,8 @@ fn serve_scripted(
                                 .expect("a digest");
                                 if forwarded.accepted_deadline_boot_ms.get() == 0 {
                                     vec![script.prompt_without_a_lifetime(
-                                        forwarded.mutation.request_id,
-                                        action_id,
+                                        &forwarded.mutation,
+                                        &forwarded.actor.actor_id,
                                         digest,
                                     )]
                                 } else {
@@ -648,10 +695,13 @@ fn serve_scripted(
                                         let _ = holding.go.await;
                                     }
                                     script
-                                        .accepted_prompts
+                                        .prompt_receipts
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(action_id, digest);
+                                        .insert(
+                                            (forwarded.actor.actor_id.clone(), action_id),
+                                            (digest, None),
+                                        );
                                     vec![respond(
                                         forwarded.mutation.request_id,
                                         &Scripted::accepted_prompt(),
