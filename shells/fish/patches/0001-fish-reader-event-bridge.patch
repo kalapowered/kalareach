@@ -248,7 +248,20 @@
          is_err |= matches!(escape_sequence.state, EscapeSequenceParseState::Error);
          let mut evt = (!is_err).then(|| {
              match escape_sequence.state {
-@@ -707,7 +748,9 @@
+@@ -144,6 +185,12 @@
+             );
+             return;
+         }
++        // A key the person typed while the reader waits for the terminal is still theirs. It is
++        // marked, so that the reader does not take it for one it put in its own queue.
++        let mut evt = evt;
++        if let CharEvent::Key(key) = &mut evt {
++            key.deferred = true;
++        }
+         self.push_back(evt);
+     }
+ 
+@@ -707,7 +754,9 @@
  
  fn decode_utf8_at_least_one(
      buffer: &mut Vec<u8>,
@@ -278,7 +291,39 @@
  };
  
  #[derive(Clone, Debug, PartialEq)]
-@@ -482,9 +483,18 @@
+@@ -43,6 +44,10 @@
+     /// Note that the generic self-insert case does not have any characters, so this would be empty.
+     /// This is also empty for invalid Unicode code points, which produce multiple characters.
+     pub seq: WString,
++    /// True for a key the person typed while the reader waited for the terminal's answer to a
++    /// question of its own, which the reader set aside in its queue until the answer came. It is
++    /// still the person's key, and not one the reader put in its own queue.
++    pub deferred: bool,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -101,6 +106,12 @@
+     pub fn is_char(&self) -> bool {
+         matches!(self, CharEvent::Key(_))
+     }
++
++    /// True for a key the person typed while the reader waited for the terminal's answer to a
++    /// question of its own, and the reader set aside until the answer came.
++    pub fn is_deferred_key(&self) -> bool {
++        matches!(self, CharEvent::Key(kevt) if kevt.deferred)
++    }
+ 
+     pub fn is_readline(&self) -> bool {
+         matches!(self, CharEvent::Readline(_))
+@@ -157,6 +168,7 @@
+             key,
+             input_style: CharInputStyle::Normal,
+             seq,
++            deferred: false,
+         })
+     }
+ 
+@@ -482,9 +494,18 @@
                  return mevt;
              }
  
@@ -297,7 +342,7 @@
                  if self.is_blocked_querying() {
                      Timeout::Duration(self.get_input_data().blocking_query_timeout.unwrap())
                  } else {
-@@ -507,6 +517,10 @@
+@@ -507,6 +528,10 @@
                      self.ioport_notified();
                  }
  
@@ -308,7 +353,7 @@
                  InputEventTrigger::Byte(read_byte) => {
                      on_byte_read(self, read_byte);
                  }
-@@ -537,11 +551,36 @@
+@@ -537,11 +562,36 @@
              return Some(evt);
          }
  
@@ -350,7 +395,7 @@
      }
  
      /// Return the fd from which to read.
-@@ -554,6 +593,33 @@
+@@ -554,6 +604,33 @@
          -1
      }
  
@@ -384,7 +429,7 @@
      /// Return the input data. This is to be implemented by the concrete type.
      fn get_input_data(&self) -> &InputData;
      fn get_input_data_mut(&mut self) -> &mut InputData;
-@@ -710,16 +776,16 @@
+@@ -710,16 +787,16 @@
                  Duration::from_millis(ms)
              }
          };
@@ -411,7 +456,7 @@
              flog!(
                  reader,
                  format!("Incomplete escape sequence: {}", DisplayBytes(buffer))
-@@ -737,9 +803,40 @@
+@@ -737,9 +814,40 @@
          }
          let next = readb(fd)?;
          buffer.push(next);
@@ -452,7 +497,7 @@
      /// Return if we have any lookahead.
      #[cfg(test)]
      fn has_lookahead(&self) -> bool {
-@@ -775,6 +872,9 @@
+@@ -775,6 +883,9 @@
      // Our ioport reported a change, so service main thread requests.
      IOPortNotified,
  
@@ -462,7 +507,7 @@
      // No file descriptor was ready within the query timeout.
      TimeoutElapsed,
  }
-@@ -795,6 +895,8 @@
+@@ -795,6 +906,8 @@
  pub(super) fn next_input_event(
      in_fd: RawFd,
      ioport_fd: RawFd,
@@ -471,7 +516,7 @@
      timeout: Timeout,
  ) -> InputEventTrigger {
      let mut fdset = FdReadableSet::new();
-@@ -805,6 +907,13 @@
+@@ -805,6 +918,13 @@
          // Add the completion ioport (possibly -1 - a no-op).
          fdset.add(ioport_fd);
  
@@ -485,7 +530,7 @@
          // Get the uvar notifier fd (possibly none).
          let notifier = default_notifier();
          let notifier_fd = notifier.notification_fd();
-@@ -843,6 +952,12 @@
+@@ -843,6 +963,12 @@
              return readb(in_fd).map_or(InputEventTrigger::Eof, InputEventTrigger::Byte);
          }
  
@@ -498,7 +543,7 @@
          // Check for iothread completions only if there is no data to be read from the stdin.
          // This gives priority to the foreground.
          if fdset.test(ioport_fd) {
-@@ -851,6 +966,9 @@
+@@ -851,6 +977,9 @@
      }
  }
  

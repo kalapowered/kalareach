@@ -485,8 +485,15 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
     // fish has no quoted insertion of its own; `get-key` is the operation that waits for a literal
     // key and reports it rather than acting on it, which is the state the exclusion protects.
     out.pending_quoted_insertion = c_int::from(state.pending_literal_key);
-    // Events queued ahead of the terminal are the reader's own input, not the person's.
-    out.pending_macro_input = c_int::from(!data.input_data.queue.is_empty());
+    // Events queued ahead of the terminal are the reader's own input, not the person's. A key the
+    // person typed while the reader waited for the terminal's answer to a question of its own is
+    // theirs, though the reader kept it in its queue.
+    out.pending_macro_input = c_int::from(
+        data.input_data
+            .queue
+            .iter()
+            .any(|event| !event.is_deferred_key()),
+    );
     out.pending_search = c_int::from(data.kr_search_active());
     out.pending_numeric_argument = c_int::from(vi_count);
     out.pending_multikey_sequence = c_int::from(state.in_key_wait && state.peeked_keys > 0);
