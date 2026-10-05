@@ -635,9 +635,11 @@ mod tests {
         }
     }
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let store = Store::open(directory.path()).expect("an empty store");
+    /// A store in a directory only its owner reaches, as the daemon's state directory is: a record
+    /// is read back only where no other account may write it.
+    fn store() -> (kr_ipc::testing::TempHost, Store) {
+        let directory = kr_ipc::testing::TempHost::create();
+        let store = Store::open(directory.root()).expect("an empty store");
         (directory, store)
     }
 
@@ -690,12 +692,12 @@ mod tests {
         assert_eq!(store.list(None, 100).len(), 1, "and nothing was recorded");
 
         // What an earlier build recorded: written into the file as it was, then read.
-        let path = directory.path().join("environments.json");
+        let path = directory.root().join("environments.json");
         let mut document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("the record")).expect("JSON");
         document["enrolments"][0]["clipboard_destination"] = serde_json::json!("clipboard-sync");
         std::fs::write(&path, serde_json::to_vec(&document).expect("encodes")).expect("written");
-        let reopened = Store::open(directory.path()).expect("an earlier record is read");
+        let reopened = Store::open(directory.root()).expect("an earlier record is read");
         let rows = reopened.list(None, 100);
         assert_eq!(rows.len(), 1, "it is still listed");
         assert!(!rows[0].enrolment.takes_clipboard_writes());
@@ -707,7 +709,7 @@ mod tests {
     fn an_enrolment_is_recorded_and_read_back() {
         let (directory, mut store) = store();
         store.enrol(enrolment(1, "ubuntu"), 100).expect("enrolled");
-        let reopened = Store::open(directory.path()).expect("reopened");
+        let reopened = Store::open(directory.root()).expect("reopened");
         let rows = reopened.list(None, 100);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].enrolment.target, "ubuntu-distribution");
@@ -1079,7 +1081,7 @@ mod tests {
         assert!(store.forget(record.environment_id).expect("forgotten"));
         assert!(!store.forget(record.environment_id).expect("already gone"));
         assert!(
-            Store::open(directory.path())
+            Store::open(directory.root())
                 .expect("reopened")
                 .list(None, 100)
                 .is_empty()
