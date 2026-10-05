@@ -2349,7 +2349,7 @@ pub fn current_uid() -> u32 {
     0
 }
 
-/// What the system's account file records of the user this process runs as.
+/// What the system records of the user this process runs as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswdEntry {
     /// The account's name.
@@ -2358,29 +2358,105 @@ pub struct PasswdEntry {
     pub home: Option<String>,
 }
 
-/// Reads the record the system's account file holds for the user this process runs as.
+/// Reads the system's record of the user this process runs as.
 ///
-/// A system whose accounts are not in that file, a directory service, has no record here, and
-/// neither has a platform with no such file.
+/// The system answers from whichever database holds the account: its account file, or the
+/// directory service of a system that keeps a person's account there. A platform with no such
+/// database has no record, and neither has an account the system does not know.
 #[cfg(unix)]
 #[must_use]
 pub fn passwd_entry() -> Option<PasswdEntry> {
-    let uid = current_uid();
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    passwd.lines().find_map(|line| {
-        let fields: Vec<&str> = line.split(':').collect();
-        (fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid)).then(|| PasswdEntry {
-            name: fields[0].to_owned(),
-            home: Some(fields[5].to_owned()).filter(|home| !home.is_empty()),
-        })
-    })
+    account::record_of(current_uid())
 }
 
-/// Reads the record the system's account file holds for the user this process runs as.
+/// Reads the system's record of the user this process runs as.
 #[cfg(not(unix))]
 #[must_use]
 pub fn passwd_entry() -> Option<PasswdEntry> {
     None
+}
+
+/// The system's account database, which the standard library has no interface to.
+///
+/// `getpwuid_r` is what the system's own tools ask. It is the only way to reach an account that
+/// is kept in a directory service, which the account file does not list.
+#[cfg(unix)]
+mod account {
+    #![expect(
+        unsafe_code,
+        reason = "the system's account database is read through `getpwuid_r`, which has no safe \
+                  interface"
+    )]
+
+    use std::ffi::CStr;
+
+    use super::PasswdEntry;
+
+    /// The size a record is first read into, which is room for an ordinary one.
+    const FIRST_BUFFER_BYTES: usize = 1024;
+
+    /// The largest buffer a record may need before it is taken to be no record: a record that does
+    /// not fit this is not an account's.
+    const LARGEST_BUFFER_BYTES: usize = 1 << 20;
+
+    /// The system's record of the account with this number, or none when the system has none or
+    /// its name is not text.
+    pub(super) fn record_of(uid: u32) -> Option<PasswdEntry> {
+        let mut size = FIRST_BUFFER_BYTES;
+        loop {
+            let mut buffer = vec![0 as libc::c_char; size];
+            // SAFETY: `passwd` is a plain record of integers and pointers, all of which are valid
+            // as zero.
+            let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut found: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: `record`, `buffer` and `found` are live locals of the types the call
+            // declares, and the buffer's length is the one passed with it. On a success the call
+            // points the record's strings into the buffer and `found` at the record, or leaves
+            // `found` null where it has no such account.
+            let status = unsafe {
+                libc::getpwuid_r(
+                    uid,
+                    &raw mut record,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &raw mut found,
+                )
+            };
+            match status {
+                0 if found.is_null() => return None,
+                0 => {
+                    // SAFETY: the call succeeded, so the record's strings, where they are not null,
+                    // are ended by a zero byte inside `buffer`, which lives to the end of this
+                    // block and is not touched while they are read.
+                    let (name, home) = unsafe { (text(record.pw_name), text(record.pw_dir)) };
+                    return Some(PasswdEntry {
+                        name: name?,
+                        home: home.filter(|home| !home.is_empty()),
+                    });
+                }
+                libc::ERANGE if size < LARGEST_BUFFER_BYTES => size *= 2,
+                libc::EINTR => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// A record's string, when it has one that is text.
+    ///
+    /// # Safety
+    ///
+    /// `string` is null or points to a string ended by a zero byte that stays alive and unchanged
+    /// for this call.
+    unsafe fn text(string: *const libc::c_char) -> Option<String> {
+        if string.is_null() {
+            return None;
+        }
+        // SAFETY: the caller states that it is a string ended by a zero byte, and not null.
+        unsafe { CStr::from_ptr(string) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
 }
 
 /// The home a session of this user starts with.

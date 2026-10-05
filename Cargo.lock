@@ -4678,6 +4678,7 @@ dependencies = [
  "kr-flush",
  "kr-ipc",
  "kr-protocol",
+ "libc",
  "libproc",
  "rustix",
  "serde",
