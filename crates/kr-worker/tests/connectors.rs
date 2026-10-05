@@ -22,15 +22,6 @@ use kr_worker::broker::connectors::{
     ConnectorSource, ConnectorSources, InstalledConnector, fixture,
 };
 
-/// The forwarder an installation names in a bridge: an absolute path, which on Windows has a drive.
-fn installed_forwarder() -> &'static Path {
-    if cfg!(windows) {
-        Path::new(r"C:\opt\kalareach\bin\kr-hook.exe")
-    } else {
-        Path::new("/opt/kalareach/bin/kr-hook")
-    }
-}
-
 /// A directory of the test's own, removed when it is dropped.
 struct Store {
     root: PathBuf,
@@ -45,12 +36,13 @@ impl Store {
     }
 
     fn package(&self) -> ConnectorSource {
-        fixture::claude_code_package(&self.root, installed_forwarder())
+        fixture::claude_code_package(&self.root, Path::new(fixture::FORWARDER))
             .expect("the package is written")
     }
 
     fn shaped(&self, shape: &fixture::Shape) -> ConnectorSource {
-        fixture::package(&self.root, installed_forwarder(), shape).expect("the package is written")
+        fixture::package(&self.root, Path::new(fixture::FORWARDER), shape)
+            .expect("the package is written")
     }
 
     /// A file standing in for an installation's forwarder, at `relative` inside the store.
@@ -252,7 +244,7 @@ fn a_command_the_package_does_not_recognise_is_refused() {
     for command in ["bin/claude", "/usr/local/bin/claude", "codex", ""] {
         let source = fixture::package(
             &store.root,
-            installed_forwarder(),
+            Path::new(fixture::FORWARDER),
             &fixture::Shape {
                 integration: Some(fixture::declaration(command, &fixture::FLAGS, &[])),
                 ..fixture::Shape::claude_code()

@@ -1186,7 +1186,7 @@ fn bound(host: &Host) -> Bound {
     let packages = tempfile::tempdir().expect("a directory on the internal disk");
     let source = kr_worker::broker::connectors::fixture::claude_code_package(
         packages.path(),
-        std::path::Path::new("/opt/kalareach/bin/kr-hook"),
+        std::path::Path::new(kr_worker::broker::connectors::fixture::FORWARDER),
     )
     .expect("the package is written");
     let package = testing::admitted(&source);
