@@ -2821,6 +2821,11 @@ async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
     );
     assert_eq!(container.state(), "exited");
 
+    // Another container starts while this one is stopped, as on any host that runs more than one.
+    // The new mount takes the device number the stopped container's filesystem had, so the
+    // filesystem it comes back on is the same one under another device number.
+    let _neighbour = Container::start();
+
     // A listing and a plain refresh read and observe, and start nothing.
     let listed = world.run(&["--json", "bridge", "list"]);
     assert!(listed.status.success());
