@@ -159,8 +159,12 @@ impl Controller {
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
             // What the context says of the session, with the name a person pinned and where the
-            // description host saw it run, so a receipt names the session as the context does.
-            let snapshot = self.voice_snapshot_of(&read.session).await?;
+            // description host saw it run, so a receipt names the session as the context does. A
+            // receipt says what was done and what the host observed, so what a model wrote of the
+            // session is left out of it: nothing here holds that text to the privacy state it was
+            // read under, and a receipt carries it past the removal privacy mode makes.
+            let mut snapshot = self.voice_snapshot_of(&read.session).await?;
+            snapshot.generated = None;
             let narrowed = self.voice_authority_now(proposal, session_id)?;
             // The same bound the context path applies, and the answer is built from what it
             // admitted and from nothing else. A session's description carries its number and the
