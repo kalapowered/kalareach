@@ -9590,7 +9590,8 @@ export interface ChangeSetVersionSummary {
  *
  * Section 25 requires a summary to name its source interval and stay separate from the events. It
  * is never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that
- * ignores it loses nothing authoritative.
+ * ignores it loses nothing authoritative. It is generated text and is labelled as such wherever it
+ * is shown; it carries no status, approval or instruction.
  */
 export interface ChangeSummary {
   /**
@@ -9602,7 +9603,7 @@ export interface ChangeSummary {
    */
   from_ms: string
   /**
-   * The model that produced it, as the host recorded it.
+   * The model that produced it, as the host recorded it: its profile identifier and revision.
    */
   model: string
   /**
@@ -26583,6 +26584,19 @@ export interface VisitChangedParams {
    * One KalaReach terminal session.
    */
   session_id: string
+  /**
+   * Whether to ask the host's model to summarise what changed, and to be answered with the
+   * newest summary it has written.
+   *
+   * The interval is frozen when it is asked for: from the cursor this actor has acknowledged to
+   * the cursor the session's changes have reached. The answer does not wait for the model. It
+   * carries a summary when one has been written for an interval that starts at the same first
+   * cursor and ends at or before the head, and a client that asks again later is answered with
+   * it once it is; asking again never restarts the work. A host that runs no model, or has not
+   * selected one, or is in privacy mode, answers none, and a grant that does not reach back to
+   * the first change of the interval is answered none.
+   */
+  summarise: boolean
 }
 /**
  * The result of `visit.changed`.
@@ -26612,7 +26626,12 @@ export interface VisitChangedResult {
    */
   omitted: AttentionGap[]
   /**
-   * The summary of this interval, when one was requested and produced.
+   * The newest summary written for an interval that starts at [`VisitChangedResult::from_cursor`]
+   * and ends at or before the cursor the session's changes have reached, when it was asked for
+   * with [`VisitChangedParams::summarise`] and one has been written.
+   *
+   * It names the interval it covers, which may end before [`VisitChangedResult::to_cursor`],
+   * and the changes after it are in `changes` as they always are: it is never merged into them.
    */
   summary: ChangeSummary | null
   /**
