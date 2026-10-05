@@ -93,7 +93,7 @@ fn reached(parked: Parked, world: &Silent) -> bool {
 const WAIT: Duration = Duration::from_secs(60);
 
 /// Waits until `condition` holds, polling it between yields to the other tasks of the runtime.
-pub(super) async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     let waited = tokio::time::timeout(WAIT, async {
         while !condition() {
             tokio::task::yield_now().await;
@@ -106,7 +106,7 @@ pub(super) async fn until(what: &str, mut condition: impl FnMut() -> bool) {
 /// Whether the daemon still holds the session's worker in its directory, its connection table, the
 /// set of workers the plugin admissions wait for, and the descriptors it published. Read with
 /// `try_lock`, because another task of the daemon may be holding a lock for a moment.
-pub(super) fn held_of(world: &Silent) -> Option<[bool; 4]> {
+fn held_of(world: &Silent) -> Option<[bool; 4]> {
     let directory = world.controller.directory.try_lock().ok()?;
     let connections = world.controller.connections.try_lock().ok()?;
     Some([

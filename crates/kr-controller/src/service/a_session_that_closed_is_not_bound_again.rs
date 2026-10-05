@@ -375,6 +375,33 @@ async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
     world.serving.abort();
 }
 
+/// What the daemon holds of the session's worker: its entry in the directory, its slot in the
+/// connection table, its place in the set the plugin admissions wait for, and its published
+/// descriptor. The locks are taken, so the answer is never that something could not be read.
+async fn held_by_the_daemon(world: &Silent) -> [bool; 4] {
+    let in_the_directory = world
+        .controller
+        .directory
+        .lock()
+        .await
+        .get(world.session_id)
+        .is_some();
+    let has_a_slot = world
+        .controller
+        .connections
+        .lock()
+        .await
+        .contains_key(&world.session_id);
+    [
+        in_the_directory,
+        has_a_slot,
+        world.controller.plugin_bridge.holds(world.session_id),
+        kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_some(),
+    ]
+}
+
 /// Starts an adoption of the world's worker on a task of its own, and holds it where it has
 /// recorded the worker and not yet published it. The daemon has not reached the worker before
 /// that: nothing is in its directory.
@@ -419,10 +446,7 @@ async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
     let script = Scripted::new();
     let world = scripted(&script).await;
     let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
-    assert_eq!(
-        super::a_closure_that_is_cancelled::held_of(&world),
-        Some([false; 4])
-    );
+    assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 
     let barrier = world
         .controller
@@ -437,10 +461,10 @@ async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
         .await
         .expect("the adoption's task ends")
         .expect("the adoption is made");
-    assert_eq!(
-        super::a_closure_that_is_cancelled::held_of(&world),
-        Some([true, false, true, true])
-    );
+    // Its slot in the connection table is not asked for: the plugin admissions are woken by the
+    // publication, and a round they send is entitled to open it.
+    let [in_the_directory, _, in_the_admissions, described] = held_by_the_daemon(&world).await;
+    assert!(in_the_directory && in_the_admissions && described);
     world.serving.abort();
 }
 
@@ -465,9 +489,15 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
         .expect("the adoption's task ends")
         .expect("an adoption that finds the closure has nothing to do");
 
-    assert_eq!(
-        super::a_closure_that_is_cancelled::held_of(&world),
-        Some([false; 4])
+    // Nothing of it is held, and no reclaim that needs room waits for a worker that will not report.
+    assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
+    assert!(
+        world
+            .controller
+            .pending_admissions()
+            .await
+            .expect("the catalogue's revision is read")
+            .is_empty()
     );
     let report = world
         .controller
