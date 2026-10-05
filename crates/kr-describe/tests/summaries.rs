@@ -123,8 +123,8 @@ fn queue_a_description(service: &mut DescriptionService, session_id: &SessionId,
 }
 
 /// KR-REQ-18.02: a requested summary is generated under a grammar and a prompt of its own, built
-/// from the changes it was asked for, and published with the interval it covers, when its first
-/// and last change were recorded, and the profile and the privacy generation it was written under.
+/// from the changes it was asked for, and published with the interval it covers, the moments of its
+/// earliest and latest change, and the profile and the privacy generation it was written under.
 #[test]
 fn a_summary_is_generated_under_its_own_grammar_and_published_with_what_it_covers() {
     let mut service = service();
@@ -963,9 +963,8 @@ fn a_summary_prompt_says_how_many_earlier_changes_it_does_not_show() {
     );
     assert!(fitted.tokens <= bare + 100);
 
-    // The longest count the line can hold is one the least a job can be.
-    let bare = Prompt::bare_summary().text();
-    assert!(line(&bare).is_some());
+    // The longest count the line can hold is the one the least a job can be.
+    assert_eq!(line(&Prompt::bare_summary().text()), Some(u64::MAX));
 }
 
 /// A description's prompt has no such line.
