@@ -111,12 +111,15 @@ async fn the_diagnostics_answer_both_doors_and_carry_no_credential_to_a_device()
     let owners_text = serde_json::to_string(&owners).expect("the answer serialises");
     let devices_text = serde_json::to_string(&devices).expect("the answer serialises");
     for value in &withheld {
+        // As the answer spells it: a backslash in a Windows path is written as two.
+        let spelled = serde_json::to_string(value).expect("the value serialises");
+        let spelled = &spelled[1..spelled.len() - 1];
         assert!(
-            owners_text.contains(value.as_str()),
+            owners_text.contains(spelled),
             "the owner's own report names {value}: {owners_text}"
         );
         assert!(
-            !devices_text.contains(value.as_str()),
+            !devices_text.contains(spelled),
             "{value} reached a paired device: {devices_text}"
         );
     }
