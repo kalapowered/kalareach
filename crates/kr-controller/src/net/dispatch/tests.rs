@@ -2278,7 +2278,8 @@ async fn a_local_prompt_reusing_an_action_for_a_draft_is_refused_before_it_is_re
 /// receipt the worker holds, and nothing about the draft is recorded or sent again, so a record
 /// that would now be refused cannot replace the answer the caller is owed.
 ///
-/// The draft's attachment belongs to another session, so recording it for this one is refused.
+/// The draft's attachment belongs to another session, so recording it for this one is refused. The
+/// worker holds a receipt for this actor and this exact request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_recorded_again() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
@@ -2305,9 +2306,16 @@ async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_rec
         .await
         .expect("records the submission to another session");
     let action_id = ActionId::new(kr_ipc::new_uuid());
-    script.kept_without_a_result(
+    let mutation = a_local_prompt(
+        &world,
+        &admission,
         action_id,
-        Method::AgentPromptSubmit,
+        Nullable::some(draft_id),
+        Nullable::null(),
+    );
+    script.holds_a_refused_prompt(
+        &mutation,
+        &actor,
         ProtocolError::new(
             ErrorCode::UnsupportedCapability,
             "no upstream takes prompts",
@@ -2315,18 +2323,7 @@ async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_rec
     );
 
     let repeated = controller
-        .perform(
-            &actor,
-            admission.connection_id,
-            None,
-            a_local_prompt(
-                &world,
-                &admission,
-                action_id,
-                Nullable::some(draft_id),
-                Nullable::null(),
-            ),
-        )
+        .perform(&actor, admission.connection_id, None, mutation)
         .await;
     let ControlFrame::Response(Response {
         outcome: Outcome::Ok(value),
@@ -2337,6 +2334,7 @@ async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_rec
     };
     let receipt: kr_protocol::receipt::ReceiptResponse = value.to_typed().expect("a receipt");
     assert_eq!(receipt.receipt.action_id, action_id);
+    assert_eq!(receipt.receipt.actor_id, actor);
     assert_eq!(
         receipt.receipt.error.0.map(|error| error.code),
         Some(ErrorCode::UnsupportedCapability)
@@ -2345,6 +2343,59 @@ async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_rec
         prompts_the_worker_was_asked_to_take(&script).is_empty(),
         "nothing is sent again"
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11: a prompt the worker cannot say whether it holds a receipt for is refused with
+/// what the worker said, and the draft it names is not recorded, because the worker may hold a
+/// receipt that makes this a reused identifier or a repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_the_worker_cannot_look_up_is_refused_and_its_draft_is_not_recorded() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    script.cannot_read_its_receipts();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "unknown.bin");
+
+    let answered = controller
+        .perform(
+            &actor,
+            admission.connection_id,
+            None,
+            a_local_prompt(
+                &world,
+                &admission,
+                ActionId::new(kr_ipc::new_uuid()),
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+        )
+        .await;
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    }) = answered
+    else {
+        panic!("the worker's refusal is the answer: {answered:?}");
+    };
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "the draft was recorded though the worker could not say whether it held a receipt"
+    );
+    assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
     world.serving.abort();
 }
 

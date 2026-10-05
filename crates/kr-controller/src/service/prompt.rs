@@ -113,17 +113,18 @@ impl Controller {
         let actor = local_actor(actor_id.clone(), connection_id, self.generation);
         // The record is made for a first submission only, and before the worker is asked to take
         // the prompt. The worker is the only thing that knows whether it already holds a receipt
-        // for this action, so it is asked first with the prompt itself and no lifetime: with no
-        // lifetime a prompt cannot be admitted, so the worker answers only from a receipt it holds
+        // for this action, so it is asked first with the prompt itself and no lifetime. A prompt
+        // with no lifetime cannot be admitted, so the worker answers only from a receipt it holds
         // (a result, or the receipt as it stands, or `ID_CONFLICT` for an identifier that was used
-        // with another payload) and otherwise says the window has passed without keeping anything.
-        // What it answers from a receipt is the answer, and nothing is recorded: the first attempt
-        // recorded the draft, and a record that failed or named another draft would otherwise come
-        // before the answer the caller is owed. Anything else it says means no receipt, and the
-        // draft is recorded as a prompt the worker then refuses is: it was still sent to its
-        // session. A draft this caller does not hold has no attachments for this host to retain,
-        // so naming one is not a failure, and a draft that is for another session is refused
-        // before anything is sent.
+        // with another payload) or, finding none, with the refusal of a first admission that has
+        // no lifetime, which keeps nothing. That refusal is the one answer that says it holds no
+        // receipt, and only then is the draft recorded and the prompt sent. Any other answer is
+        // the answer: a receipt is what the caller is owed and the draft was recorded when it was
+        // first sent, and a refusal that leaves open whether the worker holds a receipt (its
+        // journal cannot be read, a request it will not take) cannot be allowed to change what
+        // is retained before the worker has said. A draft this caller does not hold has no
+        // attachments for this host to retain, so naming one is not a failure, and a draft that is
+        // for another session is refused before anything is sent.
         if accepted.is_some()
             && let Some(draft_id) = crate::transfer::prompted_draft(mutation)
         {
@@ -134,15 +135,11 @@ impl Controller {
             )
             .await;
             match asked {
-                Ok(Ok(Ok(held))) => {
+                Ok(Ok(Err(refusal))) if refusal.code == ErrorCode::PermissionDenied => {}
+                Ok(Ok(answer)) => {
                     link.give_back();
-                    return Ok(held);
+                    return answer.map_err(|refusal| ControllerError::refused(&refusal));
                 }
-                Ok(Ok(Err(refusal))) if refusal.code == ErrorCode::IdConflict => {
-                    link.give_back();
-                    return Err(ControllerError::refused(&refusal));
-                }
-                Ok(Ok(Err(_))) => {}
                 // The link is retired in the two arms below, because its exchange was abandoned or
                 // failed part way and its next caller would read this answer as its own.
                 Ok(Err(error)) => return Err(error.into()),
