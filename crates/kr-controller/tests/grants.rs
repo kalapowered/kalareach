@@ -628,6 +628,127 @@ fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
     );
 }
 
+/// A claim whose attempt answered with nothing it has to keep is given back, so the identifier is
+/// as if no attempt had claimed it; a claim that holds an answer or a refusal never is, because
+/// that is what a retry is owed.
+#[test]
+fn a_claim_that_kept_nothing_is_given_back_and_one_that_kept_an_answer_never_is() {
+    use kr_controller::grants::{ActionClaim, ActionRecord};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::ActionId;
+
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let actor = kr_protocol::ids::ActorId::new("device:phone").expect("a principal");
+    let digest = kr_protocol::scalars::Digest256::from_bytes([7; 32]);
+    let other = kr_protocol::scalars::Digest256::from_bytes([8; 32]);
+    let claim = |action: ActionId, digest: &kr_protocol::scalars::Digest256| {
+        directory
+            .claim_action(&actor, action, digest, 1_000)
+            .expect("readable")
+    };
+
+    // Given back, the identifier is a first request again, whatever its payload.
+    let action = ActionId::new(Uuid::from_bytes([1; 16]));
+    let ActionClaim::Claimed { hold } = claim(action, &digest) else {
+        panic!("the first attempt claims the action");
+    };
+    directory.release_claim(hold).expect("given back");
+    let ActionClaim::Claimed { hold: second } = claim(action, &other) else {
+        panic!("a request under a given-back identifier claims it afresh");
+    };
+    assert!(
+        matches!(
+            claim(action, &other),
+            ActionClaim::Recorded(ActionRecord::InFlight)
+        ),
+        "the attempt that claimed it afresh is the one that holds it"
+    );
+    drop(second);
+
+    // Never given back once it holds an answer or a refusal.
+    let answered = ActionId::new(Uuid::from_bytes([2; 16]));
+    let ActionClaim::Claimed { hold } = claim(answered, &digest) else {
+        panic!("claimed");
+    };
+    directory
+        .retain_result(&hold, b"kept", 1_001)
+        .expect("kept");
+    directory.release_claim(hold).expect("asked");
+    assert_eq!(
+        directory
+            .recorded_action(&actor, answered, &digest)
+            .expect("readable"),
+        Some(ActionRecord::Answered {
+            result: b"kept".to_vec()
+        })
+    );
+    let refused = ActionId::new(Uuid::from_bytes([3; 16]));
+    let ActionClaim::Claimed { hold } = claim(refused, &digest) else {
+        panic!("claimed");
+    };
+    directory
+        .retain_refusal(&hold, ErrorCode::PermissionDenied, "no", 1_001)
+        .expect("kept");
+    directory.release_claim(hold).expect("asked");
+    assert_eq!(
+        directory
+            .recorded_action(&actor, refused, &digest)
+            .expect("readable"),
+        Some(ActionRecord::Refused {
+            code: ErrorCode::PermissionDenied,
+            detail: "no".to_owned()
+        })
+    );
+}
+
+/// A delegation identifier is spent for the device that submitted it, and stays spent until the
+/// caller says it may be forgotten: a store told nothing forgets nothing. A spend is taken back only
+/// under the action that made it.
+#[test]
+fn a_spent_delegation_stays_spent_until_the_caller_says_it_may_be_forgotten() {
+    use kr_protocol::ids::ActionId;
+
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let phone = device_id(1);
+    let tablet = device_id(2);
+    let first = ActionId::new(Uuid::from_bytes([1; 16]));
+    let second = ActionId::new(Uuid::from_bytes([2; 16]));
+    let spend = |device, action, now_ms, forget_before_ms| {
+        directory
+            .spend_delegation(device, "item_one", action, now_ms, forget_before_ms)
+            .expect("asked")
+    };
+
+    assert!(spend(phone, first, 1_000, None));
+    assert!(
+        !spend(phone, second, 1_001, None),
+        "the same identifier for the same device is the same delegation"
+    );
+    assert!(
+        spend(tablet, second, 1_002, None),
+        "another device's identifier is its own"
+    );
+
+    // Taken back under the action that made it, and only under that one.
+    directory
+        .release_delegation(phone, "item_one", second)
+        .expect("asked");
+    assert!(
+        !spend(phone, second, 1_003, None),
+        "another action's release leaves it spent"
+    );
+    directory
+        .release_delegation(phone, "item_one", first)
+        .expect("released");
+    assert!(spend(phone, second, 2_000, None), "spent again at 2000");
+
+    // Told nothing, the store forgets nothing however late it is asked; told to forget what was
+    // spent before a moment, it forgets that and not what was spent at it.
+    assert!(!spend(phone, first, 9_000_000, None));
+    assert!(!spend(phone, first, 9_000_001, Some(2_000)));
+    assert!(spend(phone, first, 9_000_002, Some(2_001)));
+}
+
 /// A claim whose attempt ended before it recorded anything is settled from what the daemon's own
 /// record shows, once: never over an answer or a refusal the claim already holds, never under an
 /// attempt that still holds the claim, and never for an action nobody claimed.

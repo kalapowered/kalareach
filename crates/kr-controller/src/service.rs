@@ -879,6 +879,10 @@ mod a_lease_that_runs_out_at_a_worker;
 #[cfg(test)]
 mod a_voice_grant_on_the_floor;
 
+/// A delegation this host has already answered, asked for again.
+#[cfg(test)]
+mod a_delegation_that_is_asked_again;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

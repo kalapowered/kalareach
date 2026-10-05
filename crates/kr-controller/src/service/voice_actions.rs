@@ -7,6 +7,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
+use kr_protocol::voice::{VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationOutcome};
 
 use crate::error::{ControllerError, Result};
 
@@ -198,11 +199,19 @@ impl Controller {
 
     /// Performs one voice mutation exactly once for its action identifier.
     ///
-    /// Section 23 marks the four voice mutations action-deduplicated, and three of them are not
-    /// safe to repeat: a second `voice.grant` would replace the grant the first one wrote and end
-    /// the calls started under it, and a second `voice.stop` would find nothing. The claim and the
-    /// retained answer are the same ones this host already keeps for an authority change, because
-    /// a voice grant is a grant in that same store.
+    /// Section 23 marks the four voice mutations action-deduplicated, and none of them is safe to
+    /// repeat: a second `voice.grant` would replace the grant the first one wrote and end the calls
+    /// started under it, a second `voice.stop` would find nothing, a second `voice.start` would be
+    /// a second metered call, and a second delegation under one identifier would be a second
+    /// action. The claim and the retained answer are the same ones this host already keeps for an
+    /// authority change, because a voice grant is a grant in that same store.
+    ///
+    /// A delegation is claimed like the others, with one difference in what it asks of the claim.
+    /// The answer to a first submission of an action that needs a confirmation is the challenge the
+    /// device signs, and the signed delegation comes back under the same identifier carrying a
+    /// different payload. That answer admits nothing, so its claim is given back rather than kept,
+    /// and the same delegation then claims the identifier afresh. Every other answer is kept under
+    /// the claim, and a repeat is answered from it.
     ///
     /// `carried` is the admission the mutation was accepted under: the connection it arrived on,
     /// the authority revision that connection was admitted at and the deadline this host accepted.
@@ -230,43 +239,6 @@ impl Controller {
         // under the revision the mutation was admitted at, and whether the deadline has passed on
         // this daemon's own continuous clock.
         let admission = VoiceAdmission::new(Arc::clone(self), carried);
-        // A delegation does not go through this host's action store at all, and cannot yet: the
-        // answer to a first submission of an action that needs a confirmation is the challenge, a
-        // claim taken before that answer is held for longer than the confirmation itself lives,
-        // and the store has no way to give a claim back. It is not read here either, because an
-        // answer that store holds for a delegation is one an earlier build wrote and is content
-        // whose authority nothing on this path re-checks. What makes one delegation one action is
-        // the coordinator's own rule, taken under its lock before it waits for anything: a
-        // delegation already submitted through any live call of that device is refused. Three
-        // things that rule does not give. The `(actor, action)` key section 9 names is absent, so
-        // two different delegations under one action identifier both reach the host; each is
-        // separately authorised and each spends its own delegation, so within one live call
-        // nothing happens twice. An exact resubmission whose reply was lost is told the delegation
-        // has already been submitted rather than answered with the retained receipt section 23
-        // wants. And stopping a call forgets its spent identifiers, so the same one submitted
-        // through a later call is a new action decided on its own merits. Closing the first needs
-        // a release call on the grant store's claim, so a challenge does not hold one, and then a
-        // claim taken before dispatch like every other mutation's; the second needs that store
-        // work and, before any of the answer's content goes back, present view authority and the
-        // current history bound over the session it is about; the third needs spent identifiers
-        // kept for the provider profile's replay window, across a call ending and across a host
-        // restart.
-        if method == Method::VoiceDelegate {
-            // Nothing retains a delegation, so every one is a first admission, and it is asked
-            // before the coordinator decides anything.
-            admission.check()?;
-            return self
-                .voice()
-                .answer(
-                    actor,
-                    mutation,
-                    method,
-                    authority_revision,
-                    self.settled_now_ms(),
-                    &admission,
-                )
-                .await;
-        }
         // What this host already holds about this action, if anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict, and one whose
         // first attempt is running or ended unrecorded is told so rather than performed.
@@ -282,9 +254,11 @@ impl Controller {
         if method != Method::VoiceStop {
             admission.check()?;
         }
-        let hold = match self.claim_voice_action(actor_id, mutation) {
-            Ok(hold) => hold,
-            Err(answer) => return answer,
+        let hold = match self.claim_voice_action(actor_id, mutation)? {
+            crate::grants::ActionClaim::Claimed { hold } => hold,
+            crate::grants::ActionClaim::Recorded(record) => {
+                return self.voice_recorded(actor_id, mutation, record).await;
+            }
         };
         let outcome = self
             .voice()
@@ -297,6 +271,12 @@ impl Controller {
                 &admission,
             )
             .await;
+        // The challenge a device signs admits nothing, so nothing is kept for it: the signed
+        // delegation is the same action under the same identifier, and claims it afresh.
+        if method == Method::VoiceDelegate && is_a_challenge(&outcome) {
+            self.sharing.grants().release_claim(hold)?;
+            return outcome;
+        }
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.
         self.settle_claim(&hold, &outcome)?;
@@ -306,9 +286,9 @@ impl Controller {
 
     /// The digest one voice action is claimed and answered under.
     ///
-    /// The mutation's own digest. A delegation does not reach this: a confirmation is bound to the
-    /// request that asked for it, so its signed resubmission is the same action carrying a
-    /// different payload, which is what a payload digest refuses.
+    /// The mutation's own digest. A confirmed delegation is the same action as the one that asked
+    /// for the confirmation and carries a different payload, which is why the challenge's claim is
+    /// given back: a payload digest would otherwise refuse the signed resubmission.
     fn voice_action_digest(
         &self,
         actor_id: &ActorId,
@@ -318,62 +298,120 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// Claims one voice action for this attempt, or gives the answer an earlier attempt's claim is
+    /// Claims one voice action for this attempt, or reports what an earlier attempt's claim is
     /// owed.
     ///
-    /// `Ok` is this attempt's hold: it wrote the claim and is the one attempt that may perform the
-    /// change. `Err` is the answer to give instead ([`Self::recorded_voice_action`]), and nothing is
-    /// performed.
+    /// [`crate::grants::ActionClaim::Claimed`] is this attempt's hold: it wrote the claim and is
+    /// the one attempt that may perform the change. [`crate::grants::ActionClaim::Recorded`] is
+    /// answered by [`Self::voice_recorded`], and nothing is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::IdConflict`] when the identifier was used with another payload.
     fn claim_voice_action(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> std::result::Result<crate::grants::ClaimHold, Result<ParamsValue>> {
-        let digest = self.voice_action_digest(actor_id, mutation).map_err(Err)?;
-        match self
-            .sharing
-            .grants()
-            .claim_action(
-                actor_id,
-                mutation.action_id,
-                &digest,
-                kr_ipc::now_ms().get(),
-            )
-            .map_err(Err)?
-        {
-            crate::grants::ActionClaim::Claimed { hold } => Ok(hold),
-            crate::grants::ActionClaim::Recorded(record) => {
-                Err(Self::recorded_voice_action(record))
-            }
-        }
+    ) -> Result<crate::grants::ActionClaim> {
+        let digest = self.voice_action_digest(actor_id, mutation)?;
+        self.sharing.grants().claim_action(
+            actor_id,
+            mutation.action_id,
+            &digest,
+            kr_ipc::now_ms().get(),
+        )
     }
 
-    /// What one voice action already came to, when this host holds a claim on it.
+    /// What this host holds about one voice action, when an earlier attempt claimed it.
     ///
-    /// The three voice changes this answers for name no session and carry no content about one:
-    /// what each produced is the grant it wrote, the call it created or the call it ended. A
-    /// delegation does not reach this, because its answer can carry content about a session and
-    /// nothing on this path re-checks the authority that content was found under.
+    /// Read, not claimed, so a retry whose freshness window has gone is still told what happened.
+    /// An action identifier reused with another payload is refused here, which is how a second
+    /// delegation under the first one's identifier never reaches the coordinator.
     pub(super) async fn voice_answered(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
         let digest = self.voice_action_digest(actor_id, mutation)?;
-        self.sharing
+        match self
+            .sharing
             .grants()
             .recorded_action(actor_id, mutation.action_id, &digest)?
-            .map(Self::recorded_voice_action)
-            .transpose()
+        {
+            Some(record) => self
+                .voice_recorded(actor_id, mutation, record)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The answer a voice change an earlier attempt claimed is owed.
     ///
+    /// A delegation's is given back only under the authority it is owed under now
+    /// ([`Self::delegation_again`]). The others name no session and carry no content about one:
+    /// what each produced is the grant it wrote, the call it created or the call it ended.
+    async fn voice_recorded(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        record: crate::grants::ActionRecord,
+    ) -> Result<ParamsValue> {
+        match record {
+            crate::grants::ActionRecord::Answered { result }
+                if mutation.method.method() == Some(Method::VoiceDelegate) =>
+            {
+                self.delegation_again(actor_id, mutation, &result).await
+            }
+            record => Self::recorded_voice_action(record),
+        }
+    }
+
+    /// The answer a delegation this host already answered is owed when it is submitted again.
+    ///
+    /// Section 23 returns the retained receipt to a duplicate from a still-authorised actor, and the
+    /// host checks current authority before it does, so that a revoked device cannot use an old
+    /// action identifier to retrieve what it was told. The actor is a paired device, and it has to
+    /// still be one. A receipt that carries nothing about a session goes back as it was kept. One
+    /// that carries content read from a session does not go back from what it said then: the read
+    /// is made again under every check a first submission passes, against the voice grant and the
+    /// device's grant and history bound as they stand now, so a call that has ended, a grant that
+    /// has gone or a bound that has narrowed gives the refusal and not the content.
+    ///
+    /// A receipt for an action that is not a read goes back as it was kept, whatever it says: an
+    /// effect is never performed again for a repeat.
+    async fn delegation_again(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        kept: &[u8],
+    ) -> Result<ParamsValue> {
+        let Some(device_id) = self.paired_device(actor_id) else {
+            return Err(ControllerError::PermissionDenied {
+                detail: "this device is no longer paired with this host".to_owned(),
+            });
+        };
+        let answered = decoded(kept)?;
+        let receipt: VoiceDelegateResult = parse(&answered)?;
+        let params: VoiceDelegateParams = parse(&mutation.params)?;
+        if !matches!(receipt.outcome, VoiceDelegationOutcome::Performed { .. })
+            || crate::voice::method_for(params.action) != Some(Method::SessionRead)
+        {
+            return Ok(answered);
+        }
+        self.voice()
+            .answer_again(device_id, mutation, self.settled_now_ms())
+            .await
+    }
+
+    /// The answer a voice change an earlier attempt claimed is owed, as the claim holds it.
+    ///
     /// As an authority change's ([`Self::recorded_authority_change`]), with one difference: none of
-    /// the three leaves anything in this host's records that names the action. A voice grant takes
-    /// a fresh identity, a voice session is held in memory, and a started call is the broker's. So
-    /// a change whose attempt ended without recording what it did is an outcome this host does not
-    /// know, and it is never performed again: a second start would be a second metered call.
+    /// the four leaves anything in this host's records that names the action. A voice grant takes a
+    /// fresh identity, a voice session is held in memory, a started call is the broker's, and a
+    /// delegation's effect is the worker's. So a change whose attempt ended without recording what
+    /// it did is an outcome this host does not know, and it is never performed again: a second
+    /// start would be a second metered call.
     fn recorded_voice_action(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         match record {
             crate::grants::ActionRecord::Answered { result } => decoded(&result),
@@ -386,7 +424,7 @@ impl Controller {
             }),
             crate::grants::ActionRecord::Unfinished => Err(ControllerError::Uncertain {
                 detail: "an earlier attempt at this voice change ended without recording what it \
-                         did, so a call or a grant it made may exist; it is not performed again"
+                         did, so what it changed may exist; it is not performed again"
                     .to_owned(),
             }),
         }
@@ -501,4 +539,18 @@ impl kr_voice::Admission for VoiceAdmission {
     fn still_admitted(&self) -> std::result::Result<(), ProtocolError> {
         self.check().map_err(|refusal| refusal.to_protocol_error())
     }
+}
+
+/// Whether a delegation's answer is the challenge a device signs, which admits nothing.
+fn is_a_challenge(outcome: &Result<ParamsValue>) -> bool {
+    outcome
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.to_typed::<VoiceDelegateResult>().ok())
+        .is_some_and(|result| {
+            matches!(
+                result.outcome,
+                VoiceDelegationOutcome::ConfirmationRequired { .. }
+            )
+        })
 }

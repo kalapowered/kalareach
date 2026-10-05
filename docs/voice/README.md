@@ -112,6 +112,9 @@ become authority by arriving over a channel the host trusts for something else.
   authorise another. Submitting one of those actions the first time answers with the challenge to
   sign rather than with a refusal, and the delegation is not spent by asking: the same delegation
   comes back carrying the signature and becomes one action.
+- A delegation identifier is spent when it is submitted, for that device, through every call it holds
+  and across a restart, for as long as the host keeps a de-duplication record. One delegation is one
+  action.
 - Submitting a prompt needs a spoken confirmation that names the destination session. The host
   checks the session against the one it is about to submit to, and checks the words themselves for
   a clear agreement, so silence and "do not send that" both stop it. The words reach the host from

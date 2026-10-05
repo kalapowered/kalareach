@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use kr_protocol::ids::{DeviceId, GrantId, SessionId, VoiceSessionId};
 use kr_protocol::scalars::CanonicalSet;
-use kr_protocol::voice::{VoiceDelegationId, VoiceRefusal};
+use kr_protocol::voice::VoiceRefusal;
 
 use crate::error::{Result, VoiceError};
 
@@ -52,66 +52,9 @@ pub struct VoiceSessionRecord {
     /// Kept so the context this host selects for the call is sent under the same statement the
     /// person was given, rather than under a second wording this host keeps.
     pub disclosure: Vec<String>,
-    /// The delegations submitted to this call, in the order they arrived, each with the action
-    /// identifier it arrived under.
-    ///
-    /// A delegation identifier is correlation data. An identifier nobody announced correlates with
-    /// nothing, which is why submitting one is refused rather than interpreted. The action
-    /// identifier is kept beside it because section 23 makes a delegation action-deduplicated and
-    /// its payload cannot be the key: a confirmation is bound to the request that asked for it, so
-    /// the signed resubmission is the same action carrying a different payload.
-    announced: Vec<Announced>,
-}
-
-/// One delegation this call has admitted, and the action identifier it arrived under.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Announced {
-    /// The provider's identifier for the delegation.
-    pub delegation_id: VoiceDelegationId,
-    /// The action identifier the request carried.
-    pub action_id: kr_protocol::ids::ActionId,
 }
 
 impl VoiceSessionRecord {
-    /// Records a delegation submitted to this call under one action identifier.
-    pub fn announce(
-        &mut self,
-        delegation_id: VoiceDelegationId,
-        action_id: kr_protocol::ids::ActionId,
-    ) {
-        if !self.announced(&delegation_id) {
-            self.announced.push(Announced {
-                delegation_id,
-                action_id,
-            });
-        }
-    }
-
-    /// Returns true when this delegation has already been submitted to this call.
-    #[must_use]
-    pub fn announced(&self, delegation_id: &VoiceDelegationId) -> bool {
-        self.announced
-            .iter()
-            .any(|held| &held.delegation_id == delegation_id)
-    }
-
-    /// Takes one delegation back out of this call's announced set.
-    ///
-    /// One delegation is one action, so submitting a delegation spends it. An answer that admitted
-    /// nothing — a challenge this host issued so the device can confirm the action — has to leave
-    /// the delegation where it was, or the same delegation carrying the proof would be refused as
-    /// one that had already been submitted.
-    pub fn forget(&mut self, delegation_id: &VoiceDelegationId) {
-        self.announced
-            .retain(|held| &held.delegation_id != delegation_id);
-    }
-
-    /// The delegations submitted so far, oldest first.
-    #[must_use]
-    pub fn delegations(&self) -> &[Announced] {
-        &self.announced
-    }
-
     /// Returns true when this voice session may reach `session_id`.
     #[must_use]
     pub fn reaches(&self, session_id: SessionId) -> bool {
@@ -199,7 +142,6 @@ impl VoiceSessions {
             started_at_ms,
             closes_at_ms,
             disclosure,
-            announced: Vec::new(),
         };
         self.live
             .insert(*voice_session_id.get().as_bytes(), record.clone());
@@ -224,25 +166,6 @@ impl VoiceSessions {
             Some(record) if record.device_id == device_id => Ok(record),
             // One answer for a call that is not this device's and one that does not exist, so the
             // identifier cannot be used to ask whether a call exists.
-            _ => Err(VoiceError::refused(
-                VoiceRefusal::UnknownVoiceSession,
-                "there is no such voice session on this host",
-            )),
-        }
-    }
-
-    /// The same, mutably, for recording an announced delegation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a refusal when there is no such voice session, or it belongs to another device.
-    pub fn of_device_mut(
-        &mut self,
-        voice_session_id: VoiceSessionId,
-        device_id: DeviceId,
-    ) -> Result<&mut VoiceSessionRecord> {
-        match self.live.get_mut(voice_session_id.get().as_bytes()) {
-            Some(record) if record.device_id == device_id => Ok(record),
             _ => Err(VoiceError::refused(
                 VoiceRefusal::UnknownVoiceSession,
                 "there is no such voice session on this host",
@@ -284,18 +207,6 @@ impl VoiceSessions {
             self.live.remove(record.voice_session_id.get().as_bytes());
         }
         ending
-    }
-
-    /// Whether this device has already submitted this delegation through any of its live calls.
-    ///
-    /// One delegation is one action. A delegation identifier belongs to one moment of one
-    /// conversation, so the same identifier arriving under another call of the same device is
-    /// that delegation arriving twice.
-    #[must_use]
-    pub fn delegation_used(&self, device_id: DeviceId, delegation_id: &VoiceDelegationId) -> bool {
-        self.live
-            .values()
-            .any(|record| record.device_id == device_id && record.announced(delegation_id))
     }
 
     /// How many voice sessions are live.
@@ -376,26 +287,6 @@ mod tests {
         assert!(sessions.is_empty());
         // Nothing in this registry closes a terminal session, and nothing here can.
         assert!(sessions.of_device(voice_session(1), device(2)).is_err());
-    }
-
-    #[test]
-    fn an_unannounced_delegation_correlates_with_nothing() {
-        let mut sessions = VoiceSessions::new();
-        started(&mut sessions);
-        let announced = VoiceDelegationId::new("item_announced").expect("an identifier");
-        let invented = VoiceDelegationId::new("item_invented").expect("an identifier");
-        sessions
-            .of_device_mut(voice_session(1), device(2))
-            .expect("the session")
-            .announce(
-                announced.clone(),
-                kr_protocol::ids::ActionId::new(Uuid::from_bytes([7; 16])),
-            );
-        let record = sessions
-            .of_device(voice_session(1), device(2))
-            .expect("the session");
-        assert!(record.announced(&announced));
-        assert!(!record.announced(&invented));
     }
 
     #[test]

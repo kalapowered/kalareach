@@ -6,18 +6,20 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
+//! | KR-REQ-09.07 | `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched` |
 //! | KR-REQ-09.08 | `a_voice_start_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_voice_start_runs_is_told_it_has_not_finished`, `a_voice_start_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_voice_start_whose_record_was_never_written_is_not_performed_again_after_a_restart` |
 //! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
 //! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds` |
-//! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation` |
+//! | KR-REQ-09.16 | `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
+//! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation`, `a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier` |
 //! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
 //! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store` |
-//! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant` |
+//! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant`, `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched`, `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
 //!
 //! Section 23 gives the five voice methods `PairedDevice` ingress and nothing else, so a local
 //! client cannot reach them: `a_voice_method_is_unreachable_from_local_ipc` is that, proved through
@@ -1444,15 +1446,27 @@ struct RawVoice {
 impl RawVoice {
     /// Pairs a device with a fresh host whose broker is `broker`, and prepares one start.
     async fn prepare(owner: &kr_crypto::keys::DeviceKeys, broker: Arc<OfflineProvider>) -> Self {
+        Self::prepare_with(
+            owner,
+            broker,
+            &[ActionRight::SessionView, ActionRight::AgentPrompt],
+            None,
+        )
+        .await
+    }
+
+    /// The same, for a device holding `rights` and a standing voice grant that permits `actions`
+    /// (the default set where none is named).
+    async fn prepare_with(
+        owner: &kr_crypto::keys::DeviceKeys,
+        broker: Arc<OfflineProvider>,
+        rights: &[ActionRight],
+        actions: Option<&[VoiceAction]>,
+    ) -> Self {
         let host = net_support::Host::start(owner).await;
         let device = net_support::Device::create().await;
-        let record = net_support::pair_with(
-            &host,
-            &device,
-            owner,
-            net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
-        )
-        .await;
+        let record =
+            net_support::pair_with(&host, &device, owner, net_support::proposal(rights)).await;
         let raw = net_support::RawDevice::connect(&host, &device, &record).await;
         raw.claim();
         host.controller()
@@ -1467,7 +1481,7 @@ impl RawVoice {
             &VoiceGrantParams {
                 device_id: record.device_id,
                 session_ids: [session_id].into_iter().collect(),
-                actions: Nullable::null(),
+                actions: Nullable(actions.map(|actions| actions.iter().copied().collect())),
             },
         )
         .await
@@ -1783,6 +1797,322 @@ async fn a_voice_start_whose_record_was_never_written_is_not_performed_again_aft
         "{refusal:?}"
     );
     assert_eq!(broker.started(), 1, "no second call was made");
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// One delegation, one action: what the host keeps about it
+// ---------------------------------------------------------------------------------------------
+
+impl RawVoice {
+    /// The session the standing voice grant and the call reach.
+    fn session_id(&self) -> SessionId {
+        *(&self.start.session_ids)
+            .into_iter()
+            .next()
+            .expect("the call names a session")
+    }
+
+    /// Starts a call over the prepared session, as the device does, and returns its identity.
+    async fn start_call(&self) -> kr_protocol::ids::VoiceSessionId {
+        let started: kr_protocol::voice::VoiceStartResult = self
+            .raw
+            .mutate(
+                Method::VoiceStart,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target.clone(),
+                &self.start,
+            )
+            .await
+            .expect("the call is created")
+            .to_typed()
+            .expect("a start result");
+        let VoiceStartOutcome::Started { session } = started.outcome else {
+            panic!("the call runs: {:?}", started.outcome);
+        };
+        session.voice_session_id
+    }
+
+    /// A delegation that submits a prompt to the prepared session, which this host admits and
+    /// does not dispatch.
+    fn prompt(
+        &self,
+        voice_session_id: kr_protocol::ids::VoiceSessionId,
+        name: &str,
+    ) -> VoiceDelegateParams {
+        VoiceDelegateParams {
+            voice_session_id,
+            delegation_id: delegation(name),
+            offset_ms: U64::new(0),
+            action: VoiceAction::SubmitPrompt,
+            session_id: Nullable::some(self.session_id()),
+            spoken_destination: Nullable::some(kr_protocol::voice::SpokenDestination {
+                session_id: self.session_id(),
+                spoken_text: "send it to this session".to_owned(),
+            }),
+            approval: Nullable::null(),
+            turn_id: Nullable::null(),
+            confirmation: Nullable::null(),
+        }
+    }
+
+    /// Submits one delegation under `action_id`, and returns what the host answered.
+    async fn delegate(
+        &self,
+        action_id: ActionId,
+        params: &VoiceDelegateParams,
+    ) -> std::result::Result<
+        kr_protocol::voice::VoiceDelegateResult,
+        kr_protocol::error::ProtocolError,
+    > {
+        self.raw
+            .mutate(
+                Method::VoiceDelegate,
+                action_id,
+                self.target.clone(),
+                params,
+            )
+            .await
+            .map(|answered| answered.to_typed().expect("a delegation result"))
+    }
+}
+
+/// KR-REQ-09.07 and 23.51: a second, different delegation under an action identifier the first
+/// one used is a reused identifier. The host refuses it with `ID_CONFLICT` and never lets it reach
+/// the coordinator, which would have spent its delegation: it is still unspent afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::new(OfflineProvider::default()),
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+        Some(&[VoiceAction::SubmitPrompt]),
+    )
+    .await;
+    let call = voice.start_call().await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let first = voice
+        .delegate(action_id, &voice.prompt(call, "one"))
+        .await
+        .expect("the first delegation is answered");
+    assert!(
+        matches!(first.outcome, VoiceDelegationOutcome::Admitted { .. }),
+        "{:?}",
+        first.outcome
+    );
+
+    let reused = voice
+        .delegate(action_id, &voice.prompt(call, "two"))
+        .await
+        .expect_err("a different delegation under the same action identifier is refused");
+    assert_eq!(
+        reused.code,
+        kr_protocol::error::ErrorCode::IdConflict,
+        "{reused:?}"
+    );
+
+    let unspent = voice
+        .delegate(
+            ActionId::new(kr_ipc::new_uuid()),
+            &voice.prompt(call, "two"),
+        )
+        .await
+        .expect("the delegation the refusal turned away is answered under a new identifier");
+    assert!(
+        matches!(unspent.outcome, VoiceDelegationOutcome::Admitted { .. }),
+        "the refused delegation was never spent: {:?}",
+        unspent.outcome
+    );
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-09.16 and 23.51: an exact resubmission, as after a reply that was lost, is answered with
+/// the receipt the first submission was given, not with a refusal that the delegation was already
+/// submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::new(OfflineProvider::default()),
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+        Some(&[VoiceAction::SubmitPrompt]),
+    )
+    .await;
+    let call = voice.start_call().await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let params = voice.prompt(call, "one");
+
+    let first = voice
+        .delegate(action_id, &params)
+        .await
+        .expect("the first submission is answered");
+    let again = voice
+        .delegate(action_id, &params)
+        .await
+        .expect("the resubmission is answered from the receipt");
+    assert_eq!(again, first);
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-15.11 and 23.51: a delegation identifier spent in a call that has ended is not a new
+/// action through a later call, and stays spent when the host restarts: the later submission is
+/// refused as one that was already made, and a delegation nobody submitted is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let broker = Arc::new(OfflineProvider::default());
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::clone(&broker),
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+        Some(&[VoiceAction::SubmitPrompt]),
+    )
+    .await;
+    let spent = |answered: kr_protocol::voice::VoiceDelegateResult| {
+        matches!(
+            answered.outcome,
+            VoiceDelegationOutcome::Refused {
+                reason: VoiceRefusal::UnannouncedDelegation,
+                ..
+            }
+        )
+    };
+
+    let first_call = voice.start_call().await;
+    let first = voice
+        .delegate(
+            ActionId::new(kr_ipc::new_uuid()),
+            &voice.prompt(first_call, "one"),
+        )
+        .await
+        .expect("the delegation is answered");
+    assert!(
+        matches!(first.outcome, VoiceDelegationOutcome::Admitted { .. }),
+        "{:?}",
+        first.outcome
+    );
+    let _: kr_protocol::voice::VoiceStopResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStop,
+            ActionId::new(kr_ipc::new_uuid()),
+            voice.target.clone(),
+            &VoiceStopParams {
+                voice_session_id: first_call,
+            },
+        )
+        .await
+        .expect("the call stops")
+        .to_typed()
+        .expect("a stop result");
+
+    let second_call = voice.start_call().await;
+    let later = voice
+        .delegate(
+            ActionId::new(kr_ipc::new_uuid()),
+            &voice.prompt(second_call, "one"),
+        )
+        .await
+        .expect("the delegation is answered");
+    assert!(
+        spent(later.clone()),
+        "the identifier was spent in the call that ended: {:?}",
+        later.outcome
+    );
+
+    let voice = voice.restart(Arc::clone(&broker)).await;
+    let third_call = voice.start_call().await;
+    let restarted = voice
+        .delegate(
+            ActionId::new(kr_ipc::new_uuid()),
+            &voice.prompt(third_call, "one"),
+        )
+        .await
+        .expect("the delegation is answered");
+    assert!(
+        spent(restarted.clone()),
+        "the identifier stays spent across a restart: {:?}",
+        restarted.outcome
+    );
+    let new = voice
+        .delegate(
+            ActionId::new(kr_ipc::new_uuid()),
+            &voice.prompt(third_call, "two"),
+        )
+        .await
+        .expect("a delegation nobody submitted is answered");
+    assert!(
+        matches!(new.outcome, VoiceDelegationOutcome::Admitted { .. }),
+        "{:?}",
+        new.outcome
+    );
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-15.13 and 23.51: the challenge that answers a first submission of an action needing a
+/// confirmation holds nothing: the same delegation comes back under the same action identifier
+/// carrying the device's signature, which is a different payload, and becomes one action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::new(OfflineProvider::default()),
+        &[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::TerminalInput,
+        ],
+        Some(&[VoiceAction::ShellInput]),
+    )
+    .await;
+    let call = voice.start_call().await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let mut params = voice.prompt(call, "shell");
+    params.action = VoiceAction::ShellInput;
+    params.spoken_destination = Nullable::null();
+
+    let asked = voice
+        .delegate(action_id, &params)
+        .await
+        .expect("the first submission is answered");
+    let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
+        panic!("the challenge is the answer: {:?}", asked.outcome);
+    };
+    // A lost challenge is asked for again and answered with the one outstanding.
+    let again = voice
+        .delegate(action_id, &params)
+        .await
+        .expect("the same submission is answered again");
+    assert!(
+        matches!(
+            &again.outcome,
+            VoiceDelegationOutcome::ConfirmationRequired { request: held, .. } if held == &request
+        ),
+        "{:?}",
+        again.outcome
+    );
+
+    params.confirmation = Nullable::some(
+        kr_voice::sign_confirmation(&voice.device.keys().authorisation, &request)
+            .expect("the device signs the challenge"),
+    );
+    let admitted = voice
+        .delegate(action_id, &params)
+        .await
+        .expect("the signed delegation is admitted under the identifier the challenge named");
+    assert!(
+        matches!(admitted.outcome, VoiceDelegationOutcome::Admitted { .. }),
+        "{:?}",
+        admitted.outcome
+    );
     voice.raw.close();
     voice.host.stop().await;
 }

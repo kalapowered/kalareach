@@ -257,9 +257,9 @@ impl VoiceModule {
     /// # Errors
     ///
     /// Returns the refusal the caller is given. The caller of this is the one that claims a voice
-    /// change and retains what it produced, so this performs the effect once for that claim; a
-    /// delegation carries no claim, and what makes one of those one action is the coordinator's
-    /// own rule about the delegation it names.
+    /// change and retains what it produced, so this performs the effect once for that claim. A
+    /// delegation is claimed like the others, and the coordinator spends the delegation's own
+    /// identifier as well, so the same delegation under another action is not a second action.
     pub async fn answer(
         &self,
         actor: VoiceActor,
@@ -278,6 +278,31 @@ impl VoiceModule {
             admission,
         )
         .await
+    }
+
+    /// Answers a delegation this host has already answered, once more, from what stands now.
+    ///
+    /// The caller has found the delegation's retained answer and decided that the action is a read
+    /// of this host's own state, which can be read again ([`Coordinator::restate`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the checks give: the call has ended, or the authority it ran under no
+    /// longer carries the action.
+    pub async fn answer_again(
+        &self,
+        device_id: DeviceId,
+        mutation: &MutationRequest,
+        now_ms: u64,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
+        value(
+            &self
+                .coordinator
+                .restate(device_id, mutation.action_id, &params, now_ms)
+                .await
+                .map_err(voice_error)?,
+        )
     }
 
     async fn dispatch(

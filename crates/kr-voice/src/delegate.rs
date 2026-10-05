@@ -179,6 +179,15 @@ enum Proposed {
     NeedsConfirmation(Box<VoiceConfirmationRequest>),
 }
 
+/// What running the checks of a delegation spends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spend {
+    /// The delegation's identifier: a first submission of it.
+    Identifier,
+    /// Nothing: the same action, answered again.
+    Nothing,
+}
+
 /// Where a call this host could not end is reported.
 type UnclosedReport = Arc<dyn Fn(&UnclosedCall) + Send + Sync>;
 
@@ -1252,57 +1261,50 @@ impl Coordinator {
     /* voice.delegate                                                    */
     /* ---------------------------------------------------------------- */
 
-    /// Records a delegation the provider announced to one call.
+    /// Spends the identifier of a delegation the provider announced to one call.
     ///
     /// The paired device is the only thing that sees the provider's data channel, so it is the
-    /// only thing that can report one. An identifier is correlation data: recording it says the
-    /// provider mentioned it, and says nothing about what anybody may do.
+    /// only thing that can report one. An identifier is correlation data: spending it says the
+    /// provider mentioned it, and says nothing about what anybody may do. What this host can check
+    /// is that the offset is on this call's own timeline and that the identifier has not been
+    /// spent. What has been spent outlives the call: the host keeps it
+    /// ([`VoiceAuthority::spend_delegation`]).
     ///
     /// # Errors
     ///
-    /// Returns an error when there is no such voice session for this device, or the offset falls
-    /// outside the call's own timeline.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a thread holding the coordinator's lock panicked.
-    pub fn announce(
+    /// Returns a refusal when the offset falls outside the call's own timeline or the identifier
+    /// has already been spent, and an error when the host cannot say.
+    fn spend(
         &self,
         device_id: DeviceId,
-        voice_session_id: VoiceSessionId,
-        delegation_id: &VoiceDelegationId,
+        started_at_ms: u64,
+        params: &VoiceDelegateParams,
         action_id: ActionId,
-        offset_ms: u64,
         now_ms: u64,
     ) -> Result<()> {
-        let mut state = self.state.lock().expect("the coordinator's state");
-        let started_at_ms = {
-            let record = state.sessions.of_device(voice_session_id, device_id)?;
-            record.started_at_ms
-        };
         let elapsed_ms = now_ms.saturating_sub(started_at_ms);
         // A delegation that happened before the call began, or after more time than the call has
         // run, is not this call's. The tolerance is one heartbeat interval, because the offset is
         // the provider's clock and the comparison is this host's.
-        if offset_ms > elapsed_ms.saturating_add(TIMELINE_TOLERANCE_MS) {
+        if params.offset_ms.get() > elapsed_ms.saturating_add(TIMELINE_TOLERANCE_MS) {
             return Err(VoiceError::refused(
                 VoiceRefusal::UnannouncedDelegation,
                 "that delegation is not on this call's own timeline",
             ));
         }
-        // Through this call or through any other this device is holding: a delegation identifier
-        // correlates to one moment of one conversation, so the same identifier arriving again is
-        // that delegation arriving twice however it is addressed.
-        if state.sessions.delegation_used(device_id, delegation_id) {
+        // Through this call or any other this device has held, and whether it ended or the host
+        // restarted since: a delegation identifier correlates to one moment of one conversation, so
+        // the same identifier arriving again is that delegation arriving twice however it is
+        // addressed.
+        if !self
+            .authority
+            .spend_delegation(device_id, &params.delegation_id, action_id, now_ms)?
+        {
             return Err(VoiceError::refused(
                 VoiceRefusal::UnannouncedDelegation,
                 "that delegation has already been submitted; one delegation is one action",
             ));
         }
-        state
-            .sessions
-            .of_device_mut(voice_session_id, device_id)?
-            .announce(delegation_id.clone(), action_id);
         Ok(())
     }
 
@@ -1362,18 +1364,10 @@ impl Coordinator {
         params: &VoiceDelegateParams,
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
-        self.answer_delegation(device_id, action_id, params, now_ms)
+        match self
+            .propose(device_id, action_id, params, now_ms, Spend::Identifier)
             .await
-    }
-
-    async fn answer_delegation(
-        &self,
-        device_id: DeviceId,
-        action_id: ActionId,
-        params: &VoiceDelegateParams,
-        now_ms: u64,
-    ) -> Result<VoiceDelegateResult> {
-        match self.propose(device_id, action_id, params, now_ms).await {
+        {
             Ok(Proposed::NeedsConfirmation(request)) => Ok(VoiceDelegateResult {
                 delegation_id: params.delegation_id.clone(),
                 outcome: VoiceDelegationOutcome::ConfirmationRequired {
@@ -1386,26 +1380,7 @@ impl Coordinator {
                     ),
                 },
             }),
-            Ok(Proposed::Ready(proposal)) => {
-                let proposal = *proposal;
-                let receipt = self.submitter.submit(&proposal).await?;
-                Ok(VoiceDelegateResult {
-                    delegation_id: params.delegation_id.clone(),
-                    outcome: if receipt.performed {
-                        VoiceDelegationOutcome::Performed {
-                            action_id: receipt.action_id,
-                            summary: bounded(&receipt.summary),
-                        }
-                    } else {
-                        // Admitted and not performed. Never reported as done: the receipt is the
-                        // authority, and this says where to read it.
-                        VoiceDelegationOutcome::Admitted {
-                            action_id: receipt.action_id,
-                            note: VOICE_ADMISSION_NOTE.to_owned(),
-                        }
-                    },
-                })
-            }
+            Ok(Proposed::Ready(proposal)) => self.submit(*proposal, params).await,
             Err(VoiceError::Refused { reason, detail }) => Ok(VoiceDelegateResult {
                 delegation_id: params.delegation_id.clone(),
                 outcome: VoiceDelegationOutcome::Refused {
@@ -1417,6 +1392,66 @@ impl Coordinator {
         }
     }
 
+    /// Answers a delegation this host has already answered, once more, from what stands now.
+    ///
+    /// The host keeps what a delegation came to and gives it back to a caller whose reply was
+    /// lost (section 23). An answer that carries content read from a session is not given back
+    /// from what it said then: the read is made again, under every check a first submission
+    /// passes, against the grants as they stand now. The identifier is not spent again, because
+    /// this is the same action. The host asks this only for an action whose effect is a read of
+    /// its own state: repeating anything else would be a second effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the checks give when the call has ended or an authority it ran under
+    /// no longer carries the action, and an error when the host could not be reached.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub async fn restate(
+        &self,
+        device_id: DeviceId,
+        action_id: ActionId,
+        params: &VoiceDelegateParams,
+        now_ms: u64,
+    ) -> Result<VoiceDelegateResult> {
+        match self
+            .propose(device_id, action_id, params, now_ms, Spend::Nothing)
+            .await?
+        {
+            Proposed::Ready(proposal) => self.submit(*proposal, params).await,
+            Proposed::NeedsConfirmation(_) => Err(VoiceError::InvalidArgument(
+                "only a read is answered again".to_owned(),
+            )),
+        }
+    }
+
+    /// Submits what the checks admitted to the host, and reports what it did about it.
+    async fn submit(
+        &self,
+        proposal: Proposal,
+        params: &VoiceDelegateParams,
+    ) -> Result<VoiceDelegateResult> {
+        let receipt = self.submitter.submit(&proposal).await?;
+        Ok(VoiceDelegateResult {
+            delegation_id: params.delegation_id.clone(),
+            outcome: if receipt.performed {
+                VoiceDelegationOutcome::Performed {
+                    action_id: receipt.action_id,
+                    summary: bounded(&receipt.summary),
+                }
+            } else {
+                // Admitted and not performed. Never reported as done: the receipt is the
+                // authority, and this says where to read it.
+                VoiceDelegationOutcome::Admitted {
+                    action_id: receipt.action_id,
+                    note: VOICE_ADMISSION_NOTE.to_owned(),
+                }
+            },
+        })
+    }
+
     /// Runs every check and builds the proposal, or names the rule that refused.
     async fn propose(
         &self,
@@ -1424,19 +1459,12 @@ impl Coordinator {
         action_id: ActionId,
         params: &VoiceDelegateParams,
         now_ms: u64,
+        spend: Spend,
     ) -> Result<Proposed> {
         // 1 and 2: the call is this device's, and the delegation is on its timeline and unspent.
-        // `announce` does both, and spends the identifier, so a second submission of the same
-        // delegation cannot become a second action.
-        self.announce(
-            device_id,
-            params.voice_session_id,
-            &params.delegation_id,
-            action_id,
-            params.offset_ms.get(),
-            now_ms,
-        )?;
-        let (voice_grant_id, reaches) = {
+        // Spending the identifier is what makes a second submission of the same delegation
+        // something other than a second action.
+        let (voice_grant_id, reaches, started_at_ms) = {
             let state = self.state.lock().expect("the coordinator's state");
             let record = state
                 .sessions
@@ -1447,8 +1475,12 @@ impl Coordinator {
                     .session_id
                     .0
                     .is_none_or(|session_id| record.reaches(session_id)),
+                record.started_at_ms,
             )
         };
+        if spend == Spend::Identifier {
+            self.spend(device_id, started_at_ms, params, action_id, now_ms)?;
+        }
 
         // 3: the session named is one this call may reach.
         if !reaches {
@@ -1472,17 +1504,16 @@ impl Coordinator {
         if params.action.needs_unlocked_screen() {
             let Some(proof) = params.confirmation.0.as_ref() else {
                 // The device has no other way to obtain the challenge this action needs, so the
-                // answer to a first submission is the challenge itself. The delegation goes back
-                // into this call's unspent set with it: the same delegation returns carrying the
-                // proof and becomes one action, rather than being spent on an answer that
-                // admitted nothing.
+                // answer to a first submission is the challenge itself. The identifier is given
+                // back with it: the same delegation returns carrying the proof and becomes one
+                // action, rather than being spent on an answer that admitted nothing.
                 let request = self.confirmation_challenge(device_id, &plan, action_id, now_ms)?;
-                let mut state = self.state.lock().expect("the coordinator's state");
-                if let Ok(record) = state
-                    .sessions
-                    .of_device_mut(params.voice_session_id, device_id)
-                {
-                    record.forget(&params.delegation_id);
+                if spend == Spend::Identifier {
+                    self.authority.release_delegation(
+                        device_id,
+                        &params.delegation_id,
+                        action_id,
+                    )?;
                 }
                 return Ok(Proposed::NeedsConfirmation(Box::new(request)));
             };

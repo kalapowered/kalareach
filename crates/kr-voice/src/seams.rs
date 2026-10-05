@@ -12,7 +12,7 @@ use std::pin::Pin;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{ActionId, ApprovalRequestId, DeviceId, GrantId, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Digest256};
-use kr_protocol::voice::{VoiceAction, VoiceContextClass};
+use kr_protocol::voice::{VoiceAction, VoiceContextClass, VoiceDelegationId};
 
 use crate::error::Result;
 
@@ -241,6 +241,41 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
         &self,
         device_id: DeviceId,
     ) -> Result<Option<kr_protocol::scalars::AuthorisationKey>>;
+
+    /// Spends one delegation identifier for a device, and says whether this call was the one that
+    /// spent it.
+    ///
+    /// A delegation identifier belongs to one moment of one conversation, so the same identifier
+    /// arriving again is that delegation arriving twice: through the call it came in, through any
+    /// other, after a call has ended and after the host has restarted. The host keeps what it has
+    /// spent for as long as it keeps the record of an action (section 9), which is longer than any
+    /// call lives. `true` is a first spend, made under `action_id`; `false` is an identifier that
+    /// was spent before.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host cannot say, and then nothing is spent.
+    fn spend_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &VoiceDelegationId,
+        action_id: ActionId,
+        now_ms: u64,
+    ) -> Result<bool>;
+
+    /// Takes back the spend [`Self::spend_delegation`] made under `action_id`, because the answer
+    /// admitted nothing: a challenge the device has to sign, which the same delegation returns
+    /// carrying. A spend made under another action is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host cannot record that, and the identifier stays spent.
+    fn release_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &VoiceDelegationId,
+        action_id: ActionId,
+    ) -> Result<()>;
 }
 
 /* -------------------------------------------------------------------------- */
