@@ -524,10 +524,14 @@ fn paired_with_every_right(
     device
 }
 
-/// KR-REQ-15.20: the receipt of a voice read of a session names the session as the voice context
-/// does, with the name a person pinned, under the bound the voice grant's device has.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
+/// The receipt a voice read of the session a fake worker serves is answered with, after `prepare`
+/// has put into the daemon whatever the test says the description host holds of it.
+///
+/// The read is made as a device paired under every right but the voice right, and a voice grant of
+/// its own: the ordinary grant a voice grant narrows.
+async fn receipt_of_a_voice_read(
+    prepare: impl FnOnce(&crate::service::Controller, kr_protocol::ids::SessionId),
+) -> String {
     use std::sync::Arc;
 
     use crate::service::a_close_a_worker_never_answers as fake;
@@ -536,8 +540,6 @@ async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
     let world = fake::fake_worker(Some(recorded)).await;
     let controller = &world.controller;
     fake::acknowledged(controller, world.session_id);
-    // A device paired under every right but the voice right, and a voice grant of its own: the
-    // ordinary grant a voice grant narrows.
     let device = paired(controller, 8, |grant| {
         grant.actions = kr_protocol::rights::ActionRight::ALL
             .iter()
@@ -573,17 +575,7 @@ async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
             || Ok(()),
         )
         .expect("a live voice grant");
-    controller
-        .descriptions()
-        .rename(
-            world.session_id,
-            Some("Release prep"),
-            "local:501",
-            &kr_describe::metadata::SessionFacts::default(),
-            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
-            &|write| write(),
-        )
-        .expect("a name is pinned");
+    prepare(controller, world.session_id);
     let voice_session_id = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let delegation_id =
         kr_protocol::voice::VoiceDelegationId::new("a-delegation").expect("an identifier");
@@ -613,12 +605,56 @@ async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
         .await
         .expect("the daemon performs the read");
     assert!(receipt.performed);
-    assert!(
-        receipt.summary.contains("named \"Release prep\""),
-        "{}",
-        receipt.summary
-    );
     world.serving.abort();
+    receipt.summary
+}
+
+/// KR-REQ-15.20: the receipt of a voice read of a session names the session as the voice context
+/// does, with the name a person pinned, under the bound the voice grant's device has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
+    let summary = receipt_of_a_voice_read(|controller, session_id| {
+        controller
+            .descriptions()
+            .rename(
+                session_id,
+                Some("Release prep"),
+                "local:501",
+                &kr_describe::metadata::SessionFacts::default(),
+                kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                &|write| write(),
+            )
+            .expect("a name is pinned");
+    })
+    .await;
+    assert!(summary.contains("named \"Release prep\""), "{summary}");
+}
+
+/// KR-REQ-15.20 and KR-REQ-24.11: a receipt says what was done and what the host observed, and
+/// nothing a model wrote of the session, so no read of it can carry that text out after privacy
+/// mode removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipt_of_a_voice_read_carries_nothing_a_model_wrote() {
+    let summary = receipt_of_a_voice_read(|controller, session_id| {
+        controller
+            .descriptions()
+            .store()
+            .publish(
+                &session_id,
+                &crate::describe::tests::generated(
+                    "Pairing check",
+                    kr_worker::privacy::PrivacyGeneration::new(0),
+                ),
+                900,
+            )
+            .expect("a description");
+    })
+    .await;
+    assert!(
+        summary.starts_with("session 1 running /bin/zsh"),
+        "the session as the host knows it: {summary}"
+    );
+    assert!(!summary.contains("Pairing check"), "{summary}");
 }
 
 /// Every read the method table admits for a paired device is served, or refused by name for a
