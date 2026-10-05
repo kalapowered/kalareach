@@ -350,12 +350,22 @@ pub(super) fn setup(temp: &kr_ipc::testing::TempHost) -> ControllerSetup {
 pub(super) async fn fake_world(
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
+    fake_world_on(None, serve).await
+}
+
+/// The same world, started on the clocks a test moves by hand where it gives some.
+pub(super) async fn fake_world_on(
+    clocks: Option<crate::service::Clocks>,
+    serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+) -> Silent {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let controller = Controller::start(setup(&temp))
-        .await
-        .expect("the daemon starts");
+    let controller = match clocks {
+        Some(clocks) => Controller::start_on_clocks(setup(&temp), clocks).await,
+        None => Controller::start(setup(&temp)).await,
+    }
+    .expect("the daemon starts");
 
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let worker_endpoint = environment
