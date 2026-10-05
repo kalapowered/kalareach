@@ -543,8 +543,8 @@ fn unsafe_free_borrow(raw: std::os::fd::RawFd) -> std::os::fd::BorrowedFd<'stati
     }
 }
 
-/// Returns how many restoration guards are running.
-fn guards_of(attach: u32) -> usize {
+/// Returns the restoration guards running as children of an attach process.
+fn guard_processes(attach: u32) -> Vec<u32> {
     let listing = std::process::Command::new("pgrep")
         .args(["-P", &attach.to_string()])
         .output()
@@ -561,7 +561,62 @@ fn guards_of(attach: u32) -> usize {
                 .trim_start()
                 .starts_with(&kr_attach_guard().display().to_string())
         })
-        .count()
+        .collect()
+}
+
+/// Returns how many restoration guards are running.
+fn guards_of(attach: u32) -> usize {
+    guard_processes(attach).len()
+}
+
+/// Waits until the restoration guard of an attach process has written everything it will write to
+/// the terminal, and says so by what was read of the terminal.
+///
+/// The guard puts the terminal's line discipline back first and writes its sequences after, so the
+/// line discipline being back says only that the guard has begun. What the guard writes is
+/// complete when the guard has ended, and the bytes are then queued for the terminal's reader. A
+/// line typed to the terminal is echoed behind whatever is already queued, so the echo, read, says
+/// that the reader has everything the guard wrote. A test that says the guard wrote *nothing* of
+/// some kind can look only after this: before it, the absence is the guard not having got there.
+///
+/// `guard` is the guard's identity, read while its attach process was still running. The terminal
+/// has to echo: it is in the modes the guard restored, which are the ones it had before the
+/// attachment took it, and a terminal that does not say so here fails this wait.
+fn after_the_guard_wrote(
+    pty: &portable_pty::PtyPair,
+    output: &TerminalOutput,
+    guard: &kr_protocol::identity::ProcessStartIdentity,
+    what: &str,
+) {
+    let started = Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    while !matches!(
+        kr_ipc::identity::process_state(guard),
+        kr_ipc::identity::ProcessState::Ended
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: waited {:?} for the restoration guard to end",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let line = format!("kr-after-the-guard-{}", kr_ipc::new_uuid());
+    let typed = format!("{line}\n");
+    let mut rest = typed.as_bytes();
+    while !rest.is_empty() {
+        match rustix::io::write(terminal_fd(pty), rest) {
+            Ok(0) => panic!("the terminal took none of the line typed to it"),
+            Ok(written) => rest = &rest[written..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("types a line into the terminal: {error}"),
+        }
+    }
+    output.expect_within(
+        line.as_bytes(),
+        LIVENESS_DEADLINE,
+        "the terminal echoed the line typed after the guard ended",
+    );
 }
 
 /// Everything the terminal has produced, collected by a thread that never blocks the test.
@@ -1735,6 +1790,13 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     );
 
     let attach = attach_process(shell.process_id().expect("the shell has an identifier"));
+    // The guard is a process of its own and what it writes is what the checks below are about, so
+    // it is found now, while the attach process is its parent.
+    let guards = guard_processes(attach);
+    assert_eq!(guards.len(), 1, "the attachment armed a restoration guard");
+    let guard =
+        kr_ipc::identity::started_process_identity(guards[0]).expect("reads the guard's identity");
+    let written_before = output.bytes().len();
     let killed = std::process::Command::new("kill")
         .args(["-KILL", &attach.to_string()])
         .status()
@@ -1745,6 +1807,24 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     canonical_again(
         &pty,
         "the guard put the terminal back after the watching attachment was killed",
+    );
+    after_the_guard_wrote(
+        &pty,
+        &output,
+        &guard,
+        "the guard wrote what it writes after the watching attachment was killed",
+    );
+    // What it wrote is there to be looked at: the reset block it writes on every path out, among
+    // the bytes that arrived after the attach process was killed. A guard that wrote nothing has
+    // restored nothing of what the emulator holds, and the absences below would then say nothing.
+    assert!(
+        last_index(
+            &output.bytes()[written_before..],
+            kr_cli::terminal::RESET_SEQUENCES
+        )
+        .is_some(),
+        "the guard wrote its reset block after the attach process was killed: {}",
+        String::from_utf8_lossy(&output.bytes()[written_before..]).escape_debug()
     );
 
     // Nothing about the keyboard was ever written to this terminal: no stack was operated, no
