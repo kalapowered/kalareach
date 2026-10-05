@@ -1,0 +1,11 @@
+{
+  "programs": [
+    { "name": "kr", "package": "kr-cli" },
+    { "name": "kr-attach-guard", "package": "kr-cli" },
+    { "name": "kr-worker", "package": "kr-worker" },
+    { "name": "kr-controller", "package": "kr-controller" },
+    { "name": "kr-describe-inference", "package": "kr-describe-model", "not_on": ["aarch64-pc-windows-msvc"] },
+    { "name": "kr-hook", "package": "kr-hook" },
+    { "name": "kr-plugin-host", "package": "kr-plugin-host" }
+  ]
+}
