@@ -671,20 +671,31 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
 // A session that is closing.
 
 /// KR-REQ-07.64: a session whose closure has begun takes no launch under either profile: it is
-/// refused by name before anything starts, and no agent is recorded on the session. Control: the
-/// same launches under an open session start (every other test here).
+/// refused by name before anything is created, so the launch never reaches the point at which its
+/// process would be, and no agent is recorded on the session. Control: the same launches under an
+/// open session start (every other test here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_profile() {
     let session = Arc::new(SessionJob::create().expect("a session job"));
     session.terminate(1).expect("the session's job ends");
     assert!(session.is_closed());
     for (which, ownership) in [(31, AgentOwnership::Full), (32, AgentOwnership::Reduced)] {
-        let refused = Launch::start(which, ownership, &session)
-            .err()
-            .expect("the launch is refused");
+        let reached = std::cell::RefCell::new(None);
+        let refused = Launch::start_with(which, ownership, &session, |gateway| {
+            // The pause is armed and its release dropped at once, so a launch that did reach it
+            // would say so and go on rather than wait.
+            *reached.borrow_mut() = Some(gateway.pause_before_creating_the_agent().0);
+        })
+        .err()
+        .expect("the launch is refused");
         assert!(
             matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
             "{ownership:?}: {refused:?}"
+        );
+        let arrived = reached.into_inner().expect("the gateway was armed");
+        assert!(
+            arrived.try_recv().is_err(),
+            "{ownership:?}: the launch reached the point where its process is created"
         );
     }
     assert!(
