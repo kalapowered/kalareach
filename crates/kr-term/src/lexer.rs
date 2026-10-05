@@ -306,21 +306,47 @@ impl Lexer {
     /// combining mark arriving in the next read still joins the scalar it belongs to.
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<Event>) {
         let mut index = 0;
-        while index < input.len() {
+        self.feed_until(input, &mut index, out, usize::MAX);
+    }
+
+    /// Lexes `input` from `*index` until the input ends or `out` holds `limit` events, whichever
+    /// comes first, appending every finished event to `out` and moving `*index` past what was read.
+    ///
+    /// Returns whether the input has been read to its end. A caller that gets `false` applies the
+    /// events, empties `out` and calls again with the same input and index; the events it gets in
+    /// all are the ones [`Self::feed`] would have given, in the same order. A batch can hold more
+    /// than the limit, because the check is between steps: most steps add a few events, and the one
+    /// that ends a tmux passthrough envelope adds every event its payload holds, as a printable run
+    /// longer than the text bound adds one for each bound it covers.
+    ///
+    /// `limit` is at least one: a call with none to give would never read.
+    pub fn feed_until(
+        &mut self,
+        input: &[u8],
+        index: &mut usize,
+        out: &mut Vec<Event>,
+        limit: usize,
+    ) -> bool {
+        debug_assert!(limit > 0, "a batch of no events never reads");
+        while *index < input.len() {
+            if out.len() >= limit {
+                return false;
+            }
             // Printable ASCII on ground is what most output is, and every byte of it takes the
             // same branch and does the same thing, so the run is found once and appended whole.
             // The answer is the answer the per-byte path gives, run bound included.
             if self.state == State::Ground {
-                let run = printable_ascii_run(&input[index..]);
+                let run = printable_ascii_run(&input[*index..]);
                 if run > 0 {
-                    index += self.push_ascii_run(&input[index..index + run], out);
+                    *index += self.push_ascii_run(&input[*index..*index + run], out);
                     continue;
                 }
             }
-            self.byte(input[index], out);
-            index += 1;
+            self.byte(input[*index], out);
+            *index += 1;
         }
         self.flush_text(out, true);
+        true
     }
 
     /// Releases a held text tail.

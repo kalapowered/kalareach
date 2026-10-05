@@ -198,12 +198,22 @@ const REPLAY_WINDOW: usize = 64;
 /// it enforces. Every 64 reads is often enough that the cache overshoots by a fraction of itself.
 const ROW_CACHE_INTERVAL: u32 = 64;
 
-/// How many events the buffer a read collects them in keeps the room for, however little the reads
-/// after a large one need.
-const SCRATCH_EVENTS: usize = 256;
+/// How many events are collected before they are applied.
+///
+/// A read is lexed and applied this many events at a time, so the buffer the events are collected
+/// in holds a batch and the few events an ordinary step adds beyond it. A read of nothing but
+/// controls is one event a byte, and collecting all of a read's events at once would size a buffer
+/// for the worst read a session has ever had and keep it for the rest of the session. The steps
+/// that add many events at once are the exception, which [`EVENT_ROOM`] deals with.
+const EVENT_BATCH: usize = 256;
 
-/// How many times what a read needed the buffer may hold before the room goes back.
-const SCRATCH_SLACK: usize = 4;
+/// How much room the buffer the events are collected in keeps between calls: twice a batch, which
+/// is what the buffer grows to when a batch and the few events a step adds to it pass one batch.
+///
+/// A step of the lexer is not bounded by the batch. The step that ends a tmux passthrough envelope
+/// lexes the whole payload and adds every event it holds, so the buffer can grow beyond this inside
+/// a call, and it gives the room back when the call ends.
+const EVENT_ROOM: usize = 2 * EVENT_BATCH;
 
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
@@ -252,6 +262,11 @@ pub struct Engine {
     dropped_marks: u64,
     keyboard_revision: u64,
     feeds: u32,
+    /// Where the read being applied ends in the session's output, which is where the lexer is once
+    /// it has lexed the whole of it. A read is lexed a batch at a time, and what the engine records
+    /// about the stream while it applies one batch names the end of the read, as it does when the
+    /// whole read is lexed first.
+    read_end: u64,
     scratch: Vec<Event>,
 }
 
@@ -298,6 +313,7 @@ impl Engine {
             dropped_marks: 0,
             keyboard_revision: 0,
             feeds: 0,
+            read_end: 0,
             scratch: Vec::new(),
         };
         engine.record_checkpoint();
@@ -437,46 +453,50 @@ impl Engine {
     }
 
     /// Feeds application output through the engine.
+    ///
+    /// The read is lexed and applied a batch of events at a time, which changes nothing a client
+    /// can see: the events, their order and what each does are the ones a single pass over the whole
+    /// read gives, and the screens are settled and measured once, after the last of them.
     pub fn feed(&mut self, bytes: &[u8], now_ms: u64) -> FeedOutcome {
         let mut events = core::mem::take(&mut self.scratch);
-        events.clear();
-        self.lexer.feed(bytes, &mut events);
         self.feeds = self.feeds.wrapping_add(1);
-        let outcome = self.consume(&events, now_ms);
-        self.keep_scratch(events);
+        self.read_end = self.lexer.offset().saturating_add(bytes.len() as u64);
+        let mut outcome = FeedOutcome::default();
+        let generation_before = self.projection_generation;
+        let mut index = 0;
+        loop {
+            events.clear();
+            let finished = self
+                .lexer
+                .feed_until(bytes, &mut index, &mut events, EVENT_BATCH);
+            self.consume_events(&events, &mut outcome, now_ms);
+            if finished {
+                break;
+            }
+        }
+        self.rest_scratch(events);
+        debug_assert_eq!(
+            self.lexer.offset(),
+            self.read_end,
+            "the read ends where the lexer says it has read to"
+        );
+        self.settle(&mut outcome, generation_before, now_ms);
         outcome
     }
 
-    /// Keeps the buffer a read collected its events in for the next read, up to a bound.
-    ///
-    /// A read of nothing but controls is one event a byte, so a buffer that kept the room such a
-    /// read grew it to would hold it for the rest of the session, outside every bound the session
-    /// keeps. So the room goes back once a read needs a [`SCRATCH_SLACK`]th of it or less, down to
-    /// what that read needed and no lower than [`SCRATCH_EVENTS`].
-    ///
-    /// Not after every read: a buffer given back and grown again on the next read costs a
-    /// reallocation each way and the pages behind it, and a stream that keeps printing needs the
-    /// same room every time. Such a stream keeps its buffer, and what the buffer holds after a read
-    /// is never more than [`SCRATCH_SLACK`] times what that read needed, or [`SCRATCH_EVENTS`].
-    ///
-    /// Only a read says how much room the next one needs. Settling and closing collect a held
-    /// scalar at most, and a session that settles after every batch of output, as one with a
-    /// projected attachment does, would give the room back after every batch and grow it again for
-    /// the next. They leave the buffer as it is, in [`Self::rest_scratch`].
-    fn keep_scratch(&mut self, mut events: Vec<Event>) {
-        let needed = events.len();
+    /// Keeps the buffer a call collected its events in for the next one, emptied, with no more room
+    /// than a batch needs.
+    fn rest_scratch(&mut self, mut events: Vec<Event>) {
         events.clear();
-        if events.capacity() > SCRATCH_EVENTS && events.capacity() / SCRATCH_SLACK >= needed {
-            events.shrink_to(needed.max(SCRATCH_EVENTS));
-        }
+        events.shrink_to(EVENT_ROOM);
         self.scratch = events;
     }
 
-    /// Keeps the buffer a call that was not a read collected its events in, emptied and no
-    /// smaller.
-    fn rest_scratch(&mut self, mut events: Vec<Event>) {
-        events.clear();
-        self.scratch = events;
+    /// Where the session's output has been read to, for what is recorded about the stream.
+    ///
+    /// The end of the read being applied while there is one, and where the lexer stands after it.
+    fn stream_end(&self) -> u64 {
+        self.lexer.offset().max(self.read_end)
     }
 
     /// Settles the screen when the stream has gone quiet.
@@ -509,19 +529,25 @@ impl Engine {
         outcome
     }
 
+    /// Applies the events a call that is not a read collected, and settles what they changed.
     fn consume(&mut self, events: &[Event], now_ms: u64) -> FeedOutcome {
-        let mut outcome = FeedOutcome {
-            events: events.len(),
-            ..FeedOutcome::default()
-        };
+        let mut outcome = FeedOutcome::default();
         let generation_before = self.projection_generation;
+        self.consume_events(events, &mut outcome, now_ms);
+        self.settle(&mut outcome, generation_before, now_ms);
+        outcome
+    }
+
+    /// Applies one batch of events to the grid, the trackers and the outcome.
+    fn consume_events(&mut self, events: &[Event], outcome: &mut FeedOutcome, now_ms: u64) {
+        outcome.events += events.len();
         for event in events {
             // A control inside a sequence is performed where it appeared, before the sequence it
             // was found in, which is the order a terminal performs them in. The bytes stop here
             // whatever the sequence around them turns out to be, so the attachment has to project:
             // a direct terminal never saw the controls, and its cursor is now somewhere else.
             if !event.embedded.is_empty() {
-                self.apply_embedded(event, &mut outcome, now_ms);
+                self.apply_embedded(event, outcome, now_ms);
                 outcome
                     .projection_required_at
                     .get_or_insert(event.span.start());
@@ -602,7 +628,7 @@ impl Engine {
                     ) {
                         self.presentation_revision = self.next_revision();
                     }
-                    self.report_truncation(event, &mut outcome, now_ms);
+                    self.report_truncation(event, outcome, now_ms);
                     cursor_performed = !adapted.unrecognised;
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
@@ -615,11 +641,11 @@ impl Engine {
                         );
                         disposition = DirectDisposition::Withhold;
                     } else if decision.track {
-                        self.track(event, &mut outcome);
+                        self.track(event, outcome);
                     }
                 }
             } else if decision.track {
-                self.track(event, &mut outcome);
+                self.track(event, outcome);
             }
             if decision.apply_to_grid {
                 if cursor_performed && !cursor_moves.is_empty() {
@@ -685,11 +711,16 @@ impl Engine {
                 DirectDisposition::Withhold => {}
             }
         }
+    }
+
+    /// Measures and enforces the resident-state bounds once the events of a call have been applied,
+    /// and fills in what the outcome says about the state they left.
+    fn settle(&mut self, outcome: &mut FeedOutcome, generation_before: u64, now_ms: u64) {
         let degradation = self.lane.degradation();
         if degradation.is_degraded() {
             self.diagnostics.record(
                 DiagnosticKind::ResponseLaneDegraded,
-                self.lexer.offset(),
+                self.stream_end(),
                 now_ms,
                 format!(
                     "coalesced {}, dropped {}, over budget {}, oversized {}, expired {}",
@@ -708,7 +739,6 @@ impl Engine {
         outcome.diagnostics = self.diagnostics.drain();
         outcome.ground_boundary = self.ground_boundary();
         outcome.projection_reset = self.projection_generation != generation_before;
-        outcome
     }
 
     /// Performs the controls that arrived inside a sequence.
@@ -1007,7 +1037,7 @@ impl Engine {
         }
         self.diagnostics.record(
             DiagnosticKind::ResidentStateTruncated,
-            self.lexer.offset(),
+            self.stream_end(),
             now_ms,
             format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
         );
