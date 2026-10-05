@@ -2290,17 +2290,15 @@ impl Broker {
 
     /// Binds what resolves a draft this host acts on.
     ///
-    /// A draft-dependent action names a draft, and the broker refuses one it cannot resolve rather
-    /// than sending an operation against a draft that may have moved. The draft store itself is
-    /// not the broker's; this is the seam it is reached through.
+    /// A plugin action that acts on a draft, such as one that contributes an attachment to the
+    /// upstream draft, names it, and the broker refuses one it cannot resolve rather than sending
+    /// an operation against a draft that may have moved. The draft store itself is not the
+    /// broker's; this is the seam it is reached through. A host that serves such an action binds
+    /// it, and a worker that binds none refuses every action that names a draft. A prompt that
+    /// names a draft is not one of these: the control daemon records it before it reaches the
+    /// worker, and the broker passes its draft on without resolving it.
     pub fn bind_drafts(&self, drafts: std::sync::Arc<dyn DraftResolver>) {
         self.state().drafts = Some(drafts);
-    }
-
-    /// Returns true when this host can resolve a draft at all.
-    #[must_use]
-    pub fn resolves_drafts(&self) -> bool {
-        self.state().drafts.is_some()
     }
 
     /// Checks that one draft is one this host can act on.
