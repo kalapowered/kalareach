@@ -601,8 +601,7 @@ pub struct NativeGateway {
     /// learns which one it has to find stopped.
     #[cfg(feature = "testing")]
     last_started: Option<ProcessStartIdentity>,
-    /// Where the next launch stops on its way to creating the agent's process, for this host's own
-    /// tests.
+    /// Where the next launch stops on its way to handing its agent over, for this host's own tests.
     #[cfg(all(feature = "testing", windows))]
     launch_pause: std::sync::Mutex<Option<ArmedPause>>,
     /// Where a failed launch stops before it undoes anything, for this host's own tests.
@@ -625,13 +624,15 @@ pub type AgentChild = std::process::Child;
 #[cfg(windows)]
 pub type AgentChild = crate::windows::launch::Child;
 
-/// A place a launch can be held on its way to creating the agent's process, for this host's own
-/// tests.
+/// A place a launch can be held on its way to handing its agent over, for this host's own tests.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchStage {
     /// The session has admitted the launch; nothing else has been done.
     Admitted,
+    /// The launch is about to read the application's own configuration, before it reserves
+    /// anything.
+    Probing,
     /// The agent's job is made, and recorded on the session where the profile is reduced; its
     /// process is not created.
     JobRecorded,
@@ -1077,7 +1078,10 @@ impl NativeGateway {
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the instance is already live,
     /// [`BrokerError::UnsupportedCapability`] on a platform that cannot publish the launch
-    /// credential as a file, [`BrokerError::Launch`] when the intent is stale, and
+    /// credential as a file, [`BrokerError::Launch`] when the intent is stale,
+    /// [`BrokerError::PreconditionFailed`] on Windows when there is no session job to hold the
+    /// launch, the session is closing, a vendor's own sandbox cannot run under the jobs the launch
+    /// would start in, or the application's package refuses the mode it is configured for, and
     /// [`BrokerError::LedgerUnavailable`] when the directory is not private, or the process cannot
     /// be started or its files written.
     pub fn launch(
@@ -1264,6 +1268,8 @@ impl NativeGateway {
         &self,
         intent: &crate::broker::profiles::LaunchIntent,
     ) -> Result<crate::broker::profiles::LaunchIntent> {
+        #[cfg(windows)]
+        self.pause_if_armed(LaunchStage::Probing);
         let mut intent = intent.clone();
         let Some(probe) = self.launch_probe.as_ref() else {
             return Ok(intent);

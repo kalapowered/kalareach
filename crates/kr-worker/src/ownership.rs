@@ -689,11 +689,14 @@ pub const fn request_stop(_owned: &OwnedProcesses) {}
 
 /// How long a closure waits for the launches a session admitted before it closed.
 ///
-/// A launch in flight is creating a process or ending the one it created, which takes as long as
-/// a process creation does, and a closure that is told the answer is not final before the wait
-/// ends carries that into its receipt rather than waiting for ever.
+/// A launch in flight reads the application's own configuration (which is bounded by the probe's
+/// own deadline), reserves its instance, makes its process, writes its files and either commits or
+/// undoes all of it. The bound is that deadline and five seconds for the rest, so it ties to the
+/// longest step; a closure that is still waiting when it ends carries that into its receipt rather
+/// than waiting for ever.
 #[cfg(windows)]
-const LAUNCHES_IN_FLIGHT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const LAUNCHES_IN_FLIGHT_DEADLINE: std::time::Duration =
+    crate::broker::probe::DEADLINE.saturating_add(std::time::Duration::from_secs(5));
 
 /// Forces every process the boundary still holds to stop.
 ///
@@ -701,9 +704,9 @@ const LAUNCHES_IN_FLIGHT_DEADLINE: std::time::Duration = std::time::Duration::fr
 /// its session, which is exactly what the boundary is for. A session without a job has only its
 /// root shell, which the caller has already ended through its own handle.
 ///
-/// A launch the session admitted before it closed may still be making its process, and a process
-/// made after the job was ended is not ended with it: that launch finds the session closing once
-/// its process exists and ends the process itself. This waits for every such launch to leave
+/// A launch the session admitted before it closed may still be under way, and a process made
+/// after the job was ended is not ended with it: that launch finds the session closing once its
+/// process exists and ends the process itself. This waits for every such launch to leave
 /// before it ends the jobs of the agents that ran under reduced ownership, so what the closure
 /// reads afterwards is what the session holds, and a launch that does not leave in time is
 /// something this host could not establish.
