@@ -140,6 +140,17 @@ impl Launch {
         ownership: AgentOwnership,
         session: &Arc<SessionJob>,
     ) -> Result<Self, BrokerError> {
+        Self::start_with(which, ownership, session, |_| {})
+    }
+
+    /// Starts the agent as [`Self::start`] does, after `arm` has been given the gateway that
+    /// makes the launch.
+    fn start_with(
+        which: u8,
+        ownership: AgentOwnership,
+        session: &Arc<SessionJob>,
+        arm: impl FnOnce(&NativeGateway),
+    ) -> Result<Self, BrokerError> {
         let directory = private_directory();
         let report = directory.join("report");
         let broker = Arc::new(
@@ -148,6 +159,7 @@ impl Launch {
         let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(which))
             .expect("the endpoint binds")
             .in_session(Arc::clone(session));
+        arm(&gateway);
         let arguments: Vec<String> = [
             "--ignored",
             "--exact",
@@ -653,6 +665,95 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
     });
     eventually("and so does what the vendor made", || ended(&vendor_made));
     assert!(ended(&agent));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A session that is closing.
+
+/// KR-REQ-07.64: a session whose closure has begun takes no launch under either profile: it is
+/// refused by name before anything starts, and no agent is recorded on the session. Control: the
+/// same launches under an open session start (every other test here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_profile() {
+    let session = Arc::new(SessionJob::create().expect("a session job"));
+    session.terminate(1).expect("the session's job ends");
+    assert!(session.is_closed());
+    for (which, ownership) in [(31, AgentOwnership::Full), (32, AgentOwnership::Reduced)] {
+        let refused = Launch::start(which, ownership, &session)
+            .err()
+            .expect("the launch is refused");
+        assert!(
+            matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+            "{ownership:?}: {refused:?}"
+        );
+    }
+    assert!(
+        session.reduced_agents().is_empty(),
+        "and no agent was recorded as running under reduced ownership"
+    );
+    assert!(
+        session
+            .process_ids()
+            .expect("the session's processes")
+            .is_empty()
+    );
+}
+
+/// KR-REQ-07.64: a session whose closure begins after a launch has recorded its agent and before
+/// the agent's process is created leaves nothing running: a process created in a job that was
+/// ended is not ended with it, so the launch asks again once its process exists, and ends it and
+/// fails by name. This is the window between the two, held open by a pause in the launch, under
+/// each profile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_closure_that_begins_before_the_agent_exists_leaves_no_agent_running() {
+    for (which, ownership) in [(33, AgentOwnership::Full), (34, AgentOwnership::Reduced)] {
+        let session = Arc::new(SessionJob::create().expect("a session job"));
+        let (to_test, armed) = std::sync::mpsc::channel();
+        let launching = Arc::clone(&session);
+        let launcher = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(async {
+                Launch::start_with(which, ownership, &launching, |gateway| {
+                    to_test
+                        .send(gateway.pause_before_creating_the_agent())
+                        .expect("the test is waiting");
+                })
+                .map(drop)
+            })
+        });
+        let (arrived, release) = armed.recv().expect("the gateway is armed");
+        arrived
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the launch reaches the pause");
+        // The closure, as the worker's makes it: the session's job and every reduced agent's.
+        session.terminate(1).expect("the session's job ends");
+        for agent in session.reduced_agents() {
+            agent.terminate(1).expect("the agent's job ends");
+        }
+        release.send(()).expect("the launch goes on");
+        let refused = launcher
+            .join()
+            .expect("the launch ends")
+            .expect_err("the launch fails");
+        assert!(
+            matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+            "{ownership:?}: {refused:?}"
+        );
+        assert!(
+            session.reduced_agents().is_empty(),
+            "{ownership:?}: the agent that never ran is forgotten"
+        );
+        assert!(
+            session
+                .process_ids()
+                .expect("the session's processes")
+                .is_empty(),
+            "{ownership:?}: nothing is left running in the session"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -75,13 +75,22 @@ const MAX_QUERY_CAPACITY: usize = 16 * 1024;
 #[derive(Debug)]
 pub struct SessionJob {
     job: Job,
-    /// The jobs of the agents this session's launches ran under an explicitly selected
-    /// reduced-ownership profile, each in a job of its own instead of this one.
+    /// The agents this session's launches ran under an explicitly selected reduced-ownership
+    /// profile, and whether this session has been closed.
     ///
-    /// Kept for as long as the session is: the session's closure lists what they hold and ends it,
-    /// and a worker that dies takes them down because they are kill-on-close and this is where the
-    /// last handle to each of them is.
-    reduced: Mutex<Vec<Arc<AgentJob>>>,
+    /// Kept for as long as the session is: the session's closure lists what the jobs hold and ends
+    /// it, and a worker that dies takes them down because they are kill-on-close and this is where
+    /// the last handle to each of them is. The two share one lock so that an agent is registered
+    /// before the session is closed or not at all: a launch that registers after the closure has
+    /// begun is refused, and one that registered before it is ended by it.
+    reduced: Mutex<Reduced>,
+}
+
+/// The agents a session ran under reduced ownership, and whether the session has been closed.
+#[derive(Debug, Default)]
+struct Reduced {
+    agents: Vec<Arc<AgentJob>>,
+    closed: bool,
 }
 
 impl SessionJob {
@@ -109,7 +118,7 @@ impl SessionJob {
         }
         Ok(Self {
             job,
-            reduced: Mutex::new(Vec::new()),
+            reduced: Mutex::new(Reduced::default()),
         })
     }
 
@@ -148,13 +157,33 @@ impl SessionJob {
         self.job.ui_restrictions()
     }
 
-    /// Records an agent that runs under the reduced-ownership profile, so this session's closure
-    /// reads what it holds and ends it, and never reads the session's coverage as complete.
-    pub fn adopt_reduced(&self, agent: Arc<AgentJob>) {
+    /// Records an agent that will run under the reduced-ownership profile, before its process is
+    /// created, so this session's closure reads what its job holds and ends it, and never reads the
+    /// session's coverage as complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this session has been closed: nothing is started for a session that
+    /// is ending.
+    pub fn adopt_reduced(&self, agent: Arc<AgentJob>) -> std::io::Result<()> {
+        let mut reduced = self
+            .reduced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reduced.closed {
+            return Err(std::io::Error::other("this session is closing"));
+        }
+        reduced.agents.push(agent);
+        Ok(())
+    }
+
+    /// Forgets an agent that was recorded and never ran, because its launch failed.
+    pub fn release_reduced(&self, agent: &Arc<AgentJob>) {
         self.reduced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(agent);
+            .agents
+            .retain(|held| !Arc::ptr_eq(held, agent));
     }
 
     /// Returns the jobs of the agents this session ran under the reduced-ownership profile.
@@ -163,7 +192,20 @@ impl SessionJob {
         self.reduced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents
             .clone()
+    }
+
+    /// Returns whether this session's closure has begun.
+    ///
+    /// A process created in a job after the job was ended is not ended with it, so a launch asks
+    /// again once its process exists, and ends the process itself where the answer is yes.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.reduced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
     }
 
     /// Returns whether a process is inside this job.
@@ -212,12 +254,19 @@ impl SessionJob {
         self.job.process_ids()
     }
 
-    /// Ends every process the job holds, at once.
+    /// Ends every process the job holds, at once, and marks this session closed.
+    ///
+    /// The mark is made before the job is ended, so a launch that creates its process afterwards
+    /// finds it ([`Self::is_closed`]) and a launch that created it before is ended with the job.
     ///
     /// # Errors
     ///
     /// Returns the operating system's failure when the job will not be terminated.
     pub fn terminate(&self, code: u32) -> std::io::Result<()> {
+        self.reduced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
         self.job.terminate(code)
     }
 }
