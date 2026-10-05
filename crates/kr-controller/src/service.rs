@@ -367,6 +367,11 @@ pub struct Controller {
     /// debts and before it tells the workers. Compiled away in every shipped build.
     #[cfg(test)]
     before_the_pass_tells: ReadPause,
+    /// Where this host's own tests stop an adoption that has recorded a worker, before it
+    /// publishes the worker, so that a closure can land in between. Compiled away in every shipped
+    /// build.
+    #[cfg(test)]
+    before_a_worker_is_published: ReadPause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.

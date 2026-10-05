@@ -486,20 +486,18 @@ impl Controller {
             worker_profile: profile,
             published_at_ms: kr_ipc::now_ms(),
         };
-        kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
         let endpoint = Endpoint::from_path(&ready.endpoint)?;
         // The worker's own description of its session, as its report gives it: nothing is asked of
         // the worker here, and a report that came after its create stopped waiting still leaves
         // the session described, as a read that meets the worker on its way out needs it.
-        self.add_worker(
+        self.publish_worker(
             KnownWorker {
                 descriptor,
                 endpoint,
             },
             Some(ready.session.as_ref().clone()),
         )
-        .await;
-        Ok(())
+        .await
     }
 
     async fn resolve(

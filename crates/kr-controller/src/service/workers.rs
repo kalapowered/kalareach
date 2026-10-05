@@ -119,9 +119,33 @@ impl Controller {
         }
     }
 
-    /// Adds a verified worker to the directory, with its own description of its session where
-    /// this daemon has one (`Directory::insert`), and starts reading its attention sources.
-    pub(super) async fn add_worker(&self, worker: KnownWorker, described: Option<SessionSummary>) {
+    /// Publishes a verified worker's descriptor and makes this daemon hold the worker: it goes in
+    /// the directory, with its own description of its session where this daemon has one
+    /// (`Directory::insert`), in the set of workers the plugin admissions wait for, and its
+    /// attention sources and its description are read. Nothing is done for a worker whose session
+    /// has closed.
+    ///
+    /// The one place a worker is made known, and it is done in a section that holds the registry's
+    /// lock and has found no closure. That is the lock a closure is recorded under, and the
+    /// closure's own tidying takes the worker out of all of this after it, so a worker is either
+    /// made known before its closure and removed by it, or the closure is seen here and nothing is
+    /// made: a closure that lands between a worker's row being written and its publication cannot
+    /// leave a closed session's worker in the directory, on the disk or in the admissions' set for
+    /// as long as the daemon runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or the descriptor cannot be published.
+    pub(super) async fn publish_worker(
+        &self,
+        worker: KnownWorker,
+        described: Option<SessionSummary>,
+    ) -> Result<()> {
+        let registry = self.registry.lock().await;
+        if registry.closure(worker.descriptor.session_id)?.is_some() {
+            return Ok(());
+        }
+        kr_ipc::descriptor::publish(&self.paths, &worker.descriptor)?;
         // A recorded or adopted worker answers rounds of plugin admissions on its own endpoint from
         // here on, and is sent one at once.
         self.plugin_bridge.recorded(
@@ -132,9 +156,13 @@ impl Controller {
             .lock()
             .await
             .insert(worker.clone(), described);
+        // Still in the section: a closure's tidying stops what these start, and it begins only once
+        // the registry is let go, so none of it can be begun after it has been stopped.
         self.attention.watch(self.attention_reach(), worker.clone());
         self.describe_worker(&worker);
         self.admissions_due();
+        drop(registry);
+        Ok(())
     }
 
     pub(super) async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {
@@ -212,17 +240,28 @@ impl Controller {
     /// bound, and one that runs out gives up nothing ([`WorkerLink`]); a link that cannot be opened
     /// is a failure of the path, and the worker's lease stops renewing with it.
     pub(super) async fn worker_client(&self, worker: &KnownWorker) -> Result<WorkerLink> {
+        let session_id = worker.descriptor.session_id;
         let slot = {
+            // A slot is made only for a worker the directory holds, with the directory's lock kept
+            // while it is made. A closure takes the worker out of the directory and then out of the
+            // table, so a caller that took the worker before the closure and asks for its
+            // connection after it finds the directory without it and makes no slot, and one that
+            // is before it has its slot taken out with the worker.
+            let directory = self.directory.lock().await;
+            if directory.get(session_id).is_none() {
+                return Err(ControllerError::UnknownSession {
+                    session: session_id.to_string(),
+                });
+            }
             let mut connections = self.connections.lock().await;
             Arc::clone(
                 connections
-                    .entry(worker.descriptor.session_id)
+                    .entry(session_id)
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
             )
         }
         .lock_owned()
         .await;
-        let session_id = worker.descriptor.session_id;
         let mut slot = slot;
         let mut link = WorkerLink {
             daemon: self.me.clone(),

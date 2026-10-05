@@ -616,6 +616,8 @@ impl Controller {
             before_the_record: ReadPause::default(),
             #[cfg(test)]
             before_the_pass_tells: ReadPause::default(),
+            #[cfg(test)]
+            before_a_worker_is_published: ReadPause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
