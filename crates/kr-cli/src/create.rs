@@ -72,6 +72,19 @@ pub fn process_variables() -> Vec<EnvironmentVariable> {
         .collect()
 }
 
+/// The directory this process is in, as a create carries it, or nothing when it cannot be told.
+///
+/// A create carries text. A directory whose name has bytes that are not text cannot be written as
+/// it is, and the text a lossy rendering gives names another directory, so such a create names none
+/// and the host starts the session where it starts one by default.
+pub fn process_directory() -> Option<String> {
+    std::env::current_dir()
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
 /// What `--palette` was given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteChoice {

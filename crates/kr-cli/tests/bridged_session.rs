@@ -849,12 +849,14 @@ impl World {
     /// Runs a shell command on a terminal of its own, in the source host's environment, and
     /// returns that terminal. The command asks it nothing yet: answering is the test's.
     fn terminal_running(&self, command: &str) -> Terminal {
-        self.terminal_running_with(command, &[])
+        self.terminal_running_in(Path::new("/"), command, &[])
     }
 
-    /// As [`Self::terminal_running`], with `variables` added to the terminal's environment.
-    fn terminal_running_with(
+    /// As [`Self::terminal_running`], in `directory` and with `variables` added to the terminal's
+    /// environment.
+    fn terminal_running_in(
         &self,
+        directory: &Path,
         command: &str,
         variables: &[(&str, &std::ffi::OsStr)],
     ) -> Terminal {
@@ -887,7 +889,7 @@ impl World {
         for (name, value) in variables {
             builder.env(name, value);
         }
-        builder.cwd("/");
+        builder.cwd(directory);
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
@@ -1027,15 +1029,17 @@ async fn a_shell_created_through_a_bridge_has_no_relative_home() {
     a_shell_has_a_home_and_starts_in_it(Login::RelativeHome).await;
 }
 
-/// Runs `kr new --attach` with `arguments` on a terminal that answers every question the command
-/// asks about what it is, with `variables` added to the terminal's own environment, and returns
-/// the terminal once the shell the command attaches is the person's.
+/// Runs `kr new --attach` with `arguments` on a terminal in `directory` that answers every question
+/// the command asks about what it is, with `variables` added to the terminal's own environment, and
+/// returns the terminal once the shell the command attaches is the person's.
 fn a_created_session_attached_on_a_terminal(
     world: &World,
+    directory: &Path,
     arguments: &str,
     variables: &[(&str, &std::ffi::OsStr)],
 ) -> Terminal {
-    let terminal = world.terminal_running_with(
+    let terminal = world.terminal_running_in(
+        directory,
         &format!(
             "{} new --attach --palette probe {arguments} --shell /bin/sh --startup interactive \
              --headless; printf 'create-finished-%s\\n' \"$?\"",
@@ -1061,6 +1065,7 @@ async fn a_shown_session_created_through_a_bridge_has_the_destination_logins_var
     std::fs::create_dir_all(&source_home).expect("the terminal's own home");
     let terminal = a_created_session_attached_on_a_terminal(
         &world,
+        Path::new("/"),
         "--environment dest",
         &[("HOME", source_home.as_os_str())],
     );
@@ -1091,6 +1096,7 @@ async fn a_session_created_from_a_terminal_whose_environment_is_not_all_text_is_
     let world = World::start().await;
     let terminal = a_created_session_attached_on_a_terminal(
         &world,
+        Path::new("/"),
         "",
         &[
             ("EXAMPLE_KEPT", std::ffi::OsStr::new("kept")),
@@ -1104,6 +1110,39 @@ async fn a_session_created_from_a_terminal_whose_environment_is_not_all_text_is_
         "the shell reported the variable it was given",
     );
     assert_eq!(printed[0], "kept", "the text variable reached the shell");
+    terminal.types("exit\r");
+    terminal.expect_within("create-finished-", "the command ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+}
+
+/// KR-REQ-07.25: a session created here from a directory whose name is not text is not started in
+/// the other directory a lossy rendering of that name spells.
+///
+/// Both directories exist: one holds the terminal, and the other is named by the text a name with
+/// bytes that are not text is shown as. The file systems macOS uses refuse the first, so only
+/// Linux can make it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_created_from_a_directory_whose_name_is_not_text_is_not_started_in_a_lookalike() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let world = World::start().await;
+    let directory = world
+        .source
+        .root()
+        .join(std::ffi::OsStr::from_bytes(b"not-text-\xff"));
+    let lookalike = world.source.root().join("not-text-\u{fffd}");
+    std::fs::create_dir(&directory).expect("a directory whose name is not text");
+    std::fs::create_dir(&lookalike).expect("the directory its lossy name spells");
+    let terminal = a_created_session_attached_on_a_terminal(&world, &directory, "", &[]);
+    terminal.types("printf 'reports|%s|\\n' \"$PWD\"\r");
+    let printed = terminal.reported_within("reports|", 1, "the shell reported where it started");
+    assert_ne!(
+        resolved(Path::new(&printed[0])),
+        resolved(&lookalike),
+        "the shell started in the directory a lossy rendering of the terminal's spells"
+    );
     terminal.types("exit\r");
     terminal.expect_within("create-finished-", "the command ended with the session");
     let mut shell = terminal.shell;

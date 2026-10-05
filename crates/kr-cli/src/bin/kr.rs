@@ -208,11 +208,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 presentation,
                 shell: Nullable(arguments.shell),
                 shell_mode,
-                cwd: Nullable(arguments.cwd.or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|path| path.display().to_string())
-                })),
+                cwd: Nullable(arguments.cwd.or_else(kr_cli::create::process_directory)),
                 dimensions: Nullable(dimensions),
                 worker_profile: profile,
                 environment_snapshot: kr_cli::create::environment_snapshot(
