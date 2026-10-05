@@ -570,8 +570,9 @@ fn account_name() -> String {
 /// Where a session created through this bridge starts, and with what, as this helper's own
 /// environment states it.
 ///
-/// What a `kr new` run here would have sent, and nothing from the host the bridge was opened from.
-/// A destination that has no home to offer starts a session at its root.
+/// The variables this helper's environment holds from a fixed allowlist, and nothing from the host
+/// the bridge was opened from. A destination that has no home to offer starts a session at its
+/// root.
 fn base() -> DestinationBase {
     // The home the user's login gave this process, which `wsl.exe --user` and a container
     // runtime's exec set for the user they run it as, and else the account's own record of it.
