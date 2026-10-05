@@ -529,8 +529,11 @@ fn paired_with_every_right(
 ///
 /// The read is made as a device paired under every right but the voice right, and a voice grant of
 /// its own: the ordinary grant a voice grant narrows.
-async fn receipt_of_a_voice_read(
-    prepare: impl FnOnce(&crate::service::Controller, kr_protocol::ids::SessionId),
+async fn receipt_of_a_voice_read<Prepared: std::future::Future<Output = ()>>(
+    prepare: impl FnOnce(
+        std::sync::Arc<crate::service::Controller>,
+        kr_protocol::ids::SessionId,
+    ) -> Prepared,
 ) -> String {
     use std::sync::Arc;
 
@@ -575,7 +578,7 @@ async fn receipt_of_a_voice_read(
             || Ok(()),
         )
         .expect("a live voice grant");
-    prepare(controller, world.session_id);
+    prepare(Arc::clone(controller), world.session_id).await;
     let voice_session_id = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let delegation_id =
         kr_protocol::voice::VoiceDelegationId::new("a-delegation").expect("an identifier");
@@ -609,11 +612,11 @@ async fn receipt_of_a_voice_read(
     receipt.summary
 }
 
-/// KR-REQ-15.20: the receipt of a voice read of a session names the session as the voice context
-/// does, with the name a person pinned, under the bound the voice grant's device has.
+/// KR-REQ-15.20: the receipt of a voice read of a session names the session with the name a person
+/// pinned, under the bound the voice grant's device has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
-    let summary = receipt_of_a_voice_read(|controller, session_id| {
+    let summary = receipt_of_a_voice_read(|controller, session_id| async move {
         controller
             .descriptions()
             .rename(
@@ -630,12 +633,16 @@ async fn the_receipt_of_a_voice_read_names_the_pin_the_host_holds() {
     assert!(summary.contains("named \"Release prep\""), "{summary}");
 }
 
-/// KR-REQ-15.20 and KR-REQ-24.11: a receipt says what was done and what the host observed, and
-/// nothing a model wrote of the session, so no read of it can carry that text out after privacy
-/// mode removes it.
+/// KR-REQ-15.20 and KR-REQ-24.11: a receipt says what was done and names the session by what a
+/// person chose and what the daemon holds of it, and nothing a model wrote of it and nothing the
+/// description host observed, so no read of it can carry either out after privacy mode removes
+/// them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_receipt_of_a_voice_read_carries_nothing_a_model_wrote() {
-    let summary = receipt_of_a_voice_read(|controller, session_id| {
+async fn the_receipt_of_a_voice_read_carries_nothing_a_model_wrote_or_the_host_observed() {
+    use kr_protocol::describe::{DescriptionFacts, DescriptionFactsPage};
+    use kr_protocol::scalars::U64;
+
+    let summary = receipt_of_a_voice_read(|controller, session_id| async move {
         controller
             .descriptions()
             .store()
@@ -648,13 +655,46 @@ async fn the_receipt_of_a_voice_read_carries_nothing_a_model_wrote() {
                 900,
             )
             .expect("a description");
+        // The description host observes the session running in another directory than the one it
+        // started in.
+        let host = controller.descriptions().host().expect("a host").clone();
+        host.session_opened(
+            session_id,
+            kr_protocol::ids::SessionEpoch::V1,
+            kr_describe::context::ContextBinding::new("test"),
+        );
+        host.page(
+            session_id,
+            Box::new(DescriptionFactsPage {
+                request_id: RequestId::new(1),
+                session_id,
+                privacy_generation: Nullable::some(U64::new(0)),
+                private: false,
+                facts: Nullable::some(DescriptionFacts {
+                    revision: U64::new(1),
+                    generation: U64::new(0),
+                    directory: Nullable::some("observed-directory".to_owned()),
+                    repository: Nullable::null(),
+                    application: Nullable::some("cargo".to_owned()),
+                    completion: Nullable::null(),
+                    intent: Nullable::null(),
+                    thread: Nullable::null(),
+                    events: Vec::new(),
+                }),
+            }),
+            false,
+        );
+        controller
+            .descriptions()
+            .until_host_has_taken_what_was_posted()
+            .await;
+        assert!(
+            host.snapshot().seen.contains_key(&session_id),
+            "the host observed the session"
+        );
     })
     .await;
-    assert!(
-        summary.starts_with("session 1 running /bin/zsh"),
-        "the session as the host knows it: {summary}"
-    );
-    assert!(!summary.contains("Pairing check"), "{summary}");
+    assert_eq!(summary, "session 1 running /bin/zsh is live in /work");
 }
 
 /// Every read the method table admits for a paired device is served, or refused by name for a

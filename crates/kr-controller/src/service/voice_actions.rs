@@ -103,33 +103,32 @@ impl Controller {
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
-        self.voice_snapshot_of(&read.session).await
+        let described = self.voice_description_of(&read.session).await?;
+        Ok(crate::voice::snapshot_with(
+            &read.session,
+            session_id,
+            &described,
+        ))
     }
 
-    /// What this host can say about a session it has already read, with what the description host
-    /// holds of it: the second half of [`Self::voice_session_snapshot`], for a path that reads the
-    /// session itself and says no more of it than the context does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the description store cannot be read.
-    async fn voice_snapshot_of(
+    /// What the description host holds of a session: the name a person pinned, what a model wrote
+    /// and what the host observed, read under the privacy state as it stands.
+    async fn voice_description_of(
         &self,
         session: &kr_protocol::session::SessionSummary,
-    ) -> Result<crate::voice::SessionSnapshot> {
+    ) -> Result<crate::describe::VoiceDescription> {
         let descriptions = Arc::clone(&self.descriptions);
         let privacy = self.privacy.state();
         let facts = crate::describe::facts_of(session);
         let session_id = session.session_id;
         let started_ms = session.created_at_ms.get();
-        let described = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             descriptions.voice_description(session_id, &facts, started_ms, &privacy)
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the session's description could not be read".to_owned(),
-        })??;
-        Ok(crate::voice::snapshot_with(session, session_id, &described))
+        })?
     }
 
     /// Performs one voice proposal under the method the registry lists for its effect.
@@ -158,13 +157,12 @@ impl Controller {
             let params = ParamsValue::from_typed(&SessionReadParams { session_id })
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
-            // What the context says of the session, with the name a person pinned and where the
-            // description host saw it run, so a receipt names the session as the context does. A
-            // receipt says what was done and what the host observed, so what a model wrote of the
-            // session is left out of it: nothing here holds that text to the privacy state it was
-            // read under, and a receipt carries it past the removal privacy mode makes.
-            let mut snapshot = self.voice_snapshot_of(&read.session).await?;
-            snapshot.generated = None;
+            // The session as the context names it, with the name a person pinned. What a model
+            // wrote of it and what the description host observed are left out: a receipt leaves
+            // this daemon with nothing that holds that text to the privacy state it was read
+            // under, and it would carry it past the removal privacy mode makes.
+            let described = self.voice_description_of(&read.session).await?.pin_only();
+            let snapshot = crate::voice::snapshot_with(&read.session, session_id, &described);
             let narrowed = self.voice_authority_now(proposal, session_id)?;
             // The same bound the context path applies, and the answer is built from what it
             // admitted and from nothing else. A session's description carries its number and the
