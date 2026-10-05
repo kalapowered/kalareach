@@ -1215,8 +1215,8 @@ async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_dae
 async fn a_session_the_host_starts_has_an_absolute_home_whatever_login_the_daemon_has() {
     let scratch = tempfile::tempdir().expect("a directory");
     let directory = scratch.path().to_path_buf();
-    // What the system records as this account's home, asked here and not through the lookup the
-    // daemon makes, so a daemon that skipped the record would be seen to.
+    // What the system records as this account's home, so a daemon that gave its sessions the root
+    // where the account has a home is seen to. The lookup itself is checked in `kr-ipc`.
     let account_home = kr_ipc::paths::passwd_entry()
         .and_then(|entry| entry.home)
         .filter(|home| home.starts_with('/'))
