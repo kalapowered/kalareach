@@ -435,8 +435,13 @@ impl ModelProfile {
         // one byte, so a prompt is never more tokens than it is bytes. A window that holds the
         // instruction byte for byte, a token each for the start and the end of a sequence and the
         // output bound has room for the instruction in such a vocabulary. A profile with less would
-        // have jobs that could not exist.
-        let instruction = crate::prompt::Prompt::bare().text().len() as u64;
+        // have jobs that could not exist. The instruction is the longer of a description's and a
+        // summary's, each with the longest numbers it repeats.
+        let instruction = crate::prompt::Prompt::bare()
+            .text()
+            .len()
+            .max(crate::prompt::Prompt::bare_summary().text().len())
+            as u64;
         if u64::from(fields.execution.context_tokens)
             < instruction + 2 + u64::from(fields.execution.max_output_tokens)
         {
