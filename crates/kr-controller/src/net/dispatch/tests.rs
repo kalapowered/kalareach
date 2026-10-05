@@ -2087,41 +2087,13 @@ async fn a_local_prompt_naming_a_draft_is_recorded_before_the_worker_is_asked() 
     let draft_id =
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "local.bin");
 
-    let window = controller
-        .windows
-        .issue(admission.connection_id, controller.boot_epoch)
-        .expect("a window");
-    let params = kr_protocol::agent::AgentPromptParams {
-        target: kr_protocol::agent::AgentMutationTarget {
-            subject: kr_protocol::agent::AgentSubject {
-                session_id: world.session_id,
-                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
-                    kr_ipc::new_uuid(),
-                ),
-            },
-            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-        },
-        draft_id: Nullable::some(draft_id),
-        text: Nullable::null(),
-    };
-    let mutation = MutationRequest {
-        request_id: RequestId::new(1),
-        method: Method::AgentPromptSubmit.into(),
-        method_version: MethodVersion::V1,
-        action_id: ActionId::new(kr_ipc::new_uuid()),
-        grant_id: Nullable::null(),
-        target: ActionTarget {
-            environment_id: world.environment_id,
-            session_id: Nullable::some(world.session_id),
-            session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::some(params.target.subject.application_instance_id),
-            agent_binding_revision: Nullable::some(params.target.binding_revision),
-        },
-        expected: ParamsValue::empty(),
-        action_window_id: window.action_window_id,
-        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
-        params: ParamsValue::from_typed(&params).expect("encodes"),
-    };
+    let mutation = a_local_prompt(
+        &world,
+        &admission,
+        ActionId::new(kr_ipc::new_uuid()),
+        Nullable::some(draft_id),
+        Nullable::null(),
+    );
 
     let (arrived, go) = script.hold_the_next_prompt();
     let mut performing = tokio::spawn({
@@ -2155,13 +2127,221 @@ async fn a_local_prompt_naming_a_draft_is_recorded_before_the_worker_is_asked() 
         ),
         "{answer:?}"
     );
-    let forwarded = script.forwarded();
-    assert_eq!(forwarded.len(), 1);
+    let sent = prompts_the_worker_was_asked_to_take(&script);
+    assert_eq!(sent.len(), 1);
     assert_eq!(
-        forwarded[0].actor.ingress,
+        sent[0].actor.ingress,
         kr_protocol::actor::ActorIngress::LocalIpc
     );
     world.serving.abort();
+}
+
+/// KR-REQ-14.11: a prompt made under an action identifier the worker has already used for another
+/// payload is refused as a reused identifier before the draft it names is recorded or anything is
+/// sent, whichever way the first prompt reached the worker, so one prompt's identifier cannot put
+/// another draft's attachments under the session's retention.
+///
+/// The first prompt carries its text inline, so nothing here ever recorded or claimed it: only the
+/// worker knows it holds the action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_reusing_an_action_for_a_draft_is_refused_before_it_is_recorded() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "reused.bin");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let inline = a_local_prompt(
+        &world,
+        &admission,
+        action_id,
+        Nullable::null(),
+        Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
+    );
+    let sent = controller
+        .perform(&actor, admission.connection_id, None, inline)
+        .await;
+    assert!(
+        matches!(
+            sent,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{sent:?}"
+    );
+
+    let reused = controller
+        .perform(
+            &actor,
+            admission.connection_id,
+            None,
+            a_local_prompt(
+                &world,
+                &admission,
+                action_id,
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+        )
+        .await;
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    }) = reused
+    else {
+        panic!("a reused identifier is refused: {reused:?}");
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::IdConflict);
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "the draft was recorded under an identifier that is not its own"
+    );
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 1);
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11: a repeat of a prompt whose first attempt reached the worker is answered from the
+/// receipt the worker holds, and nothing about the draft is recorded or sent again, so a record
+/// that would now be refused cannot replace the answer the caller is owed.
+///
+/// The draft's attachment belongs to another session, so recording it for this one is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_recorded_again() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "repeat.bin");
+    controller
+        .transfer()
+        .record_submission(
+            &actor,
+            draft_id,
+            kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+        )
+        .await
+        .expect("records the submission to another session");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    script.kept_without_a_result(
+        action_id,
+        Method::AgentPromptSubmit,
+        ProtocolError::new(
+            ErrorCode::UnsupportedCapability,
+            "no upstream takes prompts",
+        ),
+    );
+
+    let repeated = controller
+        .perform(
+            &actor,
+            admission.connection_id,
+            None,
+            a_local_prompt(
+                &world,
+                &admission,
+                action_id,
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+        )
+        .await;
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = repeated
+    else {
+        panic!("the worker answers the repeat from its receipt: {repeated:?}");
+    };
+    let receipt: kr_protocol::receipt::ReceiptResponse = value.to_typed().expect("a receipt");
+    assert_eq!(receipt.receipt.action_id, action_id);
+    assert_eq!(
+        receipt.receipt.error.0.map(|error| error.code),
+        Some(ErrorCode::UnsupportedCapability)
+    );
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "nothing is sent again"
+    );
+    world.serving.abort();
+}
+
+/// A prompt a caller at this machine makes to the scripted session as `action_id`, naming a draft
+/// or carrying its text inline, under a window issued to `admission`'s connection.
+fn a_local_prompt(
+    world: &crate::service::a_close_a_worker_never_answers::Silent,
+    admission: &crate::authority::AdmittedMutation,
+    action_id: ActionId,
+    draft_id: Nullable<kr_protocol::ids::DraftId>,
+    text: Nullable<kr_protocol::agent::PromptText>,
+) -> MutationRequest {
+    let controller = &world.controller;
+    let window = controller
+        .windows
+        .issue(admission.connection_id, controller.boot_epoch)
+        .expect("a window");
+    let params = kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_protocol::agent::AgentSubject {
+                session_id: world.session_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        },
+        draft_id,
+        text,
+    };
+    MutationRequest {
+        request_id: RequestId::new(1),
+        method: Method::AgentPromptSubmit.into(),
+        method_version: MethodVersion::V1,
+        action_id,
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: world.environment_id,
+            session_id: Nullable::some(world.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(params.target.subject.application_instance_id),
+            agent_binding_revision: Nullable::some(params.target.binding_revision),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: window.action_window_id,
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&params).expect("encodes"),
+    }
+}
+
+/// The prompts a scripted worker was asked to take, which are the ones forwarded with a lifetime:
+/// a prompt forwarded with none is only asked whether the worker holds a receipt for it.
+fn prompts_the_worker_was_asked_to_take(
+    script: &crate::service::a_read_that_meets_a_worker_on_its_way_out::Scripted,
+) -> Vec<kr_protocol::local::ForwardedMutation> {
+    script
+        .forwarded()
+        .into_iter()
+        .filter(|forwarded| forwarded.accepted_deadline_boot_ms.get() != 0)
+        .collect()
 }
 
 /// KR-REQ-14.11: a sweep judges an attachment only against a view of retention taken after the

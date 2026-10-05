@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ConnectionId;
 use kr_protocol::scalars::{CanonicalSet, U64};
 use kr_transport::window::AcceptedDeadline;
@@ -41,7 +42,8 @@ impl Controller {
     /// identity of the caller's action, and a repeat that reaches the worker by this route or by
     /// its own socket finds the same receipt. `accepted` is the deadline this daemon accepted for a
     /// first admission, and none for an exact repeat, which the worker answers from its record and
-    /// which records nothing here: its first attempt did.
+    /// which records nothing here: its first attempt did. A prompt that names a draft and still has
+    /// its window is told from a repeat by the worker's own receipt before anything is recorded.
     ///
     /// # Errors
     ///
@@ -108,20 +110,60 @@ impl Controller {
             }
             None => U64::new(0),
         };
-        // The record is made for a first admission only, before the worker is asked. A draft this
-        // caller does not hold has no attachments for this host to retain, so naming one is not a
-        // failure, and a draft that is for another session is refused before anything is sent.
+        let actor = local_actor(actor_id.clone(), connection_id, self.generation);
+        // The record is made for a first submission only, and before the worker is asked to take
+        // the prompt. The worker is the only thing that knows whether it already holds a receipt
+        // for this action, so it is asked first with the prompt itself and no lifetime: with no
+        // lifetime a prompt cannot be admitted, so the worker answers only from a receipt it holds
+        // (a result, or the receipt as it stands, or `ID_CONFLICT` for an identifier that was used
+        // with another payload) and otherwise says the window has passed without keeping anything.
+        // What it answers from a receipt is the answer, and nothing is recorded: the first attempt
+        // recorded the draft, and a record that failed or named another draft would otherwise come
+        // before the answer the caller is owed. Anything else it says means no receipt, and the
+        // draft is recorded as a prompt the worker then refuses is: it was still sent to its
+        // session. A draft this caller does not hold has no attachments for this host to retain,
+        // so naming one is not a failure, and a draft that is for another session is refused
+        // before anything is sent.
         if accepted.is_some()
             && let Some(draft_id) = crate::transfer::prompted_draft(mutation)
-            && let Err(error) = self
+        {
+            let asked = tokio::time::timeout_at(
+                budget,
+                link.client()
+                    .forward(mutation, &actor, &CanonicalSet::new(), U64::new(0)),
+            )
+            .await;
+            match asked {
+                Ok(Ok(Ok(held))) => {
+                    link.give_back();
+                    return Ok(held);
+                }
+                Ok(Ok(Err(refusal))) if refusal.code == ErrorCode::IdConflict => {
+                    link.give_back();
+                    return Err(ControllerError::refused(&refusal));
+                }
+                Ok(Ok(Err(_))) => {}
+                // The link is retired in the two arms below, because its exchange was abandoned or
+                // failed part way and its next caller would read this answer as its own.
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    return Err(ControllerError::Uncertain {
+                        detail:
+                            "the worker that owns this session did not answer in the time this \
+                                 prompt was given, so nothing was sent"
+                                .to_owned(),
+                    });
+                }
+            }
+            if let Err(error) = self
                 .transfer
                 .record_submission(actor_id, draft_id, session_id)
                 .await
-        {
-            link.give_back();
-            return Err(ControllerError::refused(&error));
+            {
+                link.give_back();
+                return Err(ControllerError::refused(&error));
+            }
         }
-        let actor = local_actor(actor_id.clone(), connection_id, self.generation);
         let answered = tokio::time::timeout_at(
             budget,
             link.client().forward(
