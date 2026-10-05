@@ -34,7 +34,8 @@ further action again. A failed insertion loses none of the three stages before i
 | `download.chunk` | read | Reads one chunk of that same snapshot, rechecking read authority first |
 
 `draft.create`, `draft.update` and `agent.draft.add_attachment` are in the same method group and the
-same service. `agent.prompt.submit` is not: submission goes to the worker that owns the session.
+same service. `agent.prompt.submit` is not: submission goes to the worker that owns the session,
+through the daemon when the prompt names a draft.
 
 Every one of these returns an opaque identifier. None of them returns a client-supplied absolute
 host path, and none accepts one.
@@ -62,13 +63,17 @@ a draft, whether the prompt is submitted or queued, when it forwards the prompt 
 worker and before the worker answers. Once the host has recorded it, nothing the worker does
 afterwards, even if the worker refuses the prompt or the connection is lost, can leave an attachment
 on the seven-day window. A prompt that never reaches the worker after the host recorded it leaves
-the attachments with the session all the same. A draft is sent to one session, and an attachment
-belongs to one. The attachments the draft holds, and any it gets later, can only be held by the
-session it was sent to. An attachment uploaded without a session takes that session. A prompt that
-names a draft for another session, or a draft that holds an attachment belonging to another session,
-is refused before anything is sent. A prompt the worker refuses was still sent to its session, so
-the attachments stay with it. The host tells the service which sessions its retention still covers;
-the service never guesses.
+the attachments with the session all the same. A prompt that names a draft may arrive at the host
+over the network from a paired device or on the local socket from a caller at this machine; it is
+recorded in the same way in either case. The worker serves a prompt that names a draft only to the
+host, so no route to the session's agent leaves a draft unrecorded. A prompt containing only prompt
+text, and therefore having no draft name, may be served to the worker on its own socket. A draft is
+sent to one session, and an attachment belongs to one. The attachments the draft holds, and any it
+gets later, can only be held by the session it was sent to. An attachment uploaded without a session
+takes that session. A prompt that names a draft for another session, or a draft that holds an
+attachment belonging to another session, is refused before anything is sent. A prompt the worker
+refuses was still sent to its session, so the attachments stay with it. The host tells the service
+which sessions its retention still covers; the service never guesses.
 
 The sweep works by first reading the published attachments. It then asks the archive which of the
 sessions that the submitted ones name still keep what was submitted to them, so the answer is taken
