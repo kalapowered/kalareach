@@ -1173,15 +1173,15 @@ mod tests {
         );
     }
 
-    /// KR-REQ-26.09: a program is a file of `bin/` the manifest lists as one, under the name its
-    /// target gives an executable: a file listed as data, or under another system's name, is not
-    /// the program.
+    /// KR-REQ-26.09: a program is a file of `bin/` under the name its target gives an executable:
+    /// a Windows release lists `kr.exe`, and `kr` there is not the program. A manifest that lists a
+    /// program as data is refused through the command, by the update tests.
     #[test]
-    fn a_program_is_a_listed_executable_under_the_name_its_target_gives_it() {
-        let listed = |target: &str, suffix: &str, mode: FileMode| {
+    fn a_program_has_the_file_name_its_target_gives_an_executable() {
+        let listed = |target: &str, suffix: &str| {
             let files = required_programs(target)
                 .map(|name| ReleaseFile {
-                    mode,
+                    mode: FileMode::Executable,
                     ..file(&format!("bin/{name}{suffix}"))
                 })
                 .collect();
@@ -1190,26 +1190,19 @@ mod tests {
                 ..manifest(files)
             }
         };
+        for (target, suffix) in [
+            ("aarch64-apple-darwin", ""),
+            ("x86_64-pc-windows-msvc", ".exe"),
+            ("aarch64-pc-windows-msvc", ".exe"),
+        ] {
+            assert_eq!(
+                listed(target, suffix).missing_programs(),
+                Vec::<&str>::new(),
+                "{target}"
+            );
+        }
         assert_eq!(
-            listed("aarch64-apple-darwin", "", FileMode::Executable).missing_programs(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            listed("x86_64-pc-windows-msvc", ".exe", FileMode::Executable).missing_programs(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            listed("aarch64-pc-windows-msvc", ".exe", FileMode::Executable).missing_programs(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            listed("aarch64-apple-darwin", "", FileMode::Regular)
-                .missing_programs()
-                .len(),
-            7
-        );
-        assert_eq!(
-            listed("x86_64-pc-windows-msvc", "", FileMode::Executable)
+            listed("x86_64-pc-windows-msvc", "")
                 .missing_programs()
                 .len(),
             7

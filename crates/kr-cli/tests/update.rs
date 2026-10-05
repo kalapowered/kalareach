@@ -184,8 +184,8 @@ const PROGRAM_NAMES: [&str; 7] = [
 /// Copied once for this whole process into the run's own directory on the internal disk, which
 /// goes when the process does. A build of this crate alone builds `kr` and the guard; the others
 /// are built by a workspace run, or by `cargo build -p kr-controller -p kr-worker -p kr-hook -p
-/// kr-plugin-host -p kr-describe-model --bin kr-describe-inference`, and a run without them fails
-/// and says so rather than passing without having tested anything.
+/// kr-plugin-host` and `cargo build -p kr-describe-model --bin kr-describe-inference`, and a run
+/// without them fails and says so rather than passing without having tested anything.
 fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
     static COPIED: OnceLock<Vec<(&'static str, PathBuf, Digest256, u64)>> = OnceLock::new();
     COPIED.get_or_init(|| {
@@ -199,8 +199,9 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
             assert!(
                 candidate.is_file(),
                 "{} is not built beside this test, so this suite cannot assemble a release; a \
-                 workspace test run builds it, and so does `cargo build -p kr-controller -p \
-                 kr-worker -p kr-hook`",
+                 workspace test run builds it, and so do `cargo build -p kr-controller -p \
+                 kr-worker -p kr-hook -p kr-plugin-host` and `cargo build -p kr-describe-model \
+                 --bin kr-describe-inference`",
                 candidate.display()
             );
             candidate
@@ -355,6 +356,17 @@ impl Assembled {
                 .iter()
                 .any(|name| file.path.as_str() == format!("bin/{name}"))
         });
+        self
+    }
+
+    /// This release with `name` listed as a file that is not a program: its bytes are in the tree
+    /// and in the manifest, so every file check passes, and the manifest does not say it runs.
+    fn with_data(mut self, name: &str) -> Self {
+        for file in &mut self.manifest.files {
+            if file.path.as_str() == format!("bin/{name}") {
+                file.mode = FileMode::Regular;
+            }
+        }
         self
     }
 
@@ -3519,8 +3531,9 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
 }
 
 /// KR-REQ-26.09: an update refuses a release whose signed manifest lists no program of one a host
-/// runs, whichever program that is, and says which. The same release with the program is taken, so
-/// the one program is the whole of the refusal.
+/// runs, whichever program that is, and says which; so does a manifest that lists the file as data,
+/// whose bytes are all there. The same release with the program is taken, so the one program is
+/// the whole of the refusal.
 #[test]
 fn an_update_refuses_a_release_that_lacks_a_program_a_host_runs() {
     let host = Host::bare();
@@ -3551,22 +3564,31 @@ fn an_update_refuses_a_release_that_lacks_a_program_a_host_runs() {
     // Every program is tried before the test says anything, so one run names each that is let
     // through.
     let mut wrong = Vec::new();
-    for name in PROGRAM_NAMES {
-        let lacking = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).without(&[name]);
-        let refused = check(&lacking, name);
+    let whole = || Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let mut cases: Vec<(String, &str, Assembled)> = PROGRAM_NAMES
+        .iter()
+        .map(|name| (format!("without-{name}"), *name, whole().without(&[name])))
+        .collect();
+    cases.push((
+        "hook-as-data".to_owned(),
+        "kr-hook",
+        whole().with_data("kr-hook"),
+    ));
+    for (label, name, release) in cases {
+        let refused = check(&release, &label);
         let said = String::from_utf8_lossy(&refused.stderr);
         if refused.status.code() != Some(1) {
             wrong.push(format!(
-                "{name}: not refused, exit {:?}",
+                "{label}: not refused, exit {:?}",
                 refused.status.code()
             ));
         } else if !said.contains(&format!("`{name}`")) {
-            wrong.push(format!("{name}: not named: {said}"));
+            wrong.push(format!("{label}: {name} is not named: {said}"));
         } else if let Some(other) = PROGRAM_NAMES
             .iter()
             .find(|other| **other != name && said.contains(&format!("`{other}`")))
         {
-            wrong.push(format!("{name}: {other} is named too: {said}"));
+            wrong.push(format!("{label}: {other} is named too: {said}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
