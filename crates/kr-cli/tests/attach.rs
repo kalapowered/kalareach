@@ -1121,12 +1121,15 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         "the guard put the terminal back after the attach process was killed",
     );
 
-    // The guard writes the reset block and then this terminal's own values over it. Waiting for the
-    // cursor's own value is waiting for the whole of that, because it is written in one go.
+    // The guard writes the reset block, then this terminal's own values over it, and last the
+    // keyboard protocols this terminal reported. A terminal is handed what it is written in
+    // whatever pieces the system likes, so the first of those values arriving says nothing of the
+    // rest: what is read below is read once the last thing the guard writes has arrived, and
+    // everything it wrote before it has.
     output.expect_within(
-        b"\x1b[?25l",
+        MODIFY_OTHER_KEYS_RESTORED,
         LIVENESS_DEADLINE,
-        "the guard hid the cursor again, because that is how it found it",
+        "the guard put the terminal's own modes back, and its keyboard protocols last",
     );
     let modes = final_modes(&output.bytes());
     for (mode, expected) in REPORTED_MODES {
@@ -1210,11 +1213,13 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
     let queries =
         answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
 
-    output.expect_within(b"attach-finished-", LIVENESS_DEADLINE, "the attach ended");
+    // The status is read once its line is whole: the digit can arrive after the rest of the marker.
+    let status = exit_status(&output, "attach-finished-");
     answered(queries);
-    assert!(
-        !output.contains(b"attach-finished-0"),
-        "and it failed, because nothing is listening on that endpoint: {}",
+    assert_ne!(
+        status,
+        0,
+        "the attach ended, and it failed, because nothing is listening on that endpoint: {}",
         output.text().escape_debug()
     );
     // The handshake did happen: this terminal was asked, and it answered.
@@ -2093,13 +2098,9 @@ async fn a_descriptor_its_worker_cannot_answer_for_is_not_attached_through() {
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    output.expect_within(
-        b"attach-finished-",
-        LIVENESS_DEADLINE,
-        "the attach finished",
-    );
-    assert!(
-        !output.contains(b"attach-finished-0"),
+    assert_ne!(
+        exit_status(&output, "attach-finished-"),
+        0,
         "an attach through a descriptor its worker cannot answer for fails: {}",
         output.text().escape_debug()
     );
