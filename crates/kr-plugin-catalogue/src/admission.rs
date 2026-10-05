@@ -185,20 +185,41 @@ pub enum NotAdmittedReason {
 }
 
 /// Names the platforms a manifest lists, as the sentence that says what a release supports reads
-/// them: each operating system with its architectures, `linux (x86_64, aarch64); mac_os (aarch64)`.
+/// them: each operating system once, with its architectures once each, in the order the manifest
+/// first lists them, `linux (x86_64, aarch64); mac_os (aarch64)`.
+///
+/// A manifest may list an operating system twice or list one with no architecture, and the
+/// sentence goes whole into an answer a host sizes, so what it names is bounded by the two closed
+/// lists and not by what the manifest repeats.
 fn describe(platforms: &[PlatformSupport]) -> String {
-    if platforms.is_empty() {
+    let mut named: Vec<(&str, Vec<&str>)> = Vec::new();
+    for platform in platforms {
+        let os = platform.os.as_str();
+        let at = named
+            .iter()
+            .position(|(seen, _)| *seen == os)
+            .unwrap_or_else(|| {
+                named.push((os, Vec::new()));
+                named.len() - 1
+            });
+        for architecture in &platform.architectures {
+            let architecture = architecture.as_str();
+            if !named[at].1.contains(&architecture) {
+                named[at].1.push(architecture);
+            }
+        }
+    }
+    if named.is_empty() {
         return "no platform".to_owned();
     }
-    platforms
+    named
         .iter()
-        .map(|platform| {
-            let architectures: Vec<&str> = platform
-                .architectures
-                .iter()
-                .map(|architecture| architecture.as_str())
-                .collect();
-            format!("{} ({})", platform.os.as_str(), architectures.join(", "))
+        .map(|(os, architectures)| {
+            if architectures.is_empty() {
+                format!("{os} (no architecture)")
+            } else {
+                format!("{os} ({})", architectures.join(", "))
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
