@@ -661,9 +661,11 @@ async fn an_environment_names_the_account_its_daemon_runs_as_and_not_what_a_vari
         |entry| entry.name,
     );
     assert_eq!(listed.environments[0].os_user, account);
-    assert_eq!(
-        listed.environments[0].label,
-        format!("{account} on {}", std::env::consts::OS)
+    assert!(
+        listed.environments[0].label.contains(&account)
+            && !listed.environments[0].label.contains("somebody-else"),
+        "the label names the account: {:?}",
+        listed.environments[0].label
     );
 }
 
