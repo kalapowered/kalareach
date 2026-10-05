@@ -360,10 +360,40 @@ struct SessionFence {
 /// What must still hold for a response's session text to be released.
 ///
 /// One entry for each live answer the response holds text from. Text read from a finished
-/// session's journal needs none: no transition can follow the closure.
+/// session's journal needs none: no transition can follow the closure. A response that carries
+/// text a model wrote also holds the privacy state that text was decided under.
 #[derive(Clone, Debug, Default)]
 pub struct Ticket {
     entries: Vec<TicketEntry>,
+    generated: Option<Generated>,
+}
+
+/// Text a model wrote that a response carries, and the privacy state it was read under.
+///
+/// Privacy mode removes what a model wrote of a session at the moment it is enabled, so the text is
+/// released only while the state is the one it was read under: not private, and in the same
+/// generation. The worker's own fence says nothing of it, since the daemon holds this text and
+/// the worker did not answer it.
+#[derive(Clone, Debug)]
+pub(crate) struct Generated {
+    state: crate::privacy::PrivacyState,
+    decided: crate::privacy::Published,
+}
+
+impl Generated {
+    /// Text a model wrote, read while `state` said `decided`.
+    pub(crate) const fn read_under(
+        state: crate::privacy::PrivacyState,
+        decided: crate::privacy::Published,
+    ) -> Self {
+        Self { state, decided }
+    }
+}
+
+/// The privacy state a response's generated text is released under, held for as long as a write
+/// of it is made: privacy mode cannot be published in between.
+struct Standing<'a> {
+    _reading: Option<crate::privacy::Reading<'a>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -398,17 +428,47 @@ impl Ticket {
         Ok(found.map(kr_worker::privacy::PrivacyGeneration::new))
     }
 
+    /// A ticket for a response whose only text is text a model wrote, read under `generated`.
+    pub(crate) fn of_generated(generated: Generated) -> Self {
+        Self {
+            entries: Vec::new(),
+            generated: Some(generated),
+        }
+    }
+
     /// Returns true when the ticket names no text that needs a check.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.generated.is_none()
     }
 
-    /// Answers whether every text the ticket names may be released at `now`: its session's
+    /// Takes the privacy state the generated text was read under, and none when it has moved or is
+    /// moving. It waits for nothing. A ticket with no generated text stands on nothing.
+    fn standing(&self) -> Option<Standing<'_>> {
+        let Some(generated) = &self.generated else {
+            return Some(Standing { _reading: None });
+        };
+        generated
+            .state
+            .try_reading()
+            .filter(|reading| reading.published() == generated.decided)
+            .map(|reading| Standing {
+                _reading: Some(reading),
+            })
+    }
+
+    /// Answers whether everything the ticket names may be released at `now`: the privacy state its
+    /// generated text was read under stands, and its session text may be released
+    /// ([`Self::holds_text`]).
+    fn holds(&self, fences: &BTreeMap<SessionId, SessionFence>, now: u64) -> bool {
+        self.standing().is_some() && self.holds_text(fences, now)
+    }
+
+    /// Answers whether every session text the ticket names may be released at `now`: its session's
     /// barrier is lowered, the session was not closed over a worker the host could not account
     /// for, the generation its answer was decided under is the one recorded, and its lease has more
     /// than the margin left.
-    fn holds(&self, fences: &BTreeMap<SessionId, SessionFence>, now: u64) -> bool {
+    fn holds_text(&self, fences: &BTreeMap<SessionId, SessionFence>, now: u64) -> bool {
         self.entries.iter().all(|entry| {
             let fence = fences.get(&entry.session_id).copied().unwrap_or_default();
             !fence.barrier
@@ -980,7 +1040,14 @@ impl AttentionModule {
         loop {
             let attempt = {
                 let fences = self.release.read().await;
-                let may_write = || ticket.holds(&fences, kr_ipc::clock::boot_elapsed_ms());
+                // Held across the write itself, so privacy mode is published before the check or
+                // after the write, and the generated text of an answer is never written under a
+                // state that has gone.
+                let standing = ticket.standing();
+                let may_write = || {
+                    standing.is_some()
+                        && ticket.holds_text(&fences, kr_ipc::clock::boot_elapsed_ms())
+                };
                 if begun {
                     writer.resume_frame_checked(may_write)
                 } else {
@@ -1215,16 +1282,21 @@ impl AttentionModule {
                 self.after_page.wait();
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, ticket) = self.texts(reach, &page.texts).await;
+                let (texts, mut ticket) = self.texts(reach, &page.texts).await;
                 for (index, text) in texts {
                     if let Some(change) = result.changes.get_mut(index) {
                         change.summary = Nullable(text);
                     }
                 }
                 // Beside the changes and never among them. The answer that withholds session
-                // text carries no summary: one is generated text, written from it.
-                if let Some(source) = &source {
-                    result.summary = self.summary(reach, caller, params.session_id, source).await;
+                // text carries no summary: one is generated text, written from it. It is released
+                // only while the privacy state it was read under holds.
+                if let Some(source) = &source
+                    && let Some((summary, generated)) =
+                        self.summary(reach, caller, params.session_id, source).await
+                {
+                    result.summary = Nullable::some(summary);
+                    ticket.generated = Some(generated);
                 }
                 Ok(Read::with(encode(&result)?, withheld, ticket))
             }
@@ -1252,22 +1324,21 @@ impl AttentionModule {
         caller: &Caller,
         session_id: SessionId,
         source: &kr_attention::visit::SummarySource,
-    ) -> Nullable<ChangeSummary> {
+    ) -> Option<(ChangeSummary, Generated)> {
         let (Some(descriptions), Some(privacy)) = (
             self.descriptions.get().map(Arc::clone),
             self.privacy.get().cloned(),
         ) else {
-            return Nullable::null();
+            return None;
         };
-        let Some((earliest, _)) = moments(&source.changes) else {
-            return Nullable::null();
-        };
+        let (earliest, _) = moments(&source.changes)?;
         if !caller.reaches_back_to(earliest) {
-            return Nullable::null();
+            return None;
         }
         let (first_cursor, head) = (source.from_cursor, source.head);
         let reading = {
             let descriptions = Arc::clone(&descriptions);
+            let privacy = privacy.clone();
             // Decided under the privacy state's read side, which waits behind a change of privacy
             // mode, so on a thread that may wait.
             match tokio::task::spawn_blocking(move || {
@@ -1276,26 +1347,29 @@ impl AttentionModule {
             .await
             {
                 Ok(Ok(reading)) => reading,
-                _ => return Nullable::null(),
+                _ => return None,
             }
         };
         if reading.wanted {
             self.ask_for_summary(reach, &descriptions, session_id, source)
                 .await;
         }
-        Nullable(
-            reading
-                .served
-                .filter(|record| caller.reaches_back_to(record.from_ms))
-                .map(|record| ChangeSummary {
-                    text: record.text.as_str().to_owned(),
-                    from_cursor: U64::new(record.cursor.from),
-                    to_cursor: U64::new(record.cursor.to),
-                    from_ms: TimestampMs::new(record.from_ms),
-                    to_ms: TimestampMs::new(record.to_ms),
-                    model: format!("{}@{}", record.profile_id, record.profile_revision.get()),
-                }),
-        )
+        reading
+            .served
+            .filter(|record| caller.reaches_back_to(record.from_ms))
+            .map(|record| {
+                (
+                    ChangeSummary {
+                        text: record.text.as_str().to_owned(),
+                        from_cursor: U64::new(record.cursor.from),
+                        to_cursor: U64::new(record.cursor.to),
+                        from_ms: TimestampMs::new(record.from_ms),
+                        to_ms: TimestampMs::new(record.to_ms),
+                        model: format!("{}@{}", record.profile_id, record.profile_revision.get()),
+                    },
+                    Generated::read_under(privacy, reading.decided),
+                )
+            })
     }
 
     /// Asks the description host for a summary of the changes in a frozen interval.
@@ -3692,7 +3766,10 @@ mod tests {
             generation,
             release_until: 0,
         };
-        let ticket = |entries: Vec<TicketEntry>| Ticket { entries };
+        let ticket = |entries: Vec<TicketEntry>| Ticket {
+            entries,
+            generated: None,
+        };
         let named = |generation: u64| Some(kr_worker::privacy::PrivacyGeneration::new(generation));
         assert_eq!(ticket(Vec::new()).generation_of(session), Ok(None));
         assert_eq!(
@@ -3865,9 +3942,11 @@ mod tests {
     /// process, so what it was asked for is what the test reads from it, and what has been written
     /// is what the test puts in the store.
     struct Summarised {
-        _temp: kr_ipc::testing::TempHost,
+        temp: kr_ipc::testing::TempHost,
         module: Arc<AttentionModule>,
+        descriptions: Arc<crate::describe::DescribeModule>,
         host: crate::describe::host::tests::ByHand,
+        privacy: crate::privacy::PrivacyState,
         session_id: SessionId,
     }
 
@@ -3883,14 +3962,38 @@ mod tests {
             descriptions
                 .set_host(host.handle())
                 .expect("the first host");
-            module.attach_privacy(crate::privacy::PrivacyState::default());
+            let privacy = crate::privacy::PrivacyState::default();
+            module.attach_privacy(privacy.clone());
             module.attach_descriptions(Arc::clone(&descriptions));
             Self {
-                _temp: temp,
+                temp,
                 module,
+                descriptions,
                 host,
+                privacy,
                 session_id: SessionId::new(kr_ipc::new_uuid()),
             }
+        }
+
+        /// Puts in the description store a summary of the session's changes from the cursor `from`
+        /// to the cursor `to`, as the host's profile wrote it in the generation in force.
+        fn write_summary(&self, from: u64, to: u64, text: &str) {
+            let handle = self.host.handle();
+            let profile = handle.profile().expect("the host selected a profile");
+            self.descriptions
+                .store()
+                .publish_summary(&kr_describe::summary::SummaryRecord {
+                    session_id: self.session_id,
+                    cursor: kr_describe::context::CursorInterval::new(from, to),
+                    from_ms: 1_000,
+                    to_ms: 1_010,
+                    text: kr_describe::metadata::SummaryText::new(text).expect("a summary"),
+                    profile_id: profile.profile_id().to_owned(),
+                    profile_revision: profile.revision(),
+                    generation: self.privacy.now().generation,
+                    produced_at_ms: 1,
+                })
+                .expect("the summary is kept");
         }
 
         /// Records one command that completed in the session for each moment given, in the order
@@ -4049,6 +4152,88 @@ mod tests {
             (asked[0].interval.from, asked[0].interval.to),
             (0, 2),
             "the interval of the page, not of the visit that came after it"
+        );
+    }
+
+    /// The summary an answer to a read of what changed carries, when it carries one.
+    fn summary_in(frame: &ControlFrame) -> Option<kr_protocol::attention::ChangeSummary> {
+        let ControlFrame::Response(response) = frame else {
+            panic!("a response");
+        };
+        let Outcome::Ok(value) = &response.outcome else {
+            panic!("the read was refused");
+        };
+        value
+            .to_typed::<VisitChangedResult>()
+            .expect("decodes")
+            .summary
+            .0
+    }
+
+    /// KR-REQ-18.02 and KR-REQ-24.11: an answer that carries a summary is written only while the
+    /// privacy state it was decided under holds. One that is held while privacy mode is enabled is
+    /// taken back, and the same answer without the summary is written instead, as it is for an
+    /// answer that carries session text. The control is the same answer written while nothing has
+    /// changed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_held_while_privacy_mode_is_enabled_carries_no_summary() {
+        let world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], false);
+        world.write_summary(0, 2, "Two commands ran");
+        let read = || async {
+            world
+                .module
+                .read_released(
+                    &Stub { unaccounted: false },
+                    &Caller::Owner,
+                    &owner(),
+                    &world.visit_changed(),
+                )
+                .await
+        };
+
+        let held = read().await;
+        assert_eq!(
+            summary_in(&held.frame).map(|summary| summary.text),
+            Some("Two commands ran".to_owned()),
+            "the answer carries the summary"
+        );
+        let (mut writer, mut reader) = owner_connection(&world.temp, 1).await;
+        let unchanged = read().await;
+        world
+            .module
+            .write_released(&mut writer, StreamKind::Control, unchanged)
+            .await
+            .expect("the answer is written");
+        let written = reader.read_message::<ControlFrame>().await.expect("read");
+        assert!(summary_in(&written).is_some(), "nothing changed");
+
+        world.privacy.set(crate::privacy::Published {
+            generation: kr_worker::privacy::PrivacyGeneration::new(1),
+            private: true,
+        });
+        world
+            .module
+            .write_released(&mut writer, StreamKind::Control, held)
+            .await
+            .expect("the answer without the summary is written");
+        let written = reader.read_message::<ControlFrame>().await.expect("read");
+        assert_eq!(summary_in(&written), None, "privacy mode was enabled");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) = written
+        else {
+            panic!("a response");
+        };
+        assert_eq!(
+            value
+                .to_typed::<VisitChangedResult>()
+                .expect("decodes")
+                .changes
+                .len(),
+            2,
+            "the changes are what they were"
         );
     }
 
@@ -4285,6 +4470,7 @@ mod tests {
                     release_until: until,
                 })
                 .collect(),
+            generated: None,
         }
     }
 
