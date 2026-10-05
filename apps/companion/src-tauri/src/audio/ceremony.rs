@@ -7,9 +7,9 @@
 //!
 //! The ceremony requires user-presence verification on the unlocked screen of the paired device,
 //! through the platform's own ceremony (`crate::verify`): Touch ID or the password on macOS,
-//! Windows Hello on Windows, and none elsewhere, which refuses with `UNAVAILABLE`. Once presence is
-//! verified, the client signs `VoiceConfirmationProof` over `CBOR(["kr-voice/confirm/1", request])`
-//! using the paired device's `authorisation` key.
+//! Windows Hello on Windows, and none elsewhere, which refuses with `RESOURCE_UNAVAILABLE`. Once
+//! presence is verified, the client signs `VoiceConfirmationProof` over
+//! `CBOR(["kr-voice/confirm/1", request])` using the paired device's `authorisation` key.
 
 use std::time::Duration;
 
@@ -25,7 +25,8 @@ use crate::error::{CommandError, Result};
 /// # Errors
 ///
 /// Returns `PERMISSION_DENIED` if the user declines or fails verification or the challenge expires
-/// first, `UNAVAILABLE` on a device without a verification ceremony, or an error if signing fails.
+/// first, `RESOURCE_UNAVAILABLE` on a device without a verification ceremony, or an error if
+/// signing fails.
 pub async fn confirm_voice_action(
     ceremony: &dyn Ceremony,
     authorisation_key: &AuthorisationKeyPair,
