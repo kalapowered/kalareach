@@ -898,13 +898,23 @@ impl Thread {
                     epoch,
                     binding,
                 } => {
+                    let tracked = self
+                        .driver
+                        .service()
+                        .live_session_ids()
+                        .contains(&session_id);
                     self.driver
                         .service_mut()
                         .session_opened(session_id, epoch, binding);
                     // The service forgot the session's events; so does the host's cursor, or the
-                    // events its worker still holds would be taken for ones it had seen.
+                    // events its worker still holds would be taken for ones it had seen. What the
+                    // host observed of a session it already tracked is kept: the worker's facts did
+                    // not change with a second open, so a page that follows it is not the first
+                    // sight of what the host has seen.
                     self.last_event.remove(&session_id);
-                    self.seen.remove(&session_id);
+                    if !tracked {
+                        self.seen.remove(&session_id);
+                    }
                     // A session opened while privacy mode is on is fenced from the start, at the
                     // generation in force.
                     let published = self.privacy.now();
@@ -2573,6 +2583,46 @@ pub(crate) mod tests {
         assert_eq!(host.last_event.get(&session()), None, "forgotten with it");
         host.apply(session(), &page_of(2), now);
         assert_eq!(host.last_event.get(&session()), Some(&0), "taken again");
+    }
+
+    /// A session the host already tracks that is opened again keeps what the host observed of it
+    /// and when: the worker's facts did not change with the second open, so a page that comes
+    /// after it, a reply a first connection held among them, does not date a directory or a program
+    /// the host had already seen as new, and does not mark it as found. Its events are taken
+    /// again, as they are for a session opened again.
+    #[test]
+    fn a_session_opened_a_second_time_keeps_what_the_host_observed_of_it() {
+        let (_directory, mut host) = thread(state(0, false));
+        let first = Reading::new(1_000, 1_700_000_001_000);
+        host.apply_page(session(), &page(0), false, first);
+        let held = host.seen.get(&session()).cloned().expect("a record");
+        assert_eq!(
+            held.application.as_ref().map(|a| (a.at_ms, a.inherited)),
+            Some((1_700_000_001_000, false))
+        );
+
+        host.shared
+            .inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(Message::Opened {
+                session_id: session(),
+                epoch: SessionEpoch::V1,
+                binding: ContextBinding::new("display-1/epoch-1"),
+            })
+            .expect("the host is listening");
+        host.take_messages(first);
+        host.apply_page(
+            session(),
+            &page_with(0, 2, |_| {}),
+            true,
+            Reading::new(9_000, 1_700_000_009_000),
+        );
+        assert_eq!(
+            host.seen.get(&session()),
+            Some(&held),
+            "what was observed keeps its moment and is not marked found"
+        );
     }
 
     /// A session opened while privacy mode is on is fenced from the start at the generation in
