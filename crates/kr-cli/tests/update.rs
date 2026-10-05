@@ -938,6 +938,33 @@ impl Host {
             .unwrap_or_default()
     }
 
+    /// The identity of the process a session's worker runs as, from the descriptor it published.
+    fn worker_process(&self, session_id: SessionId) -> kr_protocol::identity::ProcessStartIdentity {
+        kr_ipc::descriptor::read(&self.tree.environment(), session_id)
+            .expect("reads the descriptor")
+            .expect("the session is published")
+            .process_start_identity
+    }
+
+    /// Waits until the kernel says a worker's process has ended.
+    ///
+    /// `kr close` answers when the worker accepts the close, and the worker ends after that. An
+    /// update that meets a worker on its way out waits for it, which is what an update owes a
+    /// worker that has not ended, so a test that goes on to update asks for this first.
+    async fn worker_ended(&self, worker: &kr_protocol::identity::ProcessStartIdentity) {
+        let started = Instant::now();
+        while !matches!(
+            kr_ipc::identity::process_state(worker),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the worker did not end after its session was closed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// What this host's daemon states about its build.
     async fn daemon_build(&self) -> String {
         let endpoint = self
@@ -2184,8 +2211,10 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     assert_eq!(record["staged"], two.name().as_str(), "{record}");
     // Its gate is open again: a session is created.
     let kr = host.store.stable(Program::Kr);
-    let (display, _) = host.new_session(&kr);
+    let (display, session_id) = host.new_session(&kr);
+    let worker = host.worker_process(session_id);
     host.close(&kr, &display);
+    host.worker_ended(&worker).await;
 
     // The control: once the daemon has started, the next update goes through.
     drop(starting);
