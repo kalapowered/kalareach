@@ -143,6 +143,20 @@ pub struct VoiceDescription {
     pub application: Option<Observed>,
 }
 
+impl VoiceDescription {
+    /// What a person chose of the session and nothing else: the name they pinned, and none of what
+    /// a model wrote or the host observed. The answer to a voice read of a session is this, since
+    /// nothing that carries it holds what is observed or generated to the privacy state it was
+    /// read under, and privacy mode removes both.
+    #[must_use]
+    pub fn pin_only(self) -> Self {
+        Self {
+            pinned: self.pinned,
+            ..Self::default()
+        }
+    }
+}
+
 /// What a read of one session's summaries found, under the privacy state held while it was made.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SummaryReading {
