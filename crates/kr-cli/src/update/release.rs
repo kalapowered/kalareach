@@ -4,9 +4,10 @@
 //! nothing runs them, under the store's `staging/`, each read once and its digest taken as it is
 //! written; its manifest is checked against the update channel's root, a threshold of the release
 //! keys that root names having signed it; every file it lists is there with its length and digest,
-//! and nothing it does not list is; it is for this system; and only then is it made read-only,
-//! flushed, and renamed into `versions/` in one step. Nothing a release carries is trusted before
-//! its manifest is, and nothing of it is used until it is all there.
+//! and nothing it does not list is; it is for this system; it lists every program a host needs;
+//! and only then is it made read-only, flushed, and renamed into `versions/` in one step. Nothing
+//! a release carries is trusted before its manifest is, and nothing of it is used until it is all
+//! there.
 //!
 //! An archive is refused at the first entry that could put something outside the release or be
 //! something other than a file: a link, a device, a path that is absolute or climbs out of the
