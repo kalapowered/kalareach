@@ -202,7 +202,7 @@ mod tests {
     fn kr_req_07_64_the_doctor_reports_the_mode_the_application_prints() {
         let store = Store::new("read");
         let bin = store.application("codex", ELEVATED);
-        let reports = reported(&store, store.admitted(|_| {}), &[bin.clone()]);
+        let reports = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&bin));
         assert_eq!(reports.len(), 1, "{reports:?}");
         let report = &reports[0];
         assert_eq!(report.plugin_id, "kalareach/codex");
@@ -238,7 +238,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("executable");
         }
-        let granted = reported(&store, store.admitted(|_| {}), &[bin.clone()]);
+        let granted = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&bin));
         assert_eq!(granted[0].state, LaunchProbeState::Read);
         assert!(marker.exists(), "the control ran the application");
         std::fs::remove_file(&marker).expect("the marker is removed");
@@ -263,7 +263,7 @@ mod tests {
         let store = Store::new("none");
         let empty = store.0.join("empty");
         std::fs::create_dir_all(&empty).expect("a directory");
-        let reports = reported(&store, store.admitted(|_| {}), &[empty.clone()]);
+        let reports = reported(&store, store.admitted(|_| {}), std::slice::from_ref(&empty));
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, LaunchProbeState::NoExecutable);
 
