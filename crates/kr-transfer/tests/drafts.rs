@@ -13,7 +13,7 @@ use kr_protocol::transfer::{
     DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
 };
 use kr_transfer::InsertionOutcome;
-use kr_transfer::service::Admission;
+use kr_transfer::service::{Action, Admission};
 use support::{Harness, pattern};
 
 fn contribution(
@@ -775,4 +775,131 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
         .expect("reads the draft back");
     assert_eq!(after.attachments.len(), 1);
     assert_eq!(after.revision, reread.revision);
+}
+
+/// The action a draft call is performed under: `id` is the caller's durable identifier, and the
+/// payload stands for what the call carries.
+fn draft_action(harness: &Harness, id: Uuid, method: &str, payload: &[u8]) -> Action {
+    Action {
+        actor_id: harness.actor.clone(),
+        action_id: id,
+        method: method.to_owned(),
+        payload_digest: support::digest(payload),
+        admission: Admission::none(),
+    }
+}
+
+/// KR-REQ-09.07: an action identifier reused with another payload is `ID_CONFLICT` on a draft update
+/// and on a binding as it is everywhere else. It is not the draft's own conflict, which says the
+/// revision moved, and which a direct caller of the service would read as a reason to read the
+/// draft again and retry under the same identifier.
+#[test]
+fn a_draft_action_reused_with_another_payload_is_an_id_conflict() {
+    let harness = Harness::create();
+    let created = draft(&harness);
+    let update = |text: &str, expected: DraftRevision| DraftUpdateParams {
+        draft_id: created.draft_id,
+        expected_revision: expected,
+        text: text.to_owned(),
+    };
+
+    let update_id = kr_ipc::new_uuid();
+    let first = harness
+        .service
+        .draft_update(
+            &harness.actor,
+            &update("one", created.revision),
+            Some(&draft_action(&harness, update_id, "draft.update", b"one")),
+        )
+        .expect("performs the update");
+    let reused = harness
+        .service
+        .draft_update(
+            &harness.actor,
+            &update("two", first.draft.revision),
+            Some(&draft_action(&harness, update_id, "draft.update", b"two")),
+        )
+        .expect_err("the identifier belongs to the first update");
+    assert_eq!(reused.code(), ErrorCode::IdConflict);
+    let after = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect("reads the draft");
+    assert_eq!(after.text, "one", "the second payload was not applied");
+    assert_eq!(after.revision, first.draft.revision);
+
+    let attach = |name: &str| {
+        let bytes = pattern(64);
+        let begun = harness
+            .begin(&bytes, "image/png", name)
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle
+    };
+    let (one, other) = (attach("one.png"), attach("other.png"));
+    let bind = |handle: &AttachmentHandle, expected: DraftRevision| AgentDraftAddAttachmentParams {
+        draft_id: created.draft_id,
+        expected_revision: expected,
+        transfer_id: handle.transfer_id,
+        contribution: contribution(handle, InsertionMethod::TypedSubmission),
+    };
+    let bind_id = kr_ipc::new_uuid();
+    let bound = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &bind(&one, first.draft.revision),
+            Some(&draft_action(
+                &harness,
+                bind_id,
+                "agent.draft.add_attachment",
+                b"one",
+            )),
+        )
+        .expect("binds the first attachment");
+    let reused = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &bind(&other, bound.draft.revision),
+            Some(&draft_action(
+                &harness,
+                bind_id,
+                "agent.draft.add_attachment",
+                b"other",
+            )),
+        )
+        .expect_err("the identifier belongs to the first binding");
+    assert_eq!(reused.code(), ErrorCode::IdConflict);
+    let after = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect("reads the draft");
+    assert_eq!(
+        after.attachments.len(),
+        1,
+        "the second binding was not made"
+    );
+
+    // The control: the same payload under the same identifier is a repeat, and is answered with
+    // what the first attempt produced.
+    let repeated = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &bind(&one, first.draft.revision),
+            Some(&draft_action(
+                &harness,
+                bind_id,
+                "agent.draft.add_attachment",
+                b"one",
+            )),
+        )
+        .expect("a repeat is answered");
+    assert_eq!(repeated.draft.revision, bound.draft.revision);
 }
