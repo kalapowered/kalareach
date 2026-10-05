@@ -3,10 +3,13 @@
 //! A prompt that names a draft sends the draft's attachments to the session, and a submitted
 //! attachment follows that session's retention instead of the seven-day window of an unused one.
 //! The transfer service is this daemon's, so the record that says so is made here, before the
-//! prompt goes to the worker, exactly as it is for a paired device's prompt: nothing the worker
-//! then does, and nothing that happens to the connection that hears its answer, decides whether a
-//! file this host was asked to hand to a session is kept. The worker serves a prompt that names a
-//! draft only to this daemon, so no route to the session's agent leaves a draft unrecorded.
+//! prompt is sent to the worker: nothing the worker then does, and nothing that happens to the
+//! connection that hears its answer, decides whether a file this host was asked to hand to a
+//! session is kept. A paired device's prompt is recorded as it arrives. This one is first put to
+//! the worker with no lifetime, which the worker answers only from a receipt it holds, and is
+//! recorded only when the worker says it holds none; any other answer is the caller's answer and
+//! records nothing. The worker serves a prompt that names a draft only to this daemon, so no route
+//! to the session's agent leaves a draft unrecorded.
 //!
 //! A prompt that carries its text inline names no draft and records nothing. A caller at this
 //! machine may send it here or to the worker's own socket, and the worker answers it the same

@@ -64,9 +64,10 @@ worker and before the worker answers. Once the host has recorded it, nothing the
 afterwards, even if the worker refuses the prompt or the connection is lost, can leave an attachment
 on the seven-day window. A prompt that never reaches the worker after the host recorded it leaves
 the attachments with the session all the same. A prompt that names a draft may arrive at the host
-over the network from a paired device or on the local socket from a caller at this machine; it is
-recorded in the same way in either case. The worker serves a prompt that names a draft only to the
-host, so no route to the session's agent leaves a draft unrecorded. A worker that was already
+over the network from a paired device or on the local socket from a caller at this machine. The
+host records a device's prompt before it sends it. It records a local caller's only after the worker
+has said it holds no receipt for the action. The worker serves a prompt that names a draft only to
+the host, so no route to the session's agent leaves a draft unrecorded. A worker that was already
 running when the host was updated keeps serving such a prompt on its own socket until it is
 replaced. A prompt containing only prompt text, and therefore having no draft name, may be served to
 the worker on its own socket. A draft is sent to one session, and an attachment belongs to one. The
