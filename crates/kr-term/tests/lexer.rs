@@ -607,6 +607,117 @@ fn a_printable_run_is_cut_at_its_bound_wherever_the_reads_fall() {
     assert_eq!(text(&pieces), run);
 }
 
+/// Lexes `stream` through `feed_until` with `limit` events to a batch, and returns every event and
+/// the largest batch it saw.
+fn lex_in_batches(mut lexer: Lexer, stream: &[u8], limit: usize) -> (Vec<Event>, usize) {
+    let mut events = Vec::new();
+    let mut batch = Vec::new();
+    let mut largest = 0;
+    let mut index = 0;
+    loop {
+        batch.clear();
+        let finished = lexer.feed_until(stream, &mut index, &mut batch, limit);
+        largest = largest.max(batch.len());
+        events.append(&mut batch);
+        if finished {
+            break;
+        }
+    }
+    lexer.close(&mut events);
+    (events, largest)
+}
+
+/// A read lexed a few events at a time gives the events a read lexed whole gives.
+///
+/// The engine applies the events of a read in batches, so what a batch boundary may fall in is what
+/// the stream is: inside a sequence, inside a scalar, inside a text run, between a control and the
+/// text after it.
+#[test]
+fn events_collected_in_batches_are_the_events_collected_at_once() {
+    let mut stream = Vec::new();
+    for round in 0..40 {
+        stream.extend_from_slice(b"plain \x1b[1;38;5;208mcoloured\x1b[0m\r\n");
+        stream.extend_from_slice(
+            "caf\u{e9} \u{4e2d}\u{6587} \u{1f469}\u{200d}\u{1f4bb}e\u{301}\r\n".as_bytes(),
+        );
+        stream
+            .extend_from_slice(b"\x1b]8;id=a;https://example.invalid/path\x1b\\link\x1b]8;;\x1b\\");
+        stream.extend_from_slice(
+            b"\x1b]0;a title; with a separator\x07\x1bP1$rq\x1b\\\x1b[?1049h\x1b[?1049l",
+        );
+        stream.extend_from_slice(&[0xff, 0xc3, b'x', 0x07, 0x08, b'\t']);
+        stream.extend_from_slice(format!("\x1b[{round};{round}H\x1b[2K").as_bytes());
+    }
+    let whole = lex(&stream);
+    assert!(
+        whole.len() > 600,
+        "the stream carries many events: {}",
+        whole.len()
+    );
+
+    for limit in [1, 2, 3, 7, 256] {
+        let (events, largest) = lex_in_batches(Lexer::new(), &stream, limit);
+        assert_eq!(events, whole, "batches of {limit} events");
+        assert!(
+            largest < limit + 8,
+            "a batch holds the limit and what one step adds to it, not {largest} events"
+        );
+    }
+}
+
+/// The steps that add many events at once give the events a read lexed whole gives, wherever the
+/// batches fall around them.
+///
+/// The step that ends a tmux passthrough envelope lexes its whole payload and adds every event the
+/// payload holds, and a printable run longer than the text bound is cut into as many events as the
+/// bound allows. Neither can stop at a batch's limit, so a batch is not bounded by it, and the
+/// events are still the same.
+#[test]
+fn a_step_that_adds_many_events_is_still_the_events_collected_at_once() {
+    // An envelope with a doubled escape for every escape of the payload, around plain text.
+    let mut stream = b"before\x1bPtmux;".to_vec();
+    for _ in 0..300 {
+        stream.extend_from_slice(b"\x1b\x1b[1mx\x1b\x1b[0m");
+    }
+    stream.extend_from_slice(b"\x1b\\after\r\n");
+    let whole = lex(&stream);
+    assert!(
+        whole.len() > 600,
+        "the envelope's payload is many events: {}",
+        whole.len()
+    );
+    for limit in [1, 3, 256] {
+        let (events, _) = lex_in_batches(Lexer::new(), &stream, limit);
+        assert_eq!(events, whole, "batches of {limit} events");
+    }
+
+    let bounded = LexLimits {
+        max_text_run: 16,
+        ..LexLimits::DEFAULT
+    };
+    // Controls before and after the run, so a batch can end directly after the step that takes it,
+    // with sixteen bytes of text held, and the next batch has to go on from there.
+    let mut run = b"ab\r".to_vec();
+    run.extend(std::iter::repeat_n(b'x', 4_000));
+    run.extend_from_slice("\r\ncd\u{301}e".as_bytes());
+    let whole = {
+        let mut lexer = Lexer::with_limits(bounded);
+        let mut events = Vec::new();
+        lexer.feed(&run, &mut events);
+        lexer.close(&mut events);
+        events
+    };
+    assert!(
+        whole.len() > 200,
+        "the run is cut at its bound: {}",
+        whole.len()
+    );
+    for limit in [1, 7, 64] {
+        let (events, _) = lex_in_batches(Lexer::with_limits(bounded), &run, limit);
+        assert_eq!(events, whole, "batches of {limit} events");
+    }
+}
+
 /// A printable run that ends at a control, and one that starts after it.
 #[test]
 fn a_printable_run_ends_where_the_printable_bytes_end() {
