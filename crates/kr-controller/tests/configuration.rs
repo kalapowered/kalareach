@@ -331,6 +331,15 @@ impl Daemon {
     /// Starts the daemon binary, copied to the internal disk, on `host`'s own directories, with
     /// every former selection variable and every proxy variable in its environment.
     fn start(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Self {
+        Self::start_with(program, host, &[])
+    }
+
+    /// As [`Daemon::start`], with `variables` added to its environment.
+    fn start_with(
+        program: &std::path::Path,
+        host: &kr_ipc::testing::TempHost,
+        variables: &[(&str, &str)],
+    ) -> Self {
         let home = host.root().join("home");
         std::fs::create_dir_all(&home).expect("a home directory");
         let log = std::fs::OpenOptions::new()
@@ -356,6 +365,9 @@ impl Daemon {
         for (variable, value) in FORMER_SELECTIONS.into_iter().chain(PROXY_VARIABLES) {
             command.env(variable, value);
         }
+        for (variable, value) in variables {
+            command.env(variable, value);
+        }
         Self(Some(command.spawn().expect("the daemon starts")))
     }
 
@@ -375,15 +387,15 @@ impl Drop for Daemon {
     }
 }
 
-/// Asks the daemon on `host` for its diagnostics on its own socket, once it answers.
+/// Connects to the daemon on `host` on its own socket, once it answers.
 #[cfg(unix)]
-async fn diagnostics(host: &kr_ipc::testing::TempHost) -> HostDoctorResult {
+async fn local_client(host: &kr_ipc::testing::TempHost) -> kr_ipc::client::LocalClient {
     let endpoint = host
         .environment()
         .controller_endpoint()
         .expect("an endpoint");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut client = loop {
+    loop {
         if let Ok(client) = kr_ipc::client::LocalClient::connect(
             &endpoint,
             kr_protocol::local::LocalClientKind::Cli,
@@ -391,7 +403,7 @@ async fn diagnostics(host: &kr_ipc::testing::TempHost) -> HostDoctorResult {
         )
         .await
         {
-            break client;
+            return client;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -400,7 +412,13 @@ async fn diagnostics(host: &kr_ipc::testing::TempHost) -> HostDoctorResult {
                 .unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
+    }
+}
+
+/// Asks the daemon on `host` for its diagnostics on its own socket, once it answers.
+#[cfg(unix)]
+async fn diagnostics(host: &kr_ipc::testing::TempHost) -> HostDoctorResult {
+    let mut client = local_client(host).await;
     typed(
         &client
             .request(Method::HostDoctor, &())
@@ -610,6 +628,43 @@ async fn an_address_the_document_chose_that_cannot_be_bound_is_named() {
     );
     drop(taken);
     drop(controller);
+}
+
+/// KR-REQ-03.08: the account an environment names is the one the daemon runs as, which the system
+/// records, and not what a variable in the daemon's environment says: whoever started the daemon
+/// chose that variable, and an environment is identified by the user it runs as.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_names_the_account_its_daemon_runs_as_and_not_what_a_variable_says() {
+    let host = kr_ipc::testing::TempHost::create();
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
+    let mut daemon = Daemon::start_with(
+        &program,
+        &host,
+        &[("USER", "somebody-else"), ("LOGNAME", "somebody-else")],
+    );
+    let mut client = local_client(&host).await;
+    let listed: kr_protocol::hostinfo::EnvironmentListResult = typed(
+        &client
+            .request(Method::EnvironmentList, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.list is served on the local socket"),
+    );
+    daemon.stop();
+    let account = kr_ipc::paths::passwd_entry().map_or_else(
+        || format!("uid {}", kr_ipc::paths::current_uid()),
+        |entry| entry.name,
+    );
+    assert_eq!(listed.environments[0].os_user, account);
+    assert_eq!(
+        listed.environments[0].label,
+        format!("{account} on {}", std::env::consts::OS)
+    );
 }
 
 /// KR-REQ-26.44: a paired device reads no account name and no local path of the host it is paired

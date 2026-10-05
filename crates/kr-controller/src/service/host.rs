@@ -906,10 +906,19 @@ impl Controller {
     }
 }
 
+/// The account this daemon runs as: the name the system records for it, and not a variable of the
+/// daemon's environment, which whoever started the daemon chose. Where the system's record has
+/// none, as on Windows, the platform's own `USERNAME` stands in, and the user number where that is
+/// not there either.
 fn whoami() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| format!("uid {}", kr_ipc::paths::current_uid()))
+    kr_ipc::paths::passwd_entry()
+        .map(|entry| entry.name)
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var("USERNAME").ok())
+                .flatten()
+        })
+        .unwrap_or_else(|| format!("uid {}", kr_ipc::paths::current_uid()))
 }
 
 /// This daemon's side of an update of the host: its gate to new sessions, the creates under way,
