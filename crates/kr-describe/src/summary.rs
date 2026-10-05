@@ -79,10 +79,14 @@ pub struct SummaryAsk {
     pub generation: Option<PrivacyGeneration>,
     /// The newest changes in the interval, oldest first.
     pub changes: Vec<SummaryChange>,
+    /// How many changes the interval holds that are not among them: those past the bound a request
+    /// carries, and those the session's log no longer retains. The prompt says so.
+    pub earlier: u64,
 }
 
 impl SummaryAsk {
-    /// Builds a request, keeping the newest [`MAX_SUMMARY_CHANGES`] of `changes`.
+    /// Builds a request, keeping the newest [`MAX_SUMMARY_CHANGES`] of `changes`, and counting the
+    /// changes of the interval that are not among them.
     ///
     /// A request with no change in it has nothing to summarise and gives [`None`].
     #[must_use]
@@ -100,12 +104,17 @@ impl SummaryAsk {
         if changes.is_empty() {
             return None;
         }
+        let held = u64::try_from(changes.len()).unwrap_or(u64::MAX);
         Some(Self {
             session_id,
             interval,
             from_ms,
             to_ms,
             generation,
+            earlier: interval
+                .to
+                .saturating_sub(interval.from)
+                .saturating_sub(held),
             changes,
         })
     }
@@ -121,6 +130,7 @@ impl SummaryAsk {
             revision: U64::new(0),
             cursor_from: U64::new(self.interval.from),
             cursor_to: U64::new(self.interval.to),
+            earlier: U64::new(self.earlier),
             facts: Vec::new(),
             events: self
                 .changes

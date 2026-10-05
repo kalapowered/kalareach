@@ -655,6 +655,7 @@ fn prompt_at_two() -> Prompt {
         revision: U64::new(2),
         cursor_from: U64::new(3),
         cursor_to: U64::new(11),
+        earlier: U64::ZERO,
         facts: Vec::new(),
         events: Vec::new(),
     }
