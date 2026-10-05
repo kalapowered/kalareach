@@ -402,23 +402,32 @@ fn this_token_is_restricted() -> bool {
     restricted
 }
 
-/// A process that waits far longer than any test takes, started the way a vendor starts one of
-/// its own: `cmd.exe` running `ping`, both on every Windows machine. The command line names
-/// `label`, which is what a look at the system's process list finds it by.
+/// A process that waits far longer than any test takes, started the way a vendor starts one of its
+/// own: this test binary, run as the ignored case below, with `label` as its last argument, which
+/// is what a look at the system's process list finds it by. It is the process that waits, so
+/// nothing it starts is unlabelled.
 fn waiting_program(label: &str) -> std::process::Command {
-    let system = std::env::var_os("SystemRoot").expect("a system directory");
-    let mut command =
-        std::process::Command::new(Path::new(&system).join("System32").join("cmd.exe"));
+    let mut command = std::process::Command::new(this_executable());
     command
         .args([
-            "/d",
-            "/c",
-            &format!("ping -n 600 127.0.0.1 > NUL & rem {label}"),
+            "--ignored",
+            "--exact",
+            "vendor_waits",
+            "--nocapture",
+            "--test-threads=1",
+            label,
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command
+}
+
+/// What a vendor's own process does: waits, until a job ends it.
+#[test]
+#[ignore = "a process the stand-in vendor starts to wait in"]
+fn vendor_waits() {
+    std::thread::sleep(Duration::from_secs(600));
 }
 
 /// What names a launch's processes on a command line: the name of the private directory the
