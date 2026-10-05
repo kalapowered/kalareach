@@ -211,7 +211,9 @@ whatever came after, finds its attempt over and ends nothing. A daemon told to s
 step: it refuses to resume and to prepare, and one that has resumed refuses a stop, so an updater
 that sees a daemon resume knows no stop of any earlier attempt will end it. A stop or a resume is
 taken whatever the daemon can say of how it was started, and a step that answers an error is a
-step that was not taken.
+step that was not taken. Each step is claimed under its action identifier. A repeat whose answer was
+lost gets that answer and begins no second attempt, and an identifier reused for another step is
+refused with `ID_CONFLICT`.
 
 A create that arrives while the gate is closed is refused with `RESOURCE_UNAVAILABLE`, naming the
 release the host is being updated to; the caller creates the session again once the new daemon is

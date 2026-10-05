@@ -309,6 +309,87 @@ async fn a_prepare_whose_attempt_ended_while_it_settled_is_refused() {
     serving.abort();
 }
 
+/// KR-REQ-09.07 and 09.16: a step repeated under its action identifier, as by a caller whose
+/// answer was lost, is answered with what the first one answered and does not begin another
+/// attempt, and an identifier reused for a different step is refused as a reused identifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepare_repeated_under_its_action_identifier_is_answered_with_its_first_attempt() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let (controller, _) = start_controller(&temp).await;
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let serving = tokio::spawn(
+        Arc::clone(&controller).serve_clients(Listener::bind(&endpoint).expect("binds")),
+    );
+    let mut client = LocalClient::connect(
+        &endpoint,
+        LocalClientKind::Cli,
+        BuildId::new("kr/0.2.0+4254aa6e62e5").expect("a build"),
+    )
+    .await
+    .expect("reaches the daemon");
+    let step = |step: HandoverStep, attempt: Option<Uuid>| HostUpdateHandoverParams {
+        step,
+        target: target(),
+        attempt: Nullable(attempt),
+    };
+
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let prepare = step(HandoverStep::Prepare, None);
+    let first: HostUpdateHandoverResult = client
+        .mutate(
+            Method::HostUpdateHandover,
+            action_id,
+            ActionTarget::environment(environment_id),
+            &prepare,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon prepares")
+        .to_typed()
+        .expect("decodes");
+    let attempt = first.attempt.0.expect("an attempt");
+    let again: HostUpdateHandoverResult = client
+        .mutate(
+            Method::HostUpdateHandover,
+            action_id,
+            ActionTarget::environment(environment_id),
+            &prepare,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the repeat is answered")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        again.attempt.0,
+        Some(attempt),
+        "the repeat is the first one's answer, and no other attempt began"
+    );
+    assert!(
+        controller.handover.is_current(attempt),
+        "the first attempt is still the gate's"
+    );
+
+    let reused = client
+        .mutate(
+            Method::HostUpdateHandover,
+            action_id,
+            ActionTarget::environment(environment_id),
+            &step(HandoverStep::Resume, Some(attempt)),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("an identifier reused for another step is refused");
+    assert_eq!(reused.code, ErrorCode::IdConflict);
+    assert!(
+        controller.handover.is_current(attempt),
+        "the refused step changed nothing"
+    );
+    serving.abort();
+}
+
 /// A daemon of a release of its own, in this process, over `temp`'s environment, whose supervisor
 /// records every launch it is asked for and starts nothing.
 async fn start_controller(

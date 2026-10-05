@@ -769,17 +769,30 @@ impl Controller {
                         .to_owned(),
                 }),
             },
-            // Only the owner at this machine replaces what the host runs.
+            // Only the owner at this machine replaces what the host runs. A step is performed once
+            // per actor's action: it is claimed first, and what it came to is kept under the claim
+            // before it is answered, so a caller whose answer was lost is told it again rather
+            // than beginning a second attempt.
             Method::HostUpdateHandover => {
-                if is_owners_own_socket(actor_id) {
-                    self.update_handover(mutation).await
-                } else {
-                    Err(ControllerError::PermissionDenied {
-                        detail: "only the owner at this machine hands its control daemon over to \
-                                 an update"
-                            .to_owned(),
-                    })
+                if !is_owners_own_socket(actor_id) {
+                    return respond(
+                        mutation.request_id,
+                        Err(ControllerError::PermissionDenied {
+                            detail: "only the owner at this machine hands its control daemon over \
+                                     to an update"
+                                .to_owned(),
+                        }),
+                    );
                 }
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        connection_id,
+                        admitted,
+                        self.update_handover(mutation),
+                    )
+                    .await;
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
