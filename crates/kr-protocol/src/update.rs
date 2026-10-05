@@ -9,7 +9,8 @@
 //!   qualified shell packages the release was tested with, `share/` with the release's own data,
 //!   the update channel's root among it, and `release.json`, the [`ReleaseManifest`] that names
 //!   every other file. A host keeps several side by side and runs each process from the one it
-//!   started from.
+//!   started from. Which executables a release carries is `scripts/release-programs.json`'s to
+//!   say ([`required_programs`]); a host takes in only a release that lists them all.
 //! * **A compatibility level** ([`CompatibilityLevel`]) says which frames a build reads: two
 //!   builds read each other's when their protocol package versions share one. A control daemon
 //!   speaks to a worker only at a level its release retains, and an update waits while a live
@@ -293,6 +294,45 @@ pub const MAX_MANIFEST_LEN: u64 = 4 * 1024 * 1024;
 
 /// The top-level directories a release's files are in.
 pub const RELEASE_DIRECTORIES: [&str; 3] = ["bin", "shells", "share"];
+
+/// The programs a host needs, as `scripts/release-programs.json` names them: the one list the
+/// release builds, the archive checks and this check read. It is taken in when this crate is
+/// built, so a build of the host carries the list its own release was built from.
+const RELEASE_PROGRAMS: &str = include_str!("../../../scripts/release-programs.json");
+
+/// The list of programs, read as far as this crate needs it. The file also says which package
+/// builds each program, which only a build reads.
+#[derive(Deserialize)]
+struct ProgramList {
+    programs: Vec<ListedProgram>,
+}
+
+/// One program of the list, and the targets that do not carry it.
+#[derive(Deserialize)]
+struct ListedProgram {
+    name: String,
+    #[serde(default)]
+    not_on: Vec<String>,
+}
+
+/// The programs a release for `target` has to carry in `bin/`, by name and without the suffix a
+/// Windows executable has.
+///
+/// # Panics
+///
+/// Panics when the list this crate was built with is not a list of programs, which a test of this
+/// crate rules out.
+pub fn required_programs(target: &str) -> impl Iterator<Item = &'static str> {
+    static LIST: std::sync::LazyLock<ProgramList> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(RELEASE_PROGRAMS).unwrap_or_else(|error| {
+            panic!("scripts/release-programs.json is not a list of programs: {error}")
+        })
+    });
+    LIST.programs
+        .iter()
+        .filter(move |program| !program.not_on.iter().any(|named| named == target))
+        .map(|program| program.name.as_str())
+}
 
 /// What one release is, as `release.json` states it and a threshold of the release keys signs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +836,29 @@ impl ReleaseManifest {
         self.files.iter().find(|file| file.path.as_str() == path)
     }
 
+    /// The programs a host of this release's target needs that the release does not list as
+    /// programs: each is a file of `bin/` that is absent, or is there as a file that is not
+    /// runnable.
+    ///
+    /// This is a question about a release being taken in. A release already in a store was checked
+    /// when it was installed, by the build that installed it, and is read as it is: every host
+    /// process reads its own release's manifest without asking it.
+    #[must_use]
+    pub fn missing_programs(&self) -> Vec<&'static str> {
+        let suffix = if self.target.contains("-windows-") {
+            ".exe"
+        } else {
+            ""
+        };
+        required_programs(&self.target)
+            .filter(|name| {
+                !self
+                    .file(&format!("bin/{name}{suffix}"))
+                    .is_some_and(|file| file.mode == FileMode::Executable)
+            })
+            .collect()
+    }
+
     /// Whether this release's control daemon speaks to a worker built from `version`.
     #[must_use]
     pub fn retains(&self, version: PackageVersion) -> bool {
@@ -1065,6 +1128,92 @@ mod tests {
                 "{first} and {second}: {refused}"
             );
         }
+    }
+
+    /// KR-REQ-26.09: every release target needs the seven executables a host runs, but for the
+    /// description process on Windows on Arm, where no model profile lists the target and the
+    /// process is not built. The names are written out here, apart from the list they are read from,
+    /// so that a program dropped from it is caught.
+    #[test]
+    fn a_host_needs_seven_programs_and_one_target_needs_six() {
+        fn sorted(mut names: Vec<&'static str>) -> Vec<&'static str> {
+            names.sort_unstable();
+            names
+        }
+        let seven = vec![
+            "kr",
+            "kr-attach-guard",
+            "kr-controller",
+            "kr-describe-inference",
+            "kr-hook",
+            "kr-plugin-host",
+            "kr-worker",
+        ];
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert_eq!(
+                sorted(required_programs(target).collect()),
+                seven,
+                "{target}"
+            );
+        }
+        let without_description: Vec<&str> = seven
+            .iter()
+            .copied()
+            .filter(|name| *name != "kr-describe-inference")
+            .collect();
+        assert_eq!(
+            sorted(required_programs("aarch64-pc-windows-msvc").collect()),
+            without_description
+        );
+    }
+
+    /// KR-REQ-26.09: a program is a file of `bin/` the manifest lists as one, under the name its
+    /// target gives an executable: a file listed as data, or under another system's name, is not
+    /// the program.
+    #[test]
+    fn a_program_is_a_listed_executable_under_the_name_its_target_gives_it() {
+        let listed = |target: &str, suffix: &str, mode: FileMode| {
+            let files = required_programs(target)
+                .map(|name| ReleaseFile {
+                    mode,
+                    ..file(&format!("bin/{name}{suffix}"))
+                })
+                .collect();
+            ReleaseManifest {
+                target: target.to_owned(),
+                ..manifest(files)
+            }
+        };
+        assert_eq!(
+            listed("aarch64-apple-darwin", "", FileMode::Executable).missing_programs(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            listed("x86_64-pc-windows-msvc", ".exe", FileMode::Executable).missing_programs(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            listed("aarch64-pc-windows-msvc", ".exe", FileMode::Executable).missing_programs(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            listed("aarch64-apple-darwin", "", FileMode::Regular)
+                .missing_programs()
+                .len(),
+            7
+        );
+        assert_eq!(
+            listed("x86_64-pc-windows-msvc", "", FileMode::Executable)
+                .missing_programs()
+                .len(),
+            7
+        );
     }
 
     /// The manifest is read out of its signed document, and a member a later release adds is read
