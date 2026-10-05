@@ -4318,6 +4318,57 @@ async fn an_unsupported_host_is_told_every_platform_the_release_lists() {
     );
 }
 
+/// A release that lists an operating system with no architecture at all says so, and the sentence
+/// agrees with the decision: the host runs that operating system and is refused for its
+/// architecture.
+#[tokio::test]
+async fn an_operating_system_listed_with_no_architecture_is_said_to_have_none() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        only_on(vec![
+            PlatformSupport {
+                os: OperatingSystem::Linux,
+                architectures: vec![Architecture::X86_64],
+            },
+            PlatformSupport {
+                os: OperatingSystem::MacOs,
+                architectures: Vec::new(),
+            },
+        ]),
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let mac = HostPlatform {
+        os: Some(OperatingSystem::MacOs),
+        architecture: Some(Architecture::Aarch64),
+    };
+    let admissions = catalogue
+        .admissions(environment(), &[], &mac)
+        .expect("readable");
+    let refused = &admissions.not_admitted[0];
+    assert!(
+        matches!(&refused.reason,
+            NotAdmittedReason::Unsupported { what, .. }
+                if *what == kr_plugin_catalogue::Unsupported::Architecture),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .detail()
+            .ends_with("it supports linux (x86_64); mac_os (no architecture)"),
+        "{}",
+        refused.detail()
+    );
+}
+
 /// Every committed change that can alter what is admitted raises the admission revision in its own
 /// commit, and nothing else does: enrolling and changing an enrolment's settings leave it, and so
 /// does a change that is refused.
