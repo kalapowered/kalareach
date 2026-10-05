@@ -1925,8 +1925,8 @@ fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()>
 /// What this crate's own tests use to stand at each step at the end of a directory's removal,
 /// where what somebody else does to the directory's name decides what the removal can report.
 ///
-/// Compiled only with this crate's `testing` feature, which the crate's own tests enable and no
-/// shipped build does.
+/// Compiled only with this crate's `testing` feature, which the crate's own tests enable and the
+/// product never turns on.
 #[cfg(feature = "testing")]
 pub mod testing {
     use std::cell::RefCell;
