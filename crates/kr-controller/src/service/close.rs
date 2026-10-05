@@ -568,6 +568,12 @@ impl Controller {
     /// may write one: two writers without that hold would let this daemon's own account of a
     /// worker it found gone replace the worker's own.
     ///
+    /// The record is written, and the barrier told, in one section under the registry's lock. What
+    /// follows ([`Self::finish_closure`]) runs on a task of its own: a closure that is recorded is
+    /// the answer to every later ask, so nothing would repeat that tail for a request that stopped
+    /// waiting part way through it, and the worker would stay in the directory, the connection
+    /// table, the plugin admissions' set and the descriptors for as long as the daemon runs.
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
@@ -591,6 +597,28 @@ impl Controller {
         if let Some(reservation) = reservation {
             self.retire_job_when_ended(reservation.reservation_id, reservation.launcher_identity);
         }
+        let Some(daemon) = self.me.upgrade() else {
+            return self.finish_closure(record).await;
+        };
+        let record = record.clone();
+        match tokio::spawn(async move { daemon.finish_closure(&record).await }).await {
+            Ok(finished) => finished,
+            Err(ended) if ended.is_panic() => std::panic::resume_unwind(ended.into_panic()),
+            Err(_) => Err(ControllerError::supervision(
+                "this daemon stopped before it finished tidying a closed session",
+            )),
+        }
+    }
+
+    /// Takes a closed session out of what this daemon holds of its workers.
+    ///
+    /// Everything here waits for a lock of its own, and none of it needs the request that recorded
+    /// the closure, so [`Self::write_closure`] runs it on a task that no request ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session's published descriptor cannot be removed.
+    async fn finish_closure(&self, record: &ClosureRecord) -> Result<()> {
         // This daemon's own view of the session goes as soon as the closure is recorded, before
         // the published descriptor is removed and whether or not that succeeds. The closure is
         // the fact; a worker kept in the directory after it would be a session this daemon still
