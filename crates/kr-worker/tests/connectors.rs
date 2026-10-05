@@ -290,7 +290,7 @@ fn hooks_running(hook: &serde_json::Value) -> String {
 #[test]
 fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installation_s_forwarder() {
     let store = Store::new("qoder");
-    let launcher = store.forwarder("bin/kr-hook");
+    let forwarder = store.forwarder("bin/kr-hook");
     let connector = InstalledConnector::read(store.shaped(&fixture::Shape::qoder_cli()))
         .expect("the installed package is read");
     assert!(
@@ -303,7 +303,7 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
     assert_eq!(integration.command, "qodercli");
     assert_eq!(integration.flags, fixture::qoder_flags());
     let bridge = connector
-        .launch_bridge(&launcher)
+        .launch_bridge(&forwarder)
         .expect("the flags register the forwarder's hook");
     assert_eq!(
         bridge,
@@ -311,7 +311,7 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
             plugin_id: connector.plugin_id(),
             application: "qoder-cli".to_owned(),
             surfaces: [BridgeSurface::Hook].into_iter().collect(),
-            forwarder: launcher.clone(),
+            forwarder: forwarder.clone(),
         }
     );
     let declared = |application: &str, surface: BridgeSurface| BridgeDeclaration {
@@ -319,18 +319,21 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
         surface,
     };
     bridge
-        .validate(&declared("qoder-cli", BridgeSurface::Hook), Some(&launcher))
+        .validate(
+            &declared("qoder-cli", BridgeSurface::Hook),
+            Some(&forwarder),
+        )
         .expect("Qoder CLI's hook, running this installation's forwarder");
     bridge
         .validate(
             &declared("claude-code", BridgeSurface::Hook),
-            Some(&launcher),
+            Some(&forwarder),
         )
         .expect_err("another application's hook");
     bridge
         .validate(
             &declared("qoder-cli", BridgeSurface::Channel),
-            Some(&launcher),
+            Some(&forwarder),
         )
         .expect_err("a channel the flags do not register");
     let other = store.forwarder("elsewhere/kr-hook");
@@ -347,7 +350,7 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
 #[test]
 fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
     let store = Store::new("flags");
-    let launcher = store.forwarder("bin/kr-hook");
+    let forwarder = store.forwarder("bin/kr-hook");
     let declared = |application: &str, surface: BridgeSurface| BridgeDeclaration {
         application: application.to_owned(),
         surface,
@@ -374,7 +377,7 @@ fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
         }))
         .expect("the installed package is read");
         let bridge = connector
-            .launch_bridge(&launcher)
+            .launch_bridge(&forwarder)
             .expect("a package that installs no bridge gets its own hook");
         assert_eq!(bridge.application, "qoder-cli", "{flags:?}");
         assert_eq!(
@@ -382,20 +385,23 @@ fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
             [BridgeSurface::Hook].into_iter().collect(),
             "{flags:?}"
         );
-        assert_eq!(bridge.forwarder, launcher, "{flags:?}");
+        assert_eq!(bridge.forwarder, forwarder, "{flags:?}");
         bridge
-            .validate(&declared("qoder-cli", BridgeSurface::Hook), Some(&launcher))
+            .validate(
+                &declared("qoder-cli", BridgeSurface::Hook),
+                Some(&forwarder),
+            )
             .expect("the package's own hook");
         bridge
             .validate(
                 &declared("claude-code", BridgeSurface::Hook),
-                Some(&launcher),
+                Some(&forwarder),
             )
             .expect_err("another application's hook");
         bridge
             .validate(
                 &declared("qoder-cli", BridgeSurface::Channel),
-                Some(&launcher),
+                Some(&forwarder),
             )
             .expect_err("a channel");
     }
@@ -411,14 +417,14 @@ fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
     }))
     .expect("the installed package is read");
     assert_eq!(
-        connector.launch_bridge(&launcher),
+        connector.launch_bridge(&forwarder),
         connector.installed_bridge()
     );
     assert_ne!(
         connector
-            .launch_bridge(&launcher)
+            .launch_bridge(&forwarder)
             .map(|bridge| bridge.forwarder),
-        Some(launcher.clone()),
+        Some(forwarder.clone()),
         "the installation's bridge, not one made for the launch"
     );
 
@@ -428,7 +434,7 @@ fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
         .granted
         .remove(&PluginCapability::CommandIntegrationLaunch);
     let connector = InstalledConnector::read(source).expect("the installed package is read");
-    assert!(connector.launch_bridge(&launcher).is_none());
+    assert!(connector.launch_bridge(&forwarder).is_none());
 }
 
 /// A native bridge the installation put in place for another application than the package's own is
@@ -453,12 +459,12 @@ fn an_installed_bridge_for_another_application_is_refused() {
 #[test]
 fn a_declared_bridge_the_installation_did_not_apply_leaves_the_launch_with_none() {
     let store = Store::new("unapplied");
-    let launcher = store.forwarder("bin/kr-hook");
+    let forwarder = store.forwarder("bin/kr-hook");
     let mut source = store.package();
     source.bridge = None;
     let connector = InstalledConnector::read(source).expect("the installed package is read");
     assert!(connector.integration().is_some());
-    assert!(connector.launch_bridge(&launcher).is_none());
+    assert!(connector.launch_bridge(&forwarder).is_none());
 }
 
 /// KR-REQ-12.07: an integration applies only while the installation holds
