@@ -181,7 +181,8 @@ installation's own `kr-hook`, under the launch's registration and credential.
 
 A package can tell the host how to read the mode its application will run in. The `launch_probe`
 member of the manifest names the application's own diagnostic command, which the host runs before a
-launch.
+launch the worker starts and for `kr doctor`. This host starts no agent through the worker's launch,
+so on it only `kr doctor` runs the probe.
 
 - `arguments` are what the host passes to the application's executable: one to eight, each one line
   of 1 to 256 bytes, so the application is never started bare.
