@@ -554,6 +554,10 @@ pub struct AttentionModule {
     /// privacy state's read side, before it decides. Compiled away in every shipped build.
     #[cfg(any(test, feature = "testing"))]
     after_privacy_read: Pause,
+    /// Where this module's own tests stop a read of what changed in a session once it has read
+    /// its page, before it reads any text or asks for a summary.
+    #[cfg(test)]
+    after_page: Pause,
     /// The threads each pass that decided announcements ran on, which a test reads to see that no
     /// pass ran on a thread of the runtime that drives the exchanges privacy mode waits for.
     #[cfg(test)]
@@ -660,6 +664,8 @@ impl AttentionModule {
             in_save: Pause::default(),
             #[cfg(any(test, feature = "testing"))]
             after_privacy_read: Pause::default(),
+            #[cfg(test)]
+            after_page: Pause::default(),
             #[cfg(test)]
             decided_on: std::sync::Mutex::new(Vec::new()),
         };
@@ -1180,16 +1186,33 @@ impl AttentionModule {
                     ));
                 }
                 let floor = self.output_floor(reach, params.session_id);
-                let page = self
-                    .store()?
-                    .changed(
-                        actor,
-                        params.session_id,
-                        params.max_changes.get(),
-                        floor,
-                        caller.content(),
-                    )
-                    .map_err(refusal)?;
+                // The page and what a summary is written from are read under one hold of the
+                // store, so the summary starts at the cursor the page does and ends at the head the
+                // page was read at, whatever is recorded while the text is read.
+                let (page, source) = {
+                    let store = self.store()?;
+                    let page = store
+                        .changed(
+                            actor,
+                            params.session_id,
+                            params.max_changes.get(),
+                            floor,
+                            caller.content(),
+                        )
+                        .map_err(refusal)?;
+                    let source = if params.summarise {
+                        Some(
+                            store
+                                .summary_source(actor, params.session_id)
+                                .map_err(refusal)?,
+                        )
+                    } else {
+                        None
+                    };
+                    (page, source)
+                };
+                #[cfg(test)]
+                self.after_page.wait();
                 let mut result = page.result;
                 let withheld = encode(&result)?;
                 let (texts, ticket) = self.texts(reach, &page.texts).await;
@@ -1200,8 +1223,8 @@ impl AttentionModule {
                 }
                 // Beside the changes and never among them. The answer that withholds session
                 // text carries no summary: one is generated text, written from it.
-                if params.summarise {
-                    result.summary = self.summary(reach, caller, actor, params.session_id).await;
+                if let Some(source) = &source {
+                    result.summary = self.summary(reach, caller, params.session_id, source).await;
                 }
                 Ok(Read::with(encode(&result)?, withheld, ticket))
             }
@@ -1213,8 +1236,9 @@ impl AttentionModule {
     }
 
     /// Answers a read that asked for a summary of what changed since the actor's last visit: the
-    /// newest one written for the interval from the cursor the actor has acknowledged, and, when a
-    /// newer one is wanted, the request for it.
+    /// newest one written for the interval `source` froze, from the cursor the actor had
+    /// acknowledged when the page the answer carries it beside was read, and, when a newer one is
+    /// wanted, the request for it.
     ///
     /// The answer does not wait for a model. It is the summary the description host has already
     /// written, held under the profile it selected and the privacy generation in force, to a
@@ -1226,19 +1250,13 @@ impl AttentionModule {
         &self,
         reach: &dyn Reach,
         caller: &Caller,
-        actor: &ActorId,
         session_id: SessionId,
+        source: &kr_attention::visit::SummarySource,
     ) -> Nullable<ChangeSummary> {
         let (Some(descriptions), Some(privacy)) = (
             self.descriptions.get().map(Arc::clone),
             self.privacy.get().cloned(),
         ) else {
-            return Nullable::null();
-        };
-        let Ok(source) = self
-            .store()
-            .and_then(|store| store.summary_source(actor, session_id).map_err(refusal))
-        else {
             return Nullable::null();
         };
         let Some((earliest, _)) = moments(&source.changes) else {
@@ -1262,7 +1280,7 @@ impl AttentionModule {
             }
         };
         if reading.wanted {
-            self.ask_for_summary(reach, &descriptions, session_id, &source)
+            self.ask_for_summary(reach, &descriptions, session_id, source)
                 .await;
         }
         Nullable(
@@ -3988,6 +4006,57 @@ mod tests {
             "the interval the log holds"
         );
         assert_eq!((asked[0].from_ms, asked[0].to_ms), (1_000, 2_000));
+    }
+
+    /// KR-REQ-18.02: a summary is asked for from the page the answer carries it beside. A visit
+    /// that is recorded while the answer waits for session text moves the cursor the changes are
+    /// read from, and the interval frozen with the page is the one the summary is asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_asked_for_over_the_interval_its_page_was_read_from() {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], false);
+        let (arrived, go) = world.module.after_page.arm();
+        let reading = {
+            let module = Arc::clone(&world.module);
+            let request = world.visit_changed();
+            tokio::spawn(async move {
+                module
+                    .read(
+                        &Stub { unaccounted: false },
+                        &Caller::Owner,
+                        &owner(),
+                        &request,
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || arrived.recv())
+            .await
+            .expect("the wait ends")
+            .expect("the read reached its page");
+        // The person visits while the read waits: the first cursor of what changed moves on.
+        world
+            .module
+            .store()
+            .expect("the store")
+            .acknowledge_visit(&owner(), world.session_id, 1, Vec::new())
+            .expect("the visit is recorded");
+        go.send(()).expect("the read goes on");
+        let served: VisitChangedResult = reading
+            .await
+            .expect("the read finishes")
+            .expect("the changes are served")
+            .to_typed()
+            .expect("decodes");
+
+        assert_eq!(served.from_cursor, U64::new(0));
+        let asked = world.asked();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            (asked[0].interval.from, asked[0].interval.to),
+            (0, 2),
+            "the interval of the page, not of the visit that came after it"
+        );
     }
 
     /// A page that arrives after its session's closure is not taken: the closure holds the store
