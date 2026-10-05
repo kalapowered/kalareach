@@ -518,9 +518,9 @@ pub struct CommandIntegrationReport {
     /// forwarder by its own name, which an application may look for in its working directory
     /// before its search path.
     ///
-    /// For any report whose command resolves it is also the executable the daemon's search path
-    /// names first, where that is a script or shim that no launcher starts, so that an invocation
-    /// which finds it runs as typed.
+    /// For any report whose command resolves and that gives no other reason it is also the
+    /// executable the daemon's search path names first, where that is a script or shim that no
+    /// launcher starts, so that an invocation which finds it runs as typed.
     pub reason: Nullable<String>,
 }
 
