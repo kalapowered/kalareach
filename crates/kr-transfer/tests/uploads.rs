@@ -946,8 +946,15 @@ fn expiry_runs_at_twenty_four_hours_seven_days_and_the_session_retention() {
 fn a_submitted_attachment_follows_its_sessions_retention() {
     struct Retains(bool);
     impl kr_transfer::SessionRetention for Retains {
-        fn retains(&self, _session_id: SessionId) -> bool {
-            self.0
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(if self.0 {
+                sessions.clone()
+            } else {
+                std::collections::BTreeSet::new()
+            })
         }
     }
 
@@ -1208,8 +1215,15 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
 fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
     struct Retains(bool);
     impl kr_transfer::SessionRetention for Retains {
-        fn retains(&self, _session_id: SessionId) -> bool {
-            self.0
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(if self.0 {
+                sessions.clone()
+            } else {
+                std::collections::BTreeSet::new()
+            })
         }
     }
 

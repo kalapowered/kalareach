@@ -1200,6 +1200,12 @@ impl ArchiveRetention {
         self.sessions.insert(session_id);
     }
 
+    /// Returns true when this session keeps what was submitted to it.
+    #[must_use]
+    pub fn retains(&self, session_id: SessionId) -> bool {
+        self.sessions.contains(&session_id)
+    }
+
     /// Returns how many sessions are retained.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1210,12 +1216,6 @@ impl ArchiveRetention {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
-    }
-}
-
-impl kr_transfer::service::SessionRetention for ArchiveRetention {
-    fn retains(&self, session_id: SessionId) -> bool {
-        self.sessions.contains(&session_id)
     }
 }
 

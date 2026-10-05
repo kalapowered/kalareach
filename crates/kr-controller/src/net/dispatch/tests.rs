@@ -2128,6 +2128,49 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     world.serving.abort();
 }
 
+/// KR-REQ-14.11: a sweep judges an attachment only against a view of retention taken after the
+/// attachment was read, so a draft sent to a session that began while the sweep was asking is left
+/// for the next sweep and is not expired as the attachment of a session nobody knew.
+///
+/// The sweep stops once it has asked which sessions retain. A session this host did not know
+/// then receives the draft, and the sweep, let go, expires nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_leaves_a_draft_sent_to_a_session_that_began_after_it_asked() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let actor = prompting_and_viewing(controller, 61).principal();
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "began.bin");
+
+    let (arrived, go, swept) = controller
+        .transfer()
+        .sweep_paused(&std::sync::Arc::downgrade(controller));
+    tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+        .await
+        .expect("the sweep reaches the question in time")
+        .expect("the sweep says it has arrived");
+
+    // A session the sweep's question did not cover begins, and the draft is sent to it.
+    let began = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    controller
+        .transfer()
+        .record_submission(&actor, draft_id, began)
+        .await
+        .expect("records the submission");
+    assert!(is_submitted(controller, &actor, draft_id));
+    let _ = go.send(());
+
+    let swept = swept.await.expect("the sweep runs");
+    assert_eq!(
+        swept.expired_attachments, 0,
+        "an attachment submitted after the sweep asked is not judged by its answer"
+    );
+    world.serving.abort();
+}
+
 /// KR-REQ-10.49: the daemon's own link to a worker, the one a close made at the local door and a
 /// supervised action go through, carries no history scope on the wire whatever the worker states:
 /// it acts as the owner, whom no scope bounds.
