@@ -54,7 +54,7 @@ use crate::metadata::{
     LabelSource, SessionFacts, SessionLabel, VerifiedStatus, deterministic_title,
 };
 use crate::metrics::LatencyLedger;
-use crate::output::{Expectation, ProducedUnder, Rejection, validate};
+use crate::output::{Expectation, ProducedUnder, Rejection, validate, validate_summary};
 use crate::priority::Cancellation;
 use crate::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
@@ -63,11 +63,14 @@ use crate::processor::Features;
 use crate::profile::catalogue::{Catalogue, MetGates, NothingSelected, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
 use crate::prompt::Prompt;
-use crate::queue::{Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding};
+use crate::queue::{
+    Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding, Work as QueuedWork,
+};
 use crate::resource::{
     HostConditions, PauseReason, ResourcePolicy, ResourceSettings, ResourceState,
 };
 use crate::store::DescriptionStore;
+use crate::summary::{SummaryAsk, SummaryAsked, SummaryRecord, SummaryRefusal, is_wanted};
 use crate::time::Reading;
 use crate::wire::{JobEnd, LoadEnd, Phases};
 
@@ -392,6 +395,15 @@ pub enum Outcome {
         /// How long its job took once dequeued.
         execution_ms: u64,
     },
+    /// A summary was published.
+    SummaryPublished {
+        /// The session it summarises.
+        session_id: SessionId,
+        /// How long its job waited in the queue.
+        queue_wait_ms: u64,
+        /// How long its job took once dequeued.
+        execution_ms: u64,
+    },
     /// A job's result was refused.
     Rejected {
         /// The session.
@@ -444,6 +456,11 @@ pub struct JobCounts {
     pub replaced: u64,
     /// Descriptions published.
     pub published: u64,
+    /// Requests for a summary the service has taken, whatever came of each: queued, covered by
+    /// what is held, or refused.
+    pub summary_asks: u64,
+    /// Summaries published.
+    pub summarised: u64,
     /// Results refused.
     pub refused: u64,
     /// Jobs cancelled, or dropped from the queue by privacy mode.
@@ -1198,10 +1215,9 @@ impl DescriptionService {
         now: Reading,
     ) -> Option<Enqueued> {
         if self.superseded.contains(session_id)
-            && self
-                .job
-                .as_ref()
-                .is_some_and(|dispatched| dispatched.job.session_id == *session_id)
+            && self.job.as_ref().is_some_and(|dispatched| {
+                dispatched.job.session_id == *session_id && !dispatched.job.work.is_summary()
+            })
         {
             self.waiting.insert(*session_id, priority);
             return None;
@@ -1254,6 +1270,74 @@ impl DescriptionService {
             self.counts.replaced = self.counts.replaced.saturating_add(1);
         }
         Some(enqueued)
+    }
+
+    /// Asks for a summary of a session's changes in an interval that was frozen when it was
+    /// asked for.
+    ///
+    /// The request is queued as priority work in the session's one place, beside a description or
+    /// instead of one that waits, and replaces a summary that is waiting in place. Nothing is
+    /// queued when a result already held covers it, when one that stops short of the head is
+    /// younger than the cadence, or when a summary of the same first cursor that reaches as far is
+    /// already running: asking again is how a person polls, and it never restarts work.
+    ///
+    /// It is refused when this host selected no model, when the session is not tracked or privacy
+    /// mode has stopped it, and when the text of its changes was read under another privacy
+    /// generation than the one in force.
+    pub fn summarise(&mut self, ask: SummaryAsk, now: Reading) -> SummaryAsked {
+        self.counts.summary_asks = self.counts.summary_asks.saturating_add(1);
+        let session_id = ask.session_id;
+        let Some((profile_id, profile_revision)) = self
+            .selection
+            .profile()
+            .map(|profile| (profile.profile_id().to_owned(), profile.revision()))
+        else {
+            return SummaryAsked::Refused(SummaryRefusal::NoModel);
+        };
+        if !self.live_sessions.contains(&session_id) {
+            return SummaryAsked::Refused(SummaryRefusal::NotTracked);
+        }
+        if self.fence.is_fenced(&session_id) {
+            return SummaryAsked::Refused(SummaryRefusal::Fenced);
+        }
+        let generation = self.privacy_generation(&session_id);
+        if ask.generation.is_some_and(|read| read != generation) {
+            return SummaryAsked::Refused(SummaryRefusal::Generation);
+        }
+        // What is held for this first cursor, under this profile and this generation. A store that
+        // cannot be read says nothing is held: the job runs, and its own write says what it
+        // cannot do.
+        let held = self.store.summaries(&session_id).unwrap_or_default();
+        let newest = held
+            .iter()
+            .filter(|record| {
+                record.cursor.from == ask.interval.from
+                    && record.profile_id == profile_id
+                    && record.profile_revision == profile_revision
+                    && record.generation == generation
+            })
+            .max_by_key(|record| (record.cursor.to, record.produced_at_ms));
+        let cadence_ms = self.scheduler.cadence_ms(now);
+        if !is_wanted(newest, ask.interval.to, now.wall_ms().get(), cadence_ms) {
+            return SummaryAsked::Covered;
+        }
+        let running_covers = self.job.as_ref().is_some_and(|running| {
+            running.job.session_id == session_id
+                && matches!(
+                    &running.job.work,
+                    QueuedWork::Summary(under_way)
+                        if under_way.interval.from == ask.interval.from
+                            && under_way.interval.to >= ask.interval.to
+                )
+        });
+        if running_covers {
+            return SummaryAsked::Covered;
+        }
+        let enqueued = self.scheduler.enqueue_summary(ask, now);
+        if matches!(enqueued, Enqueued::Replaced { .. }) {
+            self.counts.replaced = self.counts.replaced.saturating_add(1);
+        }
+        SummaryAsked::Queued(enqueued)
     }
 
     /// Returns a session's context revision.
@@ -1459,6 +1543,7 @@ impl DescriptionService {
                 .unwrap_or_else(|| unreachable!("the job was just found"));
             let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
             let outlived = dispatched.outlived;
+            let summary = dispatched.job.work.is_summary();
             let outcome = self.finish_job(dispatched, answer, now);
             let superseded = stop == Some(Stop::Superseded)
                 || matches!(
@@ -1469,7 +1554,11 @@ impl DescriptionService {
                     })
                 );
             let requeued = matches!(outcome, Ok(Outcome::Requeued { .. }));
-            self.after_job(&session_id, outlived, superseded, requeued, now);
+            // What a session's supersession and the changes waiting for its next description
+            // follow is its descriptions' own: a summary between two of them moves neither.
+            if !summary {
+                self.after_job(&session_id, outlived, superseded, requeued, now);
+            }
             return outcome;
         }
         self.counts.dropped_answers = self.counts.dropped_answers.saturating_add(1);
@@ -1490,10 +1579,13 @@ impl DescriptionService {
         if let Some(dispatched) = self.job.take() {
             let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
             let outlived = dispatched.outlived;
+            let summary = dispatched.job.work.is_summary();
             let outcome = self.job_ended_with_process(dispatched, why, now);
             let requeued = matches!(outcome, Outcome::Requeued { .. });
             let superseded = stop == Some(Stop::Superseded);
-            self.after_job(&session_id, outlived, superseded, requeued, now);
+            if !summary {
+                self.after_job(&session_id, outlived, superseded, requeued, now);
+            }
             outcomes.push(outcome);
         }
         let load_called_off = matches!(
@@ -1600,7 +1692,9 @@ impl DescriptionService {
                 Stop::Cancelled
             } else if dispatched.outlived || !self.live_sessions.contains(&session_id) {
                 Stop::Closed
-            } else if self.revision(&session_id) != Some(ran_at) {
+            } else if !dispatched.job.work.is_summary()
+                && self.revision(&session_id) != Some(ran_at)
+            {
                 Stop::Superseded
             } else if paused {
                 Stop::Paused
@@ -1722,19 +1816,55 @@ impl DescriptionService {
             }
             let budgets = self.policy.budgets();
             let generation = self.privacy_generation(&session_id);
-            let produced_under = ProducedUnder {
-                session_epoch: job.context.session_epoch(),
-                binding: job.context.binding().clone(),
-                context_revision: job.context.revision(),
-                cursor: job.context.cursor(),
-                profile_id: profile.profile_id().to_owned(),
-                profile_revision: profile.revision(),
-                generation,
+            let (produced_under, prompt, grammar) = match &job.work {
+                QueuedWork::Description(context) => (
+                    ProducedUnder {
+                        session_epoch: context.session_epoch(),
+                        binding: context.binding().clone(),
+                        context_revision: context.revision(),
+                        cursor: context.cursor(),
+                        profile_id: profile.profile_id().to_owned(),
+                        profile_revision: profile.revision(),
+                        generation,
+                    },
+                    context.prompt(),
+                    crate::output::DESCRIPTION_GRAMMAR,
+                ),
+                QueuedWork::Summary(ask) => {
+                    // The text of its changes was read under the generation it carries, and a
+                    // generation that has moved since makes that text one this job may not use.
+                    let (Some(session_epoch), Some(binding)) = (
+                        self.epochs.get(&session_id).copied(),
+                        self.bindings.get(&session_id).cloned(),
+                    ) else {
+                        self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                        continue;
+                    };
+                    if ask.generation.is_some_and(|read| read != generation) {
+                        self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                        continue;
+                    }
+                    (
+                        ProducedUnder {
+                            session_epoch,
+                            binding,
+                            context_revision: self
+                                .revision(&session_id)
+                                .unwrap_or(ContextRevision::INITIAL),
+                            cursor: ask.interval,
+                            profile_id: profile.profile_id().to_owned(),
+                            profile_revision: profile.revision(),
+                            generation,
+                        },
+                        ask.prompt(),
+                        crate::output::SUMMARY_GRAMMAR,
+                    )
+                }
             };
             let bounds = budgets.bounds(profile.execution());
             let request = GenerationRequest {
-                prompt: job.context.prompt(),
-                grammar: crate::output::DESCRIPTION_GRAMMAR,
+                prompt,
+                grammar,
                 context_tokens: bounds.context_tokens,
                 max_output_tokens: bounds.max_output_tokens,
                 prompt_tokens: bounds.prompt_tokens,
@@ -1869,7 +1999,11 @@ impl DescriptionService {
         if stopped(&dispatched).is_some_and(Stop::requeues) || !self.settings.enabled {
             return Ok(self.requeue_unless_cancelled(dispatched));
         }
-        let outcome = self.publish(&dispatched, &bytes, execution_ms, now)?;
+        let outcome = if dispatched.job.work.is_summary() {
+            self.publish_summary(&dispatched, &bytes, execution_ms, now)?
+        } else {
+            self.publish(&dispatched, &bytes, execution_ms, now)?
+        };
         let ceiling = self.policy.budgets().process_memory_ceiling_bytes;
         if peak_rss_bytes > ceiling {
             // The ceiling is a process figure, and the process passed it. The description it
@@ -1881,7 +2015,10 @@ impl DescriptionService {
                 reason: PauseReason::MemoryPressure,
                 unloaded: true,
             };
-        } else if matches!(outcome, Outcome::Published { .. }) {
+        } else if matches!(
+            outcome,
+            Outcome::Published { .. } | Outcome::SummaryPublished { .. }
+        ) {
             self.restart.succeeded();
         }
         Ok(outcome)
@@ -1991,6 +2128,139 @@ impl DescriptionService {
                     execution_ms,
                 }
             }
+            // A pin committed after validation read none. Nothing was recorded, so nothing is a
+            // success: the queue's last success stays where it was.
+            refused => {
+                self.refused_publication(refused, session_id, produced_under.generation, now)
+            }
+        })
+    }
+
+    /// Validates a summary's bytes against what is in force now, and publishes them.
+    ///
+    /// The checks are a description's, less the two a summary has no use for: its interval is
+    /// frozen, so a session's context moving on does not refuse it, and it names nothing, so a pin
+    /// does not either. The write is held under the same admission and the same fence.
+    fn publish_summary(
+        &mut self,
+        dispatched: &Dispatched,
+        bytes: &[u8],
+        execution_ms: u64,
+        now: Reading,
+    ) -> Result<Outcome> {
+        let session_id = dispatched.job.session_id;
+        let produced_under = &dispatched.produced_under;
+        let QueuedWork::Summary(ask) = &dispatched.job.work else {
+            unreachable!("a summary is published for a summary job")
+        };
+        let rejected = |counts: &mut JobCounts, rejection: Rejection| {
+            counts.refused = counts.refused.saturating_add(1);
+            Outcome::Rejected {
+                session_id,
+                rejection,
+            }
+        };
+        if !self.live_sessions.contains(&session_id) {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        }
+        let Some(session_epoch) = self.epochs.get(&session_id).copied() else {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        };
+        let (profile_id, profile_revision) = self.selection.profile().map_or_else(
+            || (String::new(), ProfileRevision::new(0)),
+            |profile| (profile.profile_id().to_owned(), profile.revision()),
+        );
+        let expectation = Expectation {
+            session_epoch,
+            revision: ContextRevision::INITIAL,
+            binding: self
+                .bindings
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| produced_under.binding.clone()),
+            profile_id: profile_id.clone(),
+            profile_revision,
+            generation: self.privacy_generation(&session_id),
+            name_pinned: false,
+        };
+        let summary = match validate_summary(bytes, produced_under, &expectation) {
+            Ok(summary) => summary,
+            Err(rejection) => return Ok(rejected(&mut self.counts, rejection)),
+        };
+        // A job that outlived the session it was admitted for summarises a session that is gone,
+        // even when the session there now has the same epoch and binding.
+        if dispatched.outlived {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        }
+        let record = SummaryRecord {
+            session_id,
+            cursor: summary.cursor,
+            from_ms: ask.from_ms,
+            to_ms: ask.to_ms,
+            text: summary.text,
+            profile_id,
+            profile_revision,
+            generation: produced_under.generation,
+            produced_at_ms: now.wall_ms().get(),
+        };
+        let mut write = || {
+            self.fence.publish_summary_under_lock(
+                &self.store,
+                &record,
+                self.privacy_generation(&session_id),
+                &dispatched.cancellation,
+                execution_ms,
+                self.policy.budgets().execution_deadline_ms,
+            )
+        };
+        let gate = match &self.gate {
+            None => write()?,
+            Some(held) => match held.hold(produced_under.generation, &mut write) {
+                Some(done) => done?,
+                None => {
+                    return Ok(rejected(
+                        &mut self.counts,
+                        Rejection::NotAdmitted {
+                            found: produced_under.generation,
+                        },
+                    ));
+                }
+            },
+        };
+        Ok(match gate {
+            PublishGate::Allowed => {
+                self.counts.summarised = self.counts.summarised.saturating_add(1);
+                Outcome::SummaryPublished {
+                    session_id,
+                    queue_wait_ms: dispatched.queue_wait_ms,
+                    execution_ms,
+                }
+            }
+            refused => {
+                self.refused_publication(refused, session_id, produced_under.generation, now)
+            }
+        })
+    }
+
+    /// Says what a publication that the gate or the fence did not allow came to.
+    fn refused_publication(
+        &mut self,
+        gate: PublishGate,
+        session_id: SessionId,
+        produced: PrivacyGeneration,
+        now: Reading,
+    ) -> Outcome {
+        let mut rejected = |rejection: Rejection| {
+            self.counts.refused = self.counts.refused.saturating_add(1);
+            Outcome::Rejected {
+                session_id,
+                rejection,
+            }
+        };
+        match gate {
+            PublishGate::Allowed => {
+                unreachable!("a publication that was allowed is not refused")
+            }
             PublishGate::Cancelled => {
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
@@ -2000,24 +2270,18 @@ impl DescriptionService {
                 self.restart.failed(now, None);
                 Outcome::DeadlineExceeded { session_id }
             }
-            // A pin committed after validation read none. Nothing was recorded, so nothing is a
-            // success: the queue's last success stays where it was.
-            PublishGate::NamePinned => rejected(&mut self.counts, Rejection::NamePinned),
-            PublishGate::Fenced => rejected(
-                &mut self.counts,
-                Rejection::LateGeneration {
-                    expected: self
-                        .fence
-                        .generation(&session_id)
-                        .unwrap_or(PrivacyGeneration::INITIAL),
-                    found: produced_under.generation,
-                },
-            ),
-            PublishGate::LateGeneration { expected, found } => rejected(
-                &mut self.counts,
-                Rejection::LateGeneration { expected, found },
-            ),
-        })
+            PublishGate::NamePinned => rejected(Rejection::NamePinned),
+            PublishGate::Fenced => rejected(Rejection::LateGeneration {
+                expected: self
+                    .fence
+                    .generation(&session_id)
+                    .unwrap_or(PrivacyGeneration::INITIAL),
+                found: produced,
+            }),
+            PublishGate::LateGeneration { expected, found } => {
+                rejected(Rejection::LateGeneration { expected, found })
+            }
+        }
     }
 
     /// Takes a job that the process ended with nothing.

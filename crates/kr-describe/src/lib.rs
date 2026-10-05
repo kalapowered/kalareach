@@ -20,6 +20,7 @@
 //! | [`budget`] | Section 22's defaults, and what a resident model actually costs |
 //! | [`resource`] | The memory reserve, power and pressure, and `resource_paused` |
 //! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
+//! | [`summary`] | A requested summary of what changed in a session: the request, its result and when one is wanted |
 //! | [`queue`] | One latest job per session, aging, fairness and the cadence |
 //! | [`metrics`] | Queue-wait and execution latency, published separately, beside whole-product figures |
 //! | [`supervise`] | The daemon's side of the description process: starting it, its timers, ending it |
@@ -97,6 +98,7 @@ pub mod resource;
 pub mod serve;
 pub mod service;
 pub mod store;
+pub mod summary;
 pub mod supervise;
 #[cfg(feature = "testing")]
 pub mod testing;

@@ -38,7 +38,7 @@ use kr_protocol::scalars::U64;
 use serde::{Deserialize, Serialize};
 
 use crate::metadata::RepositoryFacts;
-use crate::prompt::{Datum, Prompt};
+use crate::prompt::{Datum, Prompt, PromptKind};
 use crate::time::Reading;
 
 /// The most recent semantic events one context may carry.
@@ -412,6 +412,7 @@ impl DescriptionContext {
             })
         };
         Prompt {
+            kind: PromptKind::Description,
             revision: U64::new(self.revision.get()),
             cursor_from: U64::new(self.cursor.from),
             cursor_to: U64::new(self.cursor.to),
