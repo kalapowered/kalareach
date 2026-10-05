@@ -59,53 +59,49 @@ jobs:
             runner: ubuntu-22.04
             python: python3
             exe: ''
-            describe: kr-describe-model/kr-describe-inference
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             python: python3
             exe: ''
-            describe: kr-describe-model/kr-describe-inference
           # The hosted Apple Silicon runners start at macOS 15, so the Apple Silicon executables
           # are started there. Their 14.0 floor is read from their headers, as the Intel ones are.
           - target: aarch64-apple-darwin
             runner: macos-15
             python: python3
             exe: ''
-            describe: kr-describe-model/kr-describe-inference
           # The Intel runners start at macOS 15, so the Intel executables are started there.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             python: python3
             exe: ''
-            describe: kr-describe-model/kr-describe-inference
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             python: python
             exe: .exe
-            describe: kr-describe-model/kr-describe-inference
-          # The description process is left out of this target: llama.cpp's CPU backend does not
-          # build with MSVC for Arm, and no shipped model profile lists this target.
+          # The description process is left out of this target by `scripts/release-programs.json`:
+          # llama.cpp's CPU backend does not build with MSVC for Arm, and no shipped model profile
+          # lists this target.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             python: python
             exe: .exe
-            describe: ''
     env:
       TARGET: ${{ matrix.target }}
       PYTHON: ${{ matrix.python }}
       EXE: ${{ matrix.exe }}
-      # Every executable the host ships, as the package that builds it and its name.
-      EXECUTABLES: >-
-        kr-cli/kr
-        kr-cli/kr-attach-guard
-        kr-worker/kr-worker
-        kr-controller/kr-controller
-        ${{ matrix.describe }}
-        kr-hook/kr-hook
-        kr-plugin-host/kr-plugin-host
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Every executable the host ships for this target, as the package that builds it and its
+      # name, read from `scripts/release-programs.json`: the one list the release builds, the
+      # Windows archive check and the host's own check of a release read. The reader is put through
+      # what each target needs before it is trusted with this one.
+      - name: Name the executables
+        run: |
+          "$PYTHON" scripts/release-programs.py self-test
+          builds=$("$PYTHON" scripts/release-programs.py builds --target "$TARGET")
+          echo "EXECUTABLES=${builds//$'\n'/ }" >> "$GITHUB_ENV"
 
       - name: What this runner is
         run: |

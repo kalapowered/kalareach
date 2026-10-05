@@ -45,15 +45,19 @@ natively and then started on the machine that built it. None is only cross-built
 | `aarch64-pc-windows-msvc` | `windows-11-arm` |
 
 The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
-`kr-hook` and `kr-plugin-host`. `release-baselines.yml` builds each one by a Cargo command of its
-own, as `release-windows.yml` builds each of its seven, so the dependencies of those seven resolve
-exactly as they do for the release. The file `release-windows.yml` builds and signs all seven
-executables for the x86-64 Windows target, and will fail if any is missing from the archive it
-produces. For each of the targets, excluding `aarch64-pc-windows-msvc`, the description process will
-be built; that target is excluded because the CPU backend of llama.cpp doesn't build on MSVC, and
-it's not present in any model profiles. On x86-64, the description process requires the host to
-support the `x86-64-v3` instruction sets (SSE4.2, POPCNT, AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT
-and MOVBE); see `docs/describe/README.md` for what happens when it doesn't.
+`kr-hook` and `kr-plugin-host`. The names of the programs to include in a release for each target
+are defined in `scripts/release-programs.json`. This is the one list that the two release workflows,
+the Windows archive check, `kr host install` and `kr host update` read. `release-baselines.yml`
+builds each program it names by a Cargo command of its own, as `release-windows.yml` does, so that
+the dependencies resolve exactly as they do for the release. The `release-windows.yml` workflow
+builds and signs all of these programs for the x86-64 Windows target, and will fail if any of them
+are not present in the release archive. Additionally, `kr host update` refuses a release for a macOS
+or Linux host whose manifest does not list all seven as programs. This list does not include the
+description process for the `aarch64-pc-windows-msvc` target because the CPU backend of llama.cpp
+does not build with MSVC there and no model profile lists the target. On x86-64, the description
+process requires the host to support the `x86-64-v3` instruction sets (SSE4.2, POPCNT, AVX, AVX2,
+BMI1, BMI2, FMA, F16C, LZCNT and MOVBE); see `docs/describe/README.md` for what happens when it
+doesn't.
 
 ## How each floor is read
 

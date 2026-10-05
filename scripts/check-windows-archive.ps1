@@ -6,13 +6,17 @@ Refuses a Windows release archive that lacks an executable an installed host can
 `.github/workflows/release-windows.yml` packs the executables it staged and then reads the finished
 archive back against what it packed, which a build that left an executable out would still match.
 This holds the archive to the executables a release has to carry instead, each as a file at the
-archive's top level: the command line, its terminal restoration guard, the worker, the control
-daemon, the description process, the forwarder agents run their hooks through, and the plugin host.
-An archive that lacks one is refused, and the refusal names every one it lacks. An archive this
-check cannot read is refused as well.
+archive's top level. Which they are is `scripts/release-programs.json`'s to say, for the release's
+target: the command line, its terminal restoration guard, the worker, the control daemon, the
+description process, the forwarder agents run their hooks through, and the plugin host. The same
+file is what the release builds and the host's own check of a release read, so this keeps no list
+of its own. An archive that lacks one is refused, and the refusal names every one it lacks. An
+archive this check cannot read is refused as well.
 
-  check-windows-archive.ps1 -Archive <path to the .zip>
+  check-windows-archive.ps1 -Archive <path to the .zip> [-Target <target triple>]
   check-windows-archive.ps1 -SelfTest
+
+The target is the Windows release's own, x86-64, unless it is given.
 
 `-SelfTest` drives the check with archives made to fail, one for each executable, beside a control
 it must accept: a check that passes everything looks exactly like a check that works. It signs and
@@ -25,6 +29,9 @@ param(
     [Parameter(ParameterSetName = 'Check', Mandatory)]
     [string] $Archive,
 
+    [Parameter(ParameterSetName = 'Check')]
+    [string] $Target = 'x86_64-pc-windows-msvc',
+
     [Parameter(ParameterSetName = 'SelfTest', Mandatory)]
     [switch] $SelfTest
 )
@@ -32,17 +39,28 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# By file name, as the release job stages them. Keep this list the one `release-windows.yml` builds
-# and stages.
-$required = @(
-    'kr.exe',
-    'kr-attach-guard.exe',
-    'kr-worker.exe',
-    'kr-controller.exe',
-    'kr-describe-inference.exe',
-    'kr-hook.exe',
-    'kr-plugin-host.exe'
-)
+# The executables a release for a target carries, by file name as the release job stages them, out
+# of the one list the release builds and the host's own check of a release read as well. A program
+# the list leaves out of a target, as it leaves the description process out of Windows on Arm, is
+# not asked of an archive for that target.
+function Get-RequiredExecutables {
+    param([string] $For)
+
+    $listed = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'release-programs.json') -Raw |
+        ConvertFrom-Json
+    $names = @(
+        $listed.programs |
+            Where-Object {
+                $absent = $_.PSObject.Properties['not_on']
+                -not $absent -or $For -cnotin @($absent.Value)
+            } |
+            ForEach-Object { "$($_.name).exe" }
+    )
+    if ($names.Count -eq 0) {
+        throw "scripts/release-programs.json names no program for $For."
+    }
+    return $names
+}
 
 # The files of an archive, by the path they are stored under with a slash for a separator. A
 # directory entry names no file.
@@ -62,7 +80,7 @@ function Get-ArchiveFiles {
 }
 
 function Test-Archive {
-    param([string] $Path)
+    param([string] $Path, [string] $For)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-Host "REFUSED: $Path is not there"
@@ -75,6 +93,7 @@ function Test-Archive {
         return 1
     }
 
+    $required = Get-RequiredExecutables -For $For
     $lacking = @($required | Where-Object { $files -cnotcontains $_ })
     foreach ($name in $lacking) {
         Write-Host "REFUSED: $Path lacks $name"
@@ -119,8 +138,9 @@ function Invoke-SelfTest {
     # The check runs as a separate process, so its exit code and words are exactly what a workflow
     # step reads.
     function Test-Case {
-        param([string] $Case, [string] $Path, [bool] $Accepted, [string] $Names)
-        $output = (& $host7 -NoProfile -File $PSCommandPath -Archive $Path 2>&1 | Out-String)
+        param([string] $Case, [string] $Path, [bool] $Accepted, [string] $Names, [string] $ForTarget = '')
+        $given = if ($ForTarget) { @('-Target', $ForTarget) } else { @() }
+        $output = (& $host7 -NoProfile -File $PSCommandPath -Archive $Path @given 2>&1 | Out-String)
         $code = $LASTEXITCODE
         if ($Accepted) {
             $ok = ($code -eq 0)
@@ -141,17 +161,10 @@ function Invoke-SelfTest {
     }
 
     try {
-        # Written out again here rather than read from the list above, so that a name dropped from
-        # that list makes an archive without it pass, and a case below fail.
-        $carried = @(
-            'kr.exe',
-            'kr-attach-guard.exe',
-            'kr-worker.exe',
-            'kr-controller.exe',
-            'kr-describe-inference.exe',
-            'kr-hook.exe',
-            'kr-plugin-host.exe'
-        )
+        # What an archive carries is what the list says the release needs. That the list names
+        # every executable a host runs is held by the tests of the list itself, which write the
+        # names out apart from it, and not by a copy of them here.
+        $carried = Get-RequiredExecutables -For 'x86_64-pc-windows-msvc'
         $everything = $carried + @('signatures.txt', 'SHA256SUMS')
         $control = New-Archive -Name 'control' -Files $everything
         Test-Case -Case 'an archive that carries every executable is accepted' -Path $control -Accepted $true
@@ -166,6 +179,12 @@ function Invoke-SelfTest {
 
         $below = New-Archive -Name 'below-the-top' -Files @(@($everything | Where-Object { $_ -ne 'kr-hook.exe' }) + @('bin/kr-hook.exe'))
         Test-Case -Case 'an executable below the top level does not count' -Path $below -Accepted $false -Names 'kr-hook.exe'
+
+        $arm = 'aarch64-pc-windows-msvc'
+        $withoutDescription = New-Archive -Name 'arm-without-description' -Files @($everything | Where-Object { $_ -ne 'kr-describe-inference.exe' })
+        Test-Case -Case 'an archive for Windows on Arm needs no description process' -Path $withoutDescription -Accepted $true -ForTarget $arm
+        $armWithoutForwarder = New-Archive -Name 'arm-without-forwarder' -Files @($everything | Where-Object { $_ -notin @('kr-describe-inference.exe', 'kr-hook.exe') })
+        Test-Case -Case 'an archive for Windows on Arm still needs the forwarder' -Path $armWithoutForwarder -Accepted $false -Names 'kr-hook.exe' -ForTarget $arm
 
         $notAnArchive = Join-Path $work 'not-an-archive.zip'
         Set-Content -LiteralPath $notAnArchive -Value 'not an archive'
@@ -185,4 +204,4 @@ function Invoke-SelfTest {
 if ($SelfTest) {
     exit (Invoke-SelfTest)
 }
-exit (Test-Archive -Path $Archive)
+exit (Test-Archive -Path $Archive -For $Target)

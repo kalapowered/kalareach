@@ -61,18 +61,21 @@ The archive also carries `LICENSE`, the package manifest `shells/psreadline/mani
 SignTool. The archive itself (`.zip`), the gate receipt (`signatures.txt`), and the checksum file
 (`SHA256SUMS`) are likewise unsigned data files.
 
-The workflow builds all seven of the executables to be included in the release (one `--bin` target
-at a time, using the MSVC toolchain). The executables, and the crates they come from, are `kr` and
-`kr-attach-guard` from `kr-cli`, `kr-worker` from `kr-worker`, `kr-controller` from `kr-controller`,
-`kr-describe-inference` from `kr-describe-model`, `kr-hook` from `kr-hook` and `kr-plugin-host` from
-`kr-plugin-host`. `kr-hook` is the forwarder that an agent's hooks start and the relay a launched
-agent reaches its worker through, and `kr-plugin-host` runs plugin components, one process per
-environment. Without them a host installed from the archive cannot run agent hooks or plugins. The
-workflow checks against the workspace package metadata that these are all the binaries those six
-crates declare (except for the model description test stub and the benchmark using real weights,
-which aren't included in the release). They are then copied, by specific name, from the
-`target\release` directory to the staging directory. It's important to copy them by specific name,
-as otherwise the copy might get old binaries from the cached `target\release` directory.
+The workflow reads all the programs that need to be included in the release from the
+`scripts/release-programs.json` file. There's only one list of programs to maintain, which is used
+by the workflow, the archive check below and the host's own check of an update. Then it builds each
+of the programs one at a time by building each as a `--bin` target using the MSVC toolchain. The
+executables, and the crates they come from, are `kr` and `kr-attach-guard` from `kr-cli`,
+`kr-worker` from `kr-worker`, `kr-controller` from `kr-controller`, `kr-describe-inference` from
+`kr-describe-model`, `kr-hook` from `kr-hook` and `kr-plugin-host` from `kr-plugin-host`. `kr-hook`
+is the forwarder that an agent's hooks start and the relay a launched agent reaches its worker
+through, and `kr-plugin-host` runs plugin components, one process per environment. Without them a
+host installed from the archive cannot run agent hooks or plugins. The workflow checks against the
+workspace package metadata that these are all the binaries those six crates declare (except for the
+model description test stub and the benchmark using real weights, which aren't included in the
+release). They are then copied, by specific name, from the `target\release` directory to the staging
+directory. It's important to copy them by specific name, as otherwise the copy might get old
+binaries from the cached `target\release` directory.
 
 The included prebuilt libsodium is built to use the static C runtime, and the Rust MSVC targets use
 the dynamic C runtime. Including both in the same executable causes issues with the two different
@@ -94,7 +97,9 @@ level of the archive, using the `scripts/check-windows-archive.ps1` script. This
 executable the archive lacks and fails if the archive doesn't include them all, or if it can't be
 read at all. The gate job, which runs before the release job, tests the script with archives missing
 each of the executables, one with an executable below the top level, one which isn't an archive at
-all, and one which doesn't exist, as well as a control archive which should pass the check.
+all, and one which doesn't exist, as well as a control archive which should pass the check. The
+check reads the same list, so for Windows on Arm it asks for every executable but the description
+process, which that target does not build, and the gate job tests that as well.
 
 Both records end every line in a line feed alone, although the runner that writes them is Windows.
 A carriage return would break the sum on macOS: `shasum` and the `sha256sum` macOS ships read it as
