@@ -3691,6 +3691,9 @@ pub mod configuration {
         {
             use std::os::windows::fs::OpenOptionsExt as _;
             const NO_SHARING: u32 = 0;
+            // What Windows says when another handle holds the file. The standard library gives it
+            // no kind of its own, so it is told by its code; a refused access is the open failing.
+            const ERROR_SHARING_VIOLATION: i32 = 32;
 
             let mut options = std::fs::OpenOptions::new();
             options
@@ -3704,7 +3707,7 @@ pub mod configuration {
                     _file: file,
                     path: path.to_path_buf(),
                 }),
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
                     Err(LockRefused::Held(busy(state_directory, path)))
                 }
                 Err(error) => Err(LockRefused::Failed(format!(
