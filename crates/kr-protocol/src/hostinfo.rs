@@ -512,10 +512,15 @@ pub struct CommandIntegrationReport {
     ///
     /// For an integration that is on it is also why an invocation runs as typed here, and then
     /// `mode` is `native_terminal`: its flags cannot be written with the installed forwarder (none
-    /// is installed, or a flag holds the placeholder anywhere but at the start of a word); on Windows
-    /// its flags name the forwarder by its own name, which an application may look for in its
-    /// working directory before its search path; or the executable the daemon's search path names
-    /// first is a script or shim that no launcher starts.
+    /// is installed, the installed forwarder's path is not text, a flag holds the placeholder
+    /// anywhere but where it opens a JSON string and is followed by a quotation mark or a space, or
+    /// a flag spells the placeholder with JSON escapes); or, on Windows, its flags name the
+    /// forwarder by its own name, which an application may look for in its working directory
+    /// before its search path.
+    ///
+    /// For any report whose command resolves it is also the executable the daemon's search path
+    /// names first, where that is a script or shim that no launcher starts, so that an invocation
+    /// which finds it runs as typed.
     pub reason: Nullable<String>,
 }
 
