@@ -2162,11 +2162,11 @@ impl TerminalInput {
     /// Answers a query the editor is waiting on, from the thread that read it, or keeps the answer
     /// for [`TerminalInput::release_answers`] while the terminal is told to say nothing.
     fn answer_now(&self, bytes: &[u8]) {
-        if let Ok(mut held) = self.held.lock() {
-            if let Some(kept) = held.as_mut() {
-                kept.extend_from_slice(bytes);
-                return;
-            }
+        if let Ok(mut held) = self.held.lock()
+            && let Some(kept) = held.as_mut()
+        {
+            kept.extend_from_slice(bytes);
+            return;
         }
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_all(bytes);
@@ -2187,11 +2187,11 @@ impl TerminalInput {
     /// once from here on.
     fn release_answers(&self) {
         let kept = self.held.lock().ok().and_then(|mut held| held.take());
-        if let Some(kept) = kept.filter(|kept| !kept.is_empty()) {
-            if let Ok(mut writer) = self.writer.lock() {
-                let _ = writer.write_all(&kept);
-                let _ = writer.flush();
-            }
+        if let Some(kept) = kept.filter(|kept| !kept.is_empty())
+            && let Ok(mut writer) = self.writer.lock()
+        {
+            let _ = writer.write_all(&kept);
+            let _ = writer.flush();
         }
     }
 }
