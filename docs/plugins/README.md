@@ -154,7 +154,7 @@ would write the text as it stands, and refuses a release it cannot read. A packa
 the placeholder that registers the forwarder in its flags names it by its own name. An application
 may look in its working directory for a program started by a bare name before it searches (Qoder CLI
 does on Windows), so on Windows the host runs an invocation as typed when a flag, as the package
-declares it, holds the text `kr-hook` in upper or lower case, whatever it is there for.
+declares it, holds the text `kr-hook` in any mix of upper and lower case, whatever it is there for.
 
 The owner confirms `command_integration.launch` on every release, as for a native bridge, because
 the flags and variables are part of the release. The grant shows the package's `grant_statement`
