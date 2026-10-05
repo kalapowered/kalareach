@@ -153,6 +153,8 @@ pub(crate) struct SummaryReading {
     /// Whether the host is to be asked for one: nothing written reaches the head, and what was
     /// written is older than the cadence.
     pub(crate) wanted: bool,
+    /// The privacy state the read was decided under.
+    pub(crate) decided: Published,
 }
 
 /// The session-metadata store, as this daemon serves it.
@@ -819,6 +821,7 @@ impl DescribeModule {
         Ok(SummaryReading {
             wanted: is_wanted(served.as_ref(), head, host.now_wall_ms(), cadence_ms),
             served,
+            decided: published,
         })
     }
 

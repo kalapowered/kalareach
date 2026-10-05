@@ -165,6 +165,13 @@ impl PrivacyState {
         state
     }
 
+    /// Moves this state to `published`, as a change of privacy mode does once it is recorded, for
+    /// this crate's own tests of what a reader that held the state before it does after it.
+    #[cfg(test)]
+    pub(crate) fn set(&self, published: Published) {
+        self.publish(published);
+    }
+
     /// Returns the state as it stands now.
     #[must_use]
     pub fn now(&self) -> Published {
@@ -192,6 +199,20 @@ impl PrivacyState {
                 .published
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// Reads the state and holds it as [`Self::reading`] does, without waiting: none while a change
+    /// of state is being made or is waiting to be, which a reader that may not wait takes as the
+    /// state having moved.
+    #[must_use]
+    pub fn try_reading(&self) -> Option<Reading<'_>> {
+        match self.published.try_read() {
+            Ok(held) => Some(Reading { held }),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(Reading {
+                held: poisoned.into_inner(),
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 
