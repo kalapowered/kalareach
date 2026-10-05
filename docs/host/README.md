@@ -423,15 +423,17 @@ launched without for its size is reported as `too_large`. One answer carries at 
 and 384 KiB of them, the listed packages first, and the check counts any it leaves out. A session
 whose own search path differs can find another; each launch records the one it ran.
 
-`agents` chooses a reduced-ownership profile for one agent, by package (`publisher/plugin`). An
-entry names `reduced` and nothing else. A package with no entry runs under full ownership, and a
-document this host cannot use chooses nothing. The document is refused if a key is not a
-`publisher/plugin` identifier, if an ownership is neither `full` nor `reduced`, if an entry names
-anything besides `ownership`, or if it names more than 64 packages, so a misspelt package is never
-read as no choice. An edit reaches the sessions created afterwards. `kr doctor` reports the choice
-as the value `agents.ownership` and prints one line for each package: `reduced ownership; a launch
-is tracked by start identity and its closure never reads complete; the command route does not apply
-it`. An export carries the package names by their class and length.
+`agents` records the choice of a reduced-ownership profile for one agent, by package
+(`publisher/plugin`). An entry names `reduced` and nothing else. A package with no entry has full
+ownership, and a document this host cannot use chooses nothing. The document is refused if a key is
+not a `publisher/plugin` identifier, if an ownership is neither `full` nor `reduced`, if an entry
+names anything besides `ownership`, or if it names more than 64 packages, so a malformed key is
+never read as no choice. `kr doctor` reports the choice as the value `agents.ownership` and prints
+one line for each package: `reduced ownership; a launch is tracked by start identity and its
+closure never reads complete; the command route does not apply it`. An export carries the package
+names by their class and length. The worker's launch runs an agent under the `ownership` its
+profile records and does not read this document, and this host starts no agent through that
+launch, so no edit to this section changes a launch on this host.
 
 `environment_additions` is the preference that adds variables to a session started with the host's
 environment, described under *The environment a session starts with*.
@@ -1252,9 +1254,9 @@ nesting and breakaway are separate questions, and disabling the second says noth
 Where the job cannot be created, cannot hold what it must, or does not hold the shell, the **launch
 fails by name**: no session is silently given a weaker boundary instead. Section 7's other permitted
 outcome, an explicitly selected reduced-ownership execution profile, belongs to an agent and not to
-a session: no session is given one, and an agent runs under one only where the configuration names
-its package. A GUI resource that has to outlive the session is created outside the job and is never
-ended by closing one. *A vendor's own sandbox*, below, says what an agent's sandbox needs of these
+a session: no session is given one, and an agent runs under one only where its launch profile
+records `ownership` as `reduced`. A GUI resource that has to outlive the session is created outside
+the job and is never ended by closing one. *A vendor's own sandbox*, below, says what an agent's sandbox needs of these
 jobs.
 
 A closure says what it could not establish. A job that stops answering, a process the operating
@@ -1348,15 +1350,17 @@ is, and no breakaway is granted. The jobs this product makes carry no such restr
 limits of a job above the worker cannot be read; there the vendor fails at its own start and the
 launch reports that exit.
 
-The other outcome is a choice, and it is somebody's to make. An entry for the agent's package in the
-`agents` section of the configuration document (see *Configuration*) starts that agent in a
-kill-on-close job of its own and not in the session's. The closure lists what that job holds by
-start identity and ends it, and reads its ownership coverage as incomplete, with the reason in the
-receipt. A worker that dies ends the agent too, since the worker holds the only handle to the job.
-The choice is no way past a restriction on the worker's own job, and it never switches the vendor's
-sandbox off. The launch profile records it as `ownership`. Because the jobs this product makes
-restrict nothing, the profile today is the explicit escape section 7 asks for, and a test builds the
-job that needs it.
+The other outcome is a choice, and it is somebody's to make. A launch whose profile records
+`ownership` as `reduced` starts that agent in a kill-on-close job of its own and not in the
+session's. The closure lists what that job holds by start identity and ends it, and reads its
+ownership coverage as incomplete, with the reason in the receipt. A worker that dies ends the agent
+too, since the worker holds the only handle to the job. The choice is no way past a restriction on
+the worker's own job, and it never switches the vendor's sandbox off. The `agents` section of the
+configuration document (see *Configuration*) is where the choice is written down for a package, and
+`kr doctor` reports it; the launch takes it from the profile it is given, and this host starts no
+agent through the worker's launch, so no edit to that section changes a launch on this host.
+Because the jobs this product makes restrict nothing, the profile today is the explicit escape
+section 7 asks for, and a test builds the job that needs it.
 
 The command route has no such profile: a program it starts runs in the shell's own job. A launcher
 whose job restricts desktops declines before it creates the program and says why to the backend,
@@ -5209,7 +5213,8 @@ interpreter, whose identity is not the program's. The path to the program and it
 joined into one command line by the one quoting rule this host writes every command line with, and
 the command line is never passed to a shell. The process is created suspended and put into two jobs
 by the creation itself: the session's job, which ends it with the session, and a job of its own,
-which lists everything it starts. The worker asks the kernel whether each job holds the process
+which lists everything it starts. An agent launched under reduced ownership is put into a job of its
+own alone, as *A vendor's own sandbox* says. The worker asks the kernel whether each job holds the process
 before its first instruction runs. The process receives three handles and no others: a pipe for its
 standard input, a pipe for its standard output, and the null device for its standard error. This
 host keeps the other ends of the pipes. The pipe ends are made inheritable only for the call that
