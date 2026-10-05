@@ -188,8 +188,8 @@ impl DesktopVoiceCall {
     ///
     /// # Errors
     ///
-    /// Returns `RESOURCE_UNAVAILABLE` on every call, until this end can negotiate a
-    /// connection.
+    /// Returns `PERMISSION_DENIED` once the call has been stopped, and `RESOURCE_UNAVAILABLE`
+    /// otherwise, until this end can negotiate a connection.
     pub async fn offer(&self) -> Result<String> {
         if self.is_stopped.load(Ordering::Relaxed) {
             return Err(CommandError::refused("the call has already been stopped"));
