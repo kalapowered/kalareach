@@ -107,5 +107,5 @@ pub mod workspace;
 
 pub use crate::error::{Diagnostic, ProjectError, Result};
 pub use crate::git::{Cancellation, ConfigurationAudit, GitProgram, RestrictedProfile};
-pub use crate::identity::{OpenedRepository, RepositoryIdentity};
+pub use crate::identity::{OpenedRepository, Renumbered, RepositoryIdentity};
 pub use crate::service::{ProjectService, Recovery};

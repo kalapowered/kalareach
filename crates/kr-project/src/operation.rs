@@ -544,7 +544,10 @@ pub(crate) fn remove_staging_directory(
     shown: &Path,
 ) -> Result<()> {
     let path = crate::git::redact(&shown.display().to_string());
-    if directory.identity() != expected {
+    // The recorded directory under another device number is the recorded one: it is on the
+    // filesystem of the directory it is in, which a mount over it is not. It is taken away next,
+    // so there is no record left to renumber.
+    if directory.check_recorded(expected).is_err() {
         return Err(ProjectError::IdentityChanged {
             detail: format!(
                 "this operation staged its content in {expected} and {path} now holds {}; nothing \

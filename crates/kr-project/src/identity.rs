@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::FilesystemIdentity;
 use kr_protocol::scalars::U64;
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity, RelativeName};
+use kr_transfer::{AuthorisedDirectory, IdentityCheck, ObjectIdentity, RelativeName};
 
 use crate::discovery::Discovered;
 use crate::error::{ProjectError, Result};
@@ -58,10 +58,29 @@ pub struct RepositoryIdentity {
     pub work_tree: ObjectIdentity,
 }
 
+/// A repository found on filesystems that are numbered differently from when its record was made.
+///
+/// A device number names one mounting of a filesystem and not the filesystem: a container's root
+/// filesystem comes back under another number when the container starts again after another has
+/// started. The record then carries numbers the repository no longer has, and whoever holds it
+/// replaces them with [`Self::now`], so that the numbers it carries are not taken for another
+/// filesystem's later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Renumbered {
+    /// The identities as the record carries them.
+    pub was: RepositoryIdentity,
+    /// The identities as the repository has them now.
+    pub now: RepositoryIdentity,
+}
+
 /// An opened repository: the handle, the identities and what its configuration named.
 #[derive(Debug)]
 pub struct OpenedRepository {
     work_tree: AuthorisedDirectory,
+    /// The working tree's top level, held open from the moment its identity was read: the object
+    /// [`RepositoryIdentity::work_tree`] names. [`Self::work_tree`] is the directory the repository
+    /// was opened through, which is a directory below the top when the caller named one.
+    top: AuthorisedDirectory,
     /// The administrative directory every worktree of this repository shares, held open from the
     /// moment its identity was read. A caller that has to account for this repository's own data
     /// works from this handle rather than resolving the path again: a path resolved a second time
@@ -166,6 +185,7 @@ impl OpenedRepository {
         audit.require_expressible()?;
         Ok(Self {
             work_tree,
+            top: tree,
             git_dir,
             own_dir,
             identity,
@@ -224,6 +244,7 @@ impl OpenedRepository {
             });
         }
         Ok(Self {
+            top: found.work_tree.try_clone()?,
             work_tree: found.work_tree,
             git_dir: found.common_dir,
             own_dir: found.git_dir,
@@ -244,7 +265,8 @@ impl OpenedRepository {
         self.admission.as_ref()
     }
 
-    /// Opens a working tree and requires it to be the object a record named.
+    /// Opens a working tree and requires it to be the object a record named, and says whether the
+    /// record carries device numbers the repository no longer has.
     ///
     /// # Errors
     ///
@@ -255,10 +277,10 @@ impl OpenedRepository {
         environment_id: EnvironmentId,
         path: &Path,
         expected: RepositoryIdentity,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<Renumbered>)> {
         let opened = Self::open(profile, environment_id, path)?;
-        opened.require_identity(expected)?;
-        Ok(opened)
+        let renumbered = opened.require_identity(expected)?;
+        Ok((opened, renumbered))
     }
 
     /// Refuses when this repository is not the object a record named.
@@ -267,36 +289,85 @@ impl OpenedRepository {
     /// A different repository at the recorded path, or a linked worktree standing in for the tree
     /// the record was made against, has a different identity and is refused rather than served.
     ///
+    /// Each directory is the recorded one by its inode. Under another device number it is still
+    /// the recorded one when it is on the filesystem of the directory it is in, which a mount over
+    /// it is not, and what comes back says which numbers to put in the record instead
+    /// ([`Renumbered`]); `None` says the record is as the repository is.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] naming what was recorded and what is there.
-    pub fn require_identity(&self, expected: RepositoryIdentity) -> Result<()> {
-        if self.identity.git_dir != expected.git_dir {
-            return Err(ProjectError::IdentityChanged {
+    pub fn require_identity(&self, expected: RepositoryIdentity) -> Result<Option<Renumbered>> {
+        let git_dir = self
+            .git_dir
+            .check_recorded(expected.git_dir)
+            .map_err(|_| self.git_dir_changed(expected))?;
+        let work_tree = self
+            .top
+            .check_recorded(expected.work_tree)
+            .map_err(|_| self.work_tree_changed(expected))?;
+        Ok(
+            (git_dir != IdentityCheck::AsRecorded || work_tree != IdentityCheck::AsRecorded)
+                .then_some(Renumbered {
+                    was: expected,
+                    now: self.identity,
+                }),
+        )
+    }
+
+    /// Refuses when what this repository is now is not what it was when it was opened.
+    ///
+    /// Both identities were read in this run, so they are compared as numbers: a device number
+    /// that differs within one run is another filesystem and never a renumbered one.
+    fn require_same(&self, now: RepositoryIdentity) -> Result<()> {
+        let changed = |what: &str, was: ObjectIdentity, found: ObjectIdentity| {
+            ProjectError::IdentityChanged {
                 detail: format!(
-                    "this record names the repository {}, and {} holds the repository {}; a \
-                     recorded identity is the object rather than the path, so nothing is served \
-                     from it",
-                    expected.git_dir,
-                    crate::git::redact(&self.top_level.display().to_string()),
-                    self.identity.git_dir
+                    "this repository was opened as the {what} {was}, and {} now holds the {what} \
+                     {found}; what the host read was read somewhere else",
+                    crate::git::redact(&self.top_level.display().to_string())
                 )
                 .into(),
-            });
+            }
+        };
+        if self.identity.git_dir != now.git_dir {
+            return Err(changed("repository", self.identity.git_dir, now.git_dir));
         }
-        if self.identity.work_tree != expected.work_tree {
-            return Err(ProjectError::IdentityChanged {
-                detail: format!(
-                    "this record names the working tree {}, and {} is the working tree {}; a \
-                     linked worktree is its own object and a record of one never covers another",
-                    expected.work_tree,
-                    crate::git::redact(&self.top_level.display().to_string()),
-                    self.identity.work_tree
-                )
-                .into(),
-            });
+        if self.identity.work_tree != now.work_tree {
+            return Err(changed(
+                "working tree",
+                self.identity.work_tree,
+                now.work_tree,
+            ));
         }
         Ok(())
+    }
+
+    fn git_dir_changed(&self, expected: RepositoryIdentity) -> ProjectError {
+        ProjectError::IdentityChanged {
+            detail: format!(
+                "this record names the repository {}, and {} holds the repository {}; a \
+                 recorded identity is the object rather than the path, so nothing is served \
+                 from it",
+                expected.git_dir,
+                crate::git::redact(&self.top_level.display().to_string()),
+                self.identity.git_dir
+            )
+            .into(),
+        }
+    }
+
+    fn work_tree_changed(&self, expected: RepositoryIdentity) -> ProjectError {
+        ProjectError::IdentityChanged {
+            detail: format!(
+                "this record names the working tree {}, and {} is the working tree {}; a \
+                 linked worktree is its own object and a record of one never covers another",
+                expected.work_tree,
+                crate::git::redact(&self.top_level.display().to_string()),
+                self.identity.work_tree
+            )
+            .into(),
+        }
     }
 
     /// Returns the working tree's authorised handle.
@@ -439,7 +510,7 @@ impl OpenedRepository {
                 }
             }
         };
-        self.require_identity(now)?;
+        self.require_same(now)?;
         let later = ConfigurationAudit::take(
             profile,
             &top_level,
@@ -740,6 +811,102 @@ mod tests {
                 .open_read(&witness, kr_transfer::ObjectPolicy::ReadableFile)
                 .is_err(),
             "and what took the name holds none of it"
+        );
+    }
+
+    /// A record of a repository on a filesystem numbered differently since is still the record of
+    /// it, and two readings taken in one run are not: within a run a device number that differs is
+    /// another filesystem, and never a renumbered one.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_under_another_device_number_is_the_repository_and_a_live_reading_is_not() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([10; 16]));
+        let checkout = root.path().join("project");
+        std::fs::create_dir_all(&checkout).expect("a directory for the checkout");
+        let profile = match RestrictedProfile::prepare(&root.path().join("profile"), environment_id)
+        {
+            Ok(profile) => profile,
+            Err(error) => {
+                println!("not exercised: this host has no Git to prepare a profile with: {error}");
+                return;
+            }
+        };
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["init", "--initial-branch=main"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(made.status.success(), "the repository is made");
+        let opened = OpenedRepository::open(&profile, environment_id, &checkout)
+            .expect("the repository opens");
+        let found = opened.identity();
+        let renumbered = |identity: ObjectIdentity| ObjectIdentity {
+            device: identity.device.wrapping_add(1),
+            file_id: identity.file_id,
+        };
+        let recorded = RepositoryIdentity {
+            git_dir: renumbered(found.git_dir),
+            work_tree: renumbered(found.work_tree),
+        };
+
+        // The record carries numbers the repository no longer has: it is still the repository.
+        assert_eq!(opened.require_identity(found).expect("as recorded"), None);
+        assert_eq!(
+            opened.require_identity(recorded).expect("renumbered"),
+            Some(Renumbered {
+                was: recorded,
+                now: found
+            })
+        );
+        // Another object is refused under either number.
+        let other = RepositoryIdentity {
+            git_dir: ObjectIdentity {
+                file_id: found.git_dir.file_id.wrapping_add(1),
+                ..recorded.git_dir
+            },
+            ..recorded
+        };
+        assert!(opened.require_identity(other).is_err());
+
+        // Two readings of one run are compared as numbers, each directory by itself.
+        opened.require_same(found).expect("the same reading");
+        assert!(opened.require_same(recorded).is_err());
+        assert!(
+            opened
+                .require_same(RepositoryIdentity {
+                    work_tree: recorded.work_tree,
+                    ..found
+                })
+                .is_err()
+        );
+        assert!(
+            opened
+                .require_same(RepositoryIdentity {
+                    git_dir: recorded.git_dir,
+                    ..found
+                })
+                .is_err()
+        );
+
+        // A repository opened through a directory below its top is the object its record names,
+        // whose identity is the top's, and not the directory it was opened through.
+        std::fs::create_dir(checkout.join("below")).expect("a directory in the working tree");
+        let below = OpenedRepository::open(&profile, environment_id, &checkout.join("below"))
+            .expect("the repository opens below its top");
+        assert_eq!(below.identity(), found);
+        assert_eq!(below.require_identity(found).expect("as recorded"), None);
+        assert_eq!(
+            below.require_identity(recorded).expect("renumbered"),
+            Some(Renumbered {
+                was: recorded,
+                now: found
+            })
         );
     }
 

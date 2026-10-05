@@ -39,6 +39,9 @@ working tree.
   from the record until the identity matches again.
 * A linked worktree is a new object with a new identity, so adding one creates a record rather than
   widening a grant that covers an existing one.
+* A directory under another device number, on the filesystem of the one above it, is the recorded
+  object by its inode, and a registered repository's record takes the number; any filesystem
+  giving it that inode is taken for it.
 
 Everything this host does to the filesystem itself goes through an open directory descriptor rather
 than a path: the same authority model the transfer service uses for a staging area and for a

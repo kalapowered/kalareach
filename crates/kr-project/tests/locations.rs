@@ -2357,6 +2357,214 @@ fn withdrawal_survives_a_restart_and_owner_cleanup_works() {
     assert!(names_in(&projects).is_empty(), "{:?}", names_in(&projects));
 }
 
+/// A repository registered on a filesystem that is numbered differently since, as a container's
+/// root filesystem is when the container starts again, is still the repository that was
+/// registered when its source is bound: the record takes the number the working tree has now, in
+/// the transaction that writes the binding. A working tree that is another object is refused under
+/// any number.
+#[cfg(unix)]
+#[test]
+fn a_repository_recorded_under_another_device_number_is_bound_to_the_source_that_reaches_it() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let sources = fixture.work().join("sources");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 140);
+    let project = adopt(&fixture, &sources, "repo", 141);
+    let work_tree_device = || -> i64 {
+        journal(&fixture)
+            .query_row("SELECT work_tree_device FROM projects", [], |row| {
+                row.get(0)
+            })
+            .expect("the repository's record reads")
+    };
+    let number = work_tree_device();
+
+    journal(&fixture)
+        .execute_batch("UPDATE projects SET work_tree_device = work_tree_device + 1;")
+        .expect("the record is rewritten");
+    attach(fixture.service(), &owner, project, source, 142)
+        .expect("the working tree is the registered one under its new number");
+    assert_eq!(
+        work_tree_device(),
+        number,
+        "the record takes the number the filesystem has now"
+    );
+
+    journal(&fixture)
+        .execute_batch(
+            "UPDATE projects SET work_tree_device = work_tree_device + 1,
+                                 work_tree_file_id = work_tree_file_id + 1;",
+        )
+        .expect("the record is rewritten");
+    let refusal = attach(fixture.service(), &owner, project, source, 143)
+        .expect_err("another working tree is not the registered one");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+}
+
+/// A repository registered on a filesystem that is numbered differently since, and bound to a
+/// source location, is still the registered one when it is cloned by registration and when a
+/// workspace is made of it through a location: each takes the numbers the repository has now into
+/// the record.
+#[cfg(unix)]
+#[test]
+fn a_bound_repository_recorded_under_other_device_numbers_is_cloned_from_and_worked_in() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 160);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        161,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        162,
+    );
+    let project = adopt(&fixture, &sources, "repo", 163);
+    attach(fixture.service(), &owner, project, source, 164).expect("the repository is bound");
+    let devices = || -> (i64, i64) {
+        journal(&fixture)
+            .query_row(
+                "SELECT git_dir_device, work_tree_device FROM projects
+                  WHERE project_repository_id = ?1",
+                rusqlite::params![bytes(project.get())],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the repository's record reads")
+    };
+    let numbers = devices();
+    let renumber = || {
+        journal(&fixture)
+            .execute_batch(
+                "UPDATE projects SET git_dir_device = git_dir_device + 1,
+                                     work_tree_device = work_tree_device + 2;",
+            )
+            .expect("the record is rewritten");
+    };
+
+    renumber();
+    clone_into(
+        fixture.service(),
+        through(environment, into, "copy"),
+        CloneSource::Registered {
+            project_repository_id: project,
+        },
+        165,
+    )
+    .expect("the repository is the registered one under its new numbers");
+    assert_eq!(devices(), numbers, "cloning by registration takes them in");
+
+    renumber();
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        false,
+        166,
+    )
+    .expect("a workspace of the registered repository is made through a location");
+    assert_eq!(devices(), numbers, "so does making a workspace of it");
+}
+
+/// The owner removes a workspace through its location, and the staging directory its row recorded,
+/// when the filesystem is numbered differently since the row was written: each is still the object
+/// the row recorded. A tree that is another object is not removed under any number, and the
+/// staging directory, which a removal takes first, is the recorded one under its other number.
+#[cfg(unix)]
+#[test]
+fn owner_cleanup_finds_what_the_journal_recorded_under_another_device_number() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 150);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        151,
+    );
+    let project = adopt(&fixture, &sources, "repo", 152);
+    attach(fixture.service(), &owner, project, source, 153).expect("the repository is bound");
+    let made = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "feature"),
+        false,
+        154,
+    )
+    .expect("the workspace is made through a location")
+    .workspace
+    .0
+    .expect("a workspace, not a preview");
+    // The workspace recorded a staging directory its materialisation could not take away.
+    let leftover = workspaces.join(".kr-project-leftover");
+    support::staging_directory(&leftover);
+    let identity = std::fs::metadata(&leftover).expect("its metadata");
+    let rewrite = |statement: &str, name: Option<&str>, device: i64, file_id: i64| {
+        journal(&fixture)
+            .execute(
+                statement,
+                rusqlite::params![bytes(made.workspace_id.get()), name, device, file_id],
+            )
+            .expect("the record is rewritten");
+    };
+    // What the row recorded was recorded under another number than the filesystem has now.
+    rewrite(
+        "UPDATE workspaces SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4,
+                              tree_device = tree_device + 1
+          WHERE workspace_id = ?1",
+        Some(".kr-project-leftover"),
+        std::os::unix::fs::MetadataExt::dev(&identity) as i64 + 1,
+        std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+    );
+    let remove = |seed: u8| {
+        fixture.service().workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: made.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(Some(made_in)),
+            },
+            Some(&action("workspace.remove", seed)),
+        )
+    };
+
+    // Another directory is not removed because its number moved as well as the recorded one's.
+    journal(&fixture)
+        .execute(
+            "UPDATE workspaces SET tree_file_id = tree_file_id + 1 WHERE workspace_id = ?1",
+            rusqlite::params![bytes(made.workspace_id.get())],
+        )
+        .expect("the record is rewritten");
+    let refusal = remove(155).expect_err("another directory is not the recorded tree");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(workspaces.join("feature/src/lib.rs").is_file());
+    // The staging directory is taken away before the tree is looked at, so this call took it,
+    // recorded under another number as it was.
+    support::assert_absent(&leftover, "the workspace's staging directory");
+
+    journal(&fixture)
+        .execute(
+            "UPDATE workspaces SET tree_file_id = tree_file_id - 1 WHERE workspace_id = ?1",
+            rusqlite::params![bytes(made.workspace_id.get())],
+        )
+        .expect("the record is rewritten");
+    let removed = remove(156).expect("the tree and its staging directory are the recorded ones");
+    assert!(removed.working_files_removed);
+    support::assert_absent(&workspaces.join("feature"), "the removed workspace");
+}
+
 #[test]
 fn a_workspace_whose_tree_was_never_made_is_removed_through_a_location_the_owner_names() {
     // The destination is withdrawn as a workspace's clone ends, so its tree is never made and the
