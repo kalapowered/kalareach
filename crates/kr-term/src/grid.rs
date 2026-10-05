@@ -1199,11 +1199,11 @@ impl CanonicalGrid {
     /// all the same size, which is the usual case. Nothing is walked and no cell is read: every one
     /// of those figures was taken where its row left the screen.
     ///
-    /// The room left under the bound reduces how often a history that is full needs a pass: with
-    /// the count put back, the next row would otherwise be over the bound again, and a session
-    /// printing steadily would pay for a pass, the library's eviction and a diagnostic on every
-    /// line. Rows that cost more than the room still bring a pass each, and a bound under thirty-two
-    /// bytes leaves none.
+    /// The slack a pass leaves under the bound reduces how often a history that is full needs a
+    /// pass: with the count put back, the next row would otherwise be over the bound again, and a
+    /// session printing steadily would pay for a pass, the library's eviction and a diagnostic on
+    /// every line. Rows that cost more than the space a pass left free still bring a pass each, and
+    /// a bound under thirty-two bytes sets no slack aside.
     pub fn enforce_row_cache(&mut self, limit: u64) -> bool {
         if self.history.total <= limit {
             return false;
