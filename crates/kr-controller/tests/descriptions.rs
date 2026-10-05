@@ -2070,6 +2070,409 @@ async fn a_command_that_has_ended_is_not_the_active_application() {
     environment.stop().await;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Summaries of what changed since a visit (KR-REQ-18.02)
+// ---------------------------------------------------------------------------------------------
+
+/// A turn that completed in a session, with the change set it captured, as the daemon's own
+/// producers record one: two changes in the session's log, each in the host's own words.
+fn completed_turn(
+    session_id: SessionId,
+    sequence: u64,
+    at_ms: u64,
+    words: &str,
+) -> kr_attention::SourceEvent {
+    kr_attention::SourceEvent::new(
+        kr_attention::EventCursor::new(kr_protocol::attention::AttentionSource::Semantic, sequence),
+        TimestampMs::new(at_ms),
+        kr_attention::EventKind::TurnCompleted {
+            session_id,
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+            version: sequence,
+            change_set: Some((
+                kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([5; 16])),
+                sequence,
+            )),
+            summary: words.to_owned(),
+        },
+    )
+}
+
+impl Environment {
+    /// Records events in the daemon's attention store, as the daemon's own producers do.
+    fn record(&self, events: &[kr_attention::SourceEvent]) {
+        self.controller()
+            .attention()
+            .observe(events)
+            .expect("the store records the events");
+    }
+
+    /// Reads what changed in a session since the owner's last visit, asking for a summary or not.
+    async fn changed(
+        &self,
+        session_id: SessionId,
+        summarise: bool,
+    ) -> kr_protocol::attention::VisitChangedResult {
+        let mut client = self.host.client().await;
+        client
+            .request(
+                Method::VisitChanged,
+                &kr_protocol::attention::VisitChangedParams {
+                    session_id,
+                    max_changes: U64::new(50),
+                    summarise,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the changed view is served")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Asks for a summary, as a person polls, until `holds` says the answer is the one waited for.
+    async fn changed_until(
+        &self,
+        what: &str,
+        session_id: SessionId,
+        holds: impl Fn(&kr_protocol::attention::VisitChangedResult) -> bool,
+    ) -> kr_protocol::attention::VisitChangedResult {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let changed = self.changed(session_id, true).await;
+            if holds(&changed) {
+                return changed;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen: {changed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Records that the owner has seen a session's changes up to a cursor.
+    async fn acknowledge_visit(&self, session_id: SessionId, cursor: u64) {
+        let mut client = self.host.client().await;
+        client
+            .mutate(
+                Method::VisitAcknowledge,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.environment_id()),
+                &kr_protocol::attention::VisitAcknowledgeParams {
+                    session_id,
+                    acknowledged_cursor: U64::new(cursor),
+                    views: Vec::new(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the visit is recorded");
+    }
+
+    /// Waits until the description host has taken what was posted to it, so that what it was not
+    /// asked for is in its figures.
+    async fn until_host_has_taken_what_was_posted(&self) {
+        self.controller()
+            .descriptions()
+            .until_host_has_taken_what_was_posted()
+            .await;
+    }
+
+    /// How many summaries the store holds, read from its file.
+    fn summaries_held(&self) -> i64 {
+        rusqlite::Connection::open(self.state_dir.join("descriptions.sqlite3"))
+            .expect("the store's file opens")
+            .query_row("SELECT COUNT(*) FROM describe_summaries", [], |row| {
+                row.get(0)
+            })
+            .expect("a count")
+    }
+}
+
+/// KR-REQ-18.02: changes since a visit are derived from the host's events, and a summary of them
+/// is asked for with `summarise`, written by the model in the process, and served beside them and
+/// never among them. The answer to the first ask does not wait for the model; asking again is how
+/// a person polls, and it restarts nothing. A session that goes on changing is answered with the
+/// summary that was written, the interval it covers named, beside the newer changes; past the
+/// cadence the interval from the same first cursor to the head is written again; and the first
+/// cursor moves only with the person's own visit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summary_asked_for_is_written_by_the_model_and_served_beside_the_changes_it_covers() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let at = kr_ipc::now_ms().get();
+    environment.record(&[
+        completed_turn(session_id, 1, at, "rewrote the parser"),
+        completed_turn(session_id, 2, at + 10, "added the tests"),
+        completed_turn(session_id, 3, at + 20, "fixed the lints"),
+    ]);
+
+    // Reading what changed without asking for a summary starts nothing.
+    let plain = environment.changed(session_id, false).await;
+    assert_eq!(
+        plain.changes.len(),
+        6,
+        "a turn and its change set, three times"
+    );
+    assert!(plain.summary.0.is_none());
+    environment.until_host_has_taken_what_was_posted().await;
+    assert_eq!(environment.figures().jobs.summary_asks, 0);
+
+    // The answer to the ask carries the changes and no summary: none has been written, and it does
+    // not wait for the model. A person who asks again is answered with it once it is.
+    let asked = environment.changed(session_id, true).await;
+    assert_eq!(asked.changes.len(), 6);
+    assert!(asked.summary.0.is_none());
+    let written = environment
+        .changed_until("the summary", session_id, |changed| {
+            changed.summary.0.is_some()
+        })
+        .await;
+    let summary = written.summary.0.clone().expect("a summary");
+    assert_eq!(
+        (summary.from_cursor.get(), summary.to_cursor.get()),
+        (0, 6),
+        "the interval it covers: from the first cursor not acknowledged to the head"
+    );
+    assert_eq!(
+        (summary.from_ms.get(), summary.to_ms.get()),
+        (at, at + 20),
+        "from the first change in it to the last"
+    );
+    assert_eq!(summary.model, "tiny-default@1");
+    assert!(summary.text.starts_with("6 changes:"), "{}", summary.text);
+    assert!(
+        summary.text.contains("rewrote the parser") && summary.text.contains("fixed the lints"),
+        "the model was shown the host's words for the changes: {}",
+        summary.text
+    );
+    assert_eq!(
+        written.changes.len(),
+        6,
+        "beside the changes, which are what they were"
+    );
+    assert!(
+        written.changes.iter().all(|change| change
+            .summary
+            .0
+            .as_deref()
+            .is_none_or(|words| !words.contains("changes:"))),
+        "and never among them"
+    );
+    let counts = environment.figures().jobs;
+    assert_eq!(counts.summarised, 1);
+    assert_eq!(
+        counts.published, 0,
+        "no description was written: a summary is not one"
+    );
+    assert_eq!(
+        environment.describe(session_id).await.source,
+        LabelSource::Metadata,
+        "and it names nothing"
+    );
+
+    // Asking again restarts nothing: what is held reaches the head.
+    let asks = environment.figures().jobs.summary_asks;
+    for _ in 0..3 {
+        assert!(
+            environment
+                .changed(session_id, true)
+                .await
+                .summary
+                .0
+                .is_some()
+        );
+    }
+    environment.until_host_has_taken_what_was_posted().await;
+    assert_eq!(environment.figures().jobs.summary_asks, asks);
+
+    // The session goes on changing. The answer is the summary that was written, with the interval
+    // it covers, beside every change since the first cursor; and one younger than the cadence is
+    // not written again.
+    environment.record(&[completed_turn(session_id, 4, at + 30, "wrote the docs")]);
+    let prefix = environment.changed(session_id, true).await;
+    assert_eq!(prefix.changes.len(), 8);
+    assert_eq!(prefix.to_cursor, U64::new(8));
+    let held = prefix.summary.0.expect("the completed prefix");
+    assert_eq!((held.from_cursor.get(), held.to_cursor.get()), (0, 6));
+    environment.until_host_has_taken_what_was_posted().await;
+    assert_eq!(environment.figures().jobs.summary_asks, asks);
+
+    // Past the cadence it is written again, from the same first cursor to the head.
+    let cadence = environment.describe(session_id).await.cadence_ms.get();
+    environment.placed.advance(cadence + 1);
+    let refreshed = environment
+        .changed_until("the refreshed summary", session_id, |changed| {
+            changed
+                .summary
+                .0
+                .as_ref()
+                .is_some_and(|summary| summary.to_cursor.get() == 8)
+        })
+        .await;
+    let summary = refreshed.summary.0.expect("a summary");
+    assert_eq!(summary.from_cursor.get(), 0, "never the tail alone");
+    assert!(summary.text.starts_with("8 changes:"), "{}", summary.text);
+    assert_eq!(environment.figures().jobs.summarised, 2);
+    assert_eq!(environment.summaries_held(), 2, "both are kept");
+
+    // The first cursor moves only with the person's own visit. Having seen everything, there is
+    // nothing to summarise; what comes after is another interval, with its own first cursor.
+    environment.acknowledge_visit(session_id, 8).await;
+    let nothing = environment.changed(session_id, true).await;
+    assert!(nothing.changes.is_empty() && nothing.summary.0.is_none());
+    environment.record(&[completed_turn(session_id, 5, at + 40, "tagged the release")]);
+    environment.placed.advance(cadence + 1);
+    let after = environment
+        .changed_until(
+            "a summary of what came after the visit",
+            session_id,
+            |changed| changed.summary.0.is_some(),
+        )
+        .await;
+    let summary = after.summary.0.expect("a summary");
+    assert_eq!(
+        (summary.from_cursor.get(), summary.to_cursor.get()),
+        (8, 10)
+    );
+    assert!(summary.text.starts_with("2 changes:"), "{}", summary.text);
+    environment.stop().await;
+}
+
+/// KR-REQ-18.02: a summary is written from every change in an interval, so it is served only to a
+/// grant whose history reaches back to the first of them, and asked for by none that does not.
+/// The owner's is written and a grant that starts at the first change is served the same
+/// summary; one that starts after it, and one with no history, are served none and ask for
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summary_is_served_to_a_grant_that_reaches_the_first_change_and_to_none_that_does_not() {
+    use kr_controller::attention::Caller;
+    use kr_protocol::envelope::ParamsValue;
+    use kr_protocol::method::MethodVersion;
+
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let at = kr_ipc::now_ms().get();
+    environment.record(&[
+        completed_turn(session_id, 1, at, "rewrote the parser"),
+        completed_turn(session_id, 2, at + 10, "added the tests"),
+    ]);
+    let controller = Arc::clone(environment.controller());
+    let reach = controller.attention_reach();
+    let actor = kr_protocol::ids::ActorId::new("test:device").expect("an actor");
+    let read_as = |caller: Caller| {
+        let controller = Arc::clone(&controller);
+        let reach = Arc::clone(&reach);
+        let actor = actor.clone();
+        async move {
+            let result: kr_protocol::attention::VisitChangedResult = controller
+                .attention()
+                .read(
+                    reach.as_ref(),
+                    &caller,
+                    &actor,
+                    &kr_protocol::envelope::Request {
+                        request_id: RequestId::new(7),
+                        method: Method::VisitChanged.into(),
+                        method_version: MethodVersion::V1,
+                        params: ParamsValue::from_typed(
+                            &kr_protocol::attention::VisitChangedParams {
+                                session_id,
+                                max_changes: U64::new(50),
+                                summarise: true,
+                            },
+                        )
+                        .expect("encodes"),
+                    },
+                )
+                .await
+                .expect("the changed view is served")
+                .to_typed()
+                .expect("decodes");
+            result
+        }
+    };
+    let no_history = {
+        let mut grant = voice_grant(0);
+        grant.history.lower_bound_ms = Nullable::null();
+        grant
+    };
+
+    // A grant that starts after the first change is served the changes and none of the summary,
+    // and so is one that retains no history; neither asks for one.
+    for grant in [voice_grant(at + 1), no_history.clone()] {
+        let served = read_as(Caller::device(&grant)).await;
+        assert_eq!(served.changes.len(), 4);
+        assert!(served.summary.0.is_none());
+    }
+    environment.until_host_has_taken_what_was_posted().await;
+    assert_eq!(
+        environment.figures().jobs.summary_asks,
+        0,
+        "a grant that does not reach the changes starts no job"
+    );
+
+    // The owner's is written, and a grant that starts at the first change is served it: the same
+    // summary, with the same provenance. The grants that do not reach it are still served none.
+    let written = environment
+        .changed_until("the summary", session_id, |changed| {
+            changed.summary.0.is_some()
+        })
+        .await
+        .summary
+        .0
+        .expect("a summary");
+    let reaching = read_as(Caller::device(&voice_grant(at))).await;
+    assert_eq!(reaching.summary.0.as_ref(), Some(&written));
+    for grant in [voice_grant(at + 1), no_history] {
+        assert!(read_as(Caller::device(&grant)).await.summary.0.is_none());
+    }
+    environment.stop().await;
+}
+
+/// KR-REQ-18.02 and KR-REQ-24.11: privacy mode removes the summaries with the descriptions: none is
+/// answered while it is on, and none that was written before it is answered after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_removes_the_summaries_and_none_returns_after_it() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+    let at = kr_ipc::now_ms().get();
+    environment.record(&[completed_turn(session_id, 1, at, "rewrote the parser")]);
+    environment
+        .changed_until("the summary", session_id, |changed| {
+            changed.summary.0.is_some()
+        })
+        .await;
+    assert_eq!(environment.summaries_held(), 1);
+
+    environment.privacy(true).await;
+    environment.until_privacy_settled().await;
+    assert_eq!(environment.summaries_held(), 0, "removed with the rest");
+    assert!(
+        environment
+            .changed(session_id, true)
+            .await
+            .summary
+            .0
+            .is_none(),
+        "and none is answered while it is on"
+    );
+    environment.privacy(false).await;
+    environment.until_privacy_settled().await;
+    assert!(
+        environment
+            .changed(session_id, true)
+            .await
+            .summary
+            .0
+            .is_none(),
+        "and none returns after it"
+    );
+    assert_eq!(environment.summaries_held(), 0);
+    environment.stop().await;
+}
+
 /// KR-REQ-22.01, KR-REQ-22.03: a host whose processor lacks an instruction set the description
 /// process's build uses offers no model and starts no process. Setup, the refusal of a fetch,
 /// `kr doctor` and the session's description each say so and name the sets, and the session keeps

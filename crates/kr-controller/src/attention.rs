@@ -61,12 +61,13 @@ use std::time::Duration;
 use kr_attention::host::{ActionKey, Answer as Answered, Mutation, Performed};
 use kr_attention::{
     Attention, Claimant, Content, DeviceScope, EventCursor, EventKind, HostReading, Liveness,
-    Origin, SourceEvent, Viewer,
+    Origin, SourceEvent, Text, Viewer,
 };
 use kr_automation::store::{ATTENTION_CONSUMER, ATTENTION_EVENTS};
 use kr_automation::{AttentionOutboxRecord, AttentionSubject, JournalEvent, WorkflowStore};
 use kr_ipc::client::LocalClient;
 use kr_ipc::framed::CheckedWrite;
+use kr_protocol::attention::ChangeSummary;
 use kr_protocol::attention::{
     AttentionAcknowledgeParams, AttentionAutomationSubject, AttentionBarrier,
     AttentionBarrierAcknowledged, AttentionHostRecord, AttentionQuestionRecord,
@@ -175,6 +176,9 @@ pub enum Caller {
         host_manage: bool,
         /// The sessions the grant's selector admits.
         sessions: kr_protocol::grant::SessionSelector,
+        /// How far back the grant's history reaches: the moment it starts at, when it has one. A
+        /// grant with no lower bound retains no history.
+        history_lower_bound_ms: Option<TimestampMs>,
     },
 }
 
@@ -188,6 +192,24 @@ impl Caller {
             automation_manage: grant.permits(kr_protocol::rights::ActionRight::AutomationManage),
             host_manage: grant.permits(kr_protocol::rights::ActionRight::HostManage),
             sessions: grant.session_selector.clone(),
+            history_lower_bound_ms: grant.history.lower_bound_ms.0,
+        }
+    }
+
+    /// Whether this caller's authority reaches back to a moment in a session's history: the
+    /// owner's always does, and a paired device's does when its grant's history starts at or before
+    /// it. A grant with no lower bound retains no history and reaches none.
+    ///
+    /// A summary is written from every change in an interval and says things about all of them, so
+    /// it is served only to a caller that reaches back to the first of them.
+    #[must_use]
+    pub fn reaches_back_to(&self, at_ms: u64) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Device {
+                history_lower_bound_ms,
+                ..
+            } => history_lower_bound_ms.is_some_and(|bound| bound.get() <= at_ms),
         }
     }
 
@@ -213,6 +235,7 @@ impl Caller {
                 automation_manage,
                 host_manage,
                 sessions,
+                history_lower_bound_ms: _,
             } => {
                 let admits = |session_id: SessionId| sessions.admits(session_id);
                 with(&Viewer::Device(DeviceScope {
@@ -353,6 +376,28 @@ struct TicketEntry {
 }
 
 impl Ticket {
+    /// Returns the privacy generation the text read from one session's worker was decided under:
+    /// none when no text was read, and an error when a worker did not say which, or answered under
+    /// more than one, so that nothing can be said of the text's generation.
+    fn generation_of(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<Option<kr_worker::privacy::PrivacyGeneration>, ()> {
+        let mut found: Option<u64> = None;
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.session_id == session_id)
+        {
+            let generation = entry.generation.ok_or(())?;
+            if found.is_some_and(|earlier| earlier != generation) {
+                return Err(());
+            }
+            found = Some(generation);
+        }
+        Ok(found.map(kr_worker::privacy::PrivacyGeneration::new))
+    }
+
     /// Returns true when the ticket names no text that needs a check.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -487,6 +532,9 @@ pub struct AttentionModule {
     /// The privacy state every announcement the store decides is stamped with, once the daemon has
     /// attached it.
     privacy: std::sync::OnceLock<crate::privacy::PrivacyState>,
+    /// The session names and descriptions module, which keeps the summaries a read of what
+    /// changed asks for, once the daemon has attached it.
+    descriptions: std::sync::OnceLock<Arc<crate::describe::DescribeModule>>,
     /// Whether the last pass over the workflow journal stopped short, so a failure that persists is
     /// reported once rather than at every pass.
     automation_failing: AtomicBool,
@@ -602,6 +650,7 @@ impl AttentionModule {
             automation_pass: std::sync::Mutex::new(()),
             automation_started: std::sync::OnceLock::new(),
             privacy: std::sync::OnceLock::new(),
+            descriptions: std::sync::OnceLock::new(),
             automation_failing: AtomicBool::new(false),
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
@@ -691,6 +740,13 @@ impl AttentionModule {
     /// it. Attached once, before the store decides anything; a second call changes nothing.
     pub fn attach_privacy(&self, state: crate::privacy::PrivacyState) {
         let _ = self.privacy.set(state);
+    }
+
+    /// Hands the module the descriptions module, which keeps the summaries a read of what changed
+    /// since a visit is answered with and the host that writes them. Attached once; a second call
+    /// changes nothing. Without it a read that asks for a summary is answered without one.
+    pub(crate) fn attach_descriptions(&self, descriptions: Arc<crate::describe::DescribeModule>) {
+        let _ = self.descriptions.set(descriptions);
     }
 
     /// Runs one pass that may decide announcements, under a reading that carries the privacy state
@@ -1142,12 +1198,116 @@ impl AttentionModule {
                         change.summary = Nullable(text);
                     }
                 }
+                // Beside the changes and never among them. The answer that withholds session
+                // text carries no summary: one is generated text, written from it.
+                if params.summarise {
+                    result.summary = self.summary(reach, caller, actor, params.session_id).await;
+                }
                 Ok(Read::with(encode(&result)?, withheld, ticket))
             }
             _ => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 format!("{} is not a read this group serves", method.as_str()),
             )),
+        }
+    }
+
+    /// Answers a read that asked for a summary of what changed since the actor's last visit: the
+    /// newest one written for the interval from the cursor the actor has acknowledged, and, when a
+    /// newer one is wanted, the request for it.
+    ///
+    /// The answer does not wait for a model. It is the summary the description host has already
+    /// written, held under the profile it selected and the privacy generation in force, to a
+    /// caller whose grant reaches back to the first change in it, and nothing when there is none,
+    /// when no model runs here and when privacy mode is on. A request for one that is wanted is
+    /// made only for a caller whose grant reaches back to the first change in the interval now, so
+    /// a grant that does not reach it starts nothing the answer to it could not show.
+    async fn summary(
+        &self,
+        reach: &dyn Reach,
+        caller: &Caller,
+        actor: &ActorId,
+        session_id: SessionId,
+    ) -> Nullable<ChangeSummary> {
+        let (Some(descriptions), Some(privacy)) = (
+            self.descriptions.get().map(Arc::clone),
+            self.privacy.get().cloned(),
+        ) else {
+            return Nullable::null();
+        };
+        let Ok(source) = self
+            .store()
+            .and_then(|store| store.summary_source(actor, session_id).map_err(refusal))
+        else {
+            return Nullable::null();
+        };
+        let Some(first) = source.changes.first() else {
+            return Nullable::null();
+        };
+        if !caller.reaches_back_to(first.at_ms.get()) {
+            return Nullable::null();
+        }
+        let (first_cursor, head) = (source.from_cursor, source.head);
+        let reading = {
+            let descriptions = Arc::clone(&descriptions);
+            // Decided under the privacy state's read side, which waits behind a change of privacy
+            // mode, so on a thread that may wait.
+            match tokio::task::spawn_blocking(move || {
+                descriptions.summary_reading(session_id, first_cursor, head, &privacy)
+            })
+            .await
+            {
+                Ok(Ok(reading)) => reading,
+                _ => return Nullable::null(),
+            }
+        };
+        if reading.wanted {
+            self.ask_for_summary(reach, &descriptions, session_id, &source)
+                .await;
+        }
+        Nullable(
+            reading
+                .served
+                .filter(|record| caller.reaches_back_to(record.from_ms))
+                .map(|record| ChangeSummary {
+                    text: record.text.as_str().to_owned(),
+                    from_cursor: U64::new(record.cursor.from),
+                    to_cursor: U64::new(record.cursor.to),
+                    from_ms: TimestampMs::new(record.from_ms),
+                    to_ms: TimestampMs::new(record.to_ms),
+                    model: format!("{}@{}", record.profile_id, record.profile_revision.get()),
+                }),
+        )
+    }
+
+    /// Asks the description host for a summary of the changes in a frozen interval.
+    ///
+    /// The text of the newest changes is read from its owner as a read of them is, and what is
+    /// carried to the host is the generation that text was decided under: a host that finds
+    /// privacy mode has moved since refuses the request. Nothing here is released to anybody.
+    async fn ask_for_summary(
+        &self,
+        reach: &dyn Reach,
+        descriptions: &crate::describe::DescribeModule,
+        session_id: SessionId,
+        source: &kr_attention::visit::SummarySource,
+    ) {
+        let newest = newest_changes(source);
+        let records: Vec<(usize, EventCursor)> = newest
+            .iter()
+            .enumerate()
+            .filter_map(|(index, change)| change.text.record().map(|record| (index, record)))
+            .collect();
+        let (texts, ticket) = self.texts(reach, &records).await;
+        let Ok(generation) = ticket.generation_of(session_id) else {
+            return;
+        };
+        let read: BTreeMap<usize, String> = texts
+            .into_iter()
+            .filter_map(|(index, text)| text.map(|text| (index, text)))
+            .collect();
+        if let Some(ask) = summary_ask(session_id, source, &read, generation) {
+            descriptions.ask_summary(ask);
         }
     }
 
@@ -2848,6 +3008,57 @@ impl Link {
 
 // ----- Translation -----------------------------------------------------------------------------
 
+/// The changes a summary job is built from: the newest the request may carry.
+fn newest_changes(source: &kr_attention::visit::SummarySource) -> &[kr_attention::visit::Change] {
+    let skipped = source
+        .changes
+        .len()
+        .saturating_sub(kr_describe::summary::MAX_SUMMARY_CHANGES);
+    &source.changes[skipped..]
+}
+
+/// Builds the request for a summary of the changes in `source`.
+///
+/// The interval is the whole of what was frozen: from the cursor the actor had acknowledged to the
+/// cursor the log had reached, and the moments of its first and last change are those of the
+/// changes the log retains in it, so a grant is held to the oldest of them even when the newest are
+/// all the job reads. Each of the newest changes carries the host's own words, or the text read
+/// for it from its session; a change whose text was not read carries none. `read` is indexed by
+/// the change's place among the newest.
+fn summary_ask(
+    session_id: SessionId,
+    source: &kr_attention::visit::SummarySource,
+    read: &BTreeMap<usize, String>,
+    generation: Option<kr_worker::privacy::PrivacyGeneration>,
+) -> Option<kr_describe::summary::SummaryAsk> {
+    use kr_describe::context::{CursorInterval, ProjectText};
+    use kr_describe::summary::{SummaryAsk, SummaryChange};
+
+    let first = source.changes.first()?;
+    let last = source.changes.last()?;
+    let changes: Vec<SummaryChange> = newest_changes(source)
+        .iter()
+        .enumerate()
+        .map(|(index, change)| SummaryChange {
+            cursor: change.cursor,
+            kind: change.kind.as_str(),
+            at_ms: change.at_ms.get(),
+            text: match &change.text {
+                Text::Host(words) => ProjectText::new(words),
+                Text::Record(_) => read.get(&index).and_then(|text| ProjectText::new(text)),
+            },
+        })
+        .collect();
+    SummaryAsk::new(
+        session_id,
+        CursorInterval::new(source.from_cursor, source.head),
+        first.at_ms.get(),
+        last.at_ms.get(),
+        generation,
+        changes,
+    )
+}
+
 /// Turns one page's records into the typed events the store reads, in each source's order.
 #[must_use]
 pub fn events_of(session_id: SessionId, page: &AttentionSourcePage) -> Vec<SourceEvent> {
@@ -3327,6 +3538,160 @@ mod tests {
             host_event(session, &record(Some(warning), true, None)).kind,
             EventKind::ApplicationNotice { .. }
         ));
+    }
+
+    /// KR-REQ-18.02: the request for a summary is for the whole interval that was frozen and reads
+    /// the newest changes only. Its first and last moments are those of every change the log
+    /// retains in it, so a grant is held to the oldest even when the newest are all the job
+    /// reads; each change carries the host's own words or the text read for it, and one whose
+    /// text was not read carries none.
+    #[test]
+    fn a_summary_request_is_for_the_whole_interval_and_reads_the_newest_changes() {
+        use kr_attention::visit::{Change, SummarySource};
+        use kr_protocol::attention::SemanticChangeKind;
+
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let changes: Vec<Change> = (3..80_u64)
+            .map(|cursor| Change {
+                cursor,
+                kind: SemanticChangeKind::CommandCompleted,
+                session_id: session,
+                text: if cursor % 2 == 0 {
+                    Text::Host(format!("words {cursor}"))
+                } else {
+                    Text::Record(EventCursor::in_session(
+                        session,
+                        AttentionSource::HostEvents,
+                        cursor,
+                    ))
+                },
+                at_ms: TimestampMs::new(1_000 + cursor),
+            })
+            .collect();
+        let source = SummarySource {
+            from_cursor: 3,
+            head: 80,
+            changes,
+        };
+        let newest = newest_changes(&source);
+        assert_eq!(newest.len(), kr_describe::summary::MAX_SUMMARY_CHANGES);
+        assert_eq!(newest.last().map(|change| change.cursor), Some(79));
+        // The text was read for the third newest record and for no other.
+        let record_index = newest
+            .iter()
+            .position(|change| change.cursor == 77)
+            .expect("a record among the newest");
+        let read = BTreeMap::from([(record_index, "read from the worker".to_owned())]);
+        let generation = Some(kr_worker::privacy::PrivacyGeneration::new(4));
+        let ask = summary_ask(session, &source, &read, generation).expect("a request");
+
+        assert_eq!(
+            (ask.interval.from, ask.interval.to),
+            (3, 80),
+            "the whole of what was frozen"
+        );
+        assert_eq!(
+            (ask.from_ms, ask.to_ms),
+            (1_003, 1_079),
+            "the moments of the first and last retained change, though the job reads the newest"
+        );
+        assert_eq!(ask.generation, generation);
+        assert_eq!(ask.changes.len(), kr_describe::summary::MAX_SUMMARY_CHANGES);
+        let text_of = |cursor: u64| {
+            ask.changes
+                .iter()
+                .find(|change| change.cursor == cursor)
+                .and_then(|change| change.text.as_ref().map(|text| text.as_str().to_owned()))
+        };
+        assert_eq!(
+            text_of(78).as_deref(),
+            Some("words 78"),
+            "the host's own words"
+        );
+        assert_eq!(
+            text_of(77).as_deref(),
+            Some("read from the worker"),
+            "the text read for the change"
+        );
+        assert_eq!(
+            text_of(79),
+            None,
+            "a text that was not read is not guessed at"
+        );
+        assert_eq!(
+            ask.changes
+                .iter()
+                .find(|change| change.cursor == 78)
+                .map(|change| change.kind),
+            Some("command_completed")
+        );
+        let empty = SummarySource {
+            from_cursor: 3,
+            head: 3,
+            changes: Vec::new(),
+        };
+        assert!(summary_ask(session, &empty, &BTreeMap::new(), None).is_none());
+    }
+
+    /// KR-REQ-18.02 and KR-REQ-24.11: what text was read for a summary is bound to the generation
+    /// the worker decided it under, and a worker that did not say which, or answered under two,
+    /// leaves nothing to bind it to: the request is not made.
+    #[test]
+    fn the_generation_text_was_read_under_is_one_the_worker_named() {
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let elsewhere = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
+        let entry = |session_id: SessionId, generation: Option<u64>| TicketEntry {
+            session_id,
+            generation,
+            release_until: 0,
+        };
+        let ticket = |entries: Vec<TicketEntry>| Ticket { entries };
+        let named = |generation: u64| Some(kr_worker::privacy::PrivacyGeneration::new(generation));
+        assert_eq!(ticket(Vec::new()).generation_of(session), Ok(None));
+        assert_eq!(
+            ticket(vec![entry(session, Some(4))]).generation_of(session),
+            Ok(named(4))
+        );
+        assert_eq!(
+            ticket(vec![entry(session, Some(4)), entry(session, Some(4))]).generation_of(session),
+            Ok(named(4)),
+            "two batches under one generation"
+        );
+        assert_eq!(
+            ticket(vec![entry(session, Some(4)), entry(session, Some(5))]).generation_of(session),
+            Err(())
+        );
+        assert_eq!(
+            ticket(vec![entry(session, None)]).generation_of(session),
+            Err(()),
+            "an answer that does not say"
+        );
+        assert_eq!(
+            ticket(vec![entry(elsewhere, None)]).generation_of(session),
+            Ok(None),
+            "another session's answers are its own"
+        );
+    }
+
+    /// KR-REQ-18.02: a summary is written from every change in an interval, so it is served only to
+    /// a caller whose authority reaches back to the first of them: the owner's always does, a
+    /// paired device's when its grant's history starts at or before it, and a grant with no lower
+    /// bound retains no history and reaches none.
+    #[test]
+    fn a_summary_is_for_a_caller_whose_history_reaches_the_first_change() {
+        let device = |history_lower_bound_ms: Option<u64>| Caller::Device {
+            grant_id: GrantId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            session_view: true,
+            automation_manage: false,
+            host_manage: false,
+            sessions: kr_protocol::grant::SessionSelector::Any,
+            history_lower_bound_ms: history_lower_bound_ms.map(TimestampMs::new),
+        };
+        assert!(Caller::Owner.reaches_back_to(0));
+        assert!(device(Some(1_000)).reaches_back_to(1_000), "at the moment");
+        assert!(device(Some(900)).reaches_back_to(1_000), "before it");
+        assert!(!device(Some(1_001)).reaches_back_to(1_000), "after it");
+        assert!(!device(None).reaches_back_to(1_000), "no history at all");
     }
 
     /// A reach that connects to nothing and answers a closure as the test says.

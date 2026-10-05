@@ -48,6 +48,7 @@ use kr_describe::service::{
     DescriptionService, DownloadProgress, Handles, HostPlacement, PublicationGate,
 };
 use kr_describe::store::DescriptionStore;
+use kr_describe::summary::SummaryAsk;
 use kr_describe::supervise::{Check, Checked, Driver, Launch, Report, Waker};
 use kr_describe::time::Reading;
 use kr_describe::wire::VerifyResult;
@@ -99,6 +100,8 @@ enum Message {
     Turned {
         done: tokio::sync::oneshot::Sender<()>,
     },
+    /// A summary of a session's changes was asked for, in the interval it names.
+    Summarise { ask: Box<SummaryAsk> },
     /// Forget everything held in memory, and answer when it is done.
     Purge { done: SyncSender<()> },
     /// Something the host reads changed: the privacy state, a clock a test moved, the conditions.
@@ -282,6 +285,8 @@ pub(crate) struct DescribeHost {
 
 #[derive(Debug)]
 struct Shared {
+    /// The clocks this host reads, which its readers use to age what it has published.
+    clock: Clock,
     inbox: Mutex<Sender<Message>>,
     waker: Waker,
     handles: Handles,
@@ -400,6 +405,7 @@ impl DescribeHost {
         let driver = Driver::new(service, launch, build);
         let (tell, inbox) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
+            clock: clock.clone(),
             inbox: Mutex::new(tell),
             waker: driver.waker(),
             handles,
@@ -624,6 +630,18 @@ impl DescribeHost {
             slots.insert(session_id, Waiting { page, found });
         }
         self.shared.waker.wake();
+    }
+
+    /// Asks the host for a summary of a session's changes in the interval the request names. The
+    /// host decides at its next turn whether the request is queued, and nothing here waits for it:
+    /// the summary is read from the store once it has been written.
+    pub(crate) fn summarise(&self, ask: SummaryAsk) {
+        self.post(Message::Summarise { ask: Box::new(ask) });
+    }
+
+    /// Returns the wall clock as this host reads it, in milliseconds.
+    pub(crate) fn now_wall_ms(&self) -> u64 {
+        self.shared.clock.now().wall_ms().get()
     }
 
     /// Applies the owner's settings, which take effect at the host's next turn.
@@ -912,6 +930,9 @@ impl Thread {
                     if let Some(allowed) = on_battery {
                         self.driver.service_mut().set_on_battery(allowed);
                     }
+                }
+                Message::Summarise { ask } => {
+                    let _ = self.driver.service_mut().summarise(*ask, now);
                 }
                 Message::Turned { done } => {
                     // Told once the turn has published what it found, so the answer the caller
@@ -1547,6 +1568,7 @@ pub(crate) mod tests {
         );
         let (tell, inbox) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
+            clock: Clock::skewed(Arc::new(AtomicU64::new(0))),
             inbox: Mutex::new(tell),
             waker: driver.waker(),
             handles,

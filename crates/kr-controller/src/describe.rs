@@ -33,6 +33,7 @@ use kr_describe::budget::Budgets;
 use kr_describe::metadata::{LabelSource, SessionFacts, Title, deterministic_title};
 use kr_describe::profile::catalogue::NothingSelected;
 use kr_describe::store::{DescriptionStore, GeneratedRecord};
+use kr_describe::summary::{SummaryAsk, SummaryRecord, is_wanted};
 use kr_protocol::describe::{
     DescriptionFreshness, DescriptionPause, DescriptionProvenance, DescriptionState,
     MAX_SESSION_TITLE_CODEPOINTS, SessionDescribeResult, SessionRenameResult,
@@ -116,6 +117,18 @@ pub struct VoiceDescription {
     pub directory: Option<Observed>,
     /// The program the host last observed in the foreground.
     pub application: Option<Observed>,
+}
+
+/// What a read of one session's summaries found, under the privacy state held while it was made.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SummaryReading {
+    /// The newest summary written for an interval that starts at the first cursor asked for and
+    /// ends at or before the head, under the profile this host selected and the privacy
+    /// generation in force.
+    pub(crate) served: Option<SummaryRecord>,
+    /// Whether the host is to be asked for one: nothing written reaches the head, and what was
+    /// written is older than the cadence.
+    pub(crate) wanted: bool,
 }
 
 /// The session-metadata store, as this daemon serves it.
@@ -255,6 +268,14 @@ impl DescribeModule {
     #[cfg(feature = "testing")]
     pub fn wake(&self) {
         self.wake_host();
+    }
+
+    /// Waits until the host has taken everything posted to it so far and published the turn that
+    /// took it, for this crate's own tests that show something was not asked of it: what was
+    /// posted before is then in its figures. A host that does not run is not waited for.
+    #[cfg(feature = "testing")]
+    pub async fn until_host_has_taken_what_was_posted(&self) {
+        let _ = self.until_host_turns().await;
     }
 
     /// What setup shows: the host's own account of it, or that this host generates nothing.
@@ -727,6 +748,62 @@ impl DescribeModule {
             directory: current(seen.as_ref().and_then(|seen| seen.directory.as_ref())),
             application: current(seen.as_ref().and_then(|seen| seen.application.as_ref())),
         })
+    }
+
+    /// Reads what summaries a session has, for a read of what changed since a visit that starts at
+    /// `first_cursor` and has seen the session's changes to `head`.
+    ///
+    /// A summary is read under the environment's privacy state as it stands, held until the read
+    /// is decided, so a change of privacy mode waits for it: nothing is read while privacy mode is
+    /// on, and nothing of an earlier generation or of another profile than the one this host
+    /// selected after it. A host that runs no model has none to read, and says none is wanted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub(crate) fn summary_reading(
+        &self,
+        session_id: SessionId,
+        first_cursor: u64,
+        head: u64,
+        privacy: &PrivacyState,
+    ) -> Result<SummaryReading> {
+        let store = self.store();
+        let reading = privacy.reading();
+        let published = reading.published();
+        let Some(host) = self.host().filter(|host| host.runs()) else {
+            return Ok(SummaryReading::default());
+        };
+        let Some(profile) = host.profile() else {
+            return Ok(SummaryReading::default());
+        };
+        if published.private {
+            return Ok(SummaryReading::default());
+        }
+        let served = store
+            .summaries(&session_id)
+            .map_err(ControllerError::registry)?
+            .into_iter()
+            .filter(|record| {
+                record.answers(first_cursor, head)
+                    && record.profile_id == profile.profile_id()
+                    && record.profile_revision == profile.revision()
+                    && record.generation == published.generation
+            })
+            .max_by_key(|record| (record.cursor.to, record.produced_at_ms));
+        let cadence_ms = host.snapshot().cadence_ms;
+        Ok(SummaryReading {
+            wanted: is_wanted(served.as_ref(), head, host.now_wall_ms(), cadence_ms),
+            served,
+        })
+    }
+
+    /// Asks the description host for a summary, when there is one. Nothing is waited for: the host
+    /// decides at its next turn, and the summary is read from the store once it has been written.
+    pub(crate) fn ask_summary(&self, ask: SummaryAsk) {
+        if let Some(host) = self.host().filter(|host| host.runs()) {
+            host.summarise(ask);
+        }
     }
 
     /// Returns privacy mode's hook over this store.

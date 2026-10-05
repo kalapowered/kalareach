@@ -615,21 +615,25 @@ pub struct SemanticChange {
 ///
 /// Section 25 requires a summary to name its source interval and stay separate from the events. It
 /// is never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that
-/// ignores it loses nothing authoritative.
+/// ignores it loses nothing authoritative. It is generated text and is labelled as such wherever it
+/// is shown; it carries no status, approval or instruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeSummary {
     /// The summary text.
     pub text: String,
-    /// The first cursor the summary was written from.
+    /// The first cursor the summary was written from: the cursor this actor had acknowledged when
+    /// the summary was asked for.
     pub from_cursor: U64,
-    /// The first cursor after the interval the summary was written from.
+    /// The first cursor after the interval the summary was written from: the cursor the session's
+    /// changes had reached when it was asked for. It can be before this view's own, since the
+    /// session goes on changing, and the changes after it are in the view beside the summary.
     pub to_cursor: U64,
-    /// When the interval started.
+    /// When the first change in the interval was recorded.
     pub from_ms: TimestampMs,
-    /// When it ended.
+    /// When the last change in the interval was recorded.
     pub to_ms: TimestampMs,
-    /// The model that produced it, as the host recorded it.
+    /// The model that produced it, as the host recorded it: its profile identifier and revision.
     pub model: String,
 }
 
@@ -840,6 +844,17 @@ pub struct VisitChangedParams {
     pub session_id: SessionId,
     /// The largest number of changes the caller will accept, bounded by [`MAX_VISIT_CHANGES`].
     pub max_changes: U64,
+    /// Whether to ask the host's model to summarise what changed, and to be answered with the
+    /// newest summary it has written.
+    ///
+    /// The interval is frozen when it is asked for: from the cursor this actor has acknowledged to
+    /// the cursor the session's changes have reached. The answer does not wait for the model. It
+    /// carries a summary when one has been written for an interval that starts at the same first
+    /// cursor and ends at or before the head, and a client that asks again later is answered with
+    /// it once it is; asking again never restarts the work. A host that runs no model, or has not
+    /// selected one, or is in privacy mode, answers none, and a grant that does not reach back to
+    /// the first change of the interval is answered none.
+    pub summarise: bool,
 }
 
 /// The result of `visit.changed`.
@@ -861,7 +876,12 @@ pub struct VisitChangedResult {
     pub omitted: Vec<AttentionGap>,
     /// Whether more changes remain past [`VisitChangedResult::to_cursor`].
     pub more: bool,
-    /// The summary of this interval, when one was requested and produced.
+    /// The newest summary written for an interval that starts at [`VisitChangedResult::from_cursor`]
+    /// and ends at or before the cursor the session's changes have reached, when it was asked for
+    /// with [`VisitChangedParams::summarise`] and one has been written.
+    ///
+    /// It names the interval it covers, which may end before [`VisitChangedResult::to_cursor`],
+    /// and the changes after it are in `changes` as they always are: it is never merged into them.
     pub summary: Nullable<ChangeSummary>,
     /// The log views this actor retained, with any gap retention left in them.
     pub views: Vec<RetainedLogView>,

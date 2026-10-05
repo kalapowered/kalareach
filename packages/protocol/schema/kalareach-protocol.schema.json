@@ -6507,18 +6507,18 @@
     },
     "ChangeSummary": {
       "additionalProperties": false,
-      "description": "A model's summary of an interval, carried beside the authoritative events.\n\nSection 25 requires a summary to name its source interval and stay separate from the events. It\nis never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that\nignores it loses nothing authoritative.",
+      "description": "A model's summary of an interval, carried beside the authoritative events.\n\nSection 25 requires a summary to name its source interval and stay separate from the events. It\nis never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that\nignores it loses nothing authoritative. It is generated text and is labelled as such wherever it\nis shown; it carries no status, approval or instruction.",
       "properties": {
         "from_cursor": {
           "$ref": "#/$defs/U64",
-          "description": "The first cursor the summary was written from."
+          "description": "The first cursor the summary was written from: the cursor this actor had acknowledged when\nthe summary was asked for."
         },
         "from_ms": {
           "$ref": "#/$defs/TimestampMs",
-          "description": "When the interval started."
+          "description": "When the first change in the interval was recorded."
         },
         "model": {
-          "description": "The model that produced it, as the host recorded it.",
+          "description": "The model that produced it, as the host recorded it: its profile identifier and revision.",
           "type": "string"
         },
         "text": {
@@ -6527,11 +6527,11 @@
         },
         "to_cursor": {
           "$ref": "#/$defs/U64",
-          "description": "The first cursor after the interval the summary was written from."
+          "description": "The first cursor after the interval the summary was written from: the cursor the session's\nchanges had reached when it was asked for. It can be before this view's own, since the\nsession goes on changing, and the changes after it are in the view beside the summary."
         },
         "to_ms": {
           "$ref": "#/$defs/TimestampMs",
-          "description": "When it ended."
+          "description": "When the last change in the interval was recorded."
         }
       },
       "required": [
@@ -34452,11 +34452,16 @@
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session to compare."
+        },
+        "summarise": {
+          "description": "Whether to ask the host's model to summarise what changed, and to be answered with the\nnewest summary it has written.\n\nThe interval is frozen when it is asked for: from the cursor this actor has acknowledged to\nthe cursor the session's changes have reached. The answer does not wait for the model. It\ncarries a summary when one has been written for an interval that starts at the same first\ncursor and ends at or before the head, and a client that asks again later is answered with\nit once it is; asking again never restarts the work. A host that runs no model, or has not\nselected one, or is in privacy mode, answers none, and a grant that does not reach back to\nthe first change of the interval is answered none.",
+          "type": "boolean"
         }
       },
       "required": [
         "session_id",
-        "max_changes"
+        "max_changes",
+        "summarise"
       ],
       "type": "object"
     },
@@ -34499,7 +34504,7 @@
               "type": "null"
             }
           ],
-          "description": "The summary of this interval, when one was requested and produced."
+          "description": "The newest summary written for an interval that starts at [`VisitChangedResult::from_cursor`]\nand ends at or before the cursor the session's changes have reached, when it was asked for\nwith [`VisitChangedParams::summarise`] and one has been written.\n\nIt names the interval it covers, which may end before [`VisitChangedResult::to_cursor`],\nand the changes after it are in `changes` as they always are: it is never merged into them."
         },
         "to_cursor": {
           "$ref": "#/$defs/U64",

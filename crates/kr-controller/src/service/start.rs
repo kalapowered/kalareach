@@ -586,6 +586,9 @@ impl Controller {
                 detail: "the privacy record could not be opened".to_owned(),
             })??
         };
+        // What a read of the changes since a visit is answered with, when it asks for a summary,
+        // is the descriptions module's to keep.
+        attention.attach_descriptions(Arc::clone(&descriptions));
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),

@@ -1299,6 +1299,7 @@ async fn every_method_of_the_group_is_served_at_the_daemon_s_socket() {
             &VisitChangedParams {
                 session_id,
                 max_changes: U64::new(50),
+                summarise: false,
             },
         )
         .await
@@ -1362,6 +1363,7 @@ async fn a_paired_device_is_served_the_group_under_its_grant() {
             &VisitChangedParams {
                 session_id,
                 max_changes: U64::new(50),
+                summarise: false,
             },
         )
         .await
@@ -1940,6 +1942,7 @@ async fn a_finished_session_s_views_are_measured_against_what_its_spool_retains(
                 params: ParamsValue::from_typed(&VisitChangedParams {
                     session_id,
                     max_changes: U64::new(50),
+                    summarise: false,
                 })
                 .expect("encodes"),
             },
@@ -2374,6 +2377,7 @@ async fn owner_changes(control: &mut LocalClient, session_id: SessionId) -> Visi
             &VisitChangedParams {
                 session_id,
                 max_changes: U64::new(50),
+                summarise: false,
             },
         )
         .await
