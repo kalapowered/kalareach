@@ -160,7 +160,9 @@ The random directory name is not a secret and nothing depends on it staying unkn
 two installations, or an installation and a restored backup, never collide on a payload name, and so
 a path guessed from a transfer identifier alone names nothing. What makes a staging area *this*
 environment's is the object rather than the name: its stable filesystem identity is recorded the
-first time it is opened, and a directory replaced at the same name afterwards is refused.
+first time it is opened, and a directory replaced at the same name afterwards is refused. A device
+number names one mounting of a filesystem, so the same directory under another number, on the
+filesystem of the directory above it, is still the recorded one.
 
 ## The journal, and what makes a transfer resumable
 
