@@ -4257,7 +4257,56 @@ async fn an_unsupported_operating_system_and_separately_an_unsupported_architect
             "{host:?}: {refused:?}"
         );
         assert!(refused.detail().contains(words), "{}", refused.detail());
+        // It says what the release does support, from the platforms the manifest lists.
+        assert!(
+            refused.detail().ends_with("it supports linux (x86_64)"),
+            "{}",
+            refused.detail()
+        );
     }
+}
+
+/// A package that does not support this host says, beside what the host is, every platform its own
+/// manifest lists, each operating system with its architectures: the sentence is read from the same
+/// list the admission decided on, so a release that lists others says those.
+#[tokio::test]
+async fn an_unsupported_host_is_told_every_platform_the_release_lists() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        only_on(vec![
+            PlatformSupport {
+                os: OperatingSystem::Linux,
+                architectures: vec![Architecture::X86_64, Architecture::Aarch64],
+            },
+            PlatformSupport {
+                os: OperatingSystem::MacOs,
+                architectures: vec![Architecture::Aarch64],
+            },
+        ]),
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let windows = HostPlatform {
+        os: Some(OperatingSystem::Windows),
+        architecture: Some(Architecture::X86_64),
+    };
+    let admissions = catalogue
+        .admissions(environment(), &[], &windows)
+        .expect("readable");
+    let detail = admissions.not_admitted[0].detail();
+    assert!(
+        detail.contains("does not support this host's operating system (windows x86_64)")
+            && detail.ends_with("it supports linux (x86_64, aarch64); mac_os (aarch64)"),
+        "{detail}"
+    );
 }
 
 /// Every committed change that can alter what is admitted raises the admission revision in its own
