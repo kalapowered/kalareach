@@ -336,6 +336,13 @@ impl GrantDirectory {
                      withdrawn      BLOB,
                      PRIMARY KEY (actor_id, action_id)
                  );
+                 CREATE TABLE IF NOT EXISTS voice_delegations (
+                     device_id     BLOB NOT NULL,
+                     delegation_id TEXT NOT NULL,
+                     action_id     BLOB NOT NULL,
+                     spent_at_ms   INTEGER NOT NULL,
+                     PRIMARY KEY (device_id, delegation_id)
+                 );
                  CREATE TABLE IF NOT EXISTS host_authority (
                      key   TEXT PRIMARY KEY NOT NULL,
                      value BLOB NOT NULL
@@ -1648,6 +1655,115 @@ impl GrantDirectory {
                         code.as_str(),
                         detail,
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// Gives back a claim whose attempt answered with nothing it has to keep.
+    ///
+    /// The action's row goes, so the identifier is as if no attempt had claimed it: a request under
+    /// it is a first request again, whatever its payload. That is for an action whose first answer
+    /// admits nothing and asks the caller to come back with more, which is a different payload
+    /// under the same identifier. A row that holds an outcome, a refusal or a withdrawal is never
+    /// given back, because it is what a retry is owed.
+    ///
+    /// The attempt's hold goes inside the same transaction, under the lock a claim is taken under,
+    /// so an attempt that claims the identifier next does not find its own hold removed by this
+    /// one's.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be removed, and the claim stays as it was:
+    /// unfinished, and never performed again.
+    pub fn release_claim(&self, hold: ClaimHold) -> Result<()> {
+        self.in_transaction(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM authority_receipts
+                      WHERE actor_id = ?1 AND action_id = ?2
+                        AND result IS NULL AND refusal_code IS NULL AND withdrawn IS NULL",
+                    params![hold.key.0, hold.key.1.as_slice()],
+                )
+                .map_err(ControllerError::registry)?;
+            drop(hold);
+            Ok(())
+        })
+    }
+
+    /// Spends one delegation identifier for a device, and says whether this call spent it.
+    ///
+    /// A provider's delegation identifier belongs to one moment of one conversation, so the same
+    /// identifier for the same device is the same delegation however many calls it comes through
+    /// and whatever has happened to this daemon since. It stays spent for the retention section 9
+    /// gives a de-duplication record ([`kr_protocol::limits::DEDUPLICATION_RETENTION`]), and the
+    /// caller says when that has run out: `forget_before_ms` is the moment before which a spend is
+    /// forgotten, in the transaction that looks, and `None` forgets nothing. Whether a deadline has
+    /// passed is a decision about this host's clock, which the caller takes: forgetting a spend is
+    /// what would let the same delegation be submitted again, so a host that cannot prove where
+    /// its clock stands keeps every spend. `true` is a first spend, made under `action_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the store cannot be read or written, and then nothing is
+    /// spent.
+    pub fn spend_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &str,
+        action_id: ActionId,
+        now_ms: u64,
+        forget_before_ms: Option<u64>,
+    ) -> Result<bool> {
+        self.in_transaction(|connection| {
+            if let Some(forget_before_ms) = forget_before_ms {
+                connection
+                    .execute(
+                        "DELETE FROM voice_delegations WHERE spent_at_ms < ?1",
+                        params![i64::try_from(forget_before_ms).unwrap_or(i64::MAX)],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+            let spent = connection
+                .execute(
+                    "INSERT OR IGNORE INTO voice_delegations
+                         (device_id, delegation_id, action_id, spent_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        device_id.get().as_bytes().as_slice(),
+                        delegation_id,
+                        action_id.get().as_bytes().as_slice(),
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            Ok(spent == 1)
+        })
+    }
+
+    /// Takes back a spend made under `action_id`, once the answer to it admitted nothing.
+    ///
+    /// A spend made under another action is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be removed, and the identifier stays spent.
+    pub fn release_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &str,
+        action_id: ActionId,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "DELETE FROM voice_delegations
+                      WHERE device_id = ?1 AND delegation_id = ?2 AND action_id = ?3",
+                    params![
+                        device_id.get().as_bytes().as_slice(),
+                        delegation_id,
+                        action_id.get().as_bytes().as_slice(),
                     ],
                 )
                 .map(|_| ())

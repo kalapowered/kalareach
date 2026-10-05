@@ -55,7 +55,11 @@ fn grant(
 
 /// A device committed to `controller`'s records, paired under a grant that carries viewing and
 /// stands until `expires_at_ms`, or for ever.
-fn paired(controller: &Controller, byte: u8, expires_at_ms: Option<u64>) -> DeviceRecord {
+pub(super) fn paired(
+    controller: &Controller,
+    byte: u8,
+    expires_at_ms: Option<u64>,
+) -> DeviceRecord {
     let revision = controller.policy().authority_revision();
     let device_id = DeviceId::new(kr_ipc::new_uuid());
     let device = DeviceRecord {
@@ -494,5 +498,106 @@ async fn a_voice_change_is_dated_on_the_floor_and_not_the_wound_back_wall_clock(
     assert!(
         revoked >= now + 120_000,
         "dated on the floor, not on the wound-back clock: {revoked}"
+    );
+}
+
+/// A delegation identifier is forgotten once its retention has run out, and only on a clock this
+/// host can prove: while this boot's clock continuity is lost, and while the wall clock has gone
+/// backwards and an owner has not established it again, nothing that can expire is decided, so a
+/// spend that cannot be shown to have outlived its retention stays spent, and the same delegation
+/// is not a new action. The controls are the same waits with the clock established, and a wait
+/// that stops one moment short of the retention.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_delegation_is_forgotten_only_on_a_clock_this_host_can_prove() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let authority = authority(&controller);
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let delegation = kr_protocol::voice::VoiceDelegationId::new("item_one").expect("an identifier");
+    let spend = || {
+        authority
+            .spend_delegation(
+                device_id,
+                &delegation,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                controller.settled_now_ms(),
+            )
+            .expect("asked")
+    };
+    let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+    let day = 86_400_000;
+    let start = wall.load(Ordering::SeqCst);
+
+    assert!(spend(), "a first spend");
+    wall.store(start + retention, Ordering::SeqCst);
+    assert!(
+        !spend(),
+        "one moment short of the retention it is still spent"
+    );
+
+    // The retention has run out by the clock, and this boot's clock continuity is lost.
+    wall.store(start + retention + day, Ordering::SeqCst);
+    controller.utc_floor().lose_continuity();
+    assert!(!spend(), "a clock that is not proven forgets nothing");
+    controller.utc_floor().establish_continuity();
+    let spent_again_at = wall.load(Ordering::SeqCst);
+    assert!(spend(), "a proven clock has outlived the retention");
+
+    // The wall clock goes back by more than the tolerance and then steps forward past the
+    // retention. The floor only moves forward and is written down, so the floor alone would let
+    // the forward step forget the spend; the host has found its clock going backwards and has not
+    // established it again, so it does not.
+    assert!(!spend(), "spent again, and a moment later still");
+    wall.store(spent_again_at - 60_000, Ordering::SeqCst);
+    let _ = spend();
+    wall.store(spent_again_at + retention + day, Ordering::SeqCst);
+    assert!(
+        !spend(),
+        "a clock that went backwards and was not established again forgets nothing"
+    );
+    controller
+        .lifetimes()
+        .clock_trust()
+        .establish(controller.devices())
+        .expect("the owner establishes the clock");
+    assert!(spend(), "an established clock has outlived the retention");
+}
+
+/// A spend is forgotten on the reading the retention is counted from, which is the one the floor on
+/// disk covers, and not on a later one: another reader of the shared floor can raise it past that
+/// reading with nothing written down, and a spend whose retention ran out only on that later
+/// reading is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_delegation_is_not_forgotten_on_a_reading_the_floor_on_disk_does_not_cover() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let authority = authority(&controller);
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let delegation = kr_protocol::voice::VoiceDelegationId::new("item_one").expect("an identifier");
+    let spend = |now_ms: u64| {
+        authority
+            .spend_delegation(
+                device_id,
+                &delegation,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                now_ms,
+            )
+            .expect("asked")
+    };
+    let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+    let day = 86_400_000;
+    let start = wall.load(Ordering::SeqCst);
+
+    assert!(spend(controller.settled_now_ms()), "a first spend");
+    // The reading a spend is asked at, written down, one moment short of the retention.
+    wall.store(start + retention - 1, Ordering::SeqCst);
+    let asked_at = controller.settled_now_ms();
+    // Another reader raises the shared floor a day past it, and nothing is written.
+    controller.utc_floor().observe(start + retention + day);
+    assert!(
+        !spend(asked_at),
+        "the retention had not run out at the reading the floor on disk covers"
     );
 }

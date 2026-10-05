@@ -9,15 +9,15 @@
 //! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant`, `a_start_names_the_rate_the_person_was_shown`, `a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_a_voice_session_leaves_the_terminal_sessions_running` |
 //! | KR-REQ-15.09 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `the_context_for_a_call_goes_under_the_services_words_for_it` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_carries_no_task_text` |
-//! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_one`, `a_delegation_carries_no_task_text` |
+//! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another`, `a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_it` |
 //! | KR-REQ-15.14 | `stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told` |
 //! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `a_host_without_the_services_terms_says_why`, `a_preparation_is_refused_where_a_start_would_be` |
 //! | KR-REQ-15.20 | `context_selection_uses_the_requesting_devices_scope_and_nothing_wider` |
 //! | KR-REQ-15.21 | `the_default_voice_grant_permits_four_things_and_names_them`, `submitting_a_prompt_needs_the_spoken_destination` |
 //! | KR-REQ-15.22 | `cancelling_a_turn_needs_the_typed_request_and_the_current_turn` |
-//! | KR-REQ-23.51 | `every_voice_method_needs_the_voice_grant` |
+//! | KR-REQ-23.51 | `every_voice_method_needs_the_voice_grant`, `a_delegation_answered_before_is_answered_again_under_the_authority_that_stands_now` |
 
 use std::sync::{Arc, Mutex};
 
@@ -99,6 +99,8 @@ struct Authority {
     /// The one read of a grant the host refuses to answer, and what it refuses with: a host that
     /// cannot say whether a grant has ended, because the end is not on record yet.
     refusing: Mutex<Option<(Seam, kr_protocol::error::ProtocolError)>>,
+    /// The delegation identifiers this host has spent, and the action each was spent under.
+    spent: Mutex<std::collections::BTreeMap<(DeviceId, String), ActionId>>,
 }
 
 /// The three reads of a grant the coordinator makes.
@@ -135,6 +137,7 @@ impl Authority {
             write_fails: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::atomic::AtomicU64::new(0),
             refusing: Mutex::new(None),
+            spent: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -452,6 +455,39 @@ impl VoiceAuthority for Authority {
         _device_id: DeviceId,
     ) -> kr_voice::Result<Option<AuthorisationKey>> {
         Ok(Some(self.identity))
+    }
+
+    fn spend_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &VoiceDelegationId,
+        action_id: ActionId,
+        _now_ms: u64,
+    ) -> kr_voice::Result<bool> {
+        use std::collections::btree_map::Entry;
+
+        let mut spent = self.spent.lock().expect("what was spent");
+        match spent.entry((device_id, delegation_id.as_str().to_owned())) {
+            Entry::Vacant(free) => {
+                free.insert(action_id);
+                Ok(true)
+            }
+            Entry::Occupied(_) => Ok(false),
+        }
+    }
+
+    fn release_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &VoiceDelegationId,
+        action_id: ActionId,
+    ) -> kr_voice::Result<()> {
+        let mut spent = self.spent.lock().expect("what was spent");
+        let key = (device_id, delegation_id.as_str().to_owned());
+        if spent.get(&key) == Some(&action_id) {
+            spent.remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -2121,6 +2157,164 @@ async fn one_action_identifier_carries_one_delegation() {
         1,
         "the effect still happened once"
     );
+}
+
+/// KR-REQ-23.51 and 15.11: a delegation identifier stays spent once the call it was submitted
+/// through has ended, so the same one through a later call is not a new action.
+#[tokio::test]
+async fn a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_one() {
+    let fixture = fixture();
+    let first = started(&fixture, Some(&[VoiceAction::Status])).await;
+    let params = delegate_params(first, delegation("one"), VoiceAction::Status);
+    let answered = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_000)
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        answered.outcome,
+        VoiceDelegationOutcome::Performed { .. }
+    ));
+    fixture
+        .coordinator
+        .stop(
+            device(PHONE),
+            &VoiceStopParams {
+                voice_session_id: first,
+            },
+            11_100,
+        )
+        .await
+        .expect("the call stops");
+
+    let second = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &start_params_for(&fixture.coordinator).await,
+            AuthorityRevision::new(1),
+            11_200,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a later call");
+    let VoiceStartOutcome::Started { session: second } = second.outcome else {
+        panic!("the later call runs");
+    };
+    let later = fixture
+        .coordinator
+        .delegate(
+            device(PHONE),
+            action(2),
+            &delegate_params(
+                second.voice_session_id,
+                delegation("one"),
+                VoiceAction::Status,
+            ),
+            11_300,
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&later.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
+    );
+    assert_eq!(
+        fixture.submitter.proposals().len(),
+        1,
+        "the effect happened once"
+    );
+}
+
+/// KR-REQ-15.13: the challenge that answers a first submission gives the identifier back, so the
+/// same delegation carrying the proof is a first submission and not one that was already made.
+#[tokio::test]
+async fn a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_it() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::ShellInput])).await;
+    let mut params = delegate_params(
+        voice_session_id,
+        delegation("shell"),
+        VoiceAction::ShellInput,
+    );
+    let asked = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_000)
+        .await
+        .expect("an answer");
+    let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
+        panic!("the challenge is the answer");
+    };
+    params.confirmation =
+        Nullable::some(sign_confirmation(&fixture.key, &request).expect("the device signs"));
+    let signed = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_100)
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(signed.outcome, VoiceDelegationOutcome::Performed { .. }),
+        "{:?}",
+        signed.outcome
+    );
+    // And now it is spent: the same delegation under another action is refused.
+    let again = fixture
+        .coordinator
+        .delegate(device(PHONE), action(2), &params, 11_200)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&again.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
+    );
+}
+
+/// KR-REQ-09.16 and 23.51: a delegation answered before is answered again from what stands now,
+/// without spending its identifier again: the checks of a first submission run against the grants
+/// as they are, so a grant that has narrowed since gives the refusal and not the old content.
+#[tokio::test]
+async fn a_delegation_answered_before_is_answered_again_under_the_authority_that_stands_now() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::Status])).await;
+    let params = delegate_params(voice_session_id, delegation("one"), VoiceAction::Status);
+    let first = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_000)
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        first.outcome,
+        VoiceDelegationOutcome::Performed { .. }
+    ));
+
+    let again = fixture
+        .coordinator
+        .restate(device(PHONE), action(1), &params, 11_100)
+        .await
+        .expect("the same action is answered again");
+    assert!(
+        matches!(again.outcome, VoiceDelegationOutcome::Performed { .. }),
+        "{:?}",
+        again.outcome
+    );
+    let refused = fixture
+        .coordinator
+        .delegate(device(PHONE), action(2), &params, 11_150)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&refused.outcome).0,
+        VoiceRefusal::UnannouncedDelegation,
+        "answering again did not unspend the identifier"
+    );
+
+    fixture.authority.narrow_device_grant(&[]);
+    let narrowed = fixture
+        .coordinator
+        .restate(device(PHONE), action(1), &params, 11_200)
+        .await
+        .expect_err("a grant that no longer carries the action gives no answer");
+    assert_eq!(narrowed.reason(), Some(VoiceRefusal::OutsideDeviceGrant));
 }
 
 /// KR-REQ-15.11: the delegation event supplies an identifier and a timeline offset, not task text.

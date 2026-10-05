@@ -64,6 +64,38 @@ impl GrantAuthority {
             })
     }
 
+    /// The moment before which a spent delegation identifier may be forgotten at `now_ms`, or none
+    /// while this host cannot prove where its clock stands.
+    ///
+    /// A spend is kept for the retention section 9 gives a de-duplication record, and forgetting
+    /// one on a deadline is a decision about this host's clock like any other, so it is taken as
+    /// they are. The clock is sampled through the boundary every expiry decision goes through
+    /// ([`crate::service::net::devices::ClockTrust::sample`]), which answers nothing while the
+    /// wall clock has gone backwards and an owner has not established it again, and while this
+    /// boot's clock continuity is lost. Nothing is forgotten while the floor is owed its record,
+    /// nor before the floor on disk covers `now_ms`, which is the reading the retention is counted
+    /// from. A spend that cannot be shown to have outlived its retention is kept, because
+    /// forgetting it lets the same delegation be submitted as a new action.
+    fn forget_before(&self, now_ms: u64) -> Option<u64> {
+        let daemon = self.daemon.upgrade()?;
+        daemon
+            .lifetimes()
+            .clock_trust()
+            .sample(&self.devices)
+            .ok()
+            .flatten()?;
+        daemon
+            .utc_floor()
+            .bound(
+                kr_protocol::grant::GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(now_ms),
+                },
+                now_ms,
+            )
+            .answerable()
+            .then(|| now_ms.saturating_sub(kr_protocol::limits::DEDUPLICATION_RETENTION.get()))
+    }
+
     /// The host device that issues a voice grant.
     #[must_use]
     pub const fn host_device_id(&self) -> DeviceId {
@@ -327,6 +359,37 @@ impl VoiceAuthority for GrantAuthority {
             .map_err(store)?
             .filter(super::authority::DeviceRecordExt::is_paired_record)
             .map(|record| record.authorisation))
+    }
+
+    fn spend_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &kr_protocol::voice::VoiceDelegationId,
+        action_id: kr_protocol::ids::ActionId,
+        now_ms: u64,
+    ) -> kr_voice::Result<bool> {
+        self.sharing
+            .grants()
+            .spend_delegation(
+                device_id,
+                delegation_id.as_str(),
+                action_id,
+                now_ms,
+                self.forget_before(now_ms),
+            )
+            .map_err(store)
+    }
+
+    fn release_delegation(
+        &self,
+        device_id: DeviceId,
+        delegation_id: &kr_protocol::voice::VoiceDelegationId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> kr_voice::Result<()> {
+        self.sharing
+            .grants()
+            .release_delegation(device_id, delegation_id.as_str(), action_id)
+            .map_err(store)
     }
 }
 

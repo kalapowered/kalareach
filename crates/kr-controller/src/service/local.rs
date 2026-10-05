@@ -239,8 +239,8 @@ impl Controller {
         // A voice change is claimed in the same store and answered the same way: section 9 keeps
         // a receipt readable after the window that admitted it has expired, and a retry that
         // cannot reach its result would otherwise be told its window is gone rather than what
-        // happened. A delegation is not here, because it does not go through that store.
-        if crate::voice::VoiceModule::serves(method) && method != Method::VoiceDelegate {
+        // happened. A delegation is answered from it too, under the authority it is owed now.
+        if crate::voice::VoiceModule::serves(method) {
             return match self.voice_answered(actor_id, mutation).await {
                 Ok(Some(answered)) => Some(ControlFrame::Response(Response {
                     request_id: mutation.request_id,

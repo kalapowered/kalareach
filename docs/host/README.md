@@ -4475,10 +4475,10 @@ undone.
 
 A revocation that withdrew nothing advances no revision.
 
-Every authority change, and every voice change but a delegation, is claimed under its action
-identifier before its effect, and only the attempt that writes the claim performs it. A repeat of
-the action is answered from the claim before its freshness window is considered, so a caller whose
-window has closed, or whose daemon has restarted since, is still told what happened:
+Every authority change, every voice change and every step of an update's handover is claimed under
+its action identifier before its effect, and only the attempt that writes the claim performs it. A
+repeat of the action is answered from the claim before its freshness window is considered, so a
+caller whose window has closed, or whose daemon has restarted since, is still told what happened:
 
 * the result the change produced, once it has one;
 * the refusal it was given, when that refusal's code says the same request cannot succeed if it is
@@ -4509,6 +4509,21 @@ fence one withdrawal owes at the same time raise it once: one caller at a time r
 fences and clears it, and a caller that finds it cleared answers with the revision that fence
 advanced to. A fence whose clearing could not be written stays owed, and the next caller raises it
 again, because a fence raised twice is safe and a debt dropped unfenced is not.
+
+As with any other voice change, a delegation is claimed under its action identifier, and four things
+set it apart. If the action is one that needs the device to sign a challenge, the answer to its
+first submission is the challenge, which admits nothing, so the claim is given back and the signed
+delegation (the same action carrying a different payload) claims the identifier again. The
+delegation's own identifier is spent for that device for the duration of any call it was used in,
+and for any later call (even after a restart) as long as the host holds on to its de-duplication
+record. In particular, the same delegation under a different action identifier is refused on the
+grounds that it has already been submitted. A repeat of an action is answered from the record as
+long as the device is still paired with the host.
+
+If an action would normally result in an answer with content that was read from a session, the
+answer is not replayed from the record. The read is performed again using the current grants and
+history bound. In particular, if the call has ended or a grant has gone, the answer to the action is
+a refusal.
 
 The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
 kept their authority are re-admitted at the revision now in force. Withdrawing one device's
