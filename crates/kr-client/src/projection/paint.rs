@@ -29,7 +29,7 @@
 
 use kr_protocol::projection::{
     CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign,
-    ProjectedBuffer, ProjectedRow,
+    ProjectedBuffer, ProjectedHyperlink, ProjectedRow,
 };
 use kr_width::{cells_for, is_zero_width};
 
@@ -105,7 +105,7 @@ pub struct Comparison {
     /// Keyboard-stack entries the session holds, which a projection installs as a state, not a
     /// stack.
     pub keyboard_stack: usize,
-    /// Control bytes dropped from a title or a link target so that it could not end its own string.
+    /// Control bytes dropped from a title or a link so that it could not end its own string.
     pub controls_dropped: usize,
     /// Rows of the session's own screen this window has no room for at all.
     ///
@@ -343,7 +343,7 @@ struct Writer<'a> {
     /// in whatever the destination already had.
     pen: Option<CellRendition>,
     /// The hyperlink currently open, so a run does not reopen the one it is already inside.
-    link: Option<String>,
+    link: Option<ProjectedHyperlink>,
     comparison: Comparison,
 }
 
@@ -765,7 +765,7 @@ impl<'a> Writer<'a> {
 
         self.rendition(run.rendition);
         match run.hyperlink.as_ref() {
-            Some(uri) => self.open_link(uri),
+            Some(link) => self.open_link(link),
             None => {
                 if self.link.is_some() {
                     self.close_link();
@@ -949,14 +949,17 @@ impl<'a> Writer<'a> {
         self.pen = Some(rendition);
     }
 
-    fn open_link(&mut self, uri: &str) {
-        if self.link.as_deref() == Some(uri) {
+    /// Opens `link` with the parameters that make it the link it is, unless it is the one already
+    /// open. Two links to one target stay two on the terminal that is drawn into.
+    fn open_link(&mut self, link: &ProjectedHyperlink) {
+        if self.link.as_ref() == Some(link) {
             return;
         }
-        let mut body = b";".to_vec();
-        body.extend_from_slice(uri.as_bytes());
+        let mut body = link.params.clone().into_bytes();
+        body.push(b';');
+        body.extend_from_slice(link.uri.as_bytes());
         self.osc(b"8", &body);
-        self.link = Some(uri.to_owned());
+        self.link = Some(link.clone());
     }
 
     fn close_link(&mut self) {
@@ -972,11 +975,12 @@ impl<'a> Writer<'a> {
 
     /// Writes one control string, with nothing in its payload that could end it early.
     ///
-    /// A title and a link target come from the application. A payload carrying a string terminator
-    /// would close this command and leave whatever followed to be read as a fresh one, which is how
-    /// a restoration that emits only rendering operations could be made to emit a clipboard write.
-    /// Every C0 and C1 byte is therefore dropped from the payload: a title cannot contain one and
-    /// mean anything, and dropping them is what makes the closed set of operations actually closed.
+    /// A title and a link, its parameters and its target, come from the application. A payload
+    /// carrying a string terminator would close this command and leave whatever followed to be
+    /// read as a fresh one, which is how a restoration that emits only rendering operations could
+    /// be made to emit a clipboard write. Every C0 and C1 byte is therefore dropped from the
+    /// payload: a title cannot contain one and mean anything, and dropping them is what makes the
+    /// closed set of operations actually closed.
     fn osc(&mut self, selector: &[u8], body: &[u8]) {
         self.out.push(ESC);
         self.out.push(b']');
@@ -1240,6 +1244,15 @@ pub fn row_encodes_exactly(row: &ProjectedRow) -> bool {
     row.runs
         .iter()
         .all(|run| cells_for(&run.text) as u64 == run.cells.get())
+}
+
+/// A link to `uri` with `params`, for the tests below.
+#[cfg(test)]
+fn link_to(uri: &str, params: &str) -> ProjectedHyperlink {
+    ProjectedHyperlink {
+        uri: uri.to_owned(),
+        params: params.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -2141,8 +2154,8 @@ mod fixtures {
             };
         }
         if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 6)) {
-            row.runs[0].hyperlink = Nullable::some("https://example.com/a".to_owned());
-            row.runs[1].hyperlink = Nullable::some("https://example.com/a".to_owned());
+            row.runs[0].hyperlink = Nullable::some(link_to("https://example.com/a", ""));
+            row.runs[1].hyperlink = Nullable::some(link_to("https://example.com/a", ""));
         }
         // Control characters inside a run whose cells are what the pinned model measures, so the
         // run is placed rather than replaced: each control is a cluster of no cells of its own.
@@ -2617,7 +2630,7 @@ mod fixtures {
         // covers rather than on the row.
         if let Some(row) = screen.rows.get_mut(&(ProjectedBuffer::Primary, 0)) {
             row.runs[1].hyperlink =
-                kr_protocol::scalars::Nullable::some("https://example.invalid/guide".to_owned());
+                kr_protocol::scalars::Nullable::some(link_to("https://example.invalid/guide", ""));
         }
         let painted = install(&screen, window, Keyboard::NOTHING);
         let drawn = String::from_utf8_lossy(&painted.bytes).into_owned();
@@ -2641,6 +2654,51 @@ mod fixtures {
         assert!(
             drawn[..opened].contains("read"),
             "and the run before it was drawn outside the link"
+        );
+    }
+
+    /// KR-REQ-08.29: two links to one target are two links on the terminal a frame is drawn into.
+    ///
+    /// Drawn without their parameters they would be one link, and a terminal would join two cells an
+    /// application kept apart. A run that is inside the link the one before it is inside does not
+    /// open it again.
+    #[test]
+    fn links_to_one_target_with_different_identifiers_are_drawn_as_two() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 12},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 4, "text": "read"},
+                {"column": 4, "cells": 4, "text": "here"},
+                {"column": 8, "cells": 4, "text": "then"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (mut screen, window) = screen_of(&case);
+        let target = "https://example.invalid/guide";
+        if let Some(row) = screen.rows.get_mut(&(ProjectedBuffer::Primary, 0)) {
+            row.runs[0].hyperlink = Nullable::some(link_to(target, "id=a"));
+            row.runs[1].hyperlink = Nullable::some(link_to(target, "id=b"));
+            row.runs[2].hyperlink = Nullable::some(link_to(target, "id=b"));
+        }
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let drawn = String::from_utf8_lossy(&painted.bytes).into_owned();
+        let first = format!("\u{1b}]8;id=a;{target}\u{1b}\\");
+        let second = format!("\u{1b}]8;id=b;{target}\u{1b}\\");
+        let opened_first = drawn
+            .find(&first)
+            .expect("the first link is opened with its id");
+        let opened_second = drawn
+            .find(&second)
+            .expect("the second is opened with its own");
+        assert!(
+            drawn[opened_first..opened_second].contains("read"),
+            "each is opened before the text that is in it: {}",
+            drawn.escape_debug()
+        );
+        assert_eq!(
+            drawn.matches(&second).count(),
+            1,
+            "and the third run, inside the same link as the second, does not open it again"
         );
     }
 
@@ -2877,7 +2935,7 @@ mod safety {
                         cells: U64::new(u64::try_from(cells_for(text)).unwrap_or_default()),
                         text: text.to_owned(),
                         rendition: CellRendition::PLAIN,
-                        hyperlink: Nullable(link.map(str::to_owned)),
+                        hyperlink: Nullable(link.map(|uri| link_to(uri, ""))),
                     }],
                 },
             )]),
@@ -2956,6 +3014,48 @@ mod safety {
         assert!(
             contains(&bytes, b"beforeafter"),
             "the cells are still drawn"
+        );
+    }
+
+    /// KR-REQ-08.82: the parameters of a link cannot end the link's own control string either.
+    ///
+    /// They come from the application as the target does, and are written in front of it in the
+    /// same payload. A string terminator, a bell and the eight-bit string terminator in them are
+    /// dropped from the payload, so what follows is not read as a command of its own.
+    #[test]
+    fn the_parameters_of_a_link_cannot_carry_a_control_either() {
+        let mut screen = screen("plain", "text", None);
+        if let Some(row) = screen.rows.get_mut(&(ProjectedBuffer::Primary, 0)) {
+            row.runs[0].hyperlink = Nullable::some(link_to(
+                "https://example.invalid/",
+                "id=a\u{1b}\\\u{1b}]52;c;c2VjcmV0\u{7}\u{9c}:name=b",
+            ));
+        }
+        let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
+        let bytes = painted.bytes;
+        assert!(
+            !contains(&bytes, b"\x1b]52"),
+            "no clipboard command reached the destination: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let introducers = bytes.windows(2).filter(|pair| *pair == b"\x1b]").count();
+        let terminators = bytes.windows(2).filter(|pair| *pair == b"\x1b\\").count();
+        assert_eq!(
+            introducers,
+            terminators,
+            "no payload ended its own string: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            !bytes.contains(&0x07) && !contains(&bytes, "\u{9c}".as_bytes()),
+            "no bell and no eight-bit terminator: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            contains(&bytes, b"52;c;c2VjcmV0"),
+            "the printable remainder of the parameters is still there, as a harmless part of the \
+             link: {:?}",
+            String::from_utf8_lossy(&bytes)
         );
     }
 

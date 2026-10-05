@@ -472,7 +472,7 @@ pub fn install(
             keyboard: wire::keyboard_within(&snapshot.keyboard, snapshot.active_buffer, scope),
             title: wire::title(&snapshot.title),
             title_stack: snapshot.title_stack.iter().map(wire::saved_title).collect(),
-            hyperlink: Nullable(snapshot.hyperlink.as_ref().map(|link| link.uri.clone())),
+            hyperlink: Nullable(snapshot.hyperlink.as_ref().map(wire::hyperlink)),
             palette: wire::palette(&snapshot.palette),
             oldest_retained_row: oldest,
             evicted: snapshot.evicted,
@@ -838,7 +838,7 @@ pub fn advance(
         hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
         hyperlink: Nullable(delta.hyperlink.as_ref().map(|link| {
             kr_protocol::projection::HyperlinkChange {
-                uri: Nullable(link.as_ref().map(|link| link.uri.clone())),
+                link: Nullable(link.as_ref().map(wire::hyperlink)),
             }
         })),
         title: Nullable(delta.title.as_ref().map(wire::title)),

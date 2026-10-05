@@ -545,6 +545,12 @@ sets that were saved with it, and the rows of the buffer that is not showing. A 
 `None` only when that buffer has saved none, so a restoration never invents one: a client told a
 saved cursor is at the origin would restore it there.
 
+A hyperlink, wherever the wire carries one (a run's, a range's, the open link and a saved cursor's),
+is its target together with the parameters the application gave it, spelled as `key=value` pairs in
+key order separated by `:`. Two links to one target are two links to a client when their parameters
+differ, which is what keeps a link that wraps onto the next row one link and two links to one target
+two. A client that draws the screen into a terminal opens each link with the parameters it has.
+
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`
 returns what that settling produced alongside the snapshot, so a direct attachment that is already

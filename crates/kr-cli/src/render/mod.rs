@@ -260,7 +260,11 @@ impl ProjectedDisplay {
     /// a scheme that would launch an external application needs a policy of the client's own before
     /// anything happens, and this is only the lookup.
     #[must_use]
-    pub fn hyperlink_at(&self, row: u64, column: u64) -> Option<&str> {
+    pub fn hyperlink_at(
+        &self,
+        row: u64,
+        column: u64,
+    ) -> Option<&kr_protocol::projection::ProjectedHyperlink> {
         self.projection.screen()?.hyperlink_at(row, column)
     }
 

@@ -37,9 +37,10 @@ use std::collections::BTreeMap;
 
 use kr_protocol::projection::{
     CellRendition, CharsetState, HyperlinkRange, MarginState, PaletteState, ProjectedBuffer,
-    ProjectedCursor, ProjectedKeyboard, ProjectedMode, ProjectedRow, ProjectedTitle,
-    ProjectedViewport, ProjectionDelta, ProjectionEvent, ProjectionReset, ProjectionResetReason,
-    ProjectionRowPage, ProjectionSnapshot, SavedCursorState, SavedTitleEntry,
+    ProjectedCursor, ProjectedHyperlink, ProjectedKeyboard, ProjectedMode, ProjectedRow,
+    ProjectedTitle, ProjectedViewport, ProjectionDelta, ProjectionEvent, ProjectionReset,
+    ProjectionResetReason, ProjectionRowPage, ProjectionSnapshot, SavedCursorState,
+    SavedTitleEntry,
 };
 use kr_protocol::session::Dimensions;
 
@@ -143,7 +144,7 @@ pub struct Screen {
     /// The virtual title stack, oldest first.
     pub title_stack: Vec<SavedTitleEntry>,
     /// The hyperlink the next character printed belongs to.
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<ProjectedHyperlink>,
     /// The canonical palette and where it came from.
     pub palette: PaletteState,
     /// The rows of each buffer, by stable identifier.
@@ -242,13 +243,13 @@ impl Screen {
     /// Reconnection restores these so a later click still works. Nothing here activates anything:
     /// a scheme that would launch an external application needs the client's own policy first.
     #[must_use]
-    pub fn hyperlink_at(&self, row: u64, column: u64) -> Option<&str> {
+    pub fn hyperlink_at(&self, row: u64, column: u64) -> Option<&ProjectedHyperlink> {
         self.hyperlinks
             .get(&(self.active_buffer, row))?
             .iter()
             .find_map(|range| {
                 (range.start_column.get() <= column && column < range.end_column.get())
-                    .then_some(range.uri.as_str())
+                    .then_some(&range.link)
             })
     }
 
@@ -527,7 +528,7 @@ impl Projection {
             screen.charsets = charsets;
         }
         if let Some(change) = delta.hyperlink.0 {
-            screen.hyperlink = change.uri.0;
+            screen.hyperlink = change.link.0;
         }
         if let Some(title) = delta.title.0 {
             screen.title = title;
@@ -602,12 +603,12 @@ fn screen_of(installing: Installing) -> Screen {
     }
     let mut hyperlinks: BTreeMap<(ProjectedBuffer, u64), Vec<HyperlinkRange>> =
         installing.hyperlinks;
-    // A run that is inside a link carries the target, so the ranges follow from the rows rather
+    // A run that is inside a link carries the link, so the ranges follow from the rows rather
     // than being sent twice. Reconnection restores them as inert metadata: a later click works,
     // and nothing here activates anything.
     for ((buffer, _), row) in &installing.rows {
         for run in &row.runs {
-            if let Some(uri) = run.hyperlink.as_ref() {
+            if let Some(link) = run.hyperlink.as_ref() {
                 hyperlinks
                     .entry((*buffer, row.row.get()))
                     .or_default()
@@ -617,7 +618,7 @@ fn screen_of(installing: Installing) -> Screen {
                         end_column: kr_protocol::scalars::U64::new(
                             run.column.get().saturating_add(run.cells.get()),
                         ),
-                        uri: uri.clone(),
+                        link: link.clone(),
                     });
             }
         }
@@ -757,6 +758,13 @@ mod tests {
         })
     }
 
+    fn link(uri: &str, params: &str) -> ProjectedHyperlink {
+        ProjectedHyperlink {
+            uri: uri.to_owned(),
+            params: params.to_owned(),
+        }
+    }
+
     fn row(id: u64, text: &str, link: Option<&str>) -> ProjectedRow {
         ProjectedRow {
             row: U64::new(id),
@@ -767,7 +775,7 @@ mod tests {
                 cells: U64::new(text.chars().count() as u64),
                 text: text.to_owned(),
                 rendition: CellRendition::PLAIN,
-                hyperlink: Nullable(link.map(str::to_owned)),
+                hyperlink: Nullable(link.map(|uri| self::link(uri, ""))),
             }],
         }
     }
@@ -1185,7 +1193,7 @@ mod tests {
         let screen = projection.screen().expect("a screen");
         assert_eq!(
             screen.hyperlink_at(0, 2),
-            Some("https://example.invalid/guide"),
+            Some(&link("https://example.invalid/guide", "")),
             "the range is restored from the rows the snapshot carried"
         );
         assert_eq!(screen.hyperlink_at(0, 9), None, "and covers only its cells");
@@ -1201,7 +1209,56 @@ mod tests {
         )));
         assert_eq!(
             reconnected.screen().expect("a screen").hyperlink_at(0, 0),
-            Some("https://example.invalid/guide")
+            Some(&link("https://example.invalid/guide", ""))
+        );
+    }
+
+    /// KR-REQ-08.29: two links to one target with different identifiers are two links to a client.
+    ///
+    /// The identifier an application gives a link is what keeps one link that wraps onto the next
+    /// row one link and two links to one target two, so a client that held only the target would
+    /// answer for a cell with whichever link it met first.
+    #[test]
+    fn two_links_to_one_target_stay_two_links_to_a_client() {
+        let target = "https://example.invalid/guide";
+        let mut projection = Projection::new();
+        projection.apply(ProjectionEvent::Snapshot(header(1, 0)));
+        let mut first = row(0, "ab", None);
+        first.runs[0].hyperlink = Nullable::some(link(target, "id=a"));
+        let mut second = row(1, "cd", None);
+        second.runs[0].hyperlink = Nullable::some(link(target, "id=b"));
+        projection.apply(ProjectionEvent::Rows(page(
+            1,
+            0,
+            vec![first, second],
+            false,
+        )));
+        let screen = projection.screen().expect("a screen");
+        assert_eq!(
+            screen.hyperlink_at(0, 0),
+            Some(&link(target, "id=a")),
+            "the link a row's runs carry is the one its cells answer with"
+        );
+        assert_eq!(screen.hyperlink_at(1, 0), Some(&link(target, "id=b")));
+
+        // A delta that redraws a row names the link of its ranges, parameters and all.
+        let mut update = delta(0, 3, 1, vec![row(2, "ef", None)]);
+        update.hyperlinks = vec![HyperlinkRange {
+            row: U64::new(2),
+            start_column: U64::ZERO,
+            end_column: U64::new(2),
+            link: link(target, "id=c"),
+        }];
+        update.hyperlink = Nullable::some(HyperlinkChange {
+            link: Nullable::some(link(target, "id=d")),
+        });
+        projection.apply(ProjectionEvent::Delta(update));
+        let screen = projection.screen().expect("a screen");
+        assert_eq!(screen.hyperlink_at(2, 1), Some(&link(target, "id=c")));
+        assert_eq!(
+            screen.hyperlink,
+            Some(link(target, "id=d")),
+            "and the link the next character belongs to is the one the delta opened"
         );
     }
 
@@ -1234,12 +1291,12 @@ mod tests {
     fn a_closed_hyperlink_is_told_apart_from_one_that_was_never_mentioned() {
         let mut projection = Projection::new();
         let mut open = header(1, 0);
-        open.hyperlink = Nullable::some("https://example.invalid/open".to_owned());
+        open.hyperlink = Nullable::some(link("https://example.invalid/open", ""));
         projection.apply(ProjectionEvent::Snapshot(open));
         projection.apply(ProjectionEvent::Rows(page(1, 0, Vec::new(), false)));
         assert_eq!(
-            projection.screen().expect("a screen").hyperlink.as_deref(),
-            Some("https://example.invalid/open")
+            projection.screen().expect("a screen").hyperlink,
+            Some(link("https://example.invalid/open", ""))
         );
 
         let unmentioned = delta(0, 1, 1, Vec::new());
@@ -1251,7 +1308,7 @@ mod tests {
 
         let mut closed = delta(1, 2, 1, Vec::new());
         closed.hyperlink = Nullable::some(HyperlinkChange {
-            uri: Nullable::null(),
+            link: Nullable::null(),
         });
         projection.apply(ProjectionEvent::Delta(closed));
         assert!(

@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use kr_client::projection::{ProjectedModeSpelling, Projection, Screen};
 use kr_protocol::projection::{
     CellRendition, CharsetState, MarginState, PaletteOverride, ProjectedBuffer, ProjectedCursor,
-    ProjectedKeyboard, ProjectedTitle, ProjectionResetReason, Rgb, SavedCursorState,
-    SavedTitleEntry,
+    ProjectedHyperlink, ProjectedKeyboard, ProjectedTitle, ProjectionResetReason, Rgb,
+    SavedCursorState, SavedTitleEntry,
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_term::engine::Engine;
@@ -41,7 +41,7 @@ pub struct Run {
     /// Its rendition.
     pub rendition: CellRendition,
     /// The link it is inside, if any.
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<ProjectedHyperlink>,
 }
 
 /// One line of a buffer.
@@ -121,7 +121,7 @@ pub struct View {
     /// The title stack.
     pub title_stack: Vec<SavedTitleEntry>,
     /// The link the next character would be inside.
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<ProjectedHyperlink>,
     /// The palette's colours.
     pub colours: Colours,
 }
@@ -436,14 +436,17 @@ struct Cell {
     width: u64,
     text: String,
     rendition: CellRendition,
-    hyperlink: Option<String>,
+    hyperlink: Option<ProjectedHyperlink>,
 }
 
 /// The cell of `line` that covers `column`: the column it starts at (the one before, for the right
 /// half of a wide character), its text with any zero-width scalars after it, its rendition and its
 /// link. Nothing for a blank cell in the plain rendition outside a link.
 #[must_use]
-pub fn cell_at(line: &Line, column: u64) -> Option<(u64, String, CellRendition, Option<String>)> {
+pub fn cell_at(
+    line: &Line,
+    column: u64,
+) -> Option<(u64, String, CellRendition, Option<ProjectedHyperlink>)> {
     let mut found: Option<Cell> = None;
     for run in &line.runs {
         let mut at = run.column;

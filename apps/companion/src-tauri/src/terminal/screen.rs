@@ -8,7 +8,7 @@
 
 use kr_client::projection::{ProjectedModeSpelling, Screen};
 use kr_protocol::attachment::AttachmentSummary;
-use kr_protocol::projection::{CellRendition, CellRun, PaletteState};
+use kr_protocol::projection::{CellRendition, CellRun, PaletteState, ProjectedHyperlink};
 use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 use serde::Serialize;
@@ -189,8 +189,9 @@ pub struct TerminalPiece {
     pub text: String,
     /// How it is drawn, with the screen's reverse video already applied.
     pub rendition: CellRendition,
-    /// The link it is inside, as inert metadata.
-    pub hyperlink: Option<String>,
+    /// The link it is inside, as inert metadata: where it points and the parameters that tell it
+    /// from another link to the same target.
+    pub hyperlink: Option<ProjectedHyperlink>,
 }
 
 /// The cursor, in the window's coordinates.
