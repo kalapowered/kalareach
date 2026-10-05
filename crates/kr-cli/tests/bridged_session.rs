@@ -489,11 +489,12 @@ impl World {
     }
 
     /// Closes `session` where it lives, through the destination's own daemon, and waits until that
-    /// daemon says it is closed.
+    /// daemon says it is closed and its worker has ended.
     ///
     /// Closing is asynchronous: a daemon stopped before the destination records the closure would
     /// leave nothing to be asked about it.
     fn close_in_destination(&self, session: &str) {
+        let worker = worker_process(&self.destination, session);
         let mut close = std::process::Command::new(support::kr());
         close
             .args(["--json", "close", session])
@@ -509,27 +510,7 @@ impl World {
             )
             .current_dir("/");
         assert!(close.output().expect("runs kr").status.success());
-        let started = Instant::now();
-        loop {
-            let listed: kr_protocol::session::SessionListResult = self.ask(
-                Method::SessionList,
-                &kr_protocol::session::SessionListParams {
-                    environment_id: kr_protocol::scalars::Nullable::null(),
-                    include_closed: true,
-                },
-            );
-            if listed.sessions.iter().any(|summary| {
-                summary.session_id.to_string() == session
-                    && summary.state == kr_protocol::session::SessionState::Closed
-            }) {
-                return;
-            }
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "the session did not close: {listed:?}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.wait_until_closed_in_destination(session, &worker);
     }
 
     /// What the destination's daemon wrote to its log, from the end, for a failure to say.
@@ -1392,8 +1373,44 @@ fn holds(haystack: &[u8], needle: &str) -> bool {
         .any(|window| window == needle.as_bytes())
 }
 
+/// The process a session's worker runs as, from the descriptor the worker published, which is read
+/// while the session runs because the daemon retires it when it records the session's closure.
+fn worker_process(
+    tree: &teardown::Tree,
+    session: &str,
+) -> kr_protocol::identity::ProcessStartIdentity {
+    kr_ipc::descriptor::read(
+        &tree.environment(),
+        session.parse().expect("a session identifier"),
+    )
+    .expect("reads the descriptor")
+    .expect("the session is published")
+    .process_start_identity
+}
+
+/// Waits until the kernel says a worker's process has ended.
+///
+/// A session that has closed is listed as closed while its worker is still ending, and what a
+/// worker leaves is read, and a daemon is stopped, only once the daemon has seen the worker end, so
+/// a test that goes on to export, to read the worker's journal or to stop the daemon asks for this
+/// first: it is the question the daemon asks.
+fn worker_ended(worker: &kr_protocol::identity::ProcessStartIdentity) {
+    let started = Instant::now();
+    while !matches!(
+        kr_ipc::identity::process_state(worker),
+        kr_ipc::identity::ProcessState::Ended
+    ) {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the worker did not end"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Runs a session in the destination through a bridge that prints `TYPED_WITH_SIDE_EFFECTS`, ends it
-/// by exiting its shell, and returns its identifier once the destination says it is closed.
+/// by exiting its shell, and returns its identifier once the destination says it is closed and its
+/// worker has ended, which is what an export of it needs.
 fn a_closed_session_in_the_destination(world: &World) -> String {
     let created = world.create_in_destination();
     let session = created["session_id"]
@@ -1401,6 +1418,7 @@ fn a_closed_session_in_the_destination(world: &World) -> String {
         .expect("a session")
         .to_owned();
     let display = created["display_number"].to_string();
+    let worker = worker_process(&world.destination, &session);
     let terminal = world.attach_on_a_terminal(&display);
     terminal.types(TYPED_WITH_SIDE_EFFECTS);
     terminal.expect_within("after-marker", "the shell printed past its side effects");
@@ -1410,14 +1428,24 @@ fn a_closed_session_in_the_destination(world: &World) -> String {
     terminal.expect_within("attach-finished-", "the attachment ended with the session");
     let mut shell = terminal.shell;
     let _ = shell.wait();
-    world.wait_until_closed_in_destination(&session);
+    world.wait_until_closed_in_destination(&session, &worker);
     session
 }
 
 impl World {
-    /// Waits until the destination's daemon says `session` is closed, which its shell ending brings
-    /// about.
-    fn wait_until_closed_in_destination(&self, session: &str) {
+    /// Waits until the destination's daemon says `session` is closed, which its shell ending or a
+    /// close brings about, and until the kernel says the process of its worker, `worker`, has
+    /// ended.
+    ///
+    /// The daemon lists a session as closed while its worker is still ending, and what the worker
+    /// leaves is read, and a daemon stopped, only once that worker has ended: the worker is named
+    /// by every caller, so that none of them goes on without waiting for it.
+    fn wait_until_closed_in_destination(
+        &self,
+        session: &str,
+        worker: &kr_protocol::identity::ProcessStartIdentity,
+    ) {
+        worker_ended(worker);
         let started = Instant::now();
         loop {
             let listed: kr_protocol::session::SessionListResult = self.ask(
@@ -1466,6 +1494,7 @@ fn clipboard_write_through_a_bridge(world: &World) -> (String, String) {
         .expect("a session")
         .to_owned();
     let display = created["display_number"].to_string();
+    let worker = worker_process(&world.destination, &session);
     let terminal = world.attach_on_a_terminal(&display);
     terminal.types(TYPED_CLIPBOARD_WRITE);
     terminal.expect_within("written-marker", "the shell finished writing the clipboard");
@@ -1474,7 +1503,7 @@ fn clipboard_write_through_a_bridge(world: &World) -> (String, String) {
     let shown = terminal.text();
     let mut shell = terminal.shell;
     let _ = shell.wait();
-    world.wait_until_closed_in_destination(&session);
+    world.wait_until_closed_in_destination(&session, &worker);
     (session, shown)
 }
 
@@ -1945,6 +1974,7 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
         .expect("a session")
         .to_owned();
     let display = created["display_number"].to_string();
+    let worker = worker_process(&world.source, &session);
     let terminal = world.attach_here_on_a_terminal(&display);
     terminal.types(TYPED_WITH_SIDE_EFFECTS);
     terminal.expect_within("after-marker", "the shell printed past its side effects");
@@ -1954,6 +1984,7 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
     terminal.expect_within("attach-finished-", "the attachment ended with the session");
     let mut shell = terminal.shell;
     let _ = shell.wait();
+    worker_ended(&worker);
     let started = Instant::now();
     loop {
         let listed = world.run(&["--json", "list", "--include-closed"]);
