@@ -19,7 +19,7 @@
 //! description is written to the store as the description service would have written it.
 //!
 //! Everything is on the internal disk: the environment is a temporary host tree, and the session's
-//! shell runs `/bin/sh` from a directory inside it.
+//! shell runs a POSIX shell from a directory inside it.
 
 mod net_support;
 
@@ -213,10 +213,8 @@ impl Worker {
             environment_id,
             display_number,
             shell: ShellCommand {
-                program: "/bin/sh".to_owned(),
-                arguments: vec!["-c".to_owned(), MARKING.to_owned()],
                 cwd: project.display().to_string(),
-                environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+                ..kr_worker::testing::posix_script(MARKING)
             },
             shell_mode: ShellMode::NativeCompat,
             worker_profile: WorkerProfile::HeadlessUser,
