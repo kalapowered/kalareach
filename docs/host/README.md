@@ -1383,8 +1383,10 @@ Every command in that list needs the developer environment for the target loaded
 The runner runs the worker's suites one at a time (its library, and the `windows`,
 `windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
 `windows_inheritance`, `command_backends`, `question_bindings`, `questions_answer`, `authority`,
-`persistence` and `host` suites) and does not run `cargo test -p kr-worker` with every suite,
-because the worker's other integration suites are the ones described above as compiled and not run.
+`persistence`, `host`, `binder`, `channels`, `connectors` and `attention_source` suites) and does
+not run `cargo test -p kr-worker` with every suite, because the worker's other integration suites
+are the ones described above as compiled and not run. It also runs the protocol's library and a
+named set of the control daemon's cases and suites, each in a step of the workflow.
 Nothing has to be set for the link: `.cargo/config.toml` carries what the MSVC targets need, which
 is to leave the static C runtime out of the image and to stop the linker reporting the vendored C
 library's missing debug database once per object file. Setting `RUSTFLAGS` in the environment
