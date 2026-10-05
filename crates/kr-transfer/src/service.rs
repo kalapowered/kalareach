@@ -1924,7 +1924,8 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::DraftConflict`] when the expected revision is not current.
+    /// Returns [`TransferError::DraftConflict`] when the expected revision is not current, and
+    /// [`TransferError::IdConflict`] when the action identifier carried another payload.
     pub fn draft_update(
         &self,
         actor: &ActorId,
@@ -1984,14 +1985,15 @@ impl TransferService {
             None => {
                 drop(store);
                 // Either the revision moved between the read and the write, or this action had
-                // already been performed. The record says which.
-                match self.retained_result(action) {
-                    Ok(retained) => Ok(retained),
-                    Err(_) => Err(TransferError::DraftConflict {
+                // already been performed. The record says which, and an identifier that carried
+                // another payload is a reused identifier, not a stale revision.
+                self.refuse_unless_performed(
+                    action,
+                    TransferError::DraftConflict {
                         detail: "this draft's revision moved while the update was written"
                             .to_owned(),
-                    }),
-                }
+                    },
+                )
             }
         }
     }
@@ -2012,6 +2014,7 @@ impl TransferService {
     /// # Errors
     ///
     /// Returns [`TransferError::DraftConflict`] for a stale revision,
+    /// [`TransferError::IdConflict`] when the action identifier carried another payload,
     /// [`TransferError::WrongState`] when the attachment is not published, and
     /// [`TransferError::InvalidArgument`] when the declared contribution does not admit it.
     pub fn draft_add_attachment(
@@ -2183,13 +2186,13 @@ impl TransferService {
             Some(_) => Ok(result),
             None => {
                 drop(store);
-                match self.retained_result(action) {
-                    Ok(retained) => Ok(retained),
-                    Err(_) => Err(TransferError::DraftConflict {
+                self.refuse_unless_performed(
+                    action,
+                    TransferError::DraftConflict {
                         detail: "this draft's revision moved while the binding was written"
                             .to_owned(),
-                    }),
-                }
+                    },
+                )
             }
         }
     }
