@@ -19,6 +19,7 @@ use kr_protocol::transfer::{
     UploadBeginParams, UploadCancelParams, UploadChunkParams, UploadFinishParams, UploadState,
     UploadStatusParams,
 };
+use kr_transfer::service::Admission;
 use kr_transfer::store::Limits;
 use kr_transfer::{ManualClock, RetainEverything, TransferService};
 use support::{Harness, chunk_of, digest, pattern};
@@ -1003,7 +1004,12 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
             .expect("binds the attachment");
         harness
             .service
-            .record_prompt(&harness.actor, draft.draft_id, session_id)
+            .record_prompt(
+                &harness.actor,
+                draft.draft_id,
+                session_id,
+                &Admission::none(),
+            )
             .expect("records the submission");
 
         harness
@@ -1101,7 +1107,12 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, draft.draft_id, session_id)
+            .record_prompt(
+                &harness.actor,
+                draft.draft_id,
+                session_id,
+                &Admission::none()
+            )
             .expect("records the prompt"),
         1
     );
@@ -1123,13 +1134,18 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, draft.draft_id, session_id)
+            .record_prompt(
+                &harness.actor,
+                draft.draft_id,
+                session_id,
+                &Admission::none()
+            )
             .expect("records the prompt again"),
         2
     );
     let refusal = harness
         .service
-        .record_prompt(&harness.actor, draft.draft_id, other)
+        .record_prompt(&harness.actor, draft.draft_id, other, &Admission::none())
         .expect_err("a draft is sent to one session");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
 }
@@ -1188,7 +1204,7 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
 
     let refusal = harness
         .service
-        .record_prompt(&harness.actor, draft.draft_id, other)
+        .record_prompt(&harness.actor, draft.draft_id, other, &Admission::none())
         .expect_err("another session's prompt is refused");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
     assert!(
@@ -1203,7 +1219,7 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, draft.draft_id, owner)
+            .record_prompt(&harness.actor, draft.draft_id, owner, &Admission::none())
             .expect("the owner's prompt is recorded"),
         1
     );
@@ -1280,7 +1296,12 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
         .expect("binds the attachment");
     harness
         .service
-        .record_prompt(&harness.actor, draft.draft_id, session_id)
+        .record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            session_id,
+            &Admission::none(),
+        )
         .expect("records the submission");
 
     // One hour later, long before seven days, the session's retention ends.

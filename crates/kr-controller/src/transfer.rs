@@ -327,9 +327,9 @@ impl TransferModule {
         })
     }
 
-    /// Arms the pause a mutation stops at once it has passed the daemon's own check, before it
-    /// enters the transfer service. Returns the end that says the mutation has arrived, and the end
-    /// that lets it go. The pause fires once.
+    /// Arms the pause a mutation, or the record of the draft a prompt names, stops at once it has
+    /// passed the daemon's own check, before it enters the transfer service. Returns the end that
+    /// says it has arrived, and the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]
     pub fn pause_after_the_outer_check(
         &self,
@@ -498,24 +498,35 @@ impl TransferModule {
     /// to record. A draft this actor does not hold has no attachments for this host to retain, so
     /// naming one is not a failure.
     ///
+    /// The record is a write, so it is made under the admission the prompt arrived under, asked
+    /// where the service takes its own lock and again around the commit: a prompt whose deadline
+    /// passed or whose registration was withdrawn while it waited records nothing.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, other than for a draft it does not hold: among
-    /// them a draft that is for another session, or holds an attachment that belongs to one.
-    pub async fn record_submission(
+    /// them a draft that is for another session, or holds an attachment that belongs to one, and
+    /// an admission that no longer stands.
+    pub(crate) async fn record_submission(
         &self,
         actor_id: &ActorId,
         draft_id: kr_protocol::ids::DraftId,
         session_id: SessionId,
+        admission: Arc<TransferAdmission>,
     ) -> Answer<usize> {
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
-        blocking(
-            move || match service.record_prompt(&actor, draft_id, session_id) {
+        let admission = kr_transfer::service::Admission::new(admission);
+        #[cfg(feature = "testing")]
+        let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
+        blocking(move || {
+            #[cfg(feature = "testing")]
+            after_the_outer_check.wait();
+            match service.record_prompt(&actor, draft_id, session_id, &admission) {
                 Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
                 other => Ok(other?),
-            },
-        )
+            }
+        })
         .await
     }
 

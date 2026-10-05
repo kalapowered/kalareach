@@ -2302,18 +2302,25 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::UnknownDraft`] when the draft is not this actor's, and what
-    /// [`Store::record_prompt`] returns otherwise.
+    /// Returns [`TransferError::UnknownDraft`] when the draft is not this actor's,
+    /// [`TransferError::NotAdmitted`] when the admission the prompt arrived under no longer stands
+    /// where the record is made, and what [`Store::record_prompt`] returns otherwise.
     pub fn record_prompt(
         &self,
         actor: &ActorId,
         draft_id: DraftId,
         session_id: SessionId,
+        admission: &Admission,
     ) -> Result<usize> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
         draft_of(&store, draft_id, actor)?;
-        store.record_prompt(draft_id, session_id, now)
+        // The record is a write that outlasts the prompt, so it is made only under an admission
+        // that still stands: the service takes its own lock and opens its own transaction, and
+        // both wait, so a deadline that passed or a registration that was withdrawn while the
+        // prompt was queued is refused here and records nothing.
+        admission.ask()?;
+        admission.commit(|| store.record_prompt(draft_id, session_id, now))
     }
 
     /// Returns whether the sessions whose agents may be sent a prompt that names a draft without

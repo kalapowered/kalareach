@@ -13,6 +13,7 @@ use kr_protocol::transfer::{
     DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
 };
 use kr_transfer::InsertionOutcome;
+use kr_transfer::service::Admission;
 use support::{Harness, pattern};
 
 fn contribution(
@@ -175,7 +176,8 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
             .record_prompt(
                 &harness.actor,
                 created.draft_id,
-                created.session_id.0.expect("a session")
+                created.session_id.0.expect("a session"),
+                &Admission::none()
             )
             .expect("records the submission"),
         1

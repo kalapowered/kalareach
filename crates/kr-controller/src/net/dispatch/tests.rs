@@ -2296,15 +2296,14 @@ async fn a_repeat_the_worker_holds_a_receipt_for_is_answered_from_it_and_not_rec
     let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
     let draft_id =
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "repeat.bin");
-    controller
-        .transfer()
-        .record_submission(
-            &actor,
-            draft_id,
-            kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
-        )
-        .await
-        .expect("records the submission to another session");
+    record_directly(
+        &world,
+        &actor,
+        draft_id,
+        kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect("records the submission to another session");
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let mutation = a_local_prompt(
         &world,
@@ -2453,6 +2452,164 @@ async fn the_sessions_a_daemon_knows_at_its_first_start_over_a_journal_are_noted
     world.serving.abort();
 }
 
+/// Records that a draft is sent to a session as the daemon does for a prompt, under an admission
+/// that stands.
+async fn record_directly(
+    world: &crate::service::a_close_a_worker_never_answers::Silent,
+    actor: &kr_protocol::ids::ActorId,
+    draft_id: kr_protocol::ids::DraftId,
+    session_id: kr_protocol::ids::SessionId,
+) -> Result<usize, kr_protocol::error::ProtocolError> {
+    let admission = crate::service::a_close_a_worker_never_answers::admission(
+        &world.controller,
+        world.accepted,
+    )
+    .await;
+    world
+        .controller
+        .transfer()
+        .record_submission(
+            actor,
+            draft_id,
+            session_id,
+            crate::transfer::TransferAdmission::new(
+                std::sync::Arc::clone(&world.controller),
+                admission,
+            ),
+        )
+        .await
+}
+
+/// Stops the record of a draft where it has passed the daemon's own check and not yet entered the
+/// transfer service, withdraws the registration `connection_id` was admitted under there, and lets
+/// the record go on.
+async fn withdrawing_the_registration_before_the_record(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    connection_id: kr_protocol::ids::ConnectionId,
+    prompt: impl std::future::Future<Output = ()>,
+) {
+    let (arrived, release) = controller.transfer().pause_after_the_outer_check();
+    let withdrawing = async {
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the record reaches the place it is stopped at");
+        controller.admitted_table().remove(&connection_id);
+        release.send(()).expect("the record goes on");
+    };
+    tokio::join!(prompt, withdrawing);
+}
+
+/// KR-REQ-14.11, KR-REQ-09.09: the record of the draft a local prompt names is made under the
+/// admission the prompt arrived under, asked where the transfer service writes. A registration
+/// withdrawn after the daemon's own check and before the service's lock leaves the draft as it was,
+/// and the prompt is refused and not sent.
+///
+/// The control is the same prompt with its registration standing, which the neighbouring tests
+/// carry: it is recorded and sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_records_nothing() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "lapsed.bin");
+    let mutation = a_local_prompt(
+        &world,
+        &admission,
+        ActionId::new(kr_ipc::new_uuid()),
+        Nullable::some(draft_id),
+        Nullable::null(),
+    );
+
+    let mut answered = None;
+    withdrawing_the_registration_before_the_record(controller, admission.connection_id, async {
+        answered = Some(
+            controller
+                .perform(&actor, admission.connection_id, None, mutation)
+                .await,
+        );
+    })
+    .await;
+    let Some(ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    })) = answered
+    else {
+        panic!("the prompt is refused: {answered:?}");
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "the draft was recorded after its admission had lapsed"
+    );
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "and the prompt was sent"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11, KR-REQ-09.09: the same for a paired device's prompt. The record is made under the
+/// admission the prompt arrived under, so a device whose registration is withdrawn while the
+/// prompt waits for its worker's link records nothing and sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_records_nothing() {
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 45));
+    let actor = connection.device.principal();
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "paired.bin");
+    let prompt = a_prompt_naming(&world, &connection, Method::AgentPromptSubmit, 7, draft_id);
+
+    let mut answered = None;
+    withdrawing_the_registration_before_the_record(controller, connection.connection_id(), async {
+        answered = Some(
+            connection
+                .answer(ControlFrame::Mutation(Box::new(prompt)))
+                .await
+                .expect("the prompt is answered"),
+        );
+    })
+    .await;
+    let answered = answered.expect("the prompt was answered");
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: kr_protocol::envelope::Outcome::Error(error),
+        ..
+    }) = answered.frame()
+    else {
+        panic!("the prompt is refused: {:?}", answered.frame());
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "the draft was recorded after its admission had lapsed"
+    );
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "and the prompt was sent"
+    );
+    world.serving.abort();
+}
+
 /// A prompt a caller at this machine makes to the scripted session as `action_id`, naming a draft
 /// or carrying its text inline, under a window issued to `admission`'s connection.
 fn a_local_prompt(
@@ -2539,9 +2696,7 @@ async fn a_sweep_leaves_a_draft_sent_to_a_session_that_began_after_it_asked() {
 
     // A session the sweep's question did not cover begins, and the draft is sent to it.
     let began = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
-    controller
-        .transfer()
-        .record_submission(&actor, draft_id, began)
+    record_directly(&world, &actor, draft_id, began)
         .await
         .expect("records the submission");
     assert!(is_submitted(controller, &actor, draft_id));
