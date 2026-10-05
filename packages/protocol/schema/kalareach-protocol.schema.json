@@ -6031,7 +6031,7 @@
         "hyperlink": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/ProjectedHyperlink"
             },
             {
               "type": "null"
@@ -15824,22 +15824,22 @@
     },
     "HyperlinkChange": {
       "additionalProperties": false,
-      "description": "The hyperlink the next character printed belongs to, once it has changed.\n\nA null target is an open link that closed. Without the distinction a client could not tell a\nlink that closed from one that was never mentioned.",
+      "description": "The hyperlink the next character printed belongs to, once it has changed.\n\nA null link is an open link that closed. Without the distinction a client could not tell a\nlink that closed from one that was never mentioned.",
       "properties": {
-        "uri": {
+        "link": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/ProjectedHyperlink"
             },
             {
               "type": "null"
             }
           ],
-          "description": "The target, or null when no link is open."
+          "description": "The link, or null when no link is open."
         }
       },
       "required": [
-        "uri"
+        "link"
       ],
       "type": "object"
     },
@@ -15851,6 +15851,10 @@
           "$ref": "#/$defs/U64",
           "description": "One past the last column."
         },
+        "link": {
+          "$ref": "#/$defs/ProjectedHyperlink",
+          "description": "The link."
+        },
         "row": {
           "$ref": "#/$defs/U64",
           "description": "The stable row identifier."
@@ -15858,17 +15862,13 @@
         "start_column": {
           "$ref": "#/$defs/U64",
           "description": "The first column, zero-based."
-        },
-        "uri": {
-          "description": "The target.",
-          "type": "string"
         }
       },
       "required": [
         "row",
         "start_column",
         "end_column",
-        "uri"
+        "link"
       ],
       "type": "object"
     },
@@ -25142,6 +25142,25 @@
       ],
       "type": "object"
     },
+    "ProjectedHyperlink": {
+      "additionalProperties": false,
+      "description": "A hyperlink: where it points, and the parameters that tell one link to that place from another.\n\nTwo links are the same link when both fields are equal. The identifier an application gives a\nlink is what makes a link that wraps onto the next row one link, and what makes two links to one\ntarget two, so a client that kept only the target would merge links the application kept apart.\n\nIt is inert metadata. Nothing here activates anything, and a scheme that would launch an\nexternal application needs the client's own policy before anything happens.",
+      "properties": {
+        "params": {
+          "description": "The parameters the application gave the link, as `key=value` pairs in key order separated by\n`:`, which is the one spelling every spelling of the same parameters has. Empty when there\nare none.",
+          "type": "string"
+        },
+        "uri": {
+          "description": "The target.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "params"
+      ],
+      "type": "object"
+    },
     "ProjectedKeyboard": {
       "additionalProperties": false,
       "description": "The keyboard negotiation an input encoder has to reproduce.\n\nEach buffer has its own stack, so a full-screen application's negotiation cannot leak into the\nshell's when it exits. A client that knew only the active one would send the wrong encoding the\nmoment the application quit.",
@@ -25651,7 +25670,7 @@
         "hyperlink": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/ProjectedHyperlink"
             },
             {
               "type": "null"
@@ -31061,7 +31080,7 @@
         "hyperlink": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/ProjectedHyperlink"
             },
             {
               "type": "null"

@@ -251,8 +251,10 @@ impl Terminal {
             repair.extend_from_slice(b"\x1b(B\x0f");
             repair.extend_from_slice(&place(u32::try_from(column).unwrap_or(before.column)));
             repair.extend_from_slice(&sgr(rendition));
-            if let Some(link) = link.as_deref() {
-                repair.extend_from_slice(format!("\x1b]8;;{link}\x1b\\").as_bytes());
+            if let Some(link) = link.as_ref() {
+                repair.extend_from_slice(
+                    format!("\x1b]8;{};{}\x1b\\", link.params, link.uri).as_bytes(),
+                );
             }
             repair.extend_from_slice(text.as_bytes());
             repair.extend_from_slice(b"\x1b[0m");

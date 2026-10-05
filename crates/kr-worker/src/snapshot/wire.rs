@@ -15,11 +15,13 @@
 use kr_protocol::projection::{
     CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign, CharsetState,
     HyperlinkRange, MarginState, PaletteOverride, PaletteProvenance, PaletteState, ProjectedBuffer,
-    ProjectedCursor, ProjectedKeyboard, ProjectedMode, ProjectedModeKind, ProjectedRow,
-    ProjectedTitle, ProjectedViewport, Rgb, SavedCursorState, SavedTitleEntry,
+    ProjectedCursor, ProjectedHyperlink, ProjectedKeyboard, ProjectedMode, ProjectedModeKind,
+    ProjectedRow, ProjectedTitle, ProjectedViewport, Rgb, SavedCursorState, SavedTitleEntry,
 };
 use kr_protocol::scalars::{Nullable, U64};
-use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
+use kr_term::grid::{
+    Blink, Colour, GridRow, Link, Rendition, Run, UnderlineStyle, VerticalPosition,
+};
 use kr_term::palette::PaletteSource;
 use kr_term::snapshot::{
     ActiveBuffer, Charsets, CursorState, KeyboardSnapshot, Margins, ModeEntry, PaletteSnapshot,
@@ -122,6 +124,15 @@ pub const fn rendition(value: Rendition) -> CellRendition {
     }
 }
 
+/// Converts one hyperlink, with the parameters that tell it from another link to the same target.
+#[must_use]
+pub fn hyperlink(value: &Link) -> ProjectedHyperlink {
+    ProjectedHyperlink {
+        uri: value.uri.clone(),
+        params: value.params.clone(),
+    }
+}
+
 /// Converts one run of cells.
 #[must_use]
 pub fn run(value: &Run) -> CellRun {
@@ -130,7 +141,7 @@ pub fn run(value: &Run) -> CellRun {
         cells: cells(value.cells),
         text: value.text.clone(),
         rendition: rendition(value.rendition),
-        hyperlink: Nullable(value.hyperlink.as_ref().map(|link| link.uri.clone())),
+        hyperlink: Nullable(value.hyperlink.as_ref().map(hyperlink)),
     }
 }
 
@@ -342,7 +353,7 @@ pub fn saved_cursor(value: &SavedCursor) -> SavedCursorState {
         },
         origin_mode: value.origin_mode,
         style: cells(value.style),
-        hyperlink: Nullable(value.hyperlink.as_ref().map(|link| link.uri.clone())),
+        hyperlink: Nullable(value.hyperlink.as_ref().map(hyperlink)),
     }
 }
 
@@ -377,7 +388,7 @@ pub fn hyperlinks(values: &[kr_term::snapshot::HyperlinkRange]) -> Result<Vec<Hy
                 row: row_id(range.row)?,
                 start_column: cells(range.start_col),
                 end_column: cells(range.end_col),
-                uri: range.link.uri.clone(),
+                link: hyperlink(&range.link),
             })
         })
         .collect()
@@ -500,16 +511,19 @@ mod tests {
         );
 
         let mut linked = plain.clone();
-        linked.runs[0].hyperlink =
-            Nullable::some("https://example.invalid/a-long-target".to_owned());
+        linked.runs[0].hyperlink = Nullable::some(ProjectedHyperlink {
+            uri: "https://example.invalid/a-long-target".to_owned(),
+            params: "id=a".to_owned(),
+        });
         let linked = row_cost(&linked);
         assert!(
             linked.bytes > cost.bytes,
-            "a link target is bytes on the wire: {linked:?} against {cost:?}"
+            "a link is bytes on the wire: {linked:?} against {cost:?}"
         );
-        assert_eq!(
-            linked.items, cost.items,
-            "and one value either way, present or null, which is why both are counted"
+        assert!(
+            linked.items > cost.items,
+            "and values, because it is a target and parameters and not one string, which is why \
+             both are counted"
         );
     }
 }

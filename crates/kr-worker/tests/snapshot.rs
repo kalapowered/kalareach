@@ -28,8 +28,8 @@ use kr_protocol::ids::{
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::projection::{
-    MAX_PROJECTION_PAGE_ROWS, PaletteProvenance, ProjectedBuffer, ProjectionDelta, ProjectionReset,
-    ProjectionResetReason, ProjectionRowPage, ProjectionSnapshot,
+    MAX_PROJECTION_PAGE_ROWS, PaletteProvenance, ProjectedBuffer, ProjectedHyperlink,
+    ProjectionDelta, ProjectionReset, ProjectionResetReason, ProjectionRowPage, ProjectionSnapshot,
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams, EventsSubscribeResult};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
@@ -1219,7 +1219,7 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
         header.title.window, "a title",
         "a title is state, so it is restored"
     );
-    let linked: Vec<String> = events
+    let linked: Vec<ProjectedHyperlink> = events
         .iter()
         .filter_map(|event| match event {
             Event::Rows(page) => Some(page),
@@ -1235,9 +1235,114 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
         .collect();
     assert_eq!(
         linked,
-        vec!["https://example.invalid/g".to_owned()],
+        vec![link("https://example.invalid/g", "")],
         "a hyperlink is inert metadata on the cells it covers, restored so a later click works"
     );
+}
+
+/// KR-REQ-08.29: links to one target with different identifiers reach a client as different
+/// links, in the rows of the screen it is installed from and in the updates after it.
+///
+/// A client that was sent only the target would take two links an application kept apart for one,
+/// and a link that wraps for two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn links_to_one_target_with_different_identifiers_reach_a_client_as_different_links() {
+    let target = "https://example.invalid/guide";
+    let host = host(&format!(
+        "stty -echo -echonl || exit 1; \
+         printf '\\033]8;id=a;{target}\\033\\\\one\\033]8;;\\033\\\\\\r\\n'; \
+         printf '\\033]8;id=b:name=x;{target}\\033\\\\two\\033]8;;\\033\\\\\\r\\n'; exec cat"
+    ))
+    .await;
+    produced(&host.runtime, b"two\x1b]8;;\x1b\\\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(
+        &host,
+        Dimensions::new(SMALLER.0, SMALLER.1),
+        Some("xterm-256color"),
+    )
+    .await;
+    let installed = collect_until_installed(&mut attached.client).await;
+    let linked: Vec<ProjectedHyperlink> = installed
+        .iter()
+        .filter_map(|event| match event {
+            Event::Rows(page) => Some(page),
+            _ => None,
+        })
+        .flat_map(|page| page.rows.iter())
+        .flat_map(|row| {
+            row.runs
+                .iter()
+                .filter_map(|run| run.hyperlink.as_ref().cloned())
+        })
+        .collect();
+    assert_eq!(
+        linked,
+        vec![link(target, "id=a"), link(target, "id=b:name=x")],
+        "each run carries the link it is inside, with its parameters in key order"
+    );
+
+    // A link opened and closed around some text, and then one left open: the ranges of the update
+    // that carries the text, and the link the next character belongs to.
+    typist
+        .type_bytes(
+            &host,
+            format!("\x1b]8;id=c;{target}\x1b\\three\x1b]8;;\x1b\\\n").as_bytes(),
+        )
+        .await;
+    produced(&host.runtime, b"three\x1b]8;;\x1b\\\r\n").await;
+    typist
+        .type_bytes(&host, format!("\x1b]8;id=d;{target}\x1b\\\n").as_bytes())
+        .await;
+    produced(
+        &host.runtime,
+        format!("\x1b]8;id=d;{target}\x1b\\\r\n").as_bytes(),
+    )
+    .await;
+    let updates = collect_until(
+        &mut attached.client,
+        "the updates that carry the two links",
+        |seen| {
+            let (ranges, open) = update_links(seen);
+            ranges.contains(&link(target, "id=c")) && open.contains(&link(target, "id=d"))
+        },
+    )
+    .await;
+    let (ranges, open) = update_links(&updates);
+    assert!(
+        ranges.contains(&link(target, "id=c")),
+        "the range an update carries names its link, parameters and all: {ranges:?}"
+    );
+    assert!(
+        open.contains(&link(target, "id=d")),
+        "and so does the link an update says is open: {open:?}"
+    );
+}
+
+/// The links the ranges of the updates among `events` carry, and the links they open.
+fn update_links(events: &[Event]) -> (Vec<ProjectedHyperlink>, Vec<ProjectedHyperlink>) {
+    let deltas = events.iter().filter_map(|event| match event {
+        Event::Delta(delta) => Some(delta.as_ref()),
+        _ => None,
+    });
+    let mut ranges = Vec::new();
+    let mut open = Vec::new();
+    for delta in deltas {
+        ranges.extend(delta.hyperlinks.iter().map(|range| range.link.clone()));
+        if let Some(change) = delta.hyperlink.0.as_ref()
+            && let Some(opened) = change.link.0.as_ref()
+        {
+            open.push(opened.clone());
+        }
+    }
+    (ranges, open)
+}
+
+fn link(uri: &str, params: &str) -> ProjectedHyperlink {
+    ProjectedHyperlink {
+        uri: uri.to_owned(),
+        params: params.to_owned(),
+    }
 }
 
 /// KR-ACC-002: a hyperlink is still there, and still inert, after a reconnection and a resize.
@@ -1249,7 +1354,7 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     .await;
     produced(&host.runtime, b"the guide\x1b]8;;\x1b\\\r\r\n").await;
 
-    let link_of = |events: &[Event]| -> Vec<(u64, u64, u64, String)> {
+    let link_of = |events: &[Event]| -> Vec<(u64, u64, u64, ProjectedHyperlink)> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -1260,12 +1365,12 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
                 page.rows.iter().flat_map(|row| {
                     let id = row.row.get();
                     row.runs.iter().filter_map(move |run| {
-                        run.hyperlink.as_ref().map(|uri| {
+                        run.hyperlink.as_ref().map(|link| {
                             (
                                 id,
                                 run.column.get(),
                                 run.column.get() + run.cells.get(),
-                                uri.clone(),
+                                link.clone(),
                             )
                         })
                     })
@@ -1283,7 +1388,7 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     let before = collect_until_installed(&mut first.client).await;
     let ranges = link_of(&before);
     assert_eq!(ranges.len(), 1, "the link covers its own cells: {ranges:?}");
-    assert_eq!(ranges[0].3, "https://example.invalid/guide");
+    assert_eq!(ranges[0].3, link("https://example.invalid/guide", ""));
     drop(first);
 
     // A different size, on a new connection: the reconnection.
@@ -2618,7 +2723,7 @@ async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
 
     // Everything one page carries about its cells: the row, each run's column, its width and its
     // text, and the link over it. A copy selection reads exactly this.
-    let cells_of = |events: &[Event]| -> Vec<(u64, u64, u64, String, Option<String>)> {
+    let cells_of = |events: &[Event]| -> Vec<(u64, u64, u64, String, Option<ProjectedHyperlink>)> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -2674,8 +2779,8 @@ async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
         "the link's own run is in the page that covers it: {cells:?}"
     );
     assert_eq!(
-        cells[0].4.as_deref(),
-        Some("https://example.invalid/deep"),
+        cells[0].4,
+        Some(link("https://example.invalid/deep", "")),
         "with its target, as inert metadata"
     );
     drop(first);

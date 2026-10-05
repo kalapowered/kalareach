@@ -196,6 +196,25 @@ impl CellRendition {
     };
 }
 
+/// A hyperlink: where it points, and the parameters that tell one link to that place from another.
+///
+/// Two links are the same link when both fields are equal. The identifier an application gives a
+/// link is what makes a link that wraps onto the next row one link, and what makes two links to one
+/// target two, so a client that kept only the target would merge links the application kept apart.
+///
+/// It is inert metadata. Nothing here activates anything, and a scheme that would launch an
+/// external application needs the client's own policy before anything happens.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedHyperlink {
+    /// The target.
+    pub uri: String,
+    /// The parameters the application gave the link, as `key=value` pairs in key order separated by
+    /// `:`, which is the one spelling every spelling of the same parameters has. Empty when there
+    /// are none.
+    pub params: String,
+}
+
 /// One run of cells that share a rendition and a hyperlink.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -213,7 +232,7 @@ pub struct CellRun {
     /// The rendition.
     pub rendition: CellRendition,
     /// The hyperlink this run is inside, as inert metadata.
-    pub hyperlink: Nullable<String>,
+    pub hyperlink: Nullable<ProjectedHyperlink>,
 }
 
 /// One row of the canonical grid.
@@ -462,7 +481,7 @@ pub struct SavedCursorState {
     /// The cursor-style number saved with it.
     pub style: U64,
     /// The hyperlink that was open when it was saved.
-    pub hyperlink: Nullable<String>,
+    pub hyperlink: Nullable<ProjectedHyperlink>,
 }
 
 /// The current titles.
@@ -503,19 +522,19 @@ pub struct HyperlinkRange {
     pub start_column: U64,
     /// One past the last column.
     pub end_column: U64,
-    /// The target.
-    pub uri: String,
+    /// The link.
+    pub link: ProjectedHyperlink,
 }
 
 /// The hyperlink the next character printed belongs to, once it has changed.
 ///
-/// A null target is an open link that closed. Without the distinction a client could not tell a
+/// A null link is an open link that closed. Without the distinction a client could not tell a
 /// link that closed from one that was never mentioned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HyperlinkChange {
-    /// The target, or null when no link is open.
-    pub uri: Nullable<String>,
+    /// The link, or null when no link is open.
+    pub link: Nullable<ProjectedHyperlink>,
 }
 
 /// Everything a screen is, apart from its rows.
@@ -567,7 +586,7 @@ pub struct ProjectionSnapshot {
     /// The virtual title stack, oldest first.
     pub title_stack: Vec<SavedTitleEntry>,
     /// The hyperlink the next character printed belongs to.
-    pub hyperlink: Nullable<String>,
+    pub hyperlink: Nullable<ProjectedHyperlink>,
     /// The canonical palette and its provenance.
     pub palette: PaletteState,
     /// The oldest row still retained anywhere.

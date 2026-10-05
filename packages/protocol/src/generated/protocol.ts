@@ -20024,14 +20024,36 @@ export interface ProjectedCursor {
 /**
  * The hyperlink the next character printed belongs to, once it has changed.
  *
- * A null target is an open link that closed. Without the distinction a client could not tell a
+ * A null link is an open link that closed. Without the distinction a client could not tell a
  * link that closed from one that was never mentioned.
  */
 export interface HyperlinkChange {
   /**
-   * The target, or null when no link is open.
+   * The link, or null when no link is open.
    */
-  uri: string | null
+  link: ProjectedHyperlink | null
+}
+/**
+ * A hyperlink: where it points, and the parameters that tell one link to that place from another.
+ *
+ * Two links are the same link when both fields are equal. The identifier an application gives a
+ * link is what makes a link that wraps onto the next row one link, and what makes two links to one
+ * target two, so a client that kept only the target would merge links the application kept apart.
+ *
+ * It is inert metadata. Nothing here activates anything, and a scheme that would launch an
+ * external application needs the client's own policy before anything happens.
+ */
+export interface ProjectedHyperlink {
+  /**
+   * The parameters the application gave the link, as `key=value` pairs in key order separated by
+   * `:`, which is the one spelling every spelling of the same parameters has. Empty when there
+   * are none.
+   */
+  params: string
+  /**
+   * The target.
+   */
+  uri: string
 }
 /**
  * A hyperlink over a range of cells.
@@ -20045,6 +20067,7 @@ export interface HyperlinkRange {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   end_column: string
+  link: ProjectedHyperlink1
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -20053,6 +20076,24 @@ export interface HyperlinkRange {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_column: string
+}
+/**
+ * A hyperlink: where it points, and the parameters that tell one link to that place from another.
+ *
+ * Two links are the same link when both fields are equal. The identifier an application gives a
+ * link is what makes a link that wraps onto the next row one link, and what makes two links to one
+ * target two, so a client that kept only the target would merge links the application kept apart.
+ *
+ * It is inert metadata. Nothing here activates anything, and a scheme that would launch an
+ * external application needs the client's own policy before anything happens.
+ */
+export interface ProjectedHyperlink1 {
+  /**
+   * The parameters the application gave the link, as `key=value` pairs in key order separated by
+   * `:`, which is the one spelling every spelling of the same parameters has. Empty when there
+   * are none.
+   */
+  params: string
   /**
    * The target.
    */
@@ -20441,7 +20482,7 @@ export interface CellRun {
   /**
    * The hyperlink this run is inside, as inert metadata.
    */
-  hyperlink: string | null
+  hyperlink: ProjectedHyperlink | null
   rendition: CellRendition1
   /**
    * The text.
@@ -20542,7 +20583,7 @@ export interface SavedCursorState {
   /**
    * The hyperlink that was open when it was saved.
    */
-  hyperlink: string | null
+  hyperlink: ProjectedHyperlink | null
   /**
    * Whether origin mode was set when it was saved.
    */
@@ -20795,7 +20836,7 @@ export interface ProjectionSnapshot {
   /**
    * The hyperlink the next character printed belongs to.
    */
-  hyperlink: string | null
+  hyperlink: ProjectedHyperlink | null
   keyboard: ProjectedKeyboard1
   /**
    * Whether the keypad is in application mode.

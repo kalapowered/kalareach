@@ -58,6 +58,7 @@ import type {
   PendingResource,
   PluginListParams,
   PluginListResult,
+  ProjectedHyperlink,
   Receipt,
   ReviewAcknowledgeParams,
   ReviewAcknowledgeResult,
@@ -1235,8 +1236,11 @@ export interface TerminalPiece {
   readonly text: string
   /** How it is drawn, with the screen's reverse video already applied. */
   readonly rendition: CellRendition
-  /** The link it is inside, as inert metadata: nothing draws or opens it. */
-  readonly hyperlink: string | null
+  /**
+   * The link it is inside, as inert metadata: nothing draws or opens it. Its parameters tell it
+   * from another link to the same target.
+   */
+  readonly hyperlink: ProjectedHyperlink | null
 }
 
 /** The cursor, in the window's coordinates. */
