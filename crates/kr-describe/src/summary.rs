@@ -69,9 +69,9 @@ pub struct SummaryAsk {
     pub session_id: SessionId,
     /// The interval of the session's changes: the first cursor, and the first cursor after it.
     pub interval: CursorInterval,
-    /// When the first change in the interval was recorded.
+    /// When the earliest change in the interval happened.
     pub from_ms: u64,
-    /// When the last change in the interval was recorded.
+    /// When the latest change in the interval happened.
     pub to_ms: u64,
     /// The privacy generation the text of the changes was read under, when any was read from the
     /// session: a request whose text was read under another generation than the one in force is
@@ -146,9 +146,9 @@ pub struct SummaryRecord {
     /// The interval of the session's changes it covers: the first cursor, and the first cursor
     /// after it.
     pub cursor: CursorInterval,
-    /// When the first change in the interval was recorded.
+    /// When the earliest change in the interval happened.
     pub from_ms: u64,
-    /// When the last change in the interval was recorded.
+    /// When the latest change in the interval happened.
     pub to_ms: u64,
     /// The summary.
     pub text: SummaryText,

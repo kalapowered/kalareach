@@ -26594,7 +26594,7 @@ export interface VisitChangedParams {
    * cursor and ends at or before the head, and a client that asks again later is answered with
    * it once it is; asking again never restarts the work. A host that runs no model, or has not
    * selected one, or is in privacy mode, answers none, and a grant that does not reach back to
-   * the first change of the interval is answered none.
+   * the earliest change of the interval is answered none.
    */
   summarise: boolean
 }

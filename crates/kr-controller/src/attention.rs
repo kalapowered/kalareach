@@ -201,7 +201,7 @@ impl Caller {
     /// it. A grant with no lower bound retains no history and reaches none.
     ///
     /// A summary is written from every change in an interval and says things about all of them, so
-    /// it is served only to a caller that reaches back to the first of them.
+    /// it is served only to a caller that reaches back to the earliest of them.
     #[must_use]
     pub fn reaches_back_to(&self, at_ms: u64) -> bool {
         match self {
@@ -1218,9 +1218,9 @@ impl AttentionModule {
     ///
     /// The answer does not wait for a model. It is the summary the description host has already
     /// written, held under the profile it selected and the privacy generation in force, to a
-    /// caller whose grant reaches back to the first change in it, and nothing when there is none,
+    /// caller whose grant reaches back to the earliest change in it, and nothing when there is none,
     /// when no model runs here and when privacy mode is on. A request for one that is wanted is
-    /// made only for a caller whose grant reaches back to the first change in the interval now, so
+    /// made only for a caller whose grant reaches back to the earliest change in the interval now, so
     /// a grant that does not reach it starts nothing the answer to it could not show.
     async fn summary(
         &self,
@@ -1241,10 +1241,10 @@ impl AttentionModule {
         else {
             return Nullable::null();
         };
-        let Some(first) = source.changes.first() else {
+        let Some((earliest, _)) = moments(&source.changes) else {
             return Nullable::null();
         };
-        if !caller.reaches_back_to(first.at_ms.get()) {
+        if !caller.reaches_back_to(earliest) {
             return Nullable::null();
         }
         let (first_cursor, head) = (source.from_cursor, source.head);
@@ -3005,14 +3005,25 @@ fn newest_changes(source: &kr_attention::visit::SummarySource) -> &[kr_attention
     &source.changes[skipped..]
 }
 
+/// The moments of the earliest and of the latest of `changes`, none when there are none.
+///
+/// A log holds changes in the order they were recorded, which is not the order they happened in: a
+/// session's question records are read before its host's own events, so a change recorded later
+/// can be older. What a summary says of the changes is held to the earliest of them, whichever
+/// place that one has in the log.
+fn moments(changes: &[kr_attention::visit::Change]) -> Option<(u64, u64)> {
+    let at = || changes.iter().map(|change| change.at_ms.get());
+    Some((at().min()?, at().max()?))
+}
+
 /// Builds the request for a summary of the changes in `source`.
 ///
 /// The interval is the whole of what was frozen: from the cursor the actor had acknowledged to the
-/// cursor the log had reached, and the moments of its first and last change are those of the
-/// changes the log retains in it, so a grant is held to the oldest of them even when the newest are
-/// all the job reads. Each of the newest changes carries the host's own words, or the text read
-/// for it from its session; a change whose text was not read carries none. `read` is indexed by
-/// the change's place among the newest.
+/// cursor the log had reached, and its moments are the earliest and the latest of every change the
+/// log retains in it, so a grant is held to the earliest of them even when the newest are all the
+/// job reads. Each of the newest changes carries the host's own words, or the text read for it
+/// from its session; a change whose text was not read carries none. `read` is indexed by the
+/// change's place among the newest.
 fn summary_ask(
     session_id: SessionId,
     source: &kr_attention::visit::SummarySource,
@@ -3022,8 +3033,7 @@ fn summary_ask(
     use kr_describe::context::{CursorInterval, ProjectText};
     use kr_describe::summary::{SummaryAsk, SummaryChange};
 
-    let first = source.changes.first()?;
-    let last = source.changes.last()?;
+    let (from_ms, to_ms) = moments(&source.changes)?;
     let changes: Vec<SummaryChange> = newest_changes(source)
         .iter()
         .enumerate()
@@ -3040,8 +3050,8 @@ fn summary_ask(
     SummaryAsk::new(
         session_id,
         CursorInterval::new(source.from_cursor, source.head),
-        first.at_ms.get(),
-        last.at_ms.get(),
+        from_ms,
+        to_ms,
         generation,
         changes,
     )
@@ -3461,7 +3471,7 @@ mod tests {
     use kr_ipc::framed::{FrameReader, FrameWriter};
     use kr_protocol::attention::{
         AttentionHostSlice, AttentionQuestionSlice, AttentionReadResult, AttentionRecordText,
-        AttentionTextAnswer,
+        AttentionTextAnswer, VisitChangedResult,
     };
     use kr_protocol::frame::StreamKind;
     use kr_protocol::ids::QuestionId;
@@ -3621,6 +3631,32 @@ mod tests {
         assert!(summary_ask(session, &empty, &BTreeMap::new(), None).is_none());
     }
 
+    /// KR-REQ-18.02: the order of a log is the order its changes were recorded in, and a session's
+    /// question records are read before its host's own events, so it is not the order they
+    /// happened in. The moments a request carries are the earliest and the latest of every change
+    /// the log retains in the interval, whichever place they have in it.
+    #[test]
+    fn a_summary_request_carries_the_earliest_and_latest_moments_whatever_their_order_in_the_log() {
+        use kr_attention::visit::{Change, SummarySource};
+        use kr_protocol::attention::SemanticChangeKind;
+
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let change = |cursor: u64, at_ms: u64| Change {
+            cursor,
+            kind: SemanticChangeKind::AdapterState,
+            session_id: session,
+            text: Text::Host(format!("words {cursor}")),
+            at_ms: TimestampMs::new(at_ms),
+        };
+        let source = SummarySource {
+            from_cursor: 10,
+            head: 13,
+            changes: vec![change(10, 2_000), change(11, 1_000), change(12, 1_500)],
+        };
+        let ask = summary_ask(session, &source, &BTreeMap::new(), None).expect("a request");
+        assert_eq!((ask.from_ms, ask.to_ms), (1_000, 2_000));
+    }
+
     /// KR-REQ-18.02 and KR-REQ-24.11: what text was read for a summary is bound to the generation
     /// the worker decided it under, and a worker that did not say which, or answered under two,
     /// leaves nothing to bind it to: the request is not made.
@@ -3662,7 +3698,7 @@ mod tests {
     }
 
     /// KR-REQ-18.02: a summary is written from every change in an interval, so it is served only to
-    /// a caller whose authority reaches back to the first of them: the owner's always does, a
+    /// a caller whose authority reaches back to the earliest of them: the owner's always does, a
     /// paired device's when its grant's history starts at or before it, and a grant with no lower
     /// bound retains no history and reaches none.
     #[test]
@@ -3799,6 +3835,147 @@ mod tests {
 
     fn owner() -> ActorId {
         ActorId::new("local:501").expect("an actor")
+    }
+
+    /// A session whose changes a summary is asked for, over a module that a description module is
+    /// attached to. The description module's host has selected a model profile and starts no
+    /// process, so what it was asked for is what the test reads from it, and what has been written
+    /// is what the test puts in the store.
+    struct Summarised {
+        _temp: kr_ipc::testing::TempHost,
+        module: Arc<AttentionModule>,
+        host: crate::describe::host::tests::ByHand,
+        session_id: SessionId,
+    }
+
+    impl Summarised {
+        fn start() -> Self {
+            let temp = kr_ipc::testing::TempHost::create();
+            let module = module(&temp);
+            let descriptions = Arc::new(
+                crate::describe::DescribeModule::open(temp.environment().state_dir())
+                    .expect("the description store"),
+            );
+            let host = crate::describe::host::tests::ByHand::selecting();
+            descriptions
+                .set_host(host.handle())
+                .expect("the first host");
+            module.attach_privacy(crate::privacy::PrivacyState::default());
+            module.attach_descriptions(Arc::clone(&descriptions));
+            Self {
+                _temp: temp,
+                module,
+                host,
+                session_id: SessionId::new(kr_ipc::new_uuid()),
+            }
+        }
+
+        /// Records one command that completed in the session for each moment given, in the order
+        /// given. The text of a change a session's own event gave is read from its worker; the
+        /// text of one the host recorded is the host's own words.
+        fn record_commands(&self, moments: &[u64], from_the_session: bool) {
+            let events: Vec<kr_attention::SourceEvent> = moments
+                .iter()
+                .zip(1_u64..)
+                .map(|(at_ms, sequence)| {
+                    let cursor = if from_the_session {
+                        EventCursor::in_session(
+                            self.session_id,
+                            AttentionSource::HostEvents,
+                            sequence,
+                        )
+                    } else {
+                        EventCursor::new(AttentionSource::Semantic, sequence)
+                    };
+                    kr_attention::SourceEvent::new(
+                        cursor,
+                        TimestampMs::new(*at_ms),
+                        kr_attention::EventKind::CommandCompleted {
+                            session_id: self.session_id,
+                            command: "cargo test".to_owned(),
+                            exit_code: 0,
+                        },
+                    )
+                })
+                .collect();
+            self.module
+                .observe(&events)
+                .expect("the events are recorded");
+        }
+
+        /// A read of what changed in the session that asks for a summary.
+        fn visit_changed(&self) -> Request {
+            Request {
+                request_id: RequestId::new(7),
+                method: Method::VisitChanged.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::from_typed(&VisitChangedParams {
+                    session_id: self.session_id,
+                    max_changes: U64::new(50),
+                    summarise: true,
+                })
+                .expect("encodes"),
+            }
+        }
+
+        /// What `caller` is answered when it asks what changed and asks for a summary.
+        async fn changed_for(&self, actor: &ActorId, caller: &Caller) -> VisitChangedResult {
+            self.module
+                .read(
+                    &Stub { unaccounted: false },
+                    caller,
+                    actor,
+                    &self.visit_changed(),
+                )
+                .await
+                .expect("the changes are served")
+                .to_typed()
+                .expect("decodes")
+        }
+
+        /// The summaries the daemon has asked the description host for, in the order it asked.
+        fn asked(&mut self) -> Vec<kr_describe::summary::SummaryAsk> {
+            self.host.asked_summaries()
+        }
+    }
+
+    /// A paired device whose grant's history starts at `bound`.
+    fn device_from(bound: u64) -> Caller {
+        Caller::Device {
+            grant_id: GrantId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            session_view: true,
+            automation_manage: false,
+            host_manage: false,
+            sessions: kr_protocol::grant::SessionSelector::Any,
+            history_lower_bound_ms: Some(TimestampMs::new(bound)),
+        }
+    }
+
+    /// KR-REQ-18.02: a summary is asked for only by a caller whose history reaches back to the
+    /// earliest of the changes it is written from, and the log holds them in the order they were
+    /// recorded, not the order they happened in. A grant that starts after the earliest asks for
+    /// nothing, though it starts before the first the log holds; one that starts at the earliest
+    /// asks for the interval with the moments of its earliest and latest change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_that_starts_after_the_earliest_change_asks_for_no_summary() {
+        let mut world = Summarised::start();
+        world.record_commands(&[2_000, 1_000, 1_500], false);
+        let reader = ActorId::new("test:device").expect("an actor");
+
+        let late = world.changed_for(&reader, &device_from(1_500)).await;
+        assert_eq!(late.changes.len(), 3);
+        assert!(late.summary.0.is_none());
+        assert_eq!(world.asked(), Vec::new(), "nothing is asked for");
+
+        world.changed_for(&reader, &device_from(1_000)).await;
+        let asked = world.asked();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            (asked[0].interval.from, asked[0].interval.to),
+            (0, 3),
+            "the interval the log holds"
+        );
+        assert_eq!((asked[0].from_ms, asked[0].to_ms), (1_000, 2_000));
     }
 
     /// A page that arrives after its session's closure is not taken: the closure holds the store
