@@ -23,8 +23,8 @@ use kr_protocol::identity::{
 };
 use kr_protocol::ids::{
     ActionId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, BuildId, CapabilityId,
-    CapabilityRevision, ControllerGeneration, PluginId, PublisherId, RequestId, SessionEpoch,
-    SessionId,
+    CapabilityRevision, ControllerGeneration, DraftId, PluginId, PublisherId, RequestId,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::ReceiptState;
@@ -483,6 +483,48 @@ async fn kr_req_12_06_a_mutation_with_no_upstream_is_refused_before_its_marker()
         "a refusal this host can decide is a rejection rather than an outcome nobody can \
          establish"
     );
+}
+
+/// KR-REQ-14.11: a prompt that names a draft is refused on the worker's own socket and is taken only
+/// from the control daemon, which records where the draft's attachments go before it forwards the
+/// prompt. A prompt that carries its text inline is not held to that.
+#[tokio::test]
+async fn kr_req_14_11_a_prompt_naming_a_draft_is_refused_on_the_workers_own_socket() {
+    let host = host().await;
+    register(&host, None);
+    let mut client = cli(&host).await;
+
+    let mut mutation = prompt_mutation(&client, &host, 21);
+    mutation.params = ParamsValue::from_typed(&AgentPromptParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::some(DraftId::new(kr_ipc::new_uuid())),
+        text: Nullable::null(),
+    })
+    .expect("encodes");
+    let mut forwarded = mutation.clone();
+    forwarded.action_id = ActionId::new(kr_ipc::new_uuid());
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("a prompt naming a draft is refused on the worker's own socket");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+
+    // The same prompt from the control daemon is decided on its merits, which here is that this
+    // worker has no upstream to send it to.
+    let mut daemon = daemon(&host).await;
+    let error = forward_as_device(&mut daemon, &forwarded, &[])
+        .await
+        .expect_err("a worker with no upstream refuses the prompt");
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+
+    // The same prompt with its text inline is decided on its merits: this worker has no upstream.
+    let inline = prompt_mutation(&client, &host, 22);
+    let Outcome::Error(error) = send(&mut client, inline).await else {
+        panic!("a prompt with no transport is refused");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
 }
 
 /// What two prompts sent through the worker to a [`RendezvousUpstream`] came to.

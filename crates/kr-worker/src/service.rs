@@ -3630,6 +3630,35 @@ impl WorkerService {
         }
     }
 
+    /// Refuses a prompt that names a draft unless the control daemon sent it.
+    ///
+    /// A draft is the transfer service's, which the daemon hosts, and a prompt that names one sends
+    /// the draft's attachments to this session: the daemon records that before it forwards the
+    /// prompt, so that what was submitted follows the session's retention. A prompt that reached
+    /// this worker's own socket instead would be taken with no such record. A prompt that carries
+    /// its text inline names no draft and is served on either route.
+    fn check_draft_route(
+        state: &ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<()> {
+        if !matches!(method, Method::AgentPromptSubmit | Method::AgentPromptQueue)
+            || state.client_kind == LocalClientKind::Controller
+        {
+            return Ok(());
+        }
+        let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
+        if params.draft_id.is_present() {
+            return Err(WorkerError::PermissionDenied {
+                detail: "a prompt that names a draft is sent through the control daemon, which \
+                         records where the draft's attachments go before the prompt reaches this \
+                         session"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Performs a mutation the control daemon admitted for somebody else.
     ///
     /// The mutation arrives unchanged, so its digest is the caller's, and it is recorded under the
@@ -3836,6 +3865,7 @@ impl WorkerService {
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
         self.check_envelope(mutation, entry, caller)?;
+        Self::check_draft_route(state, mutation, method)?;
         // What this mutation asks for, as distinct from the identifier it asks under. It is what
         // decides whether a fresh identifier would be taking an uncertain outcome's place.
         let subject = kr_protocol::action::subject_digest(mutation)
