@@ -60,6 +60,7 @@ mod host;
 mod inhibition;
 mod local;
 mod machine_group;
+mod prompt;
 mod reads;
 mod recovery;
 mod rendezvous;

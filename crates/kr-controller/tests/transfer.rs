@@ -921,27 +921,6 @@ async fn a_draft_is_created_through_the_daemon_and_carries_its_revision() {
     assert_eq!(created.draft.environment_id, host.environment_id);
     assert_eq!(created.draft.revision.get(), 1);
     assert!(created.draft.attachments.is_empty());
-
-    // A submission is an agent mutation against the session's worker, not something this daemon
-    // performs. It is refused here rather than served.
-    let refusal = failure(
-        control
-            .mutate(
-                Method::AgentPromptSubmit,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget {
-                    environment_id: host.environment_id,
-                    session_id: Nullable::some(SessionId::new(kr_ipc::new_uuid())),
-                    session_epoch: Nullable::some(SessionEpoch::V1),
-                    application_instance_id: Nullable::null(),
-                    agent_binding_revision: Nullable::null(),
-                },
-                &ParamsValue::empty(),
-            )
-            .await
-            .expect("the call reaches the daemon"),
-    );
-    assert_eq!(refusal.code, ErrorCode::InvalidArgument);
 }
 
 /// KR-REQ-24.09: the daemon's own expiry sweep runs against the archive's view of its sessions.

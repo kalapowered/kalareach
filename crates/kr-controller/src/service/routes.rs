@@ -664,6 +664,13 @@ impl Controller {
                 self.review_power_soon();
                 closed
             }
+            // A prompt a caller at this machine sends to a session's agent. The daemon records the
+            // draft it names, if it names one, and passes it to the session's worker as it does a
+            // paired device's.
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                self.local_prompt(actor_id, mutation, connection_id, accepted, carried)
+                    .await
+            }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
                 self.agent_tools_change(actor_id, mutation, method, carried)
                     .await

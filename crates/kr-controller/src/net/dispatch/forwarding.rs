@@ -60,24 +60,6 @@ pub(super) fn held_by_an_earlier_worker(method: Method) -> ProtocolError {
     ProtocolError::new(ErrorCode::UnsupportedCapability, detail)
 }
 
-/// The draft a prompt names, when the mutation is a prompt that names a draft.
-///
-/// A queued prompt counts with a submitted one: the session's agent holds it from the moment the
-/// worker takes it and may run it long after, and this host is not told when it does.
-fn prompted_draft(mutation: &MutationRequest) -> Option<kr_protocol::ids::DraftId> {
-    if !matches!(
-        mutation.method.method(),
-        Some(Method::AgentPromptSubmit | Method::AgentPromptQueue)
-    ) {
-        return None;
-    }
-    mutation
-        .params
-        .to_typed::<kr_protocol::agent::AgentPromptParams>()
-        .ok()
-        .and_then(|params| params.draft_id.0)
-}
-
 impl RemoteConnection {
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
     ///
@@ -278,7 +260,7 @@ impl RemoteConnection {
         // nothing in it that is not held, whenever it reads it, and a repeat of the prompt has
         // nothing left to record. A prompt the worker refuses was still sent to that session, and
         // its attachments stay with it. If the record cannot be made the prompt is not sent.
-        if let Some(draft_id) = prompted_draft(mutation)
+        if let Some(draft_id) = crate::transfer::prompted_draft(mutation)
             && let Err(error) = self
                 .controller
                 .transfer
