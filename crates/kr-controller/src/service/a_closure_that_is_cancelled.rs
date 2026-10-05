@@ -17,7 +17,7 @@ use kr_protocol::action::BarrierState;
 use kr_protocol::ids::{AuthorityRevision, SessionId};
 
 use super::LeaseDenied;
-use super::a_close_a_worker_never_answers::Silent;
+use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
 use super::the_fence_at_every_effect::a_paired_device;
 use crate::authority::Round;
@@ -43,8 +43,8 @@ fn state_of(round: &Round<'_>, session_id: SessionId, revision: AuthorityRevisio
 /// Whether the registry's file holds the closure, read on a connection of this test's own: the
 /// daemon's registry is behind a lock that this test may be holding, and another task of the
 /// daemon may hold that lock while it waits for one this test holds.
-fn on_disk(world: &Silent) -> bool {
-    let database = world._temp.environment().registry_database();
+fn on_disk(world: &Served) -> bool {
+    let database = world.controller.paths().registry_database();
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("the registry's file opens");
@@ -63,7 +63,7 @@ fn on_disk(world: &Silent) -> bool {
 /// wait for the connection table, and its connection is out of the table before the wait for the
 /// presentations. Read with `try_lock`, because this test may be holding a lock and another task of
 /// the daemon may be holding the one it asks for.
-fn reached(parked: Parked, world: &Silent) -> bool {
+fn reached(parked: Parked, world: &Served) -> bool {
     let out_of_the_directory = || {
         world
             .controller
@@ -106,7 +106,7 @@ async fn until(what: &str, mut condition: impl FnMut() -> bool) {
 /// Whether the daemon still holds the session's worker in its directory, its connection table, the
 /// set of workers the plugin admissions wait for, and the descriptors it published. Read with
 /// `try_lock`, because another task of the daemon may be holding a lock for a moment.
-fn held_of(world: &Silent) -> Option<[bool; 4]> {
+fn held_of(world: &Served) -> Option<[bool; 4]> {
     let directory = world.controller.directory.try_lock().ok()?;
     let connections = world.controller.connections.try_lock().ok()?;
     Some([
@@ -120,7 +120,7 @@ fn held_of(world: &Silent) -> Option<[bool; 4]> {
 }
 
 /// A revocation holds with no worker for the session to wait for.
-async fn assert_revocation_holds_without(world: &Silent) {
+async fn assert_revocation_holds_without(world: &Served) {
     let report = world
         .controller
         .announce_authority_revision()
@@ -132,7 +132,7 @@ async fn assert_revocation_holds_without(world: &Silent) {
 
 /// A paired device is given no dispatch lease for the session's worker, whatever the daemon still
 /// holds of it.
-async fn assert_no_lease(world: &Silent) {
+async fn assert_no_lease(world: &Served) {
     let device = a_paired_device(&world.controller);
     assert!(matches!(
         world
@@ -143,8 +143,9 @@ async fn assert_no_lease(world: &Silent) {
     ));
 }
 
-/// Records a closure and drops the future that records it while it waits at `parked`, and answers
-/// whether the closure was recorded and what the barrier says about the worker afterwards.
+/// Records a closure of a daemon's session with a real worker and drops the future that records it
+/// while it waits at `parked`, and answers whether the closure was recorded and what the barrier
+/// says about the worker afterwards.
 ///
 /// The future is polled by hand until the closure has done everything it does before the wait at
 /// `parked` ([`reached`]), so it is at that wait and no earlier one, and then dropped. While the
@@ -153,8 +154,7 @@ async fn assert_no_lease(world: &Silent) {
 /// locks are let go: the whole of it where the closure was never recorded, and none of it where it
 /// was, since the tail does not need the request that began it.
 async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
-    let script = Scripted::new();
-    let world = scripted(&script).await;
+    let world = Served::start().await;
     let record = closure_of(world.session_id);
     let revision = world.controller.leases.authority_revision();
     // A round that began while the worker ran, which is what holds an ended worker for it to report.
@@ -171,7 +171,10 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
         world.session_id,
         world.worker.descriptor.process_start_identity.clone(),
     );
-    assert_eq!(held_of(&world), Some([true; 4]));
+    until("the daemon holds the worker in all four places", || {
+        held_of(&world) == Some([true; 4])
+    })
+    .await;
     let held: Box<dyn Send + '_> = match parked {
         Parked::Registry => Box::new(world.controller.registry.lock().await),
         Parked::Directory => Box::new(world.controller.directory.lock().await),
@@ -213,7 +216,14 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     }
     drop(closing);
     drop(held);
-    let closed = recorded(&world).await;
+    let closed = world
+        .controller
+        .registry
+        .lock()
+        .await
+        .closure(world.session_id)
+        .expect("the registry answers")
+        .is_some();
     assert_eq!(closed, recorded_by_now);
     // What the closure left of the worker: all of it where nothing was recorded, and none of it
     // once the closure's own task has run to its end.
@@ -230,7 +240,6 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     // Once the round is over nothing can ask about an ended worker that named nothing.
     drop(round);
     let held = world.controller.leases.workers_held();
-    world.serving.abort();
     (closed, state, held)
 }
 
