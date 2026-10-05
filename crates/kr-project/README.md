@@ -138,11 +138,10 @@ of these falls back to reading the configuration and hoping.
 * **Windows, every invocation.** Two of the three guarantees are not things an application container
   can hold: a permission written on a file itself beats the refusal this service writes on the
   directory above it, and a container's capability permits reaching the network or nothing without
-  bounding which ports. So the service refuses there, says which guarantee it cannot make, and the
-  platform task that qualifies this host on Windows is what changes the mechanism. A third limit
-  would have been decisive had the first two not applied: on an ordinary installation Git lives
-  somewhere only an administrator may change the permissions of, so the container could not have
-  been granted read and execute on it either.
+  bounding which ports. So the service refuses there and says which guarantee it cannot make. A
+  third limit would have been decisive had the first two not applied: on an ordinary installation
+  Git lives somewhere only an administrator may change the permissions of, so the container could
+  not have been granted read and execute on it either.
 * **A platform with none of these mechanisms** runs no Git at all.
 
 ## What a caller bounded by a grant is promised
