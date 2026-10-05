@@ -351,7 +351,8 @@ refuse_links() {
 # Prints the local workspace section of the .gitignore the clone holds: the lines from its
 # "# Local workspace files" heading to the next blank line. Prints nothing when it has none. The
 # file is read as bytes, because Git reads a line that holds a NUL byte whole and the awk that macOS
-# ships cuts it at the NUL, which would end the section at a line that starts with one.
+# ships cuts it at the NUL, which would end the section at a line that starts with one. A blank line
+# holds only ASCII white space, in every locale: a line of anything else is a pattern to Git.
 local_section() {
   clean python3 - "$1/.gitignore" <<'PYTHON'
 import sys
