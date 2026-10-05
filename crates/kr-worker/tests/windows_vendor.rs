@@ -652,6 +652,102 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
 }
 
 // ---------------------------------------------------------------------------------------------
+// A worker that is itself in a job that restricts desktops.
+
+/// What a launch made by a worker in a restricted job comes to, for each profile: the worker is a
+/// process of its own (this test binary, started inside the job), because the job a process is in
+/// is the one thing a test cannot change about itself.
+#[test]
+#[ignore = "a process the test below starts inside a job of its own"]
+fn a_worker_in_a_job_tries_both_profiles() {
+    let report = PathBuf::from(std::env::args().last().expect("the report's path"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let mut lines = String::new();
+    for (name, ownership, which) in [
+        ("full", AgentOwnership::Full, 21),
+        ("reduced", AgentOwnership::Reduced, 22),
+    ] {
+        let session = Arc::new(SessionJob::create().expect("a session job"));
+        let outcome = runtime.block_on(async { Launch::start(which, ownership, &session) });
+        match outcome {
+            Ok(launch) => {
+                lines.push_str(&format!("{name}=started\n"));
+                drop(launch);
+            }
+            Err(BrokerError::PreconditionFailed { detail }) => {
+                lines.push_str(&format!("{name}=refused {}\n", detail.replace('\n', " ")));
+            }
+            Err(other) => lines.push_str(&format!("{name}=failed {other:?}\n")),
+        }
+    }
+    let partial = report.with_extension("partial");
+    std::fs::write(&partial, lines).expect("the report is written");
+    std::fs::rename(&partial, &report).expect("the report is published");
+}
+
+/// Runs the helper above as a worker inside `job`, and says what each profile's launch came to.
+fn launches_by_a_worker_in(job: &AgentJob) -> std::collections::BTreeMap<String, String> {
+    let directory = private_directory();
+    let report = directory.join("report");
+    let arguments: Vec<String> = [
+        "--ignored",
+        "--exact",
+        "a_worker_in_a_job_tries_both_profiles",
+        "--nocapture",
+        "--test-threads=1",
+        report.to_string_lossy().as_ref(),
+    ]
+    .iter()
+    .map(|argument| (*argument).to_owned())
+    .collect();
+    let mut child = kr_worker::windows::launch::start(&kr_worker::windows::launch::Spec {
+        program: &this_executable(),
+        arguments: &arguments,
+        directory: &directory,
+        environment: &[],
+        session: None,
+        agent: job,
+        pipe_input: false,
+        pipe_output: false,
+    })
+    .expect("the worker starts in the job");
+    eventually("the worker reports", || report.exists());
+    let _ = child.wait();
+    let text = std::fs::read_to_string(&report).expect("the report");
+    let _ = std::fs::remove_dir_all(&directory);
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, what)| (name.to_owned(), what.to_owned()))
+        .collect()
+}
+
+/// KR-REQ-07.64: a worker that is itself in a job that restricts desktops cannot give a vendor's
+/// sandbox a desktop whatever job its agent is put in, so both profiles are refused by name, the
+/// reduced one included: the profile is no way past a restriction on the worker's own job. Control:
+/// the same worker in a job with no restriction starts both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_worker_in_a_job_that_restricts_desktops_is_refused_by_name_under_either_profile()
+ {
+    let plain = AgentJob::create().expect("a job");
+    let started = launches_by_a_worker_in(&plain);
+    assert_eq!(started["full"], "started", "{started:?}");
+    assert_eq!(started["reduced"], "started", "{started:?}");
+
+    let restricting = AgentJob::create_restricting(DESKTOP).expect("a restricting job");
+    let refused = launches_by_a_worker_in(&restricting);
+    for profile in ["full", "reduced"] {
+        assert!(
+            refused[profile].starts_with("refused")
+                && refused[profile].contains("this worker is itself in"),
+            "{profile}: {refused:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The real agent, where the environment names one.
 
 /// The Codex build a native run uses, from the environment, or nothing.
