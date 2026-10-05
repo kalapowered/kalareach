@@ -4084,7 +4084,12 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(!writing.is_finished());
+        // A writer the connection would not take more from waits for room where the platform parks
+        // it, so the answer is still in hand once the lease has ended. Where a waiter polls, as it
+        // does on Windows, it meets the lapse at its next poll and has already stopped.
+        if cfg!(unix) {
+            assert!(!writing.is_finished());
+        }
         let reading = tokio::spawn(async move { reader.read_message::<ControlFrame>().await });
         let written = tokio::time::timeout(Duration::from_secs(5), writing)
             .await
