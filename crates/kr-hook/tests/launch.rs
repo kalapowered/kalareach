@@ -398,7 +398,13 @@ impl Shell {
             );
             std::fs::create_dir_all(elsewhere.parent().expect("a directory"))
                 .expect("a directory for the registered forwarder");
-            kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-hook")), &elsewhere);
+            // Started once where nothing is timed: the first start of a program at a new path is
+            // the one the operating system checks.
+            kr_ipc::testing::place_and_start_once(
+                Path::new(env!("CARGO_BIN_EXE_kr-hook")),
+                &elsewhere,
+                &["--version"],
+            );
             elsewhere
         } else {
             placed.forwarder.clone()
