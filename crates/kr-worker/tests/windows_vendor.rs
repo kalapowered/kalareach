@@ -860,8 +860,8 @@ async fn kr_req_07_64_a_closure_waits_for_a_launch_it_overtakes_before_it_writes
     }
 }
 
-/// KR-REQ-07.64: a launch that fails after its process started, over the registration it could
-/// not publish, is ended with the record of it, so the closure that follows reads nothing of an
+/// KR-REQ-07.64: a launch that fails after its process started, over a credential it could not
+/// write, is ended with the record of it, so the closure that follows reads nothing of an
 /// agent that never stayed and its coverage reads complete. Control: the same failure under the
 /// full profile, which records no agent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -870,12 +870,10 @@ async fn kr_req_07_64_a_launch_that_fails_after_it_started_leaves_no_reduced_age
     for (which, ownership) in [(51, AgentOwnership::Full), (52, AgentOwnership::Reduced)] {
         let session = Arc::new(SessionJob::create().expect("a session job"));
         let failed = Launch::start_with(which, ownership, &session, |_, directory| {
-            // A name the registration cannot be written over, so the launch fails once its
+            // A name the launch's credential cannot be written to, so the launch fails once its
             // process is running.
-            let occupied = directory.join("registration");
-            std::fs::create_dir(&occupied).expect("the registration's name is taken");
-            std::fs::write(occupied.join("held"), b"held")
-                .expect("by a directory with something in it");
+            std::fs::write(directory.join("credential"), b"held")
+                .expect("the credential's name is taken");
         })
         .err()
         .expect("the launch fails after its process started");
