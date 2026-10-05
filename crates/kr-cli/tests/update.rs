@@ -4,8 +4,9 @@
 //! release it started from, or waits, exit 9, and says why.
 //!
 //! Every release here is assembled from the programs this workspace built: `kr`, the restoration
-//! guard, the control daemon, the worker and the forwarder, copied once to the internal disk and
-//! then given to each release as files of its own, as an installed release has. Each release
+//! guard, the control daemon, the worker, the description process, the forwarder and the plugin
+//! host, copied once to the internal disk and then given to each release as files of its own, as
+//! an installed release has. Each release
 //! carries an update channel root this process makes, whose targets key signs its manifest. Each
 //! test builds its store inside a host tree of its own, with its own runtime and state roots, so
 //! nothing here reads or changes the person's own installation. A daemon runs as a process of its
@@ -164,15 +165,29 @@ fn signed_document(manifest: &ReleaseManifest, signer: &Ed25519KeyPair) -> Strin
 /* Releases                                                                                      */
 /* -------------------------------------------------------------------------------------------- */
 
-/// The programs this workspace built, beside this test or where Cargo says, each with its digest.
+/// The programs of a release, by name: every executable a host runs, which a release carries in
+/// `bin/`. Written out here, not read from the list a release is checked against, so that a name
+/// dropped from that list is a release these tests still assemble whole.
+const PROGRAM_NAMES: [&str; 7] = [
+    "kr",
+    "kr-attach-guard",
+    "kr-worker",
+    "kr-controller",
+    "kr-describe-inference",
+    "kr-hook",
+    "kr-plugin-host",
+];
+
+/// The programs this workspace built, beside this test or where Cargo says, each by its name with
+/// its digest.
 ///
 /// Copied once for this whole process into the run's own directory on the internal disk, which
-/// goes when the process does. A build of this crate alone builds `kr` and the guard; the daemon,
-/// the worker and the forwarder are built by a workspace run, or by
-/// `cargo build -p kr-controller -p kr-worker -p kr-hook`, and a run without them fails and says
-/// so rather than passing without having tested anything.
-fn programs() -> &'static [(Program, PathBuf, Digest256, u64)] {
-    static COPIED: OnceLock<Vec<(Program, PathBuf, Digest256, u64)>> = OnceLock::new();
+/// goes when the process does. A build of this crate alone builds `kr` and the guard; the others
+/// are built by a workspace run, or by `cargo build -p kr-controller -p kr-worker -p kr-hook -p
+/// kr-plugin-host -p kr-describe-model --bin kr-describe-inference`, and a run without them fails
+/// and says so rather than passing without having tested anything.
+fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
+    static COPIED: OnceLock<Vec<(&'static str, PathBuf, Digest256, u64)>> = OnceLock::new();
     COPIED.get_or_init(|| {
         let beside = |name: &str| {
             let executable = std::env::current_exe().expect("this test binary");
@@ -190,26 +205,24 @@ fn programs() -> &'static [(Program, PathBuf, Digest256, u64)] {
             );
             candidate
         };
-        let sources = [
-            (Program::Kr, PathBuf::from(env!("CARGO_BIN_EXE_kr"))),
-            (
-                Program::AttachGuard,
-                PathBuf::from(env!("CARGO_BIN_EXE_kr-attach-guard")),
-            ),
-            (Program::Controller, beside("kr-controller")),
-            (Program::Worker, beside("kr-worker")),
-            (Program::Hook, beside("kr-hook")),
-        ];
+        let sources = PROGRAM_NAMES.map(|name| {
+            let source = match name {
+                "kr" => PathBuf::from(env!("CARGO_BIN_EXE_kr")),
+                "kr-attach-guard" => PathBuf::from(env!("CARGO_BIN_EXE_kr-attach-guard")),
+                other => beside(other),
+            };
+            (name, source)
+        });
         let directory = support::command_binaries().join("releases");
         std::fs::create_dir_all(&directory).expect("a directory for the programs");
         sources
             .into_iter()
-            .map(|(program, source)| {
-                let copied = directory.join(program.file_name());
+            .map(|(name, source)| {
+                let copied = directory.join(name);
                 kr_ipc::testing::place_program(&source, &copied);
                 let bytes = std::fs::read(&copied).expect("the program");
                 (
-                    program,
+                    name,
                     copied,
                     Digest256::from_bytes(kr_cbor::sha256(&bytes)),
                     bytes.len() as u64,
@@ -274,8 +287,8 @@ impl Assembled {
         let name = release(name);
         let mut files: Vec<ReleaseFile> = programs()
             .iter()
-            .map(|(program, _, digest, length)| ReleaseFile {
-                path: ReleasePath::new(format!("bin/{}", program.file_name())).expect("a path"),
+            .map(|(name, _, digest, length)| ReleaseFile {
+                path: ReleasePath::new(format!("bin/{name}")).expect("a path"),
                 length: U64::new(*length),
                 sha256: *digest,
                 mode: FileMode::Executable,
@@ -334,6 +347,17 @@ impl Assembled {
         )
     }
 
+    /// This release as a build that did not yet need `names` would have assembled it: it lists none
+    /// of them and its tree holds none, the rest unchanged.
+    fn without(mut self, names: &[&str]) -> Self {
+        self.manifest.files.retain(|file| {
+            !names
+                .iter()
+                .any(|name| file.path.as_str() == format!("bin/{name}"))
+        });
+        self
+    }
+
     fn name(&self) -> &ReleaseName {
         &self.manifest.release
     }
@@ -341,8 +365,11 @@ impl Assembled {
     /// Writes the release's tree at `directory`, its manifest signed by `signer`.
     fn write_signed(&self, directory: &Path, signer: &Ed25519KeyPair) {
         std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
-        for (program, copied, _, _) in programs() {
-            clone_file(copied, &directory.join("bin").join(program.file_name()));
+        for (name, copied, _, _) in programs() {
+            // A release assembled without a program lists none and carries none.
+            if self.manifest.file(&format!("bin/{name}")).is_some() {
+                clone_file(copied, &directory.join("bin").join(name));
+            }
         }
         let write = |path: &str, contents: &[u8]| {
             let file = directory.join(path);
@@ -1278,6 +1305,36 @@ fn kr_host_install_puts_a_first_release_in_a_store_and_makes_it_current() {
         String::from_utf8_lossy(&refused.stderr).contains("already has a current release"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+/// KR-REQ-26.09: `kr host install` refuses a tree whose signed manifest lists no plugin host, a
+/// program every host runs, and the same release with it is installed into the same store.
+#[test]
+fn kr_host_install_refuses_a_release_that_lacks_a_program_a_host_runs() {
+    let host = Host::bare();
+    let store = host.store.root().display().to_string();
+    let lacking = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).without(&["kr-plugin-host"]);
+    let tree = host.scratch("lacking").join(lacking.name().as_str());
+    lacking.write(&tree);
+    let refused = host.run(
+        &tree.join("bin").join("kr"),
+        &["host", "install", "--store", &store],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a release without it is refused"
+    );
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains("`kr-plugin-host`"), "{said}");
+    assert_eq!(host.store.current().ok().flatten(), None);
+
+    let whole = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&whole);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(whole.name().clone())
     );
 }
 
@@ -3459,6 +3516,118 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
             "a {what} file is refused"
         );
     }
+}
+
+/// KR-REQ-26.09: an update refuses a release whose signed manifest lists no program of one a host
+/// runs, whichever program that is, and says which. The same release with the program is taken, so
+/// the one program is the whole of the refusal.
+#[test]
+fn an_update_refuses_a_release_that_lacks_a_program_a_host_runs() {
+    let host = Host::bare();
+    let current = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&current);
+    let kr = host.store.stable(Program::Kr);
+    let check = |release: &Assembled, label: &str| {
+        let archive = host.scratch("archives").join(format!("{label}.tar.gz"));
+        release.archive(&archive);
+        host.run(
+            &kr,
+            &[
+                "host",
+                "update",
+                "--archive",
+                &archive.display().to_string(),
+                "--check",
+            ],
+        )
+    };
+
+    let control = check(&Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2), "whole");
+    assert!(
+        control.status.success(),
+        "a release that carries every program is checked: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    // Every program is tried before the test says anything, so one run names each that is let
+    // through.
+    let mut wrong = Vec::new();
+    for name in PROGRAM_NAMES {
+        let lacking = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).without(&[name]);
+        let refused = check(&lacking, name);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.code() != Some(1) {
+            wrong.push(format!(
+                "{name}: not refused, exit {:?}",
+                refused.status.code()
+            ));
+        } else if !said.contains(&format!("`{name}`")) {
+            wrong.push(format!("{name}: not named: {said}"));
+        } else if let Some(other) = PROGRAM_NAMES
+            .iter()
+            .find(|other| **other != name && said.contains(&format!("`{other}`")))
+        {
+            wrong.push(format!("{name}: {other} is named too: {said}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(current.name().clone())
+    );
+}
+
+/// KR-REQ-26.09: a release an earlier build put in the store, whose manifest lists fewer programs
+/// than a host now runs, stays: its programs start, `kr host versions` reads its manifest, and an
+/// update from it to a release that carries every program is taken. Only a release being taken in
+/// is held to the list of programs.
+#[test]
+fn a_release_in_the_store_that_lacks_a_program_is_kept_and_updated_from() {
+    let host = Host::create();
+    // The store's record, as an install writes it: readable by its owner alone.
+    std::fs::set_permissions(
+        host.store.record(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("the record's mode");
+    let older = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        .without(&["kr-plugin-host", "kr-describe-inference"]);
+    host.put(&older);
+    host.switch(older.name());
+
+    let (listed, versions) = host.kr_json(&["host", "versions", "--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_eq!(
+        versions["releases"][0]["release"],
+        older.name().as_str(),
+        "{versions}"
+    );
+    assert_eq!(versions["releases"][0]["sequence"], 1, "{versions}");
+
+    let newer = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let archive = host.scratch("archives").join("newer.tar.gz");
+    newer.archive(&archive);
+    let updated = host.run(
+        &host.store.stable(Program::Kr),
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(newer.name().clone())
+    );
 }
 
 /* -------------------------------------------------------------------------------------------- */

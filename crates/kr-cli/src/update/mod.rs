@@ -674,6 +674,7 @@ async fn stage_tree(
     };
     release::check_files(&manifest, &written)?;
     release::check_system(&manifest)?;
+    release::check_programs(&manifest)?;
     replace_kept(store, &manifest, &document, update_lock, "install")?;
     release::seal(&staged, &manifest)?;
     // Published and made current under the install lock: a control daemon of the release started
@@ -1066,6 +1067,7 @@ fn stage_archive(
     })?;
     trusted.admits_successor(&root)?;
     release::check_system(&manifest)?;
+    release::check_programs(&manifest)?;
     if manifest.release == current.release {
         return Ok(manifest);
     }

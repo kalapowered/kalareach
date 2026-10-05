@@ -672,6 +672,28 @@ pub fn check_files(manifest: &ReleaseManifest, written: &Written) -> Result<()> 
     Ok(())
 }
 
+/// Checks that the release lists every program a host of its target needs, as programs: a release
+/// without one is refused whole, whatever else it holds and whoever signed it.
+///
+/// What is listed here is the release's own account of itself, and [`check_files`] has already held
+/// the files to it. This holds the account to what a host runs: the command line, its restoration
+/// guard, the control daemon, the worker, the description process, the forwarder and the plugin
+/// host, each a program of `bin/`.
+///
+/// # Errors
+///
+/// Returns a refusal naming each program the manifest does not list.
+pub fn check_programs(manifest: &ReleaseManifest) -> Result<()> {
+    let missing = manifest.missing_programs();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Other(shown!(
+        "the release does not list every program of bin/ that a host needs: it lacks {}",
+        Shown::joined(missing.into_iter().map(|name| shown!("`{}`", name)), ", ")
+    )))
+}
+
 /// Reads the manifest a staged release holds, bounded.
 ///
 /// # Errors
