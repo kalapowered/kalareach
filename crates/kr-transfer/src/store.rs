@@ -1665,6 +1665,30 @@ impl Store {
             .map_err(TransferError::store)
     }
 
+    /// Records that the filesystem holding one scope's root is numbered `now` where the scope was
+    /// recorded under `was`.
+    ///
+    /// Only that scope's row changes. The same filesystem can hold other scopes, and each is
+    /// checked against its own directory when it is next used; a number that was this
+    /// filesystem's is not assumed still to be, for the roots recorded on any other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn renumber_scope(&self, scope_id: GrantId, was: u64, now: u64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE scopes SET root_device = ?3 WHERE scope_id = ?1 AND root_device = ?2",
+                params![
+                    uuid_sql(scope_id.get()),
+                    identity_sql(was),
+                    identity_sql(now)
+                ],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
     /// Revokes a read scope, which stops further bytes from every transfer that came from it.
     ///
     /// # Errors

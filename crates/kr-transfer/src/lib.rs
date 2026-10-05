@@ -97,8 +97,8 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub use crate::apple::AppleAcl;
 pub use crate::authority::{
-    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, FileOwner, MountId, ObjectIdentity,
-    ObjectPolicy, Privacy, RelativeName,
+    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, FileOwner, IdentityCheck, MountId,
+    ObjectIdentity, ObjectPolicy, Privacy, RelativeName,
 };
 pub use crate::clock::{Clock, ManualClock, SystemClock};
 pub use crate::download::{DownloadWriter, publish_transfer};

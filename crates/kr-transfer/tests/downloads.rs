@@ -1267,6 +1267,68 @@ fn a_cleanup_that_fails_keeps_the_bytes_charged_until_a_later_pass_succeeds() {
     assert_eq!(std::fs::read_dir(&area).expect("reads the area").count(), 0);
 }
 
+/// KR-REQ-14.16: a scope on a filesystem that is numbered differently since it was registered, as
+/// a container's is when it starts again, is still the registered scope, and its record takes the
+/// number it has now. A directory with another inode is refused under any number.
+#[cfg(unix)]
+#[test]
+fn a_scope_found_under_another_device_number_is_still_the_registered_one() {
+    let harness = Harness::create();
+    let tree = source_tree();
+    std::fs::write(tree.path().join("notes.txt"), pattern(512)).expect("writes the source");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    let now = AuthorisedDirectory::open_root(harness.environment_id(), tree.path())
+        .expect("opens the tree")
+        .identity();
+    let record = |statements: &str| {
+        rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+            &harness.host.environment(),
+        ))
+        .expect("opens the store")
+        .execute_batch(statements)
+        .expect("rewrites the record");
+    };
+    let recorded_device = || -> i64 {
+        rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+            &harness.host.environment(),
+        ))
+        .expect("opens the store")
+        .query_row("SELECT root_device FROM scopes", [], |row| row.get(0))
+        .expect("reads the record")
+    };
+    let begin = || {
+        harness.service.download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Scope {
+                    scope_id: scope,
+                    relative_path: "notes.txt".to_owned(),
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+    };
+
+    // What the scope recorded was recorded under another number than this filesystem has now.
+    record("UPDATE scopes SET root_device = root_device + 1;");
+    begin().expect("the scope is the registered one under its new number");
+    assert_eq!(
+        recorded_device(),
+        now.device as i64,
+        "the record takes the number the filesystem has now"
+    );
+
+    // A different directory is not the registered one because its number moved as well.
+    record("UPDATE scopes SET root_device = root_device + 1, root_file_id = root_file_id + 1;");
+    let refusal = begin().expect_err("refuses a directory that is not the registered object");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
 /// KR-REQ-14.16: registering the same tree again does not revive a transfer whose scope was
 /// revoked.
 #[test]
