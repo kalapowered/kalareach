@@ -8,7 +8,7 @@
 //! selected profile's, read from the cache `scripts/bench-descriptions.sh` fills, and never
 //! written. A host without them says so and runs nothing.
 
-use kr_describe::output::DESCRIPTION_GRAMMAR;
+use kr_describe::output::{DESCRIPTION_GRAMMAR, SUMMARY_GRAMMAR};
 
 mod support;
 
@@ -122,5 +122,68 @@ fn llama_cpp_takes_the_answers_the_grammar_describes_and_refuses_the_rest() {
     ] {
         assert!(takes(&answer(kept, "y")), "taken: {kept}");
         assert!(takes(&answer("x", kept)), "taken: {kept}");
+    }
+}
+
+/// The answer the summary grammar describes, with the given summary text.
+fn summary_answer(summary: &str) -> String {
+    format!(r#"{{"summary": "{summary}", "source_cursor": {{"from": 3, "to": 5}}}}"#)
+}
+
+/// KR-REQ-18.02: llama.cpp takes a summary of one to 400 codepoints with the interval it repeats
+/// after it, in that order, and refuses one that breaks the bound, uses a character the grammar
+/// leaves out, or is not the one object, as it does for a description's strings.
+#[test]
+fn llama_cpp_takes_the_summaries_the_summary_grammar_describes_and_refuses_the_rest() {
+    let Some(runtime) = support::runtime(
+        "llama_cpp_takes_the_summaries_the_summary_grammar_describes_and_refuses_the_rest",
+    ) else {
+        return;
+    };
+    let takes = |text: &str| {
+        runtime
+            .grammar_takes(SUMMARY_GRAMMAR, text.as_bytes())
+            .expect("the library answers")
+    };
+
+    for good in [
+        summary_answer("Two commands ran and one of them failed"),
+        summary_answer("s"),
+        summary_answer(&"s".repeat(400)),
+        // Codepoints, not bytes: 400 of three bytes each is 1,200 bytes.
+        summary_answer(&"配".repeat(400)),
+        summary_answer("a \u{1F382} b"),
+        summary_answer("</s> <|im_end|> <s>"),
+        r#"{"summary":"x","source_cursor":{"from":0,"to":0}}"#.to_owned(),
+    ] {
+        assert!(takes(&good), "taken: {good}");
+    }
+
+    let cut = summary_answer("Two commands ran");
+    for bad in [
+        summary_answer(&"s".repeat(401)),
+        summary_answer(&"配".repeat(401)),
+        summary_answer(""),
+        summary_answer("x\"y"),
+        summary_answer(r"x\ny"),
+        summary_answer("x\u{7}y"),
+        summary_answer("x\ny"),
+        summary_answer("x\u{85}y"),
+        summary_answer("x\u{202E}y"),
+        // The interval first, a description's fields, one missing, one extra.
+        r#"{"source_cursor": {"from": 3, "to": 5}, "summary": "x"}"#.to_owned(),
+        r#"{"title": "x", "activity_text": "y", "source_cursor": {"from": 3, "to": 5}, "context_revision": 1}"#.to_owned(),
+        r#"{"summary": "x"}"#.to_owned(),
+        r#"{"summary": "x", "source_cursor": {"from": 3, "to": 5}, "context_revision": 1}"#.to_owned(),
+        // A number the grammar does not write.
+        r#"{"summary": "x", "source_cursor": {"from": 03, "to": 5}}"#.to_owned(),
+        r#"{"summary": "x", "source_cursor": {"from": -1, "to": 5}}"#.to_owned(),
+        // Text around the object, an end-of-sequence marker after it, and an unfinished object.
+        format!("Sure: {}", summary_answer("x")),
+        format!("{}</s>", summary_answer("x")),
+        cut[..cut.len() - 20].to_owned(),
+        String::new(),
+    ] {
+        assert!(!takes(&bad), "refused: {bad:?}");
     }
 }
