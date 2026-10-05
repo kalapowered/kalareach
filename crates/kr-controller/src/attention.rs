@@ -4107,7 +4107,18 @@ mod tests {
             .await
             .expect("the write stops")
             .expect("the write finishes");
-        assert!(written.is_err(), "no byte went after the lease ended");
+        // The refusal the write makes once part of the answer has gone and the lease no longer
+        // holds, and not a failure of the connection or of the encoding before anything was sent.
+        assert!(
+            matches!(
+                written,
+                Err(kr_ipc::IpcError::Socket {
+                    operation: "write",
+                    ..
+                })
+            ),
+            "no byte went after the lease ended: {written:?}"
+        );
         assert!(
             tokio::time::timeout(Duration::from_secs(5), reading)
                 .await
