@@ -373,14 +373,15 @@ impl InstalledConnector {
     ///
     /// A package that installs a native bridge gets the one its installation put in place, and
     /// none where the installation did not. A package that installs none gets, while its
-    /// integration applies, its own hook on `launcher`, this installation's own `kr-hook`: such a
-    /// package's hooks come from the launch itself, as Qoder CLI's inline settings register them,
-    /// naming the forwarder by the path the installation keeps current, or, in a package written
-    /// before that path was written, by its own name.
+    /// integration applies, its own hook on `forwarder`, the forwarder the installation registers
+    /// (the caller falls back to the launcher's own `kr-hook` where none is): such a package's
+    /// hooks come from the launch itself, as Qoder CLI's inline settings register them, naming the
+    /// forwarder by the path the installation keeps current, or, in a package written before that
+    /// path was written, by its own name.
     /// Whatever the flags say, a bridge is admitted only when it declares the package's own
     /// application and a surface this bridge has, and its process runs this bridge's forwarder.
     #[must_use]
-    pub fn launch_bridge(&self, launcher: &std::path::Path) -> Option<InstalledBridge> {
+    pub fn launch_bridge(&self, forwarder: &std::path::Path) -> Option<InstalledBridge> {
         if self.manifest.native_bridge.is_present() {
             return self.installed_bridge();
         }
@@ -389,7 +390,7 @@ impl InstalledConnector {
             plugin_id: self.plugin_id(),
             application: self.manifest.plugin_name.as_str().to_owned(),
             surfaces: std::iter::once(BridgeSurface::Hook).collect(),
-            forwarder: launcher.to_path_buf(),
+            forwarder: forwarder.to_path_buf(),
         })
     }
 
