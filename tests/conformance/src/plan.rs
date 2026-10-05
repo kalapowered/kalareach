@@ -705,7 +705,11 @@ fn windows() -> Vec<Step> {
                 "--test",
                 "network_host",
             ],
-        ),
+        )
+        .skipping(&[(
+            "the_startup_exchange_binds_a_worker_to_its_own_reservation",
+            "after the daemon refuses a claim and lets go of the connection, one run in ten does not see the connection end on this platform and waits out the case's bound",
+        )]),
         Step::cargo(
             Group::Rust,
             "the forwarder",
