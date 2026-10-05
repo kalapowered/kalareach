@@ -165,18 +165,17 @@ impl Host {
 
     /// The environment `kr` runs with: this host's directories on top of the platform's own, and
     /// never a session or attachment identifier of this test's own.
-    fn environment(&self) -> Vec<(String, String)> {
-        let mut environment: Vec<(String, String)> = std::env::vars()
+    fn environment(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        // The process's own variables as the system holds them: a name or value that is not text is
+        // handed on as it is, where reading them as text would stop this test on it.
+        let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
             .filter(|(name, _)| name != "KR_SESSION" && name != "KR_ATTACHMENT")
             .collect();
         environment.push((
-            "KR_RUNTIME_DIR".to_owned(),
-            self.temp.paths().runtime_root().display().to_string(),
+            "KR_RUNTIME_DIR".into(),
+            self.temp.paths().runtime_root().into(),
         ));
-        environment.push((
-            "KR_STATE_DIR".to_owned(),
-            self.temp.paths().state_root().display().to_string(),
-        ));
+        environment.push(("KR_STATE_DIR".into(), self.temp.paths().state_root().into()));
         environment
     }
 
