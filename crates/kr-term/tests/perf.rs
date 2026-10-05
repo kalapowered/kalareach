@@ -745,6 +745,21 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
 /// the account carried what the retained rows cost, every read read every retained row.
 #[test]
 fn a_read_reads_as_many_rows_as_the_geometry_has() {
+    rows_read_against_history_depth(false);
+}
+
+/// A session that settles after every read reads as many rows as one that does not.
+///
+/// A session with a projected attachment settles after every batch of output, so the cost of
+/// settling is paid as many times as a read is. What it reads must not grow with the history either.
+#[test]
+fn a_settled_read_reads_as_many_rows_as_the_geometry_has() {
+    rows_read_against_history_depth(true);
+}
+
+/// Reads the same bytes into a session with no history and into one whose history is at its bound,
+/// and compares the rows each read, settling after every read when `settle` says to.
+fn rows_read_against_history_depth(settle: bool) {
     /// Reads per session, over several of the scheduled measurement's intervals.
     const READS: usize = 200;
     /// How much further apart the two may be before the reading is growing with the history.
@@ -755,6 +770,11 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
     /// history would be twenty times the shallow figure rather than under twice it.
     const TOLERANCE: u64 = 2;
 
+    let measurement = if settle {
+        "KR-PERF-007 rows read by a settled read against history depth"
+    } else {
+        "KR-PERF-007 rows read against history depth"
+    };
     let read = build_scrolling_stream(4 * 1024);
     let session = || {
         Engine::new(EngineConfig {
@@ -764,6 +784,13 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
         .expect("engine")
     };
     let mut now_ms = 0u64;
+    let mut feed = |engine: &mut Engine, bytes: &[u8]| {
+        now_ms += 1;
+        engine.feed(bytes, now_ms);
+        if settle {
+            engine.quiesce(now_ms);
+        }
+    };
 
     // Emptied at the start of every read, so the history behind each one is nothing. The clear
     // travels with the read rather than in a read of its own, so both sessions take the same number
@@ -773,8 +800,7 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
     let mut shallow = session();
     let mut shallow_rows = 0usize;
     for _ in 0..READS {
-        now_ms += 1;
-        shallow.feed(&cleared, now_ms);
+        feed(&mut shallow, &cleared);
         shallow_rows = shallow_rows.max(shallow.grid().scrollback_rows());
     }
     let shallow_read = shallow.grid().rows_read();
@@ -784,15 +810,13 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
     let limit = deep.budget().limits().row_cache_bytes;
     let mut fills = 0usize;
     while deep.grid().history_bytes() <= limit * 9 / 10 && fills < 4_096 {
-        now_ms += 1;
         fills += 1;
-        deep.feed(&read, now_ms);
+        feed(&mut deep, &read);
     }
     let filled = deep.grid().rows_read();
     let deep_rows = deep.grid().scrollback_rows();
     for _ in 0..READS {
-        now_ms += 1;
-        deep.feed(&read, now_ms);
+        feed(&mut deep, &read);
     }
     let deep_read = deep.grid().rows_read() - filled;
 
@@ -818,7 +842,7 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
         format!("  deep rows read    {deep_read}, against at most {TOLERANCE} times the shallow"),
         format!("  verdict           {verdict}"),
     ]);
-    report("KR-PERF-007 rows read against history depth", &lines);
+    report(measurement, &lines);
 
     assert!(
         deep_rows > shallow_rows * 10,
