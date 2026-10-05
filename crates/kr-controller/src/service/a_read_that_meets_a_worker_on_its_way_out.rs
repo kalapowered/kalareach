@@ -821,8 +821,16 @@ fn carries_history(payload: &[u8]) -> bool {
 /// worker. The row names this test's process, which is the process the kernel is asked about.
 /// The daemon has not heard from the worker yet, as after a start that found it running.
 pub(super) async fn scripted(script: &Arc<Scripted>) -> Silent {
+    scripted_on(script, None).await
+}
+
+/// The same world, started on the clocks a test moves by hand where it gives some.
+pub(super) async fn scripted_on(
+    script: &Arc<Scripted>,
+    clocks: Option<crate::service::Clocks>,
+) -> Silent {
     let script = Arc::clone(script);
-    let world = fake::fake_world(move |listener, identity, endpoint_text| {
+    let world = fake::fake_world_on(clocks, move |listener, identity, endpoint_text| {
         serve_scripted(listener, identity, endpoint_text, script)
     })
     .await;

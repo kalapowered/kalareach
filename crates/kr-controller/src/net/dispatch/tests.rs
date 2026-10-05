@@ -2418,25 +2418,24 @@ async fn record_directly(
 }
 
 /// Stops the record of a draft where it has passed the daemon's own check and not yet entered the
-/// transfer service, withdraws the registration `connection_id` was admitted under there, and lets
-/// the record go on.
-async fn withdrawing_the_registration_before_the_record(
+/// transfer service, brings `lapse` about there, and lets the record go on.
+async fn lapsing_before_the_record(
     controller: &std::sync::Arc<crate::service::Controller>,
-    connection_id: kr_protocol::ids::ConnectionId,
+    lapse: impl FnOnce(),
     prompt: impl std::future::Future<Output = ()>,
 ) {
     let (arrived, release) = controller.transfer().pause_after_the_outer_check();
-    let withdrawing = async {
+    let lapsing = async {
         tokio::task::spawn_blocking(move || {
             arrived.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await
         .expect("the waiting thread finishes")
         .expect("the record reaches the place it is stopped at");
-        controller.admitted_table().remove(&connection_id);
+        lapse();
         release.send(()).expect("the record goes on");
     };
-    tokio::join!(prompt, withdrawing);
+    tokio::join!(prompt, lapsing);
 }
 
 /// KR-REQ-14.11, KR-REQ-09.09: the record of the draft a local prompt names is made under the
@@ -2470,13 +2469,19 @@ async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_reco
     );
 
     let mut answered = None;
-    withdrawing_the_registration_before_the_record(controller, admission.connection_id, async {
-        answered = Some(
-            controller
-                .perform(&actor, admission.connection_id, None, mutation)
-                .await,
-        );
-    })
+    lapsing_before_the_record(
+        controller,
+        || {
+            controller.admitted_table().remove(&admission.connection_id);
+        },
+        async {
+            answered = Some(
+                controller
+                    .perform(&actor, admission.connection_id, None, mutation)
+                    .await,
+            );
+        },
+    )
     .await;
     let Some(ControlFrame::Response(Response {
         outcome: Outcome::Error(error),
@@ -2518,14 +2523,22 @@ async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_rec
     let prompt = a_prompt_naming(&world, &connection, Method::AgentPromptSubmit, 7, draft_id);
 
     let mut answered = None;
-    withdrawing_the_registration_before_the_record(controller, connection.connection_id(), async {
-        answered = Some(
-            connection
-                .answer(ControlFrame::Mutation(Box::new(prompt)))
-                .await
-                .expect("the prompt is answered"),
-        );
-    })
+    lapsing_before_the_record(
+        controller,
+        || {
+            controller
+                .admitted_table()
+                .remove(&connection.connection_id());
+        },
+        async {
+            answered = Some(
+                connection
+                    .answer(ControlFrame::Mutation(Box::new(prompt)))
+                    .await
+                    .expect("the prompt is answered"),
+            );
+        },
+    )
     .await;
     let answered = answered.expect("the prompt was answered");
     let ControlFrame::Response(kr_protocol::envelope::Response {
@@ -2543,6 +2556,99 @@ async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_rec
     assert!(
         prompts_the_worker_was_asked_to_take(&script).is_empty(),
         "and the prompt was sent"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11, KR-REQ-09.09: the deadline a prompt was admitted under is asked again where its
+/// draft is recorded. The clock is moved past the deadline at the place the record is stopped,
+/// with the registration standing, so it is the deadline that refuses: nothing is recorded and
+/// nothing is sent, on both routes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_whose_deadline_passes_before_its_draft_is_recorded_records_nothing() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let (continuous, _wall, clocks) = crate::service::net::tests::manual_clocks();
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted_on(&script, Some(clocks)).await;
+    let controller = &world.controller;
+    let past_it = || continuous.advance(std::time::Duration::from_secs(3_600));
+
+    // A caller at this machine.
+    let admission = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "late.bin");
+    let mutation = a_local_prompt(
+        &world,
+        &admission,
+        ActionId::new(kr_ipc::new_uuid()),
+        Nullable::some(draft_id),
+        Nullable::null(),
+    );
+    let mut answered = None;
+    lapsing_before_the_record(controller, past_it, async {
+        answered = Some(
+            controller
+                .perform(&actor, admission.connection_id, None, mutation)
+                .await,
+        );
+    })
+    .await;
+    let Some(ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    })) = answered
+    else {
+        panic!("the local prompt is refused: {answered:?}");
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(
+        error.message.contains("deadline"),
+        "it is the deadline that refused: {}",
+        error.message
+    );
+    assert!(!is_submitted(controller, &actor, draft_id));
+
+    // A paired device.
+    let connection =
+        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 47));
+    let device = connection.device.principal();
+    let draft_id =
+        a_draft_holding_an_attachment(controller, world.environment_id, &device, "later.bin");
+    let prompt = a_prompt_naming(&world, &connection, Method::AgentPromptSubmit, 8, draft_id);
+    let mut answered = None;
+    lapsing_before_the_record(controller, past_it, async {
+        answered = Some(
+            connection
+                .answer(ControlFrame::Mutation(Box::new(prompt)))
+                .await
+                .expect("the prompt is answered"),
+        );
+    })
+    .await;
+    let answered = answered.expect("the prompt was answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    }) = answered.frame()
+    else {
+        panic!("the paired prompt is refused: {:?}", answered.frame());
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(
+        error.message.contains("deadline"),
+        "it is the deadline that refused: {}",
+        error.message
+    );
+    assert!(!is_submitted(controller, &device, draft_id));
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "and neither prompt was sent"
     );
     world.serving.abort();
 }
