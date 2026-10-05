@@ -16,12 +16,12 @@
          }
          // Now we have peeked far enough; check the event.
          // If it matches the char, then increment the index.
-@@ -638,6 +640,16 @@
+@@ -638,7 +640,17 @@
          self.event_queue.insert_front(self.peeked.drain(self.idx..));
          self.idx = 0;
          self.subidx = 0;
-+        kr_bridge::note_peeked(&[]);
 -        std::mem::take(&mut self.peeked)
++        kr_bridge::note_peeked(&[]);
 +        // The keys go to a binding, which hands them back as the reader's own input when it
 +        // replays them. They are no longer keys the person's typing set aside during a terminal
 +        // query, which is what the mark says.
@@ -34,6 +34,7 @@
 +        consumed
      }
  
+     /// Test if any of our peeked events are readline or check_exit.
 @@ -773,6 +785,7 @@
              "Events left on the queue - missing restart or consume?",
          );
