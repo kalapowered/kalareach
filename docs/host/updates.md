@@ -181,12 +181,24 @@ A release is taken in only whole and checked:
   `share/update-root.json`; a release carries that root or the one that follows it, the next
   version, signed by a threshold of the current root's root keys as well as its own.
 - Every file the manifest lists is there with its length and digest, and nothing else is.
+- The following programs must all be listed as programs of `bin/` in order for a release to be
+  accepted, regardless of who signed it: `kr`, `kr-attach-guard`, `kr-controller`, `kr-worker`,
+  `kr-describe-inference`, `kr-hook`, `kr-plugin-host`. If any of those are missing, the entire
+  release will be refused, and the refusal names each one it lacks.
 - It is for this host's target, and this host's operating system is at or above its floor
   (the macOS release, or the GNU C library's version on Linux).
 - It is newer than the current release.
 
 Only then is it made read-only, flushed and renamed into `versions/`. What an archive says about a
 file's mode or owner is not read: a file is a program when the manifest says it is.
+
+There is a list of programs (`scripts/release-programs.json`) that the release builds and the
+Windows archive check read as well. A host holds a release that is being taken in to the list its
+own build carries, and holds nothing already in the store to it. A release installed from a previous
+build with fewer programs in its manifest can still be started, is still shown by `kr host
+versions`, and can be updated to a release with all the programs that the host now needs. Thus, a
+program is added to the list in the release that needs it, and removed one release before the
+release that no longer needs it.
 
 A release that carries no update channel root can be installed with `kr host install`, which takes
 the release's own word for what it is, and a host whose current release carries none has no key to
