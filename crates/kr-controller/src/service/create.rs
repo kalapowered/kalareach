@@ -104,10 +104,11 @@ pub(super) fn host_context_variables(
             taken.insert(name, value);
         }
     }
-    // A shell starts in its `HOME` and reads its startup files from there, so a daemon whose login
-    // gave it none, or one that is not an absolute path, gives its sessions the account's own home
-    // instead, and a root where the account has none, as a helper does for the sessions it creates.
-    // A Windows session has no `HOME`.
+    // `HOME` decides which startup files a shell reads and what `~` means in it, so a daemon whose
+    // login gave it none, or one that is not an absolute path, gives its sessions the account's own
+    // home instead, and a root where the account has none, as a helper does for the sessions it
+    // creates. The shell's directory is the create's own and not this. A Windows session has no
+    // `HOME`.
     #[cfg(unix)]
     {
         let home = kr_ipc::paths::session_home(taken.get("HOME").map(String::as_str));

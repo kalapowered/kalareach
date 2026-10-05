@@ -1206,15 +1206,21 @@ async fn a_session_an_app_creates_gets_the_hosts_environment_and_none_of_the_dae
     daemon.stop();
 }
 
-/// KR-REQ-03.14, KR-REQ-03.15: a session the host starts with its own environment has an absolute
-/// `HOME` whatever login the daemon was started from: a daemon that was given a `HOME` that is not
-/// an absolute path, or none, gives its sessions the account's own home, as a bridge's helper does
-/// for the sessions it creates.
+/// KR-REQ-07.25: a session the host starts with its own environment has an absolute `HOME`
+/// whatever login the daemon was started from: a daemon that was given a `HOME` that is not an
+/// absolute path, or none, gives its sessions the account's own home, as a bridge's helper does for
+/// the sessions it creates, and a root where the system has no home for the account.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_the_host_starts_has_an_absolute_home_whatever_login_the_daemon_has() {
     let scratch = tempfile::tempdir().expect("a directory");
     let directory = scratch.path().to_path_buf();
+    // What the system records as this account's home, asked here and not through the lookup the
+    // daemon makes, so a daemon that skipped the record would be seen to.
+    let account_home = kr_ipc::paths::passwd_entry()
+        .and_then(|entry| entry.home)
+        .filter(|home| home.starts_with('/'))
+        .unwrap_or_else(|| "/".to_owned());
     for (login, given) in [
         ("a relative HOME", Some("relative/home")),
         ("no HOME", None),
@@ -1237,6 +1243,10 @@ async fn a_session_the_host_starts_has_an_absolute_home_whatever_login_the_daemo
         assert!(
             home.starts_with('/'),
             "{login}: the shell's HOME is not an absolute path: {home:?}"
+        );
+        assert_eq!(
+            home, &account_home,
+            "{login}: the shell's HOME is not the account's own"
         );
         daemon.stop();
     }
