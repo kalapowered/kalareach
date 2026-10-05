@@ -1875,6 +1875,82 @@ pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gestur
     );
 }
 
+/// A key a binding hands back to the editor is the editor's own input, even when the person typed
+/// it while the editor waited for the terminal's answer: the gesture is only what the person's own
+/// key press is, so this one is the editor's to deal with and not a hint's.
+///
+/// `self-insert` bound to a sequence that ends in the gesture replays the whole sequence, and the
+/// terminal is made slow to answer so that both keys are set aside first.
+pub fn a_gesture_a_binding_hands_back_is_the_editors_own_input(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "bind ctrl-x,ctrl-d self-insert\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+
+    session.hold_terminal_answers();
+    let before_command = session.written();
+    assert!(session.answered("kr-ready"));
+    let enter = session.next_prompt();
+    assert!(
+        session
+            .drew_after(before_command, "\x1b[0c", REPLY)
+            .was_drawn(),
+        "the editor asked the terminal nothing at its next prompt:\n{}",
+        session.terminal_output()
+    );
+
+    let before_keys = session.written();
+    session.type_bytes(b"\x18\x04");
+    let deadline = session.deadline_for(REPLY).0;
+    loop {
+        let held = session.fence_exchange_before(&enter, fence_id(42), deadline);
+        if held.snapshot.queued_keys >= U64::new(2) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the editor never took both keys it was typed:\n{}",
+            session.terminal_output()
+        );
+    }
+
+    // From here the editor either consumes the replayed gesture and says so with its hint, or
+    // leaves it to its own handling, which at an empty prompt ends the shell: the first of the two
+    // to happen is the answer.
+    session.release_terminal_answers();
+    let deadline = session.deadline_for(REPLY);
+    let hinted = session.expecting_the_bridge_to_go(|session| {
+        loop {
+            if !session.alive() {
+                break false;
+            }
+            if session
+                .drew_after(before_keys, DETACH_HINT, Duration::ZERO)
+                .was_drawn()
+            {
+                break true;
+            }
+            assert!(
+                !deadline.passed(),
+                "the editor neither hinted nor ended:\n{}",
+                session.terminal_output()
+            );
+            session.pump(Duration::from_millis(25));
+        }
+    });
+    assert!(
+        !hinted,
+        "a gesture a binding handed back was taken for one the person made:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// `takeover-partial-escape` and `takeover-quoted-insertion`: the cancellation the contract needs.
 pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) {
     // A reader with no key wait a takeover can end is not one this case is for, and a suite that

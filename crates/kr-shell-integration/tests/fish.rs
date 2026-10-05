@@ -141,6 +141,13 @@ fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture() 
     shellpkg::a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture(FISH);
 }
 
+/// KR-REQ-07.36, KR-REQ-07.73
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_gesture_a_binding_hands_back_is_the_editors_own_input() {
+    shellpkg::a_gesture_a_binding_hands_back_is_the_editors_own_input(FISH);
+}
+
 /// KR-REQ-07.36
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
