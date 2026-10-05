@@ -78,8 +78,8 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("attachment_upload_status", Some(Method::UploadStatus)),
     ("attachment_image", Some(Method::DownloadBegin)),
     ("attachment_image_chunk", Some(Method::DownloadChunk)),
-    // History. A live session's is read from its own worker, and a closed one's from the host's
-    // archive.
+    // History and receipts. A live session's are read from its own worker, and a closed one's from
+    // the host's archive.
     ("history_page", Some(Method::HistoryPage)),
     ("action_read", Some(Method::ActionRead)),
     ("action_cancel", Some(Method::ActionCancel)),
@@ -621,11 +621,29 @@ read_command!(
     question_read, Method::QuestionRead,
     kr_protocol::question::QuestionReadParams => kr_protocol::question::QuestionReadResult
 );
-read_command!(
-    /// Reads what became of one action.
-    action_read, Method::ActionRead,
-    kr_protocol::receipt::ActionReadParams => kr_protocol::receipt::ActionReadResult
-);
+/// Reads what became of one action.
+///
+/// The receipt of an action on a live session is that session's worker's, which performed it, so
+/// it is read on the session's own worker link; the control daemon refuses a live session's
+/// receipt. The daemon serves the receipts of a session whose worker has ended and of the effects
+/// the host performed itself, which name no session. Which it is follows from the session the
+/// request names and from whether that session's worker has a descriptor on this machine.
+#[tauri::command]
+pub async fn action_read(
+    state: State<'_, AppState>,
+    links: State<'_, crate::agent::WorkerLinks>,
+    params: Value,
+) -> Result<Value> {
+    let typed: kr_protocol::receipt::ActionReadParams = decode(params)?;
+    let answer: kr_protocol::receipt::ActionReadResult = match typed.session_id {
+        Some(session_id) if links.serves(session_id)? => {
+            links.read(session_id, Method::ActionRead, &typed).await?
+        }
+        _ => state.session()?.read(Method::ActionRead, &typed).await?,
+    };
+    encode(&answer)
+}
+
 /// Reads one page of a session's retained output, from the cursor and within the byte bound the
 /// page names.
 ///
