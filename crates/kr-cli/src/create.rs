@@ -56,6 +56,22 @@ pub fn environment_snapshot(
     shown()
 }
 
+/// The variables this process was started with, as a create carries them.
+///
+/// A create carries text, so a variable whose name or value is not text is left out and the others
+/// go. The process's own environment may hold one: nothing stops a login from putting any bytes
+/// there.
+pub fn process_variables() -> Vec<EnvironmentVariable> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| {
+            Some(EnvironmentVariable {
+                name: name.into_string().ok()?,
+                value: value.into_string().ok()?,
+            })
+        })
+        .collect()
+}
+
 /// What `--palette` was given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteChoice {

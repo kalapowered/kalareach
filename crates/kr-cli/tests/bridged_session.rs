@@ -1100,6 +1100,34 @@ async fn a_shown_session_created_through_a_bridge_has_the_destination_logins_var
     let _ = shell.wait();
 }
 
+/// KR-REQ-07.25: a session created here for a person who is shown it carries the terminal's
+/// environment, and a variable of it that is not text does not stop the create: the others arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_created_from_a_terminal_whose_environment_is_not_all_text_is_still_created() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let world = World::start().await;
+    let terminal = a_created_session_attached_on_a_terminal(
+        &world,
+        "",
+        &[
+            ("EXAMPLE_KEPT", std::ffi::OsStr::new("kept")),
+            ("EXAMPLE_BYTES", std::ffi::OsStr::from_bytes(b"\xff\xfe")),
+        ],
+    );
+    terminal.types("printf 'reports|%s|\\n' \"$EXAMPLE_KEPT\"\r");
+    let printed = terminal.reported_within(
+        "reports|",
+        1,
+        "the shell reported the variable it was given",
+    );
+    assert_eq!(printed[0], "kept", "the text variable reached the shell");
+    terminal.types("exit\r");
+    terminal.expect_within("create-finished-", "the command ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+}
+
 /// Creates a session through a bridge from a terminal that is asked for its colours while the
 /// person types five bytes, with the destination unreachable for the attachment that follows, and
 /// returns what the terminal showed.

@@ -215,14 +215,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 })),
                 dimensions: Nullable(dimensions),
                 worker_profile: profile,
-                environment_snapshot: kr_cli::create::environment_snapshot(presentation, || {
-                    std::env::vars()
-                        .map(|(name, value)| kr_protocol::session::EnvironmentVariable {
-                            name,
-                            value,
-                        })
-                        .collect()
-                }),
+                environment_snapshot: kr_cli::create::environment_snapshot(
+                    presentation,
+                    kr_cli::create::process_variables,
+                ),
                 // Chosen here, before anything connects, because a probe of this terminal is part
                 // of choosing it and a session's palette is fixed at creation.
                 palette: Nullable(palette),
