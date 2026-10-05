@@ -276,6 +276,23 @@ impl Probes {
         read_runs(&self.root.join("probe.record"))
     }
 
+    /// Places a program whose name has a colon in it on the search path: a shell with drives reads
+    /// that as a drive's name in front of a path.
+    pub fn place_the_colon_program(&self) {
+        write_recorder(
+            &self.root.join("bin").join("kr:probe"),
+            &self.root.join("colon.record"),
+            "colon-",
+            "ran",
+        );
+    }
+
+    /// Every start of the program whose name has a colon in it so far.
+    #[must_use]
+    pub fn colon_runs(&self) -> Vec<ProbeRun> {
+        read_runs(&self.root.join("colon.record"))
+    }
+
     /// Every start of the launcher's stand-in so far.
     #[must_use]
     pub fn launches(&self) -> Vec<ProbeRun> {
@@ -1007,6 +1024,16 @@ pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
         let asked = session.run_asking(&format!("& '{probe}' by-path"), "probe-ran");
         assert!(asked.is_empty(), "a path asked: {asked:?}");
         assert_eq!(last_run(&probes).arguments, ["by-path"]);
+        // A name with a colon in it is read as a drive's name in front of a path where there are
+        // drives, so it is not asked about either: the host's own test of a path looks for
+        // separators and would let it through.
+        probes.place_the_colon_program();
+        let asked = session.run_asking("kr:probe by-colon", "colon-ran");
+        assert!(asked.is_empty(), "a name with a colon asked: {asked:?}");
+        assert_eq!(
+            probes.colon_runs().last().map(|run| run.arguments.clone()),
+            Some(vec!["by-colon".to_owned()])
+        );
         return;
     }
     let asked = session.run_asking(&format!("'{probe}' by-path"), "probe-ran");
