@@ -208,7 +208,8 @@ The second patch adds what the exclusions need and the reader does not already k
 events a sequence has peeked and not resolved, an input function waiting for the target character
 it takes as an argument, `get-key` waiting for the literal key it reports, and where the character
 being judged came from. A key the person types while the reader waits for the terminal's answer to
-its own question is marked when the reader sets it aside, so it still counts as the person's.
+its own question is marked when the reader sets it aside, so it still counts as the person's until
+a binding takes it and hands it back.
 
 This is patch #4. It adds the two points of the command integration in fish: the interactive loop,
 which reports the line the person accepted, and `exec_external_command`, which asks before it forks
