@@ -491,23 +491,49 @@ pub struct Released {
     ticket: Ticket,
 }
 
+impl Released {
+    /// The answer to the request `request_id` that a read came to, with what releasing it takes.
+    pub(crate) fn of(request_id: RequestId, read: Answer<Read>) -> Self {
+        match read {
+            Ok(Read {
+                value,
+                text: Some((withheld, ticket)),
+            }) => Self {
+                frame: frame(request_id, Ok(value)),
+                withheld: Some(frame(request_id, Ok(withheld))),
+                ticket,
+            },
+            Ok(Read { value, text: None }) => Self {
+                frame: frame(request_id, Ok(value)),
+                withheld: None,
+                ticket: Ticket::default(),
+            },
+            Err(error) => Self {
+                frame: frame(request_id, Err(error)),
+                withheld: None,
+                ticket: Ticket::default(),
+            },
+        }
+    }
+}
+
 /// A read's answer, with what it takes to release it.
-struct Read {
+pub(crate) struct Read {
     /// The answer, with any session text it carries.
     value: ParamsValue,
-    /// When it carries live session text: the same answer with that text withheld, and the ticket
-    /// its release is bound by.
+    /// When it carries live session text or text a model wrote: the same answer with that text
+    /// withheld, and the ticket its release is bound by.
     text: Option<(ParamsValue, Ticket)>,
 }
 
 impl Read {
     /// An answer that carries no live session text.
-    const fn plain(value: ParamsValue) -> Self {
+    pub(crate) const fn plain(value: ParamsValue) -> Self {
         Self { value, text: None }
     }
 
     /// An answer whose live session text, if it carries any, is released under `ticket`.
-    fn with(value: ParamsValue, withheld: ParamsValue, ticket: Ticket) -> Self {
+    pub(crate) fn with(value: ParamsValue, withheld: ParamsValue, ticket: Ticket) -> Self {
         if ticket.is_empty() {
             return Self::plain(value);
         }
@@ -966,15 +992,21 @@ impl AttentionModule {
         request: &Request,
     ) -> Answer<ParamsValue> {
         let read = self.read_texts(reach, caller, actor, request).await?;
+        Ok(self.settled(read).await)
+    }
+
+    /// Decides now what a read is answered with: its text released when its ticket holds and
+    /// withheld otherwise.
+    pub(crate) async fn settled(&self, read: Read) -> ParamsValue {
         let Some((withheld, ticket)) = read.text else {
-            return Ok(read.value);
+            return read.value;
         };
         let fences = self.release.read().await;
-        Ok(if ticket.holds(&fences, kr_ipc::clock::boot_elapsed_ms()) {
+        if ticket.holds(&fences, kr_ipc::clock::boot_elapsed_ms()) {
             read.value
         } else {
             withheld
-        })
+        }
     }
 
     /// Serves one read of this group for a reader's connection: the answer, and what
@@ -986,26 +1018,10 @@ impl AttentionModule {
         actor: &ActorId,
         request: &Request,
     ) -> Released {
-        match self.read_texts(reach, caller, actor, request).await {
-            Ok(Read {
-                value,
-                text: Some((withheld, ticket)),
-            }) => Released {
-                frame: frame(request.request_id, Ok(value)),
-                withheld: Some(frame(request.request_id, Ok(withheld))),
-                ticket,
-            },
-            Ok(Read { value, text: None }) => Released {
-                frame: frame(request.request_id, Ok(value)),
-                withheld: None,
-                ticket: Ticket::default(),
-            },
-            Err(error) => Released {
-                frame: frame(request.request_id, Err(error)),
-                withheld: None,
-                ticket: Ticket::default(),
-            },
-        }
+        Released::of(
+            request.request_id,
+            self.read_texts(reach, caller, actor, request).await,
+        )
     }
 
     /// Writes a read's answer to the reader's connection, releasing its session text only while
@@ -3569,7 +3585,7 @@ fn refusal_to_error(error: ProtocolError) -> ControllerError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Instant;
 
     use kr_ipc::framed::{FrameReader, FrameWriter};
@@ -4504,7 +4520,7 @@ mod tests {
 
     /// An owner's connection for the test to write an answer on, and its far end, which reads
     /// nothing until the test does.
-    async fn owner_connection(
+    pub(crate) async fn owner_connection(
         temp: &kr_ipc::testing::TempHost,
         display: u64,
     ) -> (FrameWriter, FrameReader) {

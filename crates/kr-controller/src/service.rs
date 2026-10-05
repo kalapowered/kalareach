@@ -840,6 +840,9 @@ mod a_create_that_launches_nothing;
 mod a_close_a_worker_never_answers;
 
 #[cfg(test)]
+mod a_description_read_held_while_privacy_mode_is_enabled;
+
+#[cfg(test)]
 mod a_read_that_meets_a_worker_on_its_way_out;
 
 #[cfg(test)]

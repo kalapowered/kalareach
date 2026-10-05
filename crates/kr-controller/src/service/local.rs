@@ -486,25 +486,14 @@ impl Controller {
                     )
                 }
                 ControlFrame::Request(request)
-                    if negotiated
-                        && request
-                            .method
-                            .method()
-                            .is_some_and(crate::attention::AttentionModule::serves) =>
+                    if negotiated && request.method.method().is_some_and(Self::releases) =>
                 {
-                    // The attention store's reads carry session text, which leaves this daemon only
-                    // under the text's privacy fence: its ticket is checked before every write.
+                    // The attention store's reads carry session text and a session's description
+                    // carries what a model wrote. Neither leaves this daemon except under the
+                    // privacy fence it was read under: its ticket is checked before every write.
                     match self.authorised(connection_id) {
                         Ok(_) => {
-                            let released = self
-                                .attention
-                                .read_released(
-                                    self.attention_reach().as_ref(),
-                                    &crate::attention::Caller::Owner,
-                                    &actor_id,
-                                    &request,
-                                )
-                                .await;
+                            let released = self.read_released(&actor_id, &request).await;
                             match self.authorised(connection_id) {
                                 Ok(_) => {
                                     if self

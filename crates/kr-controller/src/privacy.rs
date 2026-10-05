@@ -3373,6 +3373,7 @@ mod tests {
             host.descriptions
                 .describe(session(1), &facts, whole, &host.privacy.state())
                 .expect("a read")
+                .answer
                 .source,
             kr_protocol::describe::LabelSource::Generated
         );
@@ -3393,7 +3394,8 @@ mod tests {
         let described = host
             .descriptions
             .describe(session(1), &facts, whole, &host.privacy.state())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(
             described.source,
             kr_protocol::describe::LabelSource::Metadata
@@ -3403,7 +3405,8 @@ mod tests {
         let pinned = host
             .descriptions
             .describe(session(2), &facts, whole, &host.privacy.state())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(pinned.title, "Release prep");
     }
 
@@ -4118,7 +4121,11 @@ mod tests {
                 .expect("the record reads");
             assert_eq!(recorded, 0, "and nothing is recorded meanwhile");
             release.send(()).expect("the read goes on");
-            let answered = reading.join().expect("the read ends").expect("an answer");
+            let answered = reading
+                .join()
+                .expect("the read ends")
+                .expect("an answer")
+                .answer;
             assert_eq!(
                 answered.source,
                 kr_protocol::describe::LabelSource::Generated,
@@ -4132,7 +4139,8 @@ mod tests {
         let after = host
             .descriptions
             .describe(session(1), &facts, whole, &state)
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(after.source, kr_protocol::describe::LabelSource::Metadata);
         assert!(after.activity_text.0.is_none());
     }
@@ -4188,7 +4196,11 @@ mod tests {
                 "the generated description is still in the store"
             );
             release.send(()).expect("the read goes on");
-            let answered = reading.join().expect("the read ends").expect("an answer");
+            let answered = reading
+                .join()
+                .expect("the read ends")
+                .expect("an answer")
+                .answer;
             assert_eq!(
                 answered.source,
                 kr_protocol::describe::LabelSource::Metadata,

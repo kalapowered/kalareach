@@ -157,6 +157,20 @@ pub(crate) struct SummaryReading {
     pub(crate) decided: Published,
 }
 
+/// What `session.describe` found: the answer, the same answer without what a model wrote, and the
+/// privacy state the answer was decided under when it carries what a model wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Described {
+    /// The answer, with the title and activity a model wrote when the caller may be shown them.
+    pub answer: SessionDescribeResult,
+    /// The answer as it is when none of that is shown: the pin or the deterministic title, and no
+    /// activity, provenance or freshness of a description.
+    pub withheld: SessionDescribeResult,
+    /// The state of privacy mode the answer was decided under, when `answer` carries what a model
+    /// wrote and so is released only while that state holds.
+    pub generated: Option<Published>,
+}
+
 /// The session-metadata store, as this daemon serves it.
 #[derive(Debug)]
 pub struct DescribeModule {
@@ -491,7 +505,9 @@ impl DescribeModule {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Answers `session.describe`: the title to show and where it came from, filtered.
+    /// Answers `session.describe`: the title to show and where it came from, filtered, and the
+    /// same answer without what a model wrote, for a reader who is answered after privacy mode is
+    /// enabled.
     ///
     /// `facts` are the host's own metadata for the session, which the deterministic title is built
     /// from; `reach` is how far the caller's authority reaches into the session's history; and
@@ -509,17 +525,20 @@ impl DescribeModule {
         facts: &SessionFacts,
         reach: HistoryReach,
         privacy: &PrivacyState,
-    ) -> Result<SessionDescribeResult> {
-        let shown = {
+    ) -> Result<Described> {
+        let (shown, decided) = {
             let store = self.store();
             #[cfg(test)]
             self.pauses.before_reading.wait();
             let reading = privacy.reading();
             #[cfg(test)]
             self.pauses.before_decision.wait();
-            self.shown(&store, session_id, facts, reach, reading.published())?
+            let decided = reading.published();
+            (
+                self.shown(&store, session_id, facts, reach, decided)?,
+                decided,
+            )
         };
-        let generated = shown.generated.as_ref();
         // What the host last published, when it runs. Without one this daemon tracks no context
         // revision and runs no model, so it cannot say that a description it holds is current: it
         // says the conservative thing rather than implying current text.
@@ -542,47 +561,69 @@ impl DescribeModule {
                 Budgets::DEFAULTS.session_cooldown_ms,
             ),
         };
-        Ok(SessionDescribeResult {
-            session_id,
-            title: shown.title.as_str().to_owned(),
-            source: protocol_source(shown.source),
-            activity_text: Nullable(generated.map(|record| record.activity.as_str().to_owned())),
-            // A row from before this host started is from an earlier daemon, whose context
-            // revisions say nothing about this one's: it is shown as stale until a newer
-            // description replaces it.
-            freshness: match (generated, standing) {
-                (Some(record), Some(standing)) => {
-                    let earlier = published
-                        .as_ref()
-                        .is_some_and(|snapshot| record.produced_at_ms < snapshot.started_wall_ms);
-                    if earlier {
-                        DescriptionFreshness::Stale
-                    } else {
-                        standing.freshness
+        let answer_of = |shown: &Shown| {
+            let generated = shown.generated.as_ref();
+            SessionDescribeResult {
+                session_id,
+                title: shown.title.as_str().to_owned(),
+                source: protocol_source(shown.source),
+                activity_text: Nullable(
+                    generated.map(|record| record.activity.as_str().to_owned()),
+                ),
+                // A row from before this host started is from an earlier daemon, whose context
+                // revisions say nothing about this one's: it is shown as stale until a newer
+                // description replaces it.
+                freshness: match (generated, standing) {
+                    (Some(record), Some(standing)) => {
+                        let earlier = published.as_ref().is_some_and(|snapshot| {
+                            record.produced_at_ms < snapshot.started_wall_ms
+                        });
+                        if earlier {
+                            DescriptionFreshness::Stale
+                        } else {
+                            standing.freshness
+                        }
                     }
-                }
-                (Some(_), None) => DescriptionFreshness::Stale,
-                (None, _) => DescriptionFreshness::None,
-            },
-            provenance: Nullable(generated.map(|record| DescriptionProvenance {
-                profile_id: record.profile_id.clone(),
-                profile_revision: U64::new(record.profile_revision.get()),
-                context_revision: U64::new(record.revision.get()),
-                source_cursor_from: U64::new(record.cursor.from),
-                source_cursor_to: U64::new(record.cursor.to),
-                produced_at_ms: TimestampMs::new(record.produced_at_ms),
-            })),
-            queued_age_ms: Nullable(
-                standing
-                    .and_then(|standing| standing.queued_age_ms)
-                    .map(U64::new),
-            ),
-            last_success_ms: Nullable(
-                generated.map(|record| TimestampMs::new(record.produced_at_ms)),
-            ),
-            cadence_ms: U64::new(cadence_ms),
-            state,
-            paused: Nullable(paused),
+                    (Some(_), None) => DescriptionFreshness::Stale,
+                    (None, _) => DescriptionFreshness::None,
+                },
+                provenance: Nullable(generated.map(|record| DescriptionProvenance {
+                    profile_id: record.profile_id.clone(),
+                    profile_revision: U64::new(record.profile_revision.get()),
+                    context_revision: U64::new(record.revision.get()),
+                    source_cursor_from: U64::new(record.cursor.from),
+                    source_cursor_to: U64::new(record.cursor.to),
+                    produced_at_ms: TimestampMs::new(record.produced_at_ms),
+                })),
+                queued_age_ms: Nullable(
+                    standing
+                        .and_then(|standing| standing.queued_age_ms)
+                        .map(U64::new),
+                ),
+                last_success_ms: Nullable(
+                    generated.map(|record| TimestampMs::new(record.produced_at_ms)),
+                ),
+                cadence_ms: U64::new(cadence_ms),
+                state,
+                paused: Nullable(paused),
+            }
+        };
+        let answer = answer_of(&shown);
+        // The answer as it is when what a model wrote is not shown. It is the same answer, since
+        // nothing else in it is generated text.
+        let withheld = if shown.generated.is_some() {
+            answer_of(&Shown {
+                title: deterministic_title(facts),
+                source: LabelSource::Metadata,
+                generated: None,
+            })
+        } else {
+            answer.clone()
+        };
+        Ok(Described {
+            generated: shown.generated.is_some().then_some(decided),
+            answer,
+            withheld,
         })
     }
 
@@ -1010,6 +1051,11 @@ impl crate::service::Controller {
     /// Answers `session.describe` for one session, from its summary, to a caller whose history
     /// reaches `reach` into it, under the environment's privacy state as it stands now.
     ///
+    /// What a model wrote is released only while the privacy state it was read under holds: an
+    /// answer that is held while privacy mode is enabled is written without it
+    /// ([`crate::attention::AttentionModule::settled`] and
+    /// [`crate::attention::AttentionModule::write_released`]).
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
@@ -1017,18 +1063,32 @@ impl crate::service::Controller {
         &self,
         summary: kr_protocol::session::SessionSummary,
         reach: HistoryReach,
-    ) -> Result<kr_protocol::envelope::ParamsValue> {
+    ) -> Result<crate::attention::Read> {
         let descriptions = std::sync::Arc::clone(&self.descriptions);
         let privacy = self.privacy.state();
-        let answer = tokio::task::spawn_blocking(move || {
+        let read_under = privacy.clone();
+        let described = tokio::task::spawn_blocking(move || {
             descriptions.describe(summary.session_id, &facts_of(&summary), reach, &privacy)
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the session's name could not be read".to_owned(),
         })??;
-        kr_protocol::envelope::ParamsValue::from_typed(&answer)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        let encode = |answer: &SessionDescribeResult| {
+            kr_protocol::envelope::ParamsValue::from_typed(answer)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        };
+        let value = encode(&described.answer)?;
+        let Some(decided) = described.generated else {
+            return Ok(crate::attention::Read::plain(value));
+        };
+        Ok(crate::attention::Read::with(
+            value,
+            encode(&described.withheld)?,
+            crate::attention::Ticket::of_generated(crate::attention::Generated::read_under(
+                read_under, decided,
+            )),
+        ))
     }
 
     /// Performs `session.rename` for `actor_id` under the admission it carries: pins the title,
@@ -1432,7 +1492,8 @@ pub(crate) mod tests {
         let module = DescribeModule::open(root.path()).expect("the store opens again");
         let described = module
             .describe(session(1), &facts(), HistoryReach::Partial, &off())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.title, "KalaReach pairing");
         assert_eq!(described.source, Shown::Pinned);
         assert!(root.path().join("descriptions.sqlite3").exists());
@@ -1473,7 +1534,8 @@ pub(crate) mod tests {
         );
         let described = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.title, "Release prep");
         assert_eq!(described.source, Shown::Pinned);
         assert!(described.activity_text.0.is_none());
@@ -1493,7 +1555,8 @@ pub(crate) mod tests {
         assert_eq!(cleared.title, "kalareach (main)");
         let described = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.source, Shown::Generated);
         assert_eq!(described.title, "Pairing check");
     }
@@ -1512,7 +1575,8 @@ pub(crate) mod tests {
             .expect("a description");
         let open = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(open.source, Shown::Generated);
         assert!(open.provenance.0.is_some());
 
@@ -1523,7 +1587,8 @@ pub(crate) mod tests {
                 HistoryReach::WholeSession,
                 &private(1),
             )
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.source, Shown::Metadata);
         assert_eq!(described.title, "kalareach (main)");
         assert!(described.activity_text.0.is_none());
@@ -1551,7 +1616,8 @@ pub(crate) mod tests {
                 HistoryReach::WholeSession,
                 &private(1),
             )
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.source, Shown::Metadata);
         assert!(described.activity_text.0.is_none());
 
@@ -1572,7 +1638,8 @@ pub(crate) mod tests {
                 HistoryReach::WholeSession,
                 &private(1),
             )
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.source, Shown::Pinned);
         assert_eq!(described.title, "Release prep");
     }
@@ -1622,18 +1689,21 @@ pub(crate) mod tests {
         };
         let partial = module
             .describe(session(1), &facts(), HistoryReach::Partial, &at(2))
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(partial.source, Shown::Metadata);
         assert!(partial.activity_text.0.is_none());
         let whole = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &at(2))
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(whole.source, Shown::Generated);
         assert_eq!(whole.title, "Pairing check");
         assert_eq!(whole.freshness, DescriptionFreshness::Stale);
         let later = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &at(3))
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(
             later.source,
             Shown::Metadata,
@@ -1671,7 +1741,8 @@ pub(crate) mod tests {
         ));
         let described = module
             .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
-            .expect("a read");
+            .expect("a read")
+            .answer;
         assert_eq!(described.title, "Release prep");
     }
 

@@ -140,6 +140,45 @@ impl Controller {
         Ok(parse::<kr_protocol::session::SessionReadResult>(&read)?.session)
     }
 
+    /// Whether this daemon answers a read with text it can take back before it leaves: what a
+    /// session's worker answered and what a model wrote. Such a read is served with
+    /// [`Self::read_released`].
+    pub(super) fn releases(method: Method) -> bool {
+        crate::attention::AttentionModule::serves(method) || method == Method::SessionDescribe
+    }
+
+    /// Serves one read whose answer is released under a privacy fence, to the owner at this
+    /// machine, who reaches the whole of every session's history. The answer is written with
+    /// [`crate::attention::AttentionModule::write_released`], which checks what holds it before
+    /// every write.
+    pub(super) async fn read_released(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        request: &Request,
+    ) -> crate::attention::Released {
+        if request.method.method() == Some(Method::SessionDescribe) {
+            // A session's name is the environment's metadata, filtered for whoever asks.
+            let described = async {
+                let params: kr_protocol::describe::SessionDescribeParams = parse(&request.params)?;
+                let summary = self.session_summary(params.session_id).await?;
+                self.session_describe(summary, crate::describe::HistoryReach::WholeSession)
+                    .await
+            };
+            return crate::attention::Released::of(
+                request.request_id,
+                described.await.map_err(|error| error.to_protocol_error()),
+            );
+        }
+        self.attention
+            .read_released(
+                self.attention_reach().as_ref(),
+                &crate::attention::Caller::Owner,
+                actor_id,
+                request,
+            )
+            .await
+    }
+
     pub(super) async fn read_method(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -233,22 +272,6 @@ impl Controller {
             Method::DeviceList => self.device_list(&request.params).await,
             Method::PrivacyStatus => self.privacy_status().await,
             Method::DescriptionSetup => self.description_setup(),
-            // A session's name is the environment's metadata, filtered for whoever asks. The owner
-            // at this machine reaches the whole of every session's history.
-            Method::SessionDescribe => {
-                let summary = async {
-                    let params: kr_protocol::describe::SessionDescribeParams =
-                        parse(&request.params)?;
-                    self.session_summary(params.session_id).await
-                };
-                match summary.await {
-                    Ok(summary) => {
-                        self.session_describe(summary, crate::describe::HistoryReach::WholeSession)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                }
-            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
                 method.as_str()

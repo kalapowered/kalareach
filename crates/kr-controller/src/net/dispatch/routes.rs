@@ -417,9 +417,11 @@ impl RemoteConnection {
                     self.controller.session_describe(summary, reach).await
                 };
                 match described.await {
-                    Ok(value) => ControlFrame::Response(Response {
+                    // What a model wrote is answered only while the privacy state it was read
+                    // under holds, decided now.
+                    Ok(read) => ControlFrame::Response(Response {
                         request_id: request.request_id,
-                        outcome: Outcome::Ok(value),
+                        outcome: Outcome::Ok(self.controller.attention().settled(read).await),
                     }),
                     Err(error) => failure(request.request_id, error.to_protocol_error()),
                 }
