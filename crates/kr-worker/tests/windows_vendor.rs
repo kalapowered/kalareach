@@ -402,18 +402,34 @@ fn this_token_is_restricted() -> bool {
     restricted
 }
 
-fn waiting_program() -> std::process::Command {
-    let mut command = std::process::Command::new(
-        Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
-            .join("System32")
-            .join("ping.exe"),
-    );
+/// A process that waits far longer than any test takes, started the way a vendor starts one of
+/// its own: `cmd.exe` running `ping`, both on every Windows machine. The command line names
+/// `label`, which is what a look at the system's process list finds it by.
+fn waiting_program(label: &str) -> std::process::Command {
+    let system = std::env::var_os("SystemRoot").expect("a system directory");
+    let mut command =
+        std::process::Command::new(Path::new(&system).join("System32").join("cmd.exe"));
     command
-        .args(["-n", "600", "127.0.0.1"])
+        .args([
+            "/d",
+            "/c",
+            &format!("ping -n 600 127.0.0.1 > NUL & rem {label}"),
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command
+}
+
+/// What names a launch's processes on a command line: the name of the private directory the
+/// report is written in.
+fn label_of(report: &Path) -> String {
+    report
+        .parent()
+        .and_then(Path::file_name)
+        .expect("the report is in a directory")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The vendor a launch starts: a sandbox with a limited job of its own and a process in it, and an
@@ -430,11 +446,12 @@ fn vendor_stand_in() {
 
     let report = PathBuf::from(std::env::args().next_back().expect("the report's path"));
     let job = vendor_job_with_limits();
-    let nested = waiting_program()
+    let label = label_of(&report);
+    let nested = waiting_program(&label)
         .spawn()
         .expect("the sandboxed process starts");
     assign(job, &nested);
-    let breakaway = match waiting_program()
+    let breakaway = match waiting_program(&label)
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
         .spawn()
     {
@@ -892,18 +909,20 @@ fn processes_naming(markers: &[String]) -> Vec<u32> {
 }
 
 /// KR-REQ-07.64: a closure that overtakes a launch waits for it before it writes its receipt, at
-/// every point the launch can be held on its way to making the agent: admitted, with its job
-/// recorded, with its process created, and with its process created and found not to be closing.
+/// every point the launch can be held on its way to handing the agent over: admitted, about to read
+/// the application's own configuration, with its job recorded, with its process created, and with
+/// its process created and found not to be closing.
 /// A launch the closure overtook before its check ends what it made and fails by name; one that
 /// had passed its check hands over an agent the closure then ends. Either way the closure reads
 /// the session after that, the receipt names nothing left running, and no process of the stand-in
-/// vendor is left, which a look at the system's own process list shows.
+/// vendor or of what it started is left, which a look at the system's own process list shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_closure_waits_for_a_launch_it_overtakes_before_it_writes_its_receipt() {
     let mut which = 40_u8;
     let mut markers = Vec::new();
     for stage in [
         LaunchStage::Admitted,
+        LaunchStage::Probing,
         LaunchStage::JobRecorded,
         LaunchStage::ProcessCreated,
         LaunchStage::Checked,
@@ -1149,10 +1168,11 @@ fn native_codex_sandboxed_command() {
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     let report = PathBuf::from(std::env::args().next_back().expect("the report's path"));
-    let held = waiting_program()
+    let label = label_of(&report);
+    let held = waiting_program(&label)
         .spawn()
         .expect("a process of its own starts");
-    let breakaway = match waiting_program()
+    let breakaway = match waiting_program(&label)
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
         .spawn()
     {
