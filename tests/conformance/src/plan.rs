@@ -775,6 +775,18 @@ fn windows() -> Vec<Step> {
             ],
             "catalogue::integrations",
         ),
+        qualified_only(
+            "the doctor's reading of the launch probes",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "catalogue::launch_probes",
+            ],
+            "catalogue::launch_probes",
+        ),
         Step::cargo(
             Group::Rust,
             "the settings-sync store",
