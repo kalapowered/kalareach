@@ -2735,10 +2735,12 @@ fn a_session_started_with_the_hosts_environment_takes_an_allowlist_of_the_daemon
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it() {
     let (temp, controller, _asked) = daemon().await;
+    // The person's home as this platform names it among what a session takes.
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     controller.set_host_environment(
         [
             ("PATH", "/usr/bin"),
-            ("HOME", "/home/a"),
+            (home, "/home/a"),
             ("OPENAI_API_KEY", "sk-planted"),
         ]
         .into_iter()
@@ -2751,12 +2753,16 @@ async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it(
                 .map(|variable| (variable.name, variable.value))
                 .collect()
         };
+    let in_name_order = |mut pairs: Vec<(&str, &str)>| -> Vec<(String, String)> {
+        pairs.sort_unstable();
+        pairs
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    };
     assert_eq!(
         names(controller.host_context_environment().variables),
-        [
-            ("HOME".to_owned(), "/home/a".to_owned()),
-            ("PATH".to_owned(), "/usr/bin".to_owned())
-        ],
+        in_name_order(vec![(home, "/home/a"), ("PATH", "/usr/bin")]),
         "with nothing configured it is the allowlisted environment, and no credential"
     );
 
@@ -2776,11 +2782,11 @@ async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it(
     let _ = controller.effective_configuration().await;
     assert_eq!(
         names(controller.host_context_environment().variables),
-        [
-            ("EDITOR".to_owned(), "hx".to_owned()),
-            ("HOME".to_owned(), "/home/a".to_owned()),
-            ("PATH".to_owned(), "/opt/added/bin:/usr/bin".to_owned())
-        ],
+        in_name_order(vec![
+            ("EDITOR", "hx"),
+            (home, "/home/a"),
+            ("PATH", "/opt/added/bin:/usr/bin")
+        ]),
         "an addition is added, and wins over the daemon's value of its name"
     );
 }
