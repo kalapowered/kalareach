@@ -916,6 +916,14 @@ async fn kr_req_07_64_a_closure_waits_for_a_launch_it_overtakes_before_it_writes
                 gateway.pause_launch_at(stage)
             });
             markers.push(held.marker.clone());
+            if stage == LaunchStage::ProcessCreated && ownership == AgentOwnership::Full {
+                // The control for the look at the system's process list below: it sees the
+                // process while it runs.
+                assert!(
+                    !processes_naming(&markers[markers.len() - 1..]).is_empty(),
+                    "{label}: the look at the system's process list finds a stand-in that runs"
+                );
+            }
 
             let (closure, heard, first) = closure_beside(&session, 0xFFFF_FF00 + u32::from(which));
             assert!(
