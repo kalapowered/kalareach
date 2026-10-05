@@ -577,6 +577,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows_vendor
 
+      # What a launch reads of its application's mode. The declared diagnostic is run in the launch's own
+      # directory with no input and no shell, a nonzero exit is not a failure, and one that prints too
+      # much, never finishes or cannot start records no mode and is ended with everything it started. A
+      # mode the package refuses in a service session is a named launch failure where the worker is in one.
+      - name: Test what a launch reads of its application's mode
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test launch_probe
+
       # The backends an integrated invocation is given before it runs, on this platform: a launch's
       # endpoint and credential exist before the answer, a bypass creates nothing, and each session
       # has a root of its own. The launcher against them is run by the forwarder's suite, above.

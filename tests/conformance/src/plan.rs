@@ -729,6 +729,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "what a launch reads of its application's mode",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "launch_probe",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the command backends",
             &[
                 "test",

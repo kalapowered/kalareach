@@ -884,15 +884,18 @@ impl Ledger {
                 kr_cbor::CanonicalValue::text(AgentOwnership::Full.as_str()),
             ));
             entries.push(("vendor_mode".to_owned(), kr_cbor::CanonicalValue::Null));
-            let brought = kr_cbor::CanonicalMap::from_entries(entries)
-                .map_err(|error| unreadable(error.to_string()))?;
+            let brought = kr_cbor::encode(&kr_cbor::CanonicalValue::Map(
+                kr_cbor::CanonicalMap::from_entries(entries)
+                    .map_err(|error| unreadable(error.to_string()))?,
+            ));
+            // What is written has to be a launch profile this build reads back: a row whose shape
+            // is not one stops the migration here, with the ledger as it was, and not at the
+            // first read after the version has been written.
+            decode::<LaunchProfile>(&brought).map_err(|error| unreadable(error.to_string()))?;
             transaction
                 .execute(
                     "UPDATE broker_profiles SET profile = ?1 WHERE profile_id = ?2",
-                    params![
-                        kr_cbor::encode(&kr_cbor::CanonicalValue::Map(brought)),
-                        profile_id
-                    ],
+                    params![brought, profile_id],
                 )
                 .map_err(|error| self.fault(error))?;
         }
@@ -2593,6 +2596,34 @@ mod tests {
 
         let refused = Ledger::open(Some(&file), JournalHealth::shared())
             .expect_err("a row that cannot be read stops the migration");
+        assert!(refused.to_string().contains("lp-2"), "{refused}");
+        assert_eq!(recorded_version(&file), 7, "the version was not written");
+        let stored: Vec<u8> = rusqlite::Connection::open(&file)
+            .expect("the file opens")
+            .query_row(
+                "SELECT profile FROM broker_profiles WHERE profile_id = 'lp-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the first row is there");
+        assert_eq!(stored, first_bytes, "the row before the failure went back");
+    }
+
+    /// A row that is valid CBOR and a map but not a launch profile stops the migration too: the
+    /// version is not written over a ledger this build would then fail to open.
+    #[test]
+    fn a_version_seven_ledger_with_a_row_that_is_not_a_profile_is_left_exactly_as_it_was() {
+        let file = ledger_path();
+        drop(Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens"));
+        let (_, first_bytes) = profile_as_version_seven_wrote_it(1);
+        put_version_seven_profile(&file, 1, &first_bytes);
+        // A map with none of a profile's members.
+        let empty = kr_cbor::encode(&kr_cbor::CanonicalValue::Map(kr_cbor::CanonicalMap::new()));
+        put_version_seven_profile(&file, 2, &empty);
+        set_version(&file, 7);
+
+        let refused = Ledger::open(Some(&file), JournalHealth::shared())
+            .expect_err("a row that is not a profile stops the migration");
         assert!(refused.to_string().contains("lp-2"), "{refused}");
         assert_eq!(recorded_version(&file), 7, "the version was not written");
         let stored: Vec<u8> = rusqlite::Connection::open(&file)

@@ -601,6 +601,15 @@ pub struct NativeGateway {
     /// learns which one it has to find stopped.
     #[cfg(feature = "testing")]
     last_started: Option<ProcessStartIdentity>,
+    /// Where a launch stops after its agent's job is recorded and before its process is created, for
+    /// this host's own tests.
+    #[cfg(all(feature = "testing", windows))]
+    before_create_pause: std::sync::Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// Where a failed launch stops before it undoes anything, for this host's own tests.
     #[cfg(feature = "testing")]
     cleanup_pause: std::sync::Mutex<
@@ -703,9 +712,16 @@ fn start_agent(
     registration: &std::path::Path,
     session: &Arc<crate::windows::job::SessionJob>,
     ownership: AgentOwnership,
+    before_create: impl FnOnce(),
 ) -> Result<(AgentChild, ProcessStartIdentity)> {
     let could_not_start =
         |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
+    let session_is_closing = || BrokerError::PreconditionFailed {
+        detail: format!("this session is closing, so {program} was not started"),
+    };
+    if session.is_closed() {
+        return Err(session_is_closing());
+    }
     let reduced = ownership == AgentOwnership::Reduced;
     let job = Arc::new(
         if reduced {
@@ -715,7 +731,20 @@ fn start_agent(
         }
         .map_err(could_not_start)?,
     );
-    let mut child = crate::windows::launch::start(&crate::windows::launch::Spec {
+    if reduced {
+        // Before the process exists: the closure reads the session's record, and an agent it did
+        // not know of would be one it could not end.
+        session
+            .adopt_reduced(Arc::clone(&job))
+            .map_err(|_| session_is_closing())?;
+    }
+    let forget = || {
+        if reduced {
+            session.release_reduced(&job);
+        }
+    };
+    before_create();
+    let mut child = match crate::windows::launch::start(&crate::windows::launch::Spec {
         program: std::path::Path::new(program),
         arguments,
         directory,
@@ -725,8 +754,23 @@ fn start_agent(
         agent: &job,
         pipe_input: true,
         pipe_output: true,
-    })
-    .map_err(could_not_start)?;
+    }) {
+        Ok(child) => child,
+        Err(error) => {
+            forget();
+            return Err(could_not_start(error));
+        }
+    };
+    // A process created in a job that was ended is not ended with it. The session's closure marks
+    // the session before it ends the jobs, so a closure that began before this process existed is
+    // seen here, and a closure that begins now ends the process with its job.
+    if session.is_closed() {
+        let _ = job.terminate(1);
+        let _ = child.kill();
+        let _ = child.wait();
+        forget();
+        return Err(session_is_closing());
+    }
     let started = match kr_ipc::identity::started_process_identity(child.id()) {
         Ok(started) => started,
         Err(error) => {
@@ -735,16 +779,12 @@ fn start_agent(
             let _ = job.terminate(1);
             let _ = child.kill();
             let _ = child.wait();
+            forget();
             return Err(BrokerError::ledger(format!(
                 "the started process cannot be read, so it was stopped: {error}"
             )));
         }
     };
-    if reduced {
-        // Before the agent has run for long enough to matter: the closure reads the session's
-        // record, and an agent it did not know of would be one it could not end.
-        session.adopt_reduced(Arc::clone(&job));
-    }
     crate::windows::job::keep_agent(started.clone(), job, child.stdin.clone());
     Ok((child, started))
 }
@@ -874,6 +914,8 @@ impl NativeGateway {
             session_job: None,
             #[cfg(feature = "testing")]
             last_started: None,
+            #[cfg(all(feature = "testing", windows))]
+            before_create_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "testing")]
             cleanup_pause: std::sync::Mutex::new(None),
         })
@@ -895,6 +937,27 @@ impl NativeGateway {
         let (release, go) = std::sync::mpsc::sync_channel(1);
         *self
             .cleanup_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next launch after its agent's job is recorded on the session and before its
+    /// process is created, for this host's own tests.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. The
+    /// pause fires once. It is compiled away in every shipped build.
+    #[cfg(all(feature = "testing", windows))]
+    pub fn pause_before_creating_the_agent(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .before_create_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -1061,6 +1124,7 @@ impl NativeGateway {
             &registration_path,
             &session,
             reservation.profile().ownership,
+            || self.stop_before_creating_the_agent(),
         )?;
         #[cfg(feature = "testing")]
         {
@@ -1120,6 +1184,22 @@ impl NativeGateway {
                 Some(&credential_path),
                 error,
             )),
+        }
+    }
+
+    /// The pause a test armed for the moment before the agent's process is created, where it armed
+    /// one.
+    #[cfg(windows)]
+    fn stop_before_creating_the_agent(&self) {
+        #[cfg(feature = "testing")]
+        if let Some((arrived, go)) = self
+            .before_create_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = arrived.send(());
+            let _ = go.recv();
         }
     }
 
