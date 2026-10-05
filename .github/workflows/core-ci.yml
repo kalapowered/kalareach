@@ -488,6 +488,34 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --lib
 
+      # The protocol crate's own tests. Among them the configuration document's validation, which
+      # takes a certificate path only as this platform writes an absolute one, and the lock a
+      # writer of that document holds, which a second writer meets as a sharing violation here and
+      # waits for.
+      - name: Test the protocol's library
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-protocol --lib
+
+      # The binder makes every binding from the admissions the worker holds; the channels, the
+      # connectors and the attention source run over packages whose native bridge names an
+      # absolute forwarder path, which on this platform carries a drive.
+      - name: Test the binder, the channels, the connectors and the attention source
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test binder --test channels --test connectors --test attention_source
+
+      # The control daemon's own tests, the configuration lock and the host environment a session
+      # takes among them.
+      - name: Test the control daemon's library
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib
+
+      # The daemon's attention inbox, its dispatch barrier, the configuration it applies and the
+      # diagnostics it answers to a device, each with a daemon and a worker of its own whose root
+      # shell is the POSIX shell Git for Windows installs.
+      - name: Test the daemon's attention, barrier, configuration and diagnostics
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host
+
       # The forwarder, all of it. Its own library: the registration it reads, the named pipe it connects
       # to, and the credential file it presents only when that file's own access list is its owner's.
       # Every hook and the channel against the worker's own listener, with a copy of `cmd.exe` as the
