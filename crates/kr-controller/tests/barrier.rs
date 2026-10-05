@@ -41,7 +41,6 @@ use kr_protocol::session::{
 use kr_transport::clock::{ContinuousClock as _, ManualClock};
 use kr_transport::lease::LeaseRefusal;
 use kr_worker::journal::Submission;
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -119,14 +118,9 @@ async fn worker() -> Worker {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            // A root program that outlives the suite and ends with its terminal, so a test that
-            // takes a minute does not find the session closed because its shell ran out.
-            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        // A root program that outlives the suite and ends with its terminal, so a test that
+        // takes a minute does not find the session closed because its shell ran out.
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -1867,12 +1861,7 @@ async fn hosted_worker() -> Hosted {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: specification.display_number,
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -1921,7 +1910,7 @@ async fn hosted_worker() -> Hosted {
             session_id,
             endpoint: endpoint.as_text(),
             root_process: session.root_identity().expect("a root process"),
-            shell_path: "/bin/sh".to_owned(),
+            shell_path: kr_worker::testing::posix_shell(),
             dimensions: session.geometry().dimensions,
             session: Box::new(session.summary()),
         }
