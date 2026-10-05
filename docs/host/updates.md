@@ -196,9 +196,10 @@ There is a list of programs (`scripts/release-programs.json`) that the release b
 Windows archive check read as well. A host holds a release that is being taken in to the list its
 own build carries, and holds nothing already in the store to it. A release installed from a previous
 build with fewer programs in its manifest can still be started, is still shown by `kr host
-versions`, and can be updated to a release with all the programs that the host now needs. Thus, a
-program is added to the list in the release that needs it, and removed one release before the
-release that no longer needs it.
+versions`, and can be updated to a release with all the programs that the host now needs. A program
+is added to the list in the release that starts needing it. It's trickier to remove programs from
+the list though: if a new release no longer needs a program that previous releases needed, then that
+new release will not be allowed on any host that has a build that needs that program.
 
 A release that carries no update channel root can be installed with `kr host install`, which takes
 the release's own word for what it is, and a host whose current release carries none has no key to
