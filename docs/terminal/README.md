@@ -381,23 +381,23 @@ and the fifth is what it leaves saved:
   buffer is showing.
 - **A soft reset clears the saved cursor of both buffers.** xterm saves a fresh cursor in the buffer
   that is showing, at home and with whatever wrap was pending, and keeps the other buffer's. The
-  product follows the library. A restore in the buffer the reset leaves showing goes home with the
-  ASCII sets and the shift in, in both. What differs is a wrap that was pending at the reset (xterm's
-  fresh cursor keeps it, so the next character goes to the second row; here it goes to the first),
-  the faint, crossed-out and doubly underlined states of the rendition (xterm's reset leaves them
-  set and its save keeps them, where the library clears the whole pen), a cursor that a program
-  saved in the other buffer before the reset and has not saved again since (xterm gives it back
-  there; here a restore goes home), and the cursor a program restores on leaving the alternate
-  buffer after a soft reset, which has already moved a direct attachment to projection. Putting
-  these right would need the engine to put a saved cursor back, rendition and character sets
-  included, and nothing but a sequence that moves the screen can.
+  product follows the library. In both, a restore in the buffer the reset leaves showing goes home
+  with the ASCII sets and the shift in. They differ in a few places. A wrap that was pending at the
+  reset stays pending in xterm's fresh cursor, so the next character goes to the second row; here it
+  goes to the first. The faint, crossed-out and doubly underlined states stay set in xterm, whose
+  reset leaves them and whose save keeps them; the library clears the whole pen. A cursor a program
+  saved in the other buffer before the reset, and has not saved again since, comes back there in
+  xterm; here a restore goes home. The cursor a program restores on leaving the alternate buffer after
+  a soft reset differs for the same reason, though that case has already moved a direct attachment to
+  projection. Putting these right would need the engine to put a saved cursor back, rendition and
+  character sets included, and nothing but a sequence that moves the screen can.
 
-A full reset is not among the differences. The library keeps whatever was saved across it, which
-leaves a program that restores a cursor after a reset at a position it saved before it, and a
-terminal that follows xterm somewhere else. So the engine saves a fresh cursor in the buffer the
-reset leaves showing, as xterm does, from the cursor the reset has just homed: a restore after a
-full reset finds the terminal as it starts. The buffer that is not showing keeps what it saved,
-which is also what xterm does.
+A full reset is not among the differences, because the engine makes it match. The library keeps
+whatever was saved across a reset. A program that restores a cursor afterwards would land where it
+saved the cursor before the reset, while a terminal that follows xterm puts it at home. So the
+engine saves a fresh cursor in the buffer the reset leaves showing, from the cursor the reset has
+just homed, as xterm does. A restore after a full reset then finds the terminal as it starts. The
+buffer that is not showing keeps what it saved, which is also what xterm does.
 
 ## The query broker
 
@@ -566,11 +566,12 @@ sets that were saved with it, and the rows of the buffer that is not showing. A 
 saved cursor is at the origin would restore it there. A full reset saves one in the buffer it leaves
 showing, and a soft reset leaves none, as the compatibility profile describes.
 
-A hyperlink, wherever the wire carries one (a run's, a range's, the open link and a saved cursor's),
-is its target together with the parameters the application gave it, spelled as `key=value` pairs in
-key order separated by `:`. Two links to one target are two links to a client when their parameters
-differ, which is what keeps a link that wraps onto the next row one link and two links to one target
-two. A client that draws the screen into a terminal opens each link with the parameters it has.
+Wherever the wire carries a hyperlink (on a run, on a range, as the open link, or in a saved
+cursor), it is the target together with the parameters the application gave it, spelled as
+`key=value` pairs in key order, separated by `:`. Two links to one target are two links to a client
+when their parameters differ. That is what keeps a link that wraps onto the next row one link, and
+two links to one target two. A client that draws the screen into a terminal opens each link with its
+parameters.
 
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`
@@ -956,10 +957,10 @@ bound is free besides, to reduce how often evictions come, then puts the configu
 the history grows again when later rows cost less. That happens after
 every grid mutation, so the bound is enforced where the rows arrive rather than at whichever read
 comes next: two rows can carry more than the whole of it. Reading every retained row's cells is a
-separate thing, needed for what the hyperlink objects cost, and it happens when something asks (a
-resize, a reset or a swap of the buffers) and every 64 reads otherwise. Settling the screen when the
-stream goes quiet does not read them, so a session that settles after every batch of output reads
-every retained row no more often than one that does not.
+separate thing, needed for what the hyperlink objects cost. It happens when something asks (a
+resize, a reset or a swap of the buffers), when a link would not fit the account, and every 64 reads
+otherwise. Settling the screen when the stream goes quiet does not read them, so a session that
+settles after every batch of output reads every retained row no more often than one that does not.
 
 Enforcing it needs the primary buffer to be the one showing, because the library drops the rows it
 is told to drop as it appends to them and it appends only to the buffer that is showing. Rows can
