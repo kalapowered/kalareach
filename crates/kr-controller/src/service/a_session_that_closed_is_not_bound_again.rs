@@ -454,14 +454,19 @@ async fn an_adoption_held_before_its_publication(
 
 /// KR-REQ-09.12: a worker whose row is recorded and that is not yet published is pending in a
 /// revocation, never absent from it: the barrier's members are the registry's, which an adoption
-/// writes before it publishes anything a dispatch could reach the worker through. Once the adoption
+/// writes before it publishes anything a dispatch could reach the worker through. The worker is one
+/// this daemon has not reached, as after a start that found it running: the lease issuer holds
+/// nothing of it, so the registry's row is the only thing that makes it a member. Once the adoption
 /// has published the worker it is held in every place the daemon holds a worker, and the next
 /// revocation reaches it and holds when it has acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
     let world = Served::start().await;
+    world.controller.leases.worker_ended(world.session_id);
+    assert_eq!(world.controller.leases.workers_held(), 0);
     let (adopting, go) = an_adoption_held_before_its_publication(&world).await;
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
+    assert_eq!(world.controller.leases.workers_held(), 0);
 
     let barrier = world
         .controller
