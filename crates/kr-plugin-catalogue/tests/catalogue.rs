@@ -4283,6 +4283,15 @@ async fn an_unsupported_host_is_told_every_platform_the_release_lists() {
                 os: OperatingSystem::MacOs,
                 architectures: vec![Architecture::Aarch64],
             },
+            // Listed again, and with nothing: each is said once, however the manifest repeats it.
+            PlatformSupport {
+                os: OperatingSystem::Linux,
+                architectures: vec![Architecture::Aarch64, Architecture::X86_64],
+            },
+            PlatformSupport {
+                os: OperatingSystem::MacOs,
+                architectures: Vec::new(),
+            },
         ]),
     )
     .await;
