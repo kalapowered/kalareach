@@ -180,12 +180,8 @@ impl Worker {
     /// Writes a package of `shape` in this worker's store, with every capability it declares
     /// granted.
     fn package(&self, shape: &fixture::Shape) -> ConnectorSource {
-        fixture::package(
-            self.packages.path(),
-            Path::new("/opt/kalareach/bin/kr-hook"),
-            shape,
-        )
-        .expect("the package is written")
+        fixture::package(self.packages.path(), Path::new(fixture::FORWARDER), shape)
+            .expect("the package is written")
     }
 
     fn claude_code(&self) -> ConnectorSource {

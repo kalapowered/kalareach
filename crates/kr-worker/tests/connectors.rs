@@ -35,12 +35,12 @@ impl Store {
     }
 
     fn package(&self) -> ConnectorSource {
-        fixture::claude_code_package(&self.root, Path::new("/opt/kalareach/bin/kr-hook"))
+        fixture::claude_code_package(&self.root, Path::new(fixture::FORWARDER))
             .expect("the package is written")
     }
 
     fn shaped(&self, shape: &fixture::Shape) -> ConnectorSource {
-        fixture::package(&self.root, Path::new("/opt/kalareach/bin/kr-hook"), shape)
+        fixture::package(&self.root, Path::new(fixture::FORWARDER), shape)
             .expect("the package is written")
     }
 
@@ -243,7 +243,7 @@ fn a_command_the_package_does_not_recognise_is_refused() {
     for command in ["bin/claude", "/usr/local/bin/claude", "codex", ""] {
         let source = fixture::package(
             &store.root,
-            Path::new("/opt/kalareach/bin/kr-hook"),
+            Path::new(fixture::FORWARDER),
             &fixture::Shape {
                 integration: Some(fixture::declaration(command, &fixture::FLAGS, &[])),
                 ..fixture::Shape::claude_code()
