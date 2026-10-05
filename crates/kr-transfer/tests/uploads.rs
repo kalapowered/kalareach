@@ -2513,8 +2513,8 @@ fn two_concurrent_copies_of_one_chunk_action_answer_the_same() {
 }
 
 /// KR-REQ-14.09, KR-REQ-24.09: a chunk that conflicts with one already recorded invalidates the
-/// upload under its action, so a repeat of that action, however late, is refused as the first copy
-/// was and not as an upload that has since ended.
+/// upload under its action, so a repeat of that action is refused as the first copy was and not as
+/// an upload that has since ended.
 #[test]
 fn a_repeat_of_the_chunk_action_that_invalidated_an_upload_is_refused_as_it_was() {
     let harness = Harness::create();
@@ -2540,6 +2540,54 @@ fn a_repeat_of_the_chunk_action_that_invalidated_an_upload_is_refused_as_it_was(
         repeat.code(),
         first.code(),
         "one action, one answer: {repeat}"
+    );
+}
+
+/// KR-REQ-14.09, KR-REQ-24.09: the refusal an invalidating chunk is given is the one that was
+/// recorded, even when the payload cannot be removed afterwards. The row stays marked for the
+/// cleanup retry, and neither the first copy nor a repeat is told the storage failed instead.
+#[cfg(unix)]
+#[test]
+fn a_chunk_invalidation_whose_payload_cannot_be_removed_is_still_refused_as_recorded() {
+    let harness = Harness::create();
+    let bytes = pattern(128);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "notes.bin")
+        .expect("reserves the upload");
+    harness
+        .send_as(begun.transfer_id, &bytes, 0, None)
+        .expect("accepts the chunk");
+    // The staged payload's name now belongs to a directory with a file in it, which an unlink of
+    // that name cannot remove.
+    let incomplete = harness
+        .service
+        .staging()
+        .incomplete()
+        .display_path()
+        .to_path_buf();
+    let staged = std::fs::read_dir(&incomplete)
+        .expect("reads the incomplete area")
+        .next()
+        .expect("the chunk's payload is staged")
+        .expect("reads the entry")
+        .path();
+    std::fs::remove_file(&staged).expect("removes the staged payload");
+    std::fs::create_dir(&staged).expect("puts a directory under its name");
+    std::fs::write(staged.join("held"), b"held").expect("fills the directory");
+
+    let other: Vec<u8> = bytes.iter().map(|byte| byte ^ 0xff).collect();
+    let conflicting = action(&harness, "upload.chunk", &other);
+    let first = harness
+        .send_as(begun.transfer_id, &other, 0, Some(&conflicting))
+        .expect_err("the conflicting duplicate invalidates the upload");
+    assert_eq!(first.code(), ErrorCode::AttachmentIntegrity, "{first}");
+    let repeat = harness
+        .send_as(begun.transfer_id, &other, 0, Some(&conflicting))
+        .expect_err("a repeat of that action is refused");
+    assert_eq!(repeat.code(), first.code(), "{repeat}");
+    assert!(
+        harness.service.staged_byte_len().expect("reads the total") > 0,
+        "the bytes stay charged until the payload is gone"
     );
 }
 
