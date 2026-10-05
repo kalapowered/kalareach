@@ -21,8 +21,8 @@
 //! changes had reached, and the job is built from the changes between them as they stood. A
 //! session that goes on changing neither lengthens the job nor invalidates its result: the result
 //! is of that interval, and says so, and the next request is for a longer one that starts at the
-//! same first cursor. Retention and acknowledgement move the first cursor of the next request and
-//! nothing about the interval a result was written for.
+//! same first cursor. Acknowledgement moves the first cursor of the next request and nothing about
+//! the interval a result was written for.
 //!
 //! # What a result is held under
 //!
@@ -56,7 +56,7 @@ pub struct SummaryChange {
     pub cursor: u64,
     /// What kind of change it was, by its stable name.
     pub kind: &'static str,
-    /// When the host recorded it, on the wall clock.
+    /// When the host observed the change, on the wall clock.
     pub at_ms: u64,
     /// The text of the change, when it has one that may be read: carried as data.
     pub text: Option<ProjectText>,

@@ -3830,7 +3830,7 @@ pub(crate) mod tests {
     /// paired device's when its grant's history starts at or before it, and a grant with no lower
     /// bound retains no history and reaches none.
     #[test]
-    fn a_summary_is_for_a_caller_whose_history_reaches_the_first_change() {
+    fn a_summary_is_for_a_caller_whose_history_reaches_the_earliest_change() {
         let device = |history_lower_bound_ms: Option<u64>| Caller::Device {
             grant_id: GrantId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
             session_view: true,
