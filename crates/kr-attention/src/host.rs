@@ -960,6 +960,25 @@ impl Attention {
         })
     }
 
+    /// Returns what a summary of what changed in one session since one actor's last visit is
+    /// written from: the interval frozen at this moment, and the changes the log retains in it.
+    ///
+    /// The changes carry where each one's text comes from, which is not read here: a session's
+    /// text is read from its owner by whoever writes the summary, under the privacy state that
+    /// holds then.
+    ///
+    /// # Errors
+    ///
+    /// As [`Attention::engine`].
+    pub fn summary_source(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+    ) -> Result<crate::visit::SummarySource> {
+        self.live()?;
+        Ok(self.state.visits.summary_source(actor, session_id))
+    }
+
     /// Returns one actor's review state of one subject, when this caller may see it.
     ///
     /// A subject outside the caller's scope is answered exactly as one the host does not hold.

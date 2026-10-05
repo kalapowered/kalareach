@@ -1707,6 +1707,93 @@ fn a_visit_cursor_never_goes_backwards() {
     assert_eq!(visit.revision, U64::new(2), "each visit is a revision");
 }
 
+/// KR-REQ-18.02: what a summary is written from is the interval from the cursor an actor has
+/// acknowledged to the cursor the log has reached, frozen when it is read, with the changes the log
+/// retains in it. Retention and further changes move the head and the oldest change, and
+/// nothing moves the first cursor but the actor's own visit.
+#[test]
+fn a_summary_is_written_from_the_interval_since_the_acknowledged_cursor() {
+    let mut attention = engine();
+    let owner = actor("local:501");
+    let nothing = attention
+        .summary_source(&owner, session(1))
+        .expect("the store is this owner's");
+    assert_eq!((nothing.from_cursor, nothing.head), (0, 0));
+    assert!(nothing.changes.is_empty());
+
+    for (sequence, version) in [(1_u64, 1_u64), (2, 2), (3, 3)] {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, version),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let source = attention
+        .summary_source(&owner, session(1))
+        .expect("the store is this owner's");
+    assert_eq!((source.from_cursor, source.head), (0, 6));
+    assert_eq!(
+        source
+            .changes
+            .iter()
+            .map(|change| change.cursor)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5],
+        "every retained change, oldest first"
+    );
+
+    attention
+        .visit_as(&owner, 3, Vec::new())
+        .expect("the store records the visit");
+    let after = attention
+        .summary_source(&owner, session(1))
+        .expect("the store is this owner's");
+    assert_eq!((after.from_cursor, after.head), (3, 6));
+    assert_eq!(after.changes.len(), 3);
+    assert_eq!(
+        attention
+            .summary_source(&actor("local:502"), session(1))
+            .expect("the store is this owner's")
+            .from_cursor,
+        0,
+        "what one actor has seen says nothing of another's"
+    );
+
+    // The session goes on changing: the head moves and the first cursor stays, and so does it when
+    // retention takes the changes from before the acknowledged cursor and then beyond it.
+    for sequence in 4..=504_u64 {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, sequence),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let later = attention
+        .summary_source(&owner, session(1))
+        .expect("the store is this owner's");
+    assert_eq!(
+        later.from_cursor, 3,
+        "retention does not move the first cursor"
+    );
+    assert_eq!(later.head, 1_008);
+    let oldest = later
+        .changes
+        .first()
+        .map(|change| change.cursor)
+        .expect("a change");
+    assert_eq!(
+        later.changes.len() as u64,
+        later.head - oldest,
+        "every change the log still retains, and the range it took is the view's omitted range"
+    );
+    assert!(
+        oldest > 3,
+        "the changes from the first cursor to {oldest} were taken"
+    );
+}
+
 #[test]
 fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
     let mut attention = engine();

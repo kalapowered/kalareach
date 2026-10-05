@@ -132,6 +132,22 @@ pub struct Changed {
     pub views: Vec<RetainedLogView>,
 }
 
+/// What a summary of the changes since an actor's last visit is written from.
+///
+/// It is the interval the summary covers, frozen at the moment it is asked for: from the cursor the
+/// actor has acknowledged to the cursor the log has reached, and every change the log still
+/// retains in it. A change that retention took is in the interval and not in `changes`, which is
+/// what a view's omitted ranges say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummarySource {
+    /// The cursor the actor has acknowledged: the first cursor of the interval.
+    pub from_cursor: u64,
+    /// The cursor the next change will be recorded at: the first cursor after the interval.
+    pub head: u64,
+    /// The changes the log retains in the interval, oldest first.
+    pub changes: Vec<Change>,
+}
+
 /// One session's change log, the visits into it and the log views beside them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionLog {
@@ -371,6 +387,20 @@ impl SessionLog {
         }
     }
 
+    fn summary_source(&self, actor: &ActorId) -> SummarySource {
+        let from = self.visits.get(actor).map_or(0, |visit| visit.cursor);
+        SummarySource {
+            from_cursor: from,
+            head: self.next_cursor,
+            changes: self
+                .log
+                .iter()
+                .filter(|change| change.cursor >= from)
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn retained_views(visit: Option<&Visit>, oldest_output_cursor: u64) -> Vec<RetainedLogView> {
         visit
             .map(|visit| visit.views.clone())
@@ -514,6 +544,17 @@ impl Visits {
                 )
             },
             |log| log.changed_since(session_id, actor, max_changes, oldest_output_cursor),
+        )
+    }
+
+    /// Returns what a summary of what changed in one session since one actor's last visit is
+    /// written from: the interval from the cursor the actor has acknowledged to the cursor the log
+    /// has reached, and the changes the log retains in it.
+    #[must_use]
+    pub fn summary_source(&self, actor: &ActorId, session_id: SessionId) -> SummarySource {
+        self.sessions.get(&session_id).map_or_else(
+            || SessionLog::default().summary_source(actor),
+            |log| log.summary_source(actor),
         )
     }
 
