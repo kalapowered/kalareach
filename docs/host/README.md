@@ -1359,6 +1359,12 @@ whose job restricts desktops declines before it creates the program and says why
 which keeps the reason on the launch attempt. The typed command then runs as typed, as it does
 without the integration.
 
+A launch that meets a session already closing is refused by name before anything is created. A
+closure that begins while a launch is creating its agent ends what the launch made, and the launch
+fails by name, because a process created in a job that has been ended is not ended with it. The
+launch records a reduced agent's job on the session before its process exists, so a closure that
+begins at any point reads it.
+
 ### Running the Windows tests
 
 Two machines run them and they run different things.
