@@ -605,8 +605,6 @@ fn acknowledged_worker_and_a_paired_device(
     kr_protocol::ids::SessionId,
     kr_protocol::actor::ActorEnvelope,
 ) {
-    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
-
     let revision = controller.leases.authority_revision();
     let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
     let binding = controller.leases.bind(session_id);
@@ -615,13 +613,22 @@ fn acknowledged_worker_and_a_paired_device(
             .leases
             .acknowledge(session_id, binding, revision, None)
     );
+    (session_id, a_paired_device(controller))
+}
+
+/// The envelope a paired device's mutation carries over a connection registered at the revision in
+/// force.
+pub(super) fn a_paired_device(controller: &Controller) -> kr_protocol::actor::ActorEnvelope {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+
+    let revision = controller.leases.authority_revision();
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor_id = ActorId::new("device:test").expect("a principal");
     controller.admitted_table().insert(
         connection_id,
         super::AdmittedConnection::new(actor_id.clone(), revision),
     );
-    let actor = ActorEnvelope {
+    ActorEnvelope {
         actor_id,
         ingress: ActorIngress::PairedDevice,
         device_id: Nullable::null(),
@@ -629,8 +636,7 @@ fn acknowledged_worker_and_a_paired_device(
         grant_revision: Nullable::some(revision),
         controller_generation: controller.generation,
         connection_id,
-    };
-    (session_id, actor)
+    }
 }
 
 /// KR-REQ-09.12: a lease is refused while this host owes a fence it could not raise. A debt is

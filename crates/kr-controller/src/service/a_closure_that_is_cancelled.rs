@@ -3,18 +3,23 @@
 //! A closure is recorded under the registry's lock and the rest of what it does waits for other
 //! locks: the directory, the connection table and the presentations. A request that stops waiting
 //! while the closure is parked at one of those leaves the closure recorded and nothing to repeat
-//! its tail, because a recorded closure is the answer to every later ask. What the barrier is told
-//! must therefore be told in the section that records the closure, or a worker that has ended stays
-//! pending for every revocation after it.
+//! its tail, because a recorded closure is the answer to every later ask. So what the barrier is
+//! told is told in the section that records the closure, and the tail runs to its end on a task
+//! of its own, whatever becomes of the request that began it: a worker that has ended neither
+//! stays pending for every revocation after it nor stays in what this daemon holds of its
+//! workers.
 
 use std::future::Future;
 use std::task::Poll;
+use std::time::Duration;
 
 use kr_protocol::action::BarrierState;
 use kr_protocol::ids::{AuthorityRevision, SessionId};
 
+use super::LeaseDenied;
 use super::a_close_a_worker_never_answers::Silent;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
+use super::the_fence_at_every_effect::a_paired_device;
 use crate::authority::Round;
 
 /// The lock a closure's recording is parked at.
@@ -82,15 +87,71 @@ fn reached(parked: Parked, world: &Silent) -> bool {
     }
 }
 
-/// How many times a test polls a closure that has not yet reached the lock it is held at before it
-/// calls that a failure: a bound on a count of polls, never a wait for a time to pass.
-const POLLS: usize = 10_000;
+/// How long a test waits for the daemon's own task to get where the test expects it before it calls
+/// that a failure. Nothing is decided by it: the waits are on conditions, and a task that never gets
+/// there is the one thing that runs it out.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// Waits until `condition` holds, polling it between yields to the other tasks of the runtime.
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let waited = tokio::time::timeout(WAIT, async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "{what}");
+}
+
+/// Whether the daemon still holds the session's worker in its directory, its connection table, the
+/// set of workers the plugin admissions wait for, and the descriptors it published. Read with
+/// `try_lock`, because another task of the daemon may be holding a lock for a moment.
+fn held_of(world: &Silent) -> Option<[bool; 4]> {
+    let directory = world.controller.directory.try_lock().ok()?;
+    let connections = world.controller.connections.try_lock().ok()?;
+    Some([
+        directory.get(world.session_id).is_some(),
+        connections.contains_key(&world.session_id),
+        world.controller.plugin_bridge.holds(world.session_id),
+        kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_some(),
+    ])
+}
+
+/// A revocation holds with no worker for the session to wait for.
+async fn assert_revocation_holds_without(world: &Silent) {
+    let report = world
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the announcement is made");
+    assert!(report.holds(), "{report:?}");
+    assert!(report.workers.is_empty(), "{report:?}");
+}
+
+/// A paired device is given no dispatch lease for the session's worker, whatever the daemon still
+/// holds of it.
+async fn assert_no_lease(world: &Silent) {
+    let device = a_paired_device(&world.controller);
+    assert!(matches!(
+        world
+            .controller
+            .dispatch_lease(world.session_id, &device)
+            .await,
+        Err(LeaseDenied::NotAcknowledged(_))
+    ));
+}
 
 /// Records a closure and drops the future that records it while it waits at `parked`, and answers
 /// whether the closure was recorded and what the barrier says about the worker afterwards.
 ///
-/// The future is polled by hand until it has done everything it does before the wait at `parked`
-/// ([`reached`]), so it is at that wait and no earlier one, and then dropped.
+/// The future is polled by hand until the closure has done everything it does before the wait at
+/// `parked` ([`reached`]), so it is at that wait and no earlier one, and then dropped. While the
+/// tail is held there, and again once it has run, a revocation holds without the worker and a
+/// paired device's lease for it is refused. What the daemon holds of the worker is read once the
+/// locks are let go: the whole of it where the closure was never recorded, and none of it where it
+/// was, since the tail does not need the request that began it.
 async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     let script = Scripted::new();
     let world = scripted(&script).await;
@@ -98,11 +159,19 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     let revision = world.controller.leases.authority_revision();
     // A round that began while the worker ran, which is what holds an ended worker for it to report.
     let round = world.controller.leases.begin_round();
-    // A link to the worker, so that its removal from the table is something to wait for.
+    // The worker as this daemon holds it once it has published it: a link, a descriptor, a place in
+    // the plugin admissions' set.
     world.controller.connections.lock().await.insert(
         world.session_id,
         std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     );
+    kr_ipc::descriptor::publish(world.controller.paths(), &world.worker.descriptor)
+        .expect("the descriptor is published");
+    world.controller.plugin_bridge.recorded(
+        world.session_id,
+        world.worker.descriptor.process_start_identity.clone(),
+    );
+    assert_eq!(held_of(&world), Some([true; 4]));
     let held: Box<dyn Send + '_> = match parked {
         Parked::Registry => Box::new(world.controller.registry.lock().await),
         Parked::Directory => Box::new(world.controller.directory.lock().await),
@@ -111,26 +180,52 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     };
     let mut closing = Box::pin(world.controller.retire(&record));
     let mut at_the_wait = false;
-    for _ in 0..POLLS {
-        let polled =
-            std::future::poll_fn(|context| Poll::Ready(closing.as_mut().poll(context))).await;
-        assert!(
-            polled.is_pending(),
-            "the closure waits at the {parked:?} lock the test holds"
-        );
-        if reached(parked, &world) {
-            at_the_wait = true;
-            break;
+    let reaching = async {
+        while !at_the_wait {
+            let polled =
+                std::future::poll_fn(|context| Poll::Ready(closing.as_mut().poll(context))).await;
+            assert!(
+                polled.is_pending(),
+                "the closure waits at the {parked:?} lock the test holds"
+            );
+            at_the_wait = reached(parked, &world);
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    };
     assert!(
-        at_the_wait,
-        "the closure did not reach the {parked:?} wait in {POLLS} polls"
+        tokio::time::timeout(WAIT, reaching).await.is_ok(),
+        "the closure did not reach the {parked:?} wait"
     );
+    // The closure is recorded wherever it waits after the registry, and nothing is while it waits
+    // for the registry. With its tail still held at the wait, a worker that ended is already sent
+    // no lease, and a revocation already holds without it: the announcement reads the directory, so
+    // where the tail waits for that, it is made once the lock is let go.
+    let recorded_by_now = !matches!(parked, Parked::Registry);
+    if recorded_by_now {
+        assert_eq!(
+            state_of(&round, world.session_id, revision),
+            BarrierState::Ended
+        );
+        assert_no_lease(&world).await;
+        if !matches!(parked, Parked::Directory) {
+            assert_revocation_holds_without(&world).await;
+        }
+    }
     drop(closing);
     drop(held);
     let closed = recorded(&world).await;
+    assert_eq!(closed, recorded_by_now);
+    if closed {
+        assert_revocation_holds_without(&world).await;
+        assert_no_lease(&world).await;
+    }
+    // What the closure left of the worker: all of it where nothing was recorded, and none of it
+    // once the closure's own task has run to its end.
+    until(
+        "the daemon's view of the worker is as the closure leaves it",
+        || held_of(&world) == Some(if closed { [false; 4] } else { [true; 4] }),
+    )
+    .await;
     let state = state_of(&round, world.session_id, revision);
     // Once the round is over nothing can ask about an ended worker that named nothing.
     drop(round);
@@ -175,9 +270,10 @@ async fn a_closure_dropped_before_it_is_recorded_ends_nothing() {
     assert_eq!(held, 1);
 }
 
-/// A closure that is recorded and then dropped, wherever it waits next, has told the barrier the
-/// worker ended: a round that began while it ran reports it ended, and once that round is over
-/// nothing of it is held.
+/// KR-REQ-09.12: a closure that is recorded and then dropped, wherever it waits next, has told the
+/// barrier the worker ended: a round that began while it ran reports it ended, once that round is
+/// over nothing of it is held, a revocation holds without it, and no lease is issued for it. The
+/// closure's own task has taken the worker out of everything else this daemon held of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_dropped_at_the_directory_has_ended_the_worker() {
     let (closed, state, held) = cancelled_at(Parked::Directory).await;
