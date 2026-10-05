@@ -215,10 +215,6 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     drop(held);
     let closed = recorded(&world).await;
     assert_eq!(closed, recorded_by_now);
-    if closed {
-        assert_revocation_holds_without(&world).await;
-        assert_no_lease(&world).await;
-    }
     // What the closure left of the worker: all of it where nothing was recorded, and none of it
     // once the closure's own task has run to its end.
     until(
@@ -226,6 +222,10 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
         || held_of(&world) == Some(if closed { [false; 4] } else { [true; 4] }),
     )
     .await;
+    if closed {
+        assert_revocation_holds_without(&world).await;
+        assert_no_lease(&world).await;
+    }
     let state = state_of(&round, world.session_id, revision);
     // Once the round is over nothing can ask about an ended worker that named nothing.
     drop(round);
