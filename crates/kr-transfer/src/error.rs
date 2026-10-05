@@ -18,6 +18,12 @@ pub enum TransferError {
         /// What went wrong.
         detail: String,
     },
+    /// The host could not say which sessions still keep what was submitted to them.
+    #[error("the host could not say which sessions retain: {detail}")]
+    RetentionUnavailable {
+        /// What went wrong.
+        detail: String,
+    },
     /// The request names another environment.
     ///
     /// A handle, a scope and a staged file all belong to one environment. A Windows path and a WSL
@@ -180,9 +186,9 @@ impl TransferError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::StoreUnavailable { .. } | Self::StagingUnavailable { .. } => {
-                ErrorCode::StorageUnavailable
-            }
+            Self::StoreUnavailable { .. }
+            | Self::StagingUnavailable { .. }
+            | Self::RetentionUnavailable { .. } => ErrorCode::StorageUnavailable,
             Self::WrongEnvironment { .. } => ErrorCode::EnvironmentUnavailable,
             // Section 23 has no distinct code for an identifier that names nothing, and inventing
             // one would tell a caller whether an identifier it guessed exists.

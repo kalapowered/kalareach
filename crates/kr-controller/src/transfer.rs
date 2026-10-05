@@ -223,7 +223,8 @@ impl kr_transfer::service::AdmissionHook for TransferAdmission {
     }
 }
 
-/// Where a test stops one sweep: where its store work begins, once the daemon has answered it.
+/// Where a test stops one sweep: once the archive has answered which sessions retain, and before
+/// the sweep is given the answer.
 ///
 /// A sweep carries one only when a test asked for that sweep ([`TransferModule::sweep_paused`]),
 /// so the daemon's own sweeps never stop. It exists only for this crate's unit tests.
@@ -240,6 +241,45 @@ impl StorePause {
     fn wait(self) {
         let _ = self.arrived.send(());
         let _ = self.go.recv();
+    }
+}
+
+/// What the archive answers when the sweep asks which sessions still retain what was submitted to
+/// them.
+///
+/// The archive is read when it is asked, which is after the sweep has read the attachments, so a
+/// session an attachment names was already known to this host when the archive is read.
+struct ArchiveAnswers<'a> {
+    owner: &'a Arc<Controller>,
+    /// The stop a test asked this sweep for, taken once the archive has answered.
+    #[cfg(test)]
+    pause: std::sync::Mutex<Option<StorePause>>,
+}
+
+impl kr_transfer::SessionRetention for ArchiveAnswers<'_> {
+    fn retained(
+        &self,
+        sessions: &std::collections::BTreeSet<SessionId>,
+    ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+        let view = self.owner.archive_retention().map_err(|error| {
+            kr_transfer::TransferError::RetentionUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        #[cfg(test)]
+        if let Some(pause) = self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            pause.wait();
+        }
+        Ok(sessions
+            .iter()
+            .copied()
+            .filter(|session_id| view.retains(*session_id))
+            .collect())
     }
 }
 
@@ -783,11 +823,11 @@ impl TransferModule {
         )
     }
 
-    /// Queues a sweep as [`TransferModule::sweep`] does, one that stops where its store work
-    /// begins until the test lets it go: the receiver hears it arrive there, and the sender lets it
-    /// go on.
+    /// Queues a sweep as [`TransferModule::sweep`] does, one that stops once the archive has said
+    /// which sessions retain, until the test lets it go: the receiver hears it arrive there, and
+    /// the sender lets it go on.
     #[cfg(test)]
-    fn sweep_paused(
+    pub(crate) fn sweep_paused(
         &self,
         daemon: &Weak<Controller>,
     ) -> (
@@ -821,16 +861,14 @@ impl TransferModule {
                     "the daemon this sweep was for has stopped",
                 )
             })?;
-            // The archive is the authority on what a session keeps. The sweep still asks one
-            // question through one interface; what changed is which store answers it.
-            let retention = owner
-                .archive_retention()
-                .map_err(|error| error.to_protocol_error())?;
-            #[cfg(test)]
-            if let Some(pause) = pause {
-                pause.wait();
-            }
-            let swept = service.sweep(&retention).map_err(Into::into);
+            // The archive is the authority on what a session keeps. The sweep asks it once, after
+            // it has read the attachments, so the answer is a view taken after them.
+            let answers = ArchiveAnswers {
+                owner: &owner,
+                #[cfg(test)]
+                pause: std::sync::Mutex::new(pause),
+            };
+            let swept = service.sweep(&answers).map_err(Into::into);
             // Only now may the daemon go, and its environment with it.
             drop(owner);
             swept

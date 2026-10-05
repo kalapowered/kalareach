@@ -15,6 +15,7 @@
 //!   Acceptance by the agent is [`TransferService::record_insertion_outcome`] with upstream
 //!   evidence, and nothing else sets it.
 
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -60,9 +61,20 @@ const READ_BUFFER_LEN: usize = 256 * 1024;
 /// A submitted attachment follows its session's retention policy rather than the seven-day
 /// unused-attachment window, and the transfer service is not the owner of that policy. The host
 /// answers for its own sessions.
+///
+/// The sweep asks once, after it has read the attachments, and about exactly the sessions those
+/// attachments name. What the host answers is a view taken after those attachments were read, so
+/// every session they name was already one the host knew when it answered. An attachment that is
+/// submitted to some other session after the question was asked is not judged by the answer.
 pub trait SessionRetention {
-    /// Returns true while the session's retention still covers what was submitted to it.
-    fn retains(&self, session_id: kr_protocol::ids::SessionId) -> bool;
+    /// Returns those of `sessions` whose retention still covers what was submitted to them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the host cannot tell. The sweep then stops, because it reads a
+    /// session the host does not list as one that has ended and removes what was submitted to it,
+    /// and declining to delete is the answer that cannot lose a file.
+    fn retained(&self, sessions: &BTreeSet<SessionId>) -> Result<BTreeSet<SessionId>>;
 }
 
 /// A retention that keeps everything.
@@ -73,8 +85,8 @@ pub trait SessionRetention {
 pub struct RetainEverything;
 
 impl SessionRetention for RetainEverything {
-    fn retains(&self, _session_id: kr_protocol::ids::SessionId) -> bool {
-        true
+    fn retained(&self, sessions: &BTreeSet<SessionId>) -> Result<BTreeSet<SessionId>> {
+        Ok(sessions.clone())
     }
 }
 
@@ -2546,13 +2558,28 @@ impl TransferService {
     /// can land in between, and a sweep that overwrote one of those would expire an attachment its
     /// session had just taken responsibility for.
     ///
+    /// The sweep decides on one view. It lists the published attachments first and then asks the
+    /// host's retention about exactly the sessions the submitted ones name, so the host's answer
+    /// is taken after the attachments were read and every session they name was already known to
+    /// it. A submitted attachment whose session was not part of that question, because it was
+    /// submitted after the attachments were listed, is not judged by the answer and waits for the
+    /// next sweep.
+    ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read or written.
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read or written, and
+    /// whatever the retention returns when it cannot answer, before anything is expired.
     pub fn sweep(&self, retention: &dyn SessionRetention) -> Result<Sweep> {
         let now = self.clock.now_ms();
         let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         let mut sweep = Sweep::default();
+        let published = self.locked()?.uploads_in(&[UploadState::Published])?;
+        let asked: BTreeSet<SessionId> = published
+            .iter()
+            .filter(|row| row.submitted_at_ms.is_some())
+            .filter_map(|row| row.session_id)
+            .collect();
+        let retained = retention.retained(&asked)?;
         let unfinished = self
             .locked()?
             .uploads_in(&[UploadState::Receiving, UploadState::Publishing])?;
@@ -2582,7 +2609,6 @@ impl TransferService {
                 sweep.expired_uploads += 1;
             }
         }
-        let published = self.locked()?.uploads_in(&[UploadState::Published])?;
         for candidate in published {
             let mut store = self.locked()?;
             let Some(row) = store.upload(candidate.transfer_id)? else {
@@ -2595,7 +2621,11 @@ impl TransferService {
             // A submitted attachment follows its session, whatever its own unused-attachment
             // deadline says; an unsubmitted one follows that deadline.
             let expired = match (row.submitted_at_ms, row.session_id) {
-                (Some(_), Some(session_id)) => !retention.retains(session_id),
+                // Judged by the answer only when the question named its session: an attachment
+                // submitted after the question was asked is for a session the answer cannot speak
+                // for, and is left for the next sweep.
+                (Some(_), Some(session_id)) if !asked.contains(&session_id) => continue,
+                (Some(_), Some(session_id)) => !retained.contains(&session_id),
                 (Some(_), None) => row.expires_at_ms.get() <= now.get(),
                 (None, _) => row.expires_at_ms.get() <= now.get(),
             };
