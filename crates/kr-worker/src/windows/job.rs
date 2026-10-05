@@ -85,6 +85,9 @@ pub struct SessionJob {
     state: Mutex<State>,
     /// Signalled when the last launch in flight leaves, which is what a closure waits for.
     launches_left: Condvar,
+    /// Told when a closure begins to wait for a launch, for this host's own tests.
+    #[cfg(feature = "testing")]
+    waiting: Mutex<Option<Notice>>,
 }
 
 /// What a session's launches and its closure share.
@@ -96,9 +99,6 @@ struct State {
     /// either ended with the session's jobs or ended by the launch itself, and the closure cannot
     /// tell which until the launch has left.
     launching: usize,
-    /// Told when a closure begins to wait for a launch, for this host's own tests.
-    #[cfg(feature = "testing")]
-    waiting: Option<Notice>,
 }
 
 /// What a test asked to be told, once.
@@ -159,6 +159,8 @@ impl SessionJob {
             job,
             state: Mutex::new(State::default()),
             launches_left: Condvar::new(),
+            #[cfg(feature = "testing")]
+            waiting: Mutex::new(None),
         })
     }
 
@@ -225,12 +227,17 @@ impl SessionJob {
     /// is admitted, so the count only falls.
     #[must_use]
     pub fn await_launches(&self, bound: std::time::Duration) -> bool {
-        let mut state = self.lock();
+        let state = self.lock();
         if state.launching == 0 {
             return true;
         }
         #[cfg(feature = "testing")]
-        if let Some(Notice(tell)) = state.waiting.take() {
+        if let Some(Notice(tell)) = self
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             tell();
         }
         let (state, _) = self
@@ -244,7 +251,10 @@ impl SessionJob {
     /// is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub fn tell_when_a_closure_waits(&self, tell: impl FnOnce() + Send + 'static) {
-        self.lock().waiting = Some(Notice(Box::new(tell)));
+        *self
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Notice(Box::new(tell)));
     }
 
     /// Records an agent that will run under the reduced-ownership profile, before its process is
