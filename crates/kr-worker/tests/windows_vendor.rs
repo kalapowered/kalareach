@@ -149,7 +149,7 @@ impl Launch {
         which: u8,
         ownership: AgentOwnership,
         session: &Arc<SessionJob>,
-        arm: impl FnOnce(&NativeGateway, &Path),
+        arm: impl FnOnce(&mut NativeGateway, &Path),
     ) -> Result<Self, BrokerError> {
         let directory = private_directory();
         let report = directory.join("report");
@@ -159,7 +159,7 @@ impl Launch {
         let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(which))
             .expect("the endpoint binds")
             .in_session(Arc::clone(session));
-        arm(&gateway, &directory);
+        arm(&mut gateway, &directory);
         let arguments: Vec<String> = [
             "--ignored",
             "--exact",
@@ -671,9 +671,9 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
 // A session that is closing.
 
 /// KR-REQ-07.64: a session whose closure has begun takes no launch under either profile: it is
-/// refused by name before anything is created, so the launch never reaches the point at which its
-/// job is made, and no agent is recorded on the session. Control: the same launches under an
-/// open session start (every other test here).
+/// refused by name before anything is created, so the launch never reaches the point at which it
+/// is admitted, and no agent is recorded on the session. Control: the same launches under an open
+/// session start (every other test here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_profile() {
     let session = Arc::new(SessionJob::create().expect("a session job"));
@@ -710,25 +710,92 @@ async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_pro
     );
 }
 
+/// Where a test holds a launch, as the gateway reports it: the end that says the launch has
+/// arrived and the end that lets it go on.
+type Pause = (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+);
+
+/// A launch made on a thread of its own and held where a test says.
+struct HeldLaunch {
+    thread: std::thread::JoinHandle<Result<Launch, BrokerError>>,
+    release: std::sync::mpsc::SyncSender<()>,
+    /// What names this launch's processes on a command line: the name of its private directory,
+    /// which the stand-in is given a path in.
+    marker: String,
+}
+
+impl HeldLaunch {
+    /// Starts a launch of the stand-in as the agent of `session` under `ownership` and returns
+    /// once it has arrived where `hold` stops it. With `credential_taken`, the launch fails once
+    /// its process is running, because the name its credential is written to is taken.
+    fn start(
+        which: u8,
+        ownership: AgentOwnership,
+        session: &Arc<SessionJob>,
+        credential_taken: bool,
+        hold: impl FnOnce(&mut NativeGateway) -> Pause + Send + 'static,
+    ) -> Self {
+        let (to_test, armed) = std::sync::mpsc::channel();
+        let launching = Arc::clone(session);
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(async {
+                Launch::start_with(which, ownership, &launching, |gateway, directory| {
+                    if credential_taken {
+                        std::fs::write(directory.join("credential"), b"held")
+                            .expect("the credential's name is taken");
+                    }
+                    let name = directory
+                        .file_name()
+                        .expect("the directory has a name")
+                        .to_string_lossy()
+                        .into_owned();
+                    to_test
+                        .send((hold(gateway), name))
+                        .expect("the test is waiting");
+                })
+            })
+        });
+        let ((arrived, release), marker) = armed.recv().expect("the gateway is armed");
+        arrived
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the launch reaches the pause");
+        Self {
+            thread,
+            release,
+            marker,
+        }
+    }
+
+    /// Lets the launch go on and returns how it ended.
+    fn release(self) -> Result<Launch, BrokerError> {
+        self.release.send(()).expect("the launch goes on");
+        self.thread.join().expect("the launch ends")
+    }
+}
+
 /// What a closure that runs beside a launch tells the test.
 enum Reported {
     /// It is waiting for a launch that was admitted before the session closed.
     Waiting,
-    /// It has read the session and written its receipt.
+    /// It has ended what the session held, waited for it to be gone and written its receipt.
     Receipt {
         coverage: OwnershipCoverage,
         resources: Vec<SurvivingResource>,
-        /// How many processes the session's jobs held when the receipt was written.
-        held: usize,
     },
 }
 
 /// Closes `session` as the worker's closure does, on a thread of its own: the record of what the
-/// session owns, one look, the forced stop, one more look, and the receipt.
+/// session owns, one look, the forced stop, then, once everything it ended has gone (the worker
+/// drains before it writes), one more look and the receipt.
 fn close_beside_a_launch(
     session: &Arc<SessionJob>,
     root: u32,
-    reduced_so_far: Vec<Arc<AgentJob>>,
     reports: std::sync::mpsc::Sender<Reported>,
 ) -> std::thread::JoinHandle<()> {
     let session = Arc::clone(session);
@@ -740,175 +807,221 @@ fn close_beside_a_launch(
         );
         owned.observe();
         force_stop(&owned);
+        eventually("what the closure ended has gone", || {
+            owned.observe();
+            owned.surviving().is_empty()
+                && session.process_ids().is_ok_and(|held| held.is_empty())
+                && session
+                    .reduced_agents()
+                    .iter()
+                    .all(|agent| agent.process_ids().is_ok_and(|held| held.is_empty()))
+        });
         owned.observe();
-        let held = session
-            .process_ids()
-            .expect("the session's processes")
-            .len()
-            + reduced_so_far
-                .iter()
-                .map(|agent| agent.process_ids().expect("the agent's processes").len())
-                .sum::<usize>();
         let receipt = Reported::Receipt {
             resources: owned.surviving_resources(),
             coverage: owned.coverage(),
-            held,
         };
         let _ = reports.send(receipt);
     })
 }
 
+/// Closes `session` beside a launch that is held, and says what the closure reports first.
+///
+/// A closure that reports a receipt before the launch is let go has written it while the launch
+/// was in flight.
+fn closure_beside(
+    session: &Arc<SessionJob>,
+    root: u32,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Reported>,
+    Reported,
+) {
+    let (reports, heard) = std::sync::mpsc::channel();
+    let waiting = reports.clone();
+    session.tell_when_a_closure_waits(move || {
+        let _ = waiting.send(Reported::Waiting);
+    });
+    let closure = close_beside_a_launch(session, root, reports);
+    let first = heard
+        .recv_timeout(LIVENESS_DEADLINE)
+        .expect("the closure reports");
+    (closure, heard, first)
+}
+
+fn receipt_of(
+    heard: &std::sync::mpsc::Receiver<Reported>,
+) -> (OwnershipCoverage, Vec<SurvivingResource>) {
+    match heard
+        .recv_timeout(LIVENESS_DEADLINE)
+        .expect("the closure writes its receipt")
+    {
+        Reported::Receipt {
+            coverage,
+            resources,
+        } => (coverage, resources),
+        Reported::Waiting => panic!("the closure reported waiting twice"),
+    }
+}
+
+/// The identifiers of the processes whose command line names any of `markers`, read from the
+/// system's own process list and not through any job a test is about.
+fn processes_naming(markers: &[String]) -> Vec<u32> {
+    let any = markers
+        .iter()
+        .map(|marker| format!("$_.CommandLine -like '*{marker}*'"))
+        .collect::<Vec<_>>()
+        .join(" -or ");
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and ({any}) }} \
+         | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("the system's process list is read");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
 /// KR-REQ-07.64: a closure that overtakes a launch waits for it before it writes its receipt, at
-/// every point the launch can be held on its way to creating the agent: admitted, with its job
-/// recorded, and with its process created. The launch ends what it made and fails by name, the
-/// closure reads the session after that, and the receipt names nothing left running; where the
-/// agent is the full profile's it reads complete. Under each profile.
+/// every point the launch can be held on its way to making the agent: admitted, with its job
+/// recorded, with its process created, and with its process created and found not to be closing.
+/// A launch the closure overtook before its check ends what it made and fails by name; one that
+/// had passed its check hands over an agent the closure then ends. Either way the closure reads
+/// the session after that, the receipt names nothing left running, and no process of the stand-in
+/// vendor is left, which a look at the system's own process list shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_closure_waits_for_a_launch_it_overtakes_before_it_writes_its_receipt() {
     let mut which = 40_u8;
+    let mut markers = Vec::new();
     for stage in [
         LaunchStage::Admitted,
         LaunchStage::JobRecorded,
         LaunchStage::ProcessCreated,
+        LaunchStage::Checked,
     ] {
         for ownership in [AgentOwnership::Full, AgentOwnership::Reduced] {
             which += 1;
             let label = format!("{ownership:?} held at {stage:?}");
             let session = Arc::new(SessionJob::create().expect("a session job"));
-            let (to_test, armed) = std::sync::mpsc::channel();
-            let launching = Arc::clone(&session);
-            let launcher = std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("a runtime");
-                runtime.block_on(async {
-                    Launch::start_with(which, ownership, &launching, |gateway, _| {
-                        to_test
-                            .send(gateway.pause_launch_at(stage))
-                            .expect("the test is waiting");
-                    })
-                    .map(drop)
-                })
+            let held = HeldLaunch::start(which, ownership, &session, false, move |gateway| {
+                gateway.pause_launch_at(stage)
             });
-            let (arrived, release) = armed.recv().expect("the gateway is armed");
-            arrived
-                .recv_timeout(LIVENESS_DEADLINE)
-                .expect("the launch reaches the pause");
+            markers.push(held.marker.clone());
 
-            let (reports, heard) = std::sync::mpsc::channel();
-            let waiting = reports.clone();
-            session.tell_when_a_closure_waits(move || {
-                let _ = waiting.send(Reported::Waiting);
-            });
-            let closure = close_beside_a_launch(
-                &session,
-                0xFFFF_FF00 + u32::from(which),
-                session.reduced_agents(),
-                reports,
-            );
-            // The launch is held where the test put it, so a closure that reports before the
-            // launch goes on has written its receipt while a launch was in flight.
-            let first = heard
-                .recv_timeout(LIVENESS_DEADLINE)
-                .expect("the closure reports");
+            let (closure, heard, first) = closure_beside(&session, 0xFFFF_FF00 + u32::from(which));
             assert!(
                 matches!(first, Reported::Waiting),
                 "{label}: the closure wrote its receipt while a launch was in flight"
             );
-
-            release.send(()).expect("the launch goes on");
-            let refused = launcher
-                .join()
-                .expect("the launch ends")
-                .expect_err("the launch fails");
-            assert!(
-                matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
-                "{label}: {refused:?}"
-            );
-            let Reported::Receipt {
-                coverage,
-                resources,
-                held,
-            } = heard
-                .recv_timeout(LIVENESS_DEADLINE)
-                .expect("the closure writes its receipt")
-            else {
-                panic!("{label}: the closure reported waiting twice");
-            };
+            let outcome = held.release();
+            let (coverage, resources) = receipt_of(&heard);
             closure.join().expect("the closure ends");
-            assert_eq!(
-                held, 0,
-                "{label}: the receipt was written with a process running"
-            );
-            assert!(
-                resources.iter().all(|resource| resource.kind != "process"),
-                "{label}: {resources:?}"
-            );
-            assert!(
-                session.reduced_agents().is_empty(),
-                "{label}: the agent that never ran is forgotten"
-            );
-            if ownership == AgentOwnership::Full {
-                assert_eq!(
+
+            let handed_over = if stage == LaunchStage::Checked {
+                let launch =
+                    outcome.expect("a launch that had passed its check hands its agent over");
+                eventually(&format!("{label}: the closure ended the agent"), || {
+                    ended(&launch.process)
+                });
+                Some(launch)
+            } else {
+                let refused = outcome.err().expect("the launch fails");
+                assert!(
+                    matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+                    "{label}: {refused:?}"
+                );
+                assert!(
+                    session.reduced_agents().is_empty(),
+                    "{label}: the agent that never ran is forgotten"
+                );
+                None
+            };
+            match ownership {
+                AgentOwnership::Full => assert_eq!(
                     coverage,
                     OwnershipCoverage::Complete,
                     "{label}: {resources:?}"
-                );
+                ),
+                // An agent the closure saw recorded, even for a moment, is one the session ran
+                // outside its own job.
+                AgentOwnership::Reduced if handed_over.is_some() => {
+                    assert_eq!(coverage, OwnershipCoverage::Incomplete, "{label}");
+                    assert!(
+                        resources
+                            .iter()
+                            .any(|resource| resource.detail.contains("reduced-ownership")),
+                        "{label}: {resources:?}"
+                    );
+                }
+                AgentOwnership::Reduced => {}
             }
+            drop(handed_over);
         }
     }
+    eventually("no process of a stand-in vendor is left", || {
+        processes_naming(&markers).is_empty()
+    });
 }
 
-/// KR-REQ-07.64: a launch that fails after its process started, over a credential it could not
-/// write, is ended with the record of it, so the closure that follows reads nothing of an
-/// agent that never stayed and its coverage reads complete. Control: the same failure under the
-/// full profile, which records no agent.
+/// KR-REQ-07.64: a closure that begins while a launch that failed after its process started is
+/// undoing what it made waits for the undo, so it never reads the session between the agent's
+/// record leaving it and the agent's process ending. The launch fails by name over the credential
+/// it could not write, leaves no reduced agent on the session, and a closure that follows reads
+/// complete coverage and nothing of an agent that never stayed. Under each profile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_64_a_launch_that_fails_after_it_started_leaves_no_reduced_agent_on_the_session()
-{
+async fn kr_req_07_64_a_closure_waits_for_a_launch_that_is_undoing_itself_and_the_session_forgets_its_agent()
+ {
+    let mut markers = Vec::new();
     for (which, ownership) in [(51, AgentOwnership::Full), (52, AgentOwnership::Reduced)] {
         let session = Arc::new(SessionJob::create().expect("a session job"));
-        let failed = Launch::start_with(which, ownership, &session, |_, directory| {
-            // A name the launch's credential cannot be written to, so the launch fails once its
-            // process is running.
-            std::fs::write(directory.join("credential"), b"held")
-                .expect("the credential's name is taken");
-        })
-        .err()
-        .expect("the launch fails after its process started");
+        let held = HeldLaunch::start(which, ownership, &session, true, |gateway| {
+            gateway.pause_before_cleanup()
+        });
+        markers.push(held.marker.clone());
+
+        let (closure, heard, first) = closure_beside(&session, 0xFFFF_FF80 + u32::from(which));
         assert!(
-            !matches!(&failed, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+            matches!(first, Reported::Waiting),
+            "{ownership:?}: the closure wrote its receipt while a launch was undoing itself"
+        );
+        let failed = held.release().err().expect("the launch fails");
+        assert!(
+            matches!(&failed, BrokerError::LedgerUnavailable { detail } if detail.contains("credential")),
             "{ownership:?}: the launch failed for the reason the test made: {failed:?}"
         );
+        let (coverage, resources) = receipt_of(&heard);
+        closure.join().expect("the closure ends");
+        if ownership == AgentOwnership::Full {
+            assert_eq!(coverage, OwnershipCoverage::Complete, "{resources:?}");
+        }
         assert!(
             session.reduced_agents().is_empty(),
             "{ownership:?}: the agent that did not stay is not recorded as one the session ran"
         );
+
         let (reports, heard) = std::sync::mpsc::channel();
-        close_beside_a_launch(
-            &session,
-            0xFFFF_FF80 + u32::from(which),
-            Vec::new(),
-            reports,
-        )
-        .join()
-        .expect("the closure ends");
-        let Reported::Receipt {
-            coverage,
-            resources,
-            held,
-        } = heard.recv().expect("the closure writes its receipt")
-        else {
-            panic!("{ownership:?}: nothing was waited for");
-        };
-        assert_eq!(held, 0, "{ownership:?}");
+        close_beside_a_launch(&session, 0xFFFF_FFC0 + u32::from(which), reports)
+            .join()
+            .expect("the closure ends");
+        let (coverage, resources) = receipt_of(&heard);
         assert_eq!(
             coverage,
             OwnershipCoverage::Complete,
-            "{ownership:?}: {resources:?}"
+            "{ownership:?}: a closure after the failed launch reads nothing of its agent: {resources:?}"
         );
     }
+    eventually("no process of a stand-in vendor is left", || {
+        processes_naming(&markers).is_empty()
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
