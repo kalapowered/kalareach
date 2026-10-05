@@ -77,7 +77,7 @@ pub struct SessionJob {
     job: Job,
     /// What this session's launches and its closure have to agree on: the agents the session ran
     /// under the reduced-ownership profile, whether the session has been closed, and how many
-    /// launches are in the middle of making a process.
+    /// launches are in flight.
     ///
     /// Kept for as long as the session is: the session's closure lists what the jobs hold and ends
     /// it, and a worker that dies takes them down because they are kill-on-close and this is where
@@ -95,9 +95,8 @@ pub struct SessionJob {
 struct State {
     agents: Vec<Arc<AgentJob>>,
     closed: bool,
-    /// Launches that were admitted and have not yet finished: a process one of them creates is
-    /// either ended with the session's jobs or ended by the launch itself, and the closure cannot
-    /// tell which until the launch has left.
+    /// Launches that were admitted and have not yet finished: until one has committed or undone
+    /// everything it made, the closure cannot tell what the session holds.
     launching: usize,
 }
 
