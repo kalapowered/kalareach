@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::task::Poll;
+use std::time::Duration;
 
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::AuthorityRevision;
@@ -21,6 +22,11 @@ use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
 use crate::error::ControllerError;
 use crate::registry::WorkerRecord;
+
+/// How long a test waits for a real worker to answer before it calls that a failure. Nothing is
+/// decided by it: the wait is on a condition, and a worker that never answers is the one thing that
+/// runs it out.
+const WAIT: Duration = Duration::from_secs(60);
 
 /// The registry's row for a world's worker, as an earlier build's recovery wrote it.
 fn row_of(world: &Silent) -> WorkerRecord {
@@ -474,12 +480,26 @@ async fn a_worker_recorded_and_not_yet_published_is_pending_in_a_revocation() {
     // publication, and a round they send is entitled to open it.
     let [in_the_directory, _, in_the_admissions, described] = held_by_the_daemon(&world).await;
     assert!(in_the_directory && in_the_admissions && described);
-    let barrier = world
-        .controller
-        .announce_authority_revision()
-        .await
-        .expect("the announcement is made");
-    assert!(barrier.holds(), "{barrier:?}");
+    // The worker answers within the bound an announcement gives it, or the next announcement is
+    // the one that reaches it: a round the publication woke may be holding its connection.
+    let held = tokio::time::timeout(WAIT, async {
+        loop {
+            let barrier = world
+                .controller
+                .announce_authority_revision()
+                .await
+                .expect("the announcement is made");
+            if barrier.holds() {
+                return barrier;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        held.is_ok(),
+        "the revocation holds once the worker has answered"
+    );
 }
 
 /// KR-REQ-09.12: an adoption that a closure overtakes between its row and its publication
@@ -502,7 +522,8 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
         .expect("the adoption's task ends")
         .expect("an adoption that finds the closure has nothing to do");
 
-    // Nothing of it is held, and no reclaim that needs room waits for a worker that will not report.
+    // Nothing of it is held, and no reclaim that needs room waits for a worker that will not
+    // report.
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
     assert!(
         world
