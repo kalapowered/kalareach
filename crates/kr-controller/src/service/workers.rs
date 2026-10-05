@@ -127,12 +127,12 @@ impl Controller {
     ///
     /// The one place a running daemon makes a worker known (a start restores the workers it finds
     /// from the registry's rows and the descriptors on disk), and it is done in a section that
-    /// holds the registry's lock and has found no closure. That is the lock a closure is recorded under, and the
-    /// closure's own tidying takes the worker out of all of this after it, so a worker is either
-    /// made known before its closure and removed by it, or the closure is seen here and nothing is
-    /// made: a closure that lands between a worker's row being written and its publication cannot
-    /// leave a closed session's worker in the directory, on the disk or in the admissions' set for
-    /// as long as the daemon runs.
+    /// holds the registry's lock and has found no closure. That is the lock a closure is recorded
+    /// under, and the closure's own tidying takes the worker out of all of this after it, so a
+    /// worker is either made known before its closure and removed by it, or the closure is seen
+    /// here and nothing is made: a closure that lands between a worker's row being written and its
+    /// publication cannot leave a closed session's worker in the directory, on the disk or in the
+    /// admissions' set for as long as the daemon runs.
     ///
     /// # Errors
     ///

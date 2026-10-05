@@ -14,13 +14,16 @@ use std::task::Poll;
 use std::time::Duration;
 
 use kr_protocol::action::BarrierState;
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{AuthorityRevision, SessionId};
+use kr_protocol::session::SessionState;
 
 use super::LeaseDenied;
 use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
 use super::the_fence_at_every_effect::a_paired_device;
 use crate::authority::Round;
+use crate::registry::WorkerRecord;
 
 /// The lock a closure's recording is parked at.
 #[derive(Clone, Copy, Debug)]
@@ -87,9 +90,9 @@ fn reached(parked: Parked, world: &Served) -> bool {
     }
 }
 
-/// How long a test waits for the daemon's own task to get where the test expects it before it calls
-/// that a failure. Nothing is decided by it: the waits are on conditions, and a task that never gets
-/// there is the one thing that runs it out.
+/// How long a test waits for the daemon's own task to get where the test expects it before it
+/// calls that a failure. Nothing is decided by it: the waits are on conditions, and a task that
+/// never gets there is the one thing that runs it out.
 const WAIT: Duration = Duration::from_secs(60);
 
 /// Waits until `condition` holds, polling it between yields to the other tasks of the runtime.
@@ -145,7 +148,8 @@ async fn assert_no_lease(world: &Served) {
 
 /// Records a closure of a daemon's session with a real worker and drops the future that records it
 /// while it waits at `parked`, and answers whether the closure was recorded and what the barrier
-/// says about the worker afterwards.
+/// says about the worker afterwards. The closure is the daemon's own record, as when it finds a
+/// worker gone; the worker here keeps running.
 ///
 /// The future is polled by hand until the closure has done everything it does before the wait at
 /// `parked` ([`reached`]), so it is at that wait and no earlier one, and then dropped. While the
@@ -167,6 +171,28 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
     );
     kr_ipc::descriptor::publish(world.controller.paths(), &world.worker.descriptor)
         .expect("the descriptor is published");
+    // And the registry's row for it, which is what a revocation's members are read from and what
+    // the closure takes out.
+    let descriptor = &world.worker.descriptor;
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &WorkerRecord {
+                session_id: world.session_id,
+                display_number: descriptor.display_number,
+                public_key: descriptor.worker_public_key,
+                process_identity: descriptor.process_start_identity.clone(),
+                endpoint: descriptor.endpoint.clone(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            },
+            Some(&DesktopBinding::none()),
+        )
+        .expect("the registry records the worker");
     world.controller.plugin_bridge.recorded(
         world.session_id,
         world.worker.descriptor.process_start_identity.clone(),
