@@ -97,6 +97,8 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 pub use crate::broker::arbitration::{
     Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
 };
+#[cfg(windows)]
+pub use crate::broker::attach::LaunchStage;
 pub use crate::broker::attach::{
     AgentChild, Attached, Ended, Launched, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE,
     TerminalWatch, hello_frame,

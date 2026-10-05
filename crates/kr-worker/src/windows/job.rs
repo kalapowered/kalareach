@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use kr_protocol::identity::ProcessStartIdentity;
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
@@ -75,20 +75,61 @@ const MAX_QUERY_CAPACITY: usize = 16 * 1024;
 #[derive(Debug)]
 pub struct SessionJob {
     job: Job,
-    /// The agents this session's launches ran under an explicitly selected reduced-ownership
-    /// profile, and whether this session has been closed.
+    /// What this session's launches and its closure have to agree on: the agents the session ran
+    /// under the reduced-ownership profile, whether the session has been closed, and how many
+    /// launches are in the middle of making a process.
     ///
     /// Kept for as long as the session is: the session's closure lists what the jobs hold and ends
     /// it, and a worker that dies takes them down because they are kill-on-close and this is where
     /// the last handle to each of them is.
-    reduced: Mutex<Reduced>,
+    state: Mutex<State>,
+    /// Signalled when the last launch in flight leaves, which is what a closure waits for.
+    launches_left: Condvar,
 }
 
-/// The agents a session ran under reduced ownership, and whether the session has been closed.
+/// What a session's launches and its closure share.
 #[derive(Debug, Default)]
-struct Reduced {
+struct State {
     agents: Vec<Arc<AgentJob>>,
     closed: bool,
+    /// Launches that were admitted and have not yet finished: a process one of them creates is
+    /// either ended with the session's jobs or ended by the launch itself, and the closure cannot
+    /// tell which until the launch has left.
+    launching: usize,
+    /// Told when a closure begins to wait for a launch, for this host's own tests.
+    #[cfg(feature = "testing")]
+    waiting: Option<Notice>,
+}
+
+/// What a test asked to be told, once.
+#[cfg(feature = "testing")]
+struct Notice(Box<dyn FnOnce() + Send>);
+
+#[cfg(feature = "testing")]
+impl std::fmt::Debug for Notice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Notice")
+    }
+}
+
+/// One launch in flight on a session, which the session's closure waits for.
+///
+/// Held from the moment a launch is admitted until it has either handed its agent over or undone
+/// everything it made; dropping it is how the launch leaves.
+#[derive(Debug)]
+#[must_use = "a launch is in flight for exactly as long as this is held"]
+pub struct Launching<'a> {
+    session: &'a SessionJob,
+}
+
+impl Drop for Launching<'_> {
+    fn drop(&mut self) {
+        let mut state = self.session.lock();
+        state.launching -= 1;
+        if state.launching == 0 {
+            self.session.launches_left.notify_all();
+        }
+    }
 }
 
 impl SessionJob {
@@ -116,8 +157,15 @@ impl SessionJob {
         }
         Ok(Self {
             job,
-            reduced: Mutex::new(Reduced::default()),
+            state: Mutex::new(State::default()),
+            launches_left: Condvar::new(),
         })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Creates a session's job that also carries user-interface restrictions, for this host's own
@@ -155,34 +203,66 @@ impl SessionJob {
         self.job.ui_restrictions()
     }
 
+    /// Admits a launch to this session, or says the session is closing.
+    ///
+    /// A closure ends the session's jobs and then waits for every launch admitted before it
+    /// marked the session ([`Self::await_launches`]), so a launch that holds the answer has either
+    /// been ended with those jobs or will end itself, and the closure reads the session only after
+    /// it has. A session that is closing admits none.
+    pub fn admit_launch(&self) -> Option<Launching<'_>> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        state.launching += 1;
+        Some(Launching { session: self })
+    }
+
+    /// Waits until every launch this session admitted has left, for at most `bound`, and says
+    /// whether none is left.
+    ///
+    /// Called by a closure after it has marked the session closed, which is when no further launch
+    /// is admitted, so the count only falls.
+    #[must_use]
+    pub fn await_launches(&self, bound: std::time::Duration) -> bool {
+        let mut state = self.lock();
+        if state.launching == 0 {
+            return true;
+        }
+        #[cfg(feature = "testing")]
+        if let Some(Notice(tell)) = state.waiting.take() {
+            tell();
+        }
+        let (state, _) = self
+            .launches_left
+            .wait_timeout_while(state, bound, |state| state.launching > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.launching == 0
+    }
+
+    /// Calls `tell` once, when a closure begins to wait for a launch, for this host's own tests. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn tell_when_a_closure_waits(&self, tell: impl FnOnce() + Send + 'static) {
+        self.lock().waiting = Some(Notice(Box::new(tell)));
+    }
+
     /// Records an agent that will run under the reduced-ownership profile, before its process is
     /// created, so this session's closure reads what its job holds and ends it, and never reads the
     /// session's coverage as complete.
     pub fn adopt_reduced(&self, agent: Arc<AgentJob>) {
-        self.reduced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .agents
-            .push(agent);
+        self.lock().agents.push(agent);
     }
 
-    /// Forgets an agent that was recorded and never ran, because its launch failed.
+    /// Forgets an agent that was recorded and did not stay: its launch failed, or ended it.
     pub fn release_reduced(&self, agent: &Arc<AgentJob>) {
-        self.reduced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .agents
-            .retain(|held| !Arc::ptr_eq(held, agent));
+        self.lock().agents.retain(|held| !Arc::ptr_eq(held, agent));
     }
 
     /// Returns the jobs of the agents this session ran under the reduced-ownership profile.
     #[must_use]
     pub fn reduced_agents(&self) -> Vec<Arc<AgentJob>> {
-        self.reduced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .agents
-            .clone()
+        self.lock().agents.clone()
     }
 
     /// Returns whether this session's closure has begun.
@@ -191,10 +271,7 @@ impl SessionJob {
     /// again once its process exists, and ends the process itself where the answer is yes.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.reduced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed
+        self.lock().closed
     }
 
     /// Returns whether a process is inside this job.
@@ -247,15 +324,14 @@ impl SessionJob {
     ///
     /// The mark is made before the job is ended, so a launch that creates its process afterwards
     /// finds it ([`Self::is_closed`]) and a launch that created it before is ended with the job.
+    /// A launch that was admitted before the mark is still in flight: the closure waits for it
+    /// with [`Self::await_launches`] before it reads what the session held.
     ///
     /// # Errors
     ///
     /// Returns the operating system's failure when the job will not be terminated.
     pub fn terminate(&self, code: u32) -> std::io::Result<()> {
-        self.reduced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = true;
+        self.lock().closed = true;
         self.job.terminate(code)
     }
 }

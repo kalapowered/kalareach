@@ -601,15 +601,10 @@ pub struct NativeGateway {
     /// learns which one it has to find stopped.
     #[cfg(feature = "testing")]
     last_started: Option<ProcessStartIdentity>,
-    /// Where a launch stops after its agent's job is recorded and before its process is created, for
-    /// this host's own tests.
+    /// Where the next launch stops on its way to creating the agent's process, for this host's own
+    /// tests.
     #[cfg(all(feature = "testing", windows))]
-    before_create_pause: std::sync::Mutex<
-        Option<(
-            std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    launch_pause: std::sync::Mutex<Option<ArmedPause>>,
     /// Where a failed launch stops before it undoes anything, for this host's own tests.
     #[cfg(feature = "testing")]
     cleanup_pause: std::sync::Mutex<
@@ -629,6 +624,29 @@ pub type AgentChild = std::process::Child;
 /// input and output this host keeps, and what ends it and waits for it.
 #[cfg(windows)]
 pub type AgentChild = crate::windows::launch::Child;
+
+/// A place a launch can be held on its way to creating the agent's process, for this host's own
+/// tests.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchStage {
+    /// The session has admitted the launch; the agent's job is not made and nothing is recorded.
+    Admitted,
+    /// The agent's job is made, and recorded on the session where the profile is reduced; its
+    /// process is not created.
+    JobRecorded,
+    /// The agent's process exists and the launch has not yet asked whether the session is closing.
+    ProcessCreated,
+}
+
+/// A pause a test armed: where it stops the launch, how it says the launch arrived and what lets
+/// the launch go on.
+#[cfg(all(feature = "testing", windows))]
+type ArmedPause = (
+    LaunchStage,
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
 ///
@@ -704,6 +722,10 @@ fn start_agent(
 /// held by the session's record of its reduced agents, so the session's closure lists what it
 /// holds and ends it. Nothing else changes about the launch, and the vendor's own sandbox is left
 /// exactly as the vendor made it.
+///
+/// The launch is in flight on the session from its admission until it returns, and a session's
+/// closure waits for every launch in flight before it reads what the session held. A session that
+/// is closing admits none.
 #[cfg(windows)]
 fn start_agent(
     program: &str,
@@ -712,16 +734,17 @@ fn start_agent(
     registration: &std::path::Path,
     session: &Arc<crate::windows::job::SessionJob>,
     ownership: AgentOwnership,
-    before_create: impl FnOnce(),
+    pause: impl Fn(LaunchStage),
 ) -> Result<(AgentChild, ProcessStartIdentity)> {
     let could_not_start =
         |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
     let session_is_closing = || BrokerError::PreconditionFailed {
         detail: format!("this session is closing, so {program} was not started"),
     };
-    if session.is_closed() {
+    let Some(_in_flight) = session.admit_launch() else {
         return Err(session_is_closing());
-    }
+    };
+    pause(LaunchStage::Admitted);
     let reduced = ownership == AgentOwnership::Reduced;
     let job = Arc::new(
         if reduced {
@@ -741,7 +764,7 @@ fn start_agent(
             session.release_reduced(&job);
         }
     };
-    before_create();
+    pause(LaunchStage::JobRecorded);
     let mut child = match crate::windows::launch::start(&crate::windows::launch::Spec {
         program: std::path::Path::new(program),
         arguments,
@@ -759,6 +782,7 @@ fn start_agent(
             return Err(could_not_start(error));
         }
     };
+    pause(LaunchStage::ProcessCreated);
     // A process created in a job that was ended is not ended with it. The session's closure marks
     // the session before it ends the jobs, so a closure that began before this process existed is
     // seen here, and a closure that begins now ends the process with its job.
@@ -913,7 +937,7 @@ impl NativeGateway {
             #[cfg(feature = "testing")]
             last_started: None,
             #[cfg(all(feature = "testing", windows))]
-            before_create_pause: std::sync::Mutex::new(None),
+            launch_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "testing")]
             cleanup_pause: std::sync::Mutex::new(None),
         })
@@ -940,14 +964,14 @@ impl NativeGateway {
         (watch, release)
     }
 
-    /// Stops the next launch after its agent's job is recorded on the session and before its
-    /// process is created, for this host's own tests.
+    /// Stops the next launch where it reaches `stage`, for this host's own tests.
     ///
     /// Returns the end that says the launch has arrived there and the end that lets it go on. The
     /// pause fires once. It is compiled away in every shipped build.
     #[cfg(all(feature = "testing", windows))]
-    pub fn pause_before_creating_the_agent(
+    pub fn pause_launch_at(
         &self,
+        stage: LaunchStage,
     ) -> (
         std::sync::mpsc::Receiver<()>,
         std::sync::mpsc::SyncSender<()>,
@@ -955,9 +979,9 @@ impl NativeGateway {
         let (arrived, watch) = std::sync::mpsc::sync_channel(1);
         let (release, go) = std::sync::mpsc::sync_channel(1);
         *self
-            .before_create_pause
+            .launch_pause
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stage, arrived, go));
         (watch, release)
     }
 
@@ -1122,7 +1146,7 @@ impl NativeGateway {
             &registration_path,
             &session,
             reservation.profile().ownership,
-            || self.stop_before_creating_the_agent(),
+            |stage| self.pause_if_armed(stage),
         )?;
         #[cfg(feature = "testing")]
         {
@@ -1185,20 +1209,29 @@ impl NativeGateway {
         }
     }
 
-    /// The pause a test armed for the moment before the agent's process is created, where it armed
-    /// one.
+    /// The pause a test armed for `stage`, where it armed one.
     #[cfg(windows)]
-    fn stop_before_creating_the_agent(&self) {
+    fn pause_if_armed(&self, stage: LaunchStage) {
         #[cfg(feature = "testing")]
-        if let Some((arrived, go)) = self
-            .before_create_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
         {
-            let _ = arrived.send(());
-            let _ = go.recv();
+            let armed = {
+                let mut armed = self
+                    .launch_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if armed.as_ref().is_some_and(|(at, ..)| *at == stage) {
+                    armed.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, arrived, go)) = armed {
+                let _ = arrived.send(());
+                let _ = go.recv();
+            }
         }
+        #[cfg(not(feature = "testing"))]
+        let _ = stage;
     }
 
     /// Runs the application's launch probe, where the package declares one and the installation
@@ -1261,6 +1294,14 @@ impl NativeGateway {
         {
             let _ = arrived.send(());
             let _ = go.recv();
+        }
+        // An agent that did not stay is not one the session ran: its record goes with its process.
+        #[cfg(windows)]
+        if let (Some(session), Some(job)) = (
+            self.session_job.as_ref(),
+            crate::windows::job::agent_job(started),
+        ) {
+            session.release_reduced(&job);
         }
         stop_started(child, started);
         if let Some(credential_path) = credential_path {

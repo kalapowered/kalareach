@@ -27,9 +27,9 @@ use kr_protocol::ids::{
     ApplicationInstanceId, EnvironmentId, LaunchProfileId, PluginId, SessionId,
 };
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_protocol::session::OwnershipCoverage;
+use kr_protocol::session::{OwnershipCoverage, SurvivingResource};
 use kr_worker::broker::{
-    AgentChild, Broker, BrokerError, Framing, Launched, NativeGateway, NativeLaunch,
+    AgentChild, Broker, BrokerError, Framing, LaunchStage, Launched, NativeGateway, NativeLaunch,
 };
 use kr_worker::ownership::{OwnedProcesses, OwnershipBoundary, force_stop};
 use kr_worker::persistence::JournalHealth;
@@ -140,16 +140,16 @@ impl Launch {
         ownership: AgentOwnership,
         session: &Arc<SessionJob>,
     ) -> Result<Self, BrokerError> {
-        Self::start_with(which, ownership, session, |_| {})
+        Self::start_with(which, ownership, session, |_, _| {})
     }
 
     /// Starts the agent as [`Self::start`] does, after `arm` has been given the gateway that
-    /// makes the launch.
+    /// makes the launch and the directory it publishes to.
     fn start_with(
         which: u8,
         ownership: AgentOwnership,
         session: &Arc<SessionJob>,
-        arm: impl FnOnce(&NativeGateway),
+        arm: impl FnOnce(&NativeGateway, &Path),
     ) -> Result<Self, BrokerError> {
         let directory = private_directory();
         let report = directory.join("report");
@@ -159,7 +159,7 @@ impl Launch {
         let mut gateway = NativeGateway::bind(Arc::clone(&broker), &directory, launch_for(which))
             .expect("the endpoint binds")
             .in_session(Arc::clone(session));
-        arm(&gateway);
+        arm(&gateway, &directory);
         let arguments: Vec<String> = [
             "--ignored",
             "--exact",
@@ -672,7 +672,7 @@ async fn kr_req_07_64_a_worker_that_dies_takes_a_reduced_agent_and_what_it_made_
 
 /// KR-REQ-07.64: a session whose closure has begun takes no launch under either profile: it is
 /// refused by name before anything is created, so the launch never reaches the point at which its
-/// process would be, and no agent is recorded on the session. Control: the same launches under an
+/// job is made, and no agent is recorded on the session. Control: the same launches under an
 /// open session start (every other test here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_profile() {
@@ -681,10 +681,10 @@ async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_pro
     assert!(session.is_closed());
     for (which, ownership) in [(31, AgentOwnership::Full), (32, AgentOwnership::Reduced)] {
         let reached = std::cell::RefCell::new(None);
-        let refused = Launch::start_with(which, ownership, &session, |gateway| {
+        let refused = Launch::start_with(which, ownership, &session, |gateway, _| {
             // The pause is armed and its release dropped at once, so a launch that did reach it
             // would say so and go on rather than wait.
-            *reached.borrow_mut() = Some(gateway.pause_before_creating_the_agent().0);
+            *reached.borrow_mut() = Some(gateway.pause_launch_at(LaunchStage::Admitted).0);
         })
         .err()
         .expect("the launch is refused");
@@ -695,7 +695,7 @@ async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_pro
         let arrived = reached.into_inner().expect("the gateway was armed");
         assert!(
             arrived.try_recv().is_err(),
-            "{ownership:?}: the launch reached the point where its process is created"
+            "{ownership:?}: the launch was admitted to a closing session"
         );
     }
     assert!(
@@ -710,59 +710,205 @@ async fn kr_req_07_64_a_session_that_is_closing_takes_no_launch_under_either_pro
     );
 }
 
-/// KR-REQ-07.64: a session whose closure begins after a launch has recorded its agent and before
-/// the agent's process is created leaves nothing running: a process created in a job that was
-/// ended is not ended with it, so the launch asks again once its process exists, and ends it and
-/// fails by name. This is the window between the two, held open by a pause in the launch, under
-/// each profile.
+/// What a closure that runs beside a launch tells the test.
+enum Reported {
+    /// It is waiting for a launch that was admitted before the session closed.
+    Waiting,
+    /// It has read the session and written its receipt.
+    Receipt {
+        coverage: OwnershipCoverage,
+        resources: Vec<SurvivingResource>,
+        /// How many processes the session's jobs held when the receipt was written.
+        held: usize,
+    },
+}
+
+/// Closes `session` as the worker's closure does, on a thread of its own: the record of what the
+/// session owns, one look, the forced stop, one more look, and the receipt.
+fn close_beside_a_launch(
+    session: &Arc<SessionJob>,
+    root: u32,
+    reduced_so_far: Vec<Arc<AgentJob>>,
+    reports: std::sync::mpsc::Sender<Reported>,
+) -> std::thread::JoinHandle<()> {
+    let session = Arc::clone(session);
+    std::thread::spawn(move || {
+        kr_worker::windows::job::record(root, &session);
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::JobObject { root },
+            kr_ipc::identity::ended_process_identity(root),
+        );
+        owned.observe();
+        force_stop(&owned);
+        owned.observe();
+        let held = session
+            .process_ids()
+            .expect("the session's processes")
+            .len()
+            + reduced_so_far
+                .iter()
+                .map(|agent| agent.process_ids().expect("the agent's processes").len())
+                .sum::<usize>();
+        let receipt = Reported::Receipt {
+            resources: owned.surviving_resources(),
+            coverage: owned.coverage(),
+            held,
+        };
+        let _ = reports.send(receipt);
+    })
+}
+
+/// KR-REQ-07.64: a closure that overtakes a launch waits for it before it writes its receipt, at
+/// every point the launch can be held on its way to creating the agent: admitted, with its job
+/// recorded, and with its process created. The launch ends what it made and fails by name, the
+/// closure reads the session after that, and the receipt names nothing left running; where the
+/// agent is the full profile's it reads complete. Under each profile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_07_64_a_closure_that_begins_before_the_agent_exists_leaves_no_agent_running() {
-    for (which, ownership) in [(33, AgentOwnership::Full), (34, AgentOwnership::Reduced)] {
-        let session = Arc::new(SessionJob::create().expect("a session job"));
-        let (to_test, armed) = std::sync::mpsc::channel();
-        let launching = Arc::clone(&session);
-        let launcher = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a runtime");
-            runtime.block_on(async {
-                Launch::start_with(which, ownership, &launching, |gateway| {
-                    to_test
-                        .send(gateway.pause_before_creating_the_agent())
-                        .expect("the test is waiting");
+async fn kr_req_07_64_a_closure_waits_for_a_launch_it_overtakes_before_it_writes_its_receipt() {
+    let mut which = 40_u8;
+    for stage in [
+        LaunchStage::Admitted,
+        LaunchStage::JobRecorded,
+        LaunchStage::ProcessCreated,
+    ] {
+        for ownership in [AgentOwnership::Full, AgentOwnership::Reduced] {
+            which += 1;
+            let label = format!("{ownership:?} held at {stage:?}");
+            let session = Arc::new(SessionJob::create().expect("a session job"));
+            let (to_test, armed) = std::sync::mpsc::channel();
+            let launching = Arc::clone(&session);
+            let launcher = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                runtime.block_on(async {
+                    Launch::start_with(which, ownership, &launching, |gateway, _| {
+                        to_test
+                            .send(gateway.pause_launch_at(stage))
+                            .expect("the test is waiting");
+                    })
+                    .map(drop)
                 })
-                .map(drop)
-            })
-        });
-        let (arrived, release) = armed.recv().expect("the gateway is armed");
-        arrived
-            .recv_timeout(LIVENESS_DEADLINE)
-            .expect("the launch reaches the pause");
-        // The closure, as the worker's makes it: the session's job and every reduced agent's.
-        session.terminate(1).expect("the session's job ends");
-        for agent in session.reduced_agents() {
-            agent.terminate(1).expect("the agent's job ends");
+            });
+            let (arrived, release) = armed.recv().expect("the gateway is armed");
+            arrived
+                .recv_timeout(LIVENESS_DEADLINE)
+                .expect("the launch reaches the pause");
+
+            let (reports, heard) = std::sync::mpsc::channel();
+            let waiting = reports.clone();
+            session.tell_when_a_closure_waits(move || {
+                let _ = waiting.send(Reported::Waiting);
+            });
+            let closure = close_beside_a_launch(
+                &session,
+                0xFFFF_FF00 + u32::from(which),
+                session.reduced_agents(),
+                reports,
+            );
+            // The launch is held where the test put it, so a closure that reports before the
+            // launch goes on has written its receipt while a launch was in flight.
+            let first = heard
+                .recv_timeout(LIVENESS_DEADLINE)
+                .expect("the closure reports");
+            assert!(
+                matches!(first, Reported::Waiting),
+                "{label}: the closure wrote its receipt while a launch was in flight"
+            );
+
+            release.send(()).expect("the launch goes on");
+            let refused = launcher
+                .join()
+                .expect("the launch ends")
+                .expect_err("the launch fails");
+            assert!(
+                matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+                "{label}: {refused:?}"
+            );
+            let Reported::Receipt {
+                coverage,
+                resources,
+                held,
+            } = heard
+                .recv_timeout(LIVENESS_DEADLINE)
+                .expect("the closure writes its receipt")
+            else {
+                panic!("{label}: the closure reported waiting twice");
+            };
+            closure.join().expect("the closure ends");
+            assert_eq!(
+                held, 0,
+                "{label}: the receipt was written with a process running"
+            );
+            assert!(
+                resources.iter().all(|resource| resource.kind != "process"),
+                "{label}: {resources:?}"
+            );
+            assert!(
+                session.reduced_agents().is_empty(),
+                "{label}: the agent that never ran is forgotten"
+            );
+            if ownership == AgentOwnership::Full {
+                assert_eq!(
+                    coverage,
+                    OwnershipCoverage::Complete,
+                    "{label}: {resources:?}"
+                );
+            }
         }
-        release.send(()).expect("the launch goes on");
-        let refused = launcher
-            .join()
-            .expect("the launch ends")
-            .expect_err("the launch fails");
+    }
+}
+
+/// KR-REQ-07.64: a launch that fails after its process started, over the registration it could
+/// not publish, is ended with the record of it, so the closure that follows reads nothing of an
+/// agent that never stayed and its coverage reads complete. Control: the same failure under the
+/// full profile, which records no agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_launch_that_fails_after_it_started_leaves_no_reduced_agent_on_the_session()
+{
+    for (which, ownership) in [(51, AgentOwnership::Full), (52, AgentOwnership::Reduced)] {
+        let session = Arc::new(SessionJob::create().expect("a session job"));
+        let failed = Launch::start_with(which, ownership, &session, |_, directory| {
+            // A name the registration cannot be written over, so the launch fails once its
+            // process is running.
+            let occupied = directory.join("registration");
+            std::fs::create_dir(&occupied).expect("the registration's name is taken");
+            std::fs::write(occupied.join("held"), b"held")
+                .expect("by a directory with something in it");
+        })
+        .err()
+        .expect("the launch fails after its process started");
         assert!(
-            matches!(&refused, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
-            "{ownership:?}: {refused:?}"
+            !matches!(&failed, BrokerError::PreconditionFailed { detail } if detail.contains("closing")),
+            "{ownership:?}: the launch failed for the reason the test made: {failed:?}"
         );
         assert!(
             session.reduced_agents().is_empty(),
-            "{ownership:?}: the agent that never ran is forgotten"
+            "{ownership:?}: the agent that did not stay is not recorded as one the session ran"
         );
-        assert!(
-            session
-                .process_ids()
-                .expect("the session's processes")
-                .is_empty(),
-            "{ownership:?}: nothing is left running in the session"
+        let (reports, heard) = std::sync::mpsc::channel();
+        close_beside_a_launch(
+            &session,
+            0xFFFF_FF80 + u32::from(which),
+            Vec::new(),
+            reports,
+        )
+        .join()
+        .expect("the closure ends");
+        let Reported::Receipt {
+            coverage,
+            resources,
+            held,
+        } = heard.recv().expect("the closure writes its receipt")
+        else {
+            panic!("{ownership:?}: nothing was waited for");
+        };
+        assert_eq!(held, 0, "{ownership:?}");
+        assert_eq!(
+            coverage,
+            OwnershipCoverage::Complete,
+            "{ownership:?}: {resources:?}"
         );
     }
 }
