@@ -527,6 +527,74 @@ async fn kr_req_14_11_a_prompt_naming_a_draft_is_refused_on_the_workers_own_sock
     assert_eq!(error.code, ErrorCode::UnsupportedCapability);
 }
 
+/// KR-REQ-14.11: a prompt the control daemon forwards for a local caller with no lifetime left is
+/// answered only from a receipt the worker holds, which is how the daemon learns whether a draft
+/// the prompt names was recorded for an earlier attempt: the receipt as it stands for the same
+/// payload, `ID_CONFLICT` for the action identifier used with another, and a refusal that keeps
+/// nothing where the worker holds none.
+#[tokio::test]
+async fn kr_req_14_11_a_prompt_with_no_lifetime_is_answered_only_from_a_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let client = cli(&host).await;
+    let mut daemon = daemon(&host).await;
+    let owner = kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("local:a-test-owner").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: Nullable::null(),
+        grant_id: Nullable::null(),
+        grant_revision: Nullable::null(),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([6; 16])),
+    };
+    let mutation = prompt_mutation(&client, &host, 23);
+    let mut another = prompt_mutation(&client, &host, 24);
+    another.action_id = mutation.action_id;
+    another.params = ParamsValue::from_typed(&AgentPromptParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::null(),
+        text: Nullable::some(PromptText::new("something else").expect("valid")),
+    })
+    .expect("encodes");
+
+    let mut forward = async |mutation: &MutationRequest, lifetime_ms: u64| {
+        let deadline = if lifetime_ms == 0 {
+            0
+        } else {
+            kr_ipc::clock::boot_elapsed_ms() + lifetime_ms
+        };
+        daemon
+            .forward(
+                mutation,
+                &owner,
+                &kr_protocol::scalars::CanonicalSet::new(),
+                kr_protocol::scalars::U64::new(deadline),
+            )
+            .await
+            .expect("the forward reaches the worker")
+    };
+
+    let unheld = forward(&mutation, 0).await.expect_err("no receipt is held");
+    assert_eq!(unheld.code, ErrorCode::PermissionDenied);
+    let sent = forward(&mutation, 30_000)
+        .await
+        .expect_err("a worker with no upstream refuses the prompt");
+    assert_eq!(sent.code, ErrorCode::UnsupportedCapability);
+
+    let held = forward(&mutation, 0)
+        .await
+        .expect("the receipt the refusal left answers");
+    let held: kr_protocol::receipt::ReceiptResponse = held.to_typed().expect("a receipt");
+    assert_eq!(held.receipt.action_id, mutation.action_id);
+    let reused = forward(&another, 0)
+        .await
+        .expect_err("the identifier belongs to another payload");
+    assert_eq!(reused.code, ErrorCode::IdConflict);
+}
+
 /// What two prompts sent through the worker to a [`RendezvousUpstream`] came to.
 #[derive(Debug)]
 struct TwoPrompts {

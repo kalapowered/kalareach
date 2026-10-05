@@ -89,6 +89,9 @@ pub(super) struct Scripted {
     accepts_prompts: AtomicBool,
     /// Where it holds the next prompt submission it is forwarded, once a test has set one.
     holding_a_prompt: std::sync::Mutex<Option<End>>,
+    /// The prompts it has accepted, by the action they came under: the digest of what was sent,
+    /// which is what a repeat is compared with.
+    accepted_prompts: std::sync::Mutex<BTreeMap<ActionId, kr_protocol::scalars::Digest256>>,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -123,6 +126,7 @@ impl Scripted {
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
             accepts_prompts: AtomicBool::new(false),
             holding_a_prompt: std::sync::Mutex::new(None),
+            accepted_prompts: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -183,6 +187,65 @@ impl Scripted {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// How this worker answers a prompt it is forwarded with no lifetime left, which it never
+    /// admits: from the receipt it holds for the action, with the result it kept or as the receipt
+    /// stands, with `ID_CONFLICT` where the action was used with another payload, and otherwise
+    /// with the refusal of a first admission that has no lifetime, keeping nothing.
+    fn prompt_without_a_lifetime(
+        &self,
+        request_id: kr_protocol::ids::RequestId,
+        action_id: ActionId,
+        digest: kr_protocol::scalars::Digest256,
+    ) -> ControlFrame {
+        let accepted = self
+            .accepted_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&action_id)
+            .copied();
+        let kept = self
+            .receipts_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&action_id)
+            .cloned();
+        let outcome = match (accepted, kept) {
+            (Some(held), _) if held != digest => Outcome::Error(ProtocolError::new(
+                ErrorCode::IdConflict,
+                format!("action {action_id} was already used with a different request"),
+            )),
+            (Some(_), _) => {
+                Outcome::Ok(ParamsValue::from_typed(&Self::accepted_prompt()).expect("encodes"))
+            }
+            (None, Some((method, failure))) => Outcome::Ok(
+                ParamsValue::from_typed(&kr_protocol::receipt::ReceiptResponse {
+                    request_id,
+                    receipt: self.receipt_of(action_id, method, Some(failure)),
+                })
+                .expect("encodes"),
+            ),
+            (None, None) => Outcome::Error(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the accepted deadline for this action had passed before it reached this worker, \
+                 so it cannot be admitted for the first time",
+            )),
+        };
+        ControlFrame::Response(Response {
+            request_id,
+            outcome,
+        })
+    }
+
+    /// What this worker answers a prompt it accepts.
+    fn accepted_prompt() -> kr_protocol::agent::AgentMutationResult {
+        kr_protocol::agent::AgentMutationResult {
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+            upstream_request_id: Nullable::null(),
+            turn_id: Nullable::null(),
+        }
     }
 
     /// Keeps a receipt for `action_id` that records `failure` and holds no result, as a worker's
@@ -562,25 +625,38 @@ fn serve_scripted(
                                 || forwarded.mutation.method == Method::AgentPromptQueue.into())
                                 && script.accepts_prompts.load(Ordering::Acquire)
                             {
-                                let holding = script
-                                    .holding_a_prompt
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .take();
-                                if let Some(holding) = holding {
-                                    let _ = holding.arrived.send(());
-                                    let _ = holding.go.await;
+                                let action_id = forwarded.mutation.action_id;
+                                let digest = kr_protocol::digest::mutation_digest(
+                                    &forwarded.mutation,
+                                    &forwarded.actor.actor_id,
+                                )
+                                .expect("a digest");
+                                if forwarded.accepted_deadline_boot_ms.get() == 0 {
+                                    vec![script.prompt_without_a_lifetime(
+                                        forwarded.mutation.request_id,
+                                        action_id,
+                                        digest,
+                                    )]
+                                } else {
+                                    let holding = script
+                                        .holding_a_prompt
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .take();
+                                    if let Some(holding) = holding {
+                                        let _ = holding.arrived.send(());
+                                        let _ = holding.go.await;
+                                    }
+                                    script
+                                        .accepted_prompts
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(action_id, digest);
+                                    vec![respond(
+                                        forwarded.mutation.request_id,
+                                        &Scripted::accepted_prompt(),
+                                    )]
                                 }
-                                let accepted = kr_protocol::agent::AgentMutationResult {
-                                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(
-                                        1,
-                                    ),
-                                    provenance:
-                                        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-                                    upstream_request_id: Nullable::null(),
-                                    turn_id: Nullable::null(),
-                                };
-                                vec![respond(forwarded.mutation.request_id, &accepted)]
                             } else if forwarded.mutation.method != Method::SessionClose.into() {
                                 // Any other action is answered from the receipt this worker keeps
                                 // for it, when it keeps one, and refused otherwise.
