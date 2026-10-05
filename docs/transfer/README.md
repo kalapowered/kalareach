@@ -73,14 +73,14 @@ the service never guesses.
 The sweep works by first reading the published attachments. It then asks the archive which of the
 sessions that the submitted ones name still keep what was submitted to them, so the answer is taken
 after the attachments were read, and every session they name was already known to the host when it
-answered. An attachment submitted after that question is not judged by the answer, and it waits for
-the next sweep. A session is considered to be covered if there exists a reservation or worker for
-that session in the session registry in any phase (even failed or closed phases) or if there exists
-any kind of record of it in the archive (summary, closure record, receipt, retained output, or a
-journal or spool the archive cannot read). If the archive is unable to complete its scan of the
-sessions then the sweep will not expire anything. This is because the sweep takes it that if a
-session is not found then it has come to an end and so its attachments should be removed. Declining
-to delete is the answer that cannot lose a file.
+answered. An attachment submitted to a session that the question did not name is not judged by the
+answer, and it waits for the next sweep. A session is considered to be covered if there exists a
+reservation or worker for that session in the session registry in any phase (even failed or closed
+phases) or if there exists any kind of record of it in the archive (summary, closure record,
+receipt, retained output, or a journal or spool the archive cannot read). If the archive is unable
+to complete its scan of the sessions then the sweep will not expire anything. This is because the
+sweep takes it that if a session is not found then it has come to an end and so its attachments
+should be removed. Declining to delete is the answer that cannot lose a file.
 
 The environment's staged total counts three things together: receiving uploads at their declared
 size, published attachments still on disk, and open download snapshots. A snapshot is storage this
@@ -242,13 +242,14 @@ actually gone. A removal that fails leaves the mark and the charge in place, and
 again: a removal failure never turns into forgotten bytes.
 
 Recovery at startup does four jobs, all idempotent. It resolves every interrupted publication as
-above. It settles every open action claim from the state its transfer ended in, so an exact repeat
-of an `upload.finish` or an `upload.cancel` whose first attempt was interrupted is answered with
-what that attempt came to. It retries every payload whose row says the bytes are still there. And it
-reconciles the three staging areas against the journal: every payload name is derived from a
-transfer identifier, so a name no live row accounts for is a file an interrupted `upload.begin`
-created before its row existed, and it is removed. The hourly sweep runs the same retry and settles
-open claims the same way, so a removal that failed once does not wait for the next start.
+above. It settles each open action claim from the state its transfer ended in, a cancellation's once
+its payload is gone, so an exact repeat of an `upload.finish` or an `upload.cancel` whose first
+attempt was interrupted is answered with what that attempt came to. It retries every payload whose
+row says the bytes are still there. And it reconciles the three staging areas against the journal:
+every payload name is derived from a transfer identifier, so a name no live row accounts for is a
+file an interrupted `upload.begin` created before its row existed, and it is removed. The hourly
+sweep runs the same retry and settles open claims the same way, so a removal that failed once does
+not wait for the next start.
 
 That is what makes the ownership contract true rather than merely stated. A worker's death
 invalidates an insertion; it does not change the identity of a file this service already verified.
@@ -269,9 +270,9 @@ A duplicate that matches what was recorded is acknowledged, and nothing is rewri
 If a duplicate chunk is received which conflicts with the existing data, the upload will be
 invalidated because it is impossible to know for sure what bytes are intended to be at the claimed
 position. A new identifier must be provided instead. The refusal is recorded under the chunk's
-action in the same transaction that invalidates the upload, so a repeat of that action, however
-late, is answered with the same `ATTACHMENT_INTEGRITY` refusal and not with the answer for an upload
-that has ended.
+action in the same transaction that invalidates the upload, so a repeat of that action, for as long
+as the host keeps the record of actions, is answered with the same `ATTACHMENT_INTEGRITY` refusal
+and not with the answer for an upload that has ended.
 
 `upload.finish` then reads the whole staged file back through its own handle and compares the digest
 and the size against what `upload.begin` recorded. A mismatch invalidates the upload with
