@@ -2822,11 +2822,6 @@ impl TransferService {
         self.retained_action(actor, action_id, method, payload_digest)
     }
 
-    /// Returns the result an action already recorded, decoded into the method's own shape.
-    ///
-    /// Reached when a transaction carrying an action found it already recorded, which means
-    /// another attempt at the same action committed first. That attempt's result is the answer
-    /// this one owes its caller.
     /// Reads this action's record and says which of the three things it is.
     ///
     /// Read at every point where the answer could already exist: before the effect, and again at
@@ -2852,8 +2847,8 @@ impl TransferService {
     /// replaces nothing: the first result recorded for an identifier is the one that stands. That is
     /// the answer every copy of the action is owed, so a call whose own completion lost, because a
     /// copy of the action or the sweep that settles open claims recorded its answer after this call
-    /// computed its result, returns what was recorded and not what it computed: the two can differ, for instance in the session a
-    /// draft bound the attachment to in between.
+    /// computed its result, returns what was recorded and not what it computed: the two can
+    /// differ, for instance in the session a draft bound the attachment to in between.
     fn complete_claim<T>(&self, action: Option<&Action>, result: T) -> Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
@@ -2961,6 +2956,18 @@ impl TransferService {
         }
     }
 
+    /// Returns what an action already recorded, decoded into the method's own shape: its result,
+    /// or the refusal it ended in.
+    ///
+    /// Reached when a transaction carrying an action found it already recorded, which means
+    /// another attempt at the same action committed first. That attempt's answer is the one this
+    /// attempt owes its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::IdConflict`] when the same identifier carried a different payload,
+    /// [`TransferError::Retained`] when the action ended in a refusal, and
+    /// [`TransferError::StoreUnavailable`] when the record cannot be read or holds neither.
     fn retained_result<T: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         action: Option<&Action>,
