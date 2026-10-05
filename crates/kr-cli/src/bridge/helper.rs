@@ -557,25 +557,12 @@ async fn controller(
 /// What this helper's user is called, as the destination's account records it.
 ///
 /// The name is the account's own and not a variable a caller could have set: `USER` and `LOGNAME`
-/// are whatever the process that started the helper put there. A destination that records no
-/// account for the user is said by its number.
+/// are whatever the process that started the helper put there. The destination's own database
+/// gives it, wherever the account is kept. A destination that records no account for the user is
+/// said by its number.
 fn account_name() -> String {
     if let Some(entry) = kr_ipc::paths::passwd_entry() {
         return entry.name;
-    }
-    // A destination whose accounts are not in that file (a directory service) answers `id`, which
-    // asks the system's own database for the name of this process's user.
-    #[cfg(unix)]
-    if let Ok(named) = std::process::Command::new("/usr/bin/id")
-        .arg("-un")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        && named.status.success()
-        && let Ok(name) = String::from_utf8(named.stdout)
-        && !name.trim().is_empty()
-    {
-        return name.trim().to_owned();
     }
     format!("uid {}", kr_ipc::paths::current_uid())
 }
