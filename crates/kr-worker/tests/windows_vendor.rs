@@ -117,6 +117,15 @@ struct Report {
     restricted: Option<bool>,
 }
 
+impl Report {
+    /// The process a try at breaking away created, where it was created.
+    fn created(&self) -> Option<u32> {
+        self.breakaway
+            .strip_prefix("created ")
+            .and_then(|pid| pid.parse().ok())
+    }
+}
+
 /// An agent this host started, ended with everything in its jobs when the test ends, however it
 /// ends.
 struct Launch {
@@ -425,9 +434,15 @@ fn waiting_program(label: &str) -> std::process::Command {
 
 /// What a vendor's own process does: waits, until a job ends it.
 #[test]
-#[ignore = "a process the stand-in vendor starts to wait in"]
+#[ignore = "a process the stand-in vendors start to wait in"]
 fn vendor_waits() {
-    std::thread::sleep(Duration::from_secs(600));
+    // Only where a launch's label is given: a run of every ignored case does not wait for it.
+    if std::env::args()
+        .next_back()
+        .is_some_and(|label| label.starts_with("kr-wv-"))
+    {
+        std::thread::sleep(Duration::from_secs(600));
+    }
 }
 
 /// What names a launch's processes on a command line: the name of the private directory the
@@ -1297,6 +1312,12 @@ async fn native_codex_nests_under_the_session_job_and_the_closure_ends_everythin
         members.contains(&report.nested),
         "the command Codex's sandbox ran is held by the session's job: {members:?}"
     );
+    if let Some(escaped) = report.created() {
+        assert!(
+            members.contains(&escaped),
+            "what the sandbox let go of is still held by the session's job: {members:?}"
+        );
+    }
     assert!(
         members.len() >= 3,
         "Codex, its sandboxed command and what it made: {members:?}"
@@ -1362,6 +1383,12 @@ async fn native_codex_under_a_desktop_restricting_session_job_fails_by_name_or_r
         held.contains(&report.nested),
         "the command Codex's sandbox ran is held by the agent's job: {held:?}"
     );
+    if let Some(escaped) = report.created() {
+        assert!(
+            held.contains(&escaped),
+            "what the sandbox let go of is still held by the agent's job: {held:?}"
+        );
+    }
     assert!(
         session
             .process_ids()
