@@ -483,14 +483,21 @@ impl TransferService {
     /// either cannot be prepared.
     pub fn with_clock(paths: &EnvironmentPaths, clock: Arc<dyn Clock>) -> Result<Self> {
         let root = StagingArea::prepare_root(paths)?;
-        let store = Store::open(StagingArea::store_path(paths), paths.environment_id())?;
+        let mut store = Store::open(StagingArea::store_path(paths), paths.environment_id())?;
         let staging_name = store.staging_name(&StagingArea::random_name(), Limits::default())?;
         let staging = StagingArea::open(&root, &staging_name)?;
         // The staging directory's own identity is recorded the first time it is opened and checked
         // every time after. A directory replaced at the same name is refused rather than used:
         // the name is not a secret, and what makes this area this environment's is the object.
+        // The same directory on a filesystem that is numbered differently since (a container that
+        // started again) is the recorded one, and what was recorded under the old number moves to
+        // the new one, so that the payloads recorded beside it are still the objects they were.
         match store.staging_identity()? {
-            Some(recorded) => staging.check_identity(recorded)?,
+            Some(recorded) => {
+                if let Some(was) = staging.check_identity(recorded)? {
+                    store.renumber_device(was, staging.identity().device)?;
+                }
+            }
             None => store.set_staging_identity(staging.identity())?,
         }
         Ok(Self {
