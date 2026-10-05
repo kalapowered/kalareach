@@ -868,6 +868,15 @@ impl World {
     /// Runs a shell command on a terminal of its own, in the source host's environment, and
     /// returns that terminal. The command asks it nothing yet: answering is the test's.
     fn terminal_running(&self, command: &str) -> Terminal {
+        self.terminal_running_with(command, &[])
+    }
+
+    /// As [`Self::terminal_running`], with `variables` added to the terminal's environment.
+    fn terminal_running_with(
+        &self,
+        command: &str,
+        variables: &[(&str, &std::ffi::OsStr)],
+    ) -> Terminal {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -893,6 +902,9 @@ impl World {
         );
         if let Some(temporary) = std::env::var_os("TMPDIR") {
             builder.env("TMPDIR", temporary);
+        }
+        for (name, value) in variables {
+            builder.env(name, value);
         }
         builder.cwd("/");
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
@@ -1031,6 +1043,61 @@ async fn a_shell_created_through_a_bridge_has_a_home_when_the_login_gave_none() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shell_created_through_a_bridge_has_no_relative_home() {
     a_shell_has_a_home_and_starts_in_it(Login::RelativeHome).await;
+}
+
+/// Runs `kr new --attach` with `arguments` on a terminal that answers every question the command
+/// asks about what it is, with `variables` added to the terminal's own environment, and returns
+/// the terminal once the shell the command attaches is the person's.
+fn a_created_session_attached_on_a_terminal(
+    world: &World,
+    arguments: &str,
+    variables: &[(&str, &std::ffi::OsStr)],
+) -> Terminal {
+    let terminal = world.terminal_running_with(
+        &format!(
+            "{} new --attach --palette probe {arguments} --shell /bin/sh --startup interactive \
+             --headless; printf 'create-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ),
+        variables,
+    );
+    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
+    terminal.types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
+    terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
+    terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    terminal
+}
+
+/// KR-REQ-03.14, 03.15, 07.25: a session created through a bridge for a person who is shown it
+/// starts from what a login in the destination gives and from nothing of the terminal that asked:
+/// its `HOME` and its `PATH` are the destination login's, where the terminal has others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shown_session_created_through_a_bridge_has_the_destination_logins_variables() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let source_home = world.source.root().join("source-home");
+    std::fs::create_dir_all(&source_home).expect("the terminal's own home");
+    let terminal = a_created_session_attached_on_a_terminal(
+        &world,
+        "--environment dest",
+        &[("HOME", source_home.as_os_str())],
+    );
+    terminal.types("printf 'reports|%s|%s|\\n' \"$HOME\" \"$PATH\"\r");
+    let printed =
+        terminal.reported_within("reports|", 2, "the shell reported its login's variables");
+    assert_eq!(
+        resolved(Path::new(&printed[0])),
+        resolved(&world.home),
+        "HOME is the destination user's and not the terminal's"
+    );
+    assert_eq!(
+        printed[1], "/usr/bin:/bin",
+        "PATH is what the destination's login gave and not the terminal's, which has the stand-in first"
+    );
+    terminal.types("exit\r");
+    terminal.expect_within("create-finished-", "the command ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
 }
 
 /// Creates a session through a bridge from a terminal that is asked for its colours while the
