@@ -260,11 +260,26 @@ impl RemoteConnection {
         // nothing in it that is not held, whenever it reads it, and a repeat of the prompt has
         // nothing left to record. A prompt the worker refuses was still sent to that session, and
         // its attachments stay with it. If the record cannot be made the prompt is not sent.
+        // The record is made under the admission this prompt arrived under, asked again where the
+        // transfer service writes: a deadline that passed or a registration that was withdrawn
+        // while the prompt waited for its worker's link records nothing and sends nothing.
         if let Some(draft_id) = crate::transfer::prompted_draft(mutation)
             && let Err(error) = self
                 .controller
                 .transfer
-                .record_submission(&self.device.principal(), draft_id, session_id)
+                .record_submission(
+                    &self.device.principal(),
+                    draft_id,
+                    session_id,
+                    crate::transfer::TransferAdmission::new(
+                        Arc::clone(&self.controller),
+                        crate::authority::AdmittedMutation {
+                            connection_id: self.connection_id(),
+                            admitted_revision: validated,
+                            deadline: Some(accepted.deadline),
+                        },
+                    ),
+                )
                 .await
         {
             return failure(mutation.request_id, error);

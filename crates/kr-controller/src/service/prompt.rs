@@ -157,7 +157,12 @@ impl Controller {
             }
             if let Err(error) = self
                 .transfer
-                .record_submission(actor_id, draft_id, session_id)
+                .record_submission(
+                    actor_id,
+                    draft_id,
+                    session_id,
+                    crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
+                )
                 .await
             {
                 link.give_back();

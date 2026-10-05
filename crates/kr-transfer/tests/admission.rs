@@ -658,6 +658,84 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
     assert_eq!(host.committed.load(Ordering::SeqCst), 1);
 }
 
+/// A draft for the session `draft_params` names, holding one published attachment.
+fn a_draft_holding_an_attachment(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
+    let draft = harness
+        .service
+        .draft_create(&harness.actor, &draft_params(harness), None)
+        .expect("creates the draft")
+        .draft;
+    let handle = harness.publish(&pattern(2048), "image/png", "photo.png");
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                transfer_id: handle.transfer_id,
+                contribution: AttachmentContribution {
+                    operation_id: "attach".to_owned(),
+                    accepted_media_types: vec![handle.declared_media_type.clone()],
+                    max_byte_len: U64::new(1024 * 1024),
+                    max_count: U64::new(4),
+                    insertion_method: InsertionMethod::TypedSubmission,
+                    external_destination: Nullable::null(),
+                    model_media_capability: false,
+                },
+            },
+            None,
+        )
+        .expect("binds the attachment")
+        .draft
+}
+
+/// KR-REQ-09.09, KR-REQ-14.11: the record that a prompt sent a draft to a session is a write, so the
+/// host is asked about it inside the lock, and a host that answers no at either place records
+/// nothing: the draft's attachment stays on the window of an unused one. The control: under an
+/// admission that stands the record is made.
+#[test]
+fn the_record_of_a_prompt_the_host_refuses_inside_the_lock_leaves_the_draft_unsent() {
+    let session_id = SessionId::new(Uuid::from_bytes([9; 16]));
+    let submitted = |harness: &Harness, draft: &kr_protocol::transfer::DraftRecord| {
+        harness
+            .service
+            .draft(&harness.actor, draft.draft_id)
+            .expect("reads the draft")
+            .attachments[0]
+            .handle
+            .submitted
+    };
+    for refuses in REFUSALS {
+        let harness = Harness::create();
+        let draft = a_draft_holding_an_attachment(&harness);
+        let host = Host::new(refuses);
+        let recorded = harness.service.record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            session_id,
+            &Admission::new(Arc::clone(&host) as Arc<dyn AdmissionHook>),
+        );
+        assert_not_admitted(recorded, refuses, &host);
+        assert!(!submitted(&harness, &draft), "{refuses:?}");
+    }
+
+    let harness = Harness::create();
+    let draft = a_draft_holding_an_attachment(&harness);
+    let host = Host::new(Refuses::Never);
+    harness
+        .service
+        .record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            session_id,
+            &Admission::new(Arc::clone(&host) as Arc<dyn AdmissionHook>),
+        )
+        .expect("under an admission that stands the prompt is recorded");
+    assert!(submitted(&harness, &draft));
+    assert_eq!(host.committed.load(Ordering::SeqCst), 1);
+}
+
 /// An answer a call already holds is not a new effect and is not asked about: a repeat of a
 /// completed action is answered from its record whatever the host now says, and the host is not
 /// asked.
