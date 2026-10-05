@@ -2360,9 +2360,10 @@ pub struct PasswdEntry {
 
 /// Reads the system's record of the user this process runs as.
 ///
-/// The system answers from whichever database holds the account: its account file, or the
-/// directory service of a system that keeps a person's account there. A platform with no such
-/// database has no record, and neither has an account the system does not know.
+/// The system answers from the account database its C library reads: the account file and, where
+/// the system keeps a person's account elsewhere, the directory service. There is no record for an
+/// account the system does not know, for one whose name is not text, and on a platform this does not
+/// read an account database for.
 #[cfg(unix)]
 #[must_use]
 pub fn passwd_entry() -> Option<PasswdEntry> {
@@ -2376,10 +2377,11 @@ pub fn passwd_entry() -> Option<PasswdEntry> {
     None
 }
 
-/// The system's account database, which the standard library has no interface to.
+/// The system's account database, read through the C library.
 ///
-/// `getpwuid_r` is what the system's own tools ask. It is the only way to reach an account that
-/// is kept in a directory service, which the account file does not list.
+/// The standard library has no interface to it. `getpwuid_r` is the C library's call for the
+/// record of a user number and answers from every database the system keeps accounts in, which the
+/// account file alone does not.
 #[cfg(unix)]
 mod account {
     #![expect(
@@ -2395,8 +2397,8 @@ mod account {
     /// The size a record is first read into, which is room for an ordinary one.
     const FIRST_BUFFER_BYTES: usize = 1024;
 
-    /// The largest buffer a record may need before it is taken to be no record: a record that does
-    /// not fit this is not an account's.
+    /// The largest buffer this reads a record into. A record that does not fit it is taken to be no
+    /// record, which bounds the retries.
     const LARGEST_BUFFER_BYTES: usize = 1 << 20;
 
     /// The system's record of the account with this number, or none when the system has none or

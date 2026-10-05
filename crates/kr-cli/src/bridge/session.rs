@@ -14,10 +14,10 @@
 //!
 //! * **A session starts from the destination.** Nothing of this host's working directory or
 //!   environment is meaningful there. The directory is the destination user's home unless the
-//!   person named one. A session its person is shown takes the helper's own allowlisted variables,
-//!   which is what a `kr new` run there would have sent, and its `HOME` is an absolute path. An
-//!   invisible one sends none: the destination host starts it with its own environment, whose
-//!   `HOME` is an absolute path too.
+//!   person named one. A session its person is shown takes the helper's own variables from a fixed
+//!   allowlist, and its `HOME` is an absolute path. An invisible one sends none: the destination
+//!   host starts it with its own environment, whose `HOME` is an absolute path unless its owner
+//!   configured another.
 //! * **A create whose answer never arrives is not retried.** The bridge ended without saying
 //!   whether the session exists, and a second create would make a second one. The person is told
 //!   the action it was asked as, and that the outcome is not known.
