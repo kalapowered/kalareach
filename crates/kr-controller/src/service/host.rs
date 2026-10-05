@@ -860,7 +860,7 @@ impl Controller {
                     "kr-hook"
                 }))
             }),
-            forwarder: crate::catalogue::integrations::registered_forwarder(),
+            forwarder: kr_ipc::install::registered_forwarder(),
         };
         let integrations = Arc::clone(&self.integrations);
         let reported = {
