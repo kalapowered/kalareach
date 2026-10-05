@@ -29,6 +29,9 @@ pub const MAX_TITLE_CODEPOINTS: usize = 64;
 /// The longest activity text this product shows, in Unicode codepoints.
 pub const MAX_ACTIVITY_CODEPOINTS: usize = 160;
 
+/// The longest summary of what changed in a session this product shows, in Unicode codepoints.
+pub const MAX_SUMMARY_CODEPOINTS: usize = 400;
+
 /// What a host knows about a session without asking a model anything.
 ///
 /// Every field is metadata the host holds for its own reasons: the working directory it started
@@ -118,6 +121,37 @@ impl ActivityText {
 }
 
 impl std::fmt::Display for ActivityText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A bounded summary of what changed in a session, normalised the same way a [`Title`] is.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryText(String);
+
+impl SummaryText {
+    /// Builds a summary, normalising and bounding it.
+    #[must_use]
+    pub fn new(text: &str) -> Option<Self> {
+        let cleaned = normalise(text, MAX_SUMMARY_CODEPOINTS);
+        (!cleaned.is_empty()).then_some(Self(cleaned))
+    }
+
+    /// Returns the text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the text's length in Unicode codepoints.
+    #[must_use]
+    pub fn codepoints(&self) -> usize {
+        self.0.chars().count()
+    }
+}
+
+impl std::fmt::Display for SummaryText {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }

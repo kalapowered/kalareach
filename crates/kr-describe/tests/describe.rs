@@ -1138,7 +1138,13 @@ fn a_private_session_captures_no_context_at_all() {
         .scheduler()
         .jobs()
         .first()
-        .map(|job| job.context.prompt().text())
+        .map(|job| {
+            job.work
+                .description()
+                .expect("a description")
+                .prompt()
+                .text()
+        })
         .expect("a job");
     for private in ["a private task", "a task from before", "an earlier command"] {
         assert!(

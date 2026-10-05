@@ -209,7 +209,10 @@ fn a_session_has_one_queued_job_whose_content_updates_in_place() {
     );
     assert_eq!(scheduler.queued(), 1);
     let job = scheduler.dequeue(at(9_000)).expect("the one job");
-    assert_eq!(job.context.revision(), ContextRevision::new(2));
+    assert_eq!(
+        job.work.description().expect("a description").revision(),
+        ContextRevision::new(2)
+    );
     assert_eq!(job.queued_at_ms, 1_000);
     assert_eq!(job.coalesced, 1);
 }

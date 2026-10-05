@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use kr_describe::prompt::{Datum, Prompt};
+use kr_describe::prompt::{Datum, Prompt, PromptKind};
 use kr_describe::wire::{
     Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
     WIRE_VERSION, WireError, frame_of, read_frame, read_message, same_release, write_message,
@@ -31,6 +31,7 @@ fn every_request() -> Vec<Request> {
         Request::Generate {
             id: U64::new(2),
             prompt: Prompt {
+                kind: PromptKind::Description,
                 revision: U64::new(3),
                 cursor_from: U64::new(1),
                 cursor_to: U64::new(4),
@@ -41,6 +42,29 @@ fn every_request() -> Vec<Request> {
                 events: Vec::new(),
             },
             grammar: "root ::= \"{\"".to_owned(),
+            limits: JobLimits {
+                context_tokens: U64::new(4_096),
+                max_output_tokens: U64::new(128),
+                prompt_tokens: U64::new(891),
+                cpu_threads: U64::new(4),
+            },
+            deadline_ms: U64::new(30_000),
+            ceiling_bytes: U64::new(4 << 30),
+        },
+        Request::Generate {
+            id: U64::new(4),
+            prompt: Prompt {
+                kind: PromptKind::Summary,
+                revision: U64::new(0),
+                cursor_from: U64::new(10),
+                cursor_to: U64::new(14),
+                facts: Vec::new(),
+                events: vec![Datum {
+                    label: "change command_completed".to_owned(),
+                    text: "cargo test exited 0".to_owned(),
+                }],
+            },
+            grammar: kr_describe::output::SUMMARY_GRAMMAR.to_owned(),
             limits: JobLimits {
                 context_tokens: U64::new(4_096),
                 max_output_tokens: U64::new(128),

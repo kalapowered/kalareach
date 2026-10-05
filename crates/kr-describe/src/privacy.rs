@@ -161,6 +161,60 @@ impl DescriptionFence {
         elapsed_ms: u64,
         deadline_ms: u64,
     ) -> crate::error::Result<PublishGate> {
+        self.publish_with(
+            session_id,
+            produced_generation,
+            fallback_generation,
+            cancellation,
+            elapsed_ms,
+            deadline_ms,
+            || match store.publish(session_id, description, wall_ms) {
+                Ok(crate::store::Published::Recorded) => Ok(()),
+                Ok(crate::store::Published::NamePinned) => Err(NotWritten::NamePinned),
+                Err(error) => Err(NotWritten::Store(error)),
+            },
+        )
+    }
+
+    /// Publishes a summary under the fence's lock if the session is not fenced, not cancelled,
+    /// and has not exceeded its whole-job deadline: [`Self::publish_under_lock`] for the other
+    /// kind of result, produced under the generation the record carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error when the write fails.
+    pub fn publish_summary_under_lock(
+        &self,
+        store: &DescriptionStore,
+        record: &crate::summary::SummaryRecord,
+        fallback_generation: PrivacyGeneration,
+        cancellation: &Cancellation,
+        elapsed_ms: u64,
+        deadline_ms: u64,
+    ) -> crate::error::Result<PublishGate> {
+        self.publish_with(
+            &record.session_id,
+            record.generation,
+            fallback_generation,
+            cancellation,
+            elapsed_ms,
+            deadline_ms,
+            || store.publish_summary(record).map_err(NotWritten::Store),
+        )
+    }
+
+    /// The rules of publishing under the fence, for a write that is one kind of result's own.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_with(
+        &self,
+        session_id: &SessionId,
+        produced_generation: PrivacyGeneration,
+        fallback_generation: PrivacyGeneration,
+        cancellation: &Cancellation,
+        elapsed_ms: u64,
+        deadline_ms: u64,
+        write: impl FnOnce() -> Result<(), NotWritten>,
+    ) -> crate::error::Result<PublishGate> {
         let held = self
             .fenced
             .lock()
@@ -196,13 +250,7 @@ impl DescriptionFence {
         // only generated description and an earlier job published it. A pin that stops the write
         // is a write that recorded nothing, so the token goes back to cancellable, as it does for a
         // write the store refused.
-        let written = cancellation.publish_unless_cancelled(|| {
-            match store.publish(session_id, description, wall_ms) {
-                Ok(crate::store::Published::Recorded) => Ok(()),
-                Ok(crate::store::Published::NamePinned) => Err(NotWritten::NamePinned),
-                Err(error) => Err(NotWritten::Store(error)),
-            }
-        });
+        let written = cancellation.publish_unless_cancelled(write);
         match written {
             None => Ok(PublishGate::Cancelled),
             Some(Ok(())) => Ok(PublishGate::Allowed),

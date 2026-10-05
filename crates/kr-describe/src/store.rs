@@ -1,4 +1,4 @@
-//! Names, pins and generated-description provenance.
+//! Names, pins, generated-description provenance and the summaries asked for.
 //!
 //! Section 24's ownership table gives *names, pins, generated description provenance* to an
 //! environment session-metadata store keyed by context and model revisions, and states the two
@@ -30,11 +30,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::context::{ContextRevision, CursorInterval};
 use crate::error::{DescribeError, Result};
 use crate::metadata::{
-    ActivityText, LabelSource, SessionFacts, SessionLabel, Title, VerifiedStatus,
+    ActivityText, LabelSource, SessionFacts, SessionLabel, SummaryText, Title, VerifiedStatus,
     deterministic_title,
 };
 use crate::output::GeneratedDescription;
 use crate::profile::ProfileRevision;
+use crate::summary::{MAX_SUMMARIES_PER_SESSION, SummaryRecord};
 
 /// The schema version this build writes and reads.
 const SCHEMA_VERSION: i64 = 1;
@@ -145,6 +146,20 @@ impl DescriptionStore {
                      profile_revision  INTEGER NOT NULL,
                      privacy_generation INTEGER NOT NULL,
                      produced_at_ms    INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS describe_summaries (
+                     session_id         TEXT NOT NULL,
+                     cursor_from        INTEGER NOT NULL,
+                     cursor_to          INTEGER NOT NULL,
+                     profile_id         TEXT NOT NULL,
+                     profile_revision   INTEGER NOT NULL,
+                     privacy_generation INTEGER NOT NULL,
+                     from_ms            INTEGER NOT NULL,
+                     to_ms              INTEGER NOT NULL,
+                     summary            TEXT NOT NULL,
+                     produced_at_ms     INTEGER NOT NULL,
+                     PRIMARY KEY (session_id, cursor_from, cursor_to, profile_id,
+                                  profile_revision, privacy_generation)
                  );",
             )
             .map_err(store_error)?;
@@ -410,6 +425,141 @@ impl DescriptionStore {
         }))
     }
 
+    /// Records a summary with its provenance, and keeps the newest [`MAX_SUMMARIES_PER_SESSION`] of
+    /// its session's: the oldest go first.
+    ///
+    /// A summary is kept by its session, its interval, the profile that wrote it and the privacy
+    /// generation it was written under; one written again under all of them replaces the earlier.
+    /// The write and the trim are one transaction, so a reader never sees a session with more than
+    /// the bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::Store`] when the write fails.
+    pub fn publish_summary(&self, record: &SummaryRecord) -> Result<()> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(store_error)?;
+        let session = record.session_id.to_string();
+        transaction
+            .execute(
+                "DELETE FROM describe_summaries
+                 WHERE session_id = ?1 AND cursor_from = ?2 AND cursor_to = ?3
+                   AND profile_id = ?4 AND profile_revision = ?5 AND privacy_generation = ?6",
+                params![
+                    session,
+                    to_sqlite(record.cursor.from, "cursor")?,
+                    to_sqlite(record.cursor.to, "cursor")?,
+                    record.profile_id,
+                    to_sqlite(record.profile_revision.get(), "profile revision")?,
+                    to_sqlite(record.generation.get(), "privacy generation")?,
+                ],
+            )
+            .map_err(store_error)?;
+        transaction
+            .execute(
+                "INSERT INTO describe_summaries (
+                     session_id, cursor_from, cursor_to, profile_id, profile_revision,
+                     privacy_generation, from_ms, to_ms, summary, produced_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    session,
+                    to_sqlite(record.cursor.from, "cursor")?,
+                    to_sqlite(record.cursor.to, "cursor")?,
+                    record.profile_id,
+                    to_sqlite(record.profile_revision.get(), "profile revision")?,
+                    to_sqlite(record.generation.get(), "privacy generation")?,
+                    to_sqlite(record.from_ms, "summary start time")?,
+                    to_sqlite(record.to_ms, "summary end time")?,
+                    record.text.as_str(),
+                    to_sqlite(record.produced_at_ms, "publication time")?,
+                ],
+            )
+            .map_err(store_error)?;
+        transaction
+            .execute(
+                "DELETE FROM describe_summaries
+                 WHERE session_id = ?1 AND rowid NOT IN (
+                     SELECT rowid FROM describe_summaries WHERE session_id = ?1
+                     ORDER BY produced_at_ms DESC, rowid DESC LIMIT ?2)",
+                params![session, MAX_SUMMARIES_PER_SESSION as i64],
+            )
+            .map_err(store_error)?;
+        transaction.commit().map_err(store_error)
+    }
+
+    /// Returns a session's summaries, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::Store`] when the read fails or a stored row is not one this build
+    /// wrote.
+    pub fn summaries(&self, session_id: &SessionId) -> Result<Vec<SummaryRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT cursor_from, cursor_to, profile_id, profile_revision, privacy_generation,
+                        from_ms, to_ms, summary, produced_at_ms
+                 FROM describe_summaries WHERE session_id = ?1
+                 ORDER BY produced_at_ms DESC, rowid DESC",
+            )
+            .map_err(store_error)?;
+        let rows = statement
+            .query_map(params![session_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(store_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (from, to, profile_id, revision, generation, from_ms, to_ms, text, produced_at_ms) =
+                row.map_err(store_error)?;
+            records.push(SummaryRecord {
+                session_id: *session_id,
+                cursor: CursorInterval::new(
+                    from_sqlite(from, "cursor")?,
+                    from_sqlite(to, "cursor")?,
+                ),
+                from_ms: from_sqlite(from_ms, "summary start time")?,
+                to_ms: from_sqlite(to_ms, "summary end time")?,
+                text: SummaryText::new(&text).ok_or_else(|| DescribeError::Store {
+                    detail: "a stored summary is not text this build can show".to_owned(),
+                })?,
+                profile_id,
+                profile_revision: ProfileRevision::new(from_sqlite(revision, "profile revision")?),
+                generation: PrivacyGeneration::new(from_sqlite(generation, "privacy generation")?),
+                produced_at_ms: from_sqlite(produced_at_ms, "publication time")?,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Returns how many summaries this store holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::Store`] when the read fails.
+    pub fn summary_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM describe_summaries", [], |row| {
+                row.get(0)
+            })
+            .map_err(store_error)?;
+        from_sqlite(count, "summary count")
+    }
+
     /// Returns how many generated descriptions this store holds.
     ///
     /// # Errors
@@ -425,7 +575,7 @@ impl DescriptionStore {
         from_sqlite(count, "description count")
     }
 
-    /// Removes every generated description, keeping every pin.
+    /// Removes every generated description and every summary, keeping every pin.
     ///
     /// This is what privacy mode's removal calls. It counts what it removed before removing it, so
     /// the figure reported is of rows that are gone rather than of rows that were asked to go.
@@ -437,7 +587,7 @@ impl DescriptionStore {
         self.remove_generated_where("1 = 1", &[])
     }
 
-    /// Removes one session's generated description, keeping its pin.
+    /// Removes one session's generated description and summaries, keeping its pin.
     ///
     /// # Errors
     ///
@@ -482,6 +632,23 @@ impl DescriptionStore {
                 parameters,
             )
             .map_err(store_error)?;
+        // The summaries go in the same transaction: they are generated text of the same sessions.
+        let (summaries, summary_bytes): (i64, i64) = transaction
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(summary AS BLOB))), 0)
+                     FROM describe_summaries WHERE {predicate}"
+                ),
+                parameters,
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(store_error)?;
+        let summaries_deleted = transaction
+            .execute(
+                &format!("DELETE FROM describe_summaries WHERE {predicate}"),
+                parameters,
+            )
+            .map_err(store_error)?;
         transaction.commit().map_err(store_error)?;
         let records = from_sqlite(records, "description count")?;
         if deleted as u64 != records {
@@ -489,9 +656,18 @@ impl DescriptionStore {
                 detail: format!("{records} descriptions were counted and {deleted} were removed"),
             });
         }
+        let summaries = from_sqlite(summaries, "summary count")?;
+        if summaries_deleted as u64 != summaries {
+            return Err(DescribeError::Store {
+                detail: format!(
+                    "{summaries} summaries were counted and {summaries_deleted} were removed"
+                ),
+            });
+        }
         Ok(RemovedText {
-            records,
-            bytes: from_sqlite(bytes, "description size")?,
+            records: records + summaries,
+            bytes: from_sqlite(bytes, "description size")?
+                + from_sqlite(summary_bytes, "summary size")?,
         })
     }
 

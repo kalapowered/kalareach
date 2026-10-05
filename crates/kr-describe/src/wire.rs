@@ -42,8 +42,10 @@ use crate::prompt::Prompt;
 ///
 /// The second version added `verify` and `verified`, `cancelling`, and the way `ready` says its
 /// memory ceiling is enforced. The third sends the prompt in its parts and the number of tokens it
-/// may be, so the process, which holds the tokenizer, makes it fit.
-pub const WIRE_VERSION: u64 = 3;
+/// may be, so the process, which holds the tokenizer, makes it fit. The fourth says in the prompt
+/// what it asks for, a description or a summary of what changed, which the process needs to end
+/// an answer the output bound stopped.
+pub const WIRE_VERSION: u64 = 4;
 
 /// This build's release, which the daemon and the process it starts share.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");

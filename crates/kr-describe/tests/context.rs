@@ -651,6 +651,7 @@ fn stand_in(text: &str) -> usize {
 /// The prompt of a job at revision 2 over the cursor interval 3 to 11.
 fn prompt_at_two() -> Prompt {
     Prompt {
+        kind: kr_describe::prompt::PromptKind::Description,
         revision: U64::new(2),
         cursor_from: U64::new(3),
         cursor_to: U64::new(11),

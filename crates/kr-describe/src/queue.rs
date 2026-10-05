@@ -4,7 +4,11 @@
 //! quietly lose, so each one is a named thing here.
 //!
 //! * *Keep at most one latest queued job per session.* [`Scheduler::enqueue`] replaces rather than
-//!   appends, so the queue's length is bounded by the number of sessions.
+//!   appends, so the queue's length is bounded by the number of sessions. A summary is the other
+//!   kind of job a session has, and the two share the one place: a session holds at most one job
+//!   of each kind, the older of the two is the one that can be sent, and the other waits behind it
+//!   as the session's next request and takes the place when that one has been sent. A request of a
+//!   kind that is already waiting replaces it in place, keeping its age.
 //! * *Update its content without resetting its aging position.* The replacement keeps
 //!   [`QueuedJob::queued_at_ms`]. This is what stops a session that changes every two seconds from
 //!   being permanently newer than one that changed once, which is the same sentence as *coalescing
@@ -28,6 +32,7 @@ use kr_protocol::ids::SessionId;
 
 use crate::budget::Budgets;
 use crate::context::{ContextRevision, DescriptionContext};
+use crate::summary::SummaryAsk;
 use crate::time::Reading;
 
 /// How many priority jobs may run before an oldest waiting ordinary job is served.
@@ -45,15 +50,51 @@ pub enum Priority {
     Ordinary,
 }
 
-/// A job waiting to be described.
+/// What a queued job is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// A description of the session, from its context.
+    Description(DescriptionContext),
+    /// A summary of the session's changes in an interval that was frozen when it was asked for.
+    Summary(SummaryAsk),
+}
+
+impl Work {
+    /// Returns whether this is a summary.
+    #[must_use]
+    pub const fn is_summary(&self) -> bool {
+        matches!(self, Self::Summary(_))
+    }
+
+    /// Returns the context to describe, when this is a description.
+    #[must_use]
+    pub const fn description(&self) -> Option<&DescriptionContext> {
+        match self {
+            Self::Description(context) => Some(context),
+            Self::Summary(_) => None,
+        }
+    }
+
+    /// Returns the request to summarise, when this is a summary.
+    #[must_use]
+    pub const fn summary(&self) -> Option<&SummaryAsk> {
+        match self {
+            Self::Summary(ask) => Some(ask),
+            Self::Description(_) => None,
+        }
+    }
+}
+
+/// A job waiting to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedJob {
     /// The session.
     pub session_id: SessionId,
     /// Whether it is priority work.
     pub priority: Priority,
-    /// The context to describe. It is replaced in place when the session changes again.
-    pub context: DescriptionContext,
+    /// What the job is for. It is replaced in place when the session changes again, or when a
+    /// summary is asked for again.
+    pub work: Work,
     /// When this session first joined the queue with work outstanding.
     ///
     /// It survives every replacement. A session that has been waiting ten minutes has been waiting
@@ -76,7 +117,10 @@ impl QueuedJob {
 pub enum Enqueued {
     /// The session had nothing queued and now has one job.
     Admitted,
-    /// The session already had a job. Its content was replaced and its position kept.
+    /// The session's place is taken by a job of the other kind that has waited longer, so this one
+    /// is held as the session's next request and takes the place when that one has been sent.
+    Held,
+    /// The session already had a job of this kind. Its content was replaced and its position kept.
     Replaced {
         /// The position that was kept.
         queued_at_ms: u64,
@@ -203,7 +247,10 @@ impl ServiceTime {
 #[derive(Clone, Debug)]
 pub struct Scheduler {
     budgets: Budgets,
+    /// Each session's waiting description.
     queued: BTreeMap<SessionId, QueuedJob>,
+    /// Each session's waiting summary.
+    summaries: BTreeMap<SessionId, QueuedJob>,
     last_dispatch_ms: BTreeMap<SessionId, u64>,
     last_success_wall_ms: BTreeMap<SessionId, u64>,
     service_time: ServiceTime,
@@ -217,6 +264,7 @@ impl Scheduler {
         Self {
             budgets,
             queued: BTreeMap::new(),
+            summaries: BTreeMap::new(),
             last_dispatch_ms: BTreeMap::new(),
             last_success_wall_ms: BTreeMap::new(),
             service_time: ServiceTime::default(),
@@ -224,10 +272,40 @@ impl Scheduler {
         }
     }
 
-    /// Returns how many sessions have a job queued.
+    /// Returns how many sessions have a job queued, of either kind.
     #[must_use]
     pub fn queued(&self) -> usize {
         self.queued.len()
+            + self
+                .summaries
+                .keys()
+                .filter(|session_id| !self.queued.contains_key(session_id))
+                .count()
+    }
+
+    /// Returns the job that holds a session's place: the one that has waited longer, and a summary
+    /// where the two arrived together.
+    fn slot(&self, session_id: &SessionId) -> Option<&QueuedJob> {
+        match (self.queued.get(session_id), self.summaries.get(session_id)) {
+            (Some(description), Some(summary)) => {
+                Some(if description.queued_at_ms < summary.queued_at_ms {
+                    description
+                } else {
+                    summary
+                })
+            }
+            (description, summary) => description.or(summary),
+        }
+    }
+
+    /// Returns the job that holds each session's place.
+    fn slots(&self) -> Vec<&QueuedJob> {
+        let sessions: std::collections::BTreeSet<&SessionId> =
+            self.queued.keys().chain(self.summaries.keys()).collect();
+        sessions
+            .into_iter()
+            .filter_map(|session_id| self.slot(session_id))
+            .collect()
     }
 
     /// Returns the measured service time.
@@ -249,8 +327,8 @@ impl Scheduler {
     #[must_use]
     pub fn cadence_ms(&self, now: Reading) -> u64 {
         let eligible = self
-            .queued
-            .values()
+            .slots()
+            .into_iter()
             .filter(|job| self.past_cooldown(&job.session_id, now))
             .count()
             .max(1) as u64;
@@ -276,7 +354,7 @@ impl Scheduler {
     ) -> Enqueued {
         let session_id = *context.session_id();
         if let Some(existing) = self.queued.get_mut(&session_id) {
-            existing.context = context;
+            existing.work = Work::Description(context);
             existing.priority = priority;
             existing.coalesced = existing.coalesced.saturating_add(1);
             return Enqueued::Replaced {
@@ -289,12 +367,55 @@ impl Scheduler {
             QueuedJob {
                 session_id,
                 priority,
-                context,
+                work: Work::Description(context),
                 queued_at_ms: now.monotonic_ms(),
                 coalesced: 0,
             },
         );
+        // The summary that was here first holds the place, and a description that arrives together
+        // with one waits for it.
+        if self.summaries.contains_key(&session_id) {
+            return Enqueued::Held;
+        }
         Enqueued::Admitted
+    }
+
+    /// Queues, or replaces, one session's summary.
+    ///
+    /// A summary is priority work, and it replaces one that is waiting in place, interval and text
+    /// both, keeping the position the waiting one had: a person who asks again while the first is
+    /// waiting is not sent to the back, and the job that runs is for the interval asked for last.
+    /// Beside a description that has waited longer it is held, and takes the session's place when
+    /// that description has been sent.
+    pub fn enqueue_summary(&mut self, ask: SummaryAsk, now: Reading) -> Enqueued {
+        let session_id = ask.session_id;
+        if let Some(existing) = self.summaries.get_mut(&session_id) {
+            existing.work = Work::Summary(ask);
+            existing.coalesced = existing.coalesced.saturating_add(1);
+            return Enqueued::Replaced {
+                queued_at_ms: existing.queued_at_ms,
+                coalesced: existing.coalesced,
+            };
+        }
+        let waiting_behind = self
+            .queued
+            .get(&session_id)
+            .is_some_and(|description| description.queued_at_ms < now.monotonic_ms());
+        self.summaries.insert(
+            session_id,
+            QueuedJob {
+                session_id,
+                priority: Priority::Foreground,
+                work: Work::Summary(ask),
+                queued_at_ms: now.monotonic_ms(),
+                coalesced: 0,
+            },
+        );
+        if waiting_behind {
+            Enqueued::Held
+        } else {
+            Enqueued::Admitted
+        }
     }
 
     /// Returns whether a session may be described now.
@@ -308,7 +429,7 @@ impl Scheduler {
 
     /// Returns whether a session may be described now, with the cadence already worked out.
     fn eligible_under(&self, session_id: &SessionId, now: Reading, cadence_ms: u64) -> bool {
-        let wait_ms = match self.queued.get(session_id) {
+        let wait_ms = match self.slot(session_id) {
             Some(job) if job.priority == Priority::Ordinary => cadence_ms,
             _ => self.budgets.session_cooldown_ms,
         };
@@ -332,13 +453,13 @@ impl Scheduler {
     /// every session is cooling down are both ordinary, and they are different enough that a
     /// caller deciding whether to unload the model needs to tell them apart.
     pub fn dequeue(&mut self, now: Reading) -> std::result::Result<QueuedJob, NothingToDequeue> {
-        if self.queued.is_empty() {
+        if self.queued.is_empty() && self.summaries.is_empty() {
             return Err(NothingToDequeue::Empty);
         }
         let cadence_ms = self.cadence_ms(now);
         let eligible: Vec<&QueuedJob> = self
-            .queued
-            .values()
+            .slots()
+            .into_iter()
             .filter(|job| self.eligible_under(&job.session_id, now, cadence_ms))
             .collect();
         if eligible.is_empty() {
@@ -365,10 +486,16 @@ impl Scheduler {
         let session_id = chosen.unwrap_or_else(|| {
             unreachable!("an eligible queue holds at least one job of some priority")
         });
-        let job = self
-            .queued
-            .remove(&session_id)
+        let held_by = self
+            .slot(&session_id)
+            .map(|job| job.work.is_summary())
             .unwrap_or_else(|| unreachable!("the chosen session was in the queue"));
+        let job = if held_by {
+            self.summaries.remove(&session_id)
+        } else {
+            self.queued.remove(&session_id)
+        }
+        .unwrap_or_else(|| unreachable!("the chosen session was in the queue"));
         self.priority_run = match job.priority {
             Priority::Foreground => self.priority_run.saturating_add(1),
             Priority::Ordinary => 0,
@@ -382,9 +509,9 @@ impl Scheduler {
     #[must_use]
     pub fn has_eligible(&self, now: Reading) -> bool {
         let cadence_ms = self.cadence_ms(now);
-        self.queued
-            .keys()
-            .any(|session_id| self.eligible_under(session_id, now, cadence_ms))
+        self.slots()
+            .into_iter()
+            .any(|job| self.eligible_under(&job.session_id, now, cadence_ms))
     }
 
     /// Returns when the soonest queued session may be described, at the cadence in force now.
@@ -394,8 +521,8 @@ impl Scheduler {
     #[must_use]
     pub fn next_due_ms(&self, now: Reading) -> Option<u64> {
         let cadence_ms = self.cadence_ms(now);
-        self.queued
-            .values()
+        self.slots()
+            .into_iter()
             .map(|job| {
                 let wait_ms = match job.priority {
                     Priority::Ordinary => cadence_ms,
@@ -417,7 +544,12 @@ impl Scheduler {
     /// content is kept and takes the older position, which is the position the session has held.
     pub fn requeue(&mut self, job: QueuedJob) {
         self.last_dispatch_ms.remove(&job.session_id);
-        match self.queued.get_mut(&job.session_id) {
+        let kept = if job.work.is_summary() {
+            &mut self.summaries
+        } else {
+            &mut self.queued
+        };
+        match kept.get_mut(&job.session_id) {
             Some(newer) => {
                 newer.queued_at_ms = newer.queued_at_ms.min(job.queued_at_ms);
                 if job.priority == Priority::Foreground {
@@ -425,7 +557,7 @@ impl Scheduler {
                 }
             }
             None => {
-                self.queued.insert(job.session_id, job);
+                kept.insert(job.session_id, job);
             }
         }
     }
@@ -447,7 +579,7 @@ impl Scheduler {
             .insert(*session_id, now.wall_ms().get());
     }
 
-    /// Returns what a client is shown about one session's place in the queue.
+    /// Returns what a client is shown about one session's place in the queue: its description's.
     #[must_use]
     pub fn standing(&self, session_id: &SessionId, now: Reading) -> SessionStanding {
         SessionStanding {
@@ -460,15 +592,23 @@ impl Scheduler {
         }
     }
 
-    /// Returns whether a session has a job waiting.
+    /// Returns whether a session has a job waiting, of either kind.
     #[must_use]
     pub fn has_queued(&self, session_id: &SessionId) -> bool {
-        self.queued.contains_key(session_id)
+        self.queued.contains_key(session_id) || self.summaries.contains_key(session_id)
     }
 
-    /// Drops a session's queued job, and returns whether there was one.
+    /// Returns whether a session has a summary waiting.
+    #[must_use]
+    pub fn has_summary(&self, session_id: &SessionId) -> bool {
+        self.summaries.contains_key(session_id)
+    }
+
+    /// Drops a session's queued jobs, of both kinds, and returns whether there was one.
     pub fn cancel(&mut self, session_id: &SessionId) -> bool {
-        self.queued.remove(session_id).is_some()
+        let description = self.queued.remove(session_id).is_some();
+        let summary = self.summaries.remove(session_id).is_some();
+        description || summary
     }
 
     /// Drops everything this scheduler remembers about a session.
@@ -477,21 +617,27 @@ impl Scheduler {
     /// dispatch and success times would be keeping a row per session this host has ever run.
     pub fn forget(&mut self, session_id: &SessionId) {
         self.queued.remove(session_id);
+        self.summaries.remove(session_id);
         self.last_dispatch_ms.remove(session_id);
         self.last_success_wall_ms.remove(session_id);
     }
 
     /// Drops every queued job and returns how many there were.
     pub fn cancel_all(&mut self) -> u64 {
-        let cancelled = self.queued.len() as u64;
+        let cancelled = (self.queued.len() + self.summaries.len()) as u64;
         self.queued.clear();
+        self.summaries.clear();
         cancelled
     }
 
-    /// Returns the queued jobs, oldest position first.
+    /// Returns the queued jobs of both kinds, oldest position first.
     #[must_use]
     pub fn jobs(&self) -> Vec<&QueuedJob> {
-        let mut jobs: Vec<&QueuedJob> = self.queued.values().collect();
+        let mut jobs: Vec<&QueuedJob> = self
+            .queued
+            .values()
+            .chain(self.summaries.values())
+            .collect();
         jobs.sort_by_key(|job| (job.queued_at_ms, job.session_id));
         jobs
     }

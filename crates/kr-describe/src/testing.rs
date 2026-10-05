@@ -20,7 +20,7 @@ use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, Signature64, U64};
 use crate::priority::Cancellation;
 use crate::profile::catalogue::Catalogue;
 use crate::profile::{Asset, ProfileDocument, ProfileTrust, SignedProfile};
-use crate::prompt::Prompt;
+use crate::prompt::{Prompt, PromptKind};
 use crate::serve::{Generating, Job, LoadWork, Loading, Model, Options, Verifying};
 use crate::wire::{
     Answer, Background, JobEnd, Phases, Request, VerifyResult, WIRE_VERSION, frame_of,
@@ -188,7 +188,8 @@ pub enum Output {
     OverlongTitle,
     /// Activity text longer than section 22's bound.
     OverlongActivity,
-    /// A description that claims a revision other than the prompt's.
+    /// A description that claims a revision other than the prompt's, or a summary that claims a
+    /// first cursor other than the prompt's.
     WrongRevision(u64),
     /// A well-formed description that claims what only the host can know: that tests passed and
     /// that an approval was given.
@@ -584,6 +585,9 @@ fn check_file(asset: &Asset, path: &Path) -> Verifying {
 /// an empty context would fail.
 #[must_use]
 pub fn answer_of(prompt: &Prompt, output: &Output) -> Vec<u8> {
+    if prompt.kind == PromptKind::Summary {
+        return summary_answer_of(prompt, output);
+    }
     let revision = match output {
         Output::WrongRevision(claimed) => *claimed,
         _ => prompt.revision.get(),
@@ -627,6 +631,53 @@ pub fn answer_of(prompt: &Prompt, output: &Output) -> Vec<u8> {
              \"context_revision\":{revision}}}",
             title = escape(&title),
             activity = escape(&activity),
+        )
+        .into_bytes(),
+    }
+}
+
+/// Builds the answer a summary's prompt gets: the number of changes it was given, and each as its
+/// label and its text, from the data section and nothing else, so a test reads in the summary what
+/// the model was shown. [`Output::WrongRevision`] gives a first cursor of the number it names, and
+/// the overlong outputs give a summary over the bound.
+fn summary_answer_of(prompt: &Prompt, output: &Output) -> Vec<u8> {
+    let (mut from, to) = (prompt.cursor_from.get(), prompt.cursor_to.get());
+    if let Output::WrongRevision(claimed) = output {
+        from = *claimed;
+    }
+    let shown: Vec<String> = prompt
+        .events
+        .iter()
+        .map(|change| {
+            if change.text.is_empty() {
+                change.label.clone()
+            } else {
+                format!("{}: {}", change.label, change.text)
+            }
+        })
+        .collect();
+    let text: String = format!("{} changes: {}", shown.len(), shown.join("; "))
+        .chars()
+        .take(crate::metadata::MAX_SUMMARY_CODEPOINTS)
+        .collect();
+    let text = match output {
+        Output::ControlCharacter => format!("{text}\u{7}"),
+        Output::OverlongTitle | Output::OverlongActivity => {
+            "s".repeat(crate::metadata::MAX_SUMMARY_CODEPOINTS + 1)
+        }
+        _ => text,
+    };
+    match output {
+        Output::Malformed => b"not an object at all".to_vec(),
+        Output::UnknownField => format!(
+            "{{\"summary\":{summary},\"source_cursor\":{{\"from\":{from},\"to\":{to}}},\
+             \"confidence\":0.9}}",
+            summary = escape(&text),
+        )
+        .into_bytes(),
+        _ => format!(
+            "{{\"summary\":{summary},\"source_cursor\":{{\"from\":{from},\"to\":{to}}}}}",
+            summary = escape(&text),
         )
         .into_bytes(),
     }
@@ -1300,6 +1351,15 @@ pub enum Tick {
         /// How long its job took once dequeued.
         execution_ms: u64,
     },
+    /// A summary was published.
+    SummaryPublished {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+        /// How long its job waited.
+        queue_wait_ms: u64,
+        /// How long its job took once dequeued.
+        execution_ms: u64,
+    },
     /// A result was refused.
     Rejected {
         /// The session.
@@ -1341,6 +1401,15 @@ impl From<crate::service::Outcome> for Tick {
                 queue_wait_ms,
                 execution_ms,
             } => Self::Published {
+                session_id,
+                queue_wait_ms,
+                execution_ms,
+            },
+            Outcome::SummaryPublished {
+                session_id,
+                queue_wait_ms,
+                execution_ms,
+            } => Self::SummaryPublished {
                 session_id,
                 queue_wait_ms,
                 execution_ms,
