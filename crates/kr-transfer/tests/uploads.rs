@@ -1983,6 +1983,7 @@ fn interrupt_publish(
         payload_digest: action.payload_digest,
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms,
     });
     let mut store = kr_transfer::Store::open(
@@ -2509,6 +2510,37 @@ fn two_concurrent_copies_of_one_chunk_action_answer_the_same() {
     let bitmap = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
         .expect("a bitmap for this layout");
     assert!(bitmap.is_complete());
+}
+
+/// KR-REQ-14.09, KR-REQ-24.09: a chunk that conflicts with one already recorded invalidates the
+/// upload under its action, so a repeat of that action, however late, is refused as the first copy
+/// was and not as an upload that has since ended.
+#[test]
+fn a_repeat_of_the_chunk_action_that_invalidated_an_upload_is_refused_as_it_was() {
+    let harness = Harness::create();
+    let bytes = pattern(128);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "notes.bin")
+        .expect("reserves the upload");
+    harness
+        .send_as(begun.transfer_id, &bytes, 0, None)
+        .expect("accepts the chunk");
+    let other: Vec<u8> = bytes.iter().map(|byte| byte ^ 0xff).collect();
+    let conflicting = action(&harness, "upload.chunk", &other);
+
+    let first = harness
+        .send_as(begun.transfer_id, &other, 0, Some(&conflicting))
+        .expect_err("the conflicting duplicate invalidates the upload");
+    assert_eq!(first.code(), ErrorCode::AttachmentIntegrity);
+
+    let repeat = harness
+        .send_as(begun.transfer_id, &other, 0, Some(&conflicting))
+        .expect_err("a repeat of that action is refused");
+    assert_eq!(
+        repeat.code(),
+        first.code(),
+        "one action, one answer: {repeat}"
+    );
 }
 
 /// KR-REQ-14.07, KR-REQ-24.09: two concurrent copies of one `upload.finish` publish one file and
@@ -3044,6 +3076,7 @@ fn a_finish_that_fails_verification_beside_a_copy_that_claimed_the_publication_i
         payload_digest: finish.payload_digest,
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
     };
     let copy_digest = digest(&bytes);
@@ -3114,6 +3147,7 @@ fn a_copy_of_one_finish_action_that_finds_the_payload_gone_is_answered_by_the_ro
         payload_digest: claim.payload_digest,
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
     };
     harness
@@ -3200,6 +3234,7 @@ fn a_copy_of_one_finish_action_whose_upload_ended_reads_the_ending() {
         payload_digest: claim.payload_digest,
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
     };
     harness
@@ -3270,6 +3305,7 @@ fn an_upload_that_ends_while_its_file_is_read_is_answered_by_the_ending() {
         payload_digest: claim.payload_digest,
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
     };
     harness

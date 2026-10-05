@@ -326,8 +326,22 @@ pub struct RetainedAction {
     /// handle to record yet. Such a claim carries no result, which is what makes a repeat of it
     /// `OUTCOME_UNKNOWN` until the second commit fills it in.
     pub result: Option<Vec<u8>>,
+    /// The refusal the effect ended in, where it ended in one in the same transaction.
+    ///
+    /// An effect that invalidates what it acts on is refused and leaves nothing to answer a repeat
+    /// from but this: a repeat is owed the refusal the first copy was given, under the same code.
+    pub failure: Option<ActionFailure>,
     /// When it was recorded.
     pub recorded_at_ms: TimestampMs,
+}
+
+/// The refusal an action is retained as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionFailure {
+    /// The protocol code the refusal was given under.
+    pub code: String,
+    /// What it said.
+    pub detail: String,
 }
 
 /// What a transaction that carried an action found.
@@ -2414,7 +2428,7 @@ fn claim_action(
             "INSERT INTO actions
                  (actor_id, action_id, method, payload_digest, subject, result, error_code,
                   error_detail, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?7, ?5, NULL, NULL, ?6)
+             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?8, ?9, ?6)
              ON CONFLICT (actor_id, action_id) DO NOTHING",
             params![
                 action.actor_id.as_str(),
@@ -2424,6 +2438,11 @@ fn claim_action(
                 action.result,
                 as_i64(action.recorded_at_ms.get()),
                 action.subject.map(|subject| uuid_sql(subject.get())),
+                action.failure.as_ref().map(|failure| failure.code.as_str()),
+                action
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.detail.as_str()),
             ],
         )
         .map_err(TransferError::store)?;

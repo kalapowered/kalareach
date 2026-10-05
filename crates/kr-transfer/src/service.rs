@@ -43,8 +43,8 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{Result, TransferError};
 use crate::staging::{StagingArea, StorageName};
 use crate::store::{
-    ActionOutcome, ActionRecord, BindingRow, DraftRow, GrantRow, Limits, RetainedAction, ScopeRow,
-    SnapshotState, Store, UploadRow,
+    ActionFailure, ActionOutcome, ActionRecord, BindingRow, DraftRow, GrantRow, Limits,
+    RetainedAction, ScopeRow, SnapshotState, Store, UploadRow,
 };
 
 /// How long a narrow read grant over one attachment lives.
@@ -292,6 +292,7 @@ impl Action {
             payload_digest: self.payload_digest,
             subject: None,
             result: Some(result),
+            failure: None,
             recorded_at_ms,
         }
     }
@@ -310,7 +311,25 @@ impl Action {
             payload_digest: self.payload_digest,
             subject: Some(transfer_id),
             result: None,
+            failure: None,
             recorded_at_ms,
+        }
+    }
+
+    /// Builds the row this action is retained as when its effect ends in `refusal`, which the
+    /// same transaction records beside the state the effect changed.
+    fn refused(
+        &self,
+        transfer_id: TransferId,
+        refusal: &TransferError,
+        recorded_at_ms: TimestampMs,
+    ) -> RetainedAction {
+        RetainedAction {
+            failure: Some(ActionFailure {
+                code: refusal.code().as_str().to_owned(),
+                detail: refusal.to_string(),
+            }),
+            ..self.claimed_for(transfer_id, recorded_at_ms)
         }
     }
 }
@@ -1001,18 +1020,27 @@ impl TransferService {
                     "chunk {index} arrived twice with different content, so this upload cannot be \
                      completed under the same identifier"
                 );
-                commit_admitted(action, || {
+                let refusal = TransferError::integrity(&reason);
+                // The refusal is recorded under the action in the transaction that invalidates the
+                // upload, so a copy or a repeat of this action is refused as this one is and not as
+                // an upload that has ended.
+                let retained =
+                    action.map(|action| action.refused(params.transfer_id, &refusal, now));
+                let outcome = commit_admitted(action, || {
                     store.close_upload(
                         params.transfer_id,
                         UploadState::Invalidated,
                         Some(&reason),
                         now,
-                        None,
+                        retained.as_ref(),
                     )
                 })?;
                 drop(store);
+                if outcome == ActionOutcome::AlreadyPerformed {
+                    return self.retained_result(action);
+                }
                 self.discard_payloads(&row)?;
-                return Err(TransferError::integrity(reason));
+                return Err(refusal);
             }
         }
         // The result is built before the transaction that commits it, because the transaction
@@ -2953,6 +2981,15 @@ impl TransferService {
             return Err(TransferError::IdConflict {
                 action: action.action_id.to_string(),
                 method: record.method,
+            });
+        }
+        // The failure the action ended in is its answer, under the code it was given.
+        if let (None, Some(code)) = (&record.result, &record.error_code) {
+            return Err(TransferError::Retained {
+                code: code.parse().unwrap_or(ErrorCode::OutcomeUnknown),
+                detail: record.error_detail.unwrap_or_else(|| {
+                    format!("action {} was recorded as {code}", action.action_id)
+                }),
             });
         }
         let result = record.result.ok_or_else(|| {

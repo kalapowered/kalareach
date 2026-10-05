@@ -508,6 +508,7 @@ fn leave_a_publication_unrecorded(
         method: Method::UploadFinish.as_str().to_owned(),
         subject: Some(transfer_id),
         result: None,
+        failure: None,
         recorded_at_ms,
     };
     let owner = claim.actor_id.clone();
