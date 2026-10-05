@@ -207,6 +207,7 @@ impl Controller {
                 | Method::EnvironmentEnrol
                 | Method::EnvironmentForget
                 | Method::EnvironmentRefresh
+                | Method::HostUpdateHandover
         ) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
