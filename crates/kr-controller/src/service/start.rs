@@ -599,8 +599,7 @@ impl Controller {
             connections: Mutex::new(BTreeMap::new()),
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
-            recovering: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-            recovered: tokio::sync::Notify::new(),
+            reservations: Arc::default(),
             admitted: std::sync::Mutex::new(BTreeMap::new()),
             identity,
             secret_store: setup.secret_store,
@@ -654,6 +653,8 @@ impl Controller {
             before_a_proxy_is_opened: ReadPause::default(),
             #[cfg(test)]
             before_a_close_asks_for_its_link: ReadPause::default(),
+            #[cfg(test)]
+            before_a_worker_is_made_known: ReadPause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
