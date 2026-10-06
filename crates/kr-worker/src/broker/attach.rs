@@ -721,11 +721,11 @@ fn start_agent(
 /// holds rather than by a walk up the parents. It is given its standard input and output as pipes
 /// and nothing else this worker holds.
 ///
-/// An agent whose package the configuration explicitly chose reduced ownership for is started in
-/// a job of its own alone: one that ends what it holds when the last handle to it closes, which is
-/// held by the session's record of its reduced agents, so the session's closure lists what it
-/// holds and ends it. Nothing else changes about the launch, and the vendor's own sandbox is left
-/// exactly as the vendor made it.
+/// An agent whose launch profile records reduced ownership is started in a job of its own alone:
+/// one that ends what it holds when the last handle to it closes, which is held by the session's
+/// record of its reduced agents, so the session's closure lists what it holds and ends it. Nothing
+/// else changes about the launch, and the vendor's own sandbox is left exactly as the vendor made
+/// it.
 ///
 /// The launch is in flight on the session, admitted by [`NativeGateway::launch`] and held by the
 /// caller, for as long as this runs and after it: the session's closure waits for it.
@@ -841,9 +841,8 @@ fn refuse_what_a_vendor_sandbox_cannot_run_under(
         Some(SandboxBlock::SessionJob) => {
             "the session's job restricts access to desktops, which a vendor's own sandbox needs \
              to make one of its own, so nothing was started and the sandbox was left as it is; \
-             name this agent's package in the configuration's agents section with reduced \
-             ownership to start it in a job of its own, which its closure then reads as \
-             incomplete coverage"
+             a launch whose profile records reduced ownership starts this agent in a job of its \
+             own, which its closure then reads as incomplete coverage"
         }
         Some(SandboxBlock::WorkersOwnJob) => {
             "the job this worker is itself in restricts access to desktops, which a vendor's own \
