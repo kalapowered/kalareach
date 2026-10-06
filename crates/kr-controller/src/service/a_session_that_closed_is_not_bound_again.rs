@@ -234,12 +234,20 @@ async fn adopt(
 /// A recovery that reached a worker, and found its closure recorded while it waited for the
 /// worker's answer, writes no row for it and publishes nothing. The control is the same adoption
 /// before any closure, which writes the row and puts the worker in the directory.
+///
+/// Both challenges are made before anything is published. A published worker is one the daemon's
+/// own tasks open connections to at once (the plugin admissions' round among them), and a
+/// connection that presents the daemon's generation fences the one that presented it before, so a
+/// challenge made then can be fenced by the daemon's own link and be answered with a closed
+/// connection. The recovery does not challenge a worker the directory holds, and nor does this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
     let world = Served::recorded().await;
+    let control = challenged(&world).await;
+    let while_the_challenge_waited = challenged(&world).await;
 
     // The control.
-    let answered = challenged(&world).await;
+    let answered = control;
     world
         .controller
         .directory
@@ -260,7 +268,7 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
     );
 
     // Closed while the challenge waited.
-    let answered = challenged(&world).await;
+    let answered = while_the_challenge_waited;
     world
         .controller
         .registry
