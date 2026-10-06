@@ -618,6 +618,49 @@ impl Served {
         }
     }
 
+    /// A daemon and a real worker, with the row the registry holds of a worker it has recorded.
+    pub(super) async fn recorded() -> Self {
+        let world = Self::start().await;
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .adopt_worker(
+                &world.row(),
+                // A headless worker is bound to no desktop.
+                Some(&kr_protocol::identity::DesktopBinding::none()),
+            )
+            .expect("the registry records the worker");
+        world
+    }
+
+    /// The registry's row for the worker.
+    pub(super) fn row(&self) -> crate::registry::WorkerRecord {
+        let descriptor = &self.worker.descriptor;
+        crate::registry::WorkerRecord {
+            session_id: self.session_id,
+            display_number: descriptor.display_number,
+            public_key: descriptor.worker_public_key,
+            process_identity: descriptor.process_start_identity.clone(),
+            endpoint: descriptor.endpoint.clone(),
+            profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            state: kr_protocol::session::SessionState::Live,
+            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+        }
+    }
+
+    /// Whether the registry has a closure recorded for the session.
+    pub(super) async fn has_a_closure(&self) -> bool {
+        self.controller
+            .registry
+            .lock()
+            .await
+            .closure(self.session_id)
+            .expect("the registry answers")
+            .is_some()
+    }
+
     /// The same worker, still running, with a daemon that is started again on the environment
     /// after the first has let go of it: what the first left in the registry and on disk is all the
     /// second has to go by, as a daemon that starts finds its workers.

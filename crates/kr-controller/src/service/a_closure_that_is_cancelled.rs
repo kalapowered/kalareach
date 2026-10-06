@@ -14,16 +14,14 @@ use std::task::Poll;
 use std::time::Duration;
 
 use kr_protocol::action::BarrierState;
-use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::identity::DesktopBinding;
 use kr_protocol::ids::{AuthorityRevision, SessionId};
-use kr_protocol::session::SessionState;
 
 use super::LeaseDenied;
 use super::a_link_that_is_not_given_back::Served;
-use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, closure_of, recorded, scripted};
+use super::a_read_that_meets_a_worker_on_its_way_out::closure_of;
 use super::the_fence_at_every_effect::a_paired_device;
 use crate::authority::Round;
-use crate::registry::WorkerRecord;
 
 /// The lock a closure's recording is parked at.
 #[derive(Clone, Copy, Debug)]
@@ -173,25 +171,12 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
         .expect("the descriptor is published");
     // And the registry's row for it, which is what a revocation's members are read from and what
     // the closure takes out.
-    let descriptor = &world.worker.descriptor;
     world
         .controller
         .registry
         .lock()
         .await
-        .adopt_worker(
-            &WorkerRecord {
-                session_id: world.session_id,
-                display_number: descriptor.display_number,
-                public_key: descriptor.worker_public_key,
-                process_identity: descriptor.process_start_identity.clone(),
-                endpoint: descriptor.endpoint.clone(),
-                profile: WorkerProfile::HeadlessUser,
-                state: SessionState::Live,
-                acknowledged_revision: AuthorityRevision::new(0),
-            },
-            Some(&DesktopBinding::none()),
-        )
+        .adopt_worker(&world.row(), Some(&DesktopBinding::none()))
         .expect("the registry records the worker");
     world.controller.plugin_bridge.recorded(
         world.session_id,
@@ -272,8 +257,7 @@ async fn cancelled_at(parked: Parked) -> (bool, BarrierState, usize) {
 /// The control: a closure that is not dropped ends the worker, whichever way it is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_that_is_not_dropped_ends_the_worker() {
-    let script = Scripted::new();
-    let world = scripted(&script).await;
+    let world = Served::recorded().await;
     let revision = world.controller.leases.authority_revision();
     let round = world.controller.leases.begin_round();
     assert_ne!(
@@ -285,14 +269,13 @@ async fn a_closure_that_is_not_dropped_ends_the_worker() {
         .retire(&closure_of(world.session_id))
         .await
         .expect("the closure is recorded");
-    assert!(recorded(&world).await);
+    assert!(world.has_a_closure().await);
     assert_eq!(
         state_of(&round, world.session_id, revision),
         BarrierState::Ended
     );
     drop(round);
     assert_eq!(world.controller.leases.workers_held(), 0);
-    world.serving.abort();
 }
 
 /// A closure dropped before it is recorded leaves the worker as it was: nothing ended, nothing
