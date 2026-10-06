@@ -13,6 +13,7 @@ use crate::directory::{KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::service::net::proxy::{Purpose, WorkerProxy};
 
+use super::recovery::ReservationHold;
 use super::{Controller, reported_read};
 
 /// The resource kind a closure uses to say its worker was never confirmed gone.
@@ -144,6 +145,12 @@ impl Controller {
     /// is written must not leave one for a session whose closure has finished, and nothing would
     /// remove it.
     ///
+    /// The reservation the worker was started for (`held`, which the caller holds) is shared with
+    /// that task, and is given back when the publication ends as well as when the request does. A look at the reservation presents a
+    /// generation token to the worker, and one presented while the worker is being made known
+    /// fences the connections that begins to open, so a look that came after a request stopped
+    /// waiting would otherwise overlap the publication that request left running.
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or the descriptor cannot be published.
@@ -151,11 +158,18 @@ impl Controller {
         &self,
         worker: KnownWorker,
         described: Option<SessionSummary>,
+        held: &ReservationHold,
     ) -> Result<()> {
         let Some(daemon) = self.me.upgrade() else {
             return self.make_worker_known(worker, described).await;
         };
-        match tokio::spawn(async move { daemon.make_worker_known(worker, described).await }).await {
+        let held = held.clone();
+        match tokio::spawn(async move {
+            let _held = held;
+            daemon.make_worker_known(worker, described).await
+        })
+        .await
+        {
             Ok(published) => published,
             Err(ended) if ended.is_panic() => std::panic::resume_unwind(ended.into_panic()),
             Err(_) => Err(ControllerError::supervision(
@@ -170,6 +184,8 @@ impl Controller {
         described: Option<SessionSummary>,
     ) -> Result<()> {
         let session_id = worker.descriptor.session_id;
+        #[cfg(test)]
+        self.before_a_worker_is_made_known.wait().await;
         // Whether it was written is looked at once the closure has been: a write that fails after
         // the file has its name (the directory's flush) leaves a descriptor all the same.
         let published = kr_ipc::descriptor::publish(&self.paths, &worker.descriptor);

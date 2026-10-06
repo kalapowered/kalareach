@@ -432,7 +432,7 @@ impl Controller {
         // its create gave up on waiting is still this worker's own word, and a look that started
         // before it would otherwise challenge the worker while this is publishing it: two
         // connections to one worker, and the second generation token fences the first.
-        let _held = self.hold_reservation(reservation_id).await;
+        let held = self.hold_reservation(reservation_id).await;
         let mut registry = self.registry.lock().await;
         let reservation = registry
             .reservation(reservation_id)?
@@ -496,6 +496,7 @@ impl Controller {
                 endpoint,
             },
             Some(ready.session.as_ref().clone()),
+            &held,
         )
         .await
     }

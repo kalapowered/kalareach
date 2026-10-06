@@ -228,9 +228,7 @@ pub struct Controller {
     /// publication take the reservation between them, one at a time. Two different reservations
     /// have nothing to say to each other and never wait for one another: a worker that reported
     /// itself must not sit behind a look at somebody else's silent process.
-    recovering: std::sync::Mutex<std::collections::BTreeSet<ReservationId>>,
-    /// Woken whenever a reservation is given back.
-    recovered: tokio::sync::Notify,
+    reservations: Arc<recovery::Reservations>,
     /// Every connection this daemon has admitted, and the authority revision it was admitted at.
     ///
     /// This is the daemon's authority store for live connections. A registration is written in the
@@ -395,6 +393,11 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(test)]
     before_a_close_asks_for_its_link: ReadPause,
+    /// Where this host's own tests stop the task that makes a worker known, before it writes the
+    /// worker's descriptor, so that a second look at the same reservation can try to begin while
+    /// the publication is in flight. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_worker_is_made_known: ReadPause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -910,6 +913,10 @@ mod a_session_that_closed_before_a_start;
 /// A request for a worker that a closure overtakes: a remote connection's link, and a close.
 #[cfg(test)]
 mod a_request_that_a_closure_overtakes;
+
+/// A recovery's publication that outlives the request that began it, and the look that follows.
+#[cfg(test)]
+mod a_publication_that_outlives_its_request;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
