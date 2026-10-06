@@ -14,6 +14,7 @@ use kr_voice::{Proposal, VoiceError};
 
 use super::context::{SessionFacts, SessionSnapshot};
 use super::submit::HostDispatch;
+use crate::privacy::Published;
 use crate::service::Controller;
 
 /// The session facts this daemon can answer with.
@@ -64,6 +65,36 @@ impl SessionFacts for ControllerFacts {
         // which it does not dispatch. Answering "none" refuses the decision, which is the safe
         // answer: a coordinator that invented the details would be verifying them against itself.
         Box::pin(async move { Ok(None) })
+    }
+
+    fn privacy(&self) -> Published {
+        // Read without waiting, since this runs on the executor. A change of privacy mode that is
+        // being made, and a daemon that has gone, are read as a state no change of it ever
+        // published, privacy mode on in the generation before the first, which no later check of
+        // the state finds again.
+        self.daemon
+            .upgrade()
+            .and_then(|daemon| {
+                daemon
+                    .privacy
+                    .state()
+                    .try_reading()
+                    .map(|reading| reading.published())
+            })
+            .unwrap_or(Published {
+                private: true,
+                ..Published::default()
+            })
+    }
+
+    fn unmoved(&self, decided: Published) -> bool {
+        self.daemon.upgrade().is_some_and(|daemon| {
+            daemon
+                .privacy
+                .state()
+                .try_reading()
+                .is_some_and(|reading| reading.published() == decided)
+        })
     }
 }
 

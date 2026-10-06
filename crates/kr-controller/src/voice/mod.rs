@@ -66,10 +66,18 @@ impl VoiceActor {
     }
 }
 
+/// How many times a read of a session's context is made when privacy mode changes while it is
+/// made. The first read is the one that is given unless privacy mode moved; each read after it is
+/// made under the state then in force.
+const CONTEXT_READS: usize = 3;
+
 /// The environment's voice service.
 #[derive(Debug)]
 pub struct VoiceModule {
     coordinator: Coordinator,
+    /// Where the coordinator reads a session, which also says whether privacy mode moved while it
+    /// did.
+    facts: Arc<dyn SessionFacts>,
     /// The managed broker's origin the coordinator was built with, empty where there is none.
     ///
     /// Kept beside the coordinator so `kr doctor` reports the broker this service is actually
@@ -95,6 +103,7 @@ impl VoiceModule {
         broker_origin: String,
     ) -> Self {
         Self {
+            facts: Arc::clone(&facts),
             coordinator: Coordinator::new(
                 Arc::new(FilteredContext::new(facts)),
                 authority,
@@ -234,13 +243,7 @@ impl VoiceModule {
                 }
                 Some(Method::VoiceContext) => {
                     let params: kr_protocol::voice::VoiceContextParams = parse(&request.params)?;
-                    value(
-                        &self
-                            .coordinator
-                            .context(device_id, &params)
-                            .await
-                            .map_err(voice_error)?,
-                    )
+                    value(&self.context_unmoved(device_id, &params).await?)
                 }
                 _ => Err(ControllerError::InvalidArgument(format!(
                     "{} is not a voice read",
@@ -250,6 +253,39 @@ impl VoiceModule {
         }
         .await;
         frame(request.request_id, outcome)
+    }
+
+    /// Reads what a running call may be told of a session, and answers only with a reading that
+    /// privacy mode did not move under.
+    ///
+    /// The context carries what a model wrote of the session and what the description host
+    /// observed, and privacy mode removes both when it is enabled. A reading is made after the
+    /// state is noted, and it is given only if privacy mode is still in that state when it ends:
+    /// otherwise it is made again, under the state now in force, which carries neither while
+    /// privacy mode is on. A device's answer is checked once, when the read ends, and privacy mode
+    /// can be enabled between that check and the write; an answer the privacy state keeps moving
+    /// under is refused for the device to ask again.
+    async fn context_unmoved(
+        &self,
+        device_id: DeviceId,
+        params: &kr_protocol::voice::VoiceContextParams,
+    ) -> Result<kr_protocol::voice::VoiceContextResult> {
+        for _ in 0..CONTEXT_READS {
+            let decided = self.facts.privacy();
+            let read = self
+                .coordinator
+                .context(device_id, params)
+                .await
+                .map_err(voice_error)?;
+            if self.facts.unmoved(decided) {
+                return Ok(read);
+            }
+        }
+        Err(ControllerError::Refused {
+            code: ErrorCode::ResourceUnavailable,
+            detail: "privacy mode changed while the context was read, so none was sent; ask again"
+                .to_owned(),
+        })
     }
 
     /// Answers one of the four voice mutations.
