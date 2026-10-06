@@ -1004,7 +1004,7 @@ jobs:
           rustc --version
 
       # What the shells need to configure and build from their own release tarballs. Upstream is
-      # fetched by the build script, never vendored. The fish package is a Rust shell built through
+      # fetched, never vendored. The fish package is a Rust shell built through
       # CMake, and its own build turns the message catalogues with gettext.
       - name: Install the shells' build dependencies
         run: |
@@ -1021,6 +1021,25 @@ jobs:
             ~/.cargo/git/db
             target
           key: shells-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # The upstream archives are pinned by digest in the manifests, so the cache that holds them
+      # is named by those digests: a run that restores it fetches nothing, and a run that does not
+      # has each archive placed from the URL its manifest names or from a listed mirror. The build
+      # script checks every archive against its pin before it uses it, so a mirror that serves any
+      # other bytes fails the job there. The cache is saved only by a run that built the packages.
+      - name: Name the pinned upstream archives
+        id: shell-sources
+        run: |
+          echo "key=shell-sources-$(bash scripts/place-shell-sources.sh --all --key)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the upstream archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/shells/sources
+          key: ${{ steps.shell-sources.outputs.key }}
+
+      - name: Place the upstream archives the cache lacks
+        run: bash scripts/place-shell-sources.sh --all
 
       # Section 26 asks packaging to verify clean patch application. The patches apply to the
       # pinned release with no fuzz at all, so a patch that has drifted from the release it names
