@@ -445,6 +445,59 @@ fn start_each_once(directory: &Path) {
 /* A host                                                                                        */
 /* -------------------------------------------------------------------------------------------- */
 
+/// How many cases that install and start releases run at once, where the operating system checks
+/// a program the first time it starts: on macOS. Nothing else checks one, so nothing else bounds
+/// the cases.
+const HOST_CASES_AT_ONCE: Option<usize> = if cfg!(target_os = "macos") {
+    Some(2)
+} else {
+    None
+};
+
+/// One of the places [`HOST_CASES_AT_ONCE`] gives, held for as long as a case has its host.
+///
+/// macOS checks each program the first time it starts from a file that was just written, one
+/// program at a time for the whole machine, and a release the commands under test install or
+/// unpack is made of such files. Starting the daemon of such a release waits for that check behind
+/// every program written before it, so cases that all write releases at once keep each other
+/// waiting, for as long as the longest of their queues, and no deadline a case or the update
+/// holds says anything about the case. With a few places the queue holds a few programs, and a
+/// case's wait is its own program's check and what the rest of the machine adds, however many
+/// cases the test run would otherwise start at once.
+struct Place;
+
+impl Place {
+    fn take() -> Self {
+        let (taken, freed) = places();
+        let mut taken = taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while HOST_CASES_AT_ONCE.is_some_and(|limit| *taken >= limit) {
+            taken = freed
+                .wait(taken)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *taken += 1;
+        Self
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let (taken, freed) = places();
+        *taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        freed.notify_one();
+    }
+}
+
+/// The places taken, and the signal that one was given back.
+fn places() -> &'static (Mutex<usize>, std::sync::Condvar) {
+    static PLACES: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+    &PLACES
+}
+
 /// A host tree with a store of releases in it, and the daemons this test started.
 ///
 /// However a test ends, what it started ends with it: a daemon still serving the tree is handed
@@ -455,6 +508,8 @@ struct Host {
     daemons: Vec<std::process::Child>,
     store: Store,
     tree: teardown::Tree,
+    // Last, so that it is given back once the tree is gone.
+    _place: Place,
 }
 
 impl Drop for Host {
@@ -709,12 +764,14 @@ impl Host {
 
     /// A tree with nothing at the store's place yet.
     fn bare() -> Self {
+        let place = Place::take();
         let tree = teardown::Tree::create();
         let store = Store::at(tree.root().join("host"));
         Self {
             daemons: Vec::new(),
             store,
             tree,
+            _place: place,
         }
     }
 
