@@ -938,6 +938,238 @@ fn expiry_runs_at_twenty_four_hours_seven_days_and_the_session_retention() {
     );
 }
 
+/// KR-REQ-09.14 and 14.11: what only the wall clock says is old is let go of only while the host
+/// can prove its clock. A sweep the host answers with no proven moment expires no upload, no
+/// unused attachment and no de-duplication record, however long ago the clock says they were made;
+/// the same sweep once the host proves the clock lets all three go.
+#[test]
+fn a_sweep_the_host_cannot_prove_a_clock_for_lets_go_of_nothing_the_clock_alone_calls_old() {
+    struct Unproven;
+    impl kr_transfer::SessionRetention for Unproven {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(sessions.clone())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            false
+        }
+    }
+
+    let harness = Harness::create();
+    let bytes = pattern(32);
+    let unfinished = harness
+        .begin(&bytes, "application/octet-stream", "abandoned.bin")
+        .expect("reserves the upload");
+    harness
+        .send(unfinished.transfer_id, &bytes, 0)
+        .expect("sends a chunk and stops");
+    let unused = harness.publish(&bytes, "application/octet-stream", "unused.bin");
+    harness
+        .service
+        .record_action(
+            &harness.actor,
+            Uuid::from_bytes([7; 16]),
+            "upload.cancel",
+            digest(b"a cancellation"),
+            &kr_transfer::service::RetainedOutcome::Ok(vec![0xa0]),
+        )
+        .expect("records an action");
+
+    harness.clock.set(
+        support::START_MS
+            + UNUSED_ATTACHMENT_LIFETIME.get()
+            + kr_protocol::limits::DEDUPLICATION_RETENTION.get(),
+    );
+    let sweep = harness.service.sweep(&Unproven).expect("runs a sweep");
+    assert_eq!(
+        (
+            sweep.expired_uploads,
+            sweep.expired_attachments,
+            sweep.forgotten_actions
+        ),
+        (0, 0, 0),
+        "an unproven clock lets go of nothing"
+    );
+    harness
+        .service
+        .attachment_handle(&harness.actor, unused.transfer_id)
+        .expect("the unused attachment is still there");
+
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("runs a sweep");
+    assert_eq!(
+        (
+            sweep.expired_uploads,
+            sweep.expired_attachments,
+            sweep.forgotten_actions
+        ),
+        (1, 1, 1),
+        "a proven clock lets all three go"
+    );
+}
+
+/// KR-REQ-09.14: a part of the sweep counts its retention from the earlier of the reading it asked the
+/// host about and one taken after the answer. Here the owner corrects a wrong clock while the host
+/// is answering, and a record is stamped after the correction: the reading the sweep asked about is
+/// from before it, and the record stamped after it is not old by it.
+#[test]
+fn a_clock_corrected_while_the_host_answers_never_ages_a_record_stamped_after_the_correction() {
+    struct CorrectsWhileAnswering<'a> {
+        service: &'a TransferService,
+        clock: Arc<ManualClock>,
+        actor: kr_protocol::ids::ActorId,
+    }
+    impl kr_transfer::SessionRetention for CorrectsWhileAnswering<'_> {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(sessions.clone())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            self.clock.set(support::START_MS);
+            self.service
+                .record_action(
+                    &self.actor,
+                    Uuid::from_bytes([9; 16]),
+                    "upload.cancel",
+                    digest(b"stamped after the correction"),
+                    &kr_transfer::service::RetainedOutcome::Ok(vec![0xa0]),
+                )
+                .expect("records an action");
+            true
+        }
+    }
+
+    let harness = Harness::create();
+    let record = |byte: u8| {
+        harness
+            .service
+            .record_action(
+                &harness.actor,
+                Uuid::from_bytes([byte; 16]),
+                "upload.cancel",
+                digest(&[byte]),
+                &kr_transfer::service::RetainedOutcome::Ok(vec![0xa0]),
+            )
+            .expect("records an action");
+    };
+    record(8);
+    let later = support::START_MS + kr_protocol::limits::DEDUPLICATION_RETENTION.get() + 86_400_000;
+    harness.clock.set(later);
+
+    let sweep = harness
+        .service
+        .sweep(&CorrectsWhileAnswering {
+            service: &harness.service,
+            clock: Arc::clone(&harness.clock),
+            actor: harness.actor.clone(),
+        })
+        .expect("runs a sweep");
+    assert_eq!(
+        sweep.forgotten_actions, 0,
+        "a reading from before the correction forgets nothing stamped after it"
+    );
+    assert!(
+        harness
+            .service
+            .retained_action(
+                &harness.actor,
+                Uuid::from_bytes([9; 16]),
+                "upload.cancel",
+                digest(b"stamped after the correction"),
+            )
+            .expect("reads the record")
+            .is_some(),
+        "the record stamped after the correction is still held"
+    );
+
+    // The control: a sweep at the later time, with nothing corrected, forgets both.
+    harness.clock.set(later);
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("runs a sweep");
+    assert_eq!(sweep.forgotten_actions, 2, "at the later time both are old");
+}
+
+/// KR-REQ-09.14: the record a sweep forgets by its age is forgotten under the journal's guard, with
+/// the clock read under it. The clock is corrected and a record stamped after the correction after
+/// the host has answered and before the sweep takes the journal: the sweep reads the clock once it
+/// holds the journal, counts from the earlier reading, and the record stamped after the correction
+/// is not old by it.
+#[test]
+fn a_receipt_stamped_after_the_host_answered_is_not_aged_by_the_reading_it_answered() {
+    struct Proves;
+    impl kr_transfer::SessionRetention for Proves {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(sessions.clone())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
+        }
+    }
+
+    let harness = Harness::create();
+    let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+    let record = |service: &TransferService, actor: &kr_protocol::ids::ActorId, byte: u8| {
+        service
+            .record_action(
+                actor,
+                Uuid::from_bytes([byte; 16]),
+                "upload.cancel",
+                digest(&[byte]),
+                &kr_transfer::service::RetainedOutcome::Ok(vec![0xa0]),
+            )
+            .expect("records an action");
+    };
+    // An old record, made forty days before the clock stands at when the sweep runs.
+    harness
+        .clock
+        .set(support::START_MS - 40 * 24 * 60 * 60 * 1000);
+    record(&harness.service, &harness.actor, 1);
+    let later = support::START_MS + retention + 86_400_000;
+    harness.clock.set(later);
+
+    // After the host has answered, the clock is corrected and a record is stamped.
+    let clock = Arc::clone(&harness.clock);
+    let actor = harness.actor.clone();
+    harness
+        .service
+        .set_after_the_clock_answer_hook(move |service| {
+            clock.set(support::START_MS);
+            record(service, &actor, 2);
+        });
+    let sweep = harness.service.sweep(&Proves).expect("runs a sweep");
+    assert_eq!(
+        sweep.forgotten_actions, 1,
+        "the old record is forgotten and the one stamped after the correction is not"
+    );
+    assert!(
+        harness
+            .service
+            .retained_action(
+                &harness.actor,
+                Uuid::from_bytes([2; 16]),
+                "upload.cancel",
+                digest(&[2]),
+            )
+            .expect("reads the record")
+            .is_some(),
+        "the record stamped after the correction is held"
+    );
+}
+
 /// KR-REQ-14.11: a submitted attachment outlives the seven-day window while its session is
 /// retained, and goes when the session's retention ends.
 ///
@@ -956,6 +1188,10 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
             } else {
                 std::collections::BTreeSet::new()
             })
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
         }
     }
 
@@ -1240,6 +1476,10 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
             } else {
                 std::collections::BTreeSet::new()
             })
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
         }
     }
 
@@ -2123,6 +2363,10 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
                 std::collections::BTreeSet::new()
             })
         }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
+        }
     }
 
     let harness = Harness::create();
@@ -2263,6 +2507,10 @@ fn an_attachment_a_noted_session_names_outlasts_a_later_submission_to_another_se
             sessions: &std::collections::BTreeSet<SessionId>,
         ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
             Ok(sessions.intersection(&self.0).copied().collect())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
         }
     }
 

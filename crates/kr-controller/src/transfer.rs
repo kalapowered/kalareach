@@ -41,6 +41,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActorId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
+use kr_protocol::scalars::TimestampMs;
 use kr_transfer::service::{Action, RetainedOutcome, Subject};
 use kr_transfer::{Sweep, TransferService};
 
@@ -254,6 +255,10 @@ struct ArchiveAnswers<'a> {
     /// The stop a test asked this sweep for, taken once the archive has answered.
     #[cfg(test)]
     pause: std::sync::Mutex<Option<StorePause>>,
+    /// The stop a test asked this sweep for at the clock question, taken once the sweep has read
+    /// the time and before the host answers whether it can prove it.
+    #[cfg(test)]
+    at_the_clock: std::sync::Mutex<Option<StorePause>>,
 }
 
 impl kr_transfer::SessionRetention for ArchiveAnswers<'_> {
@@ -281,6 +286,22 @@ impl kr_transfer::SessionRetention for ArchiveAnswers<'_> {
             .filter(|session_id| view.retains(*session_id))
             .collect())
     }
+
+    fn clock_is_proven(&self, reading: TimestampMs) -> bool {
+        #[cfg(test)]
+        if let Some(pause) = self
+            .at_the_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            pause.wait();
+        }
+        // The host's own reading is settled first: the floor is raised to it and written down, so
+        // the check covers the reading the sweep counts its retentions from.
+        self.owner.settled_now_ms();
+        self.owner.lifetimes().may_forget_at(reading.get())
+    }
 }
 
 impl Drop for TransferModule {
@@ -293,20 +314,36 @@ impl Drop for TransferModule {
     }
 }
 
+/// The daemon's own wall clock, as the transfer service reads the time.
+///
+/// The service stamps its records and the deadlines of what it holds from this, so they are on the
+/// clock the host's time contract decides about and not on one of the service's own.
+#[derive(Debug)]
+struct DaemonWall(crate::service::WallClock);
+
+impl kr_transfer::Clock for DaemonWall {
+    fn now_ms(&self) -> TimestampMs {
+        TimestampMs::new(self.0.now_ms())
+    }
+}
+
 impl TransferModule {
-    /// Opens the environment's transfer service and resolves whatever an earlier daemon left
-    /// unfinished.
+    /// Opens the environment's transfer service on the daemon's wall clock, and resolves whatever
+    /// an earlier daemon left unfinished.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store or the staging area cannot
     /// be prepared.
-    pub async fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Self> {
+    pub async fn open(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        wall: crate::service::WallClock,
+    ) -> Result<Self> {
         // Opening the store migrates it, and recovery reads whole payloads back. Both are storage
         // work, so they run on a blocking task rather than on the daemon's reactor.
         let paths = paths.clone();
         let service = tokio::task::spawn_blocking(move || {
-            let service = TransferService::open(&paths)?;
+            let service = TransferService::with_clock(&paths, Arc::new(DaemonWall(wall)))?;
             // A publication interrupted between its two commits is resolved before anything is
             // served, so a handle never names a file this daemon has not found.
             service.recover()?;
@@ -868,6 +905,8 @@ impl TransferModule {
             daemon,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -886,7 +925,25 @@ impl TransferModule {
         let (arrived, arrival) = tokio::sync::oneshot::channel();
         let (go, going) = std::sync::mpsc::channel();
         let pause = StorePause { arrived, go: going };
-        (arrival, go, self.queue_sweep(daemon, Some(pause)))
+        (arrival, go, self.queue_sweep(daemon, Some(pause), None))
+    }
+
+    /// Queues a sweep as [`TransferModule::sweep`] does, one that stops at its first clock
+    /// question, after it has read the time and before the host answers, until the test lets it
+    /// go: the receiver hears it arrive there, and the sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn sweep_paused_at_the_clock(
+        &self,
+        daemon: &Weak<Controller>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        impl Future<Output = Answer<Sweep>> + Send + use<>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        let pause = StorePause { arrived, go: going };
+        (arrival, go, self.queue_sweep(daemon, None, Some(pause)))
     }
 
     /// Queues the sweep [`TransferModule::sweep`] describes. In this crate's unit tests it carries
@@ -895,6 +952,7 @@ impl TransferModule {
         &self,
         daemon: &Weak<Controller>,
         #[cfg(test)] pause: Option<StorePause>,
+        #[cfg(test)] at_the_clock: Option<StorePause>,
     ) -> impl Future<Output = Answer<Sweep>> + Send + use<> {
         // The registry scan and the sweep are both storage work, so both run on the same blocking
         // task. Reading the registry means holding its lock, and that lock is a task-aware one, so
@@ -915,6 +973,8 @@ impl TransferModule {
                 owner: &owner,
                 #[cfg(test)]
                 pause: std::sync::Mutex::new(pause),
+                #[cfg(test)]
+                at_the_clock: std::sync::Mutex::new(at_the_clock),
             };
             let swept = service.sweep(&answers).map_err(Into::into);
             // Only now may the daemon go, and its environment with it.

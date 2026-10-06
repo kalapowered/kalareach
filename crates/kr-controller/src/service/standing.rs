@@ -272,7 +272,7 @@ impl Controller {
     /// through [`crate::grants::policy::UtcFloor::bound`], which refuses while the floor is owed
     /// its record, so a store that cannot take the floor stops expiry decisions rather than
     /// letting them stand on a floor the next start will not find.
-    pub(super) fn settled_now_ms(&self) -> u64 {
+    pub(crate) fn settled_now_ms(&self) -> u64 {
         let now_ms = self.wall_now_ms();
         let mut policy = self
             .policy

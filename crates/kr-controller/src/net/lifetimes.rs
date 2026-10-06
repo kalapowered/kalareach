@@ -504,6 +504,35 @@ impl GrantLifetimes {
         &self.clock_trust
     }
 
+    /// Whether a collector may let go of a record by counting a retention from `reading_ms`.
+    ///
+    /// Forgetting is a decision about the clock like any expiry, and the one check every
+    /// collection of this host passes before it lets go of anything the wall clock says is old.
+    /// The clock is sampled through the boundary every expiry decision goes through
+    /// ([`ClockTrust::sample`]), which answers no while the wall clock has gone backwards and an
+    /// owner has not established it again, and while this boot's clock continuity is lost. The
+    /// floor must also be answerable at `reading_ms`: nothing is owed its record, and what is
+    /// written down covers the reading the retention is counted from. A record that cannot be
+    /// shown to have outlived its retention is kept, because forgetting it lets the same action
+    /// be submitted as a new one.
+    #[must_use]
+    pub fn may_forget_at(&self, reading_ms: u64) -> bool {
+        self.clock_trust
+            .sample(&self.devices)
+            .ok()
+            .flatten()
+            .is_some()
+            && self
+                .floor
+                .bound(
+                    kr_protocol::grant::GrantExpiry::At {
+                        expires_at_ms: TimestampMs::new(reading_ms),
+                    },
+                    reading_ms,
+                )
+                .answerable()
+    }
+
     /// Refuses an expiring grant while this boot's clock continuity is lost.
     ///
     /// A reading published only in the floor this boot lost may have passed the grant's expiry,
