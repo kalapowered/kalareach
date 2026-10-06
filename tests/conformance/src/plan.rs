@@ -285,6 +285,46 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
     (
+        "a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_scope_on_another_filesystem_is_refused_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
+        "a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
         "kr_req_11_38_every_export_is_stopped_by_its_own_deadline",
         "a timed case, which runs in a step of its own, one at a time",
     ),

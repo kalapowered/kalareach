@@ -179,14 +179,17 @@ jobs:
           git --version
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
-      # Seven checks put a bind mount inside the tree they look at, from inside a mount namespace
-      # this account creates: three in change-set capture, two in the transfer authority and two
-      # in project locations. Ubuntu 24.04 denies an unprivileged account that namespace unless
-      # AppArmor's restriction on it is lifted, and each check fails rather than passes where it
-      # cannot make one, so the workspace test above leaves them out. This step lifts the
-      # restriction for itself on this runner and puts it back however the step ends, shows the
-      # namespace refused before and given after, and runs the seven by name. A name that matched
-      # no test would run nothing and still exit 0, so the step counts the seven it saw pass.
+      # Seventeen checks put a mount inside the tree they look at, from inside a mount namespace
+      # this account creates: seven put a bind mount there (three in change-set capture, two in the
+      # transfer authority and two in project locations), and ten mount another filesystem where a
+      # directory a service recorded was (three in the transfer service, four in the project
+      # service and three in the change-set service). Ubuntu 24.04 denies an unprivileged account
+      # that namespace unless AppArmor's restriction on it is lifted, and each check fails rather
+      # than passes where it cannot make one, so the workspace test above leaves them out. This
+      # step lifts the restriction for itself on this runner and puts it back however the step
+      # ends, shows the namespace refused before and given after, and runs the seventeen by name.
+      # A name that matched no test would run nothing and still exit 0, so the step counts the
+      # seventeen it saw pass.
       - name: Mount checks inside a mount namespace of this account's own
         # Whatever the steps before it did, like the boundary step above.
         if: ${{ !cancelled() }}
@@ -201,6 +204,16 @@ jobs:
             a_removal_stops_before_a_directory_mounted_into_the_tree
             bind_mount_and_cross_device_grafts_are_refused
             recursive_removal_refuses_a_grafted_mount
+            a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers
+            a_scope_on_another_filesystem_is_refused_whatever_its_numbers
+            a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
+            a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
+            a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+            owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
+            git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
+            a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
+            a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
+            a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           )
           log="$RUNNER_TEMP/mount-checks.log"
           : >"$log"
@@ -234,7 +247,17 @@ jobs:
           cargo test --locked -p kr-transfer --test authority -- --ignored --exact --color never \
             "${checks[@]:3:2}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-project --test locations -- --ignored --exact --color never \
-            "${checks[@]:5:2}" 2>&1 | tee -a "$log" || failed=1
+            "${checks[@]:5:2}" "${checks[@]:12:1}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-transfer --test filesystems -- --ignored --exact --color never \
+            "${checks[@]:7:3}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-project --test workspaces -- --ignored --exact --color never \
+            "${checks[@]:10:2}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-project --lib -- --ignored --exact --color never \
+            "${checks[@]:13:1}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-changeset --test filesystems -- --ignored --exact --color never \
+            "${checks[@]:14:2}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-changeset --test apply -- --ignored --exact --color never \
+            "${checks[@]:16:1}" 2>&1 | tee -a "$log" || failed=1
           passed=0
           for check in "${checks[@]}"; do
             if grep -q -F -x "test $check ... ok" "$log"; then
@@ -1534,11 +1557,22 @@ jobs:
           --skip bind_mount_and_cross_device_grafts_are_refused
           --skip recursive_removal_refuses_a_grafted_mount
           --skip a_removal_stops_before_a_disk_image_attached_inside_the_tree
+          --skip a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_scope_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
+          --skip a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+          --skip owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
+          --skip a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
+          --skip a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
+          --skip a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
+          --skip a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           --skip kr_req_11_38_every_export_is_stopped_by_its_own_deadline
           --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
-      # location or a tree, and a repository whose own data is on another filesystem. Each one says
+      # location or a tree, a disk image attached where a directory a service recorded was, and a
+      # repository whose own data is on another filesystem. Each one says
       # "not exercised" and returns when this host will not give it that filesystem, so they run
       # here with their output shown, and a case that says so fails the step, as does a case that
       # did not pass here by name.
@@ -1558,6 +1592,16 @@ jobs:
             bind_mount_and_cross_device_grafts_are_refused
             recursive_removal_refuses_a_grafted_mount
             a_removal_stops_before_a_disk_image_attached_inside_the_tree
+            a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers
+            a_scope_on_another_filesystem_is_refused_whatever_its_numbers
+            a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
+            a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
+            a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+            owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
+            git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
+            a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
+            a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
+            a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           )
           container="$(diskutil info -plist /System/Volumes/Data | plutil -extract APFSContainerReference raw -)"
           volume="$RUNNER_TEMP/another-filesystem"
@@ -1623,7 +1667,8 @@ jobs:
           diskutil info "$volume" | grep -E 'Device Identifier|Mount Point|Owners|Removable Media|Device Location' || true
           echo "device of /private/tmp: $(stat -f %d /private/tmp); of $volume: $(stat -f %d "$volume")"
           TMPDIR="$volume" cargo test --locked --workspace --exclude kr-sync-integration \
-            --test capture --test locations --test authority -- \
+            --lib --test capture --test locations --test authority --test filesystems \
+            --test workspaces --test apply -- \
             --exact --show-output --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
           if grep -n 'not exercised' "$log"; then
             echo "a case above says it was not exercised" >&2
