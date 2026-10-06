@@ -645,24 +645,13 @@ async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_sessio
 /// KR-REQ-09.12: a publication for a session that has closed removes the descriptor it wrote and has
 /// nothing else to do, even where the write reports a failure: a write can fail after the file has
 /// its name (the flush of the directory) and leave a descriptor that nothing else would remove,
-/// since the closure's own tidying has run. Here the descriptors' directory can be written to but
-/// not read, so the file is renamed into place and the flush that follows is refused. Where it can
-/// be read anyway (a user that is not held to file modes) the flush cannot fail and there is
-/// nothing to show.
-#[cfg(unix)]
+/// since the closure's own tidying has run. The flush of the descriptors' directory is made to
+/// fail, so the file is renamed into place and the write then fails, on every platform and for every
+/// user. The control is the same failed write for a session that is open, which is reported and
+/// leaves the file it renamed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_for_a_closed_session_removes_a_descriptor_whose_write_failed_after_its_rename()
  {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    /// Gives the directory its modes back, whatever becomes of the test.
-    struct Restore(std::path::PathBuf, std::fs::Permissions);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, self.1.clone());
-        }
-    }
-
     let world = Served::recorded().await;
     world
         .controller
@@ -670,28 +659,31 @@ async fn a_publication_for_a_closed_session_removes_a_descriptor_whose_write_fai
         .lock()
         .await
         .remove(world.session_id);
+    let _refused = kr_flush::testing::refuse_flushes_of(world.controller.paths().descriptors_dir());
+
+    // The control: the write fails after its rename, and the file has its name.
+    world
+        .controller
+        .publish_worker(world.worker.clone(), None, &world.held().await)
+        .await
+        .expect_err("a publication whose write failed is reported");
+    assert!(
+        kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_some(),
+        "the file was renamed into place before the write failed"
+    );
+
     world
         .controller
         .retire(&closure_of(world.session_id))
         .await
         .expect("the closure is recorded and its tidying has run");
-    let descriptors = world.controller.paths().descriptors_dir();
-    let modes = std::fs::metadata(&descriptors)
-        .expect("the descriptors' directory exists")
-        .permissions();
-    let restore = Restore(descriptors.clone(), modes);
-    std::fs::set_permissions(&descriptors, std::fs::Permissions::from_mode(0o300))
-        .expect("the directory is made write only");
-    if std::fs::read_dir(&descriptors).is_ok() {
-        return;
-    }
-
     world
         .controller
         .publish_worker(world.worker.clone(), None, &world.held().await)
         .await
         .expect("a publication for a closed session has nothing to do");
-    drop(restore);
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 }
 
