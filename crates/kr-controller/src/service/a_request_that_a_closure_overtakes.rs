@@ -100,6 +100,38 @@ async fn a_closure_ends_the_links_held_to_its_worker() {
         .expect_err("nothing more is asked of the worker of a closed session");
 }
 
+/// KR-REQ-09.12: the link a close is delivered over is not ended by the closure that close's own
+/// answer records. The worker holds what its session ran until the link is released, which tells it
+/// the answer has been delivered, so a closure that ended the link first would release it early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closure_does_not_end_the_link_a_close_is_delivered_over() {
+    let world = Served::start().await;
+    let connection = Connection::new();
+    let proxy = world
+        .controller
+        .open_proxy(
+            world.session_id,
+            connection.notifications.clone(),
+            Arc::clone(&connection.budget),
+            Arc::clone(&connection.lost),
+            Purpose::Close,
+        )
+        .await
+        .expect("the worker accepts the link");
+
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+
+    assert!(
+        proxy.is_open(),
+        "the closure left the close's link to its holder"
+    );
+    proxy.close();
+}
+
 /// KR-REQ-09.12: a link that a closure overtakes while it is being opened is refused. The worker
 /// has not ended, as when the daemon records the closure of a worker it found gone, so a link
 /// opened to it would be answered.
