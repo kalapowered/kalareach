@@ -586,6 +586,7 @@ impl Controller {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
+            proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             recovering: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             recovered: tokio::sync::Notify::new(),
@@ -636,6 +637,10 @@ impl Controller {
             before_the_pass_tells: ReadPause::default(),
             #[cfg(test)]
             before_a_worker_is_published: ReadPause::default(),
+            #[cfg(test)]
+            before_a_proxy_is_opened: ReadPause::default(),
+            #[cfg(test)]
+            before_a_close_asks_for_its_link: ReadPause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),

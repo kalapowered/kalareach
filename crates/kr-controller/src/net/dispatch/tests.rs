@@ -1369,13 +1369,23 @@ async fn close_for_a_device(
     close: &MutationRequest,
     rights: &[kr_protocol::rights::ActionRight],
 ) -> crate::service::net::ClosedRemotely {
+    close_for_a_device_of(&world.controller, world.accepted, connection, close, rights).await
+}
+
+/// The same for a daemon and the deadline its close was accepted under.
+async fn close_for_a_device_of(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    accepted: kr_transport::window::AcceptedDeadline,
+    connection: &super::RemoteConnection,
+    close: &MutationRequest,
+    rights: &[kr_protocol::rights::ActionRight],
+) -> crate::service::net::ClosedRemotely {
     let rights: CanonicalSet<_> = rights.iter().copied().collect();
-    let envelope = connection.envelope(world.controller.policy().authority_revision());
+    let envelope = connection.envelope(controller.policy().authority_revision());
     let (answer, answered) = tokio::sync::oneshot::channel();
     // Nothing holds the link for a delivery: the acceptance is taken as delivered at once.
     let (_, delivered) = tokio::sync::oneshot::channel();
-    world
-        .controller
+    controller
         .close_remote_session(
             close,
             crate::service::net::proxy::Vouched {
@@ -1383,7 +1393,7 @@ async fn close_for_a_device(
                 grant_rights: &rights,
                 history: Some(&connection.device.grant.history),
             },
-            world.accepted,
+            accepted,
             &connection.expiry_observer(),
             answer,
             delivered,
@@ -1393,6 +1403,59 @@ async fn close_for_a_device(
         .await
         .expect("the close settles")
         .expect("the worker answers the close")
+}
+
+/// KR-REQ-09.12: a device's close that a closure overtakes between the daemon's reading of the
+/// session's worker and its opening of the link the close goes over is answered from the closure
+/// record, which the device is told is a record and not the worker's own answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_close_that_a_closure_overtakes_is_answered_from_the_closure() {
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_link_that_is_not_given_back::Served;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = Served::start().await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 23));
+    let close = fake::close_request(controller.paths().environment_id(), world.session_id);
+    let accepted = kr_transport::window::AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(300))
+            .expect("a deadline five minutes out"),
+        bound: kr_transport::window::DeadlineBound::RequestedTtl,
+    };
+    let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+    let (closed, ()) = tokio::join!(
+        close_for_a_device_of(
+            controller,
+            accepted,
+            &connection,
+            &close,
+            &[ActionRight::SessionView, ActionRight::SessionClose],
+        ),
+        async {
+            arrived.await.expect("the close reaches the worker's door");
+            controller
+                .retire(&closure_of(world.session_id))
+                .await
+                .expect("the closure is recorded");
+            go.send(()).expect("the close is waiting");
+        }
+    );
+    assert_eq!(closed.retained, crate::service::net::Retained::Record);
+    let answered: SessionCloseResult = closed.value.to_typed().expect("a close result");
+    assert_eq!(answered.state, SessionState::Closed);
+    assert_eq!(
+        answered.closure.as_ref().map(|record| record.session_id),
+        Some(world.session_id)
+    );
 }
 
 /// KR-REQ-23.34: a daemon that replaced the one a device's close went through, and admitted the

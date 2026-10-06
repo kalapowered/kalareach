@@ -11,6 +11,7 @@ use kr_transport::lease::WorkerBinding;
 
 use crate::directory::{KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
+use crate::service::net::proxy::{Purpose, WorkerProxy};
 
 use super::{Controller, reported_read};
 
@@ -189,6 +190,61 @@ impl Controller {
             }
         }
         Ok(open)
+    }
+
+    /// Makes this daemon hold a link a remote connection has opened to a session's worker, unless
+    /// the session has closed.
+    ///
+    /// The worker was read from the directory before the link was opened, and a closure can have
+    /// landed since. The directory is read again, with its lock kept while the link is entered in
+    /// the table the closure ends links from. A link entered before the closure takes the worker out
+    /// of the directory is ended by the closure; one that comes after finds the worker gone, and is
+    /// closed and refused. A link that carries a close is not entered ([`Purpose::Close`]) and is
+    /// refused in the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::UnknownSession`] when the directory no longer holds the worker.
+    pub(super) async fn hold_proxy(
+        &self,
+        proxy: &Arc<WorkerProxy>,
+        purpose: Purpose,
+    ) -> Result<()> {
+        let session_id = proxy.session_id();
+        let directory = self.directory.lock().await;
+        if directory.get(session_id).is_none() {
+            drop(directory);
+            proxy.close();
+            return Err(ControllerError::UnknownSession {
+                session: session_id.to_string(),
+            });
+        }
+        if purpose == Purpose::Attachment {
+            let mut proxies = self
+                .proxies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let held = proxies.entry(session_id).or_default();
+            held.retain(|link| link.strong_count() > 0);
+            held.push(Arc::downgrade(proxy));
+        }
+        drop(directory);
+        Ok(())
+    }
+
+    /// Ends every link remote connections hold to a closed session's worker. Called once the
+    /// closure has taken the worker out of the directory, which is what makes the links entered
+    /// before it all the links there will be ([`Self::hold_proxy`]).
+    pub(super) fn end_proxies_of(&self, session_id: SessionId) {
+        let held = self
+            .proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id)
+            .unwrap_or_default();
+        for proxy in held.iter().filter_map(std::sync::Weak::upgrade) {
+            proxy.close();
+        }
     }
 
     pub(super) async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {

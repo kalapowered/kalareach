@@ -1432,6 +1432,7 @@ impl Controller {
         notifications: tokio::sync::mpsc::Sender<Relayed>,
         budget: Arc<RelayBudget>,
         lost: Arc<tokio::sync::Notify>,
+        purpose: proxy::Purpose,
     ) -> Result<Arc<WorkerProxy>> {
         // A worker that has started answering since the last attempt rejoins the directory here,
         // so a device can attach to a session the daemon had not reached at startup.
@@ -1447,7 +1448,12 @@ impl Controller {
             .ok_or_else(|| ControllerError::UnknownSession {
                 session: session_id.to_string(),
             })?;
+        #[cfg(test)]
+        self.before_a_proxy_is_opened.wait().await;
         let proxy = WorkerProxy::open(self, &worker, notifications, budget, lost).await?;
+        // The worker was read from the directory before the link was opened, and its session may
+        // have closed since.
+        self.hold_proxy(&proxy, purpose).await?;
         // A dispatch lease is renewed only after the worker has acknowledged the authority
         // revision in force, and a worker starts having acknowledged nothing. Asking *this* worker
         // for its acknowledgement is what makes the first remote dispatch to it possible; asking
@@ -1532,26 +1538,12 @@ impl Controller {
         if self.directory.lock().await.get(session_id).is_none() {
             // Nothing is running under that identity. Either it has already closed, and the record
             // is the answer, or it never existed here.
-            let closure = self.registry.lock().await.closure(session_id)?;
+            //
             // Whatever comes back here comes from a record rather than from a close performed now,
             // which is the same read the worker's own journal would have been. The caller decides
             // whether this device may be told it.
             *retained = Retained::Record;
-            return match closure {
-                Some(closure) => {
-                    crate::service::encode(&kr_protocol::session::SessionCloseResult {
-                        session_id,
-                        state: kr_protocol::session::SessionState::Closed,
-                        durability: closure.durability,
-                        closure: kr_protocol::scalars::Nullable::some(closure),
-                        // The record is the answer, and no worker is left to describe the session.
-                        session: None,
-                    })
-                }
-                None => Err(ControllerError::UnknownSession {
-                    session: session_id.to_string(),
-                }),
-            };
+            return self.answer_from_the_closure(session_id).await;
         }
         // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
         // a live lease before a *remote dispatch*, and it exempts stopping owned execution from
@@ -1576,14 +1568,25 @@ impl Controller {
         })?;
         // The link is this close's own, and it is released whichever way the exchange ends.
         let (notifications, _unread) = tokio::sync::mpsc::channel(1);
-        let proxy = self
+        let proxy = match self
             .open_proxy(
                 session_id,
                 notifications,
                 Arc::new(RelayBudget::new(0)),
                 Arc::new(tokio::sync::Notify::new()),
+                proxy::Purpose::Close,
             )
-            .await?;
+            .await
+        {
+            Ok(proxy) => proxy,
+            // The worker was in the directory when this close read it and is not now: its closure
+            // was recorded in between, and the record is the answer.
+            Err(ControllerError::UnknownSession { .. }) => {
+                *retained = Retained::Record;
+                return self.answer_from_the_closure(session_id).await;
+            }
+            Err(error) => return Err(error),
+        };
         *link = Some(Arc::clone(&proxy));
         let answered = proxy.forward_mutation(mutation, vouched, deadline).await?;
         // Whether this came from the worker's journal rather than from a close it performed now.

@@ -440,6 +440,7 @@ impl RemoteConnection {
                 self.notifications.clone(),
                 Arc::clone(&self.budget),
                 Arc::clone(&self.lost),
+                super::super::proxy::Purpose::Attachment,
             )
             .await?;
         *held = Some(Arc::clone(&proxy));

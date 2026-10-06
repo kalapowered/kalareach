@@ -212,6 +212,13 @@ pub struct Controller {
     /// a status read would invalidate a close that had already been authorised. One connection per
     /// worker, used in order, is what stops that.
     connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
+    /// The links remote connections hold to each session's worker, which the session's closure
+    /// ends. Weakly, because a link belongs to the connection that opened it.
+    ///
+    /// A link is entered while the directory is held and lists the session's worker, and a closure
+    /// takes the worker out of the directory before it ends these, so a link is either ended by the
+    /// closure or refused for the session having closed ([`Controller::hold_proxy`]).
+    proxies: std::sync::Mutex<BTreeMap<SessionId, Vec<std::sync::Weak<net::proxy::WorkerProxy>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
     /// The reservations a look or a publication currently holds.
     ///
@@ -372,6 +379,16 @@ pub struct Controller {
     /// build.
     #[cfg(test)]
     before_a_worker_is_published: ReadPause,
+    /// Where this host's own tests stop a remote connection's link to a worker after the worker was
+    /// read from the directory and before the link is opened, so that a closure can land in
+    /// between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_proxy_is_opened: ReadPause,
+    /// Where this host's own tests stop a close that has read its worker from the directory, before
+    /// it asks for the worker's connection, so that a closure can land in between. Compiled away in
+    /// every shipped build.
+    #[cfg(test)]
+    before_a_close_asks_for_its_link: ReadPause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -868,6 +885,10 @@ mod a_session_that_closed_is_not_bound_again;
 /// read by what a start sets going.
 #[cfg(test)]
 mod a_session_that_closed_before_a_start;
+
+/// A request for a worker that a closure overtakes: a remote connection's link, and a close.
+#[cfg(test)]
+mod a_request_that_a_closure_overtakes;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
