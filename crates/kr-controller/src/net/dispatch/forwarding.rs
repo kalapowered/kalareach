@@ -430,7 +430,7 @@ impl RemoteConnection {
                 "this connection's link to its session has ended; reconnect and subscribe again",
             ));
         }
-        let proxy = self
+        let proxy = match self
             .controller
             .open_proxy(
                 session_id,
@@ -439,7 +439,16 @@ impl RemoteConnection {
                 Arc::clone(&self.lost),
                 super::super::proxy::Purpose::Attachment,
             )
-            .await?;
+            .await
+        {
+            Ok(proxy) => proxy,
+            // A session with no worker is closed where its closure is recorded, and the record is
+            // what says so.
+            Err(error @ ControllerError::UnknownSession { .. }) => {
+                return Err(self.controller.closed_or(session_id, error).await);
+            }
+            Err(error) => return Err(error),
+        };
         *held = Some(Arc::clone(&proxy));
         Ok(proxy)
     }

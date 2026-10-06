@@ -249,6 +249,25 @@ impl Controller {
         }
     }
 
+    /// The refusal for a request that found no worker for a session: that the session closed,
+    /// where its closure is recorded, and otherwise `error`, which says the session is unknown.
+    ///
+    /// A session whose closure is recorded is not unknown, and the record is what says so. A
+    /// registry that cannot be read is the refusal, since it cannot be said which of the two it is.
+    pub(super) async fn closed_or(
+        &self,
+        session_id: SessionId,
+        error: ControllerError,
+    ) -> ControllerError {
+        match self.registry.lock().await.closure(session_id) {
+            Ok(Some(_)) => ControllerError::SessionClosed {
+                session: session_id.to_string(),
+            },
+            Ok(None) => error,
+            Err(failed) => failed,
+        }
+    }
+
     /// Settles a worker's answer to a close of `session_id` that this daemon passes on, whether
     /// the worker gave it now or from its journal, and on either door: every answer a close gets
     /// is settled here, before it goes, so none reaches its caller without this daemon knowing

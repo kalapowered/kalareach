@@ -654,6 +654,8 @@ impl Controller {
             #[cfg(test)]
             before_a_close_asks_for_its_link: ReadPause::default(),
             #[cfg(test)]
+            before_a_created_session_is_read: ReadPause::default(),
+            #[cfg(test)]
             before_a_worker_is_made_known: ReadPause::default(),
             #[cfg(test)]
             stopped_at: std::sync::Mutex::new(None),
