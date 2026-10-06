@@ -124,7 +124,11 @@ impl Controller {
         // tidying stops what this starts, and one recorded before it is found here and nothing is
         // started for its session.
         let registry = self.registry.lock().await;
-        for worker in self.workers_without_a_closure(&registry).await? {
+        let directory = self.directory_workers().await;
+        let workers = Self::without_a_closure(&registry, directory)?;
+        #[cfg(test)]
+        self.after_a_start_reads_the_directory.wait().await;
+        for worker in workers {
             self.describe_worker(&worker);
         }
         drop(registry);
@@ -637,6 +641,8 @@ impl Controller {
             before_the_pass_tells: ReadPause::default(),
             #[cfg(test)]
             before_a_worker_is_published: ReadPause::default(),
+            #[cfg(test)]
+            after_a_start_reads_the_directory: ReadPause::default(),
             #[cfg(test)]
             before_a_proxy_is_opened: ReadPause::default(),
             #[cfg(test)]

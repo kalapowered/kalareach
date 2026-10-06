@@ -96,7 +96,10 @@ impl Controller {
         // tidying stops what this starts, and one recorded before it is found here and the store
         // does not read the session at a worker.
         let registry = self.registry.lock().await;
-        let live = self.workers_without_a_closure(&registry).await?;
+        let workers = self.directory_workers().await;
+        let live = Self::without_a_closure(&registry, workers)?;
+        #[cfg(test)]
+        self.after_a_start_reads_the_directory.wait().await;
         let live_sessions: std::collections::BTreeSet<SessionId> = live
             .iter()
             .map(|worker| worker.descriptor.session_id)
