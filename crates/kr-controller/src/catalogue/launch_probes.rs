@@ -1,13 +1,13 @@
 //! The doctor's reading of each admitted package's launch probe.
 //!
 //! A package can declare how to read the mode its application runs in: the application's own
-//! diagnostic and where in what it prints the mode is. A launch runs the declaration where the
-//! worker owns the launch's environment, and records the word it read in the launch's profile.
-//! The doctor runs the same declaration here, for the executable this daemon's own search path
-//! names, and says what it read word for word: a person asking `kr doctor` how a launch would go
-//! sees the mode the application is configured for without starting one. The daemon runs it in its
-//! own environment and directory, which a launch's may differ from, and says that beside the
-//! answer.
+//! diagnostic and where in what it prints the mode is. A launch the worker starts runs the
+//! declaration where the worker owns the launch's environment, and records the word it read in the
+//! launch's profile; this host starts no such launch. The doctor runs the same declaration here,
+//! for the executable this daemon's own search path names, and says what it read word for word: a
+//! person asking `kr doctor` how a launch would go sees the mode the application is configured for
+//! without starting one. The daemon runs it in its own environment and directory, which a launch's
+//! may differ from, and says that beside the answer.
 //!
 //! A probe runs only while the installation holds the capability the owner confirmed it under,
 //! checked as the worker checks it: from the connector read under the grants these admissions

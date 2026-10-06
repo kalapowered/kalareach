@@ -346,8 +346,9 @@ pub fn launch_probe(report: &LaunchProbeReport) -> Document {
 
 /// One package's launch probe as the lines a person reads: the word the application printed for
 /// the mode it runs in and where the daemon read it from, or why nothing was read. The probe ran in
-/// the daemon's own environment, which a launch's may differ from, and a launch records the mode
-/// it read itself. `first` goes in front of the first line and `rest` in front of the others.
+/// the daemon's own environment, which a launch's may differ from, and this host starts no launch
+/// that records a mode of its own. `first` goes in front of the first line and `rest` in front of
+/// the others.
 #[must_use]
 pub fn launch_probe_lines(
     report: &LaunchProbeReport,
@@ -386,7 +387,7 @@ pub fn launch_probe_lines(
             },
             stdout_line!(
                 "{}the daemon ran the package's probe in its own environment, which a launch's \
-                 may differ from; each launch records the mode it reads",
+                 may differ from; this host starts no launch that records a mode of its own",
                 rest
             ),
         ],
@@ -1036,15 +1037,17 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
     lines
 }
 
-/// One line for each package the document chooses reduced ownership for, naming what the choice
-/// costs.
+/// One line for each package the document names reduced ownership for, saying that no launch reads
+/// it and what a launch whose profile records it gives up.
 ///
-/// Section 7 allows the profile only where it is explicitly selected, so a person who selected it
-/// is told what they gave up: the agent's launch is held by a job of its own instead of the
-/// session's, its processes are tracked by start identity, and the session's closure never reads
-/// its ownership coverage as complete. The program a command route starts runs in the shell's own
-/// job and has no such profile, so the line says that too. The packages are names the person wrote
-/// in their own document, which they asked this command to show.
+/// Section 7 allows the profile only where it is explicitly selected. A launch takes its ownership
+/// from the profile it is given and this host starts no agent through the worker's launch, so a
+/// person who wrote the entry is told that nothing acts on it. They are also told what a launch
+/// under the profile gives up on Windows, where jobs hold agents: the agent is held by a job of its
+/// own instead of the session's, its processes are tracked by start identity, and the session's
+/// closure never reads its ownership coverage as complete. The program a command route starts runs
+/// in the shell's own job and has no such profile, so the line says that too. The packages are
+/// names the person wrote in their own document, which they asked this command to show.
 fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Line> {
     if value.key != kr_protocol::hostinfo::configuration::AGENTS_OWNERSHIP_KEY
         || value.class() != kr_protocol::hostinfo::export::ContentClass::Name
@@ -1057,8 +1060,9 @@ fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Lin
         .filter_map(|entry| entry.strip_suffix("=reduced"))
         .map(|package| {
             stdout_line!(
-                "  agents {}: reduced ownership; a launch is tracked by start identity and its \
-                 closure never reads complete; the command route does not apply it",
+                "  agents {}: reduced ownership is recorded and no launch on this host reads it; on \
+                 Windows a launch whose profile records reduced is tracked by start identity and \
+                 its closure never reads complete, and the command route has no such profile",
                 Asked::text(Request::Diagnostics, package)
             )
         })

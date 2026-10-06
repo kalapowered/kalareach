@@ -292,9 +292,9 @@ impl Resolver {
         )
     }
 
-    /// Returns how completely the session's closure accounts for the agent of one package: the
-    /// document's explicit choice for it, and full ownership where there is none or where this
-    /// host cannot use the document.
+    /// Returns what the document records for the agent of one package: its explicit choice for
+    /// it, and full ownership where there is none or where this host cannot use the document. No
+    /// launch asks it.
     #[must_use]
     pub fn agent_ownership(&self, package: &str) -> kr_protocol::broker::AgentOwnership {
         self.loaded
@@ -305,7 +305,7 @@ impl Resolver {
             })
     }
 
-    /// Returns the packages the document explicitly chooses reduced ownership for, in order.
+    /// Returns the packages the document names reduced ownership for, in order.
     #[must_use]
     pub fn reduced_agents(&self) -> Vec<String> {
         self.loaded
