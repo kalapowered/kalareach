@@ -1786,6 +1786,77 @@ fn three_failures_in_a_row_leave_inference_failed_until_a_description_is_publish
     }
 }
 
+/// KR-REQ-22.18: a job the process refuses for its size, because its prompt cannot be made to fit
+/// the window, is no failure of inference: it counts toward no restart, delays no start, pauses
+/// nothing however many of them come in a row, ends that job without asking for it again, and the
+/// process keeps the model it has. The control is a job the process failed, which counts a restart,
+/// unloads the model and is the first of the failures that pause inference.
+#[test]
+fn a_job_the_process_refuses_for_its_size_is_no_failure_of_inference() {
+    let mut service = service();
+    let mut now = at(3_000);
+    for round in 1..=4_u8 {
+        queue(&mut service, &session(round), "kalareach", now);
+        let (sent, id, _) = next_job(&mut service, now);
+        now = sent;
+        let outcome = service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::TooLarge,
+                    detail: Some(
+                        "the instruction alone is 900 tokens, and a prompt may be 891".to_owned(),
+                    ),
+                },
+                now,
+            )
+            .expect("the answer");
+        assert!(
+            matches!(outcome, Outcome::Failed { session_id, .. } if session_id == session(round)),
+            "round {round}: {outcome:?}"
+        );
+        assert_eq!(service.inference_restarts(), 0, "round {round}");
+        assert_eq!(service.restart_not_before_ms(), None, "round {round}");
+        assert!(!inference_failed(&service), "round {round}");
+        assert_eq!(
+            service.counts().requeued,
+            0,
+            "round {round}: not asked again"
+        );
+    }
+    // The process still has its model: the next session's job is sent with no load between.
+    queue(&mut service, &session(5), "kalareach", now);
+    let first = loop {
+        match service.next(&roomy(), now).expect("an instruction") {
+            Instruction::Wait { .. } => {
+                now = now.after_ms(1_000);
+                assert!(now.monotonic_ms() < 400_000, "no job was sent");
+            }
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(first, Instruction::Generate { .. }),
+        "the model was not unloaded: {first:?}"
+    );
+
+    let mut control = self::service();
+    queue(&mut control, &session(1), "kalareach", at(0));
+    let (sent, id, _) = next_job(&mut control, at(3_000));
+    control
+        .finished(
+            id,
+            Answered::Ended {
+                why: JobEnd::Failed,
+                detail: None,
+            },
+            sent,
+        )
+        .expect("the answer");
+    assert_eq!(control.inference_restarts(), 1);
+    assert!(control.restart_not_before_ms().is_some());
+}
+
 /// The control for the count a publication starts again: with no publication between, the fourth
 /// failure in a row shows inference failed at once.
 #[test]

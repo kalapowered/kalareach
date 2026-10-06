@@ -1881,6 +1881,68 @@ fn a_process_that_ends_inside_a_job_is_restarted_and_the_job_retried_once() {
     assert_eq!(rig.driver.service().scheduler().queued(), 0);
 }
 
+/// KR-REQ-22.18: a job the process refuses for its size, as its own answer over the real pipes, is
+/// no failure of inference. The process stays, so no second one is started; the job is not asked
+/// for again; and nothing is counted or delayed however many sessions are refused in a row, so a
+/// session whose context cannot be described does not stop descriptions for the others.
+#[test]
+fn a_job_refused_for_its_size_leaves_the_process_and_counts_no_failure() {
+    let mut rig = Rig::new(&Script {
+        too_large: true,
+        ..Script::default()
+    });
+    for number in 1..=4_u8 {
+        // Each session in its own minute, which is past every cooldown.
+        let begun = at(u64::from(number) * 60_000);
+        queue(rig.service(), &session(number), Priority::Ordinary, begun);
+        let reports = rig.until(
+            &roomy(),
+            begun.after_ms(3_000),
+            "the refusal",
+            |reports, _| a_job_ended(reports),
+        );
+        assert!(
+            outcomes(&reports).iter().any(|outcome| matches!(
+                outcome,
+                Outcome::Failed { session_id, .. } if *session_id == session(number)
+            )),
+            "session {number}: {reports:?}"
+        );
+        assert!(
+            !the_process_ended(&reports),
+            "session {number}: {reports:?}"
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|report| matches!(report, Report::Unloaded { .. })),
+            "session {number}: {reports:?}"
+        );
+        assert_eq!(rig.driver.started(), 1, "session {number}");
+        assert_eq!(
+            rig.driver.service().inference_restarts(),
+            0,
+            "session {number}"
+        );
+        assert_eq!(
+            rig.driver.service().restart_not_before_ms(),
+            None,
+            "session {number}"
+        );
+        assert_eq!(rig.driver.service().scheduler().queued(), 0);
+    }
+    assert!(
+        !matches!(
+            rig.driver.service().resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::InferenceFailed,
+                ..
+            }
+        ),
+        "four refusals in a row do not pause inference"
+    );
+}
+
 /// A resource pause while a job is in the process cancels it, keeps its place in the queue and
 /// ends the process; when the pause clears the job is described. Thermal pressure is the pause.
 #[test]

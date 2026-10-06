@@ -148,6 +148,8 @@ pub struct Script {
     /// Whether a job answers with its result even when it was cancelled while it ran, as a model
     /// that does not look at its token would.
     pub produce_when_cancelled: bool,
+    /// Whether a job ends because its prompt cannot be made to fit what a job may spend on it.
+    pub too_large: bool,
     /// Whether a job ends because the process passed the memory ceiling.
     pub memory_ceiling: bool,
     /// What a job's answer looks like.
@@ -250,6 +252,7 @@ impl Script {
         flag("mark-work", self.mark_work);
         flag("generate-until-cancelled", self.generate_until_cancelled);
         flag("produce-when-cancelled", self.produce_when_cancelled);
+        flag("too-large", self.too_large);
         flag("memory-ceiling", self.memory_ceiling);
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
@@ -313,6 +316,7 @@ impl Script {
                 "mark-work" => script.mark_work = true,
                 "generate-until-cancelled" => script.generate_until_cancelled = true,
                 "produce-when-cancelled" => script.produce_when_cancelled = true,
+                "too-large" => script.too_large = true,
                 "memory-ceiling" => script.memory_ceiling = true,
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
@@ -490,6 +494,12 @@ impl Model for StubModel {
                     detail: None,
                 };
             }
+        }
+        if self.script.too_large {
+            return Generating::Ended {
+                why: JobEnd::TooLarge,
+                detail: Some("the instruction alone is more than a prompt may be".to_owned()),
+            };
         }
         if self.script.memory_ceiling {
             return Generating::Ended {
