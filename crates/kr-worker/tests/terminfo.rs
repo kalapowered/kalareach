@@ -98,10 +98,28 @@ async fn run(script: &str, environment: &LaunchEnvironment) -> String {
     run_observed(script, environment, None).await.text
 }
 
+/// Everything the session has retained of what its application wrote.
+fn retained_output(session: &Session) -> Vec<u8> {
+    let mut raw = Vec::new();
+    loop {
+        let page = session
+            .history_page(raw.len() as u64, 1 << 20)
+            .expect("the session's output history");
+        if page.bytes.is_empty() {
+            break;
+        }
+        raw.extend_from_slice(page.bytes.as_slice());
+    }
+    raw
+}
+
 /// Runs `script` as a session's root shell in `environment` and reports what the engine counted.
 ///
 /// The run is over when the shell has printed its last line or, for a script that draws on the
-/// screen and so is not read back from its output, when `finished` exists.
+/// screen and so is not read back from its output, when `finished` exists; and then, in either
+/// case, when that last line is in the session's retained output. A script ends before the host
+/// has read what its programs wrote last, and the shell's last line follows all of it, so only
+/// once the retained output carries that line has everything before it been through the engine.
 async fn run_observed(
     script: &str,
     environment: &LaunchEnvironment,
@@ -174,23 +192,25 @@ async fn run_observed(
         }
     }
     let text = String::from_utf8_lossy(&seen).into_owned();
-    let diagnostics = runtime.session().terminal_diagnostics();
-    let mut raw = Vec::new();
-    loop {
-        let page = runtime
-            .session()
-            .history_page(raw.len() as u64, 1 << 20)
-            .expect("the session's output history");
-        if page.bytes.is_empty() {
-            break;
+    // What the engine counted and what the session retained are read together, under one hold of
+    // the session, so that no output is taken in between the two.
+    let (diagnostics, raw) = loop {
+        let (diagnostics, raw) = {
+            let session = runtime.session();
+            (session.terminal_diagnostics(), retained_output(&session))
+        };
+        if raw.windows(marker.len()).any(|window| window == marker)
+            || tokio::time::Instant::now() >= deadline
+        {
+            break (diagnostics, raw);
         }
-        raw.extend_from_slice(page.bytes.as_slice());
-    }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     // The shell waits on `cat` for a line that never comes; the runtime's owner closes it.
     let _ = runtime.session().force_close();
     assert!(
-        done(&seen),
-        "waited {:?} for the script to finish: {text:?}",
+        done(&seen) && raw.windows(marker.len()).any(|window| window == marker),
+        "waited {:?} for the script to finish and its last line to be retained: {text:?}",
         started.elapsed()
     );
     Ran {
