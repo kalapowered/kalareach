@@ -95,8 +95,9 @@ pub fn snapshot_of(summary: &SessionSummary, session_id: SessionId) -> SessionSn
 /// - A name a person pinned is part of the description, from the moment the session started.
 /// - The directory and the program the description host observed carry the moment it observed
 ///   them. Where the session started stays with the description, and is read as the working
-///   directory only while nothing has been observed, and the foreground is reported unavailable
-///   only then.
+///   directory only while nothing has been observed. The foreground is reported unavailable
+///   until a program is observed, and again once its command has ended, because the host keeps a
+///   program only while its command runs.
 #[must_use]
 pub fn snapshot_with(
     summary: &SessionSummary,
