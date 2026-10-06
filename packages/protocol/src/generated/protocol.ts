@@ -10464,14 +10464,16 @@ export interface CollectionKeyWrapContext {
  */
 export interface ConfigurationDocument {
   /**
-   * What the owner or an administrator chose for the agents this host launches, by package
+   * What the owner or an administrator wrote down for the agents of each package
    * (`publisher/plugin`).
    *
    * Section 7 lets an agent whose own sandbox cannot nest under the session's job run under
-   * an **explicitly selected** reduced-ownership profile, and this is where that selection
-   * is made: an entry that names `reduced` for a package, and nothing else, puts that
-   * package's agent in a job of its own instead of the session's. A package with no entry
-   * runs under full ownership. Entries are read for the sessions created afterwards.
+   * an **explicitly selected** reduced-ownership profile. A launch runs an agent under the
+   * `ownership` its profile records, and nothing reads this section for a launch: every
+   * profile this host writes records `full`, and this host starts no agent through the
+   * worker's launch. So the section is validated, kept and reported as `agents.ownership`,
+   * and a change to it changes nothing a launch does. An entry names `reduced` or `full` for
+   * one package, and nothing else; a package with no entry is `full`.
    */
   agents?: {
     [k: string]: AgentChoice
@@ -10508,11 +10510,12 @@ export interface ConfigurationDocument {
   voice?: VoiceSelection
 }
 /**
- * What was chosen for one agent's launches.
+ * What the document records for one agent's launches.
  */
 export interface AgentChoice {
   /**
-   * How completely the session's closure accounts for what this agent starts.
+   * The ownership recorded for this package's agent. No launch reads it: a launch takes its
+   * ownership from its profile.
    */
   ownership: 'full' | 'reduced'
 }
@@ -12645,9 +12648,10 @@ export interface CeilingValue {
    */
   configured: string | null
   /**
-   * When it applies: immediately, only to sessions created afterwards, or at the next start.
+   * When it applies: immediately, only to sessions created afterwards, at the next start, or
+   * to nothing, because nothing acts on it.
    */
-  effect: 'immediately' | 'new_sessions_only' | 'next_start'
+  effect: 'immediately' | 'new_sessions_only' | 'next_start' | 'no_effect'
   /**
    * The key.
    */
@@ -12760,9 +12764,10 @@ export interface EffectiveValue {
     | 'variable'
     | 'name'
   /**
-   * When it applies: immediately, only to sessions created afterwards, or at the next start.
+   * When it applies: immediately, only to sessions created afterwards, at the next start, or
+   * to nothing, because nothing acts on it.
    */
-  effect: 'immediately' | 'new_sessions_only' | 'next_start'
+  effect: 'immediately' | 'new_sessions_only' | 'next_start' | 'no_effect'
   /**
    * The key, as the configuration document spells it.
    */
@@ -14641,9 +14646,10 @@ export interface HostDoctorResult {
    * What each admitted package's launch probe reads of its application, as this daemon runs it.
    *
    * Section 7 has a launch record the mode its application runs in, and a package declares how
-   * that is read: the application's own diagnostic. The doctor runs the same declaration for
-   * the executable this daemon's own search path names, in this daemon's own environment, which
-   * a launch's may differ from, and says what it read, word for word.
+   * that is read: the application's own diagnostic. This host starts no launch that records
+   * one. The doctor runs the same declaration for the executable this daemon's own search path
+   * names, in this daemon's own environment, which a launch's may differ from, and says what it
+   * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
 }
@@ -14684,7 +14690,8 @@ export interface DoctorCheck {
  * Section 7: diagnostics show the resolved executable, flags, version and integration mode. The
  * executable here is this host's reading of it: the first the command names on the daemon's own
  * search path, with the version a signed qualification record names for its digest. A session
- * whose own search path differs can find another, and each launch records the one it ran.
+ * whose own search path differs can find another, and a launch the host records names the one it
+ * ran.
  */
 export interface CommandIntegrationReport {
   /**
@@ -14845,8 +14852,8 @@ export interface EffectiveConfiguration1 {
  *
  * The executable is this daemon's reading of it: the first its package's match rule names on the
  * daemon's own search path. The probe runs in the daemon's own environment and directory, so a
- * launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode, and
- * each launch records the one it read.
+ * launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode. This
+ * host starts no launch that records a mode of its own.
  */
 export interface LaunchProbeReport {
   /**
@@ -26049,9 +26056,10 @@ export interface HostDoctorResult1 {
    * What each admitted package's launch probe reads of its application, as this daemon runs it.
    *
    * Section 7 has a launch record the mode its application runs in, and a package declares how
-   * that is read: the application's own diagnostic. The doctor runs the same declaration for
-   * the executable this daemon's own search path names, in this daemon's own environment, which
-   * a launch's may differ from, and says what it read, word for word.
+   * that is read: the application's own diagnostic. This host starts no launch that records
+   * one. The doctor runs the same declaration for the executable this daemon's own search path
+   * names, in this daemon's own environment, which a launch's may differ from, and says what it
+   * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
 }
