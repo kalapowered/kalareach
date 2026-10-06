@@ -627,14 +627,17 @@ async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_sessio
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 }
 
-/// KR-REQ-09.12: a publication for a session that has closed has nothing to do, even where the
-/// write of the descriptor it would then remove reports a failure: the closure is looked at first,
-/// since a write can fail after the file has its name and leave a descriptor that nothing else
-/// would remove. Here the directory takes no new file; where it does anyway (a user that is not
-/// held to file modes) the write cannot fail and there is nothing to show.
+/// KR-REQ-09.12: a publication for a session that has closed removes the descriptor it wrote and has
+/// nothing else to do, even where the write reports a failure: a write can fail after the file has
+/// its name (the flush of the directory) and leave a descriptor that nothing else would remove,
+/// since the closure's own tidying has run. Here the descriptors' directory can be written to but
+/// not read, so the file is renamed into place and the flush that follows is refused. Where it can
+/// be read anyway (a user that is not held to file modes) the flush cannot fail and there is
+/// nothing to show.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_publication_for_a_closed_session_does_not_fail_on_the_descriptor_it_would_remove() {
+async fn a_publication_for_a_closed_session_removes_a_descriptor_whose_write_failed_after_its_rename()
+ {
     use std::os::unix::fs::PermissionsExt as _;
 
     /// Gives the directory its modes back, whatever becomes of the test.
@@ -661,12 +664,10 @@ async fn a_publication_for_a_closed_session_does_not_fail_on_the_descriptor_it_w
     let modes = std::fs::metadata(&descriptors)
         .expect("the descriptors' directory exists")
         .permissions();
-    let _restore = Restore(descriptors.clone(), modes);
-    std::fs::set_permissions(&descriptors, std::fs::Permissions::from_mode(0o500))
-        .expect("the directory is made read only");
-    let probe = descriptors.join(".probe");
-    if std::fs::File::create(&probe).is_ok() {
-        let _ = std::fs::remove_file(&probe);
+    let restore = Restore(descriptors.clone(), modes);
+    std::fs::set_permissions(&descriptors, std::fs::Permissions::from_mode(0o300))
+        .expect("the directory is made write only");
+    if std::fs::read_dir(&descriptors).is_ok() {
         return;
     }
 
@@ -675,6 +676,7 @@ async fn a_publication_for_a_closed_session_does_not_fail_on_the_descriptor_it_w
         .publish_worker(world.worker.clone(), None)
         .await
         .expect("a publication for a closed session has nothing to do");
+    drop(restore);
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 }
 
