@@ -13,6 +13,9 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::paths::{EnvironmentPaths, HostPaths};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod volumes;
+
 /// A loopback address that nothing answers at, whatever else is running beside a test.
 ///
 /// A test that needs a connection refused cannot take the port it frees: another test in the same
@@ -41,10 +44,22 @@ impl TempHost {
     /// unusable rather than that the case under test failed.
     #[must_use]
     pub fn create() -> Self {
+        Self::create_in(&std::env::temp_dir())
+    }
+
+    /// Creates a fresh tree under `parent`, which is how a test puts the whole host on a
+    /// filesystem of its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directories cannot be created, which in a test means the environment is
+    /// unusable rather than that the case under test failed.
+    #[must_use]
+    pub fn create_in(parent: &Path) -> Self {
         // Short on purpose: a Unix socket address is 104 bytes on macOS, and a temporary directory
         // there already spends about half of that.
         let suffix = crate::new_uuid().to_string();
-        let root = std::env::temp_dir().join(format!("kr-{}", &suffix[..8]));
+        let root = parent.join(format!("kr-{}", &suffix[..8]));
         crate::paths::create_private_tree(&root, &root).expect("owner-only temporary root");
         let paths = HostPaths::new(root.join("r"), root.join("s")).expect("absolute roots");
         let environment_id = paths.open_environment_id().expect("environment identity");
