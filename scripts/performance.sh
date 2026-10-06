@@ -6,7 +6,10 @@
 #
 # Every step is checked. A build that fails, a measurement that produces no samples, or a
 # measurement that misses its bound all end this script with a non-zero status, because a
-# performance script that exits zero without measuring anything is worse than no script.
+# performance script that exits zero without measuring anything is worse than no script. A bound
+# that is a claim about a reference host is asserted only on a host with no shortfall against it:
+# elsewhere the measurement records its figure and names what was missing, and says so in its
+# verdict line.
 #
 # Nothing here reaches the person's own credential store. A measurement that needs a key store
 # opens one in its own temporary directory, so the keys a run creates leave with the run, and a
@@ -208,4 +211,4 @@ if [ "$failed" -ne 0 ]; then
   echo "one or more measurements failed"
   exit 1
 fi
-echo "all measurements met their bounds"
+echo "all asserted bounds were met; a figure recorded on a host short of the reference host without being asserted is read from its verdict line above"
