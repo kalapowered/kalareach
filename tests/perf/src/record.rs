@@ -68,12 +68,22 @@ pub struct Conditions {
 }
 
 impl Conditions {
+    /// Every condition of the reference host that this host can be shown not to meet.
+    ///
+    /// A target taken from section 27 is a claim about a reference host, so a measurement asks this
+    /// before it asserts one: an empty answer means nothing read here falls short, and each entry
+    /// otherwise names one condition for the record to carry beside the figure.
+    #[must_use]
+    pub fn shortfalls(&self) -> Vec<String> {
+        self.host.shortfalls(self.stolen)
+    }
+
     /// The lines that record the host, in the order every record gives them.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let host = &self.host;
         let unread = || "unread".to_owned();
-        let shortfalls = host.shortfalls(self.stolen);
+        let shortfalls = self.shortfalls();
         vec![
             format!(
                 "  build             {}",
@@ -123,6 +133,32 @@ impl Conditions {
                 format!("  reference host    short: {}", shortfalls.join("; "))
             },
         ]
+    }
+}
+
+#[cfg(test)]
+impl Conditions {
+    /// The conditions of a host a test describes, optimised, with the processors and memory and
+    /// the hypervisor's stolen share it names (`None` where a platform does not account for it).
+    ///
+    /// Only a test build has this. It lets a test hold a measurement's verdict to a host short of
+    /// the reference host, and to one that is not, on whatever machine the test runs on.
+    #[must_use]
+    pub fn supplied(cores: usize, memory_mib: u64, stolen: Option<f64>) -> Self {
+        Self {
+            host: Host {
+                optimised: true,
+                os: "supplied",
+                arch: "supplied",
+                cores,
+                memory_bytes: Some(memory_mib * 1024 * 1024),
+                processor: None,
+                load_average: None,
+            },
+            entering: None,
+            leaving: None,
+            stolen,
+        }
     }
 }
 

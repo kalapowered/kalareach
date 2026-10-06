@@ -615,10 +615,150 @@ fn total<T: std::iter::Sum>(
         .sum()
 }
 
-/// What the idle measurement established.
+/// What the idle measurement established, and what its host was short of the reference host.
 struct Idle {
     cores: f64,
     resident: u64,
+    /// Each condition of the reference host this host can be shown not to meet. The processor
+    /// figure is a claim about a reference host, so it is asserted only while this is empty; the
+    /// memory bound is a size and is asserted on every host.
+    shortfalls: Vec<String>,
+}
+
+impl Idle {
+    fn new(cores: f64, resident: u64, conditions: &record::Conditions) -> Self {
+        Self {
+            cores,
+            resident,
+            shortfalls: conditions.shortfalls(),
+        }
+    }
+
+    /// The lines that say what the figures came to against the target, and what stood in the way
+    /// of asserting it where something did.
+    fn verdict(&self) -> Vec<String> {
+        let inside = |figure: bool| if figure { "inside" } else { "outside" };
+        let processor = self.cores < IDLE_CORE_FRACTION;
+        let memory = self.resident < RESIDENT_BOUND_KIB;
+        if self.shortfalls.is_empty() {
+            return vec![format!(
+                "  verdict           {}",
+                if processor && memory {
+                    "the target is met on this host"
+                } else {
+                    "the target is not met on this host"
+                }
+            )];
+        }
+        let mut lines = vec![format!(
+            "  verdict           processor use is {} the target, with a condition missing, so it is \
+             recorded and not asserted here; resident memory is {} the target, which is asserted \
+             on every host",
+            inside(processor),
+            inside(memory)
+        )];
+        for shortfall in &self.shortfalls {
+            lines.push(format!("  condition missing {shortfall}"));
+        }
+        lines.push(
+            "  conditions        not met, so the processor figure above is recorded and the target \
+             is not asserted for it here; the target's evidence is the reference-host run in the \
+             release acceptance record"
+                .to_owned(),
+        );
+        lines
+    }
+
+    /// Holds the figures to the bounds that are asserted: the processor figure on a host with no
+    /// shortfall, and the resident memory on every host.
+    fn check(&self) -> Result<(), String> {
+        if self.shortfalls.is_empty() && self.cores >= IDLE_CORE_FRACTION {
+            return Err(format!(
+                "idle processor use is under one per cent of a core: {:.5}",
+                self.cores
+            ));
+        }
+        if self.resident >= RESIDENT_BOUND_KIB {
+            return Err(format!(
+                "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {} KiB",
+                self.resident
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A figure over the processor bound, which the idle measurement reads on shared virtual machines.
+const OVER_THE_PROCESSOR_BOUND: f64 = 0.012;
+
+/// A figure under the memory bound, as every runner reads it.
+const UNDER_THE_MEMORY_BOUND_KIB: u64 = 360_000;
+
+/// KR-PERF-003: the processor figure is a claim about a reference host, so a host short of one
+/// records the figure and names what it lacks rather than failing on it. Section 27's reference
+/// host has four processors and 8 GiB.
+#[test]
+fn a_host_short_of_the_reference_host_records_the_idle_processor_figure_without_asserting_it() {
+    let short = record::Conditions::supplied(3, 7 * 1024, None);
+    let idle = Idle::new(OVER_THE_PROCESSOR_BOUND, UNDER_THE_MEMORY_BOUND_KIB, &short);
+
+    let lines = idle.verdict();
+    assert!(
+        lines[0].contains("processor use is outside the target"),
+        "the figure over the bound is still recorded as outside it: {lines:#?}"
+    );
+    let missing = lines
+        .iter()
+        .filter(|line| line.starts_with("  condition missing "))
+        .count();
+    assert_eq!(
+        missing, 2,
+        "one line for the processors and one for the memory: {lines:#?}"
+    );
+    assert_eq!(
+        idle.check(),
+        Ok(()),
+        "a host short of the reference host is not failed on the processor figure"
+    );
+}
+
+/// KR-PERF-003: where nothing read falls short of the reference host, the target is asserted.
+#[test]
+fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let over = Idle::new(
+        OVER_THE_PROCESSOR_BOUND,
+        UNDER_THE_MEMORY_BOUND_KIB,
+        &reference,
+    );
+    assert!(
+        over.verdict()
+            .iter()
+            .all(|line| !line.starts_with("  condition missing ")),
+        "no condition is missing on this host"
+    );
+    assert!(
+        over.check()
+            .is_err_and(|failure| failure.contains("processor use")),
+        "the figure over the bound fails: {:?}",
+        over.check()
+    );
+
+    let under = Idle::new(0.0075, UNDER_THE_MEMORY_BOUND_KIB, &reference);
+    assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
+}
+
+/// KR-PERF-003: the memory bound is a size, so it is asserted on every host.
+#[test]
+fn a_host_short_of_the_reference_host_still_fails_idle_memory_over_the_bound() {
+    let short = record::Conditions::supplied(3, 7 * 1024, None);
+    let idle = Idle::new(0.0075, RESIDENT_BOUND_KIB, &short);
+    assert!(
+        idle.check()
+            .is_err_and(|failure| failure.contains("resident memory")),
+        "resident memory at the bound fails on a short host too: {:?}",
+        idle.check()
+    );
 }
 
 /// KR-PERF-003: idle local terminal resources, the daemon and twenty idle sessions' workers and root
@@ -637,16 +777,9 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
 
     let measured = measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
     closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
-    assert!(
-        measured.cores < IDLE_CORE_FRACTION,
-        "idle processor use is under one per cent of a core: {:.5}",
-        measured.cores
-    );
-    assert!(
-        measured.resident < RESIDENT_BOUND_KIB,
-        "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {} KiB",
-        measured.resident
-    );
+    measured
+        .check()
+        .unwrap_or_else(|failure| panic!("{failure}"));
     let _ = host.controller;
     let _ = host.worker;
 }
@@ -790,19 +923,13 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
          active"
             .to_owned(),
     );
-    lines.push(format!(
-        "  verdict           {}",
-        if cores < IDLE_CORE_FRACTION && resident < RESIDENT_BOUND_KIB {
-            "the target is met on this host"
-        } else {
-            "the target is not met on this host"
-        }
-    ));
+    let idle = Idle::new(cores, resident, &conditions);
+    lines.extend(idle.verdict());
     // Before anything is asserted, so a run whose target failed keeps the figure.
     record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);
     // The views hold connections to the workers. They go before the sessions are closed.
     drop(views);
-    Ok(Idle { cores, resident })
+    Ok(idle)
 }
 
 /// KR-PERF-004: a local attach to a warm worker, from the connection to the first usable screen of
