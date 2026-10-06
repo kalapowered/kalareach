@@ -60,6 +60,16 @@ pub(super) fn paired(
     byte: u8,
     expires_at_ms: Option<u64>,
 ) -> DeviceRecord {
+    paired_holding(controller, byte, &[ActionRight::SessionView], expires_at_ms)
+}
+
+/// As [`paired`], under a grant that carries `rights`.
+pub(super) fn paired_holding(
+    controller: &Controller,
+    byte: u8,
+    rights: &[ActionRight],
+    expires_at_ms: Option<u64>,
+) -> DeviceRecord {
     let revision = controller.policy().authority_revision();
     let device_id = DeviceId::new(kr_ipc::new_uuid());
     let device = DeviceRecord {
@@ -71,12 +81,7 @@ pub(super) fn paired(
         notification_preview: None,
         device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
         platform: kr_protocol::pairing::DevicePlatform::Ios,
-        grant: grant(
-            device_id,
-            &[ActionRight::SessionView],
-            expires_at_ms,
-            revision,
-        ),
+        grant: grant(device_id, rights, expires_at_ms, revision),
         paired_at_ms: TimestampMs::new(1),
         revoked_at_ms: None,
         committed_invitation_id: None,
@@ -435,8 +440,11 @@ async fn a_voice_change_is_dated_on_the_floor_and_not_the_wound_back_wall_clock(
             let revision = controller.policy().authority_revision();
             controller
                 .voice_mutation(
-                    &actor_id,
-                    crate::voice::VoiceActor::Device(device_id),
+                    crate::service::voice_actions::VoiceIngress {
+                        actor_id: &actor_id,
+                        actor: crate::voice::VoiceActor::Device(device_id),
+                        route: None,
+                    },
                     &mutation,
                     Method::VoiceGrant,
                     revision,

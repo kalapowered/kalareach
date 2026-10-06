@@ -6,7 +6,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.07 | `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched` |
+//! | KR-REQ-09.07 | `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched`, `one_action_identifier_is_one_action_across_the_voice_and_session_routes` |
 //! | KR-REQ-09.08 | `a_voice_start_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_voice_start_runs_is_told_it_has_not_finished`, `a_voice_start_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_voice_start_whose_record_was_never_written_is_not_performed_again_after_a_restart` |
 //! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
 //! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
@@ -2112,6 +2112,107 @@ async fn a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_i
         matches!(admitted.outcome, VoiceDelegationOutcome::Admitted { .. }),
         "{:?}",
         admitted.outcome
+    );
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+impl RawVoice {
+    /// Writes the device's voice grant under `action_id`.
+    async fn grant_as(
+        &self,
+        action_id: ActionId,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>
+    {
+        self.raw
+            .mutate(
+                Method::VoiceGrant,
+                action_id,
+                self.target.clone(),
+                &VoiceGrantParams {
+                    device_id: self.device_id,
+                    session_ids: [self.session_id()].into_iter().collect(),
+                    actions: Nullable(None),
+                },
+            )
+            .await
+    }
+
+    /// Asks for a session under `action_id`.
+    async fn create_session_as(
+        &self,
+        action_id: ActionId,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>
+    {
+        self.raw
+            .mutate(
+                Method::SessionCreate,
+                action_id,
+                self.target.clone(),
+                &kr_protocol::session::SessionCreateParams {
+                    environment_id: self.host.environment_id,
+                    presentation: kr_protocol::session::Presentation::Attach,
+                    shell: Nullable::some("/bin/sh".to_owned()),
+                    shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                    cwd: Nullable::null(),
+                    dimensions: Nullable::null(),
+                    worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                    palette: Nullable::null(),
+                    environment_snapshot: Vec::new(),
+                    launch_profile: kr_protocol::session::LaunchProfile::default(),
+                    terminal: Nullable::null(),
+                },
+            )
+            .await
+    }
+}
+
+/// KR-REQ-09.07: `(actor, action)` is one key across every route a device reaches. An identifier a
+/// voice mutation has used is not free for a session create, and the other way round: the second
+/// route is refused with `ID_CONFLICT` and nothing it names is dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_action_identifier_is_one_action_across_the_voice_and_session_routes() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::new(OfflineProvider::default()),
+        &[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::SessionCreate,
+        ],
+        None,
+    )
+    .await;
+
+    // A voice mutation spent the identifier, and a session create under it is a reused identifier.
+    let first = ActionId::new(kr_ipc::new_uuid());
+    voice
+        .grant_as(first)
+        .await
+        .expect("the voice grant is written under the identifier");
+    let reused = voice
+        .create_session_as(first)
+        .await
+        .expect_err("a session create under an identifier a voice mutation used is refused");
+    assert_eq!(
+        reused.code,
+        kr_protocol::error::ErrorCode::IdConflict,
+        "{reused:?}"
+    );
+
+    // The other way round: the create spent the identifier first, and the voice mutation is
+    // refused.
+    let second = ActionId::new(kr_ipc::new_uuid());
+    let _ = voice.create_session_as(second).await;
+    let reused = voice
+        .grant_as(second)
+        .await
+        .expect_err("a voice mutation under an identifier a session create used is refused");
+    assert_eq!(
+        reused.code,
+        kr_protocol::error::ErrorCode::IdConflict,
+        "{reused:?}"
     );
     voice.raw.close();
     voice.host.stop().await;

@@ -420,8 +420,11 @@ impl Controller {
             return respond(
                 mutation.request_id,
                 self.voice_mutation(
-                    actor_id,
-                    actor,
+                    super::voice_actions::VoiceIngress {
+                        actor_id,
+                        actor,
+                        route: None,
+                    },
                     mutation,
                     method,
                     authority_revision,

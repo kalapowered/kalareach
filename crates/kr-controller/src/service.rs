@@ -886,6 +886,10 @@ mod a_voice_grant_on_the_floor;
 #[cfg(test)]
 mod a_delegation_that_is_asked_again;
 
+/// An action an earlier build claimed in the grant store alone, as the route check finds it.
+#[cfg(test)]
+mod a_voice_receipt_from_an_earlier_build;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

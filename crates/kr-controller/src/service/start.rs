@@ -449,6 +449,8 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
+        // The routes of the actions an earlier build claimed in the grant store alone.
+        devices.adopt_receipts_as_routes()?;
         // The offline bound's time, taken as the policy holding it is restored and before anything
         // remote is decided under it: from what this boot recorded of it, advanced by the boot
         // clock, and never less than this host's reading of UTC says.

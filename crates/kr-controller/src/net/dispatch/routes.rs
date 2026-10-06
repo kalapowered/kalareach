@@ -983,6 +983,14 @@ impl RemoteConnection {
                     );
                 }
                 let actor_id = self.device.principal();
+                // A voice mutation claims its action identity the way every other mutation does,
+                // with this host named as the owner of what it produces. The voice service keeps
+                // its own record of the answer, and this claim is what makes `(verified actor,
+                // action)` one key across every route: an identifier a voice mutation used is not
+                // free for a create or a close, and the other way round.
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
                 // The admission travels with the change, as it does with a project or an
                 // automation mutation, and the voice service asks it again where it writes.
                 let carried = crate::authority::AdmittedMutation {
@@ -990,18 +998,25 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                match self
+                let outcome = self
                     .controller
                     .voice_mutation(
-                        &actor_id,
-                        crate::voice::VoiceActor::Device(self.device.device_id),
+                        crate::service::voice_actions::VoiceIngress {
+                            actor_id: &actor_id,
+                            actor: crate::voice::VoiceActor::Device(self.device.device_id),
+                            route: Some(&crate::service::voice_actions::DeviceRoute {
+                                devices: &self.devices,
+                                actor_id: &actor_id,
+                                mutation,
+                            }),
+                        },
                         mutation,
                         entry.method,
                         validated,
                         carried,
                     )
-                    .await
-                {
+                    .await;
+                match outcome {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: mutation.request_id,
                         outcome: Outcome::Ok(value),

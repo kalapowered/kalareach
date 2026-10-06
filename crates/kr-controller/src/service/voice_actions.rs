@@ -236,13 +236,17 @@ impl Controller {
     /// Returns the refusal the caller is given.
     pub(crate) async fn voice_mutation(
         self: &Arc<Self>,
-        actor_id: &ActorId,
-        actor: crate::voice::VoiceActor,
+        from: VoiceIngress<'_>,
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        let VoiceIngress {
+            actor_id,
+            actor,
+            route,
+        } = from;
         // The admission this mutation was accepted under, as a question the coordinator can ask
         // rather than a figure it has to convert. Everything after this waits — for the claim, for
         // the coordinator's own lock, for the store, for the broker — and the write at the end of
@@ -285,9 +289,21 @@ impl Controller {
             )
             .await;
         // The challenge a device signs admits nothing, so nothing is kept for it: the signed
-        // delegation is the same action under the same identifier, and claims it afresh.
+        // delegation is the same action under the same identifier, and claims it afresh. The route
+        // the ingress claimed goes back first, while this attempt still holds its claim: a request
+        // under the identifier is refused as running until the claim is given back, so no other
+        // attempt can have taken the route in the meantime, and one that comes after takes both
+        // afresh. If the claim then cannot be given back, both stay spent.
         if method == Method::VoiceDelegate && is_a_challenge(&outcome) {
-            self.sharing.grants().release_claim(hold)?;
+            if let Some(route) = route {
+                route.give_back()?;
+            }
+            if let Err(error) = self.sharing.grants().release_claim(hold) {
+                if let Some(route) = route {
+                    route.take_again();
+                }
+                return Err(error);
+            }
             return outcome;
         }
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
@@ -500,6 +516,74 @@ impl Controller {
         // The narrower of the two history scopes, which is what any content this effect answers
         // with is filtered under.
         Ok(kr_voice::narrower_history(&device_grant, &voice_grant))
+    }
+}
+
+/// Who a voice mutation comes from, and what the ingress it came by holds for it.
+pub(crate) struct VoiceIngress<'a> {
+    /// The verified actor the action is de-duplicated under.
+    pub(crate) actor_id: &'a ActorId,
+    /// The device, or the owner at this machine, it acts as.
+    pub(crate) actor: crate::voice::VoiceActor,
+    /// The route a network ingress claimed for the action, which a challenge gives back. None for
+    /// the local door, which claims none.
+    pub(crate) route: Option<&'a dyn ClaimedRoute>,
+}
+
+/// The route a network ingress claimed for an action before it reached the voice service.
+///
+/// A route is the host's record that an identifier is one action whichever route it came by. The
+/// voice service gives it back only for an answer that admitted nothing, and only while it still
+/// holds the claim it took for the same action.
+pub(crate) trait ClaimedRoute: Send + Sync {
+    /// Gives the route back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the route cannot be given back, and it stays claimed.
+    fn give_back(&self) -> Result<()>;
+
+    /// Claims the route again after a give-back whose claim could not be returned, so that the
+    /// identifier stays spent on every route.
+    fn take_again(&self);
+}
+
+/// The route one action claimed in this host's device directory, which is what a network ingress
+/// holds for a voice mutation.
+pub(crate) struct DeviceRoute<'a> {
+    /// The directory the route is recorded in.
+    pub(crate) devices: &'a crate::service::net::devices::DeviceDirectory,
+    /// The verified actor the action is claimed under.
+    pub(crate) actor_id: &'a ActorId,
+    /// The mutation the route was claimed for.
+    pub(crate) mutation: &'a MutationRequest,
+}
+
+impl DeviceRoute<'_> {
+    fn digest(&self) -> Result<kr_protocol::scalars::Digest256> {
+        kr_protocol::digest::mutation_digest(self.mutation, self.actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+}
+
+impl ClaimedRoute for DeviceRoute<'_> {
+    fn give_back(&self) -> Result<()> {
+        self.devices
+            .release_action_route(self.actor_id, self.mutation.action_id, self.digest()?)
+    }
+
+    fn take_again(&self) {
+        // Nothing more to do if it cannot be taken: the claim that could not be given back is what
+        // keeps the identifier spent for voice, and this is the same fault again.
+        if let Ok(digest) = self.digest() {
+            let _ = self.devices.claim_action_route(
+                self.actor_id,
+                self.mutation.action_id,
+                None,
+                digest,
+                kr_ipc::now_ms(),
+            );
+        }
     }
 }
 
