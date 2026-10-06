@@ -175,6 +175,18 @@ pub struct Forwarded {
     pub holds_results_to_scopes: bool,
 }
 
+/// What a link to a worker is opened for, which decides whether its session's closure ends it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Purpose {
+    /// A connection's attachment to the session: its subscription, its reads and its input. The
+    /// session's closure ends it, and the connection is told, so the device reconnects.
+    Attachment,
+    /// One close, held until the answer it carries has been delivered, which is when the worker may
+    /// go on to stop what the session ran. A closure that this close's own answer records does not
+    /// end it, since ending it would tell the worker the answer had been delivered.
+    Close,
+}
+
 /// One remote connection's link to one worker.
 #[derive(Debug)]
 pub struct WorkerProxy {

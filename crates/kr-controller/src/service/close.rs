@@ -79,23 +79,8 @@ impl Controller {
         let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
-            let registry = self.registry.lock().await;
-            let closure = registry.closure(params.session_id)?;
-            drop(registry);
-            return match closure {
-                // A duplicate close returns the existing state rather than closing anything again.
-                Some(closure) => encode(&SessionCloseResult {
-                    session_id: params.session_id,
-                    state: SessionState::Closed,
-                    durability: closure.durability,
-                    closure: Nullable::some(closure),
-                    // The record is the answer, and no worker is left to describe the session.
-                    session: None,
-                }),
-                None => Err(ControllerError::UnknownSession {
-                    session: params.session_id.to_string(),
-                }),
-            };
+            // A duplicate close returns the existing state rather than closing anything again.
+            return self.answer_from_the_closure(params.session_id).await;
         };
         // One budget for the whole exchange, started before the wait for the connection. Section 7
         // gives a closure five seconds to stop its processes and two more to drain them, and this
@@ -103,20 +88,31 @@ impl Controller {
         // hold that connection for every later caller, and the wait for it would be unbounded on
         // both sides of the handover.
         let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
+        #[cfg(test)]
+        self.before_a_close_asks_for_its_link.wait().await;
         let result = {
             // The connection comes first. Waiting for it can take as long as whatever else is using
             // it, and a deadline computed before that wait would hand the worker time that had
             // already been spent queueing.
-            let mut link = tokio::time::timeout_at(budget, self.worker_client(&worker))
-                .await
-                .map_err(|_| {
-                    // Nothing was dispatched: this close never reached the worker, and the link it
-                    // was queueing for belongs to whoever is holding it. The caller can ask again.
-                    ControllerError::supervision(
+            let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await
+            {
+                Ok(Ok(link)) => link,
+                // The worker was in the directory when this close read it and is not now: its
+                // closure was recorded in between, and the record is the answer, as it is to a
+                // close that came after the closure.
+                Ok(Err(ControllerError::UnknownSession { .. })) => {
+                    return self.answer_from_the_closure(params.session_id).await;
+                }
+                Ok(Err(error)) => return Err(error),
+                // Nothing was dispatched: this close never reached the worker, and the link it
+                // was queueing for belongs to whoever is holding it. The caller can ask again.
+                Err(_) => {
+                    return Err(ControllerError::supervision(
                         "the connection to the worker that owns this session did not come free in \
                          time, so nothing was closed",
-                    )
-                })??;
+                    ));
+                }
+            };
             // The admission is checked here rather than before the wait, because this is where
             // the wait was. A deadline that ran out while this close queued does not stop it
             // reaching the worker, because the worker is the only thing that knows whether it
@@ -224,6 +220,32 @@ impl Controller {
                 encode(&reply)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
+        }
+    }
+
+    /// The answer to a close of a session this daemon holds no worker for: the closure record, if
+    /// one is recorded. The record is the answer, and no worker is left to describe the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::UnknownSession`] when no closure is recorded, and an error when
+    /// the registry cannot be read.
+    pub(super) async fn answer_from_the_closure(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ParamsValue> {
+        let closure = self.registry.lock().await.closure(session_id)?;
+        match closure {
+            Some(closure) => encode(&SessionCloseResult {
+                session_id,
+                state: SessionState::Closed,
+                durability: closure.durability,
+                closure: Nullable::some(closure),
+                session: None,
+            }),
+            None => Err(ControllerError::UnknownSession {
+                session: session_id.to_string(),
+            }),
         }
     }
 
@@ -624,6 +646,9 @@ impl Controller {
         // the fact; a worker kept in the directory after it would be a session this daemon still
         // asked about, still counted as work outstanding, and still answered for.
         self.directory.lock().await.remove(record.session_id);
+        // The links remote connections hold to it end with it, and are told. They are ended after
+        // the worker is out of the directory, so a link opened since is refused rather than missed.
+        self.end_proxies_of(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
         // The attention store reads what is left of the session's sources from its journal and
         // then ends its live conditions, on a task of its own: a closure is not held up by it.
