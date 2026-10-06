@@ -237,9 +237,11 @@ async fn adopt(
 ///
 /// Both challenges are made before anything is published. A published worker is one the daemon's
 /// own tasks open connections to at once (the plugin admissions' round among them), and a
-/// connection that presents the daemon's generation fences the one that presented it before, so a
-/// challenge made then can be fenced by the daemon's own link and be answered with a closed
-/// connection. The recovery does not challenge a worker the directory holds, and nor does this.
+/// connection that presents the daemon's generation fences the Authority connection that presented
+/// it before, so a challenge made after the publication can be fenced by the daemon's own link and
+/// be answered with a closed connection. A recovery challenges a worker the daemon holds no link
+/// to. Here the fixture has put the worker in the directory but has started none of the tasks that
+/// open links, which only a publication does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
     let world = Served::recorded().await;
