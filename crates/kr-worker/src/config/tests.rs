@@ -331,11 +331,11 @@ fn environment_additions_resolve_on_the_ladder() {
     }
 }
 
-/// KR-REQ-07.64: the ownership an agent's launch runs under is the document's explicit choice for
-/// that package, read when the resolver is opened, and full ownership for every other package and
-/// for a host with no document or no usable one.
+/// KR-REQ-07.64: the resolver answers the ownership the document records for a package, read when
+/// it is opened, and full ownership for every other package and for a host with no document or no
+/// usable one.
 #[test]
-fn an_agents_entry_chooses_reduced_ownership_for_its_package_only() {
+fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
     use kr_protocol::broker::AgentOwnership;
     use kr_protocol::hostinfo::configuration::AgentChoice;
 
@@ -371,8 +371,8 @@ fn an_agents_entry_chooses_reduced_ownership_for_its_package_only() {
     );
     assert_eq!(chosen.reduced_agents(), vec!["kalareach/codex".to_owned()]);
 
-    // A document this host cannot use chooses nothing: an agent is never put under reduced
-    // ownership by a document it did not read.
+    // A document this host cannot use records nothing: the resolver never answers reduced from a
+    // document it did not read.
     kr_ipc::paths::write_owner_only_file(
         &document_path(&environment),
         br#"{"version": 1, "agents": {"kalareach/codex": {"ownership": "reduced"}, "x": {}}}"#,

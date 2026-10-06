@@ -12,8 +12,8 @@
 //!   revision it was based on is checked again immediately before the write, and a change that
 //!   affects authority fences dispatch before the caller is told it took effect.
 //! * **The report** ([`effective`]). Each value, its source and whether it applies immediately,
-//!   only to new sessions or at the next start, which is what `kr doctor` prints and what a support
-//!   bundle carries.
+//!   only to new sessions, at the next start or to nothing, which is what `kr doctor` prints and
+//!   what a support bundle carries.
 //! * **What the daemon started with** ([`Started`], [`network_check`]). The network section and the
 //!   voice broker's origin are read once, when the daemon starts, from this document and from
 //!   nothing a process inherited; the check says what is in force and whether an edit waits for the
@@ -572,7 +572,8 @@ pub fn effective(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));
-    // The agents the owner chose an ownership profile for, read for the sessions created next.
+    // The ownership the owner wrote down for each package's agent. Nothing acts on it, and the
+    // row says so.
     values.push(configuration::agents_row(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),

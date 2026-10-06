@@ -360,9 +360,10 @@ pub struct HostDoctorResult {
     /// What each admitted package's launch probe reads of its application, as this daemon runs it.
     ///
     /// Section 7 has a launch record the mode its application runs in, and a package declares how
-    /// that is read: the application's own diagnostic. The doctor runs the same declaration for
-    /// the executable this daemon's own search path names, in this daemon's own environment, which
-    /// a launch's may differ from, and says what it read, word for word.
+    /// that is read: the application's own diagnostic. This host starts no launch that records
+    /// one. The doctor runs the same declaration for the executable this daemon's own search path
+    /// names, in this daemon's own environment, which a launch's may differ from, and says what it
+    /// read, word for word.
     pub launch_probes: Vec<LaunchProbeReport>,
 }
 
@@ -407,8 +408,8 @@ impl HostDoctorResult {
 ///
 /// The executable is this daemon's reading of it: the first its package's match rule names on the
 /// daemon's own search path. The probe runs in the daemon's own environment and directory, so a
-/// launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode, and
-/// each launch records the one it read.
+/// launch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode. This
+/// host starts no launch that records a mode of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProbeReport {
@@ -478,7 +479,8 @@ impl LaunchProbeState {
 /// Section 7: diagnostics show the resolved executable, flags, version and integration mode. The
 /// executable here is this host's reading of it: the first the command names on the daemon's own
 /// search path, with the version a signed qualification record names for its digest. A session
-/// whose own search path differs can find another, and each launch records the one it ran.
+/// whose own search path differs can find another, and a launch the host records names the one it
+/// ran.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandIntegrationReport {
@@ -695,7 +697,8 @@ pub struct EffectiveValue {
     pub origin: Nullable<String>,
     /// The allowlisted environment variable that supplied it, when one did.
     pub variable: Nullable<String>,
-    /// When it applies: immediately, only to sessions created afterwards, or at the next start.
+    /// When it applies: immediately, only to sessions created afterwards, at the next start, or
+    /// to nothing, because nothing acts on it.
     pub effect: configuration::ValueEffect,
 }
 
@@ -773,7 +776,8 @@ pub struct CeilingValue {
     pub source: configuration::ValueSource,
     /// The document's path, when the rung had one.
     pub origin: Nullable<String>,
-    /// When it applies: immediately, only to sessions created afterwards, or at the next start.
+    /// When it applies: immediately, only to sessions created afterwards, at the next start, or
+    /// to nothing, because nothing acts on it.
     pub effect: configuration::ValueEffect,
     /// What narrowed the configured value, when something did. For the rights ceiling, which
     /// narrows grants rather than being narrowed, it names the rights the ceiling in force removes
@@ -1905,22 +1909,25 @@ pub mod configuration {
         /// and ends the description process, and no restart is needed for either. No environment
         /// variable reaches them.
         pub descriptions: DescriptionsSelection,
-        /// What the owner or an administrator chose for the agents this host launches, by package
+        /// What the owner or an administrator wrote down for the agents of each package
         /// (`publisher/plugin`).
         ///
         /// Section 7 lets an agent whose own sandbox cannot nest under the session's job run under
-        /// an **explicitly selected** reduced-ownership profile, and this is where that selection
-        /// is made: an entry that names `reduced` for a package, and nothing else, puts that
-        /// package's agent in a job of its own instead of the session's. A package with no entry
-        /// runs under full ownership. Entries are read for the sessions created afterwards.
+        /// an **explicitly selected** reduced-ownership profile. A launch runs an agent under the
+        /// `ownership` its profile records, and nothing reads this section for a launch: every
+        /// profile this host writes records `full`, and this host starts no agent through the
+        /// worker's launch. So the section is validated, kept and reported as `agents.ownership`,
+        /// and a change to it changes nothing a launch does. An entry names `reduced` or `full` for
+        /// one package, and nothing else; a package with no entry is `full`.
         pub agents: BTreeMap<String, AgentChoice>,
     }
 
-    /// What was chosen for one agent's launches.
+    /// What the document records for one agent's launches.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentChoice {
-        /// How completely the session's closure accounts for what this agent starts.
+        /// The ownership recorded for this package's agent. No launch reads it: a launch takes its
+        /// ownership from its profile.
         pub ownership: crate::broker::AgentOwnership,
     }
 
@@ -1954,8 +1961,8 @@ pub mod configuration {
             Self::default()
         }
 
-        /// Returns how completely the session's closure accounts for the agent of one package: the
-        /// owner's explicit choice for it, and full ownership where there is none.
+        /// Returns what the document records for the agent of one package: the owner's explicit
+        /// choice for it, and full ownership where there is none. No launch asks it.
         #[must_use]
         pub fn agent_ownership(&self, package: &str) -> crate::broker::AgentOwnership {
             self.agents
@@ -2922,9 +2929,9 @@ pub mod configuration {
                 }
             }
         }
-        // The packages the owner chose an ownership profile for: each a package's identifier, and
-        // no more of them than a document may name. A misspelt package would be read as no choice
-        // and the agent would run under full ownership, so it is refused instead.
+        // The packages the owner wrote an ownership choice for: each a package's identifier, and no
+        // more of them than a document may name. A misspelt package would read as no choice for
+        // the package the owner meant, so it is refused instead.
         if document.agents.len() > MAX_AGENT_ENTRIES {
             problems.push(
                 Sentence::new()
@@ -3786,8 +3793,8 @@ pub mod configuration {
         ValueSource::Default,
     ];
 
-    /// When a new value takes effect: at once, only for sessions created afterwards, or when the
-    /// host next starts.
+    /// When a new value takes effect: at once, only for sessions created afterwards, when the
+    /// host next starts, or never, because nothing acts on it.
     #[derive(
         Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
     )]
@@ -3801,6 +3808,9 @@ pub mod configuration {
         /// The running host keeps what it started with; the new value applies when it next
         /// starts. A network endpoint and the services it selects are built once, at startup.
         NextStart,
+        /// Nothing the host runs acts on the value: it is validated, kept and reported, and a new
+        /// value changes nothing.
+        NoEffect,
     }
 
     impl ValueEffect {
@@ -3811,6 +3821,7 @@ pub mod configuration {
                 Self::Immediately => "immediately",
                 Self::NewSessionsOnly => "new_sessions_only",
                 Self::NextStart => "next_start",
+                Self::NoEffect => "no_effect",
             }
         }
 
@@ -3821,6 +3832,7 @@ pub mod configuration {
                 Self::Immediately => "immediately",
                 Self::NewSessionsOnly => "to new sessions only",
                 Self::NextStart => "at the next start",
+                Self::NoEffect => "to nothing, because nothing acts on it",
             }
         }
     }
@@ -4426,10 +4438,12 @@ pub mod configuration {
 
     /// The row the document's `agents` section contributes to the effective-value report.
     ///
-    /// It lists the packages whose agent the document selects a reduced-ownership profile for, as
-    /// `publisher/plugin=reduced`, or `none`. The packages are names the owner wrote down, so an
-    /// export carries their class and length and never which agents this host runs. It applies to
-    /// the sessions created after the document says so, and nothing but the document supplies it.
+    /// It lists each package the document names an ownership for, as `publisher/plugin=reduced` or
+    /// `publisher/plugin=full`, or `none`. The packages are names the owner wrote down, so an
+    /// export carries their class and length and never which agents this host runs. Nothing acts
+    /// on the section, since a launch takes its ownership from its profile and this host writes
+    /// every profile as `full`, so the row's effect says that it applies to nothing. Nothing but
+    /// the document supplies it.
     #[must_use]
     pub fn agents_row(
         document: Option<&ConfigurationDocument>,
@@ -4446,7 +4460,7 @@ pub mod configuration {
             .collect();
         super::EffectiveValue::new(
             AGENTS_OWNERSHIP_KEY,
-            "the agents that run under an explicitly selected ownership profile",
+            "the ownership the document names for each package's agent",
             &if chosen.is_empty() {
                 Declared::term("none")
             } else {
@@ -4459,7 +4473,7 @@ pub mod configuration {
             },
             Nullable((!chosen.is_empty()).then(|| origin.to_owned())),
             Nullable::null(),
-            ValueEffect::NewSessionsOnly,
+            ValueEffect::NoEffect,
         )
     }
 
@@ -4785,7 +4799,7 @@ pub mod configuration {
     /// Each one is the `as_str` of an enumeration in this crate. They are listed rather than
     /// derived because a `const` cannot call those methods, and a test asserts the list is exactly
     /// what those methods return.
-    pub const WIRE_WORDS: [&str; 18] = [
+    pub const WIRE_WORDS: [&str; 19] = [
         "ok",
         "warning",
         "failed",
@@ -4802,6 +4816,7 @@ pub mod configuration {
         "immediately",
         "new_sessions_only",
         "next_start",
+        "no_effect",
         "desktop_bound",
         "headless_user",
     ];
@@ -8731,13 +8746,13 @@ mod tests {
         ));
     }
 
-    /// KR-REQ-07.64: an agent runs under reduced ownership only where the document's `agents`
-    /// section chooses it for that package. A package with no entry is fully owned, an edit of
-    /// another setting leaves the section as it was, an entry that names no package, an ownership
-    /// this build does not have or more packages than a document may name is refused, and the
-    /// report lists the choices for the sessions created after the document says so.
+    /// KR-REQ-07.64: the document's `agents` section is the one place an ownership is written
+    /// down for a package. A package with no entry is full, an edit of another setting leaves the
+    /// section as it was, an entry that names no package, an ownership this build does not have or
+    /// more packages than a document may name is refused, and the report lists the choices as a
+    /// value nothing acts on.
     #[test]
-    fn the_agents_section_chooses_reduced_ownership_for_a_package_and_nothing_else_does() {
+    fn the_agents_section_records_an_ownership_for_a_package_and_nothing_else_does() {
         use crate::broker::AgentOwnership;
         use configuration::{AgentChoice, Change, ValueEffect};
 
@@ -8745,7 +8760,7 @@ mod tests {
         assert_eq!(
             empty.agent_ownership("kalareach/codex"),
             AgentOwnership::Full,
-            "nothing chosen is full ownership"
+            "nothing written down is full ownership"
         );
 
         let chosen = configuration::load(Some(
@@ -8760,7 +8775,7 @@ mod tests {
         assert_eq!(
             document.agent_ownership("kalareach/claude-code"),
             AgentOwnership::Full,
-            "a choice for one package is a choice for that package alone"
+            "an entry for one package is an entry for that package alone"
         );
 
         // Another setting's edit keeps the choice: the document is rewritten whole.
@@ -8804,7 +8819,7 @@ mod tests {
         over.agents.remove("kalareach/agent-0");
         assert!(configuration::validate(&over).is_ok());
 
-        // The report lists the choices, as names, for the sessions created afterwards.
+        // The report lists the choices, as names, and says that nothing acts on them.
         let none = configuration::agents_row(None, "/config.json");
         assert_eq!(
             (none.key.as_str(), none.value(), none.source, none.effect),
@@ -8812,7 +8827,7 @@ mod tests {
                 "agents.ownership",
                 "none",
                 ValueSource::Default,
-                ValueEffect::NewSessionsOnly
+                ValueEffect::NoEffect
             )
         );
         let listed = configuration::agents_row(Some(document), "/config.json");
@@ -8855,6 +8870,7 @@ mod tests {
                 configuration::ValueEffect::Immediately,
                 configuration::ValueEffect::NewSessionsOnly,
                 configuration::ValueEffect::NextStart,
+                configuration::ValueEffect::NoEffect,
             ]
             .map(configuration::ValueEffect::as_str),
         );

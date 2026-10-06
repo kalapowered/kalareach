@@ -328,7 +328,7 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
         report.values.len(),
         6 + configuration::SELECTIONS.len() + 1,
         "four preferences, two locations, every selection read at the next start and the agents \
-         the document chooses an ownership profile for"
+         the document names an ownership for"
     );
     for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
@@ -1392,10 +1392,10 @@ fn the_environment_additions_in_force_are_reported_by_name_and_never_by_value() 
     }
 }
 
-/// KR-REQ-07.64: an agent the document chooses reduced ownership for is in the report as a name,
-/// read for the sessions created afterwards; a host with no such choice reports none.
+/// KR-REQ-07.64: an agent the document names reduced ownership for is in the report as a name, and
+/// the report says that nothing acts on it; a host with no such entry reports none.
 #[test]
-fn an_agent_chosen_for_reduced_ownership_is_in_the_report_for_new_sessions() {
+fn an_agent_named_for_reduced_ownership_is_in_the_report_as_a_value_nothing_acts_on() {
     use kr_protocol::broker::AgentOwnership;
     use kr_protocol::hostinfo::configuration::{AgentChoice, ValueSource};
 
@@ -1428,5 +1428,5 @@ fn an_agent_chosen_for_reduced_ownership_is_in_the_report_for_new_sessions() {
     let chosen = reported(&environment);
     assert_eq!(row(&chosen).value(), "kalareach/codex=reduced");
     assert_eq!(row(&chosen).source, ValueSource::HostConfiguration);
-    assert_eq!(row(&chosen).effect, ValueEffect::NewSessionsOnly);
+    assert_eq!(row(&chosen).effect, ValueEffect::NoEffect);
 }

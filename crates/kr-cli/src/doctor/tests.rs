@@ -228,10 +228,11 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
     );
 }
 
-/// KR-REQ-07.64: a package the document chooses reduced ownership for is named with what the choice
-/// costs its closure, one line each; a host that chose for no package prints no such line.
+/// KR-REQ-07.64: a package the document names reduced ownership for is named as an entry no launch
+/// on this host reads, one line each, and its value is reported as applying to nothing; a host that
+/// names no package prints no such line.
 #[test]
-fn an_agent_chosen_for_reduced_ownership_is_named_with_what_it_costs() {
+fn an_agent_named_for_reduced_ownership_is_reported_as_read_by_no_launch() {
     use kr_protocol::broker::AgentOwnership;
     use kr_protocol::hostinfo::configuration::{self, AgentChoice};
 
@@ -265,11 +266,9 @@ fn an_agent_chosen_for_reduced_ownership_is_named_with_what_it_costs() {
     let chosen = lines_of(&document);
     for package in ["kalareach/codex", "kalareach/qoder-cli"] {
         assert!(
-            chosen.iter().any(|line| line.trim_start()
-                == format!(
-                    "agents {package}: reduced ownership; a launch is tracked by start identity \
-                     and its closure never reads complete; the command route does not apply it"
-                )),
+            chosen.iter().any(|line| line.trim_start().starts_with(&format!(
+                "agents {package}: reduced ownership is recorded and no launch on this host reads it"
+            )) && line.contains("; on Windows a launch whose profile records reduced")),
             "{package}: {chosen:?}"
         );
     }
@@ -277,7 +276,8 @@ fn an_agent_chosen_for_reduced_ownership_is_named_with_what_it_costs() {
         chosen.iter().any(|line| line.contains(
             "agents.ownership = kalareach/codex=reduced, kalareach/qoder-cli=reduced from \
              host_configuration"
-        ) && line.contains("applies to new sessions only")),
+        ) && line
+            .contains("applies to nothing, because nothing acts on it")),
         "{chosen:?}"
     );
 }
@@ -471,15 +471,17 @@ fn probed() -> HostDoctorResult {
 }
 
 /// KR-REQ-07.64: the doctor says what each package's probe read of its application, word for word,
-/// where the daemon read it from and that the daemon's own environment is what it ran in; for a
-/// probe that read nothing, that it read none; for one not granted, that it did not run; for an
-/// application the search path does not name, that there was none to ask.
+/// where the daemon read it from, that the daemon's own environment is what it ran in and that no
+/// launch on this host records a mode of its own; for a probe that read nothing, that it read none;
+/// for one not granted, that it did not run; for an application the search path does not name,
+/// that there was none to ask.
 #[test]
 fn the_doctor_shows_what_each_launch_probe_read() {
     let text = text(&doctor_lines(&probed(), false));
     for shown in [
         r#"kalareach/codex 0.3.0: mode "elevated" read from /Users/someone/.local/bin/codex"#,
         "in its own environment, which a launch's may differ from",
+        "this host starts no launch that records a mode of its own",
         "kalareach/one 0.3.0: no mode was read from /opt/one/bin/one",
         "kalareach/two 0.3.0: not run, its installation does not hold launch.probe",
         "kalareach/three 0.3.0: no executable of its application is on this daemon's search path",
