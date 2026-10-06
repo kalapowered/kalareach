@@ -655,6 +655,8 @@ impl Controller {
             before_a_close_asks_for_its_link: ReadPause::default(),
             #[cfg(test)]
             before_a_worker_is_made_known: ReadPause::default(),
+            #[cfg(test)]
+            stopped_at: std::sync::Mutex::new(None),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -732,10 +734,25 @@ impl Controller {
             .await?;
         let directory = {
             let mut registry = controller.registry.lock().await;
-            // A session with a closure has no worker to restore. A row an earlier build's recovery
-            // wrote beside one is removed, with the descriptor it would have been restored from,
-            // before anything reads the rows.
-            for session_id in registry.forget_workers_of_closed_sessions()? {
+            // A session with a closure has no worker to restore, and nothing of it is left to find
+            // before anything reads it. A row an earlier build's recovery wrote beside the closure
+            // is removed (a repair of earlier builds' registries, which goes with
+            // `Registry::forget_workers_of_closed_sessions`). A descriptor beside a closure is
+            // retired at every start, whether or not a row is beside it: a stop between its write
+            // and the section that looks for a closure, a removal that was refused, and a stop
+            // inside the closure's tail each leave one, and nothing running repeats any of them.
+            let mut closed: std::collections::BTreeSet<SessionId> = registry
+                .forget_workers_of_closed_sessions()?
+                .into_iter()
+                .collect();
+            for entry in kr_ipc::descriptor::read_all(&controller.paths)? {
+                if let Ok(descriptor) = entry.descriptor
+                    && registry.closure(descriptor.session_id)?.is_some()
+                {
+                    closed.insert(descriptor.session_id);
+                }
+            }
+            for session_id in closed {
                 if let Err(error) = kr_ipc::descriptor::retire(&controller.paths, session_id) {
                     eprintln!(
                         "kr-controller: the descriptor of the closed session {session_id} could \

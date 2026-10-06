@@ -189,10 +189,14 @@ impl Controller {
         // Whether it was written is looked at once the closure has been: a write that fails after
         // the file has its name (the directory's flush) leaves a descriptor all the same.
         let published = kr_ipc::descriptor::publish(&self.paths, &worker.descriptor);
+        #[cfg(test)]
+        if self.stops_at(super::StopPoint::AfterADescriptorIsWritten) {
+            return Err(Self::stopped(super::StopPoint::AfterADescriptorIsWritten));
+        }
         let registry = self.registry.lock().await;
         if registry.closure(session_id)?.is_some() {
             drop(registry);
-            kr_ipc::descriptor::retire(&self.paths, session_id)?;
+            self.retire_descriptor(session_id)?;
             return Ok(());
         }
         published?;
@@ -213,6 +217,19 @@ impl Controller {
         self.admissions_due();
         drop(registry);
         Ok(())
+    }
+
+    /// Removes a session's published descriptor, which a closed session has none of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists and cannot be removed.
+    pub(super) fn retire_descriptor(&self, session_id: SessionId) -> Result<()> {
+        #[cfg(test)]
+        if self.stops_at(super::StopPoint::AtADescriptorsRetirement) {
+            return Err(Self::stopped(super::StopPoint::AtADescriptorsRetirement));
+        }
+        Ok(kr_ipc::descriptor::retire(&self.paths, session_id)?)
     }
 
     /// The workers the directory holds.
