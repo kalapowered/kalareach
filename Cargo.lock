@@ -1318,6 +1318,7 @@ dependencies = [
  "kr-client",
  "kr-controller",
  "kr-crypto",
+ "kr-describe",
  "kr-ipc",
  "kr-pairing",
  "kr-protocol",
