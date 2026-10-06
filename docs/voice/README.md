@@ -172,18 +172,18 @@ The context the daemon supplies is read from the daemon. The session number, pin
 and shell are read, as is the time at which the session was created. The working directory and time
 are the most recent recorded on the session's description host; if the description host has not seen
 a directory yet, the directory the session started in and the time at which the session was created
-are used instead. The active application and time are the most recent recorded on the session's
-description host; if the description host has not seen a program yet, no active application is
-provided, and the selection carries the reason for withholding it instead. If a model has written
-any text about the session this is also read; this text is marked as written by a local model which
-may be incorrect, and as written at the start of the session, so a grant whose history begins after
-the start of the session is not shown it. The model's text will not be read if a name is pinned.
-Summaries of pending decisions, and messages, are not read as the daemon does not store semantic
-history for workers; the selection carries that reason as withheld. Content of any of the four
-classes selected by the person (file contents, environment variables, scrollback contents, and
-attachment bytes) will not be provided: the companion selects none of these classes, and this daemon
-has no place to read them from, so a request that selects one gets nothing for it and no withheld
-entry.
+are used instead. The active application and time are the most recent program the description host
+saw in the foreground, and it counts as the active application only while its command runs; before
+the host has seen one, and once the command has ended, no active application is provided, and the
+selection carries the reason for withholding it instead. If a model has written any text about the
+session this is also read; this text is marked as written by a local model which may be incorrect,
+and as written at the start of the session, so a grant whose history begins after the start of the
+session is not shown it. The model's text will not be read if a name is pinned. Summaries of pending
+decisions, and messages, are not read as the daemon does not store semantic history for workers; the
+selection carries that reason as withheld. Content of any of the four classes selected by the person
+(file contents, environment variables, scrollback contents, and attachment bytes) will not be
+provided: the companion selects none of these classes, and this daemon has no place to read them
+from, so a request that selects one gets nothing for it and no withheld entry.
 
 What a model wrote and what the description host saw leave the daemon only while the privacy mode is
 in the same state as it was when they were read. Privacy mode removes both when it is turned on, and

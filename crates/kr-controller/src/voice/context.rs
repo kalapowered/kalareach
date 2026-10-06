@@ -175,17 +175,20 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
         approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>>;
 
-    /// The state of privacy mode as it stands now.
+    /// The state of privacy mode as it stands now, which a reading is noted under before it is
+    /// made.
     ///
-    /// What a snapshot carries of a model's text and of what the description host observed is read
-    /// under this state, and privacy mode removes both when it is enabled.
+    /// A snapshot carries a model's text and what the description host observed, and privacy mode
+    /// removes both when it is enabled. A source that cannot read the state without waiting, or at
+    /// all, answers a state that no change of privacy mode publishes, so that [`Self::unmoved`] of
+    /// it is false once the state can be read.
     fn privacy(&self) -> Published;
 
     /// Whether privacy mode is still in the state `decided` and no change of it is being made.
     ///
-    /// A reading that carries a model's text or what the description host observed is released
-    /// only while this holds for the state it was started under. A source that cannot say answers
-    /// no.
+    /// A reading that may carry a model's text or what the description host observed is given
+    /// only while this holds for the state it was noted under; otherwise it is made again. A
+    /// source that cannot say answers no.
     fn unmoved(&self, decided: Published) -> bool;
 }
 
