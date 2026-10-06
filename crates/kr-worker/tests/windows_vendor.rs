@@ -10,7 +10,7 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-07.64 | A sandbox that nests a limited job under the session's launches, breakaway is still refused, and closing the session ends every process the vendor made, the closure reading complete coverage; a session whose job restricts desktops refuses the launch by name and starts nothing; the profile the configuration selected starts the agent in a job of its own, tracked by start identity, ended by the closure and by a worker that dies, and the coverage never reads complete |
+//! | KR-REQ-07.64 | A sandbox that nests a limited job under the session's launches, breakaway is still refused, and closing the session ends every process the vendor made, the closure reading complete coverage; a session whose job restricts desktops refuses the launch by name and starts nothing; a launch profile that records reduced ownership starts the agent in a job of its own, tracked by start identity, ended by the closure and by a worker that dies, and the coverage never reads complete |
 
 #![cfg(windows)]
 
@@ -584,7 +584,10 @@ async fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_b
                 detail.contains("desktops"),
                 "the restriction is named: {detail}"
             );
-            assert!(detail.contains("reduced"), "and what avoids it: {detail}");
+            assert!(
+                detail.contains("a launch whose profile records reduced ownership"),
+                "and what avoids it: {detail}"
+            );
         }
         other => panic!("a named launch failure was expected: {other:?}"),
     }
@@ -601,10 +604,10 @@ async fn kr_req_07_64_a_session_job_that_restricts_desktops_refuses_the_launch_b
     );
 }
 
-/// KR-REQ-07.64: the same session job, with the package's agent explicitly selected for reduced
-/// ownership, starts the agent in a job of its own alone. Its processes are listed by start
-/// identity and the vendor's own job nests under that one, breakaway is still refused, and the
-/// closure ends all of it, reading the coverage as incomplete with the reason in the receipt.
+/// KR-REQ-07.64: the same session job, with a launch profile that records reduced ownership,
+/// starts the agent in a job of its own alone. Its processes are listed by start identity and the
+/// vendor's own job nests under that one, breakaway is still refused, and the closure ends all of
+/// it, reading the coverage as incomplete with the reason in the receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_selected_reduced_profile_starts_the_agent_in_a_job_of_its_own_and_never_reads_complete()
  {

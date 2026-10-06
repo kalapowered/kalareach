@@ -592,8 +592,8 @@ impl OwnedProcesses {
 ///
 /// Section 7's other permitted outcome, an **explicitly selected** reduced-ownership execution
 /// profile, is an agent's and not a session's: no session is quietly given one instead of the
-/// boundary it asked for, and an agent runs under one only where the configuration names its
-/// package. The session's boundary is the job either way, and an agent under the profile is
+/// boundary it asked for, and an agent runs under one only where its launch's profile records
+/// `reduced`. The session's boundary is the job either way, and an agent under the profile is
 /// recorded on it, which keeps the closure's coverage incomplete and puts the reason in its
 /// receipt. Where the job later stops answering, that is recorded as something this host could not
 /// establish, with the same consequence.
