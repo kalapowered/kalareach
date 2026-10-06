@@ -863,64 +863,110 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// What a model wrote of a session, and privacy mode enabled while it is read
+// What a model wrote of a session, and privacy mode changed while it is read
 // ---------------------------------------------------------------------------------------------
 
+/// What happens to privacy mode, through the daemon's own endpoint, right after a read of the
+/// facts, so the change lands after they were read and before the answer is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThenPrivacy {
+    /// Nothing: the control.
+    Stays,
+    /// It is enabled.
+    IsEnabled,
+    /// It is enabled and disabled again, which leaves it off in another generation.
+    IsEnabledAndDisabled,
+}
+
 /// What the description host holds of a session no worker runs here, as the voice service reads
-/// it: a description, and what a model wrote while privacy mode is off. It enables privacy mode
-/// through the daemon's own endpoint once a read has been made, when the test says so, so the
-/// change lands after the facts were read and before the answer is given.
+/// it: a description, and while privacy mode is off what a model wrote and the directory and
+/// program the host observed. It changes privacy mode as the test says once a read has been made.
+/// With `moves_every_time` it also says privacy mode is never in the state a read began in, which
+/// is what a state that keeps changing looks like.
 #[derive(Debug)]
-struct ReadsThenPrivacyIsEnabled {
+struct ReadsThenPrivacyChanges {
     daemon: kr_controller::voice::ControllerFacts,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
-    /// Whether the next read is followed by privacy mode being enabled.
-    enable_after_the_next_read: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether this source has enabled it, after which what a model wrote is not held.
-    enabled: std::sync::atomic::AtomicBool,
+    /// What follows the next read.
+    after_the_next_read: Arc<std::sync::Mutex<ThenPrivacy>>,
+    /// How many reads have been made.
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether this source has enabled privacy mode and left it on, after which nothing the host
+    /// holds is read.
+    on: std::sync::atomic::AtomicBool,
+    moves_every_time: bool,
 }
 
 /// What a model wrote of a session, in the words a voice context carries it.
-const MODEL_TEXT: &str =
-    "described by a local model, which may be wrong: \"Pairing check\": Checks the code-entry flow";
+const MODEL_TEXT: &str = "described by a local model, which may be wrong: \"Pairing check\": \
+     Checks the code-entry flow";
 
-impl kr_controller::voice::SessionFacts for ReadsThenPrivacyIsEnabled {
+/// The directory and the program the description host observed.
+const OBSERVED_DIRECTORY: &str = "/work/observed-by-the-host";
+const OBSERVED_PROGRAM: &str = "cargo-observed-by-the-host";
+
+impl ReadsThenPrivacyChanges {
+    /// Enables or disables privacy mode through the daemon's own endpoint.
+    async fn set_privacy(&self, enabled: bool) {
+        let mut control = LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects to the control endpoint");
+        control
+            .mutate(
+                Method::PrivacySet,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.environment_id),
+                &kr_protocol::privacy::PrivacySetParams { enabled },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("privacy mode is set");
+    }
+}
+
+impl kr_controller::voice::SessionFacts for ReadsThenPrivacyChanges {
     fn snapshot<'a>(
         &'a self,
         _session_id: SessionId,
     ) -> kr_voice::seams::VoiceFuture<'a, kr_controller::voice::SessionSnapshot> {
+        use kr_voice::seams::ContextItem;
         use std::sync::atomic::Ordering;
         Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let at = clock();
+            let held = !self.on.load(Ordering::SeqCst);
             let snapshot = kr_controller::voice::SessionSnapshot {
-                description: Some(kr_voice::seams::ContextItem::new(
-                    "session 3, running /bin/zsh",
+                description: Some(ContextItem::new("session 3, running /bin/zsh", at)),
+                generated: held.then(|| ContextItem::new(MODEL_TEXT, at)),
+                working_directory: Some(ContextItem::new(
+                    if held {
+                        OBSERVED_DIRECTORY
+                    } else {
+                        "/work/started"
+                    },
                     at,
                 )),
-                generated: (!self.enabled.load(Ordering::SeqCst))
-                    .then(|| kr_voice::seams::ContextItem::new(MODEL_TEXT, at)),
+                active_application: held.then(|| ContextItem::new(OBSERVED_PROGRAM, at)),
                 ..kr_controller::voice::SessionSnapshot::default()
             };
-            if self
-                .enable_after_the_next_read
-                .swap(false, Ordering::SeqCst)
-            {
-                let mut control =
-                    LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
-                        .await
-                        .expect("connects to the control endpoint");
-                control
-                    .mutate(
-                        Method::PrivacySet,
-                        ActionId::new(kr_ipc::new_uuid()),
-                        ActionTarget::environment(self.environment_id),
-                        &kr_protocol::privacy::PrivacySetParams { enabled: true },
-                    )
-                    .await
-                    .expect("the call reaches the daemon")
-                    .expect("privacy mode is enabled");
-                self.enabled.store(true, Ordering::SeqCst);
+            let then = std::mem::replace(
+                &mut *self
+                    .after_the_next_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ThenPrivacy::Stays,
+            );
+            match then {
+                ThenPrivacy::Stays => {}
+                ThenPrivacy::IsEnabled => {
+                    self.set_privacy(true).await;
+                    self.on.store(true, Ordering::SeqCst);
+                }
+                ThenPrivacy::IsEnabledAndDisabled => {
+                    self.set_privacy(true).await;
+                    self.set_privacy(false).await;
+                }
             }
             Ok(snapshot)
         })
@@ -939,73 +985,178 @@ impl kr_controller::voice::SessionFacts for ReadsThenPrivacyIsEnabled {
     }
 
     fn unmoved(&self, decided: kr_controller::privacy::Published) -> bool {
-        self.daemon.unmoved(decided)
+        !self.moves_every_time && self.daemon.unmoved(decided)
     }
 }
 
-/// What `voice.context` selected for a session, as the device that asked reads it.
-async fn context_read(host: &Host, voice_session_id: kr_protocol::ids::VoiceSessionId) -> String {
-    let request = kr_protocol::envelope::Request {
-        request_id: kr_protocol::ids::RequestId::new(1),
-        method: Method::VoiceContext.into(),
-        method_version: kr_protocol::method::MethodVersion::V1,
-        params: kr_protocol::envelope::ParamsValue::from_typed(&VoiceContextParams {
-            voice_session_id,
-            session_id: host.session_id,
-            selected: CanonicalSet::from_iter([]),
-            delegation_id: Nullable::null(),
-        })
-        .expect("encodes"),
-    };
-    let kr_protocol::envelope::ControlFrame::Response(response) =
-        host.voice.read_frame(host.device_id, &request).await
-    else {
-        panic!("a read is answered with a response");
-    };
-    let kr_protocol::envelope::Outcome::Ok(value) = response.outcome else {
-        panic!("the read was refused: {:?}", response.outcome);
-    };
-    let result: kr_protocol::voice::VoiceContextResult = value.to_typed().expect("decodes");
-    serde_json::to_string(&result.selection).expect("the selection is text")
+/// A daemon whose voice service reads through [`ReadsThenPrivacyChanges`], with a call started,
+/// and what the test holds of the source.
+struct Described {
+    host: Host,
+    voice_session_id: kr_protocol::ids::VoiceSessionId,
+    after_the_next_read: Arc<std::sync::Mutex<ThenPrivacy>>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// KR-REQ-15.20, KR-REQ-22.17 and KR-REQ-24.11: what a model wrote of a session reaches a device in
-/// a voice context only while the privacy state it was read under holds. A read that is made while
-/// privacy mode is off and answered after it was enabled gives the context the daemon holds of the
-/// session with none of it, and the control is the same read with nothing changed in between.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_context_read_while_privacy_mode_is_enabled_carries_no_model_text() {
-    let enable = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let host = host_reading({
-        let enable = Arc::clone(&enable);
-        move |controller, endpoint, environment_id| {
-            Arc::new(ReadsThenPrivacyIsEnabled {
-                daemon: kr_controller::voice::ControllerFacts::new(Arc::downgrade(controller)),
-                endpoint: endpoint.clone(),
-                environment_id,
-                enable_after_the_next_read: enable,
-                enabled: std::sync::atomic::AtomicBool::new(false),
-            })
+impl Described {
+    async fn start(moves_every_time: bool) -> Self {
+        let after_the_next_read = Arc::new(std::sync::Mutex::new(ThenPrivacy::Stays));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = host_reading({
+            let (after_the_next_read, reads) =
+                (Arc::clone(&after_the_next_read), Arc::clone(&reads));
+            move |controller, endpoint, environment_id| {
+                Arc::new(ReadsThenPrivacyChanges {
+                    daemon: kr_controller::voice::ControllerFacts::new(Arc::downgrade(controller)),
+                    endpoint: endpoint.clone(),
+                    environment_id,
+                    after_the_next_read,
+                    reads,
+                    on: std::sync::atomic::AtomicBool::new(false),
+                    moves_every_time,
+                })
+            }
+        })
+        .await;
+        host.grant_voice(None).await;
+        let voice_session_id = host.start_voice().await;
+        Self {
+            host,
+            voice_session_id,
+            after_the_next_read,
+            reads,
         }
-    })
-    .await;
-    host.grant_voice(None).await;
-    let voice_session_id = host.start_voice().await;
+    }
 
-    let shown = context_read(&host, voice_session_id).await;
-    assert!(shown.contains("Pairing check"), "the control: {shown}");
+    /// Has the next read followed by `then`.
+    fn then(&self, then: ThenPrivacy) {
+        *self
+            .after_the_next_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = then;
+    }
 
-    enable.store(true, std::sync::atomic::Ordering::SeqCst);
-    let held = context_read(&host, voice_session_id).await;
+    /// How many reads have been made so far.
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// What `voice.context` answered, as the device that asked reads it.
+    async fn context(&self) -> kr_protocol::envelope::Outcome {
+        let request = kr_protocol::envelope::Request {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            method: Method::VoiceContext.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: kr_protocol::envelope::ParamsValue::from_typed(&VoiceContextParams {
+                voice_session_id: self.voice_session_id,
+                session_id: self.host.session_id,
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            })
+            .expect("encodes"),
+        };
+        let kr_protocol::envelope::ControlFrame::Response(response) = self
+            .host
+            .voice
+            .read_frame(self.host.device_id, &request)
+            .await
+        else {
+            panic!("a read is answered with a response");
+        };
+        response.outcome
+    }
+
+    /// What `voice.context` selected for the session, as text.
+    async fn selected(&self) -> String {
+        let kr_protocol::envelope::Outcome::Ok(value) = self.context().await else {
+            panic!("the read was refused");
+        };
+        let result: kr_protocol::voice::VoiceContextResult = value.to_typed().expect("decodes");
+        serde_json::to_string(&result.selection).expect("the selection is text")
+    }
+}
+
+/// Whether a selection carries anything a model wrote or the description host observed.
+fn carries_the_hosts_text(selection: &str) -> bool {
+    [
+        "Pairing check",
+        "local model",
+        OBSERVED_DIRECTORY,
+        OBSERVED_PROGRAM,
+    ]
+    .iter()
+    .any(|text| selection.contains(text))
+}
+
+/// KR-REQ-15.20, KR-REQ-22.17 and KR-REQ-24.11: what a model wrote of a session, and the directory
+/// and program the description host observed, reach a device in a voice context only while the
+/// privacy state they were read under holds. A read that is made while privacy mode is off and
+/// answered after it was enabled gives the context the daemon holds of the session with none of
+/// it, and the control is the same read with nothing changed in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_read_while_privacy_mode_is_enabled_carries_nothing_the_host_holds() {
+    let described = Described::start(false).await;
+
+    let shown = described.selected().await;
     assert!(
-        !held.contains("Pairing check") && !held.contains("local model"),
-        "{held}"
+        shown.contains("Pairing check")
+            && shown.contains(OBSERVED_DIRECTORY)
+            && shown.contains(OBSERVED_PROGRAM),
+        "the control: {shown}"
     );
+    assert_eq!(described.reads(), 1);
+
+    described.then(ThenPrivacy::IsEnabled);
+    let held = described.selected().await;
+    assert!(!carries_the_hosts_text(&held), "{held}");
     assert!(
-        held.contains("/bin/zsh"),
+        held.contains("/bin/zsh") && held.contains("/work/started"),
         "what the daemon holds stays: {held}"
     );
-    host.clients.abort();
+    assert_eq!(
+        described.reads(),
+        3,
+        "the read that was moved under is read again"
+    );
+    described.host.clients.abort();
+}
+
+/// KR-REQ-15.20 and KR-REQ-24.11: privacy mode enabled and disabled again while a context is read
+/// leaves it in the state it began in and in another generation, and what was read before the
+/// enablement is not given: the read is made again. It is the generation that tells the two
+/// apart, so a check of whether privacy mode is on would give the answer that was read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_read_that_privacy_mode_was_enabled_and_disabled_under_is_read_again() {
+    let described = Described::start(false).await;
+    described.then(ThenPrivacy::IsEnabledAndDisabled);
+    let selected = described.selected().await;
+    assert_eq!(described.reads(), 2, "{selected}");
+    assert!(
+        selected.contains("Pairing check"),
+        "read again, as privacy mode is off: {selected}"
+    );
+    described.host.clients.abort();
+}
+
+/// KR-REQ-15.20: privacy mode that keeps changing under a context read refuses it after three
+/// reads, as a transient refusal that the device's client retries, and gives no context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_read_privacy_mode_keeps_moving_under_is_refused_as_transient() {
+    let described = Described::start(true).await;
+    let kr_protocol::envelope::Outcome::Error(refusal) = described.context().await else {
+        panic!("a read that never holds is refused");
+    };
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert_eq!(
+        refusal.code.retry_category(),
+        kr_protocol::error::RetryCategory::Transient
+    );
+    assert_eq!(described.reads(), 3);
+    described.host.clients.abort();
 }
 
 // ---------------------------------------------------------------------------------------------

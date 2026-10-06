@@ -69,9 +69,10 @@ impl SessionFacts for ControllerFacts {
 
     fn privacy(&self) -> Published {
         // Read without waiting, since this runs on the executor. A change of privacy mode that is
-        // being made, and a daemon that has gone, are read as a state no change of it ever
-        // published, privacy mode on in the generation before the first, which no later check of
-        // the state finds again.
+        // being made, and a daemon that has gone, are read as privacy mode on in generation 0. No
+        // change of privacy mode publishes that: a host that never enabled it is at generation 0
+        // with it off, and enabling advances the generation, so no later check of the state
+        // finds this one again.
         self.daemon
             .upgrade()
             .and_then(|daemon| {
