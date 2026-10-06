@@ -684,6 +684,13 @@ impl Controller {
         controller.automation.bind(Arc::downgrade(&controller));
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
         // advanced to, because that is what fences the daemon it replaced.
+        // The sessions of earlier builds are noted to the transfer service before anything else
+        // looks at one, and before any sweep: it cannot know which of their drafts their workers
+        // were sent.
+        controller
+            .transfer
+            .note_sessions_of_earlier_builds(&controller)
+            .await?;
         let directory = {
             let registry = controller.registry.lock().await;
             Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
