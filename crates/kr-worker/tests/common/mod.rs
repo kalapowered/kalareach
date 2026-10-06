@@ -48,12 +48,43 @@ pub fn carries(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Returns how many times `haystack` carries `needle`.
+/// Returns how many times `haystack` carries `needle`, as a terminal reads the bytes.
+///
+/// A line the application ends with a line feed arrives as a carriage return and a line feed, and a
+/// pseudo-terminal under load can carry that carriage return twice: a retained line has ended
+/// `all written\r\r\n`. A terminal takes the second return for the first again, so a run of
+/// carriage returns before a line feed counts as one, in the marker as in the output, and a marker
+/// finds its line whichever way the line arrived.
 pub fn carried_times(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
+    let needle = returns_before_line_feeds_as_one(needle);
+    returns_before_line_feeds_as_one(haystack)
         .windows(needle.len())
         .filter(|window| *window == needle)
         .count()
+}
+
+/// Returns `bytes` with every run of carriage returns that a line feed follows cut down to one.
+fn returns_before_line_feeds_as_one(bytes: &[u8]) -> Vec<u8> {
+    let mut read = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\r' {
+            let run = bytes[at..]
+                .iter()
+                .take_while(|byte| **byte == b'\r')
+                .count();
+            let before_a_line_feed = bytes.get(at + run) == Some(&b'\n');
+            read.extend(std::iter::repeat_n(
+                b'\r',
+                if before_a_line_feed { 1 } else { run },
+            ));
+            at += run;
+        } else {
+            read.push(bytes[at]);
+            at += 1;
+        }
+    }
+    read
 }
 
 /// Reads everything the session has retained of what the application wrote.
