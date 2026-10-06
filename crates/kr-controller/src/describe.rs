@@ -413,6 +413,12 @@ impl DescribeModule {
         self.links.watch(controller, host, worker);
     }
 
+    /// Whether one session's facts are being read at its worker. For this crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn reading(&self, session_id: SessionId) -> bool {
+        self.links.reads(session_id)
+    }
+
     /// Stops reading one session's facts.
     pub(crate) fn stop_links(&self, session_id: SessionId) {
         self.links.stop(session_id);

@@ -447,18 +447,25 @@ async fn a_refusal_the_worker_gives_leaves_its_link_and_the_lease() {
 /// revision in force, so its lease renews.
 ///
 /// The worker runs on a runtime of its own, which every task it starts belongs to, so that letting
-/// the fixture go ends them all together.
+/// the fixture go ends them all together. The worker is stopped before the daemon is let go, and
+/// the daemon before the tree they share.
 pub(super) struct Served {
+    /// Declared first, so the worker is stopped before anything else is let go.
+    _stopping: Stopping,
     pub(super) controller: Arc<Controller>,
     pub(super) worker: crate::directory::KnownWorker,
     pub(super) session_id: SessionId,
-    service: Arc<kr_worker::service::WorkerService>,
-    worker_runtime: Option<tokio::runtime::Runtime>,
     /// Declared last, so the tree is removed after the fixture's own handles to it are gone.
     _temp: kr_ipc::testing::TempHost,
 }
 
-impl Drop for Served {
+/// What stops the worker of a [`Served`] when the fixture goes.
+struct Stopping {
+    service: Arc<kr_worker::service::WorkerService>,
+    worker_runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for Stopping {
     /// Signals the shell the worker runs to stop, and then ends every task of the worker and waits
     /// for them to be gone, whether the test ended or failed, so that the worker's session no
     /// longer holds the tree when it is removed. The shell is not waited for: the worker offers
@@ -600,12 +607,38 @@ impl Served {
             .insert(worker.clone(), None);
         world::acknowledged(&controller, session_id);
         Self {
+            _stopping: Stopping {
+                service,
+                worker_runtime: Some(worker_runtime),
+            },
             controller,
             worker,
             session_id,
-            service,
-            worker_runtime: Some(worker_runtime),
             _temp: temp,
+        }
+    }
+
+    /// The same worker, still running, with a daemon that is started again on the environment
+    /// after the first has let go of it: what the first left in the registry and on disk is all the
+    /// second has to go by, as a daemon that starts finds its workers.
+    pub(super) async fn restarted(self) -> Self {
+        let Self {
+            _stopping,
+            controller,
+            worker,
+            session_id,
+            _temp,
+        } = self;
+        drop(controller);
+        let controller = crate::testing::taken_over(|| Controller::start(world::setup(&_temp)))
+            .await
+            .expect("the daemon starts again");
+        Self {
+            _stopping,
+            controller,
+            worker,
+            session_id,
+            _temp,
         }
     }
 

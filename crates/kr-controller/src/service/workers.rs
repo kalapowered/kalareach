@@ -166,6 +166,31 @@ impl Controller {
         Ok(())
     }
 
+    /// The workers the directory holds whose sessions have no closure, for a caller that holds the
+    /// registry's lock (`registry`) and acts on them before it lets that go.
+    ///
+    /// A closure is recorded under that lock, and its worker leaves the directory afterwards, on a
+    /// task of its own. A caller that copies the directory and then acts without the lock can act on
+    /// a worker that task has already tidied away. One that holds the lock acts on workers whose
+    /// tidying is still to come, and that tidying undoes what the caller did.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(super) async fn workers_without_a_closure(
+        &self,
+        registry: &crate::registry::Registry,
+    ) -> Result<Vec<KnownWorker>> {
+        let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let mut open = Vec::with_capacity(workers.len());
+        for worker in workers {
+            if registry.closure(worker.descriptor.session_id)?.is_none() {
+                open.push(worker);
+            }
+        }
+        Ok(open)
+    }
+
     pub(super) async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {
         self.read_from_worker_within(worker, None).await
     }

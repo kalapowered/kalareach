@@ -864,6 +864,11 @@ mod a_closure_that_is_cancelled;
 #[cfg(test)]
 mod a_session_that_closed_is_not_bound_again;
 
+/// A session whose closure is recorded before a daemon starts, or while it does: not restored, not
+/// read by what a start sets going.
+#[cfg(test)]
+mod a_session_that_closed_before_a_start;
+
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
 #[cfg(test)]
