@@ -638,8 +638,10 @@ fn settled_value(settled: Value) -> Value {
 /// KR-REQ-22.01: the setup card, through the three commands it calls and with the parameters it
 /// writes, against the host's own description setup. It shows the exact size and where the fetch
 /// would reach before anything is fetched, and offers no account; a fetch begins only when the card
-/// asks, and the card's cancel stops it and leaves nothing it had written; turning descriptions off
-/// stops a fetch that is running. Every answer is read back into the method's own type.
+/// asks, and the card's cancel stops it while its body is arriving; turning descriptions off stops a
+/// fetch that is running. The answers of setup, of each start of the fetch, of the cancel and of the
+/// setting are read back into the method's own type; the daemon's own suite shows that a cancelled
+/// fetch leaves no file.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_setup_card_shows_the_size_first_and_cancels_and_disables_on_the_host() {
     use kr_protocol::describe::DescriptionDownload;
@@ -714,9 +716,12 @@ async fn the_setup_card_shows_the_size_first_and_cancels_and_disables_on_the_hos
     assert!(!cancelled.can_cancel, "{cancelled:?}");
 
     // Fetch asked for again, and the card's switch turns descriptions off while it runs.
-    host.call("description_download", start())
-        .await
-        .expect("the fetch starts again");
+    let again = setup_of(settled_value(
+        host.call("description_download", start())
+            .await
+            .expect("the fetch starts again"),
+    ));
+    assert_eq!(again.download, DescriptionDownload::Running, "{again:?}");
     server.until_half_sent().await;
     let off = setup_of(settled_value(
         host.call(
