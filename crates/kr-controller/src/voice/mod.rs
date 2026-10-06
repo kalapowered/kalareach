@@ -4,7 +4,10 @@
 //! coordinator depends on the protocol, the client and the cryptography and never on this daemon,
 //! so what reaches it is what this module passes in. That is what makes the data boundary in
 //! `docs/voice/README.md` something a reader can check by reading three implementations rather
-//! than the whole daemon.
+//! than the whole daemon. One rule is this module's own and sits beside the seams rather than in
+//! one of them: [`VoiceModule::read_frame`] gives a context read only while privacy mode is in
+//! the state the read began in, because the text a read carries from the description host leaves
+//! with the answer and not with the read.
 //!
 //! | Seam | What this module gives it |
 //! | --- | --- |
@@ -166,6 +169,9 @@ impl VoiceModule {
     }
 
     /// The coordinator, for a caller that needs it directly.
+    ///
+    /// A context read made through it carries no hold against privacy mode being enabled while it
+    /// is made: the daemon's own reads go through [`Self::read_frame`].
     #[must_use]
     pub const fn coordinator(&self) -> &Coordinator {
         &self.coordinator
