@@ -56,6 +56,37 @@ fn actor(name: &str) -> ActorId {
     ActorId::new(name).expect("a principal")
 }
 
+/// A revocation's barrier once the daemon has announced it as often as it takes.
+///
+/// A worker refuses an announcement that arrives while its dispatch boundary is held, and says to
+/// come again: a generation another link installs, a mutation and a maintenance pass each hold it
+/// for a moment, and a refused announcement is `pending` for that worker, which is the contract
+/// and not a failure. The refusal also stops the evidence pages that follow an acknowledgement, so
+/// the names of what the fence took back arrive with the announcements that follow. A test that
+/// needs the whole of a revocation therefore announces again, as the daemon does for a worker it
+/// reported pending, until `settled` accepts the report, and never reads the first answer as the
+/// last.
+async fn announced_until(
+    controller: &Controller,
+    first: kr_protocol::action::RevocationBarrier,
+    settled: impl Fn(&kr_protocol::action::RevocationBarrier) -> bool,
+) -> kr_protocol::action::RevocationBarrier {
+    let mut barrier = first;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !settled(&barrier) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the revocation did not settle however often it was announced: {barrier:?}"
+        );
+        tokio::task::yield_now().await;
+        barrier = controller
+            .announce_authority_revision()
+            .await
+            .expect("the revocation is announced again");
+    }
+    barrier
+}
+
 fn action(byte: u8) -> ActionId {
     ActionId::new(Uuid::from_bytes([byte; 16]))
 }
@@ -2262,12 +2293,12 @@ async fn an_intent_admitted_and_never_dispatched_is_taken_back_and_never_takes_e
 
     // The revocation goes out through the daemon's own path. The fence finds the intent this host
     // admitted and never dispatched, takes it back, and names it.
-    let barrier = hosted
+    let first = hosted
         .controller
         .revoke_authority()
         .await
         .expect("the revocation is recorded");
-    assert!(barrier.holds(), "{barrier:?}");
+    let barrier = announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
     let reported = barrier
         .workers
         .iter()
@@ -2414,12 +2445,19 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
         }
     }
 
-    let barrier = hosted
+    let first = hosted
         .controller
         .revoke_authority()
         .await
         .expect("the revocation is recorded");
-    assert!(barrier.holds(), "{:?}", barrier.pending());
+    let barrier = announced_until(&hosted.controller, first, |barrier| {
+        barrier.holds()
+            && barrier
+                .workers
+                .iter()
+                .any(|worker| worker.rejected_actions.len() == affected)
+    })
+    .await;
     let reported = barrier
         .workers
         .iter()
