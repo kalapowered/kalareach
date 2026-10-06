@@ -303,9 +303,10 @@ fn queue_largest(service: &mut DescriptionService, session_id: SessionId, base: 
 /// are each sent through the daemon's service to the real process, and none of them is refused for
 /// its size: the Arabic and Hebrew contexts cost twice the tokens of the Latin one, and the emoji
 /// context more than the window, and each is made to fit what a job may spend on its prompt. No job
-/// fails, no process is ended, and no restart is counted, so descriptions are not delayed or paused
-/// for every session on the host because one session is large. A job that runs to its deadline is
-/// the benchmark's to measure and is not what this decides.
+/// fails or is refused, no process is ended, and no restart is counted for a size, so descriptions
+/// are not delayed or paused for every session on the host because one session is large. A job that
+/// runs to its deadline on a host slower than the reference is the benchmark's to measure and is
+/// not what this decides.
 #[test]
 fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its_size() {
     let Some(placed) = Placed::real_weights(
@@ -377,17 +378,14 @@ fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its
             !the_process_ended(&reports),
             "{script}: the process was ended: {reports:?}"
         );
-        assert_eq!(driver.service().inference_restarts(), 0, "{script}");
         assert!(
-            !matches!(
-                driver.service().resource_state(),
-                kr_describe::resource::ResourceState::ResourcePaused {
-                    reason: kr_describe::resource::PauseReason::InferenceFailed,
-                    ..
-                }
-            ),
-            "{script}"
+            !reports.iter().any(|report| matches!(
+                report,
+                Report::Outcome(Outcome::Failed { .. } | Outcome::Rejected { .. })
+            )),
+            "{script}: a job refused for its size, or an answer refused: {reports:?}"
         );
+        assert_eq!(driver.service().inference_restarts(), 0, "{script}");
     }
 }
 
