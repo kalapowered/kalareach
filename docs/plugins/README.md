@@ -181,8 +181,9 @@ installation's own `kr-hook`, under the launch's registration and credential.
 
 A package can tell the host how to read the mode its application will run in. The `launch_probe`
 member of the manifest names the application's own diagnostic command, which the host runs before a
-launch the worker starts and for `kr doctor`. This host starts no agent through the worker's launch,
-so on it only `kr doctor` runs the probe.
+launch the worker starts and whenever it reads its diagnostics (`host.doctor`, which `kr doctor`
+makes). This host starts no agent through the worker's launch, so on it only that read runs the
+probe; `kr plugin integration enable` and `disable` make it too, and a paired device may.
 
 - `arguments` are what the host passes to the application's executable: one to eight, each one line
   of 1 to 256 bytes, so the application is never started bare.
@@ -198,9 +199,9 @@ so on it only `kr doctor` runs the probe.
   application cannot run with in a Windows service session. A launch there whose mode is listed
   fails by name before anything starts.
 
-The probe runs only while the installation holds `launch.probe`. The owner confirms it on every
-release, because it runs the application's own executable with arguments the package chose. The
-grant shows the package's `grant_statement` beside the exact list `LaunchProbe::statement` renders:
+The probe runs only while the installation holds `launch.probe`. The owner confirms the capability
+on every release, because it runs the application's own executable with arguments the package chose.
+`LaunchProbe::statement` renders what the declaration does, exactly: when the application runs, then
 each argument, each carried option, the pointer and each refused word, nothing shortened. A package
 that declares a probe states `"sdk_range": ">=0.1.4, <0.2.0"`, because a host on an earlier contract
 refuses a manifest member it does not know. The validator refuses a probe without the capability
