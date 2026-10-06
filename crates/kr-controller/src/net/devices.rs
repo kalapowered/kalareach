@@ -959,6 +959,76 @@ impl DeviceDirectory {
         })
     }
 
+    /// Gives every action the grant store holds a receipt for, and this directory holds no route
+    /// for, the route it would have recorded.
+    ///
+    /// A voice mutation was claimed only in the grant store by an earlier build, so an identifier
+    /// it spent is free for every route that checks this directory. A route already recorded for
+    /// an action is left as it is. It is for devices' actions only: the receipts of an actor at
+    /// this machine's own socket are not reached through a network connection.
+    ///
+    /// Removable once no install can hold such a receipt: when every supported upgrade starts
+    /// from a build that records the route with the claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the routes cannot be written.
+    pub fn adopt_receipts_as_routes(&self) -> Result<()> {
+        self.with(|connection| {
+            let held: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                 WHERE type = 'table' AND name = 'authority_receipts')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !held {
+                return Ok(());
+            }
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO network_actions
+                         (actor_id, action_id, session_id, payload_digest, recorded_at_ms)
+                     SELECT actor_id, action_id, NULL, payload_digest, claimed_at_ms
+                       FROM authority_receipts
+                      WHERE actor_id LIKE 'device:%'",
+                    [],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// Gives back the route of an action whose answer admitted nothing, and says nothing was kept.
+    ///
+    /// Only the route this host holds for `payload_digest` goes, and only one that names no
+    /// session: an action that was dispatched, or one another payload claimed, keeps its route. It
+    /// is for an answer that asks the caller to come back with more under the same identifier,
+    /// which is a different payload, so the identifier is free for it exactly as it was before
+    /// the first one was asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be removed.
+    pub fn release_action_route(
+        &self,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        payload_digest: Digest256,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM network_actions
+                 WHERE actor_id = ?1 AND action_id = ?2 AND payload_digest = ?3
+                   AND session_id IS NULL",
+                params![
+                    actor_id.as_str(),
+                    action_id.get().as_bytes().as_slice(),
+                    payload_digest.as_bytes().as_slice(),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
     /// Returns where one actor's action went, and what payload it carried.
     ///
     /// # Errors

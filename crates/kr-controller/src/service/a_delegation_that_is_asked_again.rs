@@ -15,6 +15,7 @@ use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, ActionWindowId, RequestId, SessionId, VoiceSessionId};
 use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
     VoiceAction, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationId,
@@ -24,8 +25,9 @@ use kr_protocol::voice::{
 use kr_transport::window::{AcceptedDeadline, DeadlineBound};
 
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, scripted};
-use super::a_voice_grant_on_the_floor::paired;
-use crate::grants::ActionClaim;
+use super::a_voice_grant_on_the_floor::{paired, paired_holding};
+use super::voice_actions::VoiceIngress;
+use crate::grants::{ActionClaim, ActionRecord};
 use crate::service::Controller;
 use crate::service::net::tests::{daemon_on, manual_clocks};
 
@@ -127,8 +129,11 @@ async fn ask(
     let revision = controller.policy().authority_revision();
     controller
         .voice_mutation(
-            actor_id,
-            crate::voice::VoiceActor::Device(device_id),
+            VoiceIngress {
+                actor_id,
+                actor: crate::voice::VoiceActor::Device(device_id),
+                route: None,
+            },
             mutation,
             Method::VoiceDelegate,
             revision,
@@ -429,5 +434,156 @@ async fn a_receipt_for_an_effect_is_given_back_as_it_was_kept() {
     assert_eq!(
         given.to_typed::<VoiceDelegateResult>().expect("a result"),
         kept
+    );
+}
+
+/// The device directory's own route for one delegation, watched at the moment it is given back:
+/// the claim it was taken beside must still be held then.
+struct Route<'a> {
+    real: super::voice_actions::DeviceRoute<'a>,
+    controller: &'a Controller,
+    claim_held_when_given_back: std::sync::atomic::AtomicBool,
+}
+
+impl super::voice_actions::ClaimedRoute for Route<'_> {
+    fn give_back(&self) -> crate::error::Result<()> {
+        let digest = kr_protocol::digest::mutation_digest(self.real.mutation, self.real.actor_id)
+            .expect("a digest");
+        let held = self
+            .controller
+            .sharing()
+            .grants()
+            .recorded_action(self.real.actor_id, self.real.mutation.action_id, &digest)
+            .expect("the store answers");
+        self.claim_held_when_given_back.store(
+            matches!(held, Some(ActionRecord::InFlight)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.real.give_back()
+    }
+
+    fn take_again(&self) {
+        self.real.take_again();
+    }
+}
+
+/// KR-REQ-09.07: the route a delegation's challenge claimed goes back while the voice claim is still
+/// held, and the claim goes back after it. The route store and the grant store are the real ones: a
+/// request that comes after both takes them afresh, with the signed delegation's other payload, and
+/// a route given back is not claimed again by the same payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_holding(
+        &controller,
+        50,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        None,
+    );
+    let actor_id = device.principal();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let voice_session_id = call_over(
+        &controller,
+        device.device_id,
+        session_id,
+        &[VoiceAction::ShellInput],
+    )
+    .await;
+    let mutation = delegation_of(
+        temp.environment_id(),
+        voice_session_id,
+        session_id,
+        VoiceAction::ShellInput,
+    );
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
+    // What the network ingress does before the voice service: claim the route.
+    assert_eq!(
+        controller
+            .devices()
+            .claim_action_route(
+                &actor_id,
+                mutation.action_id,
+                None,
+                digest,
+                kr_ipc::now_ms(),
+            )
+            .expect("the route is claimed"),
+        crate::service::net::devices::ActionRoute::Recorded
+    );
+    let route = Route {
+        real: super::voice_actions::DeviceRoute {
+            devices: controller.devices(),
+            actor_id: &actor_id,
+            mutation: &mutation,
+        },
+        controller: &controller,
+        claim_held_when_given_back: std::sync::atomic::AtomicBool::new(false),
+    };
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(300))
+            .expect("a deadline five minutes out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+    let carried =
+        crate::service::a_close_a_worker_never_answers::admission(&controller, accepted).await;
+    let answered = controller
+        .voice_mutation(
+            VoiceIngress {
+                actor_id: &actor_id,
+                actor: crate::voice::VoiceActor::Device(device.device_id),
+                route: Some(&route),
+            },
+            &mutation,
+            Method::VoiceDelegate,
+            controller.policy().authority_revision(),
+            carried,
+        )
+        .await
+        .expect("the first submission is answered");
+    assert!(
+        matches!(
+            answered
+                .to_typed::<VoiceDelegateResult>()
+                .expect("a result")
+                .outcome,
+            VoiceDelegationOutcome::ConfirmationRequired { .. }
+        ),
+        "the challenge is the answer"
+    );
+    assert!(
+        route
+            .claim_held_when_given_back
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the voice claim was still held when the route went back"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .recorded_action(&actor_id, mutation.action_id, &digest)
+            .expect("the store answers")
+            .is_none(),
+        "the claim goes back too"
+    );
+    // Both stores are free for the signed delegation, which is the same action with another
+    // payload.
+    assert_eq!(
+        controller
+            .devices()
+            .claim_action_route(
+                &actor_id,
+                mutation.action_id,
+                None,
+                kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+                kr_ipc::now_ms(),
+            )
+            .expect("the route is claimed again"),
+        crate::service::net::devices::ActionRoute::Recorded,
+        "the identifier is free on the route store"
     );
 }
