@@ -39,7 +39,7 @@ use kr_protocol::transfer::{
 };
 
 use crate::authority::{AuthorisedDirectory, AuthorisedFile, ObjectPolicy, RelativeName};
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::error::{Result, TransferError};
 use crate::staging::{StagingArea, StorageName};
 use crate::store::{
@@ -56,7 +56,7 @@ pub const READ_GRANT_LIFETIME_MS: u64 = 15 * 60 * 1000;
 /// How large a read is when the service walks a whole file.
 const READ_BUFFER_LEN: usize = 256 * 1024;
 
-/// What a host tells the sweep about a session's retention.
+/// What a host tells the sweep about retention: its sessions' and its own clock's.
 ///
 /// A submitted attachment follows its session's retention policy rather than the seven-day
 /// unused-attachment window, and the transfer service is not the owner of that policy. The host
@@ -66,6 +66,10 @@ const READ_BUFFER_LEN: usize = 256 * 1024;
 /// attachments name. What the host answers is a view taken after those attachments were read, so
 /// every session they name was already one the host knew when it answered. An attachment that is
 /// submitted to some other session after the question was asked is not judged by the answer.
+///
+/// Everything else the sweep lets go of it lets go of by the wall clock, and whether that clock
+/// can be believed is the host's to say: the service reads the time, and the host owns the
+/// contract that decides what a reading is worth.
 pub trait SessionRetention {
     /// Returns those of `sessions` whose retention still covers what was submitted to them.
     ///
@@ -75,18 +79,38 @@ pub trait SessionRetention {
     /// session the host does not list as one that has ended and removes what was submitted to it,
     /// and declining to delete is the answer that cannot lose a file.
     fn retained(&self, sessions: &BTreeSet<SessionId>) -> Result<BTreeSet<SessionId>>;
+
+    /// Returns whether the host can prove where its wall clock stands at `reading`.
+    ///
+    /// `reading` is the service's own reading of the wall clock. The sweep expires a transfer, and
+    /// forgets a de-duplication record, by counting a retention from a reading of it. A clock that
+    /// went backwards and has not been established again makes a reading worth nothing: a record
+    /// stamped while it was wrong looks older, or younger, than it is. While this answers no, the
+    /// sweep lets go of nothing that only the wall clock says is old, and every other part of it
+    /// still runs.
+    ///
+    /// Asked once for each part of the sweep that has something due by the service's own reading,
+    /// before that part lets go of anything: a sweep with nothing to let go of costs the host
+    /// nothing. The part counts from the earlier of `reading` and one taken after the answer.
+    fn clock_is_proven(&self, reading: TimestampMs) -> bool;
 }
 
-/// A retention that keeps everything.
+/// A retention that keeps every submitted attachment with its session, and takes the service's own
+/// clock as proven.
 ///
-/// What a host uses before it has a retention policy to apply, and what the default sweep uses:
-/// declining to delete is the answer that cannot lose a file.
+/// What a host uses before it has a retention policy to apply: declining to delete a submitted
+/// attachment is the answer that cannot lose a file, and a host with no time contract has nothing
+/// better to say about the clock than what the service reads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetainEverything;
 
 impl SessionRetention for RetainEverything {
     fn retained(&self, sessions: &BTreeSet<SessionId>) -> Result<BTreeSet<SessionId>> {
         Ok(sessions.clone())
+    }
+
+    fn clock_is_proven(&self, _reading: TimestampMs) -> bool {
+        true
     }
 }
 
@@ -479,6 +503,21 @@ impl core::fmt::Debug for RaceHook {
     }
 }
 
+/// What a test does in a sweep once the host has answered about its clock.
+#[cfg(feature = "testing")]
+pub(crate) type ClockAnswerHookCallback = dyn Fn(&TransferService) + Send + Sync;
+
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+pub(crate) struct ClockAnswerHook(pub(crate) Arc<ClockAnswerHookCallback>);
+
+#[cfg(feature = "testing")]
+impl core::fmt::Debug for ClockAnswerHook {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ClockAnswerHook(..)")
+    }
+}
+
 /// What a test does with the result a call is about to record on its claim.
 #[cfg(feature = "testing")]
 pub(crate) type CompletionHookCallback = dyn Fn(&Store, &Action, &[u8]) + Send + Sync;
@@ -518,6 +557,9 @@ pub(crate) struct RaceHooks {
     staged_open: std::sync::RwLock<Option<RaceHook>>,
     post_verification: std::sync::RwLock<Option<RaceHook>>,
     completion: std::sync::RwLock<Option<CompletionHook>>,
+    /// Runs in a sweep once the host has said it can prove its clock, before the sweep takes the
+    /// journal to forget what is old. No journal guard is held when it runs.
+    after_the_clock_answer: std::sync::RwLock<Option<ClockAnswerHook>>,
 }
 
 /// The transfer service of one environment.
@@ -542,17 +584,8 @@ pub struct TransferService {
 }
 
 impl TransferService {
-    /// Opens the service for an environment, creating its store and staging area on first use.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransferError::StoreUnavailable`] or [`TransferError::StagingUnavailable`] when
-    /// either cannot be prepared.
-    pub fn open(paths: &EnvironmentPaths) -> Result<Self> {
-        Self::with_clock(paths, Arc::new(SystemClock))
-    }
-
-    /// Opens the service against a clock the caller supplies.
+    /// Opens the service for an environment, creating its store and staging area on first use,
+    /// against the clock the host supplies.
     ///
     /// # Errors
     ///
@@ -587,6 +620,21 @@ impl TransferService {
             #[cfg(feature = "testing")]
             race_hooks: RaceHooks::default(),
         })
+    }
+
+    /// Stops a sweep once the host has said it can prove its clock, before it takes the journal to
+    /// forget what is old, and runs `hook` with no journal guard held.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn set_after_the_clock_answer_hook<F>(&self, hook: F)
+    where
+        F: Fn(&TransferService) + Send + Sync + 'static,
+    {
+        *self
+            .race_hooks
+            .after_the_clock_answer
+            .write()
+            .expect("not poisoned") = Some(ClockAnswerHook(Arc::new(hook)));
     }
 
     /// Stops a finish after it read the state and before it decides from it, and runs `hook`.
@@ -2647,6 +2695,12 @@ impl TransferService {
 
     /// Expires everything whose retention has run out.
     ///
+    /// What the wall clock alone says is old is let go of only while the host can prove its clock
+    /// ([`SessionRetention::clock_is_proven`]): unfinished uploads, unsubmitted attachments,
+    /// snapshots and the de-duplication records that outlived their retention. A submitted
+    /// attachment follows its session, which the clock does not decide, and the cleanup and
+    /// recovery steps decide nothing by time, so those run either way.
+    ///
     /// Every transition is conditional on the state the row is still in, because the candidates
     /// were listed before the lock each transition takes: a finish, a cancellation or a submission
     /// can land in between, and a sweep that overwrote one of those would expire an attachment its
@@ -2664,7 +2718,20 @@ impl TransferService {
     /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read or written, and
     /// whatever the retention returns when it cannot answer, before anything is expired.
     pub fn sweep(&self, retention: &dyn SessionRetention) -> Result<Sweep> {
-        let now = self.clock.now_ms();
+        // What is due by the service's own reading says only whether a part has anything to ask the
+        // host about. A part lets go of something only after the host has said it can prove its
+        // clock, and counts from the earlier of the reading it asked about and one taken after the
+        // answer: a clock corrected, or established again, while the host was deciding can only
+        // lower the cutoff, so a reading from before the correction never reaches a record stamped
+        // after it. A reading is what the host proves, and every delete a part makes is a function
+        // of one, so a distrust that comes after the answer does not make that part's deletes wrong.
+        let due_at = || self.clock.now_ms();
+        let proven_reading = || {
+            let asked = self.clock.now_ms();
+            retention
+                .clock_is_proven(asked)
+                .then(|| TimestampMs::new(asked.get().min(self.clock.now_ms().get())))
+        };
         let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         let mut sweep = Sweep::default();
         let published = self.locked()?.uploads_in(&[UploadState::Published])?;
@@ -2684,10 +2751,18 @@ impl TransferService {
             }
         }
         let retained = retention.retained(&asked)?;
-        let unfinished = self
+        let mut unfinished = self
             .locked()?
             .uploads_in(&[UploadState::Receiving, UploadState::Publishing])?;
+        let due = due_at();
+        unfinished.retain(|candidate| candidate.expires_at_ms.get() <= due.get());
+        let now = if unfinished.is_empty() {
+            None
+        } else {
+            proven_reading()
+        };
         for candidate in unfinished {
+            let Some(now) = now else { break };
             let mut store = self.locked()?;
             let Some(row) = store.upload(candidate.transfer_id)? else {
                 continue;
@@ -2713,6 +2788,17 @@ impl TransferService {
                 sweep.expired_uploads += 1;
             }
         }
+        // The host is asked before any row is locked, and only when an attachment's own deadline
+        // is due by the service's reading: a submitted attachment follows its session instead.
+        let due = due_at();
+        let deadline_due = published.iter().any(|row| {
+            matches!(
+                (row.submitted_at_ms, row.session_id),
+                (Some(_), None) | (None, _)
+            ) && row.expires_at_ms.get() <= due.get()
+        });
+        let counted = if deadline_due { proven_reading() } else { None };
+        let stamped = counted.unwrap_or_else(due_at);
         for candidate in published {
             let mut store = self.locked()?;
             let Some(row) = store.upload(candidate.transfer_id)? else {
@@ -2740,7 +2826,9 @@ impl TransferService {
             let expired = match (row.submitted_at_ms, row.session_id) {
                 (Some(_), Some(session_id)) if !asked.contains(&session_id) => continue,
                 (Some(_), Some(session_id)) => !retained.contains(&session_id),
-                (Some(_), None) | (None, _) => row.expires_at_ms.get() <= now.get(),
+                (Some(_), None) | (None, _) => {
+                    counted.is_some_and(|now| row.expires_at_ms.get() <= now.get())
+                }
             } && shielding
                 .iter()
                 .all(|session_id| !retained.contains(session_id));
@@ -2752,7 +2840,7 @@ impl TransferService {
                 UploadState::Published,
                 UploadState::Expired,
                 Some("this attachment's retention has ended"),
-                now,
+                stamped,
             )?;
             if !moved {
                 continue;
@@ -2766,8 +2854,16 @@ impl TransferService {
         // would release a reservation whose file is about to exist, and nothing would be charged
         // for those bytes. An abandoned reservation is resolved at the next start, by recovery,
         // where nothing is in flight.
-        let snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
+        let mut snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
+        let due = due_at();
+        snapshots.retain(|candidate| candidate.expires_at_ms.get() <= due.get());
+        let now = if snapshots.is_empty() {
+            None
+        } else {
+            proven_reading()
+        };
         for candidate in snapshots {
+            let Some(now) = now else { break };
             let Some(row) = self.locked()?.snapshot(candidate.transfer_id)? else {
                 continue;
             };
@@ -2790,11 +2886,39 @@ impl TransferService {
         sweep.unremovable_payloads = unremovable;
         // A cleanup that succeeded here may be what a claim was waiting for.
         sweep.resolved_claims = self.resolve_claims()?;
-        let horizon = TimestampMs::new(
-            now.get()
-                .saturating_sub(kr_protocol::limits::DEDUPLICATION_RETENTION.get()),
-        );
-        sweep.forgotten_actions = self.locked()?.forget_actions_before(horizon)?;
+        // A record is forgotten only once the retention section 9 gives has run out on a clock the
+        // host can prove: one that cannot be shown to have outlived it stays, because forgetting
+        // it lets the same action identifier be performed as a new action.
+        let horizon_at = |reading: TimestampMs| {
+            TimestampMs::new(
+                reading
+                    .get()
+                    .saturating_sub(kr_protocol::limits::DEDUPLICATION_RETENTION.get()),
+            )
+        };
+        if self.locked()?.has_actions_before(horizon_at(due_at()))? {
+            let asked = self.clock.now_ms();
+            if retention.clock_is_proven(asked) {
+                #[cfg(feature = "testing")]
+                if let Some(hook) = self
+                    .race_hooks
+                    .after_the_clock_answer
+                    .read()
+                    .expect("not poisoned")
+                    .clone()
+                {
+                    (hook.0)(self);
+                }
+                // This one forgets by a predicate over every record, new ones included, so the
+                // second reading is taken under the journal's guard and the guard is held to the
+                // delete: a record stamped after a correction cannot be inserted between the two,
+                // and the cutoff is never later than the clock stands once the journal is held.
+                // The host was asked before the guard, never under it.
+                let store = self.locked()?;
+                let reading = TimestampMs::new(asked.get().min(self.clock.now_ms().get()));
+                sweep.forgotten_actions = store.forget_actions_before(horizon_at(reading))?;
+            }
+        }
         drop(payloads);
         Ok(sweep)
     }

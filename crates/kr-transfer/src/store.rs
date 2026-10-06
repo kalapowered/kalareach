@@ -2510,6 +2510,21 @@ impl Store {
             .map_err(TransferError::store)
     }
 
+    /// Returns whether any de-duplication record was written before `at_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn has_actions_before(&self, at_ms: TimestampMs) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM actions WHERE recorded_at_ms < ?1)",
+                params![as_i64(at_ms.get())],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)
+    }
+
     /// Returns outbox rows after a cursor, oldest first.
     ///
     /// # Errors

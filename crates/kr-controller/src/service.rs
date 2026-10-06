@@ -890,6 +890,10 @@ mod a_delegation_that_is_asked_again;
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
 
+/// The transfer service's de-duplication records, forgotten on a clock this host can prove.
+#[cfg(test)]
+mod a_sweep_on_a_clock_in_doubt;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

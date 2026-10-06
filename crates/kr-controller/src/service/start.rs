@@ -322,7 +322,8 @@ impl Controller {
         let recorded_revision = capability_revision(&paths);
         let started_at_ms = kr_ipc::now_ms();
         let authority_revision = registry.authority_revision()?;
-        let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
+        let transfer =
+            Arc::new(crate::transfer::TransferModule::open(&setup.paths, wall.clone()).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
         // Whether this host runs Git for a paired device is proved once here, before anything is
         // served, and again at each `host.doctor`.

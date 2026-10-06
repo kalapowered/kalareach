@@ -489,6 +489,72 @@ fn an_expired_snapshot_is_refused_and_released() {
     );
 }
 
+/// KR-REQ-14.15 and 09.14: a snapshot that has outlived its expiry is let go of by a sweep only
+/// while the host can prove its clock. A host that cannot keeps it, and once the host can prove the
+/// clock the same sweep releases it and its bytes.
+#[test]
+fn a_sweep_the_host_cannot_prove_a_clock_for_keeps_an_expired_snapshot() {
+    struct Unproven;
+    impl kr_transfer::SessionRetention for Unproven {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<kr_protocol::ids::SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<kr_protocol::ids::SessionId>> {
+            Ok(sessions.clone())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            false
+        }
+    }
+
+    let harness = Harness::create();
+    let tree = source_tree();
+    let bytes = pattern(4096);
+    std::fs::write(tree.path().join("notes.txt"), &bytes).expect("writes the source");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Scope {
+                    scope_id: scope,
+                    relative_path: "notes.txt".to_owned(),
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("stages the snapshot");
+    harness.clock.advance(DOWNLOAD_SNAPSHOT_LIFETIME.get());
+
+    let sweep = harness.service.sweep(&Unproven).expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_snapshots, 0,
+        "an unproven clock lets go of nothing"
+    );
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64,
+        "the snapshot's bytes are still held"
+    );
+
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("runs a sweep");
+    assert_eq!(sweep.expired_snapshots, 1, "a proven clock releases it");
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0
+    );
+}
+
 /// KR-REQ-14.16: revoking read authority stops further bytes at once.
 #[test]
 fn revoking_read_authority_stops_further_bytes() {
