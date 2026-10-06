@@ -775,7 +775,7 @@ async fn seed_claim(
 /// As [`seed_claim`], for a session of `profile`, with the key the claim names chosen once the
 /// reservation, and so the session, is known: a worker that is to answer a challenge for the
 /// session has to be made for it.
-async fn seed_claim_as(
+pub(super) async fn seed_claim_as(
     controller: &Controller,
     actor_id: &kr_protocol::ids::ActorId,
     profile: kr_protocol::identity::WorkerProfile,

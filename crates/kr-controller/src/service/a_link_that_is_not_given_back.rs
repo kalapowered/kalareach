@@ -492,26 +492,93 @@ impl Drop for Stopping {
 
 impl Served {
     pub(super) async fn start() -> Self {
-        use kr_protocol::ids::SessionEpoch;
-        use kr_protocol::session::DisplayNumber;
-
         let temp = kr_ipc::testing::TempHost::create();
-        let environment = temp.environment();
-        let environment_id = temp.environment_id();
         let controller = Controller::start(world::setup(&temp))
             .await
             .expect("the daemon starts");
-        let session_id = SessionId::new(kr_ipc::new_uuid());
-        let identity = Arc::new(
+        let identity = Self::identity_of(&controller, SessionId::new(kr_ipc::new_uuid()));
+        Self::serving(
+            temp,
+            controller,
+            identity,
+            kr_protocol::session::DisplayNumber::new(1),
+        )
+        .await
+    }
+
+    /// A daemon and a real worker, with the reservation the worker was started for: claimed, as
+    /// one is once its worker has been admitted, and with the worker not yet in the directory, as a
+    /// daemon that has not found it yet holds it.
+    pub(super) async fn claimed() -> (Self, kr_protocol::worker::ReservationId) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = Controller::start(world::setup(&temp))
+            .await
+            .expect("the daemon starts");
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let mut identity = None;
+        let reservation = super::a_create_that_launches_nothing::seed_claim_as(
+            &controller,
+            &actor_id,
+            kr_protocol::identity::WorkerProfile::HeadlessUser,
+            |reservation| {
+                let made = Self::identity_of(&controller, reservation.session_id);
+                let key = *made.public_key();
+                identity = Some(made);
+                key
+            },
+        )
+        .await;
+        let world = Self::serving(
+            temp,
+            controller,
+            identity.expect("the worker was made for its claim"),
+            reservation.display_number,
+        )
+        .await;
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .remove(world.session_id);
+        (world, reservation.reservation_id)
+    }
+
+    /// The identity a worker of `session_id` has under `controller`'s boot.
+    fn identity_of(controller: &Controller, session_id: SessionId) -> Arc<WorkerIdentity> {
+        Arc::new(
             WorkerIdentity::generate(
                 session_id,
-                SessionEpoch::V1,
+                kr_protocol::ids::SessionEpoch::V1,
                 controller.boot_identity.clone(),
                 kr_ipc::identity::current_process_start_identity().expect("a process identity"),
                 kr_protocol::hello::PROTOCOL_VERSION,
             )
             .expect("a session key"),
-        );
+        )
+    }
+
+    /// A hold on a reservation of no session, for a test that makes the daemon publish this worker
+    /// with neither a report nor a recovery to have taken one.
+    pub(super) async fn held(&self) -> super::recovery::ReservationHold {
+        self.controller
+            .hold_reservation(kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()))
+            .await
+    }
+
+    /// Serves a real worker for `identity` on the endpoint of `display_number`, in the directory of
+    /// `controller`, with the revision in force acknowledged.
+    async fn serving(
+        temp: kr_ipc::testing::TempHost,
+        controller: Arc<Controller>,
+        identity: Arc<WorkerIdentity>,
+        display_number: kr_protocol::session::DisplayNumber,
+    ) -> Self {
+        use kr_protocol::ids::SessionEpoch;
+
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let session_id = identity.session_id();
         let journal_path = environment.journal_database(session_id);
         if let Some(parent) = journal_path.parent() {
             std::fs::create_dir_all(parent).expect("the journal directory");
@@ -535,7 +602,7 @@ impl Served {
                             session_id,
                             session_epoch: SessionEpoch::V1,
                             environment_id,
-                            display_number: DisplayNumber::new(1),
+                            display_number,
                             shell: kr_worker::testing::posix_script("exec cat"),
                             shell_mode: kr_protocol::session::ShellMode::NativeCompat,
                             worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
@@ -559,7 +626,7 @@ impl Served {
                         .expect("starts the runtime"),
                     );
                     let endpoint = environment
-                        .worker_endpoint(DisplayNumber::new(1))
+                        .worker_endpoint(display_number)
                         .expect("an endpoint");
                     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
                     let service = Arc::new(
@@ -589,7 +656,7 @@ impl Served {
                 session_id,
                 session_epoch: SessionEpoch::V1,
                 environment_id,
-                display_number: DisplayNumber::new(1),
+                display_number,
                 boot_identity: identity.boot_identity().clone(),
                 process_start_identity: identity.process_start_identity().clone(),
                 protocol_version: kr_protocol::hello::PROTOCOL_VERSION,

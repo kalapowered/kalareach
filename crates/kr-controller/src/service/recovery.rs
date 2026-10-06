@@ -1,5 +1,7 @@
 //! The creates and claims an earlier daemon left unresolved, and the workers it left running.
 
+use std::sync::Arc;
+
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::Endpoint;
 use kr_protocol::identity::WorkerProfile;
@@ -14,23 +16,77 @@ use crate::registry::{LaunchPhase, WorkerRecord};
 
 use super::Controller;
 
+/// The reservations a look or a publication holds, and who is waiting for them.
+#[derive(Debug, Default)]
+pub(super) struct Reservations {
+    held: std::sync::Mutex<std::collections::BTreeSet<ReservationId>>,
+    /// Woken whenever a reservation is given back.
+    given_back: tokio::sync::Notify,
+    /// How many callers are waiting for a reservation now, for this crate's own tests.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl Reservations {
+    /// How many callers are waiting for a reservation to be given back.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A caller counted as waiting for a reservation for as long as it is.
+#[cfg(test)]
+struct Waiting<'a>(&'a Reservations);
+
+#[cfg(test)]
+impl<'a> Waiting<'a> {
+    fn begin(reservations: &'a Reservations) -> Self {
+        reservations
+            .waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(reservations)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// One reservation, held by whichever of a look and a publication took it.
 ///
 /// Giving it back wakes everybody who is waiting, and each of them looks for the one reservation it
 /// came for: whoever was waiting for this one takes it, and the rest wait again.
-pub(super) struct ReservationHold<'a> {
-    controller: &'a Controller,
+///
+/// A hold is shared, and the reservation is given back when the last holder lets go of it. It
+/// belongs to no request, so it can go where the work it covers goes: a publication takes a share
+/// of it into the task it runs on ([`Controller::publish_worker`]), and a request that stops
+/// waiting for that task gives nothing back.
+#[derive(Clone, Debug)]
+pub(super) struct ReservationHold {
+    /// Kept only for what its drop does, once the last share of it is gone.
+    _share: Arc<Held>,
+}
+
+#[derive(Debug)]
+struct Held {
+    reservations: Arc<Reservations>,
     reservation_id: ReservationId,
 }
 
-impl Drop for ReservationHold<'_> {
+impl Drop for Held {
     fn drop(&mut self) {
-        self.controller
-            .recovering
+        self.reservations
+            .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.reservation_id);
-        self.controller.recovered.notify_waiters();
+        self.reservations.given_back.notify_waiters();
     }
 }
 
@@ -85,7 +141,10 @@ impl Controller {
                 // shell. It is recovered by challenge where it still answers, and recorded as an
                 // abnormal closure where its process is confirmed gone; a claim is never resolved
                 // as though nothing had run.
-                LaunchPhase::Claimed => self.recover_claim(&reservation).await?,
+                LaunchPhase::Claimed => {
+                    let held = self.hold_reservation(reservation.reservation_id).await;
+                    self.recover_claim(&reservation, &held).await?;
+                }
                 _ => {}
             }
         }
@@ -94,7 +153,14 @@ impl Controller {
     }
 
     /// Recovers a worker whose claim was consumed but whose session never reached the directory.
-    async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
+    ///
+    /// The caller holds the reservation (`held`), which the publication of the worker shares until
+    /// it is over.
+    async fn recover_claim(
+        &self,
+        reservation: &crate::registry::Reservation,
+        held: &ReservationHold,
+    ) -> Result<()> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         let challenged = match reservation.claimed_key {
             Some(key) => Some(
@@ -117,6 +183,7 @@ impl Controller {
                 &proof,
                 &endpoint,
                 described,
+                held,
             )
             .await?;
             let mut registry = self.registry.lock().await;
@@ -205,7 +272,7 @@ impl Controller {
     /// Three things say it is not this daemon's to recover: a reservation that is no longer
     /// claimed, a create this daemon is still running, and a worker already in the directory.
     async fn recover_unresolved(&self, reservation_id: ReservationId) -> Result<()> {
-        let _held = self.hold_reservation(reservation_id).await;
+        let held = self.hold_reservation(reservation_id).await;
         let reservation = {
             let registry = self.registry.lock().await;
             registry.reservation(reservation_id)?
@@ -224,34 +291,36 @@ impl Controller {
         {
             return Ok(());
         }
-        self.recover_claim(&reservation).await
+        self.recover_claim(&reservation, &held).await
     }
 
     /// Takes one reservation from whatever else would look at it, and gives it back on drop.
     ///
     /// Only that reservation: a caller waiting here is waiting for one worker's own turn, never for
     /// a scan of somebody else's.
-    pub(super) async fn hold_reservation(
-        &self,
-        reservation_id: ReservationId,
-    ) -> ReservationHold<'_> {
+    pub(super) async fn hold_reservation(&self, reservation_id: ReservationId) -> ReservationHold {
         loop {
             // Created before the set is read, so a reservation given back between the two is not
             // missed: a wake from that moment on is already counted for this waiter, and the wait
             // below ends at once rather than sleeping through it.
-            let given_back = self.recovered.notified();
+            let given_back = self.reservations.given_back.notified();
             {
                 let mut held = self
-                    .recovering
+                    .reservations
+                    .held
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if held.insert(reservation_id) {
                     return ReservationHold {
-                        controller: self,
-                        reservation_id,
+                        _share: Arc::new(Held {
+                            reservations: Arc::clone(&self.reservations),
+                            reservation_id,
+                        }),
                     };
                 }
             }
+            #[cfg(test)]
+            let _waiting = Waiting::begin(&self.reservations);
             given_back.await;
         }
     }
@@ -287,7 +356,7 @@ impl Controller {
             // This row's own reservation, taken from whatever else would look at it. A challenge
             // here presents a generation token too, and one presented while that worker's own
             // report is being published fences the connection the daemon has just opened.
-            let _held = self.hold_reservation(reservation.reservation_id).await;
+            let held = self.hold_reservation(reservation.reservation_id).await;
             // The directory again, now that nothing else can be publishing into it: the report may
             // have landed while this row was waiting its turn.
             if self.directory.lock().await.get(row.session_id).is_some() {
@@ -307,6 +376,7 @@ impl Controller {
                         &proof,
                         &endpoint,
                         described,
+                        &held,
                     )
                     .await?;
                 }
@@ -372,6 +442,9 @@ impl Controller {
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
     /// description of its session it gave after its challenge, where it gave one.
+    ///
+    /// `held` is the reservation the worker was started for, which the publication shares until it
+    /// is over ([`Self::publish_worker`]).
     pub(super) async fn adopt(
         &self,
         display_number: kr_protocol::session::DisplayNumber,
@@ -379,6 +452,7 @@ impl Controller {
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
         described: Option<SessionSummary>,
+        held: &ReservationHold,
     ) -> Result<()> {
         let record = WorkerRecord {
             session_id: proof.session_id,
@@ -432,6 +506,7 @@ impl Controller {
                 endpoint: endpoint.clone(),
             },
             described,
+            held,
         )
         .await
     }

@@ -227,6 +227,7 @@ async fn adopt(
             &proof,
             &world.worker.endpoint,
             described,
+            &world.held().await,
         )
         .await
 }
@@ -422,6 +423,7 @@ async fn an_adoption_held_before_its_publication(
     let (arrived, go) = world.controller.before_a_worker_is_published.arm();
     let endpoint = world.worker.endpoint.clone();
     let controller = std::sync::Arc::clone(&world.controller);
+    let held = world.held().await;
     let adopting = tokio::spawn(async move {
         controller
             .adopt(
@@ -430,6 +432,7 @@ async fn an_adoption_held_before_its_publication(
                 &proof,
                 &endpoint,
                 described,
+                &held,
             )
             .await
     });
@@ -549,7 +552,8 @@ async fn a_descriptor_is_written_without_the_registry_and_taken_away_when_a_clos
     let publishing = tokio::spawn({
         let controller = std::sync::Arc::clone(&world.controller);
         let worker = world.worker.clone();
-        async move { controller.publish_worker(worker, None).await }
+        let held = world.held().await;
+        async move { controller.publish_worker(worker, None, &held).await }
     });
     let written = tokio::time::timeout(WAIT, async {
         while kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
@@ -599,7 +603,8 @@ async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_sessio
     let publishing = tokio::spawn({
         let controller = std::sync::Arc::clone(&world.controller);
         let worker = world.worker.clone();
-        async move { controller.publish_worker(worker, None).await }
+        let held = world.held().await;
+        async move { controller.publish_worker(worker, None, &held).await }
     });
     let written = tokio::time::timeout(WAIT, async {
         while kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
@@ -683,7 +688,7 @@ async fn a_publication_for_a_closed_session_removes_a_descriptor_whose_write_fai
 
     world
         .controller
-        .publish_worker(world.worker.clone(), None)
+        .publish_worker(world.worker.clone(), None, &world.held().await)
         .await
         .expect("a publication for a closed session has nothing to do");
     drop(restore);
