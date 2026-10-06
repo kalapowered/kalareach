@@ -44,7 +44,8 @@ use crate::prompt::Prompt;
 /// memory ceiling is enforced. The third sends the prompt in its parts and the number of tokens it
 /// may be, so the process, which holds the tokenizer, makes it fit. The fourth says in the prompt
 /// what it asks for, a description or a summary of what changed, which the process needs to end
-/// an answer the output bound stopped.
+/// an answer the output bound stopped, and ends a job whose prompt cannot be made to fit as a
+/// refusal of its own, which is no failure of the process.
 pub const WIRE_VERSION: u64 = 4;
 
 /// This build's release, which the daemon and the process it starts share.
@@ -322,6 +323,9 @@ pub enum JobEnd {
     NotLoaded,
     /// The process would not run it: more work was waiting than it holds.
     Refused,
+    /// The prompt could not be made to fit what a job may spend on it. The process is well and
+    /// keeps its model; this job cannot run, and nothing about the process caused that.
+    TooLarge,
     /// The runtime failed.
     Failed,
 }
@@ -336,6 +340,7 @@ impl JobEnd {
             Self::MemoryCeiling => "memory_ceiling",
             Self::NotLoaded => "not_loaded",
             Self::Refused => "refused",
+            Self::TooLarge => "too_large",
             Self::Failed => "failed",
         }
     }

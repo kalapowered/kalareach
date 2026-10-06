@@ -669,28 +669,33 @@ impl LlamaRuntime {
         // The prompt is made to fit what the job may spend on it: the bound the daemon sent, and
         // what the window leaves beside the answer. Project text is what gives way, and the oldest
         // events first, so a job that cannot fit does not exist: the only prompt that cannot be
-        // made to fit is one whose instruction alone is more than the window leaves, which is a
-        // fault of the profile and is refused when it loads.
+        // made to fit is one whose instruction alone is more than the window leaves, which
+        // verifying a profile refuses. Were one to reach here it ends as `too_large`, a refusal of
+        // that job that the daemon does not count as a failure of the process.
         let room = (context_tokens as usize).saturating_sub(job.max_output_tokens as usize);
         let budget = (job.prompt_tokens as usize).min(room);
-        let fitted = job
-            .prompt
-            .fit(budget, |text| {
-                self.prompt_tokens(text).map(|read| read.tokens.len())
-            })
-            .map_err(|error| match error {
-                FitError::Count(detail) => detail,
-                FitError::Base { tokens, budget } => format!(
+        let too_large = |detail: String| Generating::Ended {
+            why: JobEnd::TooLarge,
+            detail: Some(detail),
+        };
+        let fitted = match job.prompt.fit(budget, |text| {
+            self.prompt_tokens(text).map(|read| read.tokens.len())
+        }) {
+            Ok(fitted) => fitted,
+            Err(FitError::Count(detail)) => return Err(detail),
+            Err(FitError::Base { tokens, budget }) => {
+                return Ok(too_large(format!(
                     "the instruction alone is {tokens} tokens, and a prompt may be {budget}"
-                ),
-            })?;
+                )));
+            }
+        };
         let tokens = self.prompt_tokens(&fitted.text)?.tokens;
         if tokens.len() + job.max_output_tokens as usize > context_tokens as usize {
-            return Err(format!(
+            return Ok(too_large(format!(
                 "a prompt of {} tokens and {} of output do not fit in {context_tokens}",
                 tokens.len(),
                 job.max_output_tokens
-            ));
+            )));
         }
 
         // The prompt is decoded in chunks smaller than the context's own batch size, which the

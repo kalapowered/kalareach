@@ -2320,6 +2320,18 @@ impl DescriptionService {
                     detail: detail.unwrap_or_else(|| "the process passed its ceiling".to_owned()),
                 }
             }
+            JobEnd::TooLarge => {
+                // The process is well and holds its model, and this job's prompt cannot be made
+                // to fit what a job may spend on it. That says nothing of inference: it counts no
+                // restart and no failure toward a pause, delays no start, unloads nothing, and the
+                // job is not asked for again, since the same prompt would be refused again.
+                self.counts.failed = self.counts.failed.saturating_add(1);
+                Outcome::Failed {
+                    session_id,
+                    detail: detail
+                        .unwrap_or_else(|| "the prompt could not be made to fit".to_owned()),
+                }
+            }
             JobEnd::NotLoaded | JobEnd::Refused | JobEnd::Failed => self.job_failed(
                 dispatched,
                 detail.unwrap_or_else(|| format!("the job ended {}", why.as_str())),
