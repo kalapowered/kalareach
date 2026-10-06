@@ -224,8 +224,8 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_integration: Option<CommandIntegration>,
     /// The launch probe, where the package declares one: the arguments the host runs the
-    /// application's own executable with before a launch, and where in what it prints the mode the
-    /// application runs in is.
+    /// application's own executable with before a launch the host starts and whenever its
+    /// diagnostics are read, and where in what it prints the mode the application runs in is.
     ///
     /// A package that declares none leaves the member out, so a manifest written before the member
     /// existed reads and hashes exactly as it did. A host runs one only from this verified manifest
