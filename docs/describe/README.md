@@ -241,7 +241,7 @@ The daemon sends the process the parts of the prompt: the revision and cursor in
 
 A prompt is trimmed only when its session is large. The benchmark's ordinary sessions are 180 to 250 tokens and are never trimmed. Its largest context, with every field and every event at its bound, is 708 tokens in Latin text and fits whole. The same context in Arabic text is 1,768 tokens, in Hebrew 2,152 and in emoji 5,164, and each is trimmed to 891 tokens or just under. Some scripts cost more tokens than others, so a session with long Arabic events can be trimmed where a Latin one is not.
 
-No job can be too large for a profile. Verifying a profile refuses a context window that cannot hold the instruction byte for byte, two framing tokens and the output bound, because in a byte-level vocabulary a prompt is never more tokens than it is bytes.
+No job can be too large for a profile. Verifying a profile refuses a context window that cannot hold the instruction byte for byte, two framing tokens and the output bound, because in a byte-level vocabulary a prompt is never more tokens than it is bytes. A process handed one that cannot fit ends that job as `too_large`. That counts as no failure of inference: nothing restarts, and the model stays loaded.
 
 ## What comes out
 
