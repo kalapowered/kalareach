@@ -81,7 +81,7 @@ fn assert_refused(manifest: &Value, code: FindingCode, what: &str) {
 }
 
 /// KR-REQ-07.64: a package's launch probe is read from its verified manifest, whole, beside the
-/// capability that runs it, and what the grant shows lists every argument.
+/// capability that runs it, and its statement lists every argument.
 #[test]
 fn kr_req_07_64_a_declared_probe_is_read_from_the_manifest() {
     let validated = validate(&manifest_with(&declaration(), true));

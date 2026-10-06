@@ -1,5 +1,5 @@
 //! A package's launch probe: how a host reads the mode an application will run in, from the
-//! application itself, before it starts one.
+//! application itself, before it starts one and when its diagnostics are read.
 //!
 //! An application may run in a mode a host has to know to start it well. A sandbox the application
 //! provisions for itself can be of a kind that cannot start in a Windows service session, and the
@@ -9,8 +9,9 @@
 //! code is keyed to an application: what the host does is only what this declaration says.
 //!
 //! Asking for it is the `launch.probe` capability, which the owner confirms on every release,
-//! because it runs the application's own executable with arguments the package chose. The grant
-//! shows [`LaunchProbe::statement`], which lists every argument.
+//! because it runs the application's own executable with arguments the package chose, whenever the
+//! host's diagnostics are read as well as before a launch the host starts.
+//! [`LaunchProbe::statement`] renders what the declaration does, and lists every argument.
 //!
 //! What a declaration may say is closed:
 //!
@@ -70,16 +71,17 @@ pub struct LaunchProbe {
     pub mode: String,
     /// The modes the application cannot run with in a Windows service session.
     pub refused_in_service_session: Vec<String>,
-    /// What the grant tells the person before they accept it, beside the exact list the host
-    /// renders from this declaration.
+    /// What the package says its probe does, beside the exact list the host renders from this
+    /// declaration.
     pub grant_statement: Summary,
 }
 
 impl LaunchProbe {
-    /// Returns what the probe does, exactly, for the grant a person confirms.
+    /// Returns what the probe does, exactly.
     ///
     /// Every argument, option name and word is written as a JSON string, in order. Nothing is
-    /// shortened: a person confirms every byte the host passes to the application.
+    /// shortened: every declared argument, carried option name, pointer and refused word is in it.
+    /// The values of carried options come from the launch and are not.
     #[must_use]
     pub fn statement(&self) -> String {
         let quoted_all = |items: &[String]| {
@@ -90,7 +92,8 @@ impl LaunchProbe {
                 .join(" ")
         };
         let mut statement = format!(
-            "Runs the application before a launch with these arguments, in this order: {}.",
+            "Runs the application whenever the host's diagnostics are read and before a launch the \
+             host starts, with these arguments, in this order: {}.",
             quoted_all(&self.arguments)
         );
         if !self.carried_options.is_empty() {
@@ -531,17 +534,18 @@ mod tests {
         );
     }
 
-    /// The grant a person confirms lists every argument, option and word in order, and the mode.
+    /// The statement lists every argument, option and word in order, and the mode.
     #[test]
     fn the_statement_lists_everything_the_host_passes() {
         assert_eq!(
             probe().statement(),
-            "Runs the application before a launch with these arguments, in this order: \"doctor\" \
-             \"--json\". In front of them it copies these options, with their values, from the \
-             launch's own arguments: \"-c\" \"--config\" \"--enable\" \"--disable\". It reads the \
-             mode the application runs in from \"/checks/sandbox.helpers/details/sandbox backend\" \
-             of what the application prints. A launch in a Windows service session is refused when \
-             the mode is one of: \"elevated\"."
+            "Runs the application whenever the host's diagnostics are read and before a launch the \
+             host starts, with these arguments, in this order: \"doctor\" \"--json\". In front of \
+             them it copies these options, with their values, from the launch's own arguments: \
+             \"-c\" \"--config\" \"--enable\" \"--disable\". It reads the mode the application \
+             runs in from \"/checks/sandbox.helpers/details/sandbox backend\" of what the \
+             application prints. A launch in a Windows service session is refused when the mode is \
+             one of: \"elevated\"."
         );
     }
 }

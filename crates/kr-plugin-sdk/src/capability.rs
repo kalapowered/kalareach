@@ -77,7 +77,8 @@ pub enum PluginCapability {
     #[serde(rename = "command_integration.launch")]
     CommandIntegrationLaunch,
     /// Run the application's own executable with the arguments the package's launch probe
-    /// declares, before a launch, and read the mode the application runs in from what it prints.
+    /// declares, before a launch the host starts and whenever the host's diagnostics are read, and
+    /// read the mode the application runs in from what it prints.
     #[serde(rename = "launch.probe")]
     LaunchProbe,
 }
