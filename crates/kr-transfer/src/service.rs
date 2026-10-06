@@ -2316,6 +2316,50 @@ impl TransferService {
         store.record_prompt(draft_id, session_id, now)
     }
 
+    /// Returns whether the sessions whose agents may be sent a prompt that names a draft without
+    /// this host being told have been noted ([`Self::note_unseen_prompt_sessions`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read.
+    pub fn unseen_prompt_sessions_noted(&self) -> Result<bool> {
+        self.locked()?.unseen_prompt_sessions_noted()
+    }
+
+    /// Notes `sessions` as ones whose agents may be sent a prompt that names a draft without this
+    /// host being told, and that the noting is done.
+    ///
+    /// A worker of a build that predates the control daemon's record of draft prompts takes one on
+    /// its own socket, so the host cannot know which drafts the session's agent has been sent. The
+    /// sweep therefore keeps an attachment that such a session names as it keeps what was submitted
+    /// to the session: an attachment that belongs to it, or one that a draft holds that targets it
+    /// or holds another attachment that belongs to it. Nothing is recorded per draft, so a binding
+    /// made at any time, in any order, between any drafts is covered when the sweep looks.
+    ///
+    /// The host notes every session it knows when a daemon of this build first starts over the
+    /// journal, which are the sessions of earlier builds, and notes nothing after.
+    ///
+    /// Remove this, with the journal's two tables and the sweep's reading of them, once no worker of
+    /// a build before the one that serves draft prompts only to the daemon can still be running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be written; nothing is
+    /// noted then.
+    pub fn note_unseen_prompt_sessions(&self, sessions: &BTreeSet<SessionId>) -> Result<()> {
+        let now = self.clock.now_ms();
+        self.locked()?.note_unseen_prompt_sessions(sessions, now)
+    }
+
+    /// Returns the sessions noted by [`Self::note_unseen_prompt_sessions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read.
+    pub fn unseen_prompt_sessions(&self) -> Result<BTreeSet<SessionId>> {
+        self.locked()?.unseen_prompt_sessions()
+    }
+
     /// Returns one draft with its bindings.
     ///
     /// # Errors
@@ -2612,11 +2656,21 @@ impl TransferService {
         let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         let mut sweep = Sweep::default();
         let published = self.locked()?.uploads_in(&[UploadState::Published])?;
-        let asked: BTreeSet<SessionId> = published
+        let unseen = self.locked()?.unseen_prompt_sessions()?;
+        let mut asked: BTreeSet<SessionId> = published
             .iter()
             .filter(|row| row.submitted_at_ms.is_some())
             .filter_map(|row| row.session_id)
             .collect();
+        // An attachment that no prompt this host knows of has submitted is still the session's to
+        // keep when a session whose prompts the host does not see names it: the host asks about
+        // those sessions too.
+        if !unseen.is_empty() {
+            let store = self.locked()?;
+            for row in published.iter().filter(|row| row.submitted_at_ms.is_none()) {
+                asked.extend(store.sessions_shielding(row.transfer_id, &unseen)?);
+            }
+        }
         let retained = retention.retained(&asked)?;
         let unfinished = self
             .locked()?
@@ -2665,7 +2719,26 @@ impl TransferService {
                 (Some(_), Some(session_id)) if !asked.contains(&session_id) => continue,
                 (Some(_), Some(session_id)) => !retained.contains(&session_id),
                 (Some(_), None) => row.expires_at_ms.get() <= now.get(),
-                (None, _) => row.expires_at_ms.get() <= now.get(),
+                (None, _) => {
+                    let shielding = if unseen.is_empty() {
+                        BTreeSet::new()
+                    } else {
+                        store.sessions_shielding(row.transfer_id, &unseen)?
+                    };
+                    if shielding.is_empty() {
+                        row.expires_at_ms.get() <= now.get()
+                    } else if !shielding.is_subset(&asked) {
+                        // Named by a session after the question was asked, as a submission is.
+                        continue;
+                    } else {
+                        // Kept while any session that names it is retained, as a submitted one is,
+                        // and not before its own window has run out.
+                        row.expires_at_ms.get() <= now.get()
+                            && shielding
+                                .iter()
+                                .all(|session_id| !retained.contains(session_id))
+                    }
+                }
             };
             if !expired {
                 continue;

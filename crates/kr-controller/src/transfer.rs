@@ -519,6 +519,43 @@ impl TransferModule {
         .await
     }
 
+    /// Notes every session this host knows as one whose agent may be sent a prompt that names a
+    /// draft without this host being told, the first time a daemon of this build starts over the
+    /// transfer journal, and notes nothing at any start after.
+    ///
+    /// A worker that outlived the daemon before this one is of an earlier build, and one of a build
+    /// before the control daemon recorded the draft a prompt names takes such a prompt on its own
+    /// socket, where this host is not told ([`kr_transfer::TransferService::note_unseen_prompt_sessions`]).
+    /// At the first start of this build every session this host knows was started by a daemon of an
+    /// earlier build, and a session started by this build's daemon afterwards has a worker that
+    /// refuses a draft prompt that does not come from the daemon, so noting is done once. The
+    /// sessions are the registry's, in every launch phase, and the archive's: a worker that has not
+    /// yet reported, one that has stopped answering and one that has ended are among them. A start
+    /// that cannot note them does not go on, because no sweep may run before the host has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the registry, the archive or the
+    /// journal cannot be read or written.
+    pub(crate) async fn note_sessions_of_earlier_builds(
+        &self,
+        owner: &Arc<Controller>,
+    ) -> Result<()> {
+        let service = Arc::clone(&self.service);
+        let owner = Arc::clone(owner);
+        let unavailable = |detail: String| ControllerError::RegistryUnavailable { detail };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let storage = |error: kr_transfer::TransferError| unavailable(error.to_string());
+            if service.unseen_prompt_sessions_noted().map_err(storage)? {
+                return Ok(());
+            }
+            let known = owner.archive_retention()?.sessions();
+            service.note_unseen_prompt_sessions(&known).map_err(storage)
+        })
+        .await
+        .map_err(|_| unavailable("the sessions of earlier builds could not be noted".to_owned()))?
+    }
+
     /// Serves one transfer read and returns the frame it answers with.
     #[must_use]
     pub async fn read_frame(&self, actor_id: &ActorId, request: &Request) -> ControlFrame {

@@ -1206,6 +1206,12 @@ impl ArchiveRetention {
         self.sessions.contains(&session_id)
     }
 
+    /// Returns every retained session.
+    #[must_use]
+    pub fn sessions(&self) -> std::collections::BTreeSet<SessionId> {
+        self.sessions.clone()
+    }
+
     /// Returns how many sessions are retained.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -2399,6 +2399,60 @@ async fn a_local_prompt_the_worker_cannot_look_up_is_refused_and_its_draft_is_no
     world.serving.abort();
 }
 
+/// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal it notes
+/// every session the host knows, because each was started by a daemon of an earlier build whose
+/// worker may take a draft prompt this host is not told of, and a daemon that starts again over the
+/// same journal notes nothing: a session started since has a worker that refuses such a prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sessions_a_daemon_knows_at_its_first_start_over_a_journal_are_noted() {
+    use std::collections::BTreeSet;
+
+    use crate::service::a_close_a_worker_never_answers::Silent;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
+        self as scripted, Scripted, restarted,
+    };
+
+    let noted = |world: &Silent| -> BTreeSet<kr_protocol::ids::SessionId> {
+        world
+            .controller
+            .transfer()
+            .service()
+            .unseen_prompt_sessions()
+            .expect("reads the journal")
+    };
+
+    // The first start of the world found no session.
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    assert!(
+        world
+            .controller
+            .transfer()
+            .service()
+            .unseen_prompt_sessions_noted()
+            .expect("reads the journal"),
+        "the first start did its noting"
+    );
+    assert!(noted(&world).is_empty());
+
+    // A start after it knows the session, and notes nothing.
+    let world = restarted(world).await;
+    assert!(noted(&world).is_empty());
+
+    // A journal an earlier build wrote has never been noted, and its start notes the session.
+    let journal = rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
+        &world._temp.environment(),
+    ))
+    .expect("opens the transfer journal");
+    journal
+        .execute("DELETE FROM unseen_prompts_noted", [])
+        .expect("makes the journal one that was never noted");
+    drop(journal);
+    let world = restarted(world).await;
+    assert_eq!(noted(&world), BTreeSet::from([world.session_id]));
+    world.serving.abort();
+}
+
 /// A prompt a caller at this machine makes to the scripted session as `action_id`, naming a draft
 /// or carrying its text inline, under a window issued to `admission`'s connection.
 fn a_local_prompt(

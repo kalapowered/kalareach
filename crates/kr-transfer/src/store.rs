@@ -616,6 +616,14 @@ impl Store {
                          REFERENCES drafts (draft_id) ON DELETE CASCADE,
                      session_id BLOB NOT NULL,
                      sent_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS unseen_prompt_sessions (
+                     session_id  BLOB PRIMARY KEY,
+                     noted_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS unseen_prompts_noted (
+                     id          INTEGER PRIMARY KEY CHECK (id = 1),
+                     noted_at_ms INTEGER NOT NULL
                  );",
             )
             .map_err(TransferError::store)?;
@@ -1396,6 +1404,115 @@ impl Store {
         }
         transaction.commit().map_err(TransferError::store)?;
         Ok(held.len())
+    }
+
+    /// Returns whether the sessions a prompt may have reached unseen have been noted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn unseen_prompt_sessions_noted(&self) -> Result<bool> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM unseen_prompts_noted", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count > 0)
+            .map_err(TransferError::store)
+    }
+
+    /// Notes `sessions` as sessions whose agents may have been sent a prompt that names a draft
+    /// without this host being told, and that the noting is done, in one transaction: a store that
+    /// holds the mark holds every session that was named with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails, and writes nothing.
+    pub fn note_unseen_prompt_sessions(
+        &mut self,
+        sessions: &std::collections::BTreeSet<SessionId>,
+        at_ms: TimestampMs,
+    ) -> Result<()> {
+        let transaction = self.begin()?;
+        for session_id in sessions {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO unseen_prompt_sessions (session_id, noted_at_ms)
+                     VALUES (?1, ?2)",
+                    params![uuid_sql(session_id.get()), as_i64(at_ms.get())],
+                )
+                .map_err(TransferError::store)?;
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO unseen_prompts_noted (id, noted_at_ms) VALUES (1, ?1)",
+                params![as_i64(at_ms.get())],
+            )
+            .map_err(TransferError::store)?;
+        transaction.commit().map_err(TransferError::store)
+    }
+
+    /// Returns the sessions noted as ones whose agents may have been sent a prompt that names a
+    /// draft without this host being told.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn unseen_prompt_sessions(&self) -> Result<std::collections::BTreeSet<SessionId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT session_id FROM unseen_prompt_sessions")
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map([], |row| uuid_column(row, 0))
+            .map_err(TransferError::store)?;
+        rows.map(|row| row.map(SessionId::new).map_err(TransferError::store))
+            .collect()
+    }
+
+    /// Returns those of `unseen` that an attachment belongs to, or that a draft holding the
+    /// attachment names: by the session the draft targets, or by the session of another attachment
+    /// the draft holds. A draft the attachment is held by may be sent to such a session by a route
+    /// this host is not told of, and the whole draft goes with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn sessions_shielding(
+        &self,
+        transfer_id: TransferId,
+        unseen: &std::collections::BTreeSet<SessionId>,
+    ) -> Result<std::collections::BTreeSet<SessionId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id FROM uploads
+                     WHERE transfer_id = ?1 AND session_id IS NOT NULL
+                 UNION
+                 SELECT draft.session_id
+                     FROM draft_attachments AS binding
+                     JOIN drafts AS draft ON draft.draft_id = binding.draft_id
+                     WHERE binding.transfer_id = ?1 AND draft.session_id IS NOT NULL
+                 UNION
+                 SELECT upload.session_id
+                     FROM draft_attachments AS binding
+                     JOIN draft_attachments AS other ON other.draft_id = binding.draft_id
+                     JOIN uploads AS upload ON upload.transfer_id = other.transfer_id
+                     WHERE binding.transfer_id = ?1 AND upload.session_id IS NOT NULL",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map(params![uuid_sql(transfer_id.get())], |row| {
+                uuid_column(row, 0)
+            })
+            .map_err(TransferError::store)?;
+        let mut shielding = std::collections::BTreeSet::new();
+        for row in rows {
+            let session_id = SessionId::new(row.map_err(TransferError::store)?);
+            if unseen.contains(&session_id) {
+                shielding.insert(session_id);
+            }
+        }
+        Ok(shielding)
     }
 
     /// Returns the session a draft was sent to, when it was sent to one.

@@ -2080,6 +2080,154 @@ fn identity_of(path: &std::path::Path) -> kr_transfer::ObjectIdentity {
     }
 }
 
+/// KR-REQ-14.11: a session whose prompts the host does not see, once noted, keeps what it names as a
+/// session keeps what was submitted to it. The sweep reads the relations when it looks, so it does
+/// not matter when or in what order the attachments were bound: an attachment that belongs to the
+/// session, one held by a draft that targets it, and one held by a draft that holds another
+/// attachment that belongs to it, even where that attachment was bound to a draft for the session
+/// later and to a second draft too. They outlast the seven-day window while the session is
+/// retained and go when its retention ends; an attachment that names no noted session goes at the
+/// window's end.
+#[test]
+fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_names() {
+    struct Retains(bool);
+    impl kr_transfer::SessionRetention for Retains {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(if self.0 {
+                sessions.clone()
+            } else {
+                std::collections::BTreeSet::new()
+            })
+        }
+    }
+
+    let harness = Harness::create();
+    let noted = SessionId::new(Uuid::from_bytes([31; 16]));
+    let other = SessionId::new(Uuid::from_bytes([32; 16]));
+    let publish = |name: &str, for_session: Option<SessionId>| {
+        let bytes = pattern(32);
+        let begun = harness
+            .begin_for(
+                &bytes,
+                "application/octet-stream",
+                name,
+                Nullable(for_session),
+            )
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle
+    };
+    let draft_for = |session: Option<SessionId>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable(session),
+                    application_instance_id: Nullable::null(),
+                    text: "look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let bind = |draft: &kr_protocol::transfer::DraftRecord,
+                handle: &kr_protocol::transfer::AttachmentHandle| {
+        let revision = harness
+            .service
+            .draft(&harness.actor, draft.draft_id)
+            .expect("reads the draft")
+            .revision;
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(handle),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+    };
+    let there = |transfer_id: TransferId| {
+        harness
+            .service
+            .attachment_handle(&harness.actor, transfer_id)
+            .is_ok()
+    };
+
+    // One that belongs to the noted session.
+    let belonging = publish("belonging.bin", Some(noted)).transfer_id;
+    // Two that name no session, held by one draft; the first is bound to a draft for the noted
+    // session afterwards too, which gives it the session and the first draft a name for it.
+    let (shared, beside) = (publish("shared.bin", None), publish("beside.bin", None));
+    let unnamed_draft = draft_for(None);
+    bind(&unnamed_draft, &shared);
+    bind(&unnamed_draft, &beside);
+    bind(&draft_for(Some(noted)), &shared);
+    // One that names a session nothing was noted for, and one that names none and is held by a
+    // draft that names none.
+    let elsewhere = publish("elsewhere.bin", Some(other)).transfer_id;
+    let (loose, loose_draft) = (publish("loose.bin", None), draft_for(None));
+    bind(&loose_draft, &loose);
+
+    assert!(
+        !harness
+            .service
+            .unseen_prompt_sessions_noted()
+            .expect("reads the journal"),
+        "nothing is noted before the host says so"
+    );
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([noted]))
+        .expect("notes the session");
+    assert!(
+        harness
+            .service
+            .unseen_prompt_sessions_noted()
+            .expect("reads the journal")
+    );
+
+    harness
+        .clock
+        .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
+    let sweep = harness.service.sweep(&Retains(true)).expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 2,
+        "only what names no noted session expired"
+    );
+    for kept in [belonging, shared.transfer_id, beside.transfer_id] {
+        assert!(there(kept), "a noted session's attachment is still there");
+    }
+    for expired in [elsewhere, loose.transfer_id] {
+        assert!(!there(expired), "an unnamed or unnoted attachment is not");
+    }
+
+    let sweep = harness
+        .service
+        .sweep(&Retains(false))
+        .expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 3,
+        "the session's retention has ended"
+    );
+}
+
 fn contribution(
     handle: &kr_protocol::transfer::AttachmentHandle,
 ) -> kr_protocol::transfer::AttachmentContribution {
