@@ -437,6 +437,11 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(test)]
     before_a_close_asks_for_its_link: ReadPause,
+    /// Where this host's own tests stop a create that has read its worker from the directory,
+    /// before it asks the worker to describe the session, so that a closure can land in between.
+    /// Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_created_session_is_read: ReadPause,
     /// Where this host's own tests stop the task that makes a worker known, before it writes the
     /// worker's descriptor, so that a second look at the same reservation can try to begin while
     /// the publication is in flight. Compiled away in every shipped build.
@@ -969,6 +974,10 @@ mod a_descriptor_beside_a_closure;
 /// A recovery's publication that outlives the request that began it, and the look that follows.
 #[cfg(test)]
 mod a_publication_that_outlives_its_request;
+
+/// A create whose session closed after its worker reported itself.
+#[cfg(test)]
+mod a_create_whose_session_closed;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.

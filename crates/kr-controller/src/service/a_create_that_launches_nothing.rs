@@ -49,7 +49,9 @@ fn a_recorded_create_request_reads_as_itself_and_nothing_else_does() {
     assert!(super::create::recorded_create(b"not a record").is_err());
 }
 
-fn create_params(environment_id: kr_protocol::ids::EnvironmentId) -> SessionCreateParams {
+pub(super) fn create_params(
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> SessionCreateParams {
     SessionCreateParams {
         environment_id,
         presentation: Presentation::Invisible,
