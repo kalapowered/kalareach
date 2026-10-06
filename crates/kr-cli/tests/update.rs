@@ -512,8 +512,55 @@ struct Host {
     _place: Place,
 }
 
+/// Prints what the daemons of a case that failed wrote, and how long before it was read each log was
+/// last written: the tree goes with the test, and a daemon's log carries no times of its own.
+///
+/// A write that fails is no reason to stop a teardown, so this uses no macro that panics on one.
+fn show_what_the_daemons_wrote(tree: &teardown::Tree) {
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(tree.root())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("daemon") && name.ends_with(".log"))
+        })
+        .collect();
+    logs.extend(
+        std::fs::read_dir(tree.paths().state_root().join("environments"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("controller.log")),
+    );
+    logs.sort();
+    for log in logs {
+        let Ok(text) = std::fs::read_to_string(&log) else {
+            continue;
+        };
+        let ago = std::fs::metadata(&log)
+            .and_then(|about| about.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        let _ = writeln!(
+            std::io::stderr(),
+            "the log of a daemon, {}, last written {} before it was read as this test failed:\n{text}",
+            log.display(),
+            ago.map_or_else(
+                || "at a time that is not known".to_owned(),
+                |ago| format!("{:.1} s", ago.as_secs_f64())
+            ),
+        );
+    }
+}
+
 impl Drop for Host {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            show_what_the_daemons_wrote(&self.tree);
+        }
         // A daemon `kr host update` started is not this test's child: it is stopped the way an
         // update stops one, and the environment's lock says when it has gone.
         let stopped = std::thread::scope(|scope| {
@@ -727,6 +774,9 @@ impl Second {
 
 impl Drop for Second {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            show_what_the_daemons_wrote(&self.tree);
+        }
         let stopped = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -1365,7 +1415,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     ]);
     assert!(
         output.status.success(),
-        "kr host update: {}",
+        "kr host update: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(said["target"], two.name().as_str(), "{said}");
@@ -1405,7 +1455,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     ]);
     assert!(
         output.status.success(),
-        "kr host update: {}",
+        "kr host update: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(said["removed"], serde_json::json!([]), "{said}");
@@ -1443,7 +1493,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     ]);
     assert!(
         output.status.success(),
-        "kr host update: {}",
+        "kr host update: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
     // The first release, and the second, which is no longer the previous one either.
@@ -1557,7 +1607,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     ]);
     assert!(
         output.status.success(),
-        "kr host update: {}",
+        "kr host update: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(said["target"], two.name().as_str(), "{said}");
