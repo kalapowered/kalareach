@@ -168,13 +168,32 @@ dispatch to a session's worker, and a receipt stands for what was done. Deliveri
 externally has no method, so a proposal for it is refused. A decision on an approval is refused: the
 daemon holds no approval's details to check a spoken decision against.
 
-The context the daemon supplies is the session's description and the directory the session started
-in, each with the moment the session was created. It supplies no active application, because it
-cannot say when the foreground last changed, and no pending-decision summaries or messages, because
-it does not hold the worker's semantic history; the selection carries those two reasons as
-withheld. It supplies none of the four classes a person can select (file contents, environment
-variables, scrollback and attachment bytes): the companion selects none, and this daemon has no
-source for them, so a request that selects one gets nothing for it and no withheld entry.
+The context the daemon supplies is read from the daemon. The session number, pinned name (if any)
+and shell are read, as is the time at which the session was created. The working directory and time
+are the most recent recorded on the session's description host; if the description host has not seen
+a directory yet, the directory the session started in and the time at which the session was created
+are used instead. The active application and time are the most recent recorded on the session's
+description host; if the description host has not seen a program yet, no active application is
+provided, and the selection carries the reason for withholding it instead. If a model has written
+any text about the session this is also read; this text is marked as written by a local model which
+may be incorrect, and as written at the start of the session, so a grant whose history begins after
+the start of the session is not shown it. The model's text will not be read if a name is pinned.
+Summaries of pending decisions, and messages, are not read as the daemon does not store semantic
+history for workers; the selection carries that reason as withheld. Content of any of the four
+classes selected by the person (file contents, environment variables, scrollback contents, and
+attachment bytes) will not be provided: the companion selects none of these classes, and this daemon
+has no place to read them from, so a request that selects one gets nothing for it and no withheld
+entry.
+
+What a model wrote and what the description host saw leave the daemon only while the privacy mode is
+in the same state as it was when they were read. Privacy mode removes both when it is turned on, and
+the daemon reads neither while it is on. If the privacy mode is turned on whilst the context is
+being read the context will be read again, and the answer carries neither. The context will be read
+at most three times; if the privacy mode keeps changing the request will be refused as transient and
+the device will request it again. The answer is checked once, when the read ends, so the privacy
+mode may still be turned on between that check and the write to the device. The receipt for a voice
+read of a session carries the pinned name and the facts the daemon holds itself, but no model text
+or description host information.
 
 ## A voice session is not a terminal session
 
