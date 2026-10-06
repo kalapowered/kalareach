@@ -3647,8 +3647,8 @@ pub(crate) mod tests {
     }
 
     /// KR-REQ-18.02: the request for a summary is for the whole interval that was frozen and reads
-    /// the newest changes only. Its first and last moments are those of every change the log
-    /// retains in it, so a grant is held to the oldest even when the newest are all the job
+    /// the newest changes only. Its earliest and latest moments are those of every change the
+    /// log retains in it, so a grant is held to the oldest even when the newest are all the job
     /// reads; each change carries the host's own words or the text read for it, and one whose
     /// text was not read carries none.
     #[test]
@@ -3699,7 +3699,7 @@ pub(crate) mod tests {
         assert_eq!(
             (ask.from_ms, ask.to_ms),
             (1_003, 1_079),
-            "the moments of the first and last retained change, though the job reads the newest"
+            "the earliest and latest moments of the retained changes, though the job reads the newest"
         );
         assert_eq!(ask.generation, generation);
         assert_eq!(ask.changes.len(), kr_describe::summary::MAX_SUMMARY_CHANGES);
