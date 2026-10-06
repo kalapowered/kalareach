@@ -2356,8 +2356,8 @@ impl Registry {
     /// was written after it: the recovery of an earlier build wrote a row for a worker it reached
     /// once its session had closed. Nothing writes one now, and a daemon that starts calls this
     /// before it reads any row, so what it restores and seeds never includes the worker of a closed
-    /// session. Once no daemon of that earlier build is left to run against a registry, this and
-    /// its call are to be removed.
+    /// session. This and its call are to be removed once every registry in use was last written by
+    /// a build that checks a session's closure before it records a worker for it.
     ///
     /// # Errors
     ///

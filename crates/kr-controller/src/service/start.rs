@@ -61,7 +61,8 @@ impl Controller {
     /// description process beside the daemon, and tracks every session the directory holds.
     ///
     /// A host that cannot start leaves the daemon serving pins and deterministic titles, as one
-    /// without descriptions does: descriptions are never what stops a daemon.
+    /// without descriptions does: descriptions are never what stops a daemon. A registry that
+    /// cannot be read stops the start here as it does at every other step.
     ///
     /// # Errors
     ///

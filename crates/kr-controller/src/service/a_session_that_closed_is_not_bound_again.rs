@@ -77,7 +77,7 @@ async fn a_session_with_a_closure_is_not_bound() {
 
 /// Polls a future once and says it is waiting: for a test that wants two futures queued for one lock
 /// in a known order, with nothing waited for but the lock.
-pub(super) async fn parked<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>, what: &str) {
+async fn parked<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>, what: &str) {
     let polled = std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await;
     assert!(polled.is_pending(), "{what} waits for the registry");
 }
@@ -624,6 +624,57 @@ async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_sessio
     })
     .await;
     assert!(gone.is_ok(), "no descriptor is left for the closed session");
+    assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
+}
+
+/// KR-REQ-09.12: a publication for a session that has closed has nothing to do, even where the
+/// write of the descriptor it would then remove reports a failure: the closure is looked at first,
+/// since a write can fail after the file has its name and leave a descriptor that nothing else
+/// would remove. Here the directory takes no new file; where it does anyway (a user that is not
+/// held to file modes) the write cannot fail and there is nothing to show.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_for_a_closed_session_does_not_fail_on_the_descriptor_it_would_remove() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Gives the directory its modes back, whatever becomes of the test.
+    struct Restore(std::path::PathBuf, std::fs::Permissions);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+
+    let world = Served::recorded().await;
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded and its tidying has run");
+    let descriptors = world.controller.paths().descriptors_dir();
+    let modes = std::fs::metadata(&descriptors)
+        .expect("the descriptors' directory exists")
+        .permissions();
+    let _restore = Restore(descriptors.clone(), modes);
+    std::fs::set_permissions(&descriptors, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made read only");
+    let probe = descriptors.join(".probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return;
+    }
+
+    world
+        .controller
+        .publish_worker(world.worker.clone(), None)
+        .await
+        .expect("a publication for a closed session has nothing to do");
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 }
 

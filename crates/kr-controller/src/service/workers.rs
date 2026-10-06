@@ -170,13 +170,16 @@ impl Controller {
         described: Option<SessionSummary>,
     ) -> Result<()> {
         let session_id = worker.descriptor.session_id;
-        kr_ipc::descriptor::publish(&self.paths, &worker.descriptor)?;
+        // Whether it was written is looked at once the closure has been: a write that fails after
+        // the file has its name (the directory's flush) leaves a descriptor all the same.
+        let published = kr_ipc::descriptor::publish(&self.paths, &worker.descriptor);
         let registry = self.registry.lock().await;
         if registry.closure(session_id)?.is_some() {
             drop(registry);
             kr_ipc::descriptor::retire(&self.paths, session_id)?;
             return Ok(());
         }
+        published?;
         // A recorded or adopted worker answers rounds of plugin admissions on its own endpoint from
         // here on, and is sent one at once.
         self.plugin_bridge.recorded(

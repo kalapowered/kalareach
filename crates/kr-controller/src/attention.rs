@@ -2295,6 +2295,12 @@ impl AttentionModule {
         self.origins().watched.contains(&session_id)
     }
 
+    /// Whether the store has finished with a closed session. For this crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn finished_with(&self, session_id: SessionId) -> bool {
+        self.finalised(session_id)
+    }
+
     // ----- The workflow journal's alerts ----------------------------------------------------
 
     /// Reads the workflow journal's attention records for as long as the module is held: one pass
