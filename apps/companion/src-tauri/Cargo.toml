@@ -93,6 +93,9 @@ kr-width.workspace = true
 # support it includes by path.
 iroh.workspace = true
 kr-controller = { workspace = true, features = ["testing"] }
+# The description host's test catalogue and the conditions it reads, which the setup card's suite
+# places under the in-process daemon.
+kr-describe = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-transport.workspace = true
 tempfile.workspace = true
