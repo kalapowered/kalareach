@@ -641,6 +641,10 @@ impl Controller {
     ///
     /// Returns an error when the session's published descriptor cannot be removed.
     async fn finish_closure(&self, record: &ClosureRecord) -> Result<()> {
+        #[cfg(test)]
+        if self.stops_at(super::StopPoint::InAClosuresTail) {
+            return Err(Self::stopped(super::StopPoint::InAClosuresTail));
+        }
         // This daemon's own view of the session goes as soon as the closure is recorded, before
         // the published descriptor is removed and whether or not that succeeds. The closure is
         // the fact; a worker kept in the directory after it would be a session this daemon still
@@ -685,8 +689,7 @@ impl Controller {
         // host has ever run. A worker still on its way out may be holding it; on the platforms
         // where that refuses the removal, the next start writes the directory again.
         let _ = std::fs::remove_dir_all(self.paths.worker_dir(record.session_id));
-        kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
-        Ok(())
+        self.retire_descriptor(record.session_id)
     }
 
     /// Removes the job a worker was started as, once that worker has ended.

@@ -194,6 +194,50 @@ impl ReadPause {
     }
 }
 
+/// A step of this daemon that its own tests can end where a crash would: the step returns an error
+/// there and does nothing after it, and what was already written is left as it was.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopPoint {
+    /// A worker's descriptor has been written, and the section that finds out whether its session
+    /// has closed has not begun.
+    AfterADescriptorIsWritten,
+    /// A closure is recorded and what follows it has not begun: the worker is still in the
+    /// directory, and its descriptor is on disk.
+    InAClosuresTail,
+    /// A closure's removal of the session's descriptor, which is refused.
+    AtADescriptorsRetirement,
+}
+
+#[cfg(test)]
+impl Controller {
+    /// Makes the next time a step reaches `point` end there, as a crash at that point would. Once.
+    fn stop_at(&self, point: StopPoint) {
+        *self
+            .stopped_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(point);
+    }
+
+    /// Whether a test has made the step that is at `point` end there, which it takes back.
+    fn stops_at(&self, point: StopPoint) -> bool {
+        let mut armed = self
+            .stopped_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *armed == Some(point) {
+            *armed = None;
+            return true;
+        }
+        false
+    }
+
+    /// The error a step that ended at a [`StopPoint`] returns.
+    fn stopped(point: StopPoint) -> ControllerError {
+        ControllerError::supervision(format!("a test ended this step at {point:?}"))
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -398,6 +442,10 @@ pub struct Controller {
     /// the publication is in flight. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_worker_is_made_known: ReadPause,
+    /// The step this host's own tests have made stop where a crash would, if one is armed
+    /// ([`StopPoint`]). Compiled away in every shipped build.
+    #[cfg(test)]
+    stopped_at: std::sync::Mutex<Option<StopPoint>>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -913,6 +961,10 @@ mod a_session_that_closed_before_a_start;
 /// A request for a worker that a closure overtakes: a remote connection's link, and a close.
 #[cfg(test)]
 mod a_request_that_a_closure_overtakes;
+
+/// A closed session's descriptor that its closure's tidying did not remove, found by the next start.
+#[cfg(test)]
+mod a_descriptor_beside_a_closure;
 
 /// A recovery's publication that outlives the request that began it, and the look that follows.
 #[cfg(test)]
