@@ -37,6 +37,10 @@ pub enum NameKind {
 ///
 /// Returns the operating system's error when the directory cannot be opened or flushed.
 pub fn flush_directory(directory: &Path, kind: NameKind) -> std::io::Result<()> {
+    #[cfg(feature = "testing")]
+    if testing::refuses_flushes_of(directory) {
+        return Err(std::io::Error::other("a test made this flush fail"));
+    }
     #[cfg(unix)]
     {
         let _ = kind;
@@ -177,15 +181,17 @@ pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> 
     }
 }
 
-/// What the tests of a store that renames through [`retry_while_held`] use to act at the one
-/// moment a held rename cannot be reached from outside: after an attempt was refused because
-/// another program holds what it needs, and before the next.
+/// What the tests of a store that flushes through this crate use to reach what a test cannot reach
+/// from outside: a held rename, after an attempt was refused because another program holds what it
+/// needs and before the next, and a directory flush that fails after the name it follows has been
+/// given.
 ///
 /// Compiled only with this crate's `testing` feature, which a store enables for its own tests and
 /// never in a build it ships.
 #[cfg(feature = "testing")]
 pub mod testing {
     use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
 
     /// What a test does after one of its renames was refused as held.
     type Hook = Box<dyn FnMut()>;
@@ -208,6 +214,50 @@ pub mod testing {
     /// Removes the hook [`after_held_refusal`] set, when it is dropped.
     #[derive(Debug)]
     pub struct AfterHeldRefusal(());
+
+    /// The directories whose flush a test has made fail.
+    static REFUSED_FLUSHES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// Makes every [`super::flush_directory`] of `directory`, spelled as it is flushed, fail with
+    /// an error until the returned guard is dropped.
+    ///
+    /// A store's own write that renames a file into place and then flushes the directory fails
+    /// after the name was given, which no mode or ownership of the directory can show on every
+    /// platform and for every user. The failure holds for whichever thread flushes the directory,
+    /// and for that directory only, so tests that run together do not see each other's.
+    #[must_use = "the flushes are allowed again when the guard is dropped"]
+    pub fn refuse_flushes_of(directory: impl Into<PathBuf>) -> RefusedFlushes {
+        let directory = directory.into();
+        REFUSED_FLUSHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(directory.clone());
+        RefusedFlushes(directory)
+    }
+
+    /// Allows the flushes [`refuse_flushes_of`] made fail, when it is dropped.
+    #[derive(Debug)]
+    pub struct RefusedFlushes(PathBuf);
+
+    impl Drop for RefusedFlushes {
+        fn drop(&mut self) {
+            let mut refused = REFUSED_FLUSHES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(at) = refused.iter().position(|held| *held == self.0) {
+                refused.remove(at);
+            }
+        }
+    }
+
+    /// Whether a test has made the flush of `directory` fail.
+    pub(crate) fn refuses_flushes_of(directory: &Path) -> bool {
+        REFUSED_FLUSHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|refused| refused == directory)
+    }
 
     impl Drop for AfterHeldRefusal {
         fn drop(&mut self) {
