@@ -44,7 +44,7 @@ fn state_of(round: &Round<'_>, session_id: SessionId, revision: AuthorityRevisio
 /// Whether the registry's file holds the closure, read on a connection of this test's own: the
 /// daemon's registry is behind a lock that this test may be holding, and another task of the
 /// daemon may hold that lock while it waits for one this test holds.
-fn on_disk(world: &Served) -> bool {
+pub(super) fn on_disk(world: &Served) -> bool {
     let database = world.controller.paths().registry_database();
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

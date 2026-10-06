@@ -567,6 +567,66 @@ async fn a_descriptor_is_written_without_the_registry_and_taken_away_when_a_clos
     assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
 }
 
+/// KR-REQ-09.12: a publication whose request stops waiting once the descriptor is written, after
+/// the session's closure has finished, leaves no descriptor: nothing but the publication would
+/// remove it, since the closure's own tidying has run, and a start that found it would find no row
+/// to repair it by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_session() {
+    let world = Served::recorded().await;
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded and its tidying has run");
+    let registry = world.controller.registry.lock().await;
+    let publishing = tokio::spawn({
+        let controller = std::sync::Arc::clone(&world.controller);
+        let worker = world.worker.clone();
+        async move { controller.publish_worker(worker, None).await }
+    });
+    let written = tokio::time::timeout(WAIT, async {
+        while kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        written.is_ok(),
+        "the descriptor is written while the registry is held"
+    );
+
+    // The request stops waiting at the registry, after the descriptor is written.
+    publishing.abort();
+    assert!(
+        publishing
+            .await
+            .expect_err("the request was cancelled")
+            .is_cancelled()
+    );
+    drop(registry);
+    let gone = tokio::time::timeout(WAIT, async {
+        while kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "no descriptor is left for the closed session");
+    assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
+}
+
 /// No connection is opened to a worker whose session has closed, by a caller that took the worker
 /// from the directory before the closure and asks for its connection after it: the caller is told
 /// the session is unknown and the connection table holds nothing for it. The control is the same

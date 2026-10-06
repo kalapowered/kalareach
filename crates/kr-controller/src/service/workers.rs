@@ -139,12 +139,32 @@ impl Controller {
     /// waits for the disk, and where a rename is refused for a moment it is tried again for seconds,
     /// while every request that is admitted waits for the registry's lock. A closure that lands
     /// while it is written has its own tidying remove a descriptor that may not yet be there, so the
-    /// section that finds the closure removes it again.
+    /// section that finds the closure removes it again. All of it runs on a task of its own that the
+    /// caller awaits, as a closure's tidying does: a request that stops waiting after the descriptor
+    /// is written must not leave one for a session whose closure has finished, and nothing would
+    /// remove it.
     ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or the descriptor cannot be published.
     pub(super) async fn publish_worker(
+        &self,
+        worker: KnownWorker,
+        described: Option<SessionSummary>,
+    ) -> Result<()> {
+        let Some(daemon) = self.me.upgrade() else {
+            return self.make_worker_known(worker, described).await;
+        };
+        match tokio::spawn(async move { daemon.make_worker_known(worker, described).await }).await {
+            Ok(published) => published,
+            Err(ended) if ended.is_panic() => std::panic::resume_unwind(ended.into_panic()),
+            Err(_) => Err(ControllerError::supervision(
+                "this daemon stopped before it finished making a worker known",
+            )),
+        }
+    }
+
+    async fn make_worker_known(
         &self,
         worker: KnownWorker,
         described: Option<SessionSummary>,
@@ -176,8 +196,13 @@ impl Controller {
         Ok(())
     }
 
-    /// The workers the directory holds whose sessions have no closure, for a caller that holds the
-    /// registry's lock (`registry`) and acts on them before it lets that go.
+    /// The workers the directory holds.
+    pub(super) async fn directory_workers(&self) -> Vec<KnownWorker> {
+        self.directory.lock().await.iter().cloned().collect()
+    }
+
+    /// Keeps the workers whose sessions have no closure, for a caller that holds the registry's
+    /// lock (`registry`) and begins on what it keeps before it lets that go.
     ///
     /// A closure is recorded under that lock, and its worker leaves the directory afterwards, on a
     /// task of its own. A caller that copies the directory and then acts without the lock can act on
@@ -187,11 +212,10 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read.
-    pub(super) async fn workers_without_a_closure(
-        &self,
+    pub(super) fn without_a_closure(
         registry: &crate::registry::Registry,
+        workers: Vec<KnownWorker>,
     ) -> Result<Vec<KnownWorker>> {
-        let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         let mut open = Vec::with_capacity(workers.len());
         for worker in workers {
             if registry.closure(worker.descriptor.session_id)?.is_none() {

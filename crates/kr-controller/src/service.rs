@@ -379,6 +379,11 @@ pub struct Controller {
     /// build.
     #[cfg(test)]
     before_a_worker_is_published: ReadPause,
+    /// Where this host's own tests stop what a start sets going for the workers it holds, once it
+    /// has read them from the directory and before it begins on them, so that a closure can try to
+    /// land in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    after_a_start_reads_the_directory: ReadPause,
     /// Where this host's own tests stop a remote connection's link to a worker after the worker was
     /// read from the directory and before the link is opened, so that a closure can land in
     /// between. Compiled away in every shipped build.

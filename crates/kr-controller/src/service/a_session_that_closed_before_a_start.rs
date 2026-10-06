@@ -10,12 +10,14 @@
 //! recorded, so it is begun for a worker whose session has no closure, or not at all.
 
 use std::sync::Arc;
+use std::task::Poll;
 
 use kr_protocol::identity::DesktopBinding;
 
+use super::a_closure_that_is_cancelled::on_disk;
 use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::closure_of;
-use super::a_session_that_closed_is_not_bound_again::{held_by_the_daemon, parked};
+use super::a_session_that_closed_is_not_bound_again::held_by_the_daemon;
 
 /// What a daemon that stopped leaves for the next one to find of a worker that kept running: its
 /// row in the registry and its descriptor on disk, and, where `closed`, the closure of its session
@@ -140,51 +142,98 @@ async fn a_session_with_a_closure_is_not_read_by_what_a_start_begins() {
     );
 }
 
-/// What a start sets going for the workers its directory holds, begun while a closure's section
-/// has the registry, as a closure that lands between a start's reading of the directory and what
-/// it does with it would have it. The attention store's reading and the description host's are each
-/// asked to begin and are found waiting for the registry. Where `closure_lands`, the closure is
-/// recorded in the section that has the registry, and the daemon's own directory still lists the
-/// worker, as it does until the closure's tidying has run. Answers whether the store reads the
-/// session and whether the host reads its facts once the registry is let go.
-async fn begun_while_the_registry_is_held(closure_lands: bool) -> [bool; 2] {
+/// The readers a start sets going for the workers its directory holds.
+#[derive(Clone, Copy, Debug)]
+enum Reader {
+    /// The attention store's reading of the session's sources.
+    Attention,
+    /// The description host's reading of the session's facts.
+    Descriptions,
+}
+
+/// Starts `reader` on the workers the directory holds, stops it once it has read them from the
+/// directory and before it begins on them, and, where `closure_lands`, lets a closure of the
+/// worker's session try to land there: its first step is taken while the reader is stopped, and
+/// where that step records the closure it is carried through the closure's tidying before the
+/// reader goes on, as a closure on another thread would be. Answers whether the reader reads the
+/// session at its worker once both are done.
+///
+/// A start that holds the registry's lock from reading the directory to beginning on what it read
+/// has the closure wait for it and undo what it began, and a start that does not begins on a worker
+/// that a closure has already tidied away.
+async fn read_while_a_closure_lands(reader: Reader, closure_lands: bool) -> bool {
     let world = Served::start().await;
     let session_id = world.session_id;
-    assert!(!world.controller.attention.watching(session_id));
-    assert!(!world.controller.descriptions.reading(session_id));
-    let mut registry = world.controller.registry.lock().await;
-    let attention = Arc::clone(&world.controller);
-    let descriptions = Arc::clone(&world.controller);
-    let mut attending = Box::pin(async move { attention.watch_open_sessions().await });
-    let mut describing = Box::pin(async move { descriptions.describe_open_workers().await });
-    parked(attending.as_mut(), "the attention store's start").await;
-    parked(describing.as_mut(), "the description host's start").await;
+    let controller = &world.controller;
+    assert!(!controller.attention.watching(session_id));
+    assert!(!controller.descriptions.reading(session_id));
+    let (arrived, go) = controller.after_a_start_reads_the_directory.arm();
+    let reading = tokio::spawn({
+        let controller = Arc::clone(controller);
+        async move {
+            match reader {
+                Reader::Attention => controller.watch_open_sessions().await,
+                Reader::Descriptions => controller.describe_open_workers().await,
+            }
+        }
+    });
+    arrived.await.expect("the reader has read the directory");
+
+    let record = closure_of(session_id);
+    let mut closing = Box::pin(controller.retire(&record));
+    let mut closed = false;
     if closure_lands {
-        registry
-            .record_closure(&closure_of(session_id))
-            .expect("the closure is recorded");
-        world.controller.leases.worker_ended(session_id);
+        let first =
+            std::future::poll_fn(|context| Poll::Ready(closing.as_mut().poll(context))).await;
+        match first {
+            Poll::Ready(finished) => {
+                finished.expect("the closure is recorded");
+                closed = true;
+            }
+            // Recorded by that step: nothing holds the closure back, and it is carried through.
+            Poll::Pending if on_disk(&world) => {
+                closing.as_mut().await.expect("the closure is recorded");
+                closed = true;
+            }
+            // Waiting for the registry, which the reader holds.
+            Poll::Pending => {}
+        }
     }
-    drop(registry);
-    let (attended, described) = tokio::join!(attending, describing);
-    attended.expect("the attention store starts");
-    described.expect("the description host starts");
-    [
-        world.controller.attention.watching(session_id),
-        world.controller.descriptions.reading(session_id),
-    ]
+    go.send(()).expect("the reader is waiting");
+    reading
+        .await
+        .expect("the reader's task ends")
+        .expect("the reader starts");
+    if closure_lands && !closed {
+        closing.await.expect("the closure is recorded");
+    }
+    match reader {
+        Reader::Attention => controller.attention.watching(session_id),
+        Reader::Descriptions => controller.descriptions.reading(session_id),
+    }
 }
 
-/// The control: with no closure, what a start begins for a worker it holds is begun.
+/// The control: with no closure, what a start begins for a worker is begun.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_a_start_begins_for_a_worker_is_begun_when_its_session_has_no_closure() {
-    assert_eq!(begun_while_the_registry_is_held(false).await, [true, true]);
+    for reader in [Reader::Attention, Reader::Descriptions] {
+        assert!(
+            read_while_a_closure_lands(reader, false).await,
+            "the {reader:?} reader reads a session a closure has ended"
+        );
+    }
 }
 
-/// KR-REQ-09.12: a closure that lands while a start's attention store and description host are
-/// about to begin on a worker leaves neither of them reading it: a session whose closure is
-/// recorded is read by nothing that a start sets going.
+/// KR-REQ-09.12: a closure that tries to land after a start has read a worker from the directory
+/// and before it begins on it leaves nothing reading the session: the closure waits for the
+/// registry's lock, which the start holds until it has begun, and its tidying then stops what the
+/// start began.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_a_start_begins_reads_a_session_a_closure_has_ended() {
-    assert_eq!(begun_while_the_registry_is_held(true).await, [false, false]);
+    for reader in [Reader::Attention, Reader::Descriptions] {
+        assert!(
+            !read_while_a_closure_lands(reader, true).await,
+            "the {reader:?} reader reads a session a closure has ended"
+        );
+    }
 }
