@@ -1631,6 +1631,71 @@ async fn a_devices_close_that_a_closure_overtakes_is_answered_from_the_closure()
     );
 }
 
+/// KR-REQ-09.12: a paired device that reads a session that has closed is told that it closed,
+/// whether its read names the session or only an action it performed there, and not that the
+/// session is unknown: the closure is on record. A session this host never held is unknown, which
+/// is the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_reads_a_closed_session_is_told_it_closed_and_not_that_it_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::question::QuestionReadParams;
+    use kr_protocol::receipt::ActionReadParams;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_link_that_is_not_given_back::Served;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = Served::start().await;
+    let controller = &world.controller;
+    let device = paired_with_every_right(controller, 71);
+    // The route of an action the device performed in the session, which a read of that action
+    // follows to the session.
+    let close = fake::close_request(controller.paths().environment_id(), world.session_id);
+    assert!(
+        super::RemoteConnection::for_test(controller, device.clone())
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+
+    let question_read = |session_id: SessionId| {
+        device_request(
+            1,
+            Method::QuestionRead,
+            &QuestionReadParams {
+                session_id,
+                question_id: Nullable::null(),
+                include_resolved: true,
+            },
+        )
+    };
+    let action_read = device_request(
+        2,
+        Method::ActionRead,
+        &ActionReadParams {
+            action_id: close.action_id,
+            session_id: None,
+        },
+    );
+    // Each on a connection of its own, as a device that connects after the closure asks.
+    for request in [question_read(world.session_id), action_read] {
+        let connection = super::RemoteConnection::for_test(controller, device.clone());
+        let refused = refusal(connection.read(&request).await);
+        assert_eq!(refused.code, ErrorCode::SessionClosed, "{refused:?}");
+    }
+    let connection = super::RemoteConnection::for_test(controller, device);
+    let unknown = refusal(
+        connection
+            .read(&question_read(SessionId::new(kr_ipc::new_uuid())))
+            .await,
+    );
+    assert_eq!(unknown.code, ErrorCode::UnknownSession, "{unknown:?}");
+}
+
 /// KR-REQ-23.34: a daemon that replaced the one a device's close went through, and admitted the
 /// session's worker without a description, answers the device's exact retry of that close from
 /// the receipt the worker kept, and settles that answer as it settles one given now. Once the

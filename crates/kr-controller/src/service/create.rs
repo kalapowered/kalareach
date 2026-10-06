@@ -607,14 +607,49 @@ impl Controller {
             }
         };
 
+        self.answer_a_created_session(&create, &reservation, ready.endpoint)
+            .await
+    }
+
+    /// The answer to a create whose worker has reported itself: the session as the worker describes
+    /// it, and where to attach to it.
+    ///
+    /// The worker is read from the directory, and its session can close before it is described. The
+    /// closure is the answer then, as it is to a create that is asked again afterwards: the session
+    /// as it closed, with no endpoint, and with no window to report on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker cannot be described and no closure is recorded.
+    pub(super) async fn answer_a_created_session(
+        self: &Arc<Self>,
+        create: &SessionCreateParams,
+        reservation: &crate::registry::Reservation,
+        endpoint: String,
+    ) -> Result<ParamsValue> {
         let worker = self
             .directory
             .lock()
             .await
             .get(reservation.session_id)
-            .cloned()
-            .ok_or_else(|| ControllerError::supervision("the worker is not in the directory"))?;
-        let summary = self.read_from_worker(&worker).await?.session;
+            .cloned();
+        #[cfg(test)]
+        self.before_a_created_session_is_read.wait().await;
+        let described = match worker {
+            Some(worker) => match self.read_from_worker(&worker).await {
+                Ok(read) => Some(read.session),
+                // The worker left the directory between the two: its session closed.
+                Err(ControllerError::UnknownSession { .. }) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let Some(summary) = described else {
+            return self
+                .closed_create(reservation, false)
+                .await?
+                .ok_or_else(|| ControllerError::supervision("the worker is not in the directory"));
+        };
         // A new session can be the work that justifies keeping this host awake, and the setting
         // decides whether it does. That is looked at beside this answer rather than before it:
         // what the host does about its own sleep policy is no reason to hold a caller's receipt.
@@ -623,10 +658,10 @@ impl Controller {
         // host that cannot open one answers with the session it made and the reason. Nothing here
         // creates a second session, and a repeated create token never reaches this line, so a
         // retry cannot open a second window either.
-        let presentation_error = self.present(&create, reservation.session_id).await;
+        let presentation_error = self.present(create, reservation.session_id).await;
         encode(&SessionCreateResult {
             session: summary,
-            endpoint: Nullable::some(ready.endpoint),
+            endpoint: Nullable::some(endpoint),
             deduplicated: false,
             presentation_error: Nullable(presentation_error),
         })
@@ -774,38 +809,61 @@ impl Controller {
             .as_deref()
             .and_then(|recorded| recorded_create(recorded).ok());
         if let Some(worker) = worker {
-            let summary = self.read_from_worker(&worker).await?.session;
-            return encode(&SessionCreateResult {
-                session: summary,
-                endpoint: Nullable::some(worker.endpoint.as_text()),
-                deduplicated: true,
-                presentation_error: Nullable(
-                    self.replayed_presentation(requested.as_ref(), reservation.session_id)
-                        .await,
-                ),
-            });
+            match self.read_from_worker(&worker).await {
+                Ok(read) => {
+                    return encode(&SessionCreateResult {
+                        session: read.session,
+                        endpoint: Nullable::some(worker.endpoint.as_text()),
+                        deduplicated: true,
+                        presentation_error: Nullable(
+                            self.replayed_presentation(requested.as_ref(), reservation.session_id)
+                                .await,
+                        ),
+                    });
+                }
+                // The worker left the directory between the two: its session closed.
+                Err(ControllerError::UnknownSession { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
+        self.closed_create(reservation, true).await?.ok_or_else(|| {
+            ControllerError::supervision(format!(
+                "this create token is already recorded as {} and its worker is not available",
+                reservation.phase.as_str()
+            ))
+        })
+    }
+
+    /// The answer to a create whose session has closed, from the session's closure record, or
+    /// `None` where none is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    async fn closed_create(
+        &self,
+        reservation: &crate::registry::Reservation,
+        deduplicated: bool,
+    ) -> Result<Option<ParamsValue>> {
         let registry = self.registry.lock().await;
         let closure = registry.closure(reservation.session_id)?;
         drop(registry);
-        match closure {
-            Some(closure) => encode(&SessionCreateResult {
-                session: self
-                    .closed_session(&closure, reservation.display_number)
-                    .await,
-                // A closed session has no endpoint to attach to, which the reply says rather than
-                // handing back a path that leads nowhere.
-                endpoint: Nullable::null(),
-                // A closed session has no window either way, so there is no presentation to
-                // report on: what the caller is owed here is the closure record.
-                presentation_error: Nullable::null(),
-                deduplicated: true,
-            }),
-            None => Err(ControllerError::supervision(format!(
-                "this create token is already recorded as {} and its worker is not available",
-                reservation.phase.as_str()
-            ))),
-        }
+        let Some(closure) = closure else {
+            return Ok(None);
+        };
+        encode(&SessionCreateResult {
+            session: self
+                .closed_session(&closure, reservation.display_number)
+                .await,
+            // A closed session has no endpoint to attach to, which the reply says rather than
+            // handing back a path that leads nowhere.
+            endpoint: Nullable::null(),
+            // A closed session has no window either way, so there is no presentation to report on:
+            // what the caller is owed here is the closure record.
+            presentation_error: Nullable::null(),
+            deduplicated,
+        })
+        .map(Some)
     }
 }
 
