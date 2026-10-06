@@ -2396,6 +2396,246 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
     );
 }
 
+/// KR-REQ-14.28: a recovery that cannot finish taking a staged directory away leaves its record
+/// naming the filesystem the directory was found on, so the next recovery cannot take another
+/// filesystem's directory at that name for it.
+#[cfg(unix)]
+#[test]
+fn a_recovery_that_stops_leaves_the_staged_record_naming_the_filesystem_it_was_found_on() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "stopped-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("stopped-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+    let destination = ordinary_repository(fixture.work(), "stopped-destination");
+    let workspace = fixture.workspace("stopped-destination");
+    stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+    let staged = destination.join(staged_entry("README.md"));
+    if std::fs::metadata(&staged).is_ok_and(|metadata| metadata.uid() == 0) {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+        return;
+    }
+    let journal = rusqlite::Connection::open(
+        kr_changeset::ChangeSetService::root_of(&fixture.host().environment())
+            .join(kr_changeset::store::STORE_FILE_NAME),
+    )
+    .expect("the change-set journal opens");
+    // The record as a build that recorded no filesystem wrote it.
+    journal
+        .execute("UPDATE apply_progress SET staged_fs = NULL", [])
+        .expect("the record is rewritten");
+
+    // The file in it cannot be taken away, so the recovery stops after it has decided the record.
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o500))
+        .expect("its entries cannot be removed");
+    let stopped = fixture.reopen().recover_before_serving();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+    let stopped = stopped.expect("recovery runs");
+    assert_eq!(stopped.staged_left, 1, "the temporary is left where it is");
+    let filesystem: Option<Vec<u8>> = journal
+        .query_row(
+            "SELECT staged_fs FROM apply_progress WHERE staged_entry IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reads the record");
+    assert_eq!(
+        filesystem.as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN),
+        "the record took the filesystem the directory was found on before anything was removed"
+    );
+    assert!(staged.is_dir());
+    let again = fixture
+        .reopen()
+        .recover_before_serving()
+        .expect("recovery runs");
+    assert_eq!(again.staged_removed, 1, "and the next one takes it away");
+}
+
+/// KR-REQ-14.28: a recovery whose staged record cannot be given the filesystem the directory was
+/// found on takes nothing away, whether the write fails or finds the record already changed, and
+/// the next recovery, once the journal can be written, takes the directory away.
+#[cfg(unix)]
+#[test]
+fn a_recovery_whose_staged_record_cannot_be_settled_takes_nothing_away() {
+    for fault in support::Unrecorded::BOTH {
+        let fixture = Fixture::create();
+        let source = ordinary_repository(fixture.work(), "unsettled-source");
+        write(&source, "README.md", "the change\n");
+        let source_workspace = fixture.workspace("unsettled-source");
+        let record = fixture.capture(source_workspace, &include_everything());
+        let destination = ordinary_repository(fixture.work(), "unsettled-destination");
+        let workspace = fixture.workspace("unsettled-destination");
+        stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+        let staged = destination.join(staged_entry("README.md"));
+        let journal = rusqlite::Connection::open(
+            kr_changeset::ChangeSetService::root_of(&fixture.host().environment())
+                .join(kr_changeset::store::STORE_FILE_NAME),
+        )
+        .expect("the change-set journal opens");
+        // The record as a build that recorded no filesystem wrote it.
+        journal
+            .execute("UPDATE apply_progress SET staged_fs = NULL", [])
+            .expect("the record is rewritten");
+
+        fault.impose(&journal, "apply_progress", "staged_fs");
+        let stopped = fixture
+            .reopen()
+            .recover_before_serving()
+            .expect("recovery runs");
+        assert_eq!(stopped.staged_removed, 0, "{fault:?}");
+        assert_eq!(stopped.staged_left, 1, "{fault:?}: the temporary is left");
+        assert!(
+            staged.join("content").is_file(),
+            "{fault:?}: nothing in the temporary is removed"
+        );
+        let filesystem: Option<Vec<u8>> = journal
+            .query_row(
+                "SELECT staged_fs FROM apply_progress WHERE staged_entry IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reads the record");
+        assert_eq!(filesystem, None, "{fault:?}: the record is as it was");
+
+        support::Unrecorded::lift(&journal, "staged_fs");
+        let again = fixture
+            .reopen()
+            .recover_before_serving()
+            .expect("recovery runs");
+        assert_eq!(
+            again.staged_removed, 1,
+            "{fault:?}: and the next one takes it"
+        );
+    }
+}
+
+/// KR-REQ-14.28: a temporary the journal recorded is not taken away when another filesystem has
+/// taken the place of the directory it was in and gives a directory at that name the numbers the
+/// recorded one had: nothing inside it is removed, and the path is still named as one a person has
+/// to look at.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers() {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    kr_ipc::testing::volumes::with_volumes(
+        "a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers",
+        || {
+            let fixture = Fixture::create();
+            let source = ordinary_repository(fixture.work(), "elsewhere-source");
+            write(&source, "README.md", "the change\n");
+            let source_workspace = fixture.workspace("elsewhere-source");
+            let record = fixture.capture(source_workspace, &include_everything());
+            let destination = ordinary_repository(fixture.work(), "elsewhere-destination");
+            let workspace = fixture.workspace("elsewhere-destination");
+            let action =
+                stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+            let entry = staged_entry("README.md");
+            assert!(
+                destination.join(&entry).is_dir(),
+                "the temporary is where this host left it"
+            );
+
+            // Another filesystem takes the place of the directory the repositories are in, with
+            // the destination repository at the same path and, at the staged name, a directory of
+            // its own holding a file of its own.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume =
+                kr_ipc::testing::volumes::Volume::attach(fixture.work(), scratch.path(), "other")
+                    .unwrap_or_else(|| kr_ipc::testing::volumes::not_attachable());
+            let destination = ordinary_repository(fixture.work(), "elsewhere-destination");
+            let staged = destination.join(&entry);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&staged)
+                .expect("their directory");
+            std::fs::write(staged.join("content"), b"somebody else's file\n").expect("their file");
+
+            // The project's records carry the numbers the repository has here and carry no
+            // filesystem, as a record made before filesystems were recorded does: they are decided
+            // by those numbers, so what decides the staged directory is the filesystem its own
+            // record carries. The change-set journal carries the numbers of the directory and of
+            // the file in it.
+            let repository = std::fs::metadata(&destination).expect("the repository's tree");
+            let git_dir = std::fs::metadata(destination.join(".git")).expect("its Git directory");
+            let directory = std::fs::metadata(&staged).expect("their directory");
+            let content = std::fs::metadata(staged.join("content")).expect("their file");
+            let projects = rusqlite::Connection::open(
+                kr_project::ProjectService::root_of(&fixture.host().environment())
+                    .join(kr_project::store::STORE_FILE_NAME),
+            )
+            .expect("the project journal opens");
+            projects
+                .execute(
+                    "UPDATE projects SET git_dir_device = ?1, git_dir_file_id = ?2,
+                                         work_tree_device = ?1, work_tree_file_id = ?3,
+                                         git_dir_fs = NULL, work_tree_fs = NULL
+                      WHERE display_path LIKE '%elsewhere-destination'",
+                    [
+                        repository.dev() as i64,
+                        git_dir.ino() as i64,
+                        repository.ino() as i64,
+                    ],
+                )
+                .expect("the repository's record is rewritten");
+            projects
+                .execute(
+                    "UPDATE workspaces SET tree_device = ?1, tree_file_id = ?2, tree_fs = NULL
+                      WHERE display_path LIKE '%elsewhere-destination'",
+                    [repository.dev() as i64, repository.ino() as i64],
+                )
+                .expect("the workspace's record is rewritten");
+            rusqlite::Connection::open(
+                kr_changeset::ChangeSetService::root_of(&fixture.host().environment())
+                    .join(kr_changeset::store::STORE_FILE_NAME),
+            )
+            .expect("the change-set journal opens")
+            .execute(
+                "UPDATE apply_progress
+                    SET staged_device = ?1, staged_file_id = ?2,
+                        staged_content_device = ?3, staged_content_file_id = ?4
+                  WHERE staged_entry IS NOT NULL",
+                [
+                    directory.dev() as i64,
+                    directory.ino() as i64,
+                    content.dev() as i64,
+                    content.ino() as i64,
+                ],
+            )
+            .expect("the journal's record is rewritten");
+
+            let replacement = fixture.reopen();
+            let recovery = replacement.recover_before_serving().expect("recovery runs");
+            assert_eq!(recovery.applies_settled, 1);
+            assert_eq!(
+                recovery.staged_removed, 0,
+                "this host removes nothing on a filesystem it did not record"
+            );
+            assert_eq!(recovery.staged_left, 1);
+            assert_eq!(
+                std::fs::read(staged.join("content")).expect("their file is there"),
+                b"somebody else's file\n",
+                "their file is exactly as it was"
+            );
+            let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+            assert_eq!(
+                settled.recovery.staged_leftovers,
+                vec!["README.md".to_owned()],
+                "and the answer names the path a person has to look at"
+            );
+            volume.detach();
+        },
+    );
+}
+
 /// KR-REQ-23.44: an apply's authority is decided inside the transaction that opens its journal,
 /// which is the row every write of that apply follows.
 ///

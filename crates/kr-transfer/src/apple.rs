@@ -251,6 +251,65 @@ pub(crate) fn set_access_control(
     }
 }
 
+/// What `fgetattrlist` returns for a volume's UUID: the length of the reply, then the UUID.
+#[repr(C)]
+struct VolumeUuidReply {
+    length: u32,
+    uuid: [u8; 16],
+}
+
+/// Reads the UUID of the volume an open descriptor is on.
+///
+/// The volume's own identity, which is the same every time that volume is attached, wherever it is
+/// attached and under whatever device number, and differs between two volumes. A volume that
+/// reports none, because its driver has no such attribute, is given [`FilesystemId::NONE`]: that
+/// is not a failure, and a directory on it is decided by its device number and inode alone.
+///
+/// # Errors
+///
+/// Returns the platform's error when the descriptor cannot be asked for any other reason.
+pub(crate) fn volume_uuid(fd: BorrowedFd<'_>) -> std::io::Result<crate::filesystem::FilesystemId> {
+    use crate::filesystem::FilesystemId;
+
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = VolumeUuidReply {
+        length: 0,
+        uuid: [0; 16],
+    };
+    // SAFETY: the descriptor is borrowed for the call, the request is a local of the size the
+    // platform's structure has, and the reply is a local whose size is given, so the call writes
+    // inside it.
+    let read = unsafe {
+        libc::fgetattrlist(
+            fd.as_raw_fd(),
+            core::ptr::from_mut(&mut request).cast(),
+            core::ptr::from_mut(&mut reply).cast(),
+            core::mem::size_of::<VolumeUuidReply>(),
+            0,
+        )
+    };
+    if read != 0 {
+        let why = std::io::Error::last_os_error();
+        return match why.raw_os_error() {
+            Some(libc::ENOTSUP | libc::EINVAL) => Ok(FilesystemId::NONE),
+            _ => Err(why),
+        };
+    }
+    // A reply that is not the length of the one asked for carries no UUID.
+    if reply.length as usize != core::mem::size_of::<VolumeUuidReply>() {
+        return Ok(FilesystemId::NONE);
+    }
+    Ok(FilesystemId::from_prefix(&reply.uuid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

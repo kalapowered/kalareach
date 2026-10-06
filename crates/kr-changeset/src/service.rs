@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use kr_ipc::paths::EnvironmentPaths;
-use kr_project::identity::object_identity;
 use kr_project::store::RetainedRow;
 use kr_project::{OpenedRepository, ProjectService};
 use kr_protocol::changeset::{
@@ -67,7 +66,8 @@ pub fn stored_limits() -> kr_cbor::Limits {
     }
 }
 
-/// What one workspace resolves to: where its tree is, and which objects a record named.
+/// What one workspace resolves to: where its tree is, and whether it shares its project's
+/// repository.
 #[derive(Clone, Debug)]
 pub struct ResolvedWorkspace {
     /// The workspace, as the project service holds it.
@@ -76,13 +76,11 @@ pub struct ResolvedWorkspace {
     pub project_repository_id: ProjectRepositoryId,
     /// The path its working tree is at.
     pub path: PathBuf,
-    /// The object the workspace's own working tree is.
-    pub work_tree: kr_transfer::ObjectIdentity,
-    /// The Git directory the record names, for a workspace that shares the project's repository.
+    /// Whether the workspace's Git directory is the project's.
     ///
-    /// Absent for an independent clone, which is its own repository: requiring the project's Git
+    /// False for an independent clone, which is its own repository: requiring the project's Git
     /// directory there would refuse a workspace this host created itself.
-    pub git_dir: Option<kr_transfer::ObjectIdentity>,
+    pub shares_repository: bool,
 }
 
 /// What one capture is asked for.
@@ -252,13 +250,7 @@ impl ChangeSetService {
             .project
             .workspace_read(&WorkspaceReadParams { workspace_id })?;
         let summary = read.workspace;
-        let project = self
-            .project
-            .project_read(&kr_protocol::project::ProjectReadParams {
-                project_repository_id: summary.project_repository_id,
-            })?
-            .project;
-        let Nullable(Some(tree)) = summary.filesystem_identity else {
+        let Nullable(Some(_)) = summary.filesystem_identity else {
             return Err(ChangeSetError::WrongState {
                 detail: "this workspace has no working tree this host recorded an identity for, \
                          so there is nothing to capture from"
@@ -273,8 +265,7 @@ impl ChangeSetService {
         Ok(ResolvedWorkspace {
             project_repository_id: summary.project_repository_id,
             path: PathBuf::from(&summary.display_path),
-            work_tree: object_identity(tree),
-            git_dir: shares_repository.then(|| object_identity(project.filesystem_identity)),
+            shares_repository,
             summary,
         })
     }
@@ -286,86 +277,70 @@ impl ChangeSetService {
     /// Returns whatever the project service returns, including `SOURCE_CHANGED` when the objects
     /// at the recorded path are not the ones the record named.
     pub fn open_repository(&self, resolved: &ResolvedWorkspace) -> Result<OpenedRepository> {
-        let opened =
-            OpenedRepository::open(self.project.profile(), self.environment_id, &resolved.path)?;
-        let found = opened.identity();
-        if found.work_tree != resolved.work_tree {
-            return Err(kr_project::ProjectError::IdentityChanged {
-                detail: format!(
-                    "this record names the working tree {}, and {} is the working tree {}; a \
-                     linked worktree is its own object and a record of one never covers another",
-                    resolved.work_tree,
-                    kr_project::git::redact(&resolved.path.display().to_string()),
-                    found.work_tree
-                )
-                .into(),
-            }
-            .into());
-        }
-        match resolved.git_dir {
-            Some(git_dir) if found.git_dir != git_dir => {
+        // The workspace's tree, and the project's Git directory where the workspace shares it, are
+        // held to what the project service recorded, by the rule every recorded directory is
+        // decided by.
+        let opened = self
+            .project
+            .open_workspace_repository(resolved.summary.workspace_id)?;
+        // An independent clone is its own repository, and the project service records no
+        // identity for it. Two things are required of it instead. The first is what makes it
+        // an independent clone: its repository is **inside its own working tree**. A `.git`
+        // file rewritten to point at somebody else's repository fails that, and so does a
+        // working tree whose repository is elsewhere.
+        if !resolved.shares_repository {
+            if !opened.git_dir_path().starts_with(opened.top_level()) {
                 return Err(kr_project::ProjectError::IdentityChanged {
-                    detail: format!(
-                        "this workspace is a working copy of the repository {git_dir}, and the \
-                         tree at its recorded path belongs to the repository {}; a recorded \
-                         identity is the object rather than the path",
-                        found.git_dir
-                    )
-                    .into(),
+                    detail: "this workspace is an independent clone, and the tree at its \
+                             recorded path belongs to a repository outside it"
+                        .into(),
                 }
                 .into());
             }
-            Some(_) => {}
-            // An independent clone is its own repository, and the project service records no
-            // identity for it. Two things are required of it instead. The first is what makes it
-            // an independent clone: its repository is **inside its own working tree**. A `.git`
-            // file rewritten to point at somebody else's repository fails that, and so does a
-            // working tree whose repository is elsewhere.
-            None => {
-                if !opened.git_dir_path().starts_with(opened.top_level()) {
-                    return Err(kr_project::ProjectError::IdentityChanged {
-                        detail: "this workspace is an independent clone, and the tree at its \
-                                 recorded path belongs to a repository outside it"
-                            .into(),
-                    }
-                    .into());
-                }
-                // The second is that it is still the repository this host read the first time. A
-                // repository inside the working tree satisfies the containment rule whatever its
-                // name, so a second one put there under another name would pass it. What this
-                // host itself found is therefore kept, and every later read is against that.
-                // **Nothing is recorded here**: opening a repository is the first thing a
-                // read-only preflight does, and a preflight writes nothing at all. The first
-                // observation is written by the capture that follows, through
-                // [`Self::remember_repository`].
-                let found = opened.identity().git_dir.to_string();
-                if let Some(first) = self
-                    .locked()?
-                    .clone_repository(resolved.summary.workspace_id)?
-                    && first != found
-                {
-                    return Err(kr_project::ProjectError::IdentityChanged {
-                        detail: format!(
-                            "this workspace is an independent clone of the repository {first}, \
-                             and the tree at its recorded path now belongs to the repository \
-                             {found}; a recorded identity is the object rather than the path"
-                        )
-                        .into(),
-                    }
-                    .into());
-                }
+            // The second is that it is still the repository this host read the first time. A
+            // repository inside the working tree satisfies the containment rule whatever its
+            // name, so a second one put there under another name would pass it. What this
+            // host itself found is therefore kept, and every later read is against that.
+            // **Nothing is recorded here**: opening a repository is the first thing a
+            // read-only preflight does, and a preflight writes nothing at all. The first
+            // observation is written by the capture that follows, through
+            // [`Self::remember_repository`].
+            if let Some(first) = self
+                .locked()?
+                .clone_repository(resolved.summary.workspace_id)?
+            {
+                Self::require_first_repository(&opened, first)?;
             }
         }
         Ok(opened)
+    }
+
+    /// Refuses when the repository behind an independent clone is not the one this host first
+    /// found there, and says what the record is to become when it is.
+    fn require_first_repository(
+        opened: &OpenedRepository,
+        first: kr_transfer::RecordedIdentity,
+    ) -> Result<kr_transfer::Settled> {
+        opened.require_git_dir(first).map_err(|refusal| {
+            kr_project::ProjectError::IdentityChanged {
+                detail: format!(
+                    "this workspace is an independent clone, and the repository at its recorded \
+                     path is not the one this host first found there: {refusal}"
+                )
+                .into(),
+            }
+            .into()
+        })
     }
 
     /// Records what repository this host found behind one independent clone, the first time.
     ///
     /// Only a caller that is already writing calls this. An independent clone is its own
     /// repository and the project service records no identity for it, so the first thing this
-    /// host captures from one is also what fixes which repository that workspace is. A shared
-    /// workspace needs none of it: the project service's own record is what that one is compared
-    /// with.
+    /// host captures from one is also what fixes which repository that workspace is. A record
+    /// that is the same repository under another device number, or that was made before
+    /// filesystems were recorded, takes what the repository is now. A shared workspace needs none
+    /// of it: the project service's own record is what that one is compared with.
     ///
     /// # Errors
     ///
@@ -376,12 +351,23 @@ impl ChangeSetService {
         repository: &OpenedRepository,
         admitted: Option<&dyn crate::store::StillAdmitted>,
     ) -> Result<()> {
-        if resolved.git_dir.is_some() {
+        if resolved.shares_repository {
             return Ok(());
         }
+        let now = repository.recorded()?.git_dir;
+        let first = self
+            .locked()?
+            .clone_repository(resolved.summary.workspace_id)?;
+        let revised = match first {
+            Some(first) => Self::require_first_repository(repository, first)?
+                .revision()
+                .map(|(was, _)| was),
+            None => None,
+        };
         self.locked()?.record_clone_repository(
             resolved.summary.workspace_id,
-            &repository.identity().git_dir.to_string(),
+            now,
+            revised,
             kr_ipc::now_ms(),
             admitted,
         )

@@ -25,12 +25,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kr_ipc::testing::volumes;
 use kr_project::ProjectService;
 use kr_project::discovery::{Discovered, MAX_ALTERNATE_DEPTH, discover, discover_through};
 use kr_project::git::{Interposition, ReadAdmission};
 use kr_project::policy::{Admitting, LocationUse};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId};
+use kr_protocol::ids::{
+    ActionId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId, WorkspaceId,
+};
 use kr_protocol::pairing::OwnerConfirmationRequest;
 use kr_protocol::project::{
     AdoptionFlow, AuthorisedLocation, CloneSource, DestinationParent, DestinationRequest,
@@ -2563,6 +2566,486 @@ fn owner_cleanup_finds_what_the_journal_recorded_under_another_device_number() {
     let removed = remove(156).expect("the tree and its staging directory are the recorded ones");
     assert!(removed.working_files_removed);
     support::assert_absent(&workspaces.join("feature"), "the removed workspace");
+}
+
+/// The owner's cleanup of a workspace through its location does not remove the staging directory
+/// its row recorded when another filesystem has taken the place of the location and gives a
+/// directory at that name the numbers the recorded one had: what the other filesystem holds there
+/// is left as it is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem() {
+    volumes::with_volumes(
+        "owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem",
+        || {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let fixture = Fixture::create();
+            let owner = TestOwner::default();
+            let environment = fixture.environment_id();
+            let sources = fixture.work().join("sources");
+            let workspaces = fixture.work().join("workspaces");
+            let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 170);
+            let made_in = owner_location(
+                &fixture,
+                &owner,
+                &workspaces,
+                LocationPurpose::Destination,
+                171,
+            );
+            let project = adopt(&fixture, &sources, "repo", 172);
+            attach(fixture.service(), &owner, project, source, 173)
+                .expect("the repository is bound");
+            let made = workspace_through(
+                fixture.service(),
+                project,
+                through(environment, made_in, "feature"),
+                false,
+                174,
+            )
+            .expect("the workspace is made through a location")
+            .workspace
+            .0
+            .expect("a workspace, not a preview");
+
+            // The workspace recorded a staging directory its materialisation could not take away,
+            // with the filesystem it is on.
+            let leftover = workspaces.join(".kr-project-leftover");
+            support::staging_directory(&leftover);
+            let recorded = AuthorisedDirectory::open_root(environment, &leftover)
+                .expect("opens the directory")
+                .recorded()
+                .expect("reads its identity");
+            journal(&fixture)
+                .execute(
+                    "UPDATE workspaces SET staging_name = ?2, staging_device = ?3,
+                                           staging_file_id = ?4, staging_fs = ?5
+                      WHERE workspace_id = ?1",
+                    rusqlite::params![
+                        bytes(made.workspace_id.get()),
+                        ".kr-project-leftover",
+                        recorded.object.device as i64,
+                        recorded.object.file_id as i64,
+                        recorded.filesystem,
+                    ],
+                )
+                .expect("the record is rewritten");
+
+            // Another filesystem takes the place of the location, with a directory of its own at
+            // that name, and the row carries the numbers that directory has.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume = volumes::Volume::attach(&workspaces, scratch.path(), "other")
+                .unwrap_or_else(|| volumes::not_attachable());
+            support::staging_directory(&leftover);
+            std::fs::write(leftover.join("theirs.txt"), b"not this host's\n").expect("their file");
+            let found =
+                std::fs::metadata(&leftover).expect("the directory on the other filesystem");
+            journal(&fixture)
+                .execute(
+                    "UPDATE workspaces SET staging_device = ?2, staging_file_id = ?3
+                      WHERE workspace_id = ?1",
+                    rusqlite::params![
+                        bytes(made.workspace_id.get()),
+                        found.dev() as i64,
+                        found.ino() as i64,
+                    ],
+                )
+                .expect("the record is rewritten");
+
+            // A replacement service is told by the owner that the location is the directory at
+            // that path, which is now the other filesystem's.
+            let replacement = fixture.reopen();
+            let again = support::authorise_location(
+                &replacement,
+                &owner,
+                &workspaces,
+                LocationPurpose::Destination,
+                176,
+            );
+            let removed = replacement.workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id: made.workspace_id,
+                    retention: RetentionPolicy::RemoveRetained,
+                    through_location_id: Nullable(Some(again)),
+                },
+                Some(&action("workspace.remove", 175)),
+            );
+            removed.expect("the removal runs, and keeps what it cannot show is its own");
+            let kept: (Option<String>, Option<String>) = journal(&fixture)
+                .query_row(
+                    "SELECT staging_name, staging_detail FROM workspaces WHERE workspace_id = ?1",
+                    rusqlite::params![bytes(made.workspace_id.get())],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("reads the record");
+            assert!(
+                kept.0.is_some() && kept.1.is_some(),
+                "the staging directory is kept, with the reason it was: {kept:?}"
+            );
+            assert!(
+                leftover.join("theirs.txt").is_file(),
+                "what the other filesystem holds is as it was"
+            );
+            volume.detach();
+        },
+    );
+}
+
+/// A workspace made through a location, whose row names a staging directory its materialisation
+/// could not take away, recorded as a store written before filesystems were recorded holds it: by
+/// its numbers, with no filesystem. A directory inside it that a removal cannot empty while it is
+/// shut is there too.
+#[cfg(unix)]
+struct LeftBehind {
+    fixture: Fixture,
+    workspace_id: WorkspaceId,
+    location: ProjectLocationId,
+    staging: std::path::PathBuf,
+    shut: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl LeftBehind {
+    fn made() -> Self {
+        let fixture = Fixture::create();
+        let owner = TestOwner::default();
+        let environment = fixture.environment_id();
+        let sources = fixture.work().join("sources");
+        let workspaces = fixture.work().join("workspaces");
+        let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 180);
+        let location = owner_location(
+            &fixture,
+            &owner,
+            &workspaces,
+            LocationPurpose::Destination,
+            181,
+        );
+        let project = adopt(&fixture, &sources, "repo", 182);
+        attach(fixture.service(), &owner, project, source, 183).expect("the repository is bound");
+        let made = workspace_through(
+            fixture.service(),
+            project,
+            through(environment, location, "feature"),
+            false,
+            184,
+        )
+        .expect("the workspace is made through a location")
+        .workspace
+        .0
+        .expect("a workspace, not a preview");
+        let staging = workspaces.join(".kr-project-leftover");
+        support::staging_directory(&staging);
+        let shut = staging.join("tree/inner");
+        std::fs::create_dir(&shut).expect("a directory inside it");
+        std::fs::write(shut.join("entry"), b"what a removal takes away\n").expect("a file in it");
+        let recorded = AuthorisedDirectory::open_root(environment, &staging)
+            .expect("opens the directory")
+            .recorded()
+            .expect("reads its identity");
+        journal(&fixture)
+            .execute(
+                "UPDATE workspaces SET staging_name = ?2, staging_device = ?3,
+                                       staging_file_id = ?4, staging_fs = NULL
+                  WHERE workspace_id = ?1",
+                rusqlite::params![
+                    bytes(made.workspace_id.get()),
+                    ".kr-project-leftover",
+                    recorded.object.device as i64,
+                    recorded.object.file_id as i64,
+                ],
+            )
+            .expect("the record is rewritten");
+        Self {
+            fixture,
+            workspace_id: made.workspace_id,
+            location,
+            staging,
+            shut,
+        }
+    }
+
+    /// Removes the workspace through its location.
+    fn remove(&self, seed: u8) -> Result<(), kr_project::ProjectError> {
+        self.fixture
+            .service()
+            .workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id: self.workspace_id,
+                    retention: RetentionPolicy::RemoveRetained,
+                    through_location_id: Nullable(Some(self.location)),
+                },
+                Some(&action("workspace.remove", seed)),
+            )
+            .map(|_| ())
+    }
+
+    /// Returns the filesystem the row records for the staging directory, and the reason it was kept.
+    fn staging_record(&self) -> (Option<Vec<u8>>, Option<String>) {
+        journal(&self.fixture)
+            .query_row(
+                "SELECT staging_fs, staging_detail FROM workspaces WHERE workspace_id = ?1",
+                rusqlite::params![bytes(self.workspace_id.get())],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reads the record")
+    }
+}
+
+/// Whether this process is stopped from emptying a directory by its mode, which a process that
+/// removes entries whatever the mode says is not.
+#[cfg(unix)]
+fn modes_bind(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let binds = std::fs::metadata(path).is_ok_and(|metadata| metadata.uid() != 0);
+    if !binds {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+    }
+    binds
+}
+
+#[cfg(unix)]
+fn forbid_removals_in(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+        .expect("its entries cannot be removed");
+}
+
+#[cfg(unix)]
+fn allow_removals_in(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+}
+
+/// A removal of a workspace's staging directory that stops part way leaves its row naming the
+/// filesystem the directory was found on, whatever the row held before, so a repeat cannot take
+/// another filesystem's directory at that name for it.
+#[cfg(unix)]
+#[test]
+fn a_workspace_staging_removal_that_stops_leaves_the_row_naming_the_filesystem_it_was_found_on() {
+    let left = LeftBehind::made();
+    if !modes_bind(&left.shut) {
+        return;
+    }
+    assert_eq!(
+        left.staging_record().0,
+        None,
+        "the row starts as a legacy one"
+    );
+
+    forbid_removals_in(&left.shut);
+    let removed = left.remove(185);
+    allow_removals_in(&left.shut);
+    removed.expect("the workspace is removed, and its staging directory kept with the reason");
+    let (filesystem, detail) = left.staging_record();
+    assert_eq!(
+        filesystem.as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN),
+        "the row took the filesystem the directory was found on before anything was removed"
+    );
+    assert!(detail.is_some(), "the directory is kept, with the reason");
+    assert!(
+        left.shut.join("entry").is_file(),
+        "the removal started and stopped inside the directory"
+    );
+}
+
+/// A workspace's staging directory is not removed when its row cannot be given the filesystem the
+/// directory was found on, whether the write fails or finds the row already changed.
+#[cfg(unix)]
+#[test]
+fn a_workspace_staging_directory_whose_row_cannot_be_settled_is_not_removed() {
+    for fault in support::Unrecorded::BOTH {
+        let left = LeftBehind::made();
+        fault.impose(&journal(&left.fixture), "workspaces", "staging_fs");
+        left.remove(186)
+            .expect("the workspace is removed, and its staging directory kept with the reason");
+        let (filesystem, detail) = left.staging_record();
+        assert_eq!(filesystem, None, "{fault:?}: the row is as it was");
+        assert!(
+            detail.is_some(),
+            "{fault:?}: the directory is kept, with the reason"
+        );
+        assert!(
+            left.shut.join("entry").is_file(),
+            "{fault:?}: nothing in the staging directory is removed"
+        );
+
+        support::Unrecorded::lift(&journal(&left.fixture), "staging_fs");
+        left.remove(187)
+            .expect("the removal is repeated once the journal can be written");
+        support::assert_absent(
+            &left.staging,
+            "the staging directory, once its row could be settled",
+        );
+        assert_eq!(
+            left.staging_record().1,
+            None,
+            "{fault:?}: and the reason it was kept is gone with it"
+        );
+    }
+}
+
+/// A clone whose destination was withdrawn while it ran and that kept its staging directory, the
+/// row recorded as a store written before filesystems were recorded holds it, and the owner's
+/// location for the directory it is in. A directory inside the staging directory that a removal
+/// cannot empty while it is shut is there too.
+#[cfg(unix)]
+struct KeptClone {
+    fixture: Fixture,
+    operation: ActionId,
+    location: ProjectLocationId,
+    projects: std::path::PathBuf,
+    shut: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl KeptClone {
+    fn made() -> Self {
+        let mut fixture = Fixture::create();
+        let owner = TestOwner::default();
+        let environment = fixture.environment_id();
+        let sources = fixture.work().join("sources");
+        let projects = fixture.work().join("projects");
+        let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 190);
+        let into = owner_location(
+            &fixture,
+            &owner,
+            &projects,
+            LocationPurpose::Destination,
+            191,
+        );
+        let project = adopt(&fixture, &sources, "repo", 192);
+        attach(fixture.service(), &owner, project, source, 193).expect("the repository is bound");
+        ordinary_repository(&sources, "upstream");
+        withdrawing_during(&mut fixture, "git clone", into, 194, |fixture| {
+            clone_into(
+                fixture.service(),
+                through(environment, into, "interrupted"),
+                beneath(source, "upstream"),
+                195,
+            )
+        })
+        .expect_err("the operation stops at the withdrawal");
+        let kept = names_in(&projects);
+        assert_eq!(kept.len(), 1, "the staging directory is kept: {kept:?}");
+        let shut = projects.join(&kept[0]).join("inner");
+        std::fs::create_dir(&shut).expect("a directory inside it");
+        std::fs::write(shut.join("entry"), b"what a removal takes away\n").expect("a file in it");
+        let location = support::authorise_location(
+            fixture.service(),
+            &owner,
+            &projects,
+            LocationPurpose::Destination,
+            196,
+        );
+        let operation = ActionId::new(action("project.clone", 195).action_id);
+        journal(&fixture)
+            .execute(
+                "UPDATE operations SET staging_fs = NULL WHERE action_id = ?1",
+                rusqlite::params![bytes(operation.get())],
+            )
+            .expect("the record is rewritten");
+        Self {
+            fixture,
+            operation,
+            location,
+            projects,
+            shut,
+        }
+    }
+
+    /// The owner reconciles the operation through the location.
+    fn reconcile(&self) -> kr_protocol::project::OperationRecord {
+        self.fixture
+            .service()
+            .project_operation_cancel(
+                &actor(),
+                &ProjectOperationCancelParams {
+                    operation_action_id: self.operation,
+                    through_location_id: Nullable(Some(self.location)),
+                },
+                kr_project::store::Performed::default(),
+            )
+            .expect("the owner reconciles the operation through the location")
+            .operation
+    }
+
+    /// Returns the filesystem the row records for the staging directory.
+    fn staging_fs(&self) -> Option<Vec<u8>> {
+        journal(&self.fixture)
+            .query_row(
+                "SELECT staging_fs FROM operations WHERE action_id = ?1",
+                rusqlite::params![bytes(self.operation.get())],
+                |row| row.get(0),
+            )
+            .expect("reads the record")
+    }
+}
+
+/// A reconciliation of an operation's staging directory that stops part way leaves the row naming
+/// the filesystem the directory was found on, whatever the row held before, and the repeat takes
+/// the directory away.
+#[cfg(unix)]
+#[test]
+fn an_operation_staging_removal_that_stops_leaves_the_row_naming_the_filesystem_it_was_found_on() {
+    let kept = KeptClone::made();
+    if !modes_bind(&kept.shut) {
+        return;
+    }
+    assert_eq!(kept.staging_fs(), None, "the row starts as a legacy one");
+
+    forbid_removals_in(&kept.shut);
+    let stopped = kept.reconcile();
+    allow_removals_in(&kept.shut);
+    assert_eq!(
+        stopped.retained_staging_paths.len(),
+        1,
+        "the staging directory is kept"
+    );
+    assert_eq!(
+        kept.staging_fs().as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN),
+        "the row took the filesystem the directory was found on before anything was removed"
+    );
+    let again = kept.reconcile();
+    assert!(again.retained_staging_paths.is_empty());
+    assert!(names_in(&kept.projects).is_empty());
+}
+
+/// An operation's staging directory is not removed when its row cannot be given the filesystem the
+/// directory was found on, whether the write fails or finds the row already changed, and the
+/// repeat once the journal can be written takes it away.
+#[cfg(unix)]
+#[test]
+fn an_operation_staging_directory_whose_row_cannot_be_settled_is_not_removed() {
+    for fault in support::Unrecorded::BOTH {
+        let kept = KeptClone::made();
+        fault.impose(&journal(&kept.fixture), "operations", "staging_fs");
+        let refused = kept.reconcile();
+        assert_eq!(
+            refused.retained_staging_paths.len(),
+            1,
+            "{fault:?}: the staging directory is kept"
+        );
+        assert_eq!(kept.staging_fs(), None, "{fault:?}: the row is as it was");
+        assert!(
+            kept.shut.join("entry").is_file(),
+            "{fault:?}: nothing in the staging directory is removed"
+        );
+
+        support::Unrecorded::lift(&journal(&kept.fixture), "staging_fs");
+        let again = kept.reconcile();
+        assert!(again.retained_staging_paths.is_empty(), "{fault:?}");
+        assert!(names_in(&kept.projects).is_empty(), "{fault:?}");
+    }
 }
 
 #[test]

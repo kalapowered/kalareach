@@ -33,6 +33,7 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use crate::authority::ObjectIdentity;
 use crate::error::{Result, TransferError};
+use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 
 /// The schema version this build reads.
 pub const SCHEMA_VERSION: i64 = 2;
@@ -222,7 +223,7 @@ pub struct ScopeRow {
     /// The path it was opened from, for diagnostics and for reopening.
     pub root_path: String,
     /// The identity the opened directory had when it was registered.
-    pub root_identity: ObjectIdentity,
+    pub root: RecordedIdentity,
     /// What the scope is for.
     pub purpose: String,
     /// True once the scope is revoked. A revoked scope stops further bytes at once.
@@ -471,6 +472,7 @@ impl Store {
                      staging_name    TEXT NOT NULL,
                      staging_device  INTEGER,
                      staging_file_id INTEGER,
+                     staging_fs      BLOB,
                      max_file_len    INTEGER NOT NULL,
                      max_staged_len  INTEGER NOT NULL,
                      max_concurrent  INTEGER NOT NULL
@@ -550,6 +552,7 @@ impl Store {
                      root_path      TEXT NOT NULL,
                      root_device    INTEGER NOT NULL,
                      root_file_id   INTEGER NOT NULL,
+                     root_fs        BLOB,
                      purpose        TEXT NOT NULL,
                      revoked        INTEGER NOT NULL DEFAULT 0
                  );
@@ -650,6 +653,15 @@ impl Store {
                 )
                 .map_err(TransferError::store)?;
         }
+        // A store written before directory identities carried a filesystem has no column for it.
+        // The columns are added here, empty, and each record's first successful check fills its
+        // own (`Settled::Revised`): the check decides such a record as every record was decided
+        // before, by its device number and inode, and records the filesystem it found. Remove this
+        // step and the handling of a record without a filesystem in `filesystem::settle` once no
+        // supported upgrade starts from a store written before filesystems were recorded; a record
+        // that no use has settled by then is refused, and registered again.
+        self.add_column_if_absent("environment", "staging_fs", "BLOB")?;
+        self.add_column_if_absent("scopes", "root_fs", "BLOB")?;
         let recorded = match recorded {
             Some(1) => Some(SCHEMA_VERSION),
             other => other,
@@ -672,6 +684,27 @@ impl Store {
                     ),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Adds a column to a table that an earlier build created without it.
+    fn add_column_if_absent(&self, table: &str, column: &str, kind: &str) -> Result<()> {
+        let present: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if present == 0 {
+            self.connection
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(TransferError::store)?;
         }
         Ok(())
     }
@@ -787,19 +820,23 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the row cannot be read.
-    pub fn staging_identity(&self) -> Result<Option<ObjectIdentity>> {
+    pub fn staging_identity(&self) -> Result<Option<RecordedIdentity>> {
         self.connection
             .query_row(
-                "SELECT staging_device, staging_file_id FROM environment WHERE environment_id = ?1",
+                "SELECT staging_device, staging_file_id, staging_fs FROM environment
+                 WHERE environment_id = ?1",
                 params![uuid_sql(self.environment_id.get())],
                 |row| {
-                    Ok(row
-                        .get::<_, Option<i64>>(0)?
-                        .zip(row.get::<_, Option<i64>>(1)?)
-                        .map(|(device, file_id)| ObjectIdentity {
-                            device: identity_from_sql(device),
-                            file_id: identity_from_sql(file_id),
-                        }))
+                    let device: Option<i64> = row.get(0)?;
+                    let file_id: Option<i64> = row.get(1)?;
+                    let filesystem: Option<FilesystemId> = row.get(2)?;
+                    Ok(device.zip(file_id).map(|(device, file_id)| {
+                        RecordedIdentity::from_parts(
+                            identity_from_sql(device),
+                            identity_from_sql(file_id),
+                            filesystem,
+                        )
+                    }))
                 },
             )
             .optional()
@@ -812,47 +849,91 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the row cannot be written.
-    pub fn set_staging_identity(&self, identity: ObjectIdentity) -> Result<()> {
+    pub fn set_staging_identity(&self, identity: RecordedIdentity) -> Result<()> {
         self.connection
             .execute(
-                "UPDATE environment SET staging_device = ?2, staging_file_id = ?3
+                "UPDATE environment SET staging_device = ?2, staging_file_id = ?3, staging_fs = ?4
                  WHERE environment_id = ?1",
                 params![
                     uuid_sql(self.environment_id.get()),
-                    identity_sql(identity.device),
-                    identity_sql(identity.file_id),
+                    identity_sql(identity.object.device),
+                    identity_sql(identity.object.file_id),
+                    identity.filesystem,
                 ],
             )
             .map_err(TransferError::store)?;
         Ok(())
     }
 
-    /// Records that the filesystem holding the staging area is numbered `now` where it was
-    /// numbered `was`: the staging directory's identity and every payload's.
+    /// Replaces the identity recorded for the staging directory by what the directory has now,
+    /// and moves every payload recorded on the same filesystem to its new number.
     ///
     /// A device number names one mounting of a filesystem, so a filesystem mounted again can come
-    /// back under another one. The objects are the same and keep their numbers within it. Both
-    /// kinds of record change in one transaction, so a start never finds some under each number.
+    /// back under another one. The objects are the same and keep their numbers within it. The
+    /// directory's identity and every payload's change in one transaction, so a start never finds
+    /// some under each number, and only while the directory's row still carries the whole of what
+    /// it is replacing. A row another settlement already replaced by `now` is as it should be; a
+    /// row that is neither is refused, and no payload moves with it.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the rows cannot be written.
-    pub fn renumber_device(&mut self, was: u64, now: u64) -> Result<()> {
+    /// Returns [`TransferError::StoreUnavailable`] when the rows cannot be written, or when the
+    /// directory's record is neither what it replaces nor what it becomes.
+    pub fn settle_staging(&mut self, settled: &Settled) -> Result<()> {
+        let Some((was, now)) = settled.revision() else {
+            return Ok(());
+        };
         let environment = uuid_sql(self.environment_id.get());
         let transaction = self.begin()?;
-        transaction
+        let changed = transaction
             .execute(
-                "UPDATE environment SET staging_device = ?3
-                 WHERE environment_id = ?1 AND staging_device = ?2",
-                params![environment, identity_sql(was), identity_sql(now)],
+                "UPDATE environment SET staging_device = ?3, staging_fs = ?5
+                 WHERE environment_id = ?1 AND staging_device = ?2 AND staging_file_id = ?6
+                   AND staging_fs IS ?4",
+                params![
+                    environment,
+                    identity_sql(was.object.device),
+                    identity_sql(now.object.device),
+                    was.filesystem,
+                    now.filesystem,
+                    identity_sql(was.object.file_id),
+                ],
             )
             .map_err(TransferError::store)?;
-        transaction
-            .execute(
-                "UPDATE uploads SET payload_device = ?2 WHERE payload_device = ?1",
-                params![identity_sql(was), identity_sql(now)],
-            )
-            .map_err(TransferError::store)?;
+        if changed == 0 {
+            let already: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM environment
+                     WHERE environment_id = ?1 AND staging_device = ?2 AND staging_file_id = ?3
+                       AND staging_fs IS ?4",
+                    params![
+                        environment,
+                        identity_sql(now.object.device),
+                        identity_sql(now.object.file_id),
+                        now.filesystem,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(TransferError::store)?;
+            return if already == 1 {
+                Ok(())
+            } else {
+                Err(TransferError::store(
+                    "the staging directory's record changed while it was being checked",
+                ))
+            };
+        }
+        if was.object.device != now.object.device {
+            transaction
+                .execute(
+                    "UPDATE uploads SET payload_device = ?2 WHERE payload_device = ?1",
+                    params![
+                        identity_sql(was.object.device),
+                        identity_sql(now.object.device)
+                    ],
+                )
+                .map_err(TransferError::store)?;
+        }
         transaction.commit().map_err(TransferError::store)
     }
 
@@ -1882,15 +1963,16 @@ impl Store {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO scopes
-                     (scope_id, environment_id, root_path, root_device, root_file_id, purpose,
-                      revoked)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (scope_id, environment_id, root_path, root_device, root_file_id, root_fs,
+                      purpose, revoked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     uuid_sql(row.scope_id.get()),
                     uuid_sql(row.environment_id.get()),
                     row.root_path,
-                    identity_sql(row.root_identity.device),
-                    identity_sql(row.root_identity.file_id),
+                    identity_sql(row.root.object.device),
+                    identity_sql(row.root.object.file_id),
+                    row.root.filesystem,
                     row.purpose,
                     i64::from(row.revoked),
                 ],
@@ -1907,8 +1989,8 @@ impl Store {
     pub fn scope(&self, scope_id: GrantId) -> Result<Option<ScopeRow>> {
         self.connection
             .query_row(
-                "SELECT scope_id, environment_id, root_path, root_device, root_file_id, purpose,
-                        revoked
+                "SELECT scope_id, environment_id, root_path, root_device, root_file_id, root_fs,
+                        purpose, revoked
                  FROM scopes WHERE scope_id = ?1",
                 params![uuid_sql(scope_id.get())],
                 |row| {
@@ -1916,12 +1998,13 @@ impl Store {
                         scope_id: GrantId::new(uuid_column(row, 0)?),
                         environment_id: EnvironmentId::new(uuid_column(row, 1)?),
                         root_path: row.get(2)?,
-                        root_identity: ObjectIdentity {
-                            device: identity_from_sql(row.get(3)?),
-                            file_id: identity_from_sql(row.get(4)?),
-                        },
-                        purpose: row.get(5)?,
-                        revoked: row.get::<_, i64>(6)? != 0,
+                        root: RecordedIdentity::from_parts(
+                            identity_from_sql(row.get(3)?),
+                            identity_from_sql(row.get(4)?),
+                            row.get(5)?,
+                        ),
+                        purpose: row.get(6)?,
+                        revoked: row.get::<_, i64>(7)? != 0,
                     })
                 },
             )
@@ -1929,28 +2012,60 @@ impl Store {
             .map_err(TransferError::store)
     }
 
-    /// Records that the filesystem holding one scope's root is numbered `now` where the scope was
-    /// recorded under `was`.
+    /// Replaces the identity one scope's root was recorded under by what the directory has now.
     ///
-    /// Only that scope's row changes. The same filesystem can hold other scopes, and each is
-    /// checked against its own directory when it is next used; a number that was this
-    /// filesystem's is not assumed still to be, for the roots recorded on any other.
+    /// Only that scope's row changes, and only while it still carries the whole of what it
+    /// replaces. The same filesystem can hold other scopes, and each is checked against its own
+    /// directory when it is next used. A row another settlement already replaced by `now` is as it
+    /// should be; a row that is neither, because the scope was registered again, is refused.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn renumber_scope(&self, scope_id: GrantId, was: u64, now: u64) -> Result<()> {
-        self.connection
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails, or when the scope's
+    /// record is neither what it replaces nor what it becomes.
+    pub fn settle_scope(&self, scope_id: GrantId, settled: &Settled) -> Result<()> {
+        let Some((was, now)) = settled.revision() else {
+            return Ok(());
+        };
+        let changed = self
+            .connection
             .execute(
-                "UPDATE scopes SET root_device = ?3 WHERE scope_id = ?1 AND root_device = ?2",
+                "UPDATE scopes SET root_device = ?3, root_fs = ?5
+                 WHERE scope_id = ?1 AND root_device = ?2 AND root_file_id = ?6 AND root_fs IS ?4",
                 params![
                     uuid_sql(scope_id.get()),
-                    identity_sql(was),
-                    identity_sql(now)
+                    identity_sql(was.object.device),
+                    identity_sql(now.object.device),
+                    was.filesystem,
+                    now.filesystem,
+                    identity_sql(was.object.file_id),
                 ],
             )
             .map_err(TransferError::store)?;
-        Ok(())
+        if changed == 1 {
+            return Ok(());
+        }
+        let already: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scopes
+                 WHERE scope_id = ?1 AND root_device = ?2 AND root_file_id = ?3 AND root_fs IS ?4",
+                params![
+                    uuid_sql(scope_id.get()),
+                    identity_sql(now.object.device),
+                    identity_sql(now.object.file_id),
+                    now.filesystem,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if already == 1 {
+            Ok(())
+        } else {
+            Err(TransferError::store(
+                "the scope's record changed while it was being checked",
+            ))
+        }
     }
 
     /// Revokes a read scope, which stops further bytes from every transfer that came from it.
@@ -3462,10 +3577,7 @@ mod tests {
             scope_id,
             environment_id: environment(),
             root_path: "/work/project".to_owned(),
-            root_identity: ObjectIdentity {
-                device: 17,
-                file_id: 4242,
-            },
+            root: RecordedIdentity::from_parts(17, 4242, Some(FilesystemId::from_u64(99))),
             purpose: "diff review".to_owned(),
             revoked: false,
         };

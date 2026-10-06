@@ -1199,3 +1199,49 @@ pub fn outbox(host: &TempHost) -> Vec<(String, String)> {
         .map(|row| row.expect("an event"))
         .collect()
 }
+
+/// The two ways a journal fails to record a filesystem a check found, where it had none.
+#[derive(Clone, Copy, Debug)]
+pub enum Unrecorded {
+    /// The write fails.
+    Fails,
+    /// The write finds nothing to replace, as it does when the record changed under it.
+    FindsNothing,
+}
+
+impl Unrecorded {
+    /// Both of them.
+    pub const BOTH: [Self; 2] = [Self::Fails, Self::FindsNothing];
+
+    /// Makes the journal refuse, from now until [`Self::lift`], to give `column` of `table` a
+    /// filesystem where it holds none: a record decided by its numbers can then be checked and
+    /// found right, and cannot be settled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the journal refuses the trigger.
+    pub fn impose(self, journal: &rusqlite::Connection, table: &str, column: &str) {
+        let action = match self {
+            Self::Fails => "RAISE(ABORT, 'the journal cannot be written')",
+            Self::FindsNothing => "RAISE(IGNORE)",
+        };
+        journal
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_{column} BEFORE UPDATE OF {column} ON {table}
+                   WHEN OLD.{column} IS NULL AND NEW.{column} IS NOT NULL
+                 BEGIN SELECT {action}; END"
+            ))
+            .expect("the journal takes the trigger");
+    }
+
+    /// Ends what [`Self::impose`] made for `column`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the journal refuses.
+    pub fn lift(journal: &rusqlite::Connection, column: &str) {
+        journal
+            .execute_batch(&format!("DROP TRIGGER refuse_{column}"))
+            .expect("the journal drops the trigger");
+    }
+}

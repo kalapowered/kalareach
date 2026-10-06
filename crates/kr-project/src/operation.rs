@@ -33,7 +33,9 @@ use kr_protocol::project::{
     OPERATION_DEADLINE, RemoteTransport,
 };
 use kr_transfer::authority::ObjectKind;
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity, Privacy, RelativeName};
+use kr_transfer::{
+    AuthorisedDirectory, ObjectIdentity, Privacy, RecordedIdentity, RelativeName, Settled,
+};
 
 use crate::credential::ValidatedRemote;
 use crate::error::{ProjectError, Result};
@@ -466,14 +468,26 @@ impl StagingSibling {
         staged_in(self.reach()?)
     }
 
-    /// Returns the sibling's own filesystem identity, read through its handle.
-    ///
-    /// The cleanup removes a name this host recorded *and* checks that the object at that name is
-    /// still this one, so a replacement at an old name is never removed as though it were the
-    /// staging directory.
+    /// Returns the sibling's own object, read through its handle, for the invocations that have to
+    /// run in this directory and no other.
     #[must_use]
     pub fn identity(&self) -> ObjectIdentity {
         self.directory.identity()
+    }
+
+    /// Returns the sibling's own filesystem identity as the journal records it, read through its
+    /// handle.
+    ///
+    /// The cleanup removes a name this host recorded *and* checks that the object at that name is
+    /// still this one, on the filesystem it was recorded on, so a replacement at an old name is
+    /// never removed as though it were the staging directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when the directory cannot be asked which filesystem it
+    /// is on.
+    pub fn recorded(&self) -> Result<RecordedIdentity> {
+        Ok(self.directory.recorded()?)
     }
 
     /// Removes the sibling and everything in it, when it is still the directory this host
@@ -495,10 +509,22 @@ impl StagingSibling {
     /// [`ProjectError::Destination`] when it is not a directory only this account can change or
     /// the removal stopped, or the location's refusal. A removal that stopped names where, and
     /// what it removed before then stays removed.
-    pub fn remove(self, destination: &Destination, expected: ObjectIdentity) -> Result<()> {
+    pub fn remove(
+        self,
+        destination: &Destination,
+        expected: RecordedIdentity,
+        settle: Settle<'_>,
+    ) -> Result<()> {
         // A removal beneath a location is an effect through it, asked for once, before anything.
         let parent = destination.reach()?;
-        remove_staging_directory(parent, &self.name, self.directory, expected, &self.path)
+        remove_staging_directory(
+            parent,
+            &self.name,
+            self.directory,
+            expected,
+            &self.path,
+            settle,
+        )
     }
 
     /// Removes the sibling as [`Self::remove`] does, and says what that left.
@@ -509,15 +535,26 @@ impl StagingSibling {
     /// A directory that is still there comes back with the refusal, which names where a removal
     /// stopped and what it removed first, so the record can say why.
     #[must_use]
-    pub fn clean_up(self, destination: &Destination, expected: ObjectIdentity) -> Cleanup {
+    pub fn clean_up(
+        self,
+        destination: &Destination,
+        expected: RecordedIdentity,
+        settle: Settle<'_>,
+    ) -> Cleanup {
         let name = self.name.clone();
-        match self.remove(destination, expected) {
+        match self.remove(destination, expected, settle) {
             Ok(()) => Cleanup::Removed,
             Err(_) if destination.absent(&name) => Cleanup::Absent,
             Err(refusal) => Cleanup::Kept(refusal.to_string()),
         }
     }
 }
+
+/// What the holder of a record does with what the record is to become when a directory it names is
+/// found to be the recorded one: the record is written before the removal starts, so a removal
+/// that stops part way leaves a record that names the filesystem the directory was found on and a
+/// retry cannot take another filesystem's directory for it.
+pub(crate) type Settle<'a> = &'a dyn Fn(&Settled) -> Result<()>;
 
 /// Removes one staging directory and everything in it through its parent's handle, when it is the
 /// directory this host recorded and still one only this account can change.
@@ -540,14 +577,15 @@ pub(crate) fn remove_staging_directory(
     parent: &AuthorisedDirectory,
     name: &RelativeName,
     directory: AuthorisedDirectory,
-    expected: ObjectIdentity,
+    expected: RecordedIdentity,
     shown: &Path,
+    settle: Settle<'_>,
 ) -> Result<()> {
     let path = crate::git::redact(&shown.display().to_string());
-    // The recorded directory under another device number is the recorded one: it is on the
-    // filesystem of the directory it is in, which a mount over it is not. It is taken away next,
-    // so there is no record left to renumber.
-    if directory.check_recorded(expected).is_err() {
+    // The recorded directory on the filesystem it was recorded on is the recorded one, under
+    // whatever device number the filesystem has now, and its record takes what it is now before
+    // the removal starts.
+    let Ok(settled) = directory.check_recorded(expected) else {
         return Err(ProjectError::IdentityChanged {
             detail: format!(
                 "this operation staged its content in {expected} and {path} now holds {}; nothing \
@@ -556,7 +594,8 @@ pub(crate) fn remove_staging_directory(
             )
             .into(),
         });
-    }
+    };
+    settle(&settled)?;
     directory
         .check_privacy(Privacy::Exclusive)
         .map_err(|refusal| ProjectError::Destination {
@@ -616,35 +655,32 @@ impl Cleanup {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StagedWitness {
     /// The staged repository's filesystem identity.
-    pub identity: ObjectIdentity,
+    pub identity: RecordedIdentity,
     /// When the filesystem says it was created, where the platform reports it.
     pub created_at_ms: Option<u64>,
 }
 
 impl StagedWitness {
-    /// Returns whether a later reading is of the same object.
+    /// Returns whether `directory`, read now, is the object this witness recorded.
     ///
-    /// The identities must match. The creation instants must match too where both readings have
-    /// one; where either does not, the identity is the whole of the witness and this host says so
-    /// rather than pretending to more.
+    /// The identity must be the recorded one ([`AuthorisedDirectory::check_recorded`]). The
+    /// creation instants must match too where both readings have one; where either does not, the
+    /// identity is the whole of the witness and this host says so rather than pretending to more.
     #[must_use]
-    pub fn same_object(&self, later: &Self) -> bool {
-        if self.identity != later.identity {
+    pub fn is_the_object_in(&self, directory: &AuthorisedDirectory) -> bool {
+        if directory.check_recorded(self.identity).is_err() {
             return false;
         }
-        match (self.created_at_ms, later.created_at_ms) {
+        match (self.created_at_ms, creation_instant(directory)) {
             (Some(first), Some(second)) => first == second,
             _ => true,
         }
     }
 }
 
-/// Reads the witness of the repository staged in a sibling's directory, which the caller has been
-/// admitted to for this read.
-fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
-    let name = RelativeName::parse(STAGED_TREE)?;
-    let staged = directory.subdirectory(&name)?;
-    let created_at_ms = staged
+/// Returns when the filesystem says a directory was created, where the platform reports it.
+fn creation_instant(directory: &AuthorisedDirectory) -> Option<u64> {
+    directory
         .handle()
         .dir_metadata()
         .ok()
@@ -655,10 +691,23 @@ fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
         })
-        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Opens the repository staged in a sibling's directory, which the caller has been admitted to
+/// for this read.
+fn staged_tree_in(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
+    let name = RelativeName::parse(STAGED_TREE)?;
+    Ok(directory.subdirectory(&name)?)
+}
+
+/// Reads the witness of the repository staged in a sibling's directory, which the caller has been
+/// admitted to for this read.
+fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
+    let staged = staged_tree_in(directory)?;
     Ok(StagedWitness {
-        identity: staged.identity(),
-        created_at_ms,
+        identity: staged.recorded()?,
+        created_at_ms: creation_instant(&staged),
     })
 }
 
@@ -684,8 +733,8 @@ pub fn publish(
     // every attempt at it: there the rename waits while another program holds a file inside the
     // tree, and something else can take the staging name meanwhile.
     let still_staged = || -> Result<()> {
-        let found = staged_in(&staging.directory)?;
-        if expected.same_object(&found) {
+        let found = staged_tree_in(&staging.directory)?;
+        if expected.is_the_object_in(&found) {
             return Ok(());
         }
         Err(ProjectError::IdentityChanged {
@@ -693,12 +742,11 @@ pub fn publish(
                 "this operation staged the repository {} and {} now holds {}; nothing is published",
                 expected.identity,
                 crate::git::redact(&staging.tree_path().display().to_string()),
-                found.identity
+                found.identity()
             )
             .into(),
         })
     };
-    let staged = expected.identity;
     let tree = RelativeName::parse(STAGED_TREE)?;
     rename_no_replace(
         &staging.directory,
@@ -711,18 +759,19 @@ pub fn publish(
     // The object at the destination has to be the object that was staged. A rename preserves the
     // identity, so a mismatch here is something else having taken the name.
     let published = parent.subdirectory(destination.name())?;
-    if published.identity() != staged {
+    if published.check_recorded(expected.identity).is_err() {
         return Err(ProjectError::OutcomeUnknown {
             detail: format!(
-                "the staged repository was {staged} and {} now holds {}; this host cannot say \
-                 which publication landed",
+                "the staged repository was {} and {} now holds {}; this host cannot say which \
+                 publication landed",
+                expected.identity,
                 crate::git::redact(&destination.path().display().to_string()),
                 published.identity()
             )
             .into(),
         });
     }
-    Ok(staged)
+    Ok(published.identity())
 }
 
 /// Renames one directory into another's single name, refusing to replace anything, once
@@ -842,29 +891,15 @@ pub fn reconcile(
 ) -> Result<Reconciliation> {
     let parent = destination.reach()?;
     if let Ok(published) = parent.subdirectory(destination.name())
-        && let Ok(metadata) = published.handle().dir_metadata()
-        && staged.same_object(&StagedWitness {
-            identity: published.identity(),
-            created_at_ms: metadata
-                .created()
-                .ok()
-                .or_else(|| metadata.modified().ok())
-                .and_then(|instant| {
-                    instant
-                        .into_std()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                })
-                .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX)),
-        })
+        && staged.is_the_object_in(&published)
     {
-        return Ok(Reconciliation::Published(staged.identity));
+        return Ok(Reconciliation::Published(published.identity()));
     }
     if let Some(staging) = staging
-        && let Ok(found) = staged_in(&staging.directory)
-        && staged.same_object(&found)
+        && let Ok(found) = staged_tree_in(&staging.directory)
+        && staged.is_the_object_in(&found)
     {
-        return Ok(Reconciliation::Staged(staged.identity));
+        return Ok(Reconciliation::Staged(found.identity()));
     }
     Ok(Reconciliation::Unknown)
 }
@@ -1263,6 +1298,26 @@ mod tests {
         assert!(root.path().join("staging/tree/objects/pack").is_file());
     }
 
+    /// On Windows a published tree is the object that was recorded when it was staged: the
+    /// identity a staged repository is recorded with, the volume's serial number with the
+    /// directory's own 128-bit id, holds across the rename into another directory, so the
+    /// publication finds the staged object at its new name.
+    #[cfg(windows)]
+    #[test]
+    fn a_published_tree_is_the_object_that_was_recorded_when_it_was_staged() {
+        let (_parent, destination, sibling) = staged_by_plain_means();
+        let witness = sibling
+            .staged_witness()
+            .expect("the staged repository is read");
+
+        let published = publish(&sibling, &destination, witness).expect("the tree is published");
+        assert_eq!(published, witness.identity.object);
+        assert_eq!(
+            std::fs::read(destination.path().join("objects/pack")).expect("the published file"),
+            b"staged\n"
+        );
+    }
+
     /// On Windows the staged repository is compared with the one recorded before every attempt
     /// at its publication: a tree put in its place while the held publication waits is never
     /// published, the publication says the staged object changed, and the destination stays
@@ -1322,9 +1377,22 @@ mod tests {
         assert_eq!(cancel.stopped(), 2);
     }
 
-    /// A staging directory with something staged in it, beside a destination in a directory of
-    /// its own.
-    fn staged() -> (tempfile::TempDir, Destination, StagingSibling) {
+    /// A destination in a directory of its own, and a sibling of it made by plain means, which is
+    /// opened and not created: a test of what is recorded about a staged tree and of its rename
+    /// is not a test of who may change the sibling, which only a sibling that `create` makes is
+    /// asked.
+    fn staged_by_plain_means() -> (tempfile::TempDir, Destination, StagingSibling) {
+        let (parent, destination) = a_destination();
+        let name = StagingSibling::propose();
+        std::fs::create_dir(parent.path().join(&name)).expect("the staging directory");
+        let sibling = StagingSibling::open(&destination, &name).expect("the sibling opens");
+        std::fs::create_dir_all(sibling.tree_path().join("objects")).expect("staged content");
+        std::fs::write(sibling.tree_path().join("objects/pack"), b"staged\n").expect("a file");
+        (parent, destination, sibling)
+    }
+
+    /// A destination named `published`, in a directory of its own.
+    fn a_destination() -> (tempfile::TempDir, Destination) {
         let parent = tempfile::tempdir().expect("a directory to stage beside");
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
         let destination = Destination::resolve(
@@ -1340,11 +1408,60 @@ mod tests {
             crate::policy::Admitting::Caller(None),
         )
         .expect("the destination resolves");
+        (parent, destination)
+    }
+
+    /// A staging directory with something staged in it, beside a destination in a directory of
+    /// its own.
+    fn staged() -> (tempfile::TempDir, Destination, StagingSibling) {
+        let (parent, destination) = a_destination();
         let sibling = StagingSibling::create(&destination, &StagingSibling::propose())
             .expect("the staging directory is made");
         std::fs::create_dir_all(sibling.tree_path().join("objects")).expect("staged content");
         std::fs::write(sibling.tree_path().join("objects/pack"), b"staged\n").expect("a file");
         (parent, destination, sibling)
+    }
+
+    /// A staged repository is the object a witness recorded only on the filesystem it was
+    /// recorded on, and a witness made before filesystems were recorded is decided by the numbers.
+    #[test]
+    fn a_witness_names_the_staged_object_on_the_filesystem_it_was_recorded_on() {
+        let (_parent, _destination, sibling) = staged_by_plain_means();
+        let witness = sibling
+            .staged_witness()
+            .expect("the staged repository is read");
+        let staged = staged_tree_in(&sibling.directory).expect("the staged repository opens");
+        assert!(witness.is_the_object_in(&staged));
+
+        // The same numbers on another filesystem are not the object that was staged.
+        let elsewhere = StagedWitness {
+            identity: kr_transfer::RecordedIdentity {
+                filesystem: Some(kr_transfer::FilesystemId::from_bytes(
+                    [0xee; kr_transfer::FilesystemId::LEN],
+                )),
+                ..witness.identity
+            },
+            ..witness
+        };
+        assert!(!elsewhere.is_the_object_in(&staged));
+
+        // A witness recorded without a filesystem is decided as it was, by the numbers.
+        let before = StagedWitness {
+            identity: kr_transfer::RecordedIdentity::without_filesystem(witness.identity.object),
+            ..witness
+        };
+        assert!(before.is_the_object_in(&staged));
+
+        // And another object is never the one that was staged.
+        let other = StagedWitness {
+            identity: kr_transfer::RecordedIdentity::from_parts(
+                witness.identity.object.device,
+                witness.identity.object.file_id.wrapping_add(1),
+                witness.identity.filesystem,
+            ),
+            ..witness
+        };
+        assert!(!other.is_the_object_in(&staged));
     }
 
     /// A cleanup that stops part way keeps the directory and says where it stopped and why.
@@ -1366,8 +1483,8 @@ mod tests {
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
             .expect("its entries cannot be removed");
-        let recorded = sibling.identity();
-        let cleanup = sibling.clean_up(&destination, recorded);
+        let recorded = sibling.recorded().expect("reads its identity");
+        let cleanup = sibling.clean_up(&destination, recorded, &|_| Ok(()));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
             .expect("the directory is writable again");
         let Cleanup::Kept(why) = cleanup else {
@@ -1400,11 +1517,11 @@ mod tests {
         // A mode that admits another account.
         let (_parent, destination, sibling) = staged();
         let path = sibling.path().to_path_buf();
-        let recorded = sibling.identity();
+        let recorded = sibling.recorded().expect("reads its identity");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750))
             .expect("the group is let in");
         let refusal = sibling
-            .remove(&destination, recorded)
+            .remove(&destination, recorded, &|_| Ok(()))
             .expect_err("a directory another account may enter is not removed");
         assert!(
             refusal.to_string().contains("only this account can change"),
@@ -1418,7 +1535,7 @@ mod tests {
         // A directory that moved: another one holds the name now.
         let (parent, destination, sibling) = staged();
         let name = sibling.name().to_owned();
-        let recorded = sibling.identity();
+        let recorded = sibling.recorded().expect("reads its identity");
         drop(sibling);
         std::fs::rename(parent.path().join(&name), parent.path().join("moved"))
             .expect("the staging directory moves");
@@ -1431,7 +1548,7 @@ mod tests {
         std::fs::write(parent.path().join(&name).join("theirs"), b"theirs\n").expect("its file");
         let reopened = StagingSibling::open(&destination, &name).expect("the name opens");
         let refusal = reopened
-            .remove(&destination, recorded)
+            .remove(&destination, recorded, &|_| Ok(()))
             .expect_err("a directory that is not the recorded one is not removed");
         assert!(
             matches!(refusal, ProjectError::IdentityChanged { .. }),
@@ -1449,9 +1566,9 @@ mod tests {
         // The recorded directory, only this account's: it goes, whole.
         let (_parent, destination, sibling) = staged();
         let path = sibling.path().to_path_buf();
-        let recorded = sibling.identity();
+        let recorded = sibling.recorded().expect("reads its identity");
         sibling
-            .remove(&destination, recorded)
+            .remove(&destination, recorded, &|_| Ok(()))
             .expect("the recorded directory goes");
         assert!(
             std::fs::symlink_metadata(&path)

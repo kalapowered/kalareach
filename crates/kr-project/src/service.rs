@@ -39,13 +39,13 @@ use kr_protocol::project::{
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
 };
 use kr_protocol::scalars::{Nullable, U64, Uuid};
-use kr_transfer::{Clock, ObjectIdentity, RelativeName, SystemClock};
+use kr_transfer::{Clock, ObjectIdentity, RecordedIdentity, RelativeName, Settled, SystemClock};
 
 use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
 use crate::git::ReadAdmission;
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
-use crate::identity::{OpenedRepository, Renumbered, wire_identity};
+use crate::identity::{OpenedRepository, Revised, wire_identity};
 use crate::operation::{
     Cleanup, Destination, Reconciliation, STAGED_TREE, STAGING_PREFIX, StagedWitness,
     StagingSibling, publish, reconcile, remove_staging_directory, stage_clone, stage_init,
@@ -293,21 +293,19 @@ impl ProjectService {
         self.locked()
     }
 
-    /// Takes in the device numbers a registered repository was found under, when they are not the
-    /// ones its record carries.
+    /// Replaces what a registered repository's record carries by what the repository is now, when
+    /// they are not the same.
     ///
     /// A repository on a filesystem that is numbered differently since it was registered, as a
     /// container's is when it starts again, is the repository that was registered. Its record
     /// takes the numbers it has now, so that the old ones are not taken for it if another
-    /// filesystem is given them. The journal's guard is taken here, so the caller holds none.
-    fn renumber_project(
-        &self,
-        project: ProjectRepositoryId,
-        renumbered: Option<Renumbered>,
-    ) -> Result<()> {
-        match renumbered {
-            Some(renumbered) => {
-                crate::store::renumber_project(self.writable()?.connection(), project, renumbered)
+    /// filesystem is given them, and a record written before filesystems were recorded takes the
+    /// filesystem the repository is on. The journal's guard is taken here, so the caller holds
+    /// none.
+    fn settle_project(&self, project: ProjectRepositoryId, revised: Option<Revised>) -> Result<()> {
+        match revised {
+            Some(revised) => {
+                crate::store::settle_project(self.writable()?.connection(), project, &revised)
             }
             None => Ok(()),
         }
@@ -785,9 +783,14 @@ impl ProjectService {
                 // A name with no recorded identity beside it is not this host's to remove: the
                 // daemon died before it could say which object it had created. The path is
                 // recorded as one that is still there and a person decides.
-                let cleanup = row
-                    .staging_identity
-                    .map(|expected| self.remove_staging(sibling, destination, expected));
+                let cleanup = row.staging_identity.map(|expected| {
+                    self.remove_staging(
+                        sibling,
+                        destination,
+                        expected,
+                        StagingRecord::Operation(row.action_id),
+                    )
+                });
                 let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
                 if !removed {
                     left_behind = Some(path.clone());
@@ -902,9 +905,14 @@ impl ProjectService {
                 let path = sibling.path().display().to_string();
                 // Removed as the directory this operation recorded creating, which nothing but
                 // the recorded identity proves.
-                let cleanup = row
-                    .staging_identity
-                    .map(|expected| self.remove_staging(sibling, destination, expected));
+                let cleanup = row.staging_identity.map(|expected| {
+                    self.remove_staging(
+                        sibling,
+                        destination,
+                        expected,
+                        StagingRecord::Operation(row.action_id),
+                    )
+                });
                 let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
                 let why = cleanup.as_ref().and_then(Cleanup::why);
                 let _ = self.writable().and_then(|mut store| {
@@ -1030,7 +1038,7 @@ impl ProjectService {
             label: row.destination_name.clone(),
             origin: origin_of_method(&row.method),
             state: ProjectState::Ready,
-            identity: opened.identity(),
+            identity: opened.recorded()?,
             display_path: path.display().to_string(),
             remote: row.remote.clone(),
             created_at_ms: self.clock.now_ms(),
@@ -1064,9 +1072,14 @@ impl ProjectService {
             // what came out of the sibling.
             // No recorded identity, so nothing proves the directory at that name is this host's:
             // the publication stands and the path is reported as still there.
-            let cleanup = row
-                .staging_identity
-                .map(|expected| self.remove_staging(sibling, destination, expected));
+            let cleanup = row.staging_identity.map(|expected| {
+                self.remove_staging(
+                    sibling,
+                    destination,
+                    expected,
+                    StagingRecord::Operation(row.action_id),
+                )
+            });
             let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
             let why = cleanup.as_ref().and_then(Cleanup::why);
             let _ = self.writable().and_then(|mut store| {
@@ -1157,7 +1170,7 @@ impl ProjectService {
         let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
         let opened = self.open_through(&held, &relative, admission)?;
         if let Some((project, expected)) = expected {
-            self.renumber_project(project, opened.require_identity(expected)?)?;
+            self.settle_project(project, opened.require_identity(expected)?)?;
         }
         let remote = self.brokers.validate(&RemoteSpecification {
             remote_name: "origin".to_owned(),
@@ -1272,8 +1285,7 @@ impl ProjectService {
         staging: StagingSibling,
     ) {
         let path = staging.path().display().to_string();
-        let identity = staging.identity();
-        let cleanup = self.remove_staging(staging, destination, identity);
+        let cleanup = self.remove_held_staging(staging, destination);
         let _ = self.writable().and_then(|mut store| {
             store.record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
         });
@@ -1289,14 +1301,51 @@ impl ProjectService {
         &self,
         sibling: StagingSibling,
         destination: &Destination,
-        expected: ObjectIdentity,
+        expected: RecordedIdentity,
+        record: StagingRecord,
     ) -> Cleanup {
         if let Err(refusal) = destination.admit() {
             return Cleanup::Kept(format!(
                 "{refusal}; nothing is removed through it, and the owner reconciles this path"
             ));
         }
-        sibling.clean_up(destination, expected)
+        sibling.clean_up(destination, expected, &|settled| {
+            self.settle_staging_record(record, settled)
+        })
+    }
+
+    /// Writes what a recorded staging directory is now, when it is not what its row carries: the
+    /// filesystem it is on, or the device number that filesystem has now.
+    fn settle_staging_record(&self, record: StagingRecord, settled: &Settled) -> Result<()> {
+        let Some((was, now)) = settled.revision() else {
+            return Ok(());
+        };
+        match record {
+            StagingRecord::Held => Ok(()),
+            StagingRecord::Operation(action_id) => crate::store::settle_operation_staging(
+                self.writable()?.connection(),
+                action_id,
+                was,
+                now,
+            ),
+            StagingRecord::Workspace(workspace_id) => crate::store::settle_workspace_staging(
+                self.writable()?.connection(),
+                workspace_id,
+                was,
+                now,
+            ),
+        }
+    }
+
+    /// Removes the staging sibling this operation holds, as the directory it created: the
+    /// identity it is asked to be is the one its own handle has.
+    fn remove_held_staging(&self, sibling: StagingSibling, destination: &Destination) -> Cleanup {
+        match sibling.recorded() {
+            Ok(expected) => {
+                self.remove_staging(sibling, destination, expected, StagingRecord::Held)
+            }
+            Err(refusal) => Cleanup::Kept(refusal.to_string()),
+        }
     }
 
     /// Takes one workspace's staging sibling away through the handle it holds, and records what
@@ -1309,8 +1358,7 @@ impl ProjectService {
         destination: &Destination,
         staging: StagingSibling,
     ) {
-        let identity = staging.identity();
-        let _ = match self.remove_staging(staging, destination, identity).why() {
+        let _ = match self.remove_held_staging(staging, destination).why() {
             None => self
                 .writable()
                 .and_then(|mut store| store.clear_workspace_staging(workspace_id)),
@@ -1347,7 +1395,7 @@ impl ProjectService {
             row.action_id,
             OperationState::Staging,
             &OperationUpdate {
-                staging_identity: Some(staging.identity()),
+                staging_identity: Some(staging.recorded()?),
                 ..OperationUpdate::default()
             },
         )
@@ -1492,6 +1540,76 @@ impl ProjectService {
         Ok(WorkspaceReadResult {
             workspace: self.summarise_workspace(&store, &row)?,
         })
+    }
+
+    /// Opens the repository one workspace's working tree belongs to, and requires the objects there
+    /// to be the ones the journal recorded: the workspace's own tree and, for a workspace that
+    /// shares its project's repository, the repository's Git directory.
+    ///
+    /// Each is decided by the rule every recorded directory is decided by: it is the recorded one
+    /// by its inode on the recorded filesystem, under whatever device number that filesystem has
+    /// now, and what the record is to become is written here. An independent clone is its own
+    /// repository, so only its tree is held to a record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::UnknownWorkspace`] for a workspace this environment does not have,
+    /// and [`ProjectError::IdentityChanged`] when this host recorded no identity for the tree or
+    /// when either object at the recorded path is not the one the record names.
+    pub fn open_workspace_repository(&self, workspace_id: WorkspaceId) -> Result<OpenedRepository> {
+        let (row, project) = {
+            let store = self.locked()?;
+            let row =
+                store
+                    .workspace(workspace_id)?
+                    .ok_or_else(|| ProjectError::UnknownWorkspace {
+                        workspace: workspace_id.to_string().into(),
+                    })?;
+            let project = store.project(row.project_repository_id)?.ok_or_else(|| {
+                ProjectError::UnknownProject {
+                    project: row.project_repository_id.to_string().into(),
+                }
+            })?;
+            (row, project)
+        };
+        let Some(tree) = row.identity else {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this host recorded no filesystem identity for the workspace at {}, so \
+                     nothing proves what is there is its working tree",
+                    crate::git::redact(&row.display_path)
+                )
+                .into(),
+            });
+        };
+        let opened = OpenedRepository::open(
+            &self.profile,
+            self.environment_id,
+            Path::new(&row.display_path),
+        )?;
+        let settled_tree = opened.require_tree(tree)?;
+        let settled_git_dir = if row.isolation == Some(IsolationMechanism::IndependentClone) {
+            Settled::AsRecorded
+        } else {
+            opened.require_git_dir(project.identity.git_dir)?
+        };
+        if let Some((was, now)) = settled_tree.revision() {
+            crate::store::settle_workspace_tree(
+                self.writable()?.connection(),
+                workspace_id,
+                was,
+                now,
+            )?;
+        }
+        if let Some((was, now)) = settled_git_dir.revision() {
+            crate::store::settle_project_git_dir(
+                self.writable()?.connection(),
+                project.project_repository_id,
+                was,
+                now,
+            )?;
+        }
+        Ok(opened)
     }
 
     // ----- creations ------------------------------------------------------------------------
@@ -1814,7 +1932,7 @@ impl ProjectService {
             label: label.to_owned(),
             origin: plan.origin(),
             state: ProjectState::Ready,
-            identity: opened.identity(),
+            identity: opened.recorded()?,
             display_path: path.display().to_string(),
             remote: plan.remote().cloned(),
             created_at_ms: self.clock.now_ms(),
@@ -2055,7 +2173,12 @@ impl ProjectService {
         if let Some(hook) = &self.reconciling {
             (hook.0)();
         }
-        let cleanup = self.remove_recorded_staging(&reach, row.staging_identity, &shown);
+        let cleanup = self.remove_recorded_staging(
+            &reach,
+            row.staging_identity,
+            &shown,
+            StagingRecord::Operation(operation),
+        );
         let outcome = self
             .writable()
             .and_then(|mut store| {
@@ -2127,8 +2250,9 @@ impl ProjectService {
     fn remove_recorded_staging(
         &self,
         reach: &TreeReach,
-        expected: Option<ObjectIdentity>,
+        expected: Option<RecordedIdentity>,
         shown: &Path,
+        record: StagingRecord,
     ) -> Cleanup {
         let Some((held, relative)) = &reach.through else {
             return Cleanup::Kept(unreachable_reason(None));
@@ -2169,7 +2293,9 @@ impl ProjectService {
                     .to_owned(),
             );
         };
-        match remove_staging_directory(&parent, &leaf, directory, expected, shown) {
+        match remove_staging_directory(&parent, &leaf, directory, expected, shown, &|settled| {
+            self.settle_staging_record(record, settled)
+        }) {
             Ok(()) => Cleanup::Removed,
             Err(refusal) => Cleanup::Kept(refusal.to_string()),
         }
@@ -2267,7 +2393,7 @@ impl ProjectService {
                     Path::new(&project.display_path),
                     project.identity,
                 )?;
-                self.renumber_project(project.project_repository_id, renumbered)?;
+                self.settle_project(project.project_repository_id, renumbered)?;
                 opened
             }
         };
@@ -2439,7 +2565,7 @@ impl ProjectService {
                 // The user's own working tree, used where it is. Nothing is created, nothing is
                 // cleaned and nothing is copied.
                 Ok(Materialised {
-                    identity: repository.identity().work_tree,
+                    identity: repository.recorded()?.work_tree,
                     unapplied: Vec::new(),
                 })
             }
@@ -2470,7 +2596,7 @@ impl ProjectService {
                         self.writable()?.set_workspace_state(
                             row.workspace_id,
                             WorkspaceState::Materialising,
-                            Some(reserved.identity()),
+                            Some(reserved.recorded()?),
                             None,
                             None,
                         )?;
@@ -2516,7 +2642,7 @@ impl ProjectService {
                                 row.workspace_id,
                                 WorkspaceState::Materialising,
                                 &WorkspaceUpdate {
-                                    staging_identity: Some(staging.identity()),
+                                    staging_identity: Some(staging.recorded()?),
                                     ..WorkspaceUpdate::default()
                                 },
                             )?;
@@ -2668,7 +2794,7 @@ impl ProjectService {
                     row.workspace_id,
                     WorkspaceState::Materialising,
                     &WorkspaceUpdate {
-                        identity: Some(tree.identity()),
+                        identity: Some(tree.recorded()?),
                         detail: Some(&format!(
                             "{carried} of the working tree's uncommitted paths were carried in \
                              and {} could not be",
@@ -2693,7 +2819,7 @@ impl ProjectService {
                     )?;
                 }
                 Ok(Materialised {
-                    identity: tree.identity(),
+                    identity: tree.recorded()?,
                     unapplied: report.skipped,
                 })
             }
@@ -3020,7 +3146,12 @@ impl ProjectService {
         };
         let shown = PathBuf::from(workspace_staging_path(row));
         let cleanup = match reach.beside(name) {
-            Ok(beside) => self.remove_recorded_staging(&beside, row.staging_identity, &shown),
+            Ok(beside) => self.remove_recorded_staging(
+                &beside,
+                row.staging_identity,
+                &shown,
+                StagingRecord::Workspace(row.workspace_id),
+            ),
             Err(refusal) => Cleanup::Kept(refusal.to_string()),
         };
         let _ = match cleanup.why() {
@@ -3069,7 +3200,7 @@ impl ProjectService {
             &RelativeName::parse(&bound.relative_path)?,
             admission_for(self.locations(), reach.clone()),
         )?;
-        self.renumber_project(
+        self.settle_project(
             project.project_repository_id,
             opened.require_identity(project.identity)?,
         )?;
@@ -3273,10 +3404,10 @@ impl ProjectService {
         // The identity is checked before anything is removed: a record whose object has been
         // replaced does not authorise removing whatever now holds its path.
         // The recorded tree under another device number is the recorded one: it is on the
-        // filesystem of the directory it is in, which a mount over it is not. It is removed next,
-        // so there is no record left to renumber.
+        // recorded filesystem, and on the filesystem of the directory it is in, which a mount over
+        // it is not.
         let here = parent.subdirectory(&name)?;
-        if here.check_recorded(expected).is_err() {
+        let Ok(settled) = here.check_recorded(expected) else {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "this workspace was recorded as {expected} and {} now holds {}; nothing is \
@@ -3286,6 +3417,17 @@ impl ProjectService {
                 )
                 .into(),
             });
+        };
+        // The record takes what the tree is now before the removal starts: a removal that stops
+        // part way leaves a record that names the filesystem the tree was found on, so a retry
+        // cannot take another filesystem's directory at that path for it.
+        if let Some((was, now)) = settled.revision() {
+            crate::store::settle_workspace_tree(
+                self.writable()?.connection(),
+                row.workspace_id,
+                was,
+                now,
+            )?;
         }
         // The tree goes through the handle whose identity was just checked and through handles
         // the removal opens beneath it, never through a path, so no name in the tree can be
@@ -3326,7 +3468,7 @@ impl ProjectService {
                 &top,
                 project.identity,
             ) && self
-                .renumber_project(project.project_repository_id, renumbered)
+                .settle_project(project.project_repository_id, renumbered)
                 .is_ok()
                 && opened.recheck(&self.profile).is_ok()
             {
@@ -3634,7 +3776,7 @@ impl ProjectService {
             label: row.label.clone(),
             origin: row.origin,
             state: row.state,
-            filesystem_identity: wire_identity(row.identity.git_dir),
+            filesystem_identity: wire_identity(row.identity.git_dir.object),
             display_path: row.display_path.clone(),
             remote: Nullable(row.remote.clone()),
             created_at_ms: row.created_at_ms,
@@ -3657,7 +3799,9 @@ impl ProjectService {
             // An absent identity is reported as absent. A workspace whose materialisation did not
             // get as far as creating its tree has none, and inventing one would be inventing a
             // filesystem object.
-            filesystem_identity: Nullable(row.identity.map(wire_identity)),
+            filesystem_identity: Nullable(
+                row.identity.map(|identity| wire_identity(identity.object)),
+            ),
             display_path: row.display_path.clone(),
             detail: Nullable(with_staging_notes(
                 row.detail.clone(),
@@ -3873,10 +4017,23 @@ enum DirtyCount {
     Unmeasurable(String),
 }
 
+/// Which record a staging directory's identity is kept in, so that what the directory is found to
+/// be is written there before the directory is removed.
+#[derive(Clone, Copy, Debug)]
+enum StagingRecord {
+    /// A sibling this run holds a handle on: its identity was read from that handle just now, and
+    /// no record holds a different one.
+    Held,
+    /// An operation's row.
+    Operation(ActionId),
+    /// A workspace's row.
+    Workspace(WorkspaceId),
+}
+
 /// What a materialisation produced.
 struct Materialised {
     /// The working tree's filesystem identity.
-    identity: ObjectIdentity,
+    identity: RecordedIdentity,
     /// The paths the policy included that this host could not carry.
     unapplied: Vec<String>,
 }

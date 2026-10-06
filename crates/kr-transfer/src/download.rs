@@ -29,9 +29,7 @@ use kr_protocol::transfer::{
     DownloadSource, UploadState,
 };
 
-use crate::authority::{
-    AuthorisedDirectory, AuthorisedFile, IdentityCheck, ObjectPolicy, RelativeName,
-};
+use crate::authority::{AuthorisedDirectory, AuthorisedFile, ObjectPolicy, RelativeName};
 use crate::error::{Result, TransferError};
 use crate::service::{
     TransferService, digest_of, read_at, snapshot_expiry, snapshot_name, unknown, write_at,
@@ -676,10 +674,8 @@ impl TransferService {
         // A scope on a filesystem that is numbered differently since it was registered, as a
         // container's is when it starts again, is the scope that was registered: its record takes
         // the new number, so that the old one is not taken for it if another filesystem is given it.
-        if let IdentityCheck::Renumbered { was } = directory.check_recorded(row.root_identity)? {
-            self.locked()?
-                .renumber_scope(scope_id, was, directory.identity().device)?;
-        }
+        let settled = directory.check_recorded(row.root)?;
+        self.locked()?.settle_scope(scope_id, &settled)?;
         Ok(directory)
     }
 

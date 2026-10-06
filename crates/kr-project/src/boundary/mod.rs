@@ -98,8 +98,8 @@ use std::sync::Arc;
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::RemoteTransport;
-use kr_transfer::AuthorisedDirectory;
 pub use kr_transfer::ObjectIdentity;
+use kr_transfer::{AuthorisedDirectory, RecordedIdentity, Settled};
 
 use crate::error::{ProjectError, Result};
 
@@ -536,6 +536,48 @@ pub fn identity_of_handle(
             detail: format!("a directory this host made could not be identified: {error}").into(),
         })?;
     Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.identity())
+}
+
+/// Returns the object one opened directory is, as the journal records it: with the filesystem it is
+/// on.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read.
+pub fn recorded_of_handle(
+    environment_id: EnvironmentId,
+    directory: &cap_std::fs::Dir,
+) -> Result<RecordedIdentity> {
+    let handle = directory
+        .try_clone()
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a directory this host made could not be identified: {error}").into(),
+        })?;
+    Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.recorded()?)
+}
+
+/// Decides whether one opened directory is the directory a record names, by the rule every
+/// recorded directory is decided by.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when the handle cannot be read, and
+/// [`ProjectError::IdentityChanged`] when it is not the recorded directory.
+pub fn settle_handle(
+    environment_id: EnvironmentId,
+    directory: &cap_std::fs::Dir,
+    expected: RecordedIdentity,
+) -> Result<Settled> {
+    let handle = directory
+        .try_clone()
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a directory this host made could not be identified: {error}").into(),
+        })?;
+    AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?
+        .check_recorded(expected)
+        .map_err(|refusal| ProjectError::IdentityChanged {
+            detail: refusal.to_string().into(),
+        })
 }
 
 /// Returns the object one path names now, for a caller that needs to record it.

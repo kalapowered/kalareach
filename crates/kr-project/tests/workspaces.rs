@@ -14,6 +14,8 @@
 
 mod support;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use kr_ipc::testing::volumes;
 use kr_project::store::{Performed, RetainedRow, WorkspaceRow};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ChangeSetId, ProjectRepositoryId, SessionId};
@@ -631,6 +633,381 @@ fn a_workspace_tree_found_under_another_device_number_is_removed_as_the_recorded
     );
 }
 
+/// Returns the device number and the inode a path has now.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn numbers_of(path: &std::path::Path) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path).expect("the directory is there");
+    (metadata.dev() as i64, metadata.ino() as i64)
+}
+
+/// A registered repository is refused on another filesystem that gives the directory at its path
+/// the inodes the registered one had, and accepted on the filesystem it was registered on.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers() {
+    volumes::with_volumes(
+        "a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers",
+        || {
+            let fixture = Fixture::create();
+            let project = adopted_with_changes(&fixture, "elsewhere");
+            let journal = || {
+                rusqlite::Connection::open(
+                    kr_project::ProjectService::root_of(&fixture.host().environment())
+                        .join(kr_project::store::STORE_FILE_NAME),
+                )
+                .expect("the journal opens")
+            };
+            let preview = |seed: u8| {
+                fixture.service().workspace_create(
+                    &actor(),
+                    &WorkspaceCreateParams {
+                        project_repository_id: project,
+                        label: "in place".to_owned(),
+                        kind: WorkspaceKind::SharedExisting,
+                        isolation: Nullable(None),
+                        policy: include_everything(),
+                        base_revision: Nullable(None),
+                        base_change_set_id: Nullable(None),
+                        destination: Nullable(None),
+                        preview_only: true,
+                    },
+                    Some(&action("workspace.create", seed)),
+                )
+            };
+            preview(70).expect("the repository on the filesystem it was registered on");
+
+            // Another filesystem takes the place of the directory the repository is in, with a
+            // repository at the same path, and the record carries the numbers that repository has:
+            // as it would where the new filesystem was given the device number the first had and
+            // was built in the same order.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume = volumes::Volume::attach(fixture.work(), scratch.path(), "other")
+                .unwrap_or_else(|| volumes::not_attachable());
+            let other = ordinary_repository(fixture.work(), "elsewhere");
+            let (device, tree) = numbers_of(&other);
+            let (_, git_dir) = numbers_of(&other.join(".git"));
+            journal()
+                .execute(
+                    "UPDATE projects SET git_dir_device = ?1, git_dir_file_id = ?2,
+                                         work_tree_device = ?1, work_tree_file_id = ?3",
+                    [device, git_dir, tree],
+                )
+                .expect("the record is rewritten");
+            let refusal =
+                preview(71).expect_err("another filesystem is not the one it was registered on");
+            assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+            volume.detach();
+        },
+    );
+}
+
+/// A workspace tree is not removed on another filesystem that gives the directory at its path the
+/// inode the recorded one had, and what the other filesystem holds there is left as it is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers() {
+    volumes::with_volumes(
+        "a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers",
+        || {
+            let fixture = Fixture::create();
+            let project = adopted_with_changes(&fixture, "source");
+            let trees = fixture.work().join("trees");
+            std::fs::create_dir(&trees).expect("where workspaces are made");
+            let created = fixture
+                .service()
+                .workspace_create(
+                    &actor(),
+                    &WorkspaceCreateParams {
+                        project_repository_id: project,
+                        label: "elsewhere".to_owned(),
+                        kind: WorkspaceKind::Isolated,
+                        isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                        policy: InclusionPolicy::base_only(),
+                        base_revision: Nullable(None),
+                        base_change_set_id: Nullable(None),
+                        destination: Nullable(Some(destination(
+                            fixture.environment_id(),
+                            &trees,
+                            "tree",
+                        ))),
+                        preview_only: false,
+                    },
+                    Some(&action("workspace.create", 72)),
+                )
+                .expect("the workspace is created");
+            let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+
+            // Another filesystem takes the place of the directory the workspace is in, with a
+            // directory of its own at the tree's path that has the inode the tree had.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume = volumes::Volume::attach(&trees, scratch.path(), "other")
+                .unwrap_or_else(|| volumes::not_attachable());
+            std::fs::create_dir(trees.join("tree")).expect("a directory at the tree's path");
+            std::fs::write(trees.join("tree/theirs.txt"), b"not this host's\n")
+                .expect("their file");
+            let (device, inode) = numbers_of(&trees.join("tree"));
+            rusqlite::Connection::open(
+                kr_project::ProjectService::root_of(&fixture.host().environment())
+                    .join(kr_project::store::STORE_FILE_NAME),
+            )
+            .expect("the journal opens")
+            .execute(
+                "UPDATE workspaces SET tree_device = ?2, tree_file_id = ?3 WHERE workspace_id = ?1",
+                rusqlite::params![workspace_id.get().as_bytes().to_vec(), device, inode],
+            )
+            .expect("the record is rewritten");
+
+            let refusal = fixture
+                .service()
+                .workspace_remove(
+                    &WorkspaceRemoveParams {
+                        workspace_id,
+                        retention: RetentionPolicy::RemoveRetained,
+                        through_location_id: Nullable(None),
+                    },
+                    Some(&action("workspace.remove", 73)),
+                )
+                .expect_err("this host does not remove a directory on another filesystem");
+            assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+            assert!(
+                trees.join("tree/theirs.txt").is_file(),
+                "what the other filesystem holds is as it was"
+            );
+            volume.detach();
+        },
+    );
+}
+
+/// A repository recorded before filesystems were recorded is decided as it was, by its numbers,
+/// and takes the filesystem it is found on, once; a repository that is another filesystem is refused
+/// from then on.
+#[test]
+fn a_repository_recorded_before_filesystems_were_recorded_takes_the_filesystem_it_is_found_on_once()
+{
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "before");
+    let journal = || {
+        rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the journal opens")
+    };
+    let recorded = || -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        journal()
+            .query_row("SELECT git_dir_fs, work_tree_fs FROM projects", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("the record has the filesystem columns")
+    };
+    let preview = |service: &kr_project::ProjectService, seed: u8| {
+        service.workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "in place".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: true,
+            },
+            Some(&action("workspace.create", seed)),
+        )
+    };
+
+    // The store as a build that recorded no filesystem wrote it: the columns are not there.
+    let connection = journal();
+    for column in ["git_dir_fs", "work_tree_fs"] {
+        connection
+            .execute_batch(&format!("ALTER TABLE projects DROP COLUMN {column}"))
+            .expect("takes the column away");
+    }
+    drop(connection);
+    let service = fixture.reopen();
+    assert_eq!(recorded(), (None, None), "the columns come back empty");
+    preview(&service, 74).expect("the repository is decided as it was");
+    let (git_dir, work_tree) = recorded();
+    assert_eq!(
+        git_dir.as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN)
+    );
+    assert_eq!(
+        work_tree.as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN)
+    );
+
+    // Once: the next use leaves what was recorded as it is.
+    preview(&service, 75).expect("the repository is the registered one");
+    assert_eq!(recorded(), (git_dir, work_tree));
+
+    // And from then on another filesystem is not the registered one.
+    journal()
+        .execute_batch("UPDATE projects SET work_tree_fs = x'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'")
+        .expect("the record is rewritten");
+    let refusal = preview(&service, 76).expect_err("another filesystem is refused");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+}
+
+/// A workspace tree whose removal stops part way leaves its record naming the filesystem the tree
+/// was found on, whatever the record held before, so a removal that is repeated cannot take another
+/// filesystem's directory at that path for the tree.
+#[cfg(unix)]
+#[test]
+fn a_tree_removal_that_stops_leaves_the_record_naming_the_filesystem_the_tree_was_found_on() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "stopped");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "stopped".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "stopped-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 77)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let tree = fixture.work().join("stopped-tree");
+    let locked = tree.join("src");
+    if std::fs::metadata(&locked).is_ok_and(|metadata| metadata.uid() == 0) {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+        return;
+    }
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    // The record as a build that recorded no filesystem wrote it.
+    journal
+        .execute("UPDATE workspaces SET tree_fs = NULL", [])
+        .expect("the record is rewritten");
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+        .expect("its entries cannot be removed");
+    let stopped = fixture.service().workspace_remove(
+        &WorkspaceRemoveParams {
+            workspace_id,
+            retention: RetentionPolicy::RemoveRetained,
+            through_location_id: Nullable(None),
+        },
+        Some(&action("workspace.remove", 78)),
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+    stopped.expect_err("a removal that cannot empty the tree stops");
+    let filesystem: Option<Vec<u8>> = journal
+        .query_row(
+            "SELECT tree_fs FROM workspaces WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .expect("reads the record");
+    assert_eq!(
+        filesystem.as_ref().map(Vec::len),
+        Some(kr_transfer::FilesystemId::LEN),
+        "the record took the filesystem the tree was found on before anything was removed"
+    );
+}
+
+/// A workspace tree is not removed when the record cannot be given the filesystem the tree was
+/// found on, whether the write fails or finds the record already changed: what decides a removal
+/// has to be on record before the removal starts, and a repeat once the journal can be written
+/// takes the tree away.
+#[cfg(unix)]
+#[test]
+fn a_tree_whose_record_cannot_be_settled_is_not_removed() {
+    for fault in support::Unrecorded::BOTH {
+        let fixture = Fixture::create();
+        let project = adopted_with_changes(&fixture, "unsettled");
+        let created = fixture
+            .service()
+            .workspace_create(
+                &actor(),
+                &WorkspaceCreateParams {
+                    project_repository_id: project,
+                    label: "unsettled".to_owned(),
+                    kind: WorkspaceKind::Isolated,
+                    isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                    policy: InclusionPolicy::base_only(),
+                    base_revision: Nullable(None),
+                    base_change_set_id: Nullable(None),
+                    destination: Nullable(Some(destination(
+                        fixture.environment_id(),
+                        fixture.work(),
+                        "unsettled-tree",
+                    ))),
+                    preview_only: false,
+                },
+                Some(&action("workspace.create", 80)),
+            )
+            .expect("the workspace is created");
+        let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+        let tree = fixture.work().join("unsettled-tree");
+        let journal = rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the journal opens");
+        // The record as a build that recorded no filesystem wrote it.
+        journal
+            .execute("UPDATE workspaces SET tree_fs = NULL", [])
+            .expect("the record is rewritten");
+        let remove = |seed: u8| {
+            fixture.service().workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id,
+                    retention: RetentionPolicy::RemoveRetained,
+                    through_location_id: Nullable(None),
+                },
+                Some(&action("workspace.remove", seed)),
+            )
+        };
+
+        fault.impose(&journal, "workspaces", "tree_fs");
+        remove(81).expect_err("a record that cannot be settled does not authorise a removal");
+        assert!(
+            tree.join("src/lib.rs").is_file(),
+            "{fault:?}: nothing of the tree is removed"
+        );
+        let filesystem: Option<Vec<u8>> = journal
+            .query_row("SELECT tree_fs FROM workspaces", [], |row| row.get(0))
+            .expect("reads the record");
+        assert_eq!(filesystem, None, "{fault:?}: the record is as it was");
+
+        support::Unrecorded::lift(&journal, "tree_fs");
+        remove(82).expect("the journal can be written, so the tree is the recorded one");
+        support::assert_absent(&tree, "the tree, once its record could be settled");
+    }
+}
+
 #[test]
 fn a_read_never_deletes() {
     // KR-REQ-23.43: view and read never imply deletion.
@@ -1238,10 +1615,7 @@ fn a_workspace_row_holds_every_field_a_replacement_needs() {
         state: WorkspaceState::Ready,
         base_revision: "a".repeat(40),
         base_change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([4; 16]))),
-        identity: Some(kr_transfer::ObjectIdentity {
-            device: 1,
-            file_id: 2,
-        }),
+        identity: Some(kr_transfer::RecordedIdentity::from_parts(1, 2, None)),
         display_path: "/tmp/review".to_owned(),
         staging_name: None,
         staging_identity: None,

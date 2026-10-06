@@ -244,7 +244,7 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
     std::fs::write(original.join("notes.txt"), b"the recorded tree").expect("writes a file");
     let authority =
         AuthorisedDirectory::open_root(environment(), &original).expect("opens the authority");
-    let recorded = authority.identity();
+    let recorded = authority.recorded().expect("reads its identity");
     let name = RelativeName::parse("notes.txt").expect("a valid relative name");
 
     // What the platform does with an authorised directory whose path is taken away differs, and

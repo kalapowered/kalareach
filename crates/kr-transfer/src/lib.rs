@@ -17,6 +17,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`authority`] | Opened directory and object handles, the no-escape policy, identity checks |
+//! | [`filesystem`] | Which filesystem a recorded directory is on, and the one rule that settles a record against the directory found where it was recorded |
 //! | [`staging`] | The environment's private staging area and the names payloads are stored under |
 //! | [`store`] | `transfers.sqlite`: uploads, the per-chunk journal, snapshots, drafts, grants |
 //! | [`service`] | Uploads, attachment handles, drafts, read grants, recovery and expiry sweeps |
@@ -28,8 +29,9 @@
 //!
 //! Two more modules, each private to this crate and each compiled on one platform alone, own what
 //! that platform says about an opened object's access-control list and the account it belongs to.
-//! The Windows one also removes a file of a tree through the file's own handle. They are the only
-//! code here that leaves safe Rust.
+//! The Apple one also reads the volume an opened directory is on, and the Windows one reads the
+//! volume's serial number and removes a file of a tree through the file's own handle. They are the
+//! only code here that leaves safe Rust.
 //!
 //! ## What a handle is, and is not
 //!
@@ -61,48 +63,55 @@ pub mod chunks;
 pub mod clock;
 pub mod download;
 pub mod error;
+pub mod filesystem;
 pub mod preview;
 pub mod service;
 pub mod staging;
 pub mod store;
 
-/// Whether an open Apple file carries an access-control list.
+/// Whether an open Apple file carries an access-control list, and which volume an open directory
+/// is on.
 ///
-/// The platform's list is reachable only through a descriptor and only through its own interface,
-/// which is why this module is allowed to leave safe Rust and nothing else on this platform is.
+/// The platform's list and the volume's UUID are reachable only through a descriptor and only
+/// through its own interface, which is why this module is allowed to leave safe Rust and nothing
+/// else on this platform is.
 #[cfg(target_os = "macos")]
 #[expect(
     unsafe_code,
-    reason = "asking a descriptor for its access-control list is a call into the platform's own \
-              interface, which has no safe binding; the call is made here and nowhere else"
+    reason = "asking a descriptor for its access-control list or for its volume's UUID is a call \
+              into the platform's own interface, which has no safe binding; the calls are made \
+              here and nowhere else"
 )]
 mod apple;
 
 /// What an open Windows file's access-control list says, how one is written back, removal of a
-/// file through its own handle, and the path an open directory's handle reports.
+/// file through its own handle, the path an open directory's handle reports, and the serial number
+/// of the volume a handle is on.
 ///
 /// Every file on this platform carries a list, reachable only through the platform's own
 /// interface; removing a file through its handle is two calls into `kernel32`, and reading the
-/// path a handle holds is one more. That is why this module is allowed to leave safe Rust and
-/// nothing else on this platform is.
+/// path a handle holds or the volume it is on is one more each. That is why this module is allowed
+/// to leave safe Rust and nothing else on this platform is.
 #[cfg(windows)]
 #[expect(
     unsafe_code,
     reason = "reading and writing an opened object's access-control list, removing a file through \
-              its own handle, and reading the path a handle holds, are calls into the platform's \
-              own interface, which has no safe binding; the calls are made here and nowhere else"
+              its own handle, and reading the path a handle holds or the volume it is on, are \
+              calls into the platform's own interface, which has no safe binding; the calls are \
+              made here and nowhere else"
 )]
 mod windows;
 
 #[cfg(target_os = "macos")]
 pub use crate::apple::AppleAcl;
 pub use crate::authority::{
-    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, FileOwner, IdentityCheck, MountId,
-    ObjectIdentity, ObjectPolicy, Privacy, RelativeName,
+    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, FileOwner, MountId, ObjectIdentity,
+    ObjectPolicy, Privacy, RelativeName,
 };
 pub use crate::clock::{Clock, ManualClock, SystemClock};
 pub use crate::download::{DownloadWriter, publish_transfer};
 pub use crate::error::{Result, TransferError};
+pub use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 pub use crate::service::{
     InsertionOutcome, Recovery, RetainEverything, RetainedOutcome, SessionRetention, Sweep,
     TransferService,

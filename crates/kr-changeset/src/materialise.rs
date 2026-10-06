@@ -124,7 +124,7 @@ pub fn materialise(
                 .into(),
         });
     }
-    let identity = directory.identity();
+    let identity = directory.recorded()?;
     let created_at_ms = kr_ipc::now_ms();
     let mut held = MaterialisationRecord {
         materialisation_id,
@@ -135,8 +135,8 @@ pub fn materialise(
         label: label.to_owned(),
         directory_path: parent.host_path(&name).display().to_string(),
         filesystem_identity: FilesystemIdentity {
-            device: U64::new(identity.device),
-            file_id: U64::new(identity.file_id),
+            device: U64::new(identity.object.device),
+            file_id: U64::new(identity.object.file_id),
         },
         paths_written: U64::new(0),
         unapplied: Vec::new(),
@@ -343,15 +343,27 @@ pub fn reread(
             ));
         }
     };
-    if directory.identity() != row.identity {
-        return Ok((
-            row,
-            Reread::Indeterminate(
-                "the directory at this materialisation's name is not the object this host made"
-                    .to_owned(),
-            ),
-            Vec::new(),
-        ));
+    // The directory this host made, on the filesystem it made it on, under whatever device number
+    // that filesystem has now. A record that is to be replaced by what the directory is now is.
+    match directory.check_recorded(row.identity) {
+        Ok(settled) => {
+            if let Some((was, now)) = settled.revision() {
+                service
+                    .locked()?
+                    .settle_materialisation(row.materialisation_id, was, now)?;
+            }
+        }
+        Err(_) => {
+            return Ok((
+                row,
+                Reread::Indeterminate(
+                    "the directory at this materialisation's name is not the object this host \
+                     made"
+                        .to_owned(),
+                ),
+                Vec::new(),
+            ));
+        }
     }
     let mut found = Manifest {
         paths: Vec::new(),
@@ -377,7 +389,9 @@ pub fn reread(
         return Ok((row, Reread::Indeterminate(detail), observed));
     }
     found.canonicalise();
-    if same_content(&original, &found) && same_objects(&held.observed, &observed) {
+    if same_content(&original, &found)
+        && same_objects(&held.observed, &observed, directory.identity().device)
+    {
         Ok((row, Reread::Unmodified, observed))
     } else {
         Ok((row, Reread::Modified(found), observed))
@@ -407,7 +421,12 @@ fn same_content(left: &Manifest, right: &Manifest) -> bool {
 /// a file changes the instant the platform records for it, and replacing it changes the object.
 /// What it does not catch is a run that restored the object, the length **and** the instant, which
 /// takes deliberate work, and a platform that reports no instant at all.
-fn same_objects(before: &[ObservedPath], after: &[ObservedPath]) -> bool {
+///
+/// The object is its number on the device it was recorded under, or on the one the directory has
+/// now (`device`), which the directory's own check has just tied to the filesystem it was made on:
+/// the record of a directory that was found under another number carries the old number for every
+/// file in it. A file found on neither is not the one this host wrote.
+fn same_objects(before: &[ObservedPath], after: &[ObservedPath], device: u64) -> bool {
     if before.len() != after.len() {
         return false;
     }
@@ -417,7 +436,7 @@ fn same_objects(before: &[ObservedPath], after: &[ObservedPath]) -> bool {
     after.sort_by(|a, b| a.path.cmp(&b.path));
     before.iter().zip(&after).all(|(a, b)| {
         a.path == b.path
-            && a.device == b.device
+            && (a.device == b.device || b.device.get() == device)
             && a.file_id == b.file_id
             && a.byte_len == b.byte_len
             && a.written_at_nanos == b.written_at_nanos
@@ -930,12 +949,25 @@ pub fn release(
     let name = RelativeName::parse(&row.directory_name)?;
     match parent.subdirectory(&name) {
         Ok(directory) => {
-            if directory.identity() != row.identity {
-                return Err(ChangeSetError::StorageUnavailable {
-                    detail: "the directory at this materialisation's name is not the object this \
-                             host made, so nothing was removed and nothing is recorded as released"
-                        .into(),
-                });
+            // Its record takes what the directory is now before anything is removed: a removal
+            // that stops part way leaves a record that names the filesystem the directory was
+            // found on, so a retry cannot take another filesystem's directory for it.
+            match directory.check_recorded(row.identity) {
+                Ok(settled) => {
+                    if let Some((was, now)) = settled.revision() {
+                        service
+                            .locked()?
+                            .settle_materialisation(materialisation_id, was, now)?;
+                    }
+                }
+                Err(_) => {
+                    return Err(ChangeSetError::StorageUnavailable {
+                        detail: "the directory at this materialisation's name is not the object \
+                                 this host made, so nothing was removed and nothing is recorded \
+                                 as released"
+                            .into(),
+                    });
+                }
             }
             // The identity is what establishes it, together with the two things the creation
             // established: the name was **made** rather than opened, and what the open reached
@@ -1061,4 +1093,41 @@ pub fn results(
 ) -> Result<Vec<MaterialisationResult>> {
     let rows = service.locked()?.results(change_set_id, version)?;
     rows.iter().map(|row| decode_stored(&row.record)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observed(device: u64) -> ObservedPath {
+        ObservedPath {
+            path: "a".to_owned(),
+            device: U64::new(device),
+            file_id: U64::new(7),
+            byte_len: U64::new(3),
+            written_at_nanos: Nullable(Some(U64::new(9))),
+        }
+    }
+
+    /// A file is the one this host wrote when it is found on the device it was recorded under or
+    /// on the device its directory has now, and not when it is found on another: the directory's
+    /// own check ties the second to the filesystem the directory was made on, and a directory
+    /// whose files are on other devices than itself, as an overlay of layers on different
+    /// filesystems without `xino` has them, keeps the first.
+    #[test]
+    fn a_file_is_the_one_written_on_its_recorded_device_or_on_its_directorys_device_now() {
+        let recorded = [observed(4)];
+        assert!(
+            same_objects(&recorded, &[observed(4)], 9),
+            "the device it was recorded under, which is not its directory's"
+        );
+        assert!(
+            same_objects(&recorded, &[observed(9)], 9),
+            "its directory's device now, under an older record"
+        );
+        assert!(
+            !same_objects(&recorded, &[observed(5)], 9),
+            "neither device"
+        );
+    }
 }

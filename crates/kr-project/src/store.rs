@@ -41,10 +41,10 @@ use kr_protocol::project::{
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
-use kr_transfer::ObjectIdentity;
+use kr_transfer::{FilesystemId, RecordedIdentity};
 
 use crate::error::{ProjectError, Result};
-use crate::identity::{Renumbered, RepositoryIdentity};
+use crate::identity::{RecordedRepository, Revised};
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
@@ -74,7 +74,7 @@ pub struct ProjectRow {
     pub state: ProjectState,
     /// The stable filesystem identity of its repository and of the working tree it was recorded
     /// against.
-    pub identity: RepositoryIdentity,
+    pub identity: RecordedRepository,
     /// The path it was created or adopted at, for a person to read.
     pub display_path: String,
     /// The remote it was cloned from, when it has one.
@@ -117,7 +117,7 @@ pub struct OperationUpdate<'a> {
     /// The private sibling the content is staged in.
     pub staging_name: Option<&'a str>,
     /// That sibling's own filesystem identity.
-    pub staging_identity: Option<ObjectIdentity>,
+    pub staging_identity: Option<RecordedIdentity>,
 }
 
 /// What one workspace state change records beside the state.
@@ -127,7 +127,7 @@ pub struct OperationUpdate<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkspaceUpdate<'a> {
     /// The working tree's filesystem identity, once there is one.
-    pub identity: Option<ObjectIdentity>,
+    pub identity: Option<RecordedIdentity>,
     /// The retention policy a removal was requested under.
     pub retention: Option<RetentionPolicy>,
     /// When it was removed.
@@ -135,7 +135,7 @@ pub struct WorkspaceUpdate<'a> {
     /// The private sibling an independent clone is staged in.
     pub staging_name: Option<&'a str>,
     /// The filesystem identity of that sibling, once the directory exists.
-    pub staging_identity: Option<ObjectIdentity>,
+    pub staging_identity: Option<RecordedIdentity>,
     /// Why it is in the state it is in.
     pub detail: Option<&'a str>,
 }
@@ -173,14 +173,14 @@ pub struct WorkspaceRow {
     /// The change-set version it materialised, when it named one.
     pub base_change_set_id: Option<ChangeSetId>,
     /// The stable filesystem identity of its working tree.
-    pub identity: Option<ObjectIdentity>,
+    pub identity: Option<RecordedIdentity>,
     /// The path its working tree is at.
     pub display_path: String,
     /// The private sibling an independent clone was staged in, while one existed.
     pub staging_name: Option<String>,
     /// That sibling's own filesystem identity, so a cleanup removes the directory this host
     /// created rather than whatever holds the name now.
-    pub staging_identity: Option<ObjectIdentity>,
+    pub staging_identity: Option<RecordedIdentity>,
     /// Why it is in the state it is in, when it ended up there for a reason.
     pub detail: Option<String>,
     /// The location its working tree was created through, and the tree's name beneath it.
@@ -229,7 +229,7 @@ pub struct OperationRow {
     ///
     /// A recorded name is not authority to remove whatever now holds it. The identity is what
     /// makes the cleanup a removal of this host's own directory rather than of a replacement.
-    pub staging_identity: Option<ObjectIdentity>,
+    pub staging_identity: Option<RecordedIdentity>,
     /// What this host recorded about the object it staged, before the publication.
     ///
     /// This is what makes an interrupted publication resolvable: the question is not whether a
@@ -550,7 +550,9 @@ impl Store {
                      created_location_id   BLOB,
                      created_relative_path TEXT,
                      source_location_id    BLOB,
-                     source_relative_path  TEXT
+                     source_relative_path  TEXT,
+                     git_dir_fs            BLOB,
+                     work_tree_fs          BLOB
                  );
                  CREATE TABLE IF NOT EXISTS workspaces (
                      workspace_id          BLOB PRIMARY KEY,
@@ -580,7 +582,9 @@ impl Store {
                      created_at_ms         INTEGER NOT NULL,
                      removed_at_ms         INTEGER,
                      location_id           BLOB,
-                     relative_path         TEXT
+                     relative_path         TEXT,
+                     tree_fs               BLOB,
+                     staging_fs            BLOB
                  );
                  CREATE TABLE IF NOT EXISTS workspace_progress (
                      workspace_id BLOB NOT NULL,
@@ -640,7 +644,9 @@ impl Store {
                      ended_at_ms           INTEGER,
                      grant_id              BLOB,
                      destination_location_id BLOB,
-                     source_location_id    BLOB
+                     source_location_id    BLOB,
+                     staging_fs            BLOB,
+                     staged_fs             BLOB
                  );
                  CREATE TABLE IF NOT EXISTS operation_paths (
                      action_id BLOB NOT NULL,
@@ -845,7 +851,9 @@ impl Store {
                         staged_created_at_ms = COALESCE(?7, staged_created_at_ms),
                         staging_name = COALESCE(?8, staging_name),
                         staging_device = COALESCE(?9, staging_device),
-                        staging_file_id = COALESCE(?10, staging_file_id)
+                        staging_file_id = COALESCE(?10, staging_file_id),
+                        staged_fs = COALESCE(?11, staged_fs),
+                        staging_fs = COALESCE(?12, staging_fs)
                   WHERE action_id = ?1",
                 params![
                     action_id.get().as_bytes().to_vec(),
@@ -854,14 +862,16 @@ impl Store {
                     // the write, as every other retained diagnostic does.
                     detail.map(crate::git::redact),
                     ended_at_ms.map(|stamp| i64_of(stamp.get())),
-                    staged_identity.map(|staged| i64_of(staged.identity.device)),
-                    staged_identity.map(|staged| i64_of(staged.identity.file_id)),
+                    staged_identity.map(|staged| i64_of(staged.identity.object.device)),
+                    staged_identity.map(|staged| i64_of(staged.identity.object.file_id)),
                     staged_identity
                         .and_then(|staged| staged.created_at_ms)
                         .map(i64_of),
                     staging_name,
-                    staging_identity.map(|identity| i64_of(identity.device)),
-                    staging_identity.map(|identity| i64_of(identity.file_id)),
+                    staging_identity.map(|identity| i64_of(identity.object.device)),
+                    staging_identity.map(|identity| i64_of(identity.object.file_id)),
+                    staged_identity.and_then(|staged| staged.identity.filesystem),
+                    staging_identity.and_then(|identity| identity.filesystem),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -1201,7 +1211,7 @@ impl Store {
         &mut self,
         id: WorkspaceId,
         state: WorkspaceState,
-        identity: Option<ObjectIdentity>,
+        identity: Option<RecordedIdentity>,
         retention: Option<RetentionPolicy>,
         removed_at_ms: Option<TimestampMs>,
     ) -> Result<()> {
@@ -1251,19 +1261,23 @@ impl Store {
                         staging_name = COALESCE(?7, staging_name),
                         staging_device = COALESCE(?8, staging_device),
                         staging_file_id = COALESCE(?9, staging_file_id),
-                        detail = COALESCE(?10, detail)
+                        detail = COALESCE(?10, detail),
+                        tree_fs = COALESCE(?11, tree_fs),
+                        staging_fs = COALESCE(?12, staging_fs)
                   WHERE workspace_id = ?1",
                 params![
                     id.get().as_bytes().to_vec(),
                     workspace_state_text(state),
-                    identity.map(|identity| i64_of(identity.device)),
-                    identity.map(|identity| i64_of(identity.file_id)),
+                    identity.map(|identity| i64_of(identity.object.device)),
+                    identity.map(|identity| i64_of(identity.object.file_id)),
                     retention.map(retention_text),
                     removed_at_ms.map(|stamp| i64_of(stamp.get())),
                     staging_name,
-                    staging_identity.map(|identity| i64_of(identity.device)),
-                    staging_identity.map(|identity| i64_of(identity.file_id)),
+                    staging_identity.map(|identity| i64_of(identity.object.device)),
+                    staging_identity.map(|identity| i64_of(identity.object.file_id)),
                     detail.map(crate::git::redact),
+                    identity.and_then(|identity| identity.filesystem),
+                    staging_identity.and_then(|identity| identity.filesystem),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -1656,7 +1670,7 @@ impl Store {
             .execute(
                 "UPDATE workspaces
                     SET staging_name = NULL, staging_device = NULL, staging_file_id = NULL,
-                        staging_detail = NULL
+                        staging_fs = NULL, staging_detail = NULL
                   WHERE workspace_id = ?1",
                 params![id.get().as_bytes().to_vec()],
             )
@@ -2530,13 +2544,15 @@ const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_re
      method, state, remote_name, remote_transport, remote_url, remote_provider, remote_broker, \
      flow, destination_state, parent_path, destination_name, staging_name, staging_device, \
      staging_file_id, staged_device, staged_file_id, staged_created_at_ms, detail, \
-     started_at_ms, ended_at_ms, grant_id, destination_location_id, source_location_id";
+     started_at_ms, ended_at_ms, grant_id, destination_location_id, source_location_id, \
+     staging_fs, staged_fs";
 
 /// The columns a repository row is read from.
 const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
      git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
      remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms, \
-     created_location_id, created_relative_path, source_location_id, source_relative_path";
+     created_location_id, created_relative_path, source_location_id, source_relative_path, \
+     git_dir_fs, work_tree_fs";
 
 /// Puts the free-text reasons a store already holds through the rule.
 fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
@@ -2756,6 +2772,19 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("operations", "source_location_id", "BLOB"),
         ("workspaces", "location_id", "BLOB"),
         ("workspaces", "relative_path", "TEXT"),
+        // The filesystem each recorded directory was on. A row without one was written before
+        // directories were recorded with their filesystem: its first successful check decides it
+        // by its device number and inode, as every record was decided, and records the filesystem
+        // it found (`Settled::Revised`). Remove these entries, with the handling of a record
+        // without a filesystem in `kr_transfer::filesystem::settle`, once no supported upgrade
+        // starts from a store written before filesystems were recorded; a record that no use has
+        // settled by then is refused, and recorded again.
+        ("projects", "git_dir_fs", "BLOB"),
+        ("projects", "work_tree_fs", "BLOB"),
+        ("workspaces", "tree_fs", "BLOB"),
+        ("workspaces", "staging_fs", "BLOB"),
+        ("operations", "staging_fs", "BLOB"),
+        ("operations", "staged_fs", "BLOB"),
     ];
     for (table, column, kind) in ADDED {
         let present: i64 = transaction
@@ -2779,7 +2808,7 @@ const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environmen
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
      display_path, staging_name, detail, retention, created_at_ms, removed_at_ms, \
-     staging_device, staging_file_id, location_id, relative_path";
+     staging_device, staging_file_id, location_id, relative_path, tree_fs, staging_fs";
 
 fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
     let remote = row.remote.as_ref();
@@ -2791,9 +2820,10 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                                      parent_path, destination_name, staging_name, staging_device,
                                      staging_file_id, staged_device, staged_file_id,
                                      staged_created_at_ms, detail, started_at_ms, ended_at_ms,
-                                     grant_id, destination_location_id, source_location_id)
+                                     grant_id, destination_location_id, source_location_id,
+                                     staging_fs, staged_fs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 row.action_id.get().as_bytes().to_vec(),
                 row.actor_id.as_str(),
@@ -2811,13 +2841,14 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.parent_path,
                 row.destination_name,
                 row.staging_name,
-                row.staging_identity.map(|identity| i64_of(identity.device)),
                 row.staging_identity
-                    .map(|identity| i64_of(identity.file_id)),
+                    .map(|identity| i64_of(identity.object.device)),
+                row.staging_identity
+                    .map(|identity| i64_of(identity.object.file_id)),
                 row.staged_identity
-                    .map(|staged| i64_of(staged.identity.device)),
+                    .map(|staged| i64_of(staged.identity.object.device)),
                 row.staged_identity
-                    .map(|staged| i64_of(staged.identity.file_id)),
+                    .map(|staged| i64_of(staged.identity.object.file_id)),
                 row.staged_identity
                     .and_then(|staged| staged.created_at_ms)
                     .map(i64_of),
@@ -2833,6 +2864,10 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.authority
                     .source_location_id
                     .map(|location| location.get().as_bytes().to_vec()),
+                row.staging_identity
+                    .and_then(|identity| identity.filesystem),
+                row.staged_identity
+                    .and_then(|staged| staged.identity.filesystem),
             ],
         )
         .map_err(ProjectError::store)?;
@@ -2879,23 +2914,13 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         parent_path: row.get(13)?,
         destination_name: row.get(14)?,
         staging_name: row.get(15)?,
-        staging_identity: match (staging_device, staging_file_id) {
-            (Some(device), Some(file_id)) => Some(ObjectIdentity {
-                device: u64_of(device),
-                file_id: u64_of(file_id),
-            }),
-            _ => None,
-        },
-        staged_identity: match (device, file_id) {
-            (Some(device), Some(file_id)) => Some(StagedWitness {
-                identity: ObjectIdentity {
-                    device: u64_of(device),
-                    file_id: u64_of(file_id),
-                },
+        staging_identity: recorded_identity(staging_device, staging_file_id, row.get(27)?),
+        staged_identity: recorded_identity(device, file_id, row.get(28)?).map(|identity| {
+            StagedWitness {
+                identity,
                 created_at_ms: created_at_ms.map(u64_of),
-            }),
-            _ => None,
-        },
+            }
+        }),
         detail: optional_detail_column(row, 21)?,
         authority: RecordedAuthority {
             grant_id: optional_uuid_column(row, 24)?.map(GrantId::new),
@@ -2937,19 +2962,20 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
                                    work_tree_file_id, display_path, remote_name, remote_transport,
                                    remote_url, remote_provider, remote_broker, created_at_ms,
                                    created_location_id, created_relative_path,
-                                   source_location_id, source_relative_path)
+                                   source_location_id, source_relative_path, git_dir_fs,
+                                   work_tree_fs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20)",
+                     ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.project_repository_id.get().as_bytes().to_vec(),
                 row.environment_id.get().as_bytes().to_vec(),
                 row.label,
                 origin_text(row.origin),
                 project_state_text(row.state),
-                i64_of(row.identity.git_dir.device),
-                i64_of(row.identity.git_dir.file_id),
-                i64_of(row.identity.work_tree.device),
-                i64_of(row.identity.work_tree.file_id),
+                i64_of(row.identity.git_dir.object.device),
+                i64_of(row.identity.git_dir.object.file_id),
+                i64_of(row.identity.work_tree.object.device),
+                i64_of(row.identity.work_tree.object.file_id),
                 row.display_path,
                 remote.map(|remote| remote.remote_name.clone()),
                 remote.map(|remote| transport_text(remote.transport).to_owned()),
@@ -2969,6 +2995,8 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
                     .as_ref()
                     .map(|named| named.location_id.get().as_bytes().to_vec()),
                 row.source.as_ref().map(|named| named.relative_path.clone()),
+                row.identity.git_dir.filesystem,
+                row.identity.work_tree.filesystem,
             ],
         )
         .map_err(ProjectError::store)?;
@@ -3024,32 +3052,218 @@ pub(crate) fn set_project_source(
     Ok(())
 }
 
-/// Replaces the device numbers a repository was recorded under with the ones it has now: those of
-/// both its directories, in one statement, and only while the row still carries the numbers they
-/// replace.
+/// Replaces what a repository's record carries by what the repository is now: the device number
+/// and the filesystem of both its directories, in one statement, and only while the row still
+/// carries what they replace.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
-pub(crate) fn renumber_project(
+pub(crate) fn settle_project(
     connection: &Connection,
     id: ProjectRepositoryId,
-    renumbered: Renumbered,
+    revised: &Revised,
 ) -> Result<()> {
-    connection
+    let changed = connection
         .execute(
-            "UPDATE projects SET git_dir_device = ?2, work_tree_device = ?3
-              WHERE project_repository_id = ?1 AND git_dir_device = ?4 AND work_tree_device = ?5",
+            "UPDATE projects SET git_dir_device = ?2, git_dir_fs = ?3,
+                                 work_tree_device = ?4, work_tree_fs = ?5
+              WHERE project_repository_id = ?1
+                AND git_dir_device = ?6 AND git_dir_file_id = ?10 AND git_dir_fs IS ?7
+                AND work_tree_device = ?8 AND work_tree_file_id = ?11 AND work_tree_fs IS ?9",
             params![
                 id.get().as_bytes().to_vec(),
-                i64_of(renumbered.now.git_dir.device),
-                i64_of(renumbered.now.work_tree.device),
-                i64_of(renumbered.was.git_dir.device),
-                i64_of(renumbered.was.work_tree.device),
+                i64_of(revised.now.git_dir.object.device),
+                revised.now.git_dir.filesystem,
+                i64_of(revised.now.work_tree.object.device),
+                revised.now.work_tree.filesystem,
+                i64_of(revised.was.git_dir.object.device),
+                revised.was.git_dir.filesystem,
+                i64_of(revised.was.work_tree.object.device),
+                revised.was.work_tree.filesystem,
+                i64_of(revised.was.git_dir.object.file_id),
+                i64_of(revised.was.work_tree.object.file_id),
             ],
         )
         .map_err(ProjectError::store)?;
-    Ok(())
+    let held = |column: &str| {
+        stored_identity(
+            connection,
+            &format!(
+                "SELECT {column}_device, {column}_file_id, {column}_fs FROM projects
+                  WHERE project_repository_id = ?1"
+            ),
+            id.get().as_bytes().to_vec(),
+        )
+    };
+    replaced(
+        changed,
+        || {
+            held("git_dir") == Some(revised.now.git_dir)
+                && held("work_tree") == Some(revised.now.work_tree)
+        },
+        "the repository's record",
+    )
+}
+
+/// Replaces what a workspace's record carries for its working tree by what the tree is now, only
+/// while the row still carries what it replaces.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn settle_workspace_tree(
+    connection: &Connection,
+    id: WorkspaceId,
+    was: RecordedIdentity,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET tree_device = ?3, tree_fs = ?5
+              WHERE workspace_id = ?1 AND tree_device = ?2 AND tree_file_id = ?6
+                AND tree_fs IS ?4",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(was.object.device),
+                i64_of(now.object.device),
+                was.filesystem,
+                now.filesystem,
+                i64_of(was.object.file_id),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || {
+            stored_identity(
+                connection,
+                "SELECT tree_device, tree_file_id, tree_fs FROM workspaces WHERE workspace_id = ?1",
+                id.get().as_bytes().to_vec(),
+            ) == Some(now)
+        },
+        "the workspace's record of its tree",
+    )
+}
+
+/// Replaces what a repository's record carries for its Git common directory by what the directory
+/// is now, only while the row still carries what it replaces.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn settle_project_git_dir(
+    connection: &Connection,
+    id: ProjectRepositoryId,
+    was: RecordedIdentity,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE projects SET git_dir_device = ?3, git_dir_fs = ?5
+              WHERE project_repository_id = ?1 AND git_dir_device = ?2 AND git_dir_file_id = ?6
+                AND git_dir_fs IS ?4",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(was.object.device),
+                i64_of(now.object.device),
+                was.filesystem,
+                now.filesystem,
+                i64_of(was.object.file_id),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || {
+            stored_identity(
+                connection,
+                "SELECT git_dir_device, git_dir_file_id, git_dir_fs FROM projects WHERE project_repository_id = ?1",
+                id.get().as_bytes().to_vec(),
+            ) == Some(now)
+        },
+        "the repository's record of its Git directory",
+    )
+}
+
+/// Replaces what an operation's record carries for its staging directory by what the directory is
+/// now, only while the row still carries the whole of what it replaces.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn settle_operation_staging(
+    connection: &Connection,
+    id: ActionId,
+    was: RecordedIdentity,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE operations SET staging_device = ?3, staging_fs = ?5
+              WHERE action_id = ?1 AND staging_device = ?2 AND staging_file_id = ?6
+                AND staging_fs IS ?4",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(was.object.device),
+                i64_of(now.object.device),
+                was.filesystem,
+                now.filesystem,
+                i64_of(was.object.file_id),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || {
+            stored_identity(
+                connection,
+                "SELECT staging_device, staging_file_id, staging_fs FROM operations WHERE action_id = ?1",
+                id.get().as_bytes().to_vec(),
+            ) == Some(now)
+        },
+        "the operation's record of its staging directory",
+    )
+}
+
+/// Replaces what a workspace's record carries for its staging directory by what the directory is
+/// now, only while the row still carries the whole of what it replaces.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn settle_workspace_staging(
+    connection: &Connection,
+    id: WorkspaceId,
+    was: RecordedIdentity,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET staging_device = ?3, staging_fs = ?5
+              WHERE workspace_id = ?1 AND staging_device = ?2 AND staging_file_id = ?6
+                AND staging_fs IS ?4",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(was.object.device),
+                i64_of(now.object.device),
+                was.filesystem,
+                now.filesystem,
+                i64_of(was.object.file_id),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || {
+            stored_identity(
+                connection,
+                "SELECT staging_device, staging_file_id, staging_fs FROM workspaces WHERE workspace_id = ?1",
+                id.get().as_bytes().to_vec(),
+            ) == Some(now)
+        },
+        "the workspace's record of its staging directory",
+    )
 }
 
 /// Returns how many workspaces are selected on one repository, read inside a transaction.
@@ -3123,15 +3337,17 @@ fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
         label: row.get(2)?,
         origin: origin_of(&origin),
         state: project_state_of(&state),
-        identity: RepositoryIdentity {
-            git_dir: ObjectIdentity {
-                device: u64_of(row.get::<_, i64>(5)?),
-                file_id: u64_of(row.get::<_, i64>(6)?),
-            },
-            work_tree: ObjectIdentity {
-                device: u64_of(row.get::<_, i64>(7)?),
-                file_id: u64_of(row.get::<_, i64>(8)?),
-            },
+        identity: RecordedRepository {
+            git_dir: RecordedIdentity::from_parts(
+                u64_of(row.get::<_, i64>(5)?),
+                u64_of(row.get::<_, i64>(6)?),
+                row.get(20)?,
+            ),
+            work_tree: RecordedIdentity::from_parts(
+                u64_of(row.get::<_, i64>(7)?),
+                u64_of(row.get::<_, i64>(8)?),
+                row.get(21)?,
+            ),
         },
         display_path: row.get(9)?,
         remote,
@@ -3149,9 +3365,9 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                                      binary_files, generated_artefacts, state, base_revision,
                                      base_change_set_id, tree_device, tree_file_id, display_path,
                                      staging_name, detail, retention, created_at_ms, removed_at_ms,
-                                     location_id, relative_path)
+                                     location_id, relative_path, tree_fs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 row.workspace_id.get().as_bytes().to_vec(),
                 row.project_repository_id.get().as_bytes().to_vec(),
@@ -3168,8 +3384,8 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                 row.base_revision,
                 row.base_change_set_id
                     .map(|id| id.get().as_bytes().to_vec()),
-                row.identity.map(|id| i64_of(id.device)),
-                row.identity.map(|id| i64_of(id.file_id)),
+                row.identity.map(|id| i64_of(id.object.device)),
+                row.identity.map(|id| i64_of(id.object.file_id)),
                 row.display_path,
                 row.staging_name,
                 row.detail.as_deref().map(crate::git::redact),
@@ -3182,6 +3398,7 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                 row.located
                     .as_ref()
                     .map(|named| named.relative_path.clone()),
+                row.identity.and_then(|id| id.filesystem),
             ],
         )
         .map_err(ProjectError::store)?;
@@ -3227,22 +3444,10 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
             .as_deref()
             .and_then(uuid_of)
             .map(ChangeSetId::new),
-        identity: match (device, file_id) {
-            (Some(device), Some(file_id)) => Some(ObjectIdentity {
-                device: u64_of(device),
-                file_id: u64_of(file_id),
-            }),
-            _ => None,
-        },
+        identity: recorded_identity(device, file_id, row.get(26)?),
         display_path: row.get(16)?,
         staging_name: row.get(17)?,
-        staging_identity: match (staging_device, staging_file_id) {
-            (Some(device), Some(file_id)) => Some(ObjectIdentity {
-                device: u64_of(device),
-                file_id: u64_of(file_id),
-            }),
-            _ => None,
-        },
+        staging_identity: recorded_identity(staging_device, staging_file_id, row.get(27)?),
         detail: optional_detail_column(row, 18)?,
         located: located_name(row, 24, 25)?,
         retention: retention.as_deref().map(retention_of),
@@ -3329,6 +3534,50 @@ const fn i64_of(value: u64) -> i64 {
 /// Reads back what [`i64_of`] wrote.
 const fn u64_of(value: i64) -> u64 {
     value as u64
+}
+
+/// Reads back a directory's identity from its three columns: absent unless both numbers were
+/// recorded, and without a filesystem for a row written before one was recorded.
+const fn recorded_identity(
+    device: Option<i64>,
+    file_id: Option<i64>,
+    filesystem: Option<FilesystemId>,
+) -> Option<RecordedIdentity> {
+    match (device, file_id) {
+        (Some(device), Some(file_id)) => Some(RecordedIdentity::from_parts(
+            u64_of(device),
+            u64_of(file_id),
+            filesystem,
+        )),
+        _ => None,
+    }
+}
+
+/// Reads the identity a record holds in three columns, for a settlement that matched no row.
+fn stored_identity(connection: &Connection, sql: &str, id: Vec<u8>) -> Option<RecordedIdentity> {
+    connection
+        .query_row(sql, params![id], |row| {
+            Ok(recorded_identity(row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .ok()
+        .flatten()
+}
+
+/// Says whether a settlement left its record as it should be, and refuses when the record is
+/// neither what the settlement replaced nor what it made: anything that follows, a removal above
+/// all, must not go on.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the record changed under the settlement.
+fn replaced(changed: usize, becomes_so: impl FnOnce() -> bool, what: &str) -> Result<()> {
+    if changed >= 1 || becomes_so() {
+        Ok(())
+    } else {
+        Err(ProjectError::store(format!(
+            "{what} changed while it was being checked"
+        )))
+    }
 }
 
 macro_rules! text_enum {
@@ -3486,6 +3735,11 @@ mod tests {
         EnvironmentId::new(Uuid::from_bytes([7; 16]))
     }
 
+    /// A filesystem identity a case records beside the numbers it makes up.
+    const fn filesystem() -> FilesystemId {
+        FilesystemId::from_u64(0x00ab_cdef)
+    }
+
     fn workspace_row(id: u8) -> WorkspaceRow {
         WorkspaceRow {
             workspace_id: WorkspaceId::new(Uuid::from_bytes([id; 16])),
@@ -3564,10 +3818,7 @@ mod tests {
         assert_eq!(read.state, OperationState::Staging);
         // The state change and the identity that resolves a publication are recorded together.
         let staged = StagedWitness {
-            identity: ObjectIdentity {
-                device: 16_777_234,
-                file_id: 98_765,
-            },
+            identity: RecordedIdentity::from_parts(16_777_234, 98_765, Some(filesystem())),
             created_at_ms: Some(1_700_000_000_000),
         };
         store
@@ -3723,10 +3974,7 @@ mod tests {
             .expect("it reads")
             .expect("it is there");
         assert_eq!(read, row);
-        let tree = ObjectIdentity {
-            device: 1,
-            file_id: 2,
-        };
+        let tree = RecordedIdentity::from_parts(1, 2, Some(filesystem()));
         store
             .set_workspace_state(workspace_id, WorkspaceState::Ready, Some(tree), None, None)
             .expect("the state moves");
@@ -3924,15 +4172,9 @@ mod tests {
                     label: "done".to_owned(),
                     origin: ProjectOrigin::Cloned,
                     state: ProjectState::Ready,
-                    identity: RepositoryIdentity {
-                        git_dir: ObjectIdentity {
-                            device: 1,
-                            file_id: 2,
-                        },
-                        work_tree: ObjectIdentity {
-                            device: 1,
-                            file_id: 3,
-                        },
+                    identity: RecordedRepository {
+                        git_dir: RecordedIdentity::from_parts(1, 2, Some(filesystem())),
+                        work_tree: RecordedIdentity::from_parts(1, 3, Some(filesystem())),
                     },
                     display_path: "/tmp/done".to_owned(),
                     remote: None,

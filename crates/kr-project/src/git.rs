@@ -814,9 +814,9 @@ struct Recorded {
     /// The name of the mark written inside it, which is the one entry it may hold.
     token: String,
     /// The directory, once there was one to identify.
-    identity: Option<crate::boundary::ObjectIdentity>,
+    identity: Option<kr_transfer::RecordedIdentity>,
     /// The mark inside it, once there was one to identify.
-    mark: Option<crate::boundary::ObjectIdentity>,
+    mark: Option<kr_transfer::RecordedIdentity>,
 }
 
 impl Recorded {
@@ -824,7 +824,11 @@ impl Recorded {
     fn lines(&self, name: &str) -> Vec<String> {
         let mut lines = vec![format!("making {name} {}", self.token)];
         if let (Some(identity), Some(mark)) = (self.identity, self.mark) {
-            lines.push(format!("made {name} {identity} {mark}"));
+            lines.push(format!(
+                "made {name} {} {}",
+                identity_text(identity),
+                identity_text(mark)
+            ));
         }
         lines
     }
@@ -978,13 +982,39 @@ fn recorded(profile: &cap_std::fs::Dir) -> Option<std::collections::BTreeMap<Str
     Some(entries)
 }
 
-/// Reads back an object's identity as the record writes it.
-fn parse_identity(text: &str) -> Option<crate::boundary::ObjectIdentity> {
-    let (device, file_id) = text.split_once(':')?;
-    Some(crate::boundary::ObjectIdentity {
-        device: device.parse().ok()?,
-        file_id: file_id.parse().ok()?,
-    })
+/// Writes a directory's identity as the record holds it: its device number, its inode and the
+/// filesystem it was on, which a record written before filesystems were recorded does not carry.
+fn identity_text(identity: kr_transfer::RecordedIdentity) -> String {
+    match identity.filesystem {
+        Some(filesystem) => format!(
+            "{}:{}:{filesystem}",
+            identity.object.device, identity.object.file_id
+        ),
+        None => format!("{}:{}", identity.object.device, identity.object.file_id),
+    }
+}
+
+/// Reads back a directory's identity as the record writes it.
+///
+/// A record written before filesystems were recorded holds the two numbers alone, and is read as
+/// one without a filesystem: the sweep decides it as every record was decided, and the record it
+/// writes back holds the filesystem it found. Remove the two-part reading once no supported upgrade
+/// starts from a record written before filesystems were recorded; a record the sweep has not
+/// settled by then is left in place.
+fn parse_identity(text: &str) -> Option<kr_transfer::RecordedIdentity> {
+    let mut parts = text.split(':');
+    let device: u64 = parts.next()?.parse().ok()?;
+    let file_id: u64 = parts.next()?.parse().ok()?;
+    let filesystem = match parts.next() {
+        None => None,
+        Some(text) => Some(kr_transfer::FilesystemId::from_hex(text)?),
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(kr_transfer::RecordedIdentity::from_parts(
+        device, file_id, filesystem,
+    ))
 }
 
 /// Says that something inside the profile's own temporary directory was left where it is.
@@ -1016,7 +1046,7 @@ fn remove_recorded(
     root: &cap_std::fs::Dir,
     root_path: &Path,
     name: &str,
-    entry: &Recorded,
+    entry: &mut Recorded,
 ) -> bool {
     let path = root_path.join(name);
     // Both objects, or neither: a record that says this host was about to make a directory says
@@ -1032,11 +1062,15 @@ fn remove_recorded(
         left_in_place(&path, "it could not be opened");
         return false;
     };
-    if !crate::boundary::identity_of_handle(environment_id, &handle)
-        .is_ok_and(|found| found == identity)
-    {
-        left_in_place(&path, "it is not the object this host made");
-        return false;
+    // The object this host made, on the filesystem it made it on, under whatever device number
+    // that filesystem has now. A record that holds no filesystem is decided as it was, and takes
+    // the one found, so that a directory left in place is recorded as it is.
+    match crate::boundary::settle_handle(environment_id, &handle, identity) {
+        Ok(settled) => entry.identity = Some(settled.current(identity)),
+        Err(_) => {
+            left_in_place(&path, "it is not the object this host made");
+            return false;
+        }
     }
     // Exactly this host's own mark, and nothing besides. An empty directory is not one this host
     // made either: the mark went in before the record said the directory existed.
@@ -1063,11 +1097,12 @@ fn remove_recorded(
         left_in_place(&path, "this host's own mark could not be opened");
         return false;
     };
-    if !crate::boundary::identity_of_handle(environment_id, &marked)
-        .is_ok_and(|found| found == mark)
-    {
-        left_in_place(&path, "this host's own mark is not the object it made");
-        return false;
+    match crate::boundary::settle_handle(environment_id, &marked, mark) {
+        Ok(settled) => entry.mark = Some(settled.current(mark)),
+        Err(_) => {
+            left_in_place(&path, "this host's own mark is not the object it made");
+            return false;
+        }
     }
     drop(marked);
     // The mark is a directory, so this cannot take away anything anybody wrote: a name holding a
@@ -1133,15 +1168,17 @@ fn sweep(
             .into(),
         })?;
         let name = found.file_name().to_string_lossy().into_owned();
-        let Some(entry) = entries.get(&name) else {
+        let Some(mut entry) = entries.remove(&name) else {
             left_in_place(
                 &root_path.join(&name),
                 "this host has no record of making it",
             );
             continue;
         };
-        if remove_recorded(environment_id, root, root_path, &name, entry) {
+        if remove_recorded(environment_id, root, root_path, &name, &mut entry) {
             entries.remove(&name);
+        } else {
+            entries.insert(name, entry);
         }
     }
     // What is left is what is still there, so a later start tries again rather than losing the
@@ -3062,7 +3099,7 @@ impl PrivateTemporary {
                 .into(),
             }
         })?;
-        let mark = crate::boundary::identity_of_handle(environment_id, &mark).map_err(|error| {
+        let mark = crate::boundary::recorded_of_handle(environment_id, &mark).map_err(|error| {
             ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own mark inside its temporary directory could not be \
@@ -3138,7 +3175,7 @@ impl PrivateTemporary {
             }
         })?;
         let identity =
-            crate::boundary::identity_of_handle(environment_id, &handle).map_err(|error| {
+            crate::boundary::recorded_of_handle(environment_id, &handle).map_err(|error| {
                 ProjectError::StagingUnavailable {
                     detail: format!(
                         "{described}'s own temporary directory could not be identified: {error}"
@@ -3147,11 +3184,18 @@ impl PrivateTemporary {
                 }
             })?;
         drop(handle);
-        record(profile, &format!("made {name} {identity} {mark}"))?;
+        record(
+            profile,
+            &format!(
+                "made {name} {} {}",
+                identity_text(identity),
+                identity_text(mark)
+            ),
+        )?;
         Ok(Self {
             environment_id,
             path,
-            identity,
+            identity: identity.object,
             name,
             entry: Recorded {
                 token,
@@ -3186,7 +3230,7 @@ impl Drop for PrivateTemporary {
             &self.root,
             &self.root_path,
             &self.name,
-            &self.entry,
+            &mut self.entry,
         ) {
             let _ = record(&self.profile, &format!("gone {}", self.name));
         }
@@ -4054,6 +4098,165 @@ mod tests {
             );
         }
         assert!(!kept.contains_key("mine"), "and forgets what is gone");
+    }
+
+    /// The record names the directory and its mark by device number, inode and filesystem; this
+    /// puts other numbers in a line of it and leaves the filesystem each carries as it is.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn with_numbers(identity: &str, device: u64, file_id: u64) -> String {
+        match identity.splitn(3, ':').nth(2) {
+            Some(filesystem) => format!("{device}:{file_id}:{filesystem}"),
+            None => format!("{device}:{file_id}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+    )]
+    fn a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        kr_ipc::testing::volumes::with_volumes(
+            "git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made",
+            || {
+                let root = tempfile::tempdir().expect("a directory to sweep");
+                let profile_path = root.path().join(PROFILE_DIRECTORY);
+                let temporary = profile_path.join(TEMPORARY_DIRECTORY);
+                std::fs::create_dir_all(&temporary).expect("the directory to sweep");
+                let manifest = profile_path.join(TEMPORARY_MANIFEST_FILE);
+                let profile = Arc::new(
+                    cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
+                        .expect("the profile's own directory opens"),
+                );
+                let handle = Arc::new(
+                    cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
+                        .expect("the directory opens"),
+                );
+                let environment_id =
+                    EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+
+                // A directory this host made and recorded, and a daemon that died before it took
+                // it away.
+                let made = PrivateTemporary::create(
+                    environment_id,
+                    &profile,
+                    &handle,
+                    &temporary,
+                    "an invocation",
+                )
+                .expect("the directory is made and recorded");
+                let name = made.name.clone();
+                let token = made.entry.token.clone();
+                std::mem::forget(made);
+
+                // Another filesystem is mounted at that directory, with a mark of its own, and the
+                // record carries the numbers that filesystem's directory and mark have: the
+                // filesystem is all that tells it from the one that was recorded.
+                let at = temporary.join(&name);
+                let scratch = tempfile::tempdir().expect("a place for an image");
+                let volume = kr_ipc::testing::volumes::Volume::attach(&at, scratch.path(), "other")
+                    .unwrap_or_else(|| kr_ipc::testing::volumes::not_attachable());
+                std::fs::create_dir(at.join(&token)).expect("a mark on the other filesystem");
+                let directory = std::fs::metadata(&at).expect("the mounted directory");
+                let mark = std::fs::metadata(at.join(&token)).expect("its mark");
+                let text = std::fs::read_to_string(&manifest).expect("the record reads");
+                let rewritten: Vec<String> = text
+                    .lines()
+                    .map(
+                        |line| match line.split(' ').collect::<Vec<_>>().as_slice() {
+                            ["made", name, identity, marked] => format!(
+                                "made {name} {} {}",
+                                with_numbers(identity, directory.dev(), directory.ino()),
+                                with_numbers(marked, mark.dev(), mark.ino())
+                            ),
+                            _ => line.to_owned(),
+                        },
+                    )
+                    .collect();
+                std::fs::write(&manifest, rewritten.join("\n") + "\n")
+                    .expect("the record is rewritten");
+
+                sweep(environment_id, &profile, &handle, &temporary, &manifest)
+                    .expect("the record is written out again");
+                assert!(
+                    at.join(&token).is_dir(),
+                    "what the other filesystem holds is as it was"
+                );
+                assert!(
+                    recorded(&profile)
+                        .expect("the record reads")
+                        .contains_key(&name),
+                    "the record keeps it, so a later start tries again"
+                );
+                volume.detach();
+            },
+        );
+    }
+
+    #[test]
+    fn a_record_made_before_filesystems_were_recorded_takes_the_filesystem_it_is_found_on() {
+        // A directory this host recorded making, in the form that holds two numbers, which is left
+        // where it is because something else is in it: the record written out again holds the
+        // filesystem the directory is on, so that it is decided by it from then on.
+        let root = tempfile::tempdir().expect("a directory to sweep");
+        let profile_path = root.path().join(PROFILE_DIRECTORY);
+        let temporary = profile_path.join(TEMPORARY_DIRECTORY);
+        std::fs::create_dir_all(&temporary).expect("the directory to sweep");
+        let manifest = profile_path.join(TEMPORARY_MANIFEST_FILE);
+        let profile =
+            cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
+                .expect("the profile's own directory opens");
+        let handle = cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
+            .expect("the directory opens");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        handle.create_dir("used").expect("a directory");
+        handle.create_dir("used/cccc").expect("a mark");
+        handle.create("used/left-behind").expect("what Git left");
+        let numbers = |path: &str| {
+            crate::boundary::identity_of_handle(
+                environment_id,
+                &handle.open_dir(path).expect("the directory opens"),
+            )
+            .expect("the directory has an identity")
+        };
+        record(&profile, "making used cccc").expect("the record");
+        record(
+            &profile,
+            &format!("made used {} {}", numbers("used"), numbers("used/cccc")),
+        )
+        .expect("the record");
+        let before = recorded(&profile).expect("the record reads");
+        assert_eq!(
+            before["used"].identity.expect("identified").filesystem,
+            None
+        );
+
+        sweep(environment_id, &profile, &handle, &temporary, &manifest)
+            .expect("the record is written out again");
+        assert!(temporary.join("used/left-behind").exists(), "it is left");
+        let after = recorded(&profile).expect("the record reads");
+        let kept = &after["used"];
+        assert!(
+            kept.identity
+                .and_then(|identity| identity.filesystem)
+                .is_some(),
+            "the record takes the filesystem the directory is on"
+        );
+        assert_eq!(
+            kept.identity.map(|identity| identity.object),
+            Some(numbers("used")),
+            "and the numbers it had"
+        );
+        // The sweep stopped at what Git left, before it looked at the mark, so the mark's line is
+        // as it was written and is decided the same way when it is next looked at.
+        assert_eq!(
+            kept.mark.map(|mark| mark.filesystem),
+            Some(None),
+            "the mark was not looked at"
+        );
     }
 
     #[test]

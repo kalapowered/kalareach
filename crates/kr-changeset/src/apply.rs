@@ -1575,7 +1575,7 @@ impl Staging<'_> {
         &self,
         path: &str,
         entry: &str,
-        identity: kr_transfer::ObjectIdentity,
+        identity: kr_transfer::RecordedIdentity,
     ) -> Result<()> {
         #[cfg(feature = "fault-injection")]
         if self
@@ -1601,7 +1601,7 @@ impl Staging<'_> {
         &self,
         path: &str,
         entry: &str,
-        identity: kr_transfer::ObjectIdentity,
+        identity: kr_transfer::RecordedIdentity,
         content: kr_transfer::ObjectIdentity,
     ) -> Result<()> {
         self.service.locked()?.stage_path(
@@ -1802,7 +1802,20 @@ fn install(
             )));
         }
     };
-    let staged_identity = staged_directory.identity();
+    let staged_identity = match staged_directory.recorded() {
+        Ok(identity) => identity,
+        Err(error) => {
+            // The directory is this host's and nothing can say which filesystem it is on, so
+            // nothing could later prove it was this host's own. The record keeps the name with no
+            // identity, as it does for a directory this host could not open, and the path is
+            // reported rather than removed.
+            return Ok(Installed::Unresolved(format!(
+                "this host made the directory it stages this path through and could not identify \
+                 it, so it wrote nothing at this path and the name it made is reported rather \
+                 than removed: {error}"
+            )));
+        }
+    };
     if let Err(error) = staging.created(path, &entry, staged_identity) {
         // The journal would not take the identity of the directory this host had just made, so
         // nothing could later prove that directory was this host's own. This host asks for it to
@@ -2060,8 +2073,9 @@ fn install(
 fn take_staged(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
-    identity: Option<kr_transfer::ObjectIdentity>,
+    identity: Option<kr_transfer::RecordedIdentity>,
     content_identity: Option<kr_transfer::ObjectIdentity>,
+    settle: &dyn Fn(&kr_transfer::Settled) -> Result<()>,
 ) -> Staged {
     let opened = match here.subdirectory(temporary) {
         Ok(directory) => Some(directory),
@@ -2080,8 +2094,16 @@ fn take_staged(
     let Some(identity) = identity else {
         return Staged::NotOurs;
     };
-    if directory.identity() != identity {
+    // The directory this host recorded making, on the filesystem it was recorded on, under
+    // whatever device number that filesystem has now. Its record takes what it is now before
+    // anything is removed, with the file inside it, which is on the same filesystem and is carried
+    // to the number the filesystem has now: a removal that stops part way leaves a record that
+    // names the filesystem the directory was found on.
+    let Ok(settled) = directory.check_recorded(identity) else {
         return Staged::NotOurs;
+    };
+    if settle(&settled).is_err() {
+        return Staged::Kept;
     }
     let Ok(content) = RelativeName::parse(STAGED_CONTENT) else {
         return Staged::NotOurs;
@@ -2097,7 +2119,7 @@ fn take_staged(
     // removal below decides it, because a directory holding anything keeps the directory and one
     // holding nothing is this host's own obligation ending.
     if let Ok(found) = directory.open_read(&content, ObjectPolicy::ReadableFile) {
-        if Some(found.identity()) != content_identity {
+        if Some(found.identity()) != content_identity.map(|content| settled.carried(content)) {
             return Staged::NotOurs;
         }
         // The rest of what the directory's own handle says about it: still a directory, owned by
@@ -2137,12 +2159,21 @@ fn take_staged(
 fn clear_temporary(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
-    identity: Option<kr_transfer::ObjectIdentity>,
+    identity: Option<kr_transfer::RecordedIdentity>,
     content_identity: Option<kr_transfer::ObjectIdentity>,
     staging: &Staging<'_>,
     path: &str,
 ) -> Result<()> {
-    match take_staged(here, temporary, identity, content_identity) {
+    let settle = |settled: &kr_transfer::Settled| match (identity, settled.revision()) {
+        (Some(_), Some((was, now))) => {
+            staging
+                .service
+                .locked()?
+                .settle_staged_path(staging.action_id, path, was, now)
+        }
+        _ => Ok(()),
+    };
+    match take_staged(here, temporary, identity, content_identity, &settle) {
         Staged::TakenAway | Staged::NotThere => staging.gone(path)?,
         Staged::NotOurs | Staged::Kept => {}
     }
@@ -3157,7 +3188,15 @@ fn clear_staged(
         return Ok(cleanup);
     };
     for entry in staged {
-        match staged_now(&repository, &entry) {
+        let settle = |settled: &kr_transfer::Settled| match settled.revision() {
+            Some((was, now)) => {
+                service
+                    .locked()?
+                    .settle_staged_path(row.action_id, &entry.path, was, now)
+            }
+            None => Ok(()),
+        };
+        match staged_now(&repository, &entry, &settle) {
             Staged::TakenAway => {
                 service.locked()?.unstage_path(row.action_id, &entry.path)?;
                 cleanup.removed += 1;
@@ -3183,7 +3222,11 @@ fn clear_staged(
 /// staging directory sits in, level by level through each own handle, and hands that directory
 /// over. A directory above the name that is gone takes the staging directory with it, so there is
 /// nothing left to account for.
-fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -> Staged {
+fn staged_now(
+    repository: &OpenedRepository,
+    entry: &crate::store::StagedPath,
+    settle: &dyn Fn(&kr_transfer::Settled) -> Result<()>,
+) -> Staged {
     let Ok(name) = RelativeName::parse(&entry.path) else {
         return Staged::NotOurs;
     };
@@ -3217,7 +3260,7 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
     let Ok(temporary) = RelativeName::parse(&entry.entry) else {
         return Staged::NotOurs;
     };
-    take_staged(&here, &temporary, entry.identity, entry.content)
+    take_staged(&here, &temporary, entry.identity, entry.content, settle)
 }
 
 /// Settles the action one recovered apply was performed under, from what the journal holds.

@@ -455,7 +455,8 @@ fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_n
         &first,
     )
     .expect("it opens")
-    .identity();
+    .recorded()
+    .expect("it reads its identity");
 
     // A rename of the checkout. The object is the same, so the recorded identity still names it.
     let moved = fixture.work().join("moved");
@@ -518,7 +519,7 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
         &source,
     )
     .expect("it opens");
-    let recorded = repository.identity();
+    let recorded = repository.recorded().expect("it reads its identity");
     // A linked worktree, added with plain Git the way a user would.
     let added = fixture.work().join("linked");
     support::git_raw(
@@ -538,10 +539,10 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
     )
     .expect("the worktree opens");
     // The repository is the same object, which is what makes both worktrees one repository.
-    assert_eq!(worktree.identity().git_dir, recorded.git_dir);
+    assert_eq!(worktree.identity().git_dir, recorded.git_dir.object);
     // The working tree is a different object, so a record made against the first does not cover
     // the second: adding a worktree extends no grant.
-    assert_ne!(worktree.identity().work_tree, recorded.work_tree);
+    assert_ne!(worktree.identity().work_tree, recorded.work_tree.object);
     let refusal = OpenedRepository::open_recorded(
         fixture.service().profile(),
         fixture.environment_id(),

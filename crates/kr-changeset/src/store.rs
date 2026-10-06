@@ -101,8 +101,8 @@ pub struct MaterialisationRow {
     pub record: Vec<u8>,
     /// The single-component directory name it lives under.
     pub directory_name: String,
-    /// Its directory's stable filesystem identity.
-    pub identity: kr_transfer::ObjectIdentity,
+    /// Its directory's stable filesystem identity, with the filesystem it is on.
+    pub identity: kr_transfer::RecordedIdentity,
     /// When it was made.
     pub created_at_ms: TimestampMs,
     /// When it was released, once it has been.
@@ -246,7 +246,7 @@ pub struct StagedPath {
     /// The single-component name of the staging directory itself.
     pub entry: String,
     /// The directory this host created there, when it got as far as creating one.
-    pub identity: Option<kr_transfer::ObjectIdentity>,
+    pub identity: Option<kr_transfer::RecordedIdentity>,
     /// The file this host wrote inside it, when it got as far as writing one.
     pub content: Option<kr_transfer::ObjectIdentity>,
 }
@@ -403,6 +403,7 @@ impl Store {
                      directory_name     TEXT NOT NULL,
                      identity_device    INTEGER NOT NULL,
                      identity_file_id   INTEGER NOT NULL,
+                     identity_fs        BLOB,
                      created_at_ms      INTEGER NOT NULL,
                      released_at_ms     INTEGER
                  );
@@ -455,6 +456,7 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS clone_repositories (
                      workspace_id   BLOB NOT NULL PRIMARY KEY,
                      git_dir        TEXT NOT NULL,
+                     git_dir_fs     BLOB,
                      recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS apply_progress (
@@ -481,12 +483,40 @@ impl Store {
                      -- object, which is how it never takes away anything it cannot prove it made.
                      staged_device  INTEGER,
                      staged_file_id INTEGER,
+                     staged_fs      BLOB,
                      staged_content_device  INTEGER,
                      staged_content_file_id INTEGER,
                      PRIMARY KEY (action_id, path)
                  );",
             )
             .map_err(ChangeSetError::store)?;
+        // A store written before directories were recorded with their filesystem has no column for
+        // it. The columns are added here, empty, and each record's first successful check fills
+        // its own: a record without a filesystem is decided as every record was decided before,
+        // by its device number and inode, and the filesystem found becomes its record
+        // (`kr_transfer::Settled::Revised`). The storage format does not move, because a format
+        // this build cannot read has no way forward. Remove this step, with the handling of a
+        // record without a filesystem in `kr_transfer::filesystem::settle`, once no supported
+        // upgrade starts from a store written before filesystems were recorded; a record that no
+        // use has settled by then is refused, and recorded again.
+        for (table, column) in [
+            ("materialisations", "identity_fs"),
+            ("apply_progress", "staged_fs"),
+            ("clone_repositories", "git_dir_fs"),
+        ] {
+            let present: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .map_err(ChangeSetError::store)?;
+            if present == 0 {
+                transaction
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} BLOB"))
+                    .map_err(ChangeSetError::store)?;
+            }
+        }
         let recorded: Option<i64> = transaction
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
                 row.get(0)
@@ -1049,9 +1079,9 @@ impl Store {
                 .execute(
                     "INSERT INTO materialisations
                        (materialisation_id, change_set_id, version, purpose, record,
-                        directory_name, identity_device, identity_file_id, created_at_ms,
-                        released_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                        directory_name, identity_device, identity_file_id, identity_fs,
+                        created_at_ms, released_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
                     params![
                         uuid_bytes(row.materialisation_id.get()),
                         uuid_bytes(row.change_set_id.get()),
@@ -1059,8 +1089,9 @@ impl Store {
                         purpose_text(row.purpose),
                         row.record,
                         row.directory_name,
-                        row.identity.device as i64,
-                        row.identity.file_id as i64,
+                        row.identity.object.device as i64,
+                        row.identity.object.file_id as i64,
+                        row.identity.filesystem,
                         row.created_at_ms.get() as i64,
                     ],
                 )
@@ -1095,7 +1126,7 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT change_set_id, version, purpose, record, directory_name, identity_device,
-                        identity_file_id, created_at_ms, released_at_ms
+                        identity_file_id, created_at_ms, released_at_ms, identity_fs
                    FROM materialisations WHERE materialisation_id = ?1",
                 params![uuid_bytes(materialisation_id.get())],
                 |row| {
@@ -1107,10 +1138,11 @@ impl Store {
                             .ok_or_else(|| unknown(2, "a materialisation purpose"))?,
                         record: row.get(3)?,
                         directory_name: row.get(4)?,
-                        identity: kr_transfer::ObjectIdentity {
-                            device: row.get::<_, i64>(5)? as u64,
-                            file_id: row.get::<_, i64>(6)? as u64,
-                        },
+                        identity: kr_transfer::RecordedIdentity::from_parts(
+                            row.get::<_, i64>(5)? as u64,
+                            row.get::<_, i64>(6)? as u64,
+                            row.get(9)?,
+                        ),
                         created_at_ms: TimestampMs::new(row.get::<_, i64>(7)? as u64),
                         released_at_ms: row
                             .get::<_, Option<i64>>(8)?
@@ -1137,7 +1169,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT materialisation_id, purpose, record, directory_name, identity_device,
-                        identity_file_id, created_at_ms, released_at_ms
+                        identity_file_id, created_at_ms, released_at_ms, identity_fs
                    FROM materialisations
                   WHERE change_set_id = ?1 AND version = ?2
                     AND (?3 OR released_at_ms IS NULL)
@@ -1160,10 +1192,11 @@ impl Store {
                             .ok_or_else(|| unknown(1, "a materialisation purpose"))?,
                         record: row.get(2)?,
                         directory_name: row.get(3)?,
-                        identity: kr_transfer::ObjectIdentity {
-                            device: row.get::<_, i64>(4)? as u64,
-                            file_id: row.get::<_, i64>(5)? as u64,
-                        },
+                        identity: kr_transfer::RecordedIdentity::from_parts(
+                            row.get::<_, i64>(4)? as u64,
+                            row.get::<_, i64>(5)? as u64,
+                            row.get(8)?,
+                        ),
                         created_at_ms: TimestampMs::new(row.get::<_, i64>(6)? as u64),
                         released_at_ms: row
                             .get::<_, Option<i64>>(7)?
@@ -1175,6 +1208,60 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ChangeSetError::store)?;
         Ok(rows)
+    }
+
+    /// Replaces the identity one materialisation's directory was recorded under by what the
+    /// directory has now, only while the row still carries what it replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn settle_materialisation(
+        &self,
+        materialisation_id: MaterialisationId,
+        was: kr_transfer::RecordedIdentity,
+        now: kr_transfer::RecordedIdentity,
+    ) -> Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE materialisations SET identity_device = ?3, identity_fs = ?5
+                  WHERE materialisation_id = ?1 AND identity_device = ?2 AND identity_file_id = ?6
+                    AND identity_fs IS ?4",
+                params![
+                    uuid_bytes(materialisation_id.get()),
+                    was.object.device as i64,
+                    now.object.device as i64,
+                    was.filesystem,
+                    now.filesystem,
+                    was.object.file_id as i64,
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        if changed >= 1
+            || self
+                .connection
+                .query_row(
+                    "SELECT identity_device, identity_file_id, identity_fs FROM materialisations
+                      WHERE materialisation_id = ?1",
+                    params![uuid_bytes(materialisation_id.get())],
+                    |row| {
+                        Ok(kr_transfer::RecordedIdentity::from_parts(
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, i64>(1)? as u64,
+                            row.get(2)?,
+                        ))
+                    },
+                )
+                .ok()
+                == Some(now)
+        {
+            Ok(())
+        } else {
+            Err(ChangeSetError::store(
+                "the materialisation's record changed while it was being checked",
+            ))
+        }
     }
 
     /// Marks one materialisation released and replaces the record a caller reads.
@@ -1404,18 +1491,48 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
-    pub fn clone_repository(&self, workspace_id: WorkspaceId) -> Result<Option<String>> {
+    pub fn clone_repository(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<kr_transfer::RecordedIdentity>> {
         self.connection
             .query_row(
-                "SELECT git_dir FROM clone_repositories WHERE workspace_id = ?1",
+                "SELECT git_dir, git_dir_fs FROM clone_repositories WHERE workspace_id = ?1",
                 params![workspace_id.get().as_bytes()],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<kr_transfer::FilesystemId>>(1)?,
+                    ))
+                },
             )
             .optional()
-            .map_err(ChangeSetError::store)
+            .map_err(ChangeSetError::store)?
+            .map(|(numbers, filesystem)| {
+                // The two numbers as the identity writes them, `device:file_id`.
+                let (device, file_id) = numbers
+                    .split_once(':')
+                    .and_then(|(device, file_id)| {
+                        Some((device.parse::<u64>().ok()?, file_id.parse::<u64>().ok()?))
+                    })
+                    .ok_or_else(|| ChangeSetError::StoreUnavailable {
+                        detail: "the record of the repository behind an independent clone does \
+                                 not hold two numbers"
+                            .into(),
+                    })?;
+                Ok(kr_transfer::RecordedIdentity::from_parts(
+                    device, file_id, filesystem,
+                ))
+            })
+            .transpose()
     }
 
-    /// Records the repository behind one independent clone, the first time this host reads it.
+    /// Records the repository behind one independent clone, the first time this host reads it,
+    /// and replaces what an earlier reading recorded by what the repository is now.
+    ///
+    /// A repository found under another device number, or one recorded before filesystems were,
+    /// is the recorded one, and the record takes what it is now. `was` is what the record carries,
+    /// when it carries one the repository is the same as.
     ///
     /// # Errors
     ///
@@ -1423,7 +1540,8 @@ impl Store {
     pub fn record_clone_repository(
         &mut self,
         workspace_id: WorkspaceId,
-        git_dir: &str,
+        git_dir: kr_transfer::RecordedIdentity,
+        was: Option<kr_transfer::RecordedIdentity>,
         now: TimestampMs,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
@@ -1433,11 +1551,31 @@ impl Store {
             transaction
                 .execute(
                     "INSERT OR IGNORE INTO clone_repositories
-                       (workspace_id, git_dir, recorded_at_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![workspace_id.get().as_bytes(), git_dir, now.get() as i64],
+                       (workspace_id, git_dir, git_dir_fs, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        workspace_id.get().as_bytes(),
+                        git_dir.object.to_string(),
+                        git_dir.filesystem,
+                        now.get() as i64
+                    ],
                 )
                 .map_err(ChangeSetError::store)?;
+            if let Some(was) = was {
+                transaction
+                    .execute(
+                        "UPDATE clone_repositories SET git_dir = ?3, git_dir_fs = ?5
+                          WHERE workspace_id = ?1 AND git_dir = ?2 AND git_dir_fs IS ?4",
+                        params![
+                            workspace_id.get().as_bytes(),
+                            was.object.to_string(),
+                            git_dir.object.to_string(),
+                            was.filesystem,
+                            git_dir.filesystem,
+                        ],
+                    )
+                    .map_err(ChangeSetError::store)?;
+            }
             Ok(())
         })
     }
@@ -1927,34 +2065,104 @@ impl Store {
         action_id: ActionId,
         path: &str,
         entry: &str,
-        identity: Option<kr_transfer::ObjectIdentity>,
+        identity: Option<kr_transfer::RecordedIdentity>,
         content: Option<kr_transfer::ObjectIdentity>,
     ) -> Result<()> {
         self.connection
             .execute(
                 "INSERT INTO apply_progress
                    (action_id, path, state, detail, staged_entry, staged_device, staged_file_id,
-                    staged_content_device, staged_content_file_id)
-                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8)
+                    staged_content_device, staged_content_file_id, staged_fs)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (action_id, path) DO UPDATE SET
                    staged_entry = excluded.staged_entry,
                    staged_device = excluded.staged_device,
                    staged_file_id = excluded.staged_file_id,
                    staged_content_device = excluded.staged_content_device,
-                   staged_content_file_id = excluded.staged_content_file_id",
+                   staged_content_file_id = excluded.staged_content_file_id,
+                   staged_fs = excluded.staged_fs",
                 params![
                     uuid_bytes(action_id.get()),
                     path,
                     progress_text(PathProgressState::Planned),
                     entry,
-                    identity.map(|identity| identity.device as i64),
-                    identity.map(|identity| identity.file_id as i64),
+                    identity.map(|identity| identity.object.device as i64),
+                    identity.map(|identity| identity.object.file_id as i64),
                     content.map(|identity| identity.device as i64),
                     content.map(|identity| identity.file_id as i64),
+                    identity.and_then(|identity| identity.filesystem),
                 ],
             )
             .map_err(ChangeSetError::store)?;
         Ok(())
+    }
+
+    /// Replaces the identity a staging directory was recorded under by what the directory has
+    /// now, and moves the file recorded inside it to the same device number, in one statement and
+    /// only while the row still carries the whole of what it replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn settle_staged_path(
+        &self,
+        action_id: ActionId,
+        path: &str,
+        was: kr_transfer::RecordedIdentity,
+        now: kr_transfer::RecordedIdentity,
+    ) -> Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE apply_progress
+                    SET staged_device = ?4, staged_fs = ?6,
+                        staged_content_device = CASE WHEN staged_content_device = ?3
+                                                     THEN ?4 ELSE staged_content_device END
+                  WHERE action_id = ?1 AND path = ?2 AND staged_device = ?3
+                    AND staged_file_id = ?7 AND staged_fs IS ?5",
+                params![
+                    uuid_bytes(action_id.get()),
+                    path,
+                    was.object.device as i64,
+                    now.object.device as i64,
+                    was.filesystem,
+                    now.filesystem,
+                    was.object.file_id as i64,
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        if changed >= 1
+            || self
+                .connection
+                .query_row(
+                    "SELECT staged_device, staged_file_id, staged_fs FROM apply_progress
+                      WHERE action_id = ?1 AND path = ?2",
+                    params![uuid_bytes(action_id.get()), path],
+                    |row| {
+                        row.get::<_, Option<i64>>(0)?
+                            .zip(row.get::<_, Option<i64>>(1)?)
+                            .map(|(device, file_id)| {
+                                row.get(2).map(|filesystem| {
+                                    kr_transfer::RecordedIdentity::from_parts(
+                                        device as u64,
+                                        file_id as u64,
+                                        filesystem,
+                                    )
+                                })
+                            })
+                            .transpose()
+                    },
+                )
+                .ok()
+                .flatten()
+                == Some(now)
+        {
+            Ok(())
+        } else {
+            Err(ChangeSetError::store(
+                "the staged directory's record changed while it was being checked",
+            ))
+        }
     }
 
     /// Forgets the temporary recorded beside one destination path.
@@ -1969,7 +2177,8 @@ impl Store {
         self.connection
             .execute(
                 "UPDATE apply_progress
-                    SET staged_entry = NULL, staged_device = NULL, staged_file_id = NULL
+                    SET staged_entry = NULL, staged_device = NULL, staged_file_id = NULL,
+                        staged_fs = NULL
                   WHERE action_id = ?1 AND path = ?2",
                 params![uuid_bytes(action_id.get()), path],
             )
@@ -1987,7 +2196,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT path, staged_entry, staged_device, staged_file_id,
-                        staged_content_device, staged_content_file_id
+                        staged_content_device, staged_content_file_id, staged_fs
                    FROM apply_progress
                   WHERE action_id = ?1 AND staged_entry IS NOT NULL ORDER BY path",
             )
@@ -2003,10 +2212,13 @@ impl Store {
                     }),
                     _ => None,
                 };
+                let directory = whole(row.get(2)?, row.get(3)?);
+                let filesystem: Option<kr_transfer::FilesystemId> = row.get(6)?;
                 Ok(StagedPath {
                     path: row.get(0)?,
                     entry: row.get(1)?,
-                    identity: whole(row.get(2)?, row.get(3)?),
+                    identity: directory
+                        .map(|object| kr_transfer::RecordedIdentity { object, filesystem }),
                     content: whole(row.get(4)?, row.get(5)?),
                 })
             })
@@ -2689,10 +2901,11 @@ mod tests {
                     purpose: MaterialisationPurpose::Test,
                     record: vec![7],
                     directory_name: "m-nothing-admits".to_owned(),
-                    identity: kr_transfer::ObjectIdentity {
-                        device: 1,
-                        file_id: 2,
-                    },
+                    identity: kr_transfer::RecordedIdentity::from_parts(
+                        1,
+                        2,
+                        Some(kr_transfer::FilesystemId::from_u64(7)),
+                    ),
                     created_at_ms: TimestampMs::new(3),
                     released_at_ms: None,
                 },
@@ -2781,6 +2994,113 @@ mod tests {
             store.insert_version(&row, &[], None).is_err(),
             "a second write of the same version is refused by the key"
         );
+    }
+
+    #[test]
+    fn a_settlement_moves_a_staged_directory_and_its_file_together_and_only_from_the_record_it_names()
+     {
+        let mut store = store();
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let change_set_id = change_set(&mut store);
+        store
+            .insert_version(&version_row(change_set_id, 1), &[], None)
+            .expect("a version");
+        store
+            .begin_apply(
+                &ApplyRow {
+                    action_id,
+                    change_set_id,
+                    version: ChangeSetVersion::new(1),
+                    workspace_id: None,
+                    destination: DestinationClass::SharedExisting,
+                    outcome: None,
+                    before_version: None,
+                    after_version: None,
+                    staged_name: None,
+                    detail: "beginning".to_owned(),
+                    started_at_ms: TimestampMs::new(1),
+                    decided_at_ms: None,
+                },
+                &["a.txt".to_owned(), "b.txt".to_owned()],
+                None,
+            )
+            .expect("the apply begins");
+        let filesystem = Some(kr_transfer::FilesystemId::from_u64(7));
+        let was = kr_transfer::RecordedIdentity::from_parts(1, 2, filesystem);
+        let content = kr_transfer::ObjectIdentity {
+            device: 1,
+            file_id: 3,
+        };
+        // The second path's file is on another device than its directory.
+        let elsewhere = kr_transfer::ObjectIdentity {
+            device: 5,
+            file_id: 3,
+        };
+        store
+            .stage_path(action_id, "a.txt", ".kr-apply-x", Some(was), Some(content))
+            .expect("the staged directory and its file are recorded");
+        store
+            .stage_path(
+                action_id,
+                "b.txt",
+                ".kr-apply-y",
+                Some(was),
+                Some(elsewhere),
+            )
+            .expect("the second staged directory and its file are recorded");
+        let now = kr_transfer::RecordedIdentity::from_parts(9, 2, filesystem);
+        let held = |store: &Store, path: &str| {
+            store
+                .staged_paths(action_id)
+                .expect("a read")
+                .into_iter()
+                .find(|row| row.path == path)
+                .expect("the path is staged")
+        };
+
+        // A settlement made against another record than the one the journal holds changes nothing
+        // and is refused, so that what would follow it, a removal, does not: another inode,
+        // another device number, another filesystem.
+        for other in [
+            kr_transfer::RecordedIdentity::from_parts(1, 5, filesystem),
+            kr_transfer::RecordedIdentity::from_parts(4, 2, filesystem),
+            kr_transfer::RecordedIdentity::from_parts(
+                1,
+                2,
+                Some(kr_transfer::FilesystemId::from_u64(8)),
+            ),
+        ] {
+            store
+                .settle_staged_path(action_id, "a.txt", other, now)
+                .expect_err("the record is neither what this replaces nor what it becomes");
+            let row = held(&store, "a.txt");
+            assert_eq!(row.identity, Some(was), "{other:?}");
+            assert_eq!(row.content, Some(content), "{other:?}");
+        }
+
+        // Made against it, it moves the directory and the file inside it to the new number, and
+        // moves no other path's.
+        store
+            .settle_staged_path(action_id, "a.txt", was, now)
+            .expect("a write");
+        let row = held(&store, "a.txt");
+        assert_eq!(row.identity, Some(now));
+        assert_eq!(
+            row.content,
+            Some(kr_transfer::ObjectIdentity {
+                device: 9,
+                file_id: 3
+            })
+        );
+        assert_eq!(held(&store, "b.txt").identity, Some(was));
+
+        // A file that was recorded on another device than its directory stays recorded there.
+        store
+            .settle_staged_path(action_id, "b.txt", was, now)
+            .expect("a write");
+        let row = held(&store, "b.txt");
+        assert_eq!(row.identity, Some(now));
+        assert_eq!(row.content, Some(elsewhere));
     }
 
     #[test]
@@ -2874,10 +3194,11 @@ mod tests {
                     purpose: MaterialisationPurpose::Test,
                     record: vec![7],
                     directory_name: "m-1".to_owned(),
-                    identity: kr_transfer::ObjectIdentity {
-                        device: 1,
-                        file_id: 2,
-                    },
+                    identity: kr_transfer::RecordedIdentity::from_parts(
+                        1,
+                        2,
+                        Some(kr_transfer::FilesystemId::from_u64(7)),
+                    ),
                     created_at_ms: TimestampMs::new(11),
                     released_at_ms: None,
                 },

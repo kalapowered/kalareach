@@ -742,6 +742,58 @@ pub(crate) fn final_path(handle: BorrowedHandle<'_>) -> std::io::Result<std::pat
     }
 }
 
+/// What the id query says about one open handle.
+pub(crate) struct FileId {
+    /// The serial number of the volume the handle is on, 64 bits.
+    pub(crate) volume: u64,
+    /// The object's own 128-bit id, which is wider than the 64-bit file index the device number
+    /// and inode pair holds: a volume whose ids need more than 64 bits is told apart by it.
+    pub(crate) id: [u8; 16],
+}
+
+/// Asks a handle for its 128-bit file id and the 64-bit serial number of its volume.
+///
+/// The device number of an object holds a 32-bit serial number and its inode a 64-bit file index.
+/// This query is the one that carries the whole of both. It answers on NTFS and ReFS and refuses
+/// on a volume with no such ids.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the volume gives no id for the handle.
+pub(crate) fn file_id(handle: BorrowedHandle<'_>) -> std::io::Result<FileId> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    // SAFETY: all zeroes is a structure of integers.
+    let mut information: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed for the whole call, and the structure is a local of the size
+    // told.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileIdInfo,
+            std::ptr::from_mut(&mut information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).unwrap_or(0),
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileId {
+        volume: information.VolumeSerialNumber,
+        id: information.FileId.Identifier,
+    })
+}
+
+/// Says whether an error from [`file_id`] is the volume's answer that it keeps no such ids, which
+/// is a fact about the volume, rather than a failure that may pass.
+pub(crate) fn gives_no_file_id(error: &std::io::Error) -> bool {
+    // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED and ERROR_INVALID_PARAMETER, which is what a
+    // volume without 128-bit ids answers the query with.
+    matches!(error.raw_os_error(), Some(1 | 50 | 87))
+}
+
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::Security::ACL;
@@ -764,6 +816,29 @@ mod tests {
     /// entry; it is the list it is put in that says where it came from.
     fn from_the_directory_above() -> AclEntry {
         AclEntry::new(0, 0, 0x0012_0089, everyone())
+    }
+
+    /// The volume the temporary directory is on answers the id query with a serial number and the
+    /// directory's own id, and two directories on it have two ids.
+    #[test]
+    fn a_volume_answers_the_id_query_with_its_serial_number_and_the_directory_with_its_id() {
+        use std::os::windows::io::AsHandle as _;
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir(root.path().join("below")).expect("a second directory");
+        let open = |path: &std::path::Path| {
+            cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+                .expect("opens the directory")
+        };
+        let above = open(root.path());
+        let below = open(&root.path().join("below"));
+        let first = super::file_id(above.as_handle())
+            .expect("the volume the temporary directory is on answers the id query");
+        let second =
+            super::file_id(below.as_handle()).expect("and answers it for another directory");
+        assert_ne!(first.volume, 0);
+        assert_eq!(first.volume, second.volume);
+        assert_ne!(first.id, second.id);
     }
 
     #[test]
