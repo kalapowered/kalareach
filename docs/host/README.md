@@ -421,7 +421,7 @@ admissions leave out is reported only where the list names it, and where the adm
 computed each listed package is reported as `unknown`. An integration a new session would be
 launched without for its size is reported as `too_large`. One answer carries at most 256 reports
 and 384 KiB of them, the listed packages first, and the check counts any it leaves out. A session
-whose own search path differs can find another; each launch records the one it ran.
+whose own search path differs can find another; a launch the host records names the one it ran.
 
 `agents` records the choice of a reduced-ownership profile for one agent, by package
 (`publisher/plugin`). An entry names `ownership`, as `reduced` or `full`, and nothing else. A
@@ -429,12 +429,14 @@ package with no entry has full ownership, and a document this host cannot use ch
 document is refused if a key is not a `publisher/plugin` identifier, if an ownership is neither
 `full` nor `reduced`, if an entry names anything besides `ownership`, or if it names more than 64
 packages, so a malformed key is never read as no choice. `kr doctor` reports the choice as the value
-`agents.ownership` and prints one line for each package the document chooses `reduced` for: `reduced
-ownership; a launch is tracked by start identity and its closure never reads complete; the command
-route does not apply it`. An export carries the package names by their class and length. The
-worker's launch runs an agent under the `ownership` its profile records and does not read this
-document, and this host starts no agent through that launch, so no edit to this section changes a
-launch on this host.
+`agents.ownership`, whose effect it gives as applying to nothing, and prints one line for each
+package the document chooses `reduced` for: `reduced ownership is recorded and no launch on this
+host reads it; on Windows a launch whose profile records reduced is tracked by start identity and
+its closure never reads complete, and the command route has no such profile`. An export carries the
+package names by their class and length. The worker's launch runs an agent under the `ownership` its
+profile records and does not read this document, every profile this host writes records `full`, and
+this host starts no agent through that launch, so no edit to this section changes a launch on this
+host.
 
 `environment_additions` is the preference that adds variables to a session started with the host's
 environment, described under *The environment a session starts with*.
@@ -4823,13 +4825,13 @@ argument vector, what is known about authentication, and the integration mode. I
 the launch, so a refused launch still leaves a record of what was going to be run.
 
 A profile also records how completely the session's closure accounts for what the launch starts, as
-`ownership`: `full` or `reduced`, as the launch's creator set it. Every profile this host writes
-records `full`, and no edit to the `agents` section changes that (see *A vendor's own sandbox*). It
-records `vendor_mode` too: the word the application's own package read for the mode the application
-runs in, exactly as the application printed it, or null. A ledger an earlier build wrote holds
-profiles without the two fields. The first open by this build records each as `full` and null, in
-one transaction with the schema version (7 to 8), and a ledger with a row it cannot read is left as
-it was.
+`ownership`: `full` or `reduced`. The worker's launch runs the agent under the ownership its profile
+records and takes it from nowhere else. Every profile this host writes records `full`, and no edit
+to the `agents` section changes that (see *A vendor's own sandbox*). It records `vendor_mode` too:
+the word the application's own package read for the mode the application runs in, exactly as the
+application printed it, or null. A ledger an earlier build wrote holds profiles without the two
+fields. The first open by this build records each as `full` and null, in one transaction with the
+schema version (7 to 8), and a ledger with a row it cannot read is left as it was.
 
 A launch intent is prepared against the idle root shell and executed against it. If an application
 has taken the foreground, or the prompt has moved, the launch is refused, and refusing is the
@@ -4860,7 +4862,8 @@ the mode is. The owner confirms the capability `launch.probe` on every release, 
 runs the application's executable with arguments the package chose. Codex 0.155.1 prints `disabled`
 where no Windows sandbox is set, `elevated` for its elevated sandbox and `<redacted>` for its
 unelevated one, and a package for it reads that word at `/checks/sandbox.helpers/details/sandbox
-backend` of `codex doctor --json`. The host records the word as printed and interprets nothing.
+backend` of `codex doctor --json`. The host reports the word as printed and the worker's launch
+records it in the launch's profile; neither interprets it.
 
 The worker's launch runs the probe before it reserves anything, in the launch's own environment
 and directory, with no input and no shell. The probe has five seconds and may print 256
@@ -4877,13 +4880,15 @@ the modes its application cannot run with in a Windows service session, the sess
 when no person is signed in. A launch there whose mode is listed fails by name before anything
 starts, where it would otherwise hang.
 
-This host starts no agent through the worker's launch, so on it only `kr doctor` runs a probe.
-`kr doctor` runs the same declaration for the executable the daemon's own search path names for each
-granted package. It runs in the daemon's environment, which a launch's may differ from, and prints
-the word it read and where it read it from, or why it read none. A package whose installation does
-not hold `launch.probe` is reported as not run. A launch through the command route records no mode:
-the worker is not given the shell's environment, and that environment decides which configuration
-the application reads.
+This host starts no agent through the worker's launch, so on it only the diagnostics read,
+`host.doctor`, runs a probe. `kr doctor` makes that read. So do `kr plugin integration enable` and
+`disable`, and a paired device may. The read runs the same declaration for the executable the
+daemon's own search path names for each granted package. It runs in the daemon's environment, which
+a launch's may differ from, and `kr doctor` prints the word it read and where it read it from, or
+that it read none, with the class and length of the reason. A package whose installation does not
+hold `launch.probe` is reported as not run. A launch through the command route records no mode: the
+worker is not given the shell's environment, and that environment decides which configuration the
+application reads.
 
 ### What a native exit ends
 
@@ -5217,18 +5222,19 @@ transport back, closes the connection and withdraws the subscription. It stops n
 terminal's: what the terminal does is the terminal's own supervision's, and that is still running
 when the connection has gone.
 
-Launching is the other half of the same composition. It first asks everything that can refuse
-without starting anything: whether this platform can publish the credential file, whether the
-runtime directory is the owner's alone, whether a private exchange can be drawn, and whether the
+Launching is the other half of the same composition, though this host starts no agent through it: an
+agent starts from the managed shell (see *Launch profiles*). The launch first asks everything that
+can refuse without starting anything: whether this platform can publish the credential file, whether
+the runtime directory is the owner's alone, whether a private exchange can be drawn, and whether the
 launch intent still holds against the foreground it was prepared against. Only then does it start
-the executable the profile names, with the registration and credential paths in its environment and
-nothing secret in its arguments, read back from the kernel what it started, write the owner-only
-credential file, register the instance against that record, and write the registration file last, so
-a forwarder that reads it reads a complete one and the credential it names already exists. A launch
-that fails after the start leaves nothing running and nothing reserved: the process is ended and
-waited for before the launch returns, the credential file it wrote is removed, and the broker gives
-back the instance and the conversation the launch took, so a retry is not refused for a launch that
-never happened.
+the executable the profile names, with the registration path, which names the credential file, in
+its environment and nothing secret in its arguments, read back from the kernel what it started,
+write the owner-only credential file, register the instance against that record, and write the
+registration file last, so a forwarder that reads it reads a complete one and the credential it
+names already exists. A launch that fails after the start leaves nothing running and nothing
+reserved: the process is ended and waited for before the launch returns, the credential file it
+wrote is removed, and the broker gives back the instance and the conversation the launch took, so a
+retry is not refused for a launch that never happened.
 
 On Windows the spawned programs must be `.exe` or `.com`: a batch file, a PowerShell script or a
 script that a runtime runs is refused by name, because the process that would start is the
