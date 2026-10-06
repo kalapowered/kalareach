@@ -91,6 +91,15 @@ impl Links {
         }
     }
 
+    /// Whether one session's facts are being read. For this crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn reads(&self, session_id: SessionId) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&session_id)
+    }
+
     /// Stops reading one session's facts.
     pub(crate) fn stop(&self, session_id: SessionId) {
         let task = self

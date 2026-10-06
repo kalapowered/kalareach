@@ -2350,6 +2350,50 @@ impl Registry {
         Ok(())
     }
 
+    /// Removes the worker row of every session that has a closure, and returns those sessions.
+    ///
+    /// [`Self::record_closure`] removes a session's row with the record, so a row beside a closure
+    /// was written after it: the recovery of an earlier build wrote a row for a worker it reached
+    /// once its session had closed. Nothing writes one now, and a daemon that starts calls this
+    /// before it reads any row, so what it restores and seeds never includes the worker of a closed
+    /// session. Once no daemon of that earlier build is left to run against a registry, this and
+    /// its call are to be removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn forget_workers_of_closed_sessions(&mut self) -> Result<Vec<SessionId>> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ControllerError::registry)?;
+        let forgotten = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT session_id FROM workers
+                     WHERE session_id IN (SELECT session_id FROM tombstones)",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(ControllerError::registry)?;
+            let mut forgotten = Vec::new();
+            for row in rows {
+                let session = row.map_err(ControllerError::registry)?;
+                forgotten.push(SessionId::new(uuid_from(&session)?));
+            }
+            forgotten
+        };
+        transaction
+            .execute(
+                "DELETE FROM workers WHERE session_id IN (SELECT session_id FROM tombstones)",
+                [],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(forgotten)
+    }
+
     /// Reads the closure record of a session that has closed.
     ///
     /// # Errors

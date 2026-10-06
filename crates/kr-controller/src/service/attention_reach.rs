@@ -70,10 +70,33 @@ impl Controller {
         Arc::new(AttentionReach(self.me.clone()))
     }
 
-    /// Starts the attention store's reading of every session it has to read.
-    pub(super) async fn start_attention(self: &Arc<Self>) {
+    /// Starts the attention store's reading of every session it has to read, and its own work.
+    pub(super) async fn start_attention(self: &Arc<Self>) -> Result<()> {
+        self.watch_open_sessions().await?;
+        // The environment's own source: the workflow journal's attention records, taken up where
+        // the store and the journal left off before the timers run.
+        self.attention
+            .consume_automation(Arc::clone(self.automation.journal()))
+            .await;
+        self.attention.maintain(self.attention_reach());
+        Ok(())
+    }
+
+    /// Starts the attention store's reading of every session it has to read: the live ones over
+    /// their workers, and the ones whose closure an earlier daemon recorded and which the store has
+    /// not finished yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(super) async fn watch_open_sessions(self: &Arc<Self>) -> Result<()> {
         let reach = self.attention_reach();
-        let live: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        // In one section under the registry's lock, as a worker is made known (`publish_worker`):
+        // a closure recorded after this section has the worker's tidying still to run, and the
+        // tidying stops what this starts, and one recorded before it is found here and the store
+        // does not read the session at a worker.
+        let registry = self.registry.lock().await;
+        let live = self.workers_without_a_closure(&registry).await?;
         let live_sessions: std::collections::BTreeSet<SessionId> = live
             .iter()
             .map(|worker| worker.descriptor.session_id)
@@ -88,8 +111,7 @@ impl Controller {
             if live_sessions.contains(&session_id) {
                 continue;
             }
-            let closed = matches!(self.registry.lock().await.closure(session_id), Ok(Some(_)));
-            if closed {
+            if registry.closure(session_id)?.is_some() {
                 let module = Arc::clone(&self.attention);
                 let reach = Arc::clone(&reach);
                 tokio::spawn(async move {
@@ -97,12 +119,8 @@ impl Controller {
                 });
             }
         }
-        // The environment's own source: the workflow journal's attention records, taken up where
-        // the store and the journal left off before the timers run.
-        self.attention
-            .consume_automation(Arc::clone(self.automation.journal()))
-            .await;
-        self.attention.maintain(reach);
+        drop(registry);
+        Ok(())
     }
 }
 

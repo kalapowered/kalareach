@@ -100,7 +100,7 @@ async fn a_session_with_a_closure_is_not_bound() {
 
 /// Polls a future once and says it is waiting: for a test that wants two futures queued for one lock
 /// in a known order, with nothing waited for but the lock.
-async fn parked<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>, what: &str) {
+pub(super) async fn parked<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>, what: &str) {
     let polled = std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await;
     assert!(polled.is_pending(), "{what} waits for the registry");
 }
@@ -385,7 +385,7 @@ async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
 /// What the daemon holds of the session's worker: its entry in the directory, its slot in the
 /// connection table, its place in the set the plugin admissions wait for, and its published
 /// descriptor. The locks are taken, so the answer is never that something could not be read.
-async fn held_by_the_daemon(world: &Served) -> [bool; 4] {
+pub(super) async fn held_by_the_daemon(world: &Served) -> [bool; 4] {
     let in_the_directory = world
         .controller
         .directory

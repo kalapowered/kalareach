@@ -2289,6 +2289,12 @@ impl AttentionModule {
             .collect()
     }
 
+    /// Whether the store is reading a session's sources at its worker. For this crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn watching(&self, session_id: SessionId) -> bool {
+        self.origins().watched.contains(&session_id)
+    }
+
     // ----- The workflow journal's alerts ----------------------------------------------------
 
     /// Reads the workflow journal's attention records for as long as the module is held: one pass

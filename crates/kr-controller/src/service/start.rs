@@ -62,7 +62,11 @@ impl Controller {
     ///
     /// A host that cannot start leaves the daemon serving pins and deterministic titles, as one
     /// without descriptions does: descriptions are never what stops a daemon.
-    pub(crate) async fn start_descriptions(self: &std::sync::Arc<Self>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn start_descriptions(self: &std::sync::Arc<Self>) -> Result<()> {
         let settings = self.description_settings();
         self.descriptions.note_start_settings(&settings);
         let state_dir = self.paths.state_dir().to_path_buf();
@@ -99,18 +103,32 @@ impl Controller {
             Ok(Ok(host)) => host,
             Ok(Err(error)) => {
                 eprintln!("kr-controller: descriptions are not generated on this host: {error}");
-                return;
+                return Ok(());
             }
-            Err(_) => return,
+            Err(_) => return Ok(()),
         };
         if self.descriptions.set_host(host).is_err() {
-            return;
+            return Ok(());
         }
-        let workers: Vec<crate::directory::KnownWorker> =
-            self.directory.lock().await.iter().cloned().collect();
-        for worker in workers {
+        self.describe_open_workers().await
+    }
+
+    /// Starts tracking every session the directory holds, and reading its facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn describe_open_workers(&self) -> Result<()> {
+        // In one section under the registry's lock, as a worker is made known (`publish_worker`):
+        // a closure recorded after this section has the worker's tidying still to run, and the
+        // tidying stops what this starts, and one recorded before it is found here and nothing is
+        // started for its session.
+        let registry = self.registry.lock().await;
+        for worker in self.workers_without_a_closure(&registry).await? {
             self.describe_worker(&worker);
         }
+        drop(registry);
+        Ok(())
     }
 
     /// Starts tracking one session the directory holds, and reading its facts.
@@ -687,7 +705,18 @@ impl Controller {
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
         // advanced to, because that is what fences the daemon it replaced.
         let directory = {
-            let registry = controller.registry.lock().await;
+            let mut registry = controller.registry.lock().await;
+            // A session with a closure has no worker to restore. A row an earlier build's recovery
+            // wrote beside one is removed, with the descriptor it would have been restored from,
+            // before anything reads the rows.
+            for session_id in registry.forget_workers_of_closed_sessions()? {
+                if let Err(error) = kr_ipc::descriptor::retire(&controller.paths, session_id) {
+                    eprintln!(
+                        "kr-controller: the descriptor of the closed session {session_id} could \
+                         not be removed: {error}"
+                    );
+                }
+            }
             Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
         };
         *controller.directory.lock().await = directory;
@@ -763,9 +792,9 @@ impl Controller {
         controller.start_voice();
         // Every session the attention store reads: the live ones over their workers, and the ones
         // whose closure an earlier daemon recorded and which the store has not finished yet.
-        controller.start_attention().await;
+        controller.start_attention().await?;
         // And every session's facts for the descriptions, over the workers the directory holds.
-        controller.start_descriptions().await;
+        controller.start_descriptions().await?;
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
