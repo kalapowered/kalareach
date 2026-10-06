@@ -522,6 +522,51 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
     assert!(report.workers.is_empty(), "{report:?}");
 }
 
+/// KR-REQ-09.12: a worker's descriptor is written while the registry is held by another operation,
+/// as a closure's section holds it, so the write, which waits for the disk, is not spent holding
+/// every admitted request back; and where the closure lands in the meantime, the publication finds
+/// it and takes the descriptor away again, so nothing is left of the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_is_written_without_the_registry_and_taken_away_when_a_closure_lands() {
+    let world = Served::recorded().await;
+    world
+        .controller
+        .directory
+        .lock()
+        .await
+        .remove(world.session_id);
+    let mut registry = world.controller.registry.lock().await;
+    let publishing = tokio::spawn({
+        let controller = std::sync::Arc::clone(&world.controller);
+        let worker = world.worker.clone();
+        async move { controller.publish_worker(worker, None).await }
+    });
+    let written = tokio::time::timeout(WAIT, async {
+        while kr_ipc::descriptor::read(world.controller.paths(), world.session_id)
+            .expect("the descriptor directory reads")
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        written.is_ok(),
+        "the descriptor is written while the registry is held"
+    );
+
+    registry
+        .record_closure(&closure_of(world.session_id))
+        .expect("the closure is recorded");
+    world.controller.leases.worker_ended(world.session_id);
+    drop(registry);
+    publishing
+        .await
+        .expect("the publication's task ends")
+        .expect("a publication that finds the closure has nothing to do");
+    assert_eq!(held_by_the_daemon(&world).await, [false; 4]);
+}
+
 /// No connection is opened to a worker whose session has closed, by a caller that took the worker
 /// from the directory before the closure and asks for its connection after it: the caller is told
 /// the session is unknown and the connection table holds nothing for it. The control is the same

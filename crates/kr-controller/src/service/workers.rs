@@ -127,13 +127,19 @@ impl Controller {
     /// has closed.
     ///
     /// The one place a running daemon makes a worker known (a start restores the workers it finds
-    /// from the registry's rows and the descriptors on disk), and it is done in a section that
-    /// holds the registry's lock and has found no closure. That is the lock a closure is recorded
-    /// under, and the closure's own tidying takes the worker out of all of this after it, so a
-    /// worker is either made known before its closure and removed by it, or the closure is seen
-    /// here and nothing is made: a closure that lands between a worker's row being written and its
-    /// publication cannot leave a closed session's worker in the directory, on the disk or in the
-    /// admissions' set for as long as the daemon runs.
+    /// from the registry's rows and the descriptors on disk), and what this daemon holds of it is
+    /// made in a section that holds the registry's lock and has found no closure. That is the lock
+    /// a closure is recorded under, and the closure's own tidying takes the worker out of all of
+    /// this after it, so a worker is either made known before its closure and removed by it, or the
+    /// closure is seen here and nothing is made: a closure that lands between a worker's row being
+    /// written and its publication cannot leave a closed session's worker in the directory, on the
+    /// disk or in the admissions' set for as long as the daemon runs.
+    ///
+    /// The descriptor is written before that section, not in it. The write is a durable one that
+    /// waits for the disk, and where a rename is refused for a moment it is tried again for seconds,
+    /// while every request that is admitted waits for the registry's lock. A closure that lands
+    /// while it is written has its own tidying remove a descriptor that may not yet be there, so the
+    /// section that finds the closure removes it again.
     ///
     /// # Errors
     ///
@@ -143,11 +149,14 @@ impl Controller {
         worker: KnownWorker,
         described: Option<SessionSummary>,
     ) -> Result<()> {
+        let session_id = worker.descriptor.session_id;
+        kr_ipc::descriptor::publish(&self.paths, &worker.descriptor)?;
         let registry = self.registry.lock().await;
-        if registry.closure(worker.descriptor.session_id)?.is_some() {
+        if registry.closure(session_id)?.is_some() {
+            drop(registry);
+            kr_ipc::descriptor::retire(&self.paths, session_id)?;
             return Ok(());
         }
-        kr_ipc::descriptor::publish(&self.paths, &worker.descriptor)?;
         // A recorded or adopted worker answers rounds of plugin admissions on its own endpoint from
         // here on, and is sent one at once.
         self.plugin_bridge.recorded(
