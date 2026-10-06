@@ -188,7 +188,7 @@ impl Controller {
         self.before_a_worker_is_made_known.wait().await;
         // Whether it was written is looked at once the closure has been: a write that fails after
         // the file has its name (the directory's flush) leaves a descriptor all the same.
-        let published = kr_ipc::descriptor::publish(&self.paths, &worker.descriptor);
+        let published = self.write_descriptor(&worker).await;
         #[cfg(test)]
         if self.stops_at(super::StopPoint::AfterADescriptorIsWritten) {
             return Err(Self::stopped(super::StopPoint::AfterADescriptorIsWritten));
@@ -217,6 +217,20 @@ impl Controller {
         self.admissions_due();
         drop(registry);
         Ok(())
+    }
+
+    /// Writes a worker's descriptor, on a thread that may block: the write waits for the disk twice
+    /// and, where a rename is refused for a moment, tries again for seconds, which a thread that
+    /// serves every other client of this daemon must not spend.
+    async fn write_descriptor(&self, worker: &KnownWorker) -> Result<()> {
+        let paths = self.paths.clone();
+        let descriptor = worker.descriptor.clone();
+        tokio::task::spawn_blocking(move || kr_ipc::descriptor::publish(&paths, &descriptor))
+            .await
+            .map_err(|_| {
+                ControllerError::supervision("the thread that writes a descriptor did not finish")
+            })?
+            .map_err(ControllerError::from)
     }
 
     /// Removes a session's published descriptor, which a closed session has none of.
