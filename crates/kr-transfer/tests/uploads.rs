@@ -2193,6 +2193,137 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
     );
 }
 
+/// KR-REQ-14.11: an attachment a noted session names stays while that session is retained even
+/// when a prompt this host knows of later submits it to another session, which follows its own
+/// retention too. The draft an earlier worker may have been sent holds the attachment beside one
+/// that belongs to the noted session; the same attachment is then bound to a draft for another
+/// session and that draft is recorded as sent.
+#[test]
+fn an_attachment_a_noted_session_names_outlasts_a_later_submission_to_another_session() {
+    struct RetainsOnly(std::collections::BTreeSet<SessionId>);
+    impl kr_transfer::SessionRetention for RetainsOnly {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(sessions.intersection(&self.0).copied().collect())
+        }
+    }
+
+    let harness = Harness::create();
+    let noted = SessionId::new(Uuid::from_bytes([33; 16]));
+    let later = SessionId::new(Uuid::from_bytes([34; 16]));
+    let publish = |name: &str, for_session: Option<SessionId>| {
+        let bytes = pattern(32);
+        let begun = harness
+            .begin_for(
+                &bytes,
+                "application/octet-stream",
+                name,
+                Nullable(for_session),
+            )
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle
+    };
+    let draft_for = |session: Option<SessionId>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable(session),
+                    application_instance_id: Nullable::null(),
+                    text: "look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let bind = |draft: &kr_protocol::transfer::DraftRecord,
+                handle: &kr_protocol::transfer::AttachmentHandle| {
+        let revision = harness
+            .service
+            .draft(&harness.actor, draft.draft_id)
+            .expect("reads the draft")
+            .revision;
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(handle),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+    };
+    let there = |transfer_id: TransferId| {
+        harness
+            .service
+            .attachment_handle(&harness.actor, transfer_id)
+            .is_ok()
+    };
+
+    let (named, shared) = (
+        publish("named.bin", Some(noted)),
+        publish("shared.bin", None),
+    );
+    let unnamed_draft = draft_for(None);
+    bind(&unnamed_draft, &shared);
+    bind(&unnamed_draft, &named);
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([noted]))
+        .expect("notes the session");
+    // The shared attachment is bound to a draft for another session, which is then sent.
+    let later_draft = draft_for(Some(later));
+    bind(&later_draft, &shared);
+    harness
+        .service
+        .record_prompt(
+            &harness.actor,
+            later_draft.draft_id,
+            later,
+            &Admission::none(),
+        )
+        .expect("records the prompt");
+    assert!(
+        harness
+            .service
+            .attachment_handle(&harness.actor, shared.transfer_id)
+            .expect("reads the handle")
+            .submitted,
+        "the later session holds it now"
+    );
+
+    harness
+        .clock
+        .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
+    let retained = RetainsOnly(std::collections::BTreeSet::from([noted]));
+    let sweep = harness.service.sweep(&retained).expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 0,
+        "the noted session is retained, and it names both"
+    );
+    assert!(there(shared.transfer_id) && there(named.transfer_id));
+
+    let none = RetainsOnly(std::collections::BTreeSet::new());
+    let sweep = harness.service.sweep(&none).expect("runs a sweep");
+    assert_eq!(sweep.expired_attachments, 2, "neither session is retained");
+}
+
 fn contribution(
     handle: &kr_protocol::transfer::AttachmentHandle,
 ) -> kr_protocol::transfer::AttachmentContribution {

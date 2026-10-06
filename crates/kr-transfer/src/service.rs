@@ -2343,7 +2343,9 @@ impl TransferService {
     /// journal, which are the sessions of earlier builds, and notes nothing after.
     ///
     /// Remove this, with the journal's two tables and the sweep's reading of them, once no worker of
-    /// a build before the one that serves draft prompts only to the daemon can still be running.
+    /// a build before the one that serves draft prompts only to the daemon can still be running and
+    /// no session noted here is still retained, since what an earlier worker was sent stays with
+    /// its session for as long as the session does.
     ///
     /// # Errors
     ///
@@ -2665,12 +2667,12 @@ impl TransferService {
             .filter(|row| row.submitted_at_ms.is_some())
             .filter_map(|row| row.session_id)
             .collect();
-        // An attachment that no prompt this host knows of has submitted is still the session's to
-        // keep when a session whose prompts the host does not see names it: the host asks about
-        // those sessions too.
+        // An attachment that a session whose prompts the host does not see names is that session's
+        // to keep, whether or not a prompt this host knows of has submitted it to another session
+        // since: the host asks about those sessions too.
         if !unseen.is_empty() {
             let store = self.locked()?;
-            for row in published.iter().filter(|row| row.submitted_at_ms.is_none()) {
+            for row in &published {
                 asked.extend(store.sessions_shielding(row.transfer_id, &unseen)?);
             }
         }
@@ -2714,35 +2716,27 @@ impl TransferService {
             }
             // Two retentions, and which one applies is which of them the attachment is under.
             // A submitted attachment follows its session, whatever its own unused-attachment
-            // deadline says; an unsubmitted one follows that deadline.
+            // deadline says; an unsubmitted one follows that deadline. A session whose prompts the
+            // host does not see that names the attachment, by a relation read here, only ever adds
+            // a reason to keep it: it goes when none of those sessions is retained as well.
+            let shielding = if unseen.is_empty() {
+                BTreeSet::new()
+            } else {
+                store.sessions_shielding(row.transfer_id, &unseen)?
+            };
+            // Judged by the answer only when the question named the sessions: one named after the
+            // question was asked is for a session the answer cannot speak for, and is left for the
+            // next sweep.
+            if !shielding.is_subset(&asked) {
+                continue;
+            }
             let expired = match (row.submitted_at_ms, row.session_id) {
-                // Judged by the answer only when the question named its session: an attachment
-                // submitted after the question was asked is for a session the answer cannot speak
-                // for, and is left for the next sweep.
                 (Some(_), Some(session_id)) if !asked.contains(&session_id) => continue,
                 (Some(_), Some(session_id)) => !retained.contains(&session_id),
-                (Some(_), None) => row.expires_at_ms.get() <= now.get(),
-                (None, _) => {
-                    let shielding = if unseen.is_empty() {
-                        BTreeSet::new()
-                    } else {
-                        store.sessions_shielding(row.transfer_id, &unseen)?
-                    };
-                    if shielding.is_empty() {
-                        row.expires_at_ms.get() <= now.get()
-                    } else if !shielding.is_subset(&asked) {
-                        // Named by a session after the question was asked, as a submission is.
-                        continue;
-                    } else {
-                        // Kept while any session that names it is retained, as a submitted one is,
-                        // and not before its own window has run out.
-                        row.expires_at_ms.get() <= now.get()
-                            && shielding
-                                .iter()
-                                .all(|session_id| !retained.contains(session_id))
-                    }
-                }
-            };
+                (Some(_), None) | (None, _) => row.expires_at_ms.get() <= now.get(),
+            } && shielding
+                .iter()
+                .all(|session_id| !retained.contains(session_id));
             if !expired {
                 continue;
             }
