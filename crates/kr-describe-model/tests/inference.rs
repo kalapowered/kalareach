@@ -250,6 +250,147 @@ fn the_description_process_runs_the_real_model() {
     );
 }
 
+/// Opens a session whose every field and every recent event is at the bound the product admits,
+/// in the script of `base`, and settles it into a queued job.
+fn queue_largest(service: &mut DescriptionService, session_id: SessionId, base: &str) {
+    use kr_describe::context::{MAX_RECENT_EVENTS, SemanticEventKind};
+    use kr_describe_model::fixtures::{LARGE_CURSOR, event, field_of, repository};
+
+    service.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("tests"));
+    let start = Reading::new(0, 0);
+    service.observe(
+        &session_id,
+        ContextSignal::WorkingDirectory {
+            directory: field_of(base, 0),
+            repository: Some(repository(&field_of(base, 7), &field_of(base, 13))),
+        },
+        start,
+    );
+    service.observe(
+        &session_id,
+        ContextSignal::ForegroundApplication(Some(field_of(base, 19))),
+        start,
+    );
+    service.observe(
+        &session_id,
+        ContextSignal::SelectedThread(Some(field_of(base, 29))),
+        start,
+    );
+    service.observe(
+        &session_id,
+        ContextSignal::TaskIntent(field_of(base, 37)),
+        start,
+    );
+    for index in 0..MAX_RECENT_EVENTS {
+        service.note_event(
+            &session_id,
+            event(
+                LARGE_CURSOR + index as u64,
+                SemanticEventKind::ApprovalRequested,
+                &field_of(base, 41 + 11 * index),
+            ),
+            start,
+        );
+    }
+    assert!(
+        service
+            .settle(&session_id, Priority::Foreground, start.after_ms(2_000))
+            .is_some()
+    );
+}
+
+/// KR-REQ-22.18: the largest contexts the product admits, in Latin, Arabic, Hebrew and emoji text,
+/// are each sent through the daemon's service to the real process, and none of them is refused for
+/// its size: the Arabic and Hebrew contexts cost twice the tokens of the Latin one, and the emoji
+/// context more than the window, and each is made to fit what a job may spend on its prompt. No job
+/// fails, no process is ended, and no restart is counted, so descriptions are not delayed or paused
+/// for every session on the host because one session is large. A job that runs to its deadline is
+/// the benchmark's to measure and is not what this decides.
+#[test]
+fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its_size() {
+    let Some(placed) = Placed::real_weights(
+        "the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its_size",
+    ) else {
+        return;
+    };
+    let service = DescriptionService::new(
+        HostPlacement {
+            environment: ExecutionEnvironment::new(
+                EnvironmentId::new(Uuid::from_bytes([0x82; 16])),
+                EnvironmentKind::Native,
+            ),
+            data_access: None,
+            target: build_target().to_owned(),
+            processor: kr_describe::processor::Features::running(),
+        },
+        Catalogue::builtin().expect("this build's profiles"),
+        MetGates::default(),
+        ResourceSettings::default(),
+        DescriptionStore::in_memory().expect("a store"),
+    );
+    let mut driver = Driver::new(
+        service,
+        Launch {
+            program: placed.program.clone(),
+            arguments: vec!["--runtime-dir".into(), placed.runtime.clone().into()],
+            working_directory: placed.runtime.clone(),
+            environment: Vec::new(),
+            models: placed.models.clone(),
+        },
+        "kr-describe-tests/0".to_owned(),
+    );
+    let started = Instant::now();
+    let now = || {
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let wall = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
+        Reading::new(2_000 + elapsed, wall)
+    };
+
+    for (seed, (script, base)) in [
+        ("latin", kr_describe_model::fixtures::LATIN),
+        ("arabic", kr_describe_model::fixtures::ARABIC),
+        ("hebrew", kr_describe_model::fixtures::HEBREW),
+        ("emoji", kr_describe_model::fixtures::EMOJI),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        queue_largest(driver.service_mut(), session(10 + seed as u8), base);
+        let reports = run_until(
+            &mut driver,
+            &now,
+            script,
+            Duration::from_secs(600),
+            |reports, _| a_job_ended(reports),
+        );
+        eprintln!("the largest {script} context: {reports:?}");
+        assert!(
+            reports.iter().any(|report| matches!(
+                report,
+                Report::Outcome(Outcome::Published { .. } | Outcome::DeadlineExceeded { .. })
+            )),
+            "{script}: the job is described, or ends at its deadline: {reports:?}"
+        );
+        assert!(
+            !the_process_ended(&reports),
+            "{script}: the process was ended: {reports:?}"
+        );
+        assert_eq!(driver.service().inference_restarts(), 0, "{script}");
+        assert!(
+            !matches!(
+                driver.service().resource_state(),
+                kr_describe::resource::ResourceState::ResourcePaused {
+                    reason: kr_describe::resource::PauseReason::InferenceFailed,
+                    ..
+                }
+            ),
+            "{script}"
+        );
+    }
+}
+
 /// The real model stops a job it is told to cancel, between chunks of its prompt or tokens of its
 /// output, and the process answers that job `ended` as cancelled. A model that ran the job to its
 /// end would answer `produced`: the daemon's outcome would still be a cancellation, because the
