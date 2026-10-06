@@ -19,6 +19,8 @@ use kr_voice::seams::{
 };
 use kr_worker::history_filter::{HistoryFilter, Surface, Timed, ViewerScope};
 
+use crate::privacy::Published;
+
 /// What this host can say about one session, before any filtering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionSnapshot {
@@ -172,6 +174,19 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
         session_id: SessionId,
         approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>>;
+
+    /// The state of privacy mode as it stands now.
+    ///
+    /// What a snapshot carries of a model's text and of what the description host observed is read
+    /// under this state, and privacy mode removes both when it is enabled.
+    fn privacy(&self) -> Published;
+
+    /// Whether privacy mode is still in the state `decided` and no change of it is being made.
+    ///
+    /// A reading that carries a model's text or what the description host observed is released
+    /// only while this holds for the state it was started under. A source that cannot say answers
+    /// no.
+    fn unmoved(&self, decided: Published) -> bool;
 }
 
 /// The context source: session facts through the shared host-side filter.
@@ -394,6 +409,14 @@ mod tests {
             _approval_request_id: &'a ApprovalRequestId,
         ) -> VoiceFuture<'a, Option<Digest256>> {
             Box::pin(async move { Ok(None) })
+        }
+
+        fn privacy(&self) -> Published {
+            Published::default()
+        }
+
+        fn unmoved(&self, decided: Published) -> bool {
+            decided == Published::default()
         }
     }
 
