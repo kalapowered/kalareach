@@ -11,30 +11,11 @@
 
 use std::sync::Arc;
 
-use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::AuthorityRevision;
-use kr_protocol::session::SessionState;
+use kr_protocol::identity::DesktopBinding;
 
 use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::closure_of;
 use super::a_session_that_closed_is_not_bound_again::{held_by_the_daemon, parked};
-use crate::directory::KnownWorker;
-use crate::registry::WorkerRecord;
-
-/// The registry's row for a worker, as an earlier build's recovery wrote it.
-fn row_of(worker: &KnownWorker) -> WorkerRecord {
-    let descriptor = &worker.descriptor;
-    WorkerRecord {
-        session_id: descriptor.session_id,
-        display_number: descriptor.display_number,
-        public_key: descriptor.worker_public_key,
-        process_identity: descriptor.process_start_identity.clone(),
-        endpoint: descriptor.endpoint.clone(),
-        profile: WorkerProfile::HeadlessUser,
-        state: SessionState::Live,
-        acknowledged_revision: AuthorityRevision::new(0),
-    }
-}
 
 /// What a daemon that stopped leaves for the next one to find of a worker that kept running: its
 /// row in the registry and its descriptor on disk, and, where `closed`, the closure of its session
@@ -48,7 +29,7 @@ async fn left_for_the_next_start(world: &Served, closed: bool) {
             .expect("the closure is recorded");
     }
     registry
-        .adopt_worker(&row_of(&world.worker), Some(&DesktopBinding::none()))
+        .adopt_worker(&world.row(), Some(&DesktopBinding::none()))
         .expect("the registry records the worker");
     drop(registry);
     kr_ipc::descriptor::publish(world.controller.paths(), &world.worker.descriptor)
