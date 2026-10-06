@@ -48,12 +48,18 @@ const DEPTH: usize = 64;
 /// How long a test waits for the room to deliver one frame.
 const FRAME_WAIT: Duration = Duration::from_secs(10);
 
+/// How long a test waits for a host to hold its room: it fails a wait that never ends, and is not
+/// a measurement.
+const HOSTING_DEADLINE: Duration = Duration::from_secs(120);
+
 /// An in-process rendezvous service with one room per reserved locator.
 #[derive(Clone, Debug)]
 pub struct TestRoom {
     rooms: Arc<Mutex<Rooms>>,
     /// True while the room holds back what hosts send, as a slow service does.
     held: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Woken each time a host attaches to a record and each time a record is released.
+    hosting: Arc<tokio::sync::Notify>,
 }
 
 impl Default for TestRoom {
@@ -61,6 +67,7 @@ impl Default for TestRoom {
         Self {
             rooms: Arc::default(),
             held: Arc::new(tokio::sync::watch::channel(false).0),
+            hosting: Arc::default(),
         }
     }
 }
@@ -79,6 +86,8 @@ struct Record {
     expires_at_ms: u64,
     token_hash: Digest256,
     host: Option<mpsc::Sender<ServiceFrame>>,
+    /// Whether a host has attached to this record, now or earlier.
+    hosted: bool,
     attempts: BTreeMap<AttemptId, mpsc::Sender<ServiceFrame>>,
 }
 
@@ -123,6 +132,48 @@ impl TestRoom {
     #[must_use]
     pub fn release_requests(&self) -> Vec<String> {
         self.rooms().release_requests.clone()
+    }
+
+    /// Waits until the host that reserved `locator` has attached to its room for the first time.
+    ///
+    /// A host reserves a locator and attaches to the room a moment later, on a task of its own, and
+    /// a frame a candidate relays before then ends its attempt, as the service ends one that has no
+    /// host to carry its frame. An invitation is on offer once its host holds the room, so a
+    /// candidate that starts from the invitation's answer starts after this. A locator nobody holds
+    /// a record for has no host to wait for, and neither has one whose record was released, or
+    /// released and reserved again for another invitation, while the wait lasted. A host that
+    /// attached once and went is not waited for again: what a candidate meets then is the room's
+    /// own answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no host attaches within [`HOSTING_DEADLINE`].
+    pub async fn until_hosted(&self, locator: &str) {
+        let waited = tokio::time::timeout(HOSTING_DEADLINE, async {
+            // The invitation whose host is waited for, which is the one the record names when the
+            // wait begins.
+            let mut invitation = None;
+            loop {
+                // Asked to be woken before the record is read, so a change between the read and
+                // the wait is not missed.
+                let changed = self.hosting.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let pending = self.rooms().records.get(locator).is_some_and(|record| {
+                    *invitation.get_or_insert(record.invitation_id) == record.invitation_id
+                        && !record.hosted
+                });
+                if !pending {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "no host attached to the room of {locator} within {HOSTING_DEADLINE:?}"
+        );
     }
 
     /// Opens a candidate socket in the room of `locator`.
@@ -170,6 +221,7 @@ impl TestRoom {
                     reason: CloseReason::Superseded,
                 });
             }
+            record.hosted = true;
             let _ = to_host.try_send(ServiceFrame::Attached {
                 invitation_id: record.invitation_id,
                 expires_at_ms: record.expires_at_ms,
@@ -180,6 +232,7 @@ impl TestRoom {
                 });
             }
         }
+        self.hosting.notify_waiters();
         tokio::spawn(
             self.clone()
                 .pump_host(locator.as_str().to_owned(), to_host, from_host),
@@ -397,6 +450,7 @@ impl RendezvousHost for TestRoom {
                 expires_at_ms: advertised_expires_at_ms.get(),
                 token_hash: control_token_hash,
                 host: None,
+                hosted: false,
                 attempts: BTreeMap::new(),
             },
         );
@@ -430,6 +484,7 @@ impl RendezvousHost for TestRoom {
             .remove(locator.as_str())
             .expect("the record was just read");
         rooms.released.push(locator.as_str().to_owned());
+        self.hosting.notify_waiters();
         // Every socket attached to the record ends with it: each candidate's, which the host is
         // told about, and then the host's own.
         let closed = ServiceFrame::Closed {
@@ -458,8 +513,10 @@ impl kr_client::pairing::candidate::CandidateRoom for TestRoom {
         locator: &'a Locator,
     ) -> kr_client::pairing::BoxFuture<'a, Result<RoomSocket, kr_client::pairing::room::RoomError>>
     {
-        let socket = self.candidate(locator.as_str());
-        Box::pin(async move { Ok(socket) })
+        Box::pin(async move {
+            self.until_hosted(locator.as_str()).await;
+            Ok(self.candidate(locator.as_str()))
+        })
     }
 }
 
@@ -526,6 +583,7 @@ impl<'a> CodeCandidate<'a> {
         code: &str,
     ) -> Result<Self, Stopped> {
         let entered = EnteredCode::parse(code).map_err(|error| Stopped::Local(error.code()))?;
+        room.until_hosted(entered.locator().as_str()).await;
         let mut socket = room.candidate(entered.locator().as_str());
         let ServiceFrame::Record {
             invitation_id,

@@ -1553,6 +1553,7 @@ async fn room_behind_tls(
                 return;
             };
             if role == "candidate" {
+                room.until_hosted(&locator).await;
                 room_tls::carry(end, room.candidate(&locator)).await;
             }
         }
