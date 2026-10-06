@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
 
@@ -1677,7 +1677,10 @@ jobs:
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under and asserted
-      # against its bound.
+      # against its bound. This runner has three processors and 7 GiB, short of section 27's
+      # reference host, so the idle processor figure is recorded here with each missing condition
+      # named and is asserted by the macos-reference job; the idle memory bound and the other
+      # figures are asserted here.
       - name: Performance measurements
         if: ${{ !cancelled() }}
         timeout-minutes: 45
@@ -1713,3 +1716,93 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
+
+  # The idle measurement on a host that meets section 27's reference host: four processors and
+  # more than 8 GiB, the operating system and architecture recorded beside the figure. The macos
+  # job's runner is short of that host, so it records the idle processor figure and does not assert
+  # it; this job asserts it, with the memory bound, where nothing read falls short. Only the
+  # measurements run here: the tests are the macos job's.
+  macos-reference:
+    name: macos-reference
+    # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    runs-on: macos-15-intel
+    # The build alone is about an hour on this runner. Every step has a limit of its own, and the
+    # limits add up to less than this one.
+    timeout-minutes: 240
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # What this runner is, printed before anything asserts on it, so a pass or a failure below
+      # names the processor, the memory and the system it happened on. Every build here is given
+      # one job per processor.
+      - name: What this runner is
+        timeout-minutes: 2
+        run: |
+          sw_vers
+          uname -srm
+          echo "processors: $(sysctl -n hw.logicalcpu) logical, $(sysctl -n machdep.cpu.brand_string)"
+          echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          df -h /System/Volumes/Data
+          echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The registry and the Git dependencies the macos job saves from main; this job only reads
+      # them.
+      - name: Restore the cargo registry
+        timeout-minutes: 10
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # Everything the script below builds before it measures, so the machine can then be let
+      # settle and the script's own builds find nothing to do.
+      - name: Build what the measurements run
+        timeout-minutes: 120
+        run: |
+          cargo build --locked --release --workspace
+          cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
+
+      # Until the load average over the last minute is under one and a half, or ten minutes have
+      # passed; the script records the load at the edges of every measurement either way.
+      - name: Let the machine settle
+        timeout-minutes: 12
+        run: |
+          for _ in $(seq 1 60); do
+            if sysctl -n vm.loadavg | awk '{ exit !($2 < 1.5) }'; then
+              break
+            fi
+            sleep 10
+          done
+          echo "load average: $(sysctl -n vm.loadavg)"
+
+      # The idle processor figure is asserted here because this host reports no shortfall against
+      # the reference host; a shortfall the host reported would be recorded and named instead.
+      - name: Performance measurements
+        timeout-minutes: 45
+        run: bash scripts/performance.sh
+
+      - name: Keep the test evidence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-macos-reference
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
