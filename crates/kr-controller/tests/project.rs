@@ -208,6 +208,10 @@ fn repository(parent: &Path, name: &str) -> PathBuf {
 /// KR-REQ-14.17, 14.20, 23.42 and 23.43: the ten methods reach the service through the daemon's
 /// own admission path, and each one does what its row says.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon() {
     let host = host().await;
     let mut control = client(&host).await;
@@ -549,6 +553,10 @@ async fn the_daemon_refuses_a_project_envelope_that_names_a_session_or_another_e
 
 /// KR-REQ-14.18: a lost reply is answered from the retained record rather than by cloning twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_repeated_creation_action_is_answered_from_the_record() {
     let host = host().await;
     let mut control = client(&host).await;
@@ -672,6 +680,10 @@ async fn a_retained_failure_carries_none_of_what_the_caller_sent() {
 /// KR-REQ-24.08: a workspace, its policy and its pins survive the daemon's death, and cleanup
 /// still respects them afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_workspace_and_its_pins_survive_a_replacement_daemon() {
     let host = host().await;
     let mut control = client(&host).await;
@@ -782,6 +794,10 @@ async fn a_workspace_and_its_pins_survive_a_replacement_daemon() {
 /// a verified download publishes into a workspace's own directory the same way it publishes into
 /// any other destination the user chose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_verified_download_publishes_into_a_workspace_this_daemon_created() {
     let host = host().await;
     let mut control = client(&host).await;
@@ -2524,6 +2540,10 @@ fn attach_params(
 /// A binding is proved through the location's held handle, confirmed by the owner, and retried
 /// from its record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn attachment_completes_and_its_retry_returns_the_receipt() {
     use kr_protocol::project::{LocationAttachment, LocationPurpose, ProjectLocationAttachResult};
 
@@ -2586,6 +2606,10 @@ async fn attachment_completes_and_its_retry_returns_the_receipt() {
 /// A proof is for the binding it was issued for: another repository, another location or another
 /// action's challenge is refused, and the binding each challenge was issued for still works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn an_attachment_proof_for_another_repository_or_location_is_refused() {
     use kr_protocol::project::LocationPurpose;
 
