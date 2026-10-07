@@ -392,9 +392,9 @@ pub struct Session {
     held_input_bytes: usize,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
-    /// The output cursor at which terminals kept on a projection by their screen were last asked
-    /// whether a screen drawn now would carry everything.
-    reconsidered_at: u64,
+    /// The output cursor and the projection generation at which terminals kept on a projection by
+    /// their screen were last asked whether a screen drawn now would carry everything.
+    reconsidered_at: (u64, u64),
     /// How much of the screen each attachment's caller may be shown.
     ///
     /// Section 10's live-screen exception is the currently visible screen and never the buffer
@@ -723,7 +723,7 @@ impl Session {
             interrupt_failed: None,
             held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
-            reconsidered_at: 0,
+            reconsidered_at: (0, 0),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1505,6 +1505,11 @@ impl Session {
     fn reinstall_every_subscriber(&mut self, reason: ProjectionResetReason) {
         let next = self.history.next_cursor();
         let oldest = self.history.oldest_retained_cursor();
+        // The screen was reflowed, so a terminal kept off the stream by what the last one could
+        // not carry is asked again of this one, before it is installed in the form it is then
+        // given. Waiting for output would leave it projected for as long as the application is
+        // quiet.
+        self.reconsider_incomplete_restorations();
         for attachment_id in self.hub.subscribers() {
             if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
                 let Ok(dimensions) = self.attachment_dimensions(attachment_id) else {
@@ -1512,6 +1517,11 @@ impl Session {
                 };
                 // Forgetting its base is what makes this an install rather than a continuation.
                 self.projections.forget(attachment_id);
+                // The screen it is installed with is a projection, so it is served one from here:
+                // left as the stream, the next delivery would find the two disagreeing and tell it
+                // to begin again, throwing away the screen it has just been sent.
+                self.hub
+                    .set_presentation(attachment_id, crate::output::Presentation::Projected);
                 let _ = self.publish_projection(attachment_id, dimensions, Some(reason), oldest);
                 continue;
             }
@@ -1598,6 +1608,28 @@ impl Session {
     /// authenticated as this user holds no grant to be narrowed by.
     pub fn narrow_content(&mut self, attachment_id: AttachmentId, scope: crate::render::Scope) {
         self.content_scopes.insert(attachment_id, scope);
+        // What a screen drawn for this caller carries depends on how much of the session's screen
+        // it is drawn, so the answer the table holds is asked again here. Left to the caller's
+        // first subscription, a window report made before it would say the stream is what the
+        // caller is given, and the subscription would then say it is not.
+        if let Ok(dimensions) = self.attachment_dimensions(attachment_id) {
+            self.ask_restoration(attachment_id, dimensions);
+        }
+    }
+
+    /// Asks the screen the session holds now whether a restoration drawn for one attachment would
+    /// carry everything, and records the answer.
+    ///
+    /// Nothing is drawn for anybody and nothing is counted among what renderings left out. The
+    /// screen is read as it stands, so a caller that wants the settled one has settled it.
+    fn ask_restoration(&mut self, attachment_id: AttachmentId, dimensions: Dimensions) {
+        let keyboard = self.attachments.keyboard_control(attachment_id);
+        let scope = self.content_scope(attachment_id);
+        let carried = self
+            .engine
+            .carried_by_restoration(dimensions, keyboard, scope);
+        self.attachments
+            .note_restoration(attachment_id, carried.continues_the_stream());
     }
 
     /// Records that an attachment was made under a grant, so an authority revision or the grant's
@@ -2193,9 +2225,14 @@ impl Session {
         let (mut presentation, mut presentation_reason) =
             self.attachments
                 .viewport(attachment_id, dimensions, anchor, column)?;
-        let scope = self.content_scope(attachment_id);
+        // The terminal is on the stream when the hub sends it the application's bytes, which is
+        // not the same as the table saying so: a terminal told to begin again is sent nothing
+        // until it subscribes, and one that has not subscribed yet is sent nothing at all.
+        let on_the_stream = self.hub.presentation_of(attachment_id)
+            == Some(crate::output::Presentation::Direct)
+            && !self.hub.is_resynchronising(attachment_id);
         if (moved || before_dimensions != Some(dimensions))
-            && before != Some(TerminalPresentationMode::Direct)
+            && !on_the_stream
             && matches!(
                 presentation_reason,
                 None | Some(
@@ -2203,22 +2240,18 @@ impl Session {
                         | kr_protocol::attachment::PresentationReason::AwaitingParserBoundary
                 )
             )
-            && scope != crate::render::Scope::LiveScreen
+            && self.content_scope(attachment_id) != crate::render::Scope::LiveScreen
         {
             // What the last screen could not carry says nothing about the one this window is drawn
             // next, and a screen that was carried when it was drawn can have changed since. A
             // terminal that is the session's size again, or back on the live screen, was not on
             // the stream, and has only this left to keep it off it, so the answer is asked of the
-            // screen the session holds now and the report says what it found. A terminal that is
-            // on the stream is left out whatever its stored window says: every byte that changed
-            // its screen reached it. A caller shown the live screen alone is left out, because no
-            // screen it is drawn can carry everything.
-            let keyboard = self.attachments.keyboard_control(attachment_id);
-            let carried = self
-                .engine
-                .carried_by_restoration(dimensions, keyboard, scope);
-            self.attachments
-                .note_restoration(attachment_id, carried.continues_the_stream());
+            // screen the session holds now and the report says what it found. A terminal the hub
+            // is sending the application's bytes is left out whatever its stored window says:
+            // every byte that changed its screen reached it. A caller shown the live screen alone
+            // is left out because it was asked when its scope was recorded, and no screen it is
+            // drawn can carry everything.
+            self.ask_restoration(attachment_id, dimensions);
             (presentation, presentation_reason) =
                 self.attachments
                     .viewport(attachment_id, dimensions, anchor, column)?;
@@ -3125,15 +3158,18 @@ impl Session {
     /// attachment that moves between the two, which draws it a screen of its own at a boundary.
     /// Nothing is drawn for anybody here, so nothing is counted among what renderings left out.
     ///
-    /// The question is asked once per output cursor, and terminals that would be drawn the same
-    /// restoration share one answer. A quiet moment at the cursor last asked about follows a read
-    /// that ended inside a sequence, or the end of the stream, and no terminal can begin
-    /// forwarding there. A terminal's own report of a new window asks the question where it is
-    /// made. A change of the session's size does not yet, so a terminal that it leaves held waits
-    /// for the next output.
+    /// The question is asked once per output cursor and projection generation, and terminals that
+    /// would be drawn the same restoration share one answer. A quiet moment at the cursor last
+    /// asked about follows a read that ended inside a sequence, or the end of the stream, and no
+    /// terminal can begin forwarding there. A change of the session's size moves the generation
+    /// without moving the cursor, and reflows the screen, so it asks again. A terminal's own report
+    /// of a new window asks the question where it is made.
     fn reconsider_incomplete_restorations(&mut self) {
-        let cursor = self.engine.output_cursor();
-        if std::mem::replace(&mut self.reconsidered_at, cursor) == cursor {
+        let asked = (
+            self.engine.output_cursor(),
+            self.engine.projection_generation(),
+        );
+        if std::mem::replace(&mut self.reconsidered_at, asked) == asked {
             return;
         }
         self.attachments

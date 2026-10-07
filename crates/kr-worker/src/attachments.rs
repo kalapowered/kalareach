@@ -48,9 +48,11 @@ pub struct Attachment {
     /// restoration rendered for it sets it again, and one that could not carry the state the
     /// application will address keeps the attachment on a projection instead, where the host paints
     /// the canonical screen rather than trusting the terminal to already match it. The host asks
-    /// again whenever the session's output goes quiet, so a screen that has become one a
-    /// restoration can carry gives the attachment the stream back, and a report of a new window
-    /// asks again of the screen the session holds then.
+    /// again whenever the session's output goes quiet and whenever the session's size changes, so a
+    /// screen that has become one a restoration can carry gives the attachment the stream back,
+    /// and a report of a new window from a terminal that is not being sent the stream asks again
+    /// of the screen the session holds then. A caller shown the live screen alone is asked once,
+    /// when that is recorded, because no screen it is drawn can carry everything.
     pub restoration_continues: bool,
     /// Whether this attachment is waiting for a parser-ground boundary before it may forward.
     ///
