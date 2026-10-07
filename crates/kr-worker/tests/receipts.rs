@@ -4069,7 +4069,8 @@ fn a_restarted_worker_keeps_neither_a_false_distrust_nor_a_missed_rollback() {
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
     assert_eq!(session.collect_expired(), 1);
 
-    // A rollback the worker saw is still one after it restarts.
+    // A rollback the worker saw is still one after it restarts, although the time service has put
+    // the clock right in the meantime.
     let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
     let machine = DriftingMachine::fast_by(50);
     let mut session = a_worker_on(&machine, &environment, session_id);
@@ -4078,6 +4079,7 @@ fn a_restarted_worker_keeps_neither_a_false_distrust_nor_a_missed_rollback() {
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
     drop(session);
+    machine.wall.advance(ten_seconds);
     let mut session = a_worker_on(&machine, &environment, session_id);
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
     assert_eq!(session.collect_expired(), 0);
