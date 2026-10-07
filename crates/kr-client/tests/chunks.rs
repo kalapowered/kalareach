@@ -1313,8 +1313,10 @@ async fn a_lane_whose_reader_stopped_sends_nothing_more() {
 /// A call on a lane whose window is due for renewal waits for the renewal, even when the host sends
 /// it behind a backlog the reader has not read yet, and goes out under it.
 ///
-/// The window here stands for two seconds, so its renewal is due after one. The call starts after
-/// that and before the host has sent anything; the host then sends three hundred keepalives and the
+/// The window here stands for ten minutes, so its renewal is due after five by the lane's own
+/// reading of time, which the test takes out of the runtime's hands and puts at 300.1 s after the
+/// lane was opened, so the window is due however long the machine takes. The call starts then
+/// and before the host has sent anything; the host then sends three hundred keepalives and the
 /// renewal, and from then on refuses the first window.
 #[tokio::test]
 async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
@@ -1322,7 +1324,7 @@ async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
     let host = Host::start(Script {
         renewal: Some(window("window-2")),
         renewal_trigger: Some(Arc::clone(&trigger)),
-        chunk_window_ms: Some(2_000),
+        chunk_window_ms: Some(600_000),
         keepalives_before_renewal: 300,
         expire_first_window: true,
         ..Script::default()
@@ -1335,7 +1337,7 @@ async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
         .open(reserved.transfer_id)
         .await
         .expect("a lane");
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    lane.hold_clock_at(std::time::Duration::from_millis(300_100));
 
     let target = host.target();
     let chunk = chunk_of(reserved.transfer_id, &bytes, 0);
@@ -1351,7 +1353,7 @@ async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
         "the call has not finished before the host is told to renew"
     );
     trigger.notify_one();
-    let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+    let accepted = tokio::time::timeout(LIVENESS_DEADLINE, call)
         .await
         .expect("the call ends")
         .expect("the chunk goes under the renewed window");
@@ -1363,6 +1365,10 @@ async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
 
 /// A lane whose window runs out with no renewal has lost its connection, and sends nothing under
 /// the window that ran out.
+///
+/// The window stands for 600 ms. The test takes the lane's reading of time out of the runtime's
+/// hands and puts it a millisecond before the window is gone: it is due for renewal and has a
+/// millisecond left, however long the machine takes to get to the call.
 #[tokio::test]
 async fn a_lane_whose_window_runs_out_unrenewed_has_lost_its_connection() {
     let host = Host::start(Script {
@@ -1377,10 +1383,10 @@ async fn a_lane_whose_window_runs_out_unrenewed_has_lost_its_connection() {
         .open(reserved.transfer_id)
         .await
         .expect("a lane");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    lane.hold_clock_at(std::time::Duration::from_millis(599));
 
     let lost = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        LIVENESS_DEADLINE,
         lane.send_chunk(
             &host.target(),
             &chunk_of(reserved.transfer_id, &bytes, 0),
