@@ -3930,6 +3930,25 @@ impl DriftingMachine {
         }
     }
 
+    /// The clocks as [`Self::sources`] gives them, with the host's clock floor mapped.
+    fn sources_on(
+        &self,
+        floor: &Arc<kr_ipc::floor::SharedFloor>,
+    ) -> kr_worker::action::time::TimeSources {
+        kr_worker::action::time::TimeSources {
+            floor: Some(Arc::clone(floor)),
+            ..self.sources()
+        }
+    }
+
+    /// The owner establishes the host's clock at what this machine reads now, as the daemon
+    /// publishes it in the floor.
+    fn owner_establishes(&self, floor: &kr_ipc::floor::SharedFloor) {
+        use kr_ipc::clock::SharedClock as _;
+        use kr_worker::action::time::WallClock as _;
+        floor.establish(self.wall.now_ms().get(), self.continuous.boot_elapsed_ms());
+    }
+
     /// The machine runs awake for `duration`: the wall clock counts it, the other two count it
     /// fast.
     fn runs(&self, duration: std::time::Duration) {
@@ -3971,6 +3990,20 @@ fn a_worker_on(
 ) -> Session {
     Session::open(SessionConfig {
         time: machine.sources(),
+        ..session_config(environment, session_id)
+    })
+    .expect("opens")
+}
+
+/// Starts a worker on `session_id`'s journal that reads `machine`'s clocks and maps `floor`.
+fn a_worker_on_floor(
+    machine: &DriftingMachine,
+    floor: &Arc<kr_ipc::floor::SharedFloor>,
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> Session {
+    Session::open(SessionConfig {
+        time: machine.sources_on(floor),
         ..session_config(environment, session_id)
     })
     .expect("opens")
@@ -4099,6 +4132,96 @@ fn a_restarted_worker_keeps_neither_a_false_distrust_nor_a_missed_rollback() {
         session.journal().expect("a journal").len().expect("reads"),
         1
     );
+}
+
+/// KR-REQ-09.19: the owner's one establishment of the host's clock ends a worker's distrust too.
+/// The worker saw the wall clock go back and stopped collecting; the owner then establishes the
+/// host's clock, which the daemon publishes in the clock floor every worker maps; the worker's own
+/// clock still agrees with what the owner established, so it trusts its clock again, collects what
+/// retention covers, and keeps trusting it through the restart that follows.
+#[test]
+fn the_owners_establishment_of_the_host_clock_ends_a_workers_distrust() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    assert_eq!(session.collect_expired(), 0);
+
+    machine.owner_establishes(&floor);
+    machine.runs(std::time::Duration::from_secs(30));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "the worker's clock agrees with what the owner established"
+    );
+    assert_eq!(
+        session.collect_expired(),
+        1,
+        "a worker that trusts its clock collects what retention covers"
+    );
+
+    // What the worker wrote down is what a restart reads back: trusted, and confirmed by the owner.
+    drop(session);
+    let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+}
+
+/// KR-REQ-09.19: a worker follows an establishment only when its own clock agrees with it, and
+/// only once. An owner who established the clock cannot speak for a wall clock that has been
+/// stepped since; and a rollback after the establishment is not undone by it, however the clock
+/// reads later. Only the next establishment ends either.
+#[test]
+fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_once() {
+    let an_hour = std::time::Duration::from_secs(3_600);
+    let a_minute = std::time::Duration::from_secs(60);
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.steps_back(a_minute);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+
+    // The wall clock is stepped forward an hour after the owner established it: the worker's clock
+    // no longer reads what the owner established, so the worker stays distrusted, and the clock
+    // reading right again later does not bring the establishment back.
+    machine.owner_establishes(&floor);
+    machine.wall.advance(an_hour);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    machine.steps_back(an_hour);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "an establishment the worker met and could not follow is spent"
+    );
+
+    // The next one ends it.
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+
+    // A rollback after that establishment stays a rollback, and the clock put right again does not
+    // undo it.
+    machine.runs(AN_HOUR);
+    machine.steps_back(a_minute);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    machine.wall.advance(a_minute);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "an establishment the worker has followed is not followed again"
+    );
+    assert_eq!(session.collect_expired(), 0);
 }
 
 /// KR-REQ-09.12, 09.13: a fence report bigger than one acknowledgement is delivered a page at a

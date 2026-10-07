@@ -297,6 +297,110 @@ async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetti
     assert!(collections.spend(), "and the voice spend");
 }
 
+/// The wall clock a worker's contract reads in the test below: the one the test moves for the
+/// daemon.
+#[derive(Debug)]
+struct SameWall(Arc<std::sync::atomic::AtomicU64>);
+
+impl kr_worker::action::time::WallClock for SameWall {
+    fn now_ms(&self) -> kr_protocol::scalars::TimestampMs {
+        kr_protocol::scalars::TimestampMs::new(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// KR-REQ-09.19: the owner's one establishment frees a worker's own time contract as it frees the
+/// daemon's. A worker maps the daemon's clock floor as a worker process does; the wall clock goes
+/// back, and the daemon and the worker both stop trusting it; the owner establishes the clock at
+/// the terminal, and the worker, whose own clock still agrees with what the owner established,
+/// trusts its clock again. The daemon's contract and the worker's are two records, and the owner's
+/// action is the one thing that ends both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::{TimeContract, TimeSources};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let floor = Arc::new(
+        kr_ipc::floor::SharedFloor::open(
+            controller
+                .utc_floor()
+                .words()
+                .path()
+                .expect("the daemon's floor is a file"),
+            temp.environment_id(),
+            controller.boot_epoch,
+        )
+        .expect("a worker maps the daemon's floor"),
+    );
+    let synchronised = kr_worker::action::adapter::classify_unix(
+        "macos",
+        "ntp_adjtime(2)",
+        kr_worker::action::adapter::UnixTimex {
+            time_state: kr_worker::action::adapter::unix_model::TIME_OK,
+            status: kr_worker::action::adapter::unix_model::STA_PLL,
+            maxerror_us: 62_192,
+            esterror_us: 500,
+        },
+        kr_protocol::scalars::TimestampMs::new(wall.load(Ordering::SeqCst)),
+    );
+    let worker = TimeContract::new(
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
+        String::new(),
+        TimeSources {
+            continuous: Arc::new(kr_ipc::clock::SystemSharedClock),
+            active: Arc::new(kr_worker::action::time::SystemActiveClock::new()),
+            wall: Arc::new(SameWall(Arc::clone(&wall))),
+            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(
+                synchronised,
+            )),
+            floor: Some(floor),
+        },
+    );
+    let start = wall.load(Ordering::SeqCst);
+    worker.observe();
+    assert_eq!(
+        worker.trust(),
+        kr_protocol::action::WallClockTrust::Trusted,
+        "a worker's clock is proven where it starts"
+    );
+    assert!(super::an_owner_establishes_the_clock::proven(&controller));
+
+    wall.store(start - 60_000, Ordering::SeqCst);
+    worker.observe();
+    assert_eq!(
+        worker.trust(),
+        kr_protocol::action::WallClockTrust::Unresolved,
+        "the worker finds the step back"
+    );
+    assert!(
+        !super::an_owner_establishes_the_clock::proven(&controller),
+        "and so does the daemon"
+    );
+
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    assert!(super::an_owner_establishes_the_clock::proven(&controller));
+    let established = controller
+        .utc_floor()
+        .words()
+        .established()
+        .expect("the owner's establishment is published in the floor");
+    // The wall clock reads what the owner established, carried forward by the time since on the
+    // machine's own clock, which is what a clock the owner was right about reads.
+    wall.store(
+        established.wall_ms
+            + (kr_ipc::clock::SystemSharedClock.boot_elapsed_ms() - established.boot_ms),
+        Ordering::SeqCst,
+    );
+    worker.observe();
+    assert_eq!(
+        worker.trust(),
+        kr_protocol::action::WallClockTrust::Trusted,
+        "the worker's clock agrees with what the owner established, so it trusts it again"
+    );
+}
+
 /// The record an earlier build's attention store kept of its clock, as that build wrote it: a
 /// store that was trusted and then found the wall clock going backwards.
 const EARLIER_BUILD_AFTER_A_ROLLBACK: &[u8] =
