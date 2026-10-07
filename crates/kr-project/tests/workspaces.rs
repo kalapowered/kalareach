@@ -27,8 +27,8 @@ use kr_protocol::project::{
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use support::{
-    Fixture, action, actor, destination, git_started_in, include_everything, ordinary_repository,
-    watching_git, write, write_bytes,
+    Fixture, action, actor, destination, git_ran_in, git_started_in, include_everything,
+    ordinary_repository, watching_git, write, write_bytes,
 };
 
 /// Builds a repository with one of each class of uncommitted work in it and adopts it.
@@ -1077,15 +1077,16 @@ fn a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers() {
     );
 }
 
-/// A repository registered through a directory below its top level is recorded by the top level's
-/// identity, and its workspace is still read: the directory at the registered path is inside the
-/// recorded tree.
-#[cfg(unix)]
-#[test]
-fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read() {
-    let mut fixture = Fixture::create();
-    let started = watching_git(&mut fixture);
-    let top = ordinary_repository(fixture.work(), "whole");
+/// Registers `whole/below`, a directory inside a checkout, and returns the checkout.
+///
+/// Registering a directory below the top level of a repository records the top level's identity
+/// with the path of the directory below it.
+fn registered_through_a_subdirectory(
+    fixture: &Fixture,
+    name: &str,
+    seed: u8,
+) -> (std::path::PathBuf, ProjectRepositoryId) {
+    let top = ordinary_repository(fixture.work(), name);
     write(
         &top,
         "below/work.txt",
@@ -1100,12 +1101,21 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
                 label: "below".to_owned(),
                 flow: AdoptionFlow::ExistingCheckout,
             },
-            Some(&action("project.adopt", 86)),
+            Some(&action("project.adopt", seed)),
         )
         .expect("a directory inside a checkout is adopted")
         .project
         .project_repository_id;
-    let workspace_id = fixture
+    (top, project)
+}
+
+/// Makes a shared workspace of `project`: its own working tree, used where it is.
+fn shared_workspace(
+    fixture: &Fixture,
+    project: ProjectRepositoryId,
+    seed: u8,
+) -> kr_protocol::ids::WorkspaceId {
+    fixture
         .service()
         .workspace_create(
             &actor(),
@@ -1120,13 +1130,25 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
                 destination: Nullable(None),
                 preview_only: false,
             },
-            Some(&action("workspace.create", 87)),
+            Some(&action("workspace.create", seed)),
         )
         .expect("the shared workspace is created")
         .workspace
         .0
         .expect("it exists")
-        .workspace_id;
+        .workspace_id
+}
+
+/// A repository registered through a directory below its top level is recorded by the top level's
+/// identity, and its workspace is still read: the directory at the registered path is inside the
+/// recorded tree.
+#[cfg(unix)]
+#[test]
+fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let (top, project) = registered_through_a_subdirectory(&fixture, "whole", 86);
+    let workspace_id = shared_workspace(&fixture, project, 87);
     let named = std::fs::canonicalize(&top).expect("the checkout resolves");
 
     let _ = git_started_in(&started, &named);
@@ -1140,6 +1162,107 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
     assert!(
         git_started_in(&started, &named),
         "Git is started in the recorded tree"
+    );
+}
+
+/// A repository inside the directory a repository was registered through is not read as the
+/// registered one: Git reports it as the top level, it is not the recorded tree, and its
+/// configuration is not read.
+#[cfg(unix)]
+#[test]
+fn a_repository_inside_a_registered_subdirectory_is_not_read_as_the_registered_one() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let (top, project) = registered_through_a_subdirectory(&fixture, "enclosing", 97);
+    let workspace_id = shared_workspace(&fixture, project, 98);
+    let below = std::fs::canonicalize(top.join("below")).expect("the directory resolves");
+
+    // The registered repository's configuration is read for the tree it is.
+    let _ = git_started_in(&started, &below);
+    let held = measured(&fixture, workspace_id, 99);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the tree is read where it is: {held:?}"
+    );
+    assert!(
+        git_ran_in(&started, &top_of(&top), "git config"),
+        "the configuration of the recorded tree is read"
+    );
+
+    // Another repository is made where the registered directory is: Git reports it as the top level.
+    support::git_raw(&below, ["init", "--initial-branch=main"]);
+    let held = measured(&fixture, workspace_id, 100);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        !git_ran_in(&started, &below, "git config"),
+        "the configuration of the repository that is not the recorded tree is not read"
+    );
+}
+
+/// The top level of a checkout as Git spells it.
+fn top_of(top: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(top).expect("the checkout resolves")
+}
+
+/// Another filesystem mounted over the directory a repository was registered through is not read
+/// as that directory: the climb from it to the recorded tree stops at the mount, so no Git
+/// invocation starts in it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it() {
+    volumes::with_volumes(
+        "a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it",
+        || {
+            let mut fixture = Fixture::create();
+            let started = watching_git(&mut fixture);
+            let (top, project) = registered_through_a_subdirectory(&fixture, "mounted-whole", 92);
+            // Two workspaces of it: reading one ends it, so the control and the mounted case each
+            // have their own.
+            let read = shared_workspace(&fixture, project, 93);
+            let mounted = shared_workspace(&fixture, project, 94);
+            let below = top.join("below");
+            let named = std::fs::canonicalize(&below).expect("the directory resolves");
+
+            // The directory the record was made through is read where it is.
+            let _ = git_started_in(&started, &named);
+            let held = measured(&fixture, read, 95);
+            assert!(
+                held.iter()
+                    .any(|item| item.detail.contains("hold uncommitted work")),
+                "the registered directory is read where it is: {held:?}"
+            );
+            assert!(
+                git_started_in(&started, &named),
+                "Git is started in the registered directory"
+            );
+
+            // Another filesystem is mounted over it.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume = volumes::Volume::attach(&below, scratch.path(), "over")
+                .unwrap_or_else(|| volumes::not_attachable());
+            let held = measured(&fixture, mounted, 96);
+            assert!(
+                held.iter().any(|item| item
+                    .detail
+                    .contains("could not read what this workspace holds")),
+                "the host says it could not inspect the tree: {held:?}"
+            );
+            assert!(
+                !git_started_in(&started, &named),
+                "no Git invocation started in the filesystem mounted over the directory"
+            );
+            volume.detach();
+        },
     );
 }
 

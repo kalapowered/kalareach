@@ -210,24 +210,36 @@ impl Fixture {
     }
 }
 
-/// Makes the fixture list every directory a Git invocation is about to start in.
-pub fn watching_git(fixture: &mut Fixture) -> std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>> {
-    let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+/// What the fixture saw start: each Git invocation as a person reads it, and the directory it ran
+/// in.
+pub type Started = std::sync::Arc<std::sync::Mutex<Vec<(String, PathBuf)>>>;
+
+/// Makes the fixture list every Git invocation, with the directory it is about to start in.
+pub fn watching_git(fixture: &mut Fixture) -> Started {
+    let started = Started::default();
     let seen = std::sync::Arc::clone(&started);
     fixture.interpose(kr_project::git::Interposition::new(std::sync::Arc::new(
-        move |_: &str, directory: &Path, _: &Path| {
+        move |described: &str, directory: &Path, _: &Path| {
             seen.lock()
                 .expect("the list is held")
-                .push(directory.to_path_buf());
+                .push((described.to_owned(), directory.to_path_buf()));
         },
     )));
     started
 }
 
 /// Returns true when a Git invocation started in `directory`, and forgets what was listed.
-pub fn git_started_in(started: &std::sync::Mutex<Vec<PathBuf>>, directory: &Path) -> bool {
-    let started = std::mem::take(&mut *started.lock().expect("the list is held"));
-    started.iter().any(|started| started == directory)
+pub fn git_started_in(started: &Started, directory: &Path) -> bool {
+    git_ran_in(started, directory, "git")
+}
+
+/// Returns true when a Git invocation whose description starts with `described` started in
+/// `directory`, and forgets what was listed.
+pub fn git_ran_in(started: &Started, directory: &Path, described: &str) -> bool {
+    let listed = std::mem::take(&mut *started.lock().expect("the list is held"));
+    listed
+        .iter()
+        .any(|(what, at)| at == directory && what.starts_with(described))
 }
 
 /// A broker whose programs are the ones installed Git ships with.
