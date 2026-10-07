@@ -783,19 +783,6 @@ async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
         ),
         ErrorCode::PermissionDenied
     );
-    assert_eq!(
-        code(
-            viewer_raw
-                .mutate(
-                    Method::HostClockEstablish,
-                    ActionId::new(kr_ipc::new_uuid()),
-                    target.clone(),
-                    &HostClockEstablishParams {},
-                )
-                .await
-        ),
-        ErrorCode::PermissionDenied
-    );
 
     // The owner device answers the local owner's challenge, and the local owner spends it once.
     let (proof, _) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner_keys));
@@ -810,6 +797,21 @@ async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
     )
     .await
     .expect("the owner device answers from its own connection");
+    // With an answered confirmation waiting, a device that is not an owner device still cannot
+    // spend it, and it is still there for the local owner.
+    assert_eq!(
+        code(
+            viewer_raw
+                .mutate(
+                    Method::HostClockEstablish,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target.clone(),
+                    &HostClockEstablishParams {},
+                )
+                .await
+        ),
+        ErrorCode::PermissionDenied
+    );
     let established = calls::establish_clock(environment, &mut client)
         .await
         .expect("the local owner spends the owner device's confirmation");
