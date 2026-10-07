@@ -85,7 +85,7 @@ pub struct Host {
     pub environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
-    work: tempfile::TempDir,
+    work: kr_ipc::testing::PrivateTempDir,
     /// The owner device the host was bootstrapped with.
     pub owner: Option<DeviceRecord>,
     /// That device's own endpoint and keys, for a suite that connects it.
@@ -253,7 +253,7 @@ impl Host {
             environment_id,
             endpoint,
             clients,
-            work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
+            work: kr_ipc::testing::PrivateTempDir::create(),
             owner: None,
             owner_device: None,
             room,
