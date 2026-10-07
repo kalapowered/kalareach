@@ -363,7 +363,7 @@ To move forward again, an archive of a newer release must be given to `kr host u
 
 The control daemon of the older release will be started with the arguments the newer release's daemon ran with. If this fails the rollback will still be recorded, and the next run of `kr host update` or `kr host rollback` will try to start the daemon again. The daemon can be started by hand with arguments it does accept. A service definition that `kr host startup` wrote names the daemon through `current`, so it follows the switch.
 
-`kr host update --check` does not read the stores. A release without a store in its manifest cannot be rolled back to. Stores listed in the older release's manifest but not present on the host are not checked, and neither is an environment that cannot be reached. The registry stores session create requests, closure records and the configuration it accepted, and most changes to those raise the version of the registry, so a rollback across such a release is refused. On Windows `kr host rollback` says what `kr host update` says: that the host keeps no store of releases.
+`kr host update --check` does not read the stores. A release without a store in its manifest cannot be rolled back to. Stores listed in the older release's manifest but not present on the host are not checked, and neither is an environment that cannot be reached. A `kr` command that writes a record between the check and the switch is not held off. The registry stores session create requests, closure records and the configuration it accepted, and most changes to those raise the version of the registry, so a rollback across such a release is refused. On Windows `kr host rollback` says what `kr host update` says: that the host keeps no store of releases.
 
 ## Stored formats
 
