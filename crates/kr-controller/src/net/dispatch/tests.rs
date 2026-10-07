@@ -2751,9 +2751,9 @@ async fn a_local_prompt_for_a_live_session_whose_worker_was_not_reached_at_start
 /// KR-REQ-09.12: a prompt a caller at this machine makes while another exchange holds the daemon's
 /// one link to the worker waits for its turn, and a session that closes meanwhile is closed to it:
 /// it is answered that the session closed, from the closure the host recorded, and nothing is
-/// recorded or sent for a session that is gone. It is not answered as a failure of the worker,
-/// whether the link it then gets still reaches the worker or the worker has ended and the daemon
-/// cannot open another.
+/// recorded, and nothing the worker could take is sent, for a session that is gone. It is not
+/// answered as a failure of the worker, whether the link it then gets still reaches the worker or
+/// the worker has ended and the daemon cannot open another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is_told_it_closed() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
@@ -2855,9 +2855,9 @@ async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is
 /// KR-REQ-09.12: an exact repeat of a prompt, made while another exchange holds the daemon's one
 /// link to the worker, is answered from the receipt the worker holds for its first attempt even when
 /// the session closes while it waits: the closure is recorded and the worker still answers, and what
-/// a duplicate is owed is the existing receipt. Nothing is recorded or sent anew, whether the repeat
-/// carries the window of the connection it is made on or one this connection never issued, and
-/// whether it carries its text or names a draft.
+/// a duplicate is owed is the existing receipt. Nothing is recorded, and nothing the worker could
+/// take is sent, whether the repeat carries the window of the connection it is made on or one this
+/// connection never issued, and whether it carries its text or names a draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_waiting_for_the_workers_link_while_the_session_closes_is_answered_from_its_receipt()
  {
