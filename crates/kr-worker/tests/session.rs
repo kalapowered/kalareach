@@ -223,8 +223,11 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     // itself by `exec` as a Unix process does, so the closure can name more than one.
     if cfg!(windows) {
         assert!(
-            !record.terminated.is_empty(),
-            "the closure names what it stopped: {:?}",
+            record
+                .terminated
+                .iter()
+                .any(|process| process.name.0.as_deref() == Some("the session's root shell")),
+            "the closure names the root shell it stopped: {:?}",
             record.terminated
         );
     } else {
