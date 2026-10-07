@@ -2152,8 +2152,12 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 
 /// A worker whose session runtime and connections run on a runtime of their own, on a thread of
 /// their own, as a worker's do in its own process. It ends, with its runtime, when this is dropped.
+///
+/// A case holds one of the worker's tasks for seconds, where the product's worker holds the
+/// boundary for one transition at a time, so this worker's runtime is kept polling ([`Awake`]) and
+/// a product worker's need not be.
 struct ApartWorker {
-    /// First, so it ends before the runtime it wakes.
+    /// The thread that keeps the runtime polling, ended before the runtime is told to stop.
     awake: Option<Awake>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -2220,8 +2224,9 @@ impl ApartWorker {
 /// a timer until it comes back: the daemon's announcement would sit unread until the daemon's own
 /// bound on the exchange ran out, and a case that waits for the worker to refuse it would be
 /// waiting for the release it has not yet given. A task handed to the runtime from outside wakes a
-/// sleeping thread, which polls the sockets and timers when it goes to sleep again. How often the
-/// task comes decides nothing: any interval wakes a thread in the end.
+/// sleeping thread, which polls the sockets and timers when it goes to sleep again. A task comes
+/// every few milliseconds, which is far inside the daemon's exchange bound; a thread of the runtime
+/// has to be free to take it, and a case never stops more than three of the four.
 struct Awake {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
