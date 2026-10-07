@@ -1,7 +1,7 @@
 {
   "format": "kalareach.trace/1",
   "name": "time-rollback-and-suspension",
-  "about": "the machine sleeps between two expiry reads and the wall clock goes back twice, once inside the 5 s tolerance and once past it: a sleep counts against a deadline on the continuous clock whichever read notices it first, a rollback inside the tolerance gives a UTC deadline none of its time back, a rollback past it leaves UTC deadlines unproven, and nothing that expired revives",
+  "about": "the machine sleeps between two expiry reads and the wall clock goes back twice, once inside the 5 s tolerance and once past it: a sleep counts against a deadline on the continuous clock whichever read notices it first, a rollback inside the tolerance gives a UTC deadline none of its time back (the projection credits the continuous clock 100 ppm less, so the deadline is reached a few milliseconds after the continuous clock counts down to it, and the last advance is 2010 ms for that), a rollback past it leaves UTC deadlines unproven, and nothing that expired revives",
   "columns": 20,
   "rows": 3,
   "wall_ms": 1790000000000,
@@ -21,7 +21,7 @@
     { "do": "step_wall", "ms": -4000 },
     { "do": "observe_time", "expect": [] },
     { "do": "validity", "object": { "name": "token", "utc_ms": 1790000060000 }, "expect": "valid" },
-    { "do": "advance", "ms": 2000 },
+    { "do": "advance", "ms": 2010 },
     { "do": "observe_time", "expect": [] },
     { "do": "validity", "object": { "name": "token", "utc_ms": 1790000060000 }, "expect": "expired: trusted_utc_deadline" },
     { "do": "step_wall", "ms": -2000 },
