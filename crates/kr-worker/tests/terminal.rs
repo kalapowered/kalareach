@@ -411,6 +411,10 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
     // The shell asks the terminal what it is. A host that forwarded the question would have the
     // attached terminal answer it, and two attachments would answer it twice; a host that answered
@@ -466,6 +470,10 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     // A bell, a clipboard write and some text, all before anybody attaches. What the attachment
     // gets is the text, on a screen; what it must not get is the bell or the clipboard write, which
@@ -567,6 +575,10 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
 /// KR-REQ-08.06, KR-REQ-08.38: a side effect reaches the one attachment holding the input lease,
 /// under the host's policy, and no other terminal watching the same output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     // The bell, a clipboard write and a line of text in one write. The bell and the clipboard
     // write are side effects and have one destination; the text is output and reaches every
@@ -671,6 +683,10 @@ const SPLIT_CLIPBOARD_WRITE: &str = "stty -echo -echonl || exit 1; printf '\\033
 /// at, nor cut where that screen ends: an operating-system command that is sent in part leaves the
 /// terminal inside it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole() {
     let host = host(SPLIT_CLIPBOARD_WRITE).await;
     produced(&host.runtime, b"]52;c;c2Vj").await;
@@ -691,6 +707,10 @@ async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole()
 /// lets a held terminal take the stream. The terminal is then told to begin again on it, and the
 /// effect it is owed is written before that, not dropped with the stream it replaces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches_it() {
     let host = host(SPLIT_CLIPBOARD_WRITE).await;
     produced(&host.runtime, b"]52;c;c2Vj").await;
@@ -720,6 +740,10 @@ async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches
 /// KR-REQ-08.38, KR-REQ-08.06: with nobody holding the input lease a side effect has no
 /// destination, so it is recorded as a durable host event and reaches no attached terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_terminal() {
     // Two terminals watch and neither takes the keys, so nobody can release the application by
     // typing. It waits for a file this test creates once both are watching, on the internal disk
@@ -777,6 +801,10 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
 /// bracketed paste open, it waits for the paste to close rather than landing inside it, reaches
 /// the application after the question it answers, and neither needs nor takes the input lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     // The application turns bracketed paste on, asks its question only when this test says so,
     // and reads its input only once the paste is over, so the order it reads things in is the
@@ -832,6 +860,10 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
 /// KR-REQ-08.49: when the person with a paste open goes away, the paste is closed before the host's
 /// held answer is written, so the answer never lands inside a paste nobody is left to finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&gates).expect("a directory for this test's gates");
@@ -1000,6 +1032,10 @@ async fn flooded_application() -> Flooded {
 /// application read of them. What the application then does with the line is the next test's
 /// question, which the shell and the operating system's terminal answer as much as this host does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_typed_line_is_taken_whole() {
     let Flooded {
         host,
@@ -1108,6 +1144,10 @@ async fn a_flooded_application_answers_the_line_typed_to_it() {
 /// the terminal that comes back, even one resuming from a position before the question, is drawn
 /// the screen as it is, and nothing in its stream asks its own terminal the question again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer() {
     // The application asks once, when this test opens the gate, and then shows everything it is
     // given as text, so every answer the host writes into its input can be counted.
@@ -1210,6 +1250,10 @@ async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer
 /// KR-REQ-08.47: output direct mode cannot carry moves a direct terminal to projection, and it is
 /// shown U+FFFD where the malformed bytes were rather than the bytes themselves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+)]
 async fn malformed_output_moves_a_direct_terminal_to_projection_with_replacement_characters() {
     // A surrogate, which is never valid UTF-8, between two runs of good text, written only once
     // this terminal has joined, and then a line that ends the run.
