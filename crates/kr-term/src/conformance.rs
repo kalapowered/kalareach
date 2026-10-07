@@ -611,6 +611,16 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
         input: b"\x1b)0\x1b[1;31m\x1b[2;4H\x1b7\x1b[?1047h\x1b)B\x1b[42m\x1b[3;2H\x1b7",
     },
     GridCase {
+        id: "saved_cursors_inside_links",
+        covers: "KR-REQ-08.29 a saved cursor keeps the link it was saved inside, parameters included",
+        cols: 12,
+        rows: 3,
+        // Two links to one target that differ only in their parameters, one saved in each buffer.
+        // The second spells its parameters out of order: the record holds them in key order.
+        input: b"\x1b]8;id=a;https://example.invalid/\x1b\\\x1b7\x1b[?1047h\
+                 \x1b]8;x=1:id=b;https://example.invalid/\x1b\\\x1b7\x1b]8;;\x1b\\",
+    },
+    GridCase {
         id: "pending_wrap_at_margin",
         covers: "KR-REQ-08.78 pending wrap",
         cols: 4,
@@ -907,7 +917,8 @@ fn row_values(rows: &[crate::grid::GridRow]) -> Vec<Value> {
         .collect()
 }
 
-/// Records one saved cursor, including the rendition and the character sets saved with it.
+/// Records one saved cursor, including the rendition, the character sets and the link, parameters
+/// included, saved with it.
 fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
     json!({
         "buffer": format!("{:?}", saved.buffer),
@@ -921,7 +932,10 @@ fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
             "g0": saved.charsets.g0,
             "g1": saved.charsets.g1,
         },
-        "hyperlink": saved.hyperlink.as_ref().map(|link| &link.uri),
+        "hyperlink": saved.hyperlink.as_ref().map(|link| json!({
+            "uri": link.uri,
+            "params": link.params,
+        })),
         "rendition": {
             "foreground": format!("{:?}", saved.rendition.foreground),
             "background": format!("{:?}", saved.rendition.background),
