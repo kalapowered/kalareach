@@ -137,13 +137,20 @@ impl OpenedRepository {
     /// that tree before Git is asked anything there.
     ///
     /// The directory is opened and decided by `require_within` first, and Git starts in that
-    /// object. Git looks upward for the repository a directory belongs to, so its search is
-    /// stopped at the directory above the recorded tree: a tree that lost its own `.git` finds no
-    /// repository, rather than the one around it. Where the platform cannot say where the tree
-    /// is, the search is not stopped, and the top level Git reports is decided before its
-    /// configuration is audited or anything else is run in it, which refuses a repository
-    /// that is not the recorded tree. A directory that took the place of the recorded tree, or a
-    /// filesystem mounted over it, is refused without Git having been started in it.
+    /// object. The top level Git reports is decided as well, before its configuration is audited
+    /// or anything else is run in it, so a directory that took the place of the recorded tree, or
+    /// a filesystem mounted over it, or a repository Git found around or inside it, is refused
+    /// without the repository being audited.
+    ///
+    /// `inside_tree` says the repository is one this host made inside its tree, an independent
+    /// clone, whose Git directory no record decides. Git's search for the repository is then
+    /// stopped at the directory above the tree, so a tree that lost its own `.git` finds no
+    /// repository rather than the one around it, whatever that repository's configuration says.
+    /// Any other repository can keep its Git directory anywhere (a checkout whose configuration
+    /// sets `core.worktree` keeps it above the tree), so the search is not stopped, and the
+    /// caller decides the Git directory once Git has said where it is. The search is not stopped
+    /// either where the platform cannot say where the tree is, or where the directory above it
+    /// holds the character Git separates its ceilings by.
     ///
     /// # Errors
     ///
@@ -155,18 +162,15 @@ impl OpenedRepository {
         environment_id: EnvironmentId,
         path: &Path,
         tree: RecordedIdentity,
+        inside_tree: bool,
     ) -> Result<(Self, Settled)> {
         let opened = Self::open_deciding(
             profile,
             environment_id,
             path,
             |named| {
-                // The search for the repository ends above the recorded tree, where the platform
-                // says where that is.
                 let recorded = require_within(named, tree)?;
-                Ok(path_of(&recorded)
-                    .ok()
-                    .and_then(|path| path.parent().map(Path::to_path_buf)))
+                Ok(inside_tree.then(|| ceiling_above(&recorded)).flatten())
             },
             |top| {
                 top.check_recorded(tree)
@@ -236,7 +240,7 @@ impl OpenedRepository {
             });
         }
         // The top level is opened and decided before its configuration is audited, and before
-        // anything is run in the repository Git found.
+        // anything else is run in the repository Git found.
         let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
         top(&tree)?;
         // The Git directory is opened as an object of its own, because for a linked worktree it
@@ -359,7 +363,7 @@ impl OpenedRepository {
         expected: RecordedRepository,
     ) -> Result<(Self, Option<Revised>)> {
         let (opened, tree) =
-            Self::open_recorded_tree(profile, environment_id, path, expected.work_tree)?;
+            Self::open_recorded_tree(profile, environment_id, path, expected.work_tree, false)?;
         let git_dir = opened.require_git_dir(expected.git_dir)?;
         Ok((opened, Self::revised(expected, git_dir, tree)))
     }
@@ -855,6 +859,21 @@ fn require_within(
     }
     Err(not_the_recorded_tree(tree, named.display_path(), &refusal))
 }
+
+/// Returns where Git's search for a repository stops for a tree: the directory above it, which Git
+/// does not look in. None where the platform does not say where the tree is, and where that
+/// directory's path holds the character Git separates its ceilings by, which would split it.
+fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
+    let above = path_of(tree).ok()?.parent()?.to_path_buf();
+    (!above.to_string_lossy().contains(CEILING_SEPARATOR)).then_some(above)
+}
+
+/// The character `GIT_CEILING_DIRECTORIES` separates its directories by.
+#[cfg(unix)]
+const CEILING_SEPARATOR: char = ':';
+/// The character `GIT_CEILING_DIRECTORIES` separates its directories by.
+#[cfg(windows)]
+const CEILING_SEPARATOR: char = ';';
 
 /// Returns the refusal for a directory that is not the working tree a record names.
 pub(crate) fn not_the_recorded_tree(

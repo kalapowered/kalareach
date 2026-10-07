@@ -1634,6 +1634,8 @@ impl ProjectService {
                     self.environment_id,
                     Path::new(&row.display_path),
                     tree,
+                    // An independent clone is its own repository, made inside its tree.
+                    row.isolation == Some(IsolationMechanism::IndependentClone),
                 )?;
                 (opened, settled)
             }
