@@ -1240,7 +1240,8 @@ impl TimeContract {
     /// A reading the worker took after the confirmation outranks it in the same way: a wall clock
     /// that has fallen behind the worker's own mark, when that mark was raised after the owner
     /// spoke, is a rollback the owner did not see, and an older confirmation does not clear what
-    /// the worker found after it.
+    /// the worker found after it. A restatement answers to the mark whatever its age, since it
+    /// adds nothing to what the worker knows.
     ///
     /// A wall clock behind either is a rollback since, and the confirmation is spent all the same,
     /// because one a worker met and could not follow is not one it follows when the clock next
@@ -1261,9 +1262,9 @@ impl TimeContract {
     /// worker that begins in a new boot and for a publication it did not complete. A restatement
     /// is not an action of the owner, so only a contract that began with nothing recorded, has
     /// found no rollback and is making its first look at a confirmation takes it. One that has
-    /// looked, that found a rollback, or that restored a record, spends it without following it:
-    /// a restatement over a withdrawal whose distrust the daemon lost clears nothing a worker
-    /// found.
+    /// looked at a confirmation, that found a rollback, or that restored a record, spends it
+    /// without following it: a restatement over a withdrawal whose distrust the daemon lost clears
+    /// nothing a worker found. One that takes it answers to its own mark, as above.
     fn follow_the_owner(
         &self,
         state: &mut TimeState,
@@ -1291,8 +1292,11 @@ impl TimeContract {
         let slack = MAX_WALL_CLOCK_ROLLBACK_MS
             .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
         let behind_the_confirmation = wall_ms.saturating_add(slack) < expected;
+        // A restatement adds nothing to what the worker knows of its clock, so it answers to the
+        // worker's mark whatever the mark's age. An action of the owner answers only to a mark
+        // raised after the owner spoke.
         let behind_a_later_mark = state.high_water.is_some_and(|mark| {
-            mark.continuous_ms >= established.boot_ms
+            (established.restated || mark.continuous_ms >= established.boot_ms)
                 && mark.projected(continuous_ms).saturating_sub(wall_ms)
                     > MAX_WALL_CLOCK_ROLLBACK_MS
         });
