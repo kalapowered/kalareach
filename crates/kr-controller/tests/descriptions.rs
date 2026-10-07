@@ -1352,6 +1352,10 @@ async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job
 /// resize still answer, and so do the daemon's reads of the session. The control is the same
 /// reads with nothing in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the typed input is not echoed into the output the case waits on, on a Windows pseudo-console, or not every time"
+)]
 async fn with_a_job_stopped_in_the_process_input_queries_and_resize_still_answer() {
     let mut environment = Environment::start(Setup {
         script: Script {
@@ -1589,6 +1593,10 @@ async fn privacy_mode_removes_the_description_and_describes_nothing_captured_whi
 /// job is tried again; when the next process fails it as well the job is not tried a third time,
 /// the session keeps the title it had, and input and reads still answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the typed input is not echoed into the output the case waits on, on a Windows pseudo-console, or not every time"
+)]
 async fn a_process_that_ends_inside_a_job_is_restarted_and_the_session_keeps_its_title() {
     let mut environment = Environment::start(Setup {
         script: Script {
