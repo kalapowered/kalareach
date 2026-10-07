@@ -71,8 +71,7 @@ pub struct LaunchProbe {
     pub mode: String,
     /// The modes the application cannot run with in a Windows service session.
     pub refused_in_service_session: Vec<String>,
-    /// What the package says its probe does, beside the exact list the host renders from this
-    /// declaration.
+    /// What the package says its probe does, in its own words.
     pub grant_statement: Summary,
 }
 
@@ -244,7 +243,7 @@ fn line_problem(text: &str, limit: usize) -> Option<String> {
         .find(|c| is_forbidden_text_char(*c))
         .map(|character| {
             format!(
-                "it carries U+{:04X}, which a person reading the grant could not see",
+                "it carries U+{:04X}, which a person reading the declaration could not see",
                 u32::from(character)
             )
         })
@@ -488,10 +487,7 @@ mod tests {
             "arguments, over",
         );
         one(mutated(&|p| p.arguments[0] = String::new()), "empty");
-        one(
-            mutated(&|p| p.arguments[1] = "a\nb".to_owned()),
-            "could not see",
-        );
+        one(mutated(&|p| p.arguments[1] = "a\nb".to_owned()), "U+000A");
         one(
             mutated(&|p| p.arguments[1] = "x".repeat(MAX_ARGUMENT_BYTES + 1)),
             "bytes, over",

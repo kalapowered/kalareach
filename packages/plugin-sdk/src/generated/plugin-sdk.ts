@@ -3332,8 +3332,7 @@ export interface CommandIntegration {
    */
   flags: string[]
   /**
-   * What the grant tells the person before they accept it, beside the exact list the host
-   * renders from this declaration.
+   * What the package says its integration does, in its own words.
    */
   grant_statement: string
   /**

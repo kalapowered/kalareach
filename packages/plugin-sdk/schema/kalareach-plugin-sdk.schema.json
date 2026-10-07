@@ -925,7 +925,7 @@
         },
         "grant_statement": {
           "$ref": "#/$defs/Summary",
-          "description": "What the grant tells the person before they accept it, beside the exact list the host\nrenders from this declaration."
+          "description": "What the package says its integration does, in its own words."
         },
         "variables": {
           "description": "The environment variables the integration sets for that invocation, in order.",
@@ -2209,7 +2209,7 @@
         },
         "grant_statement": {
           "$ref": "#/$defs/Summary",
-          "description": "What the package says its probe does, beside the exact list the host renders from this\ndeclaration."
+          "description": "What the package says its probe does, in its own words."
         },
         "mode": {
           "description": "An RFC 6901 JSON Pointer to the mode in the JSON the probe prints on standard output.",

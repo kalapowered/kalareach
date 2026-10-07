@@ -156,10 +156,14 @@ may look in its working directory for a program started by a bare name before it
 does on Windows), so on Windows the host runs an invocation as typed when a flag, as the package
 declares it, holds the text `kr-hook` in any mix of upper and lower case, whatever it is there for.
 
-The owner confirms `command_integration.launch` on every release, as for a native bridge, because
-the flags and variables are part of the release. The grant shows the package's `grant_statement`
-beside the exact list `CommandIntegration::statement` renders from the declaration: the command,
-each flag as a JSON string in order, and each variable as `NAME="value"`, nothing shortened.
+The owner confirms `command_integration.launch` on every release, because the flags and variables
+are part of the release. The plan a `plugin.install` confirmation is bound to holds the capability
+names, the exact package hash, which covers the declaration, and, when the grant holds
+`native_bridge.install`, that bridge's statement. The plan of a `plugin.grant` confirmation holds
+the capability names and the package hash. Neither holds the integration's `grant_statement` or the
+list `CommandIntegration::statement` renders from the declaration (the command, each flag as a JSON
+string in order, and each variable as `NAME="value"`, nothing shortened), so no confirmation shows
+them.
 
 A host reads the integration only from the verified manifest, never from what an installation says
 about it, and applies it only while the installation holds `command_integration.launch`. The

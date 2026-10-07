@@ -158,6 +158,6 @@ fn kr_req_07_64_a_probe_outside_the_contract_is_refused() {
     assert_refused(
         &changed(&|probe| probe["arguments"] = json!(["doctor", "--json\n--other"])),
         FindingCode::LaunchProbeInvalid,
-        "an argument a person reading the grant could not see whole",
+        "an argument a person reading the declaration could not see whole",
     );
 }
