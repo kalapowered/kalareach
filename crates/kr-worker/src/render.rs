@@ -105,8 +105,12 @@ pub struct Carried {
     pub clipped_rows: usize,
     /// Soft-wrap markers, which a byte stream cannot set on a row it has drawn itself.
     pub soft_wraps: usize,
-    /// Keyboard negotiation this restoration does not install: that of the buffer that is not
-    /// showing, and, for a terminal nobody was allowed to ask about its keyboard, that of both.
+    /// Keyboard negotiation this restoration does not install, other than the stack of the buffer
+    /// that is showing, which [`Carried::keyboard_stack`] counts.
+    ///
+    /// For a terminal that was asked about its keyboard that is the other buffer's flags and
+    /// stack. For one that was not asked it is whatever the session holds: the `modifyOtherKeys`
+    /// level, both buffers' flags and the other buffer's stack.
     pub other_keyboard: bool,
     /// Keyboard-stack entries the session holds, which this restoration does not install.
     pub keyboard_stack: usize,
@@ -577,8 +581,9 @@ impl Writer {
             // Nobody was allowed to ask this terminal what it had negotiated, so nothing here
             // changes it: a level or a flag installed now could not be put back, and a person left
             // in an encoding their shell does not expect is the failure they cannot work around.
-            // What the session holds is counted as something this restoration did not carry, which
-            // is what keeps such an attachment on a projection.
+            // What the session holds is counted as something this restoration did not carry. An
+            // attachment that declared no terminal is never handed the stream whatever is counted,
+            // because it is shown a projection for having no profile.
             if keyboard.modify_other_keys != 0
                 || kitty.flags.is_some()
                 || other.flags.is_some()
@@ -2376,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_that_was_asked_nothing_is_told_of_a_negotiation_only_the_other_buffer_holds() {
+    fn a_negotiation_only_the_other_buffer_holds_is_counted_for_a_terminal_asked_nothing() {
         // Nothing is installed for such a terminal in either buffer, so what the buffer that is
         // not showing holds is as much a loss as what the one that is showing holds.
         let withheld = render(
