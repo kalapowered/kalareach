@@ -4273,20 +4273,22 @@ an event and producing from it are two transactions, so a host that stops betwee
 and no notification, and the pending work is still where a person can see it. The event row carries
 the notice it was taken with, so the next pass finishes what the last one started.
 
-Each source keeps its own cursor, per store rather than per kind: a position in one session's
-outbox says nothing about another's. The cursor and the de-duplication record are committed in the
-same transaction as the work they describe, and the source is acknowledged only afterwards, so a
-host that dies in between is offered the same page again and the event keys absorb it. Both
-consumers register before they rely on collection keeping anything for them.
+The journal keeps the attention store's cursor under a consumer name that carries the store's scope,
+so a position in one store is never applied to another. The cursor and the de-duplication record are
+committed in the same transaction as the work they describe, and the store is acknowledged only
+afterwards, so a host that dies in between is offered the same page again and the event keys absorb
+it. The consumer registers before it relies on collection keeping anything for it.
 
-The attention store is one of the journal's sources, and the daemon takes from it on every pass. The
-take is made with the store held, in the producer's order: the announcements are read, the events
-and the cursor are committed to the journal, and only then is the store told. An announcement about
-a session the daemon is closing is not offered until the store has read the session's journal to its
-end. The take is made only while the journal stands where the privacy state the daemon publishes
-says: a fence the journal has not reached, or has not yet lifted, takes nothing, and the store
-offers the same announcements again. Notifications are then built from the notices the journal
-holds, one for each destination whose recipient's grant reaches what the notice is about.
+The attention store is the journal's source, and the daemon takes from it on every pass. The
+worker's receipt outbox is not a source: no attention rule or alert maps a receipt transition to a
+notification. The take is made with the store held, in the producer's order: the announcements are
+read, the events and the cursor are committed to the journal, and only then is the store told. An
+announcement about a session the daemon is closing is not offered until the store has read the
+session's journal to its end. The take is made only while the journal stands where the privacy
+state the daemon publishes says: a fence the journal has not reached, or has not yet lifted, takes
+nothing, and the store offers the same announcements again. Notifications are then built from the
+notices the journal holds, one for each destination whose recipient's grant reaches what the notice
+is about.
 
 What travels to a device is an opaque identifier, a preview sealed to that device's own
 notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a

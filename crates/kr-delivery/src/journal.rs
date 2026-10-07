@@ -120,13 +120,10 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The consumer prefix attention announcements are taken under.
 pub const ATTENTION_CONSUMER: &str = "kr-delivery/attention";
 
-/// The consumer prefix a worker outbox is taken under.
-///
-/// It is what [`kr_worker::journal::Journal::note_outbox_consumed`] is registered with, because a
-/// consumer that has not registered has no claim on what collection removes.
-pub const OUTBOX_CONSUMER: &str = "kr-delivery/outbox";
-
 /// Which retained source one taken event came from.
+///
+/// The enum types the `source` column of `delivery_events`, which is read back by
+/// [`EventSource::from_stored`], and names the consumer prefix a store is taken under.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -134,35 +131,30 @@ pub const OUTBOX_CONSUMER: &str = "kr-delivery/outbox";
 pub enum EventSource {
     /// An attention announcement, taken through `Attention::take_announcements`.
     Attention,
-    /// A worker outbox record, read through `Journal::outbox_after`.
-    WorkerOutbox,
 }
 
 impl EventSource {
     /// Every source, in declaration order.
-    pub const ALL: [Self; 2] = [Self::Attention, Self::WorkerOutbox];
+    pub const ALL: [Self; 1] = [Self::Attention];
 
     /// The stable name this source is stored under.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Attention => "attention",
-            Self::WorkerOutbox => "worker_outbox",
         }
     }
 
     /// The consumer one store of this source is taken under.
     ///
-    /// The scope is the store, not the source. Each session has its own journal and its own
-    /// attention store, and a cursor is a position in one of them: a cursor of 100 in one worker's
-    /// outbox says nothing about another worker's, whose records may start at one. One consumer
-    /// name for every store of a kind would hand a new session's records to a cursor that had
-    /// already passed them.
+    /// The scope is the store, not the source. A cursor is a position in one store: a cursor of 100
+    /// in one says nothing about another, whose records may start at one. One consumer name for
+    /// every store of a kind would hand a new store's records to a cursor that had already passed
+    /// them.
     #[must_use]
     pub fn consumer(self, scope: &str) -> String {
         let prefix = match self {
             Self::Attention => ATTENTION_CONSUMER,
-            Self::WorkerOutbox => OUTBOX_CONSUMER,
         };
         format!("{prefix}/{scope}")
     }
@@ -179,10 +171,9 @@ impl EventSource {
 /// The identity of one underlying event, in its own source's vocabulary.
 ///
 /// It is the de-duplication record's key, so it has to be the identity the source will present
-/// again if this host dies before it acknowledges the page. For the worker outbox that is the
-/// event's immutable identifier. For attention it is the session, the item key and the
-/// announcement's own never-reused number, which is exactly what the attention store says a
-/// consumer keys by.
+/// again if this host dies before it acknowledges the page. For attention it is the session, the
+/// item key and the announcement's own never-reused number, which is exactly what the attention
+/// store says a consumer keys by.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -192,15 +183,6 @@ pub struct EventKey {
 }
 
 impl EventKey {
-    /// Names one worker outbox event.
-    #[must_use]
-    pub fn outbox(event_id: &kr_protocol::scalars::Uuid) -> Self {
-        Self {
-            source: EventSource::WorkerOutbox,
-            identity: hex(event_id.as_bytes()),
-        }
-    }
-
     /// Names one attention announcement, by session, item and announcement number.
     #[must_use]
     pub fn announcement(session: Option<SessionId>, item: &str, number: u64) -> Self {
@@ -217,7 +199,7 @@ impl EventKey {
         self.source
     }
 
-    /// The stored form: the source and the identity, which is unique across both sources.
+    /// The stored form: the source and the identity.
     #[must_use]
     pub fn stored(&self) -> String {
         format!("{}:{}", self.source.as_str(), self.identity)
@@ -4057,14 +4039,6 @@ fn parse_notification(value: &str) -> Result<NotificationId> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    text
-}
-
 /// Returns a bounded `i64` for a count this store holds as one.
 fn as_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -4233,7 +4207,7 @@ mod tests {
     }
 
     fn event(byte: u8) -> EventKey {
-        EventKey::outbox(&uuid(byte))
+        EventKey::announcement(None, "an-item", u64::from(byte))
     }
 
     fn taken(byte: u8, cursor: u64) -> TakenEvent {
@@ -4247,7 +4221,7 @@ mod tests {
     }
 
     fn consumer() -> String {
-        EventSource::WorkerOutbox.consumer("session-1")
+        EventSource::Attention.consumer("session-1")
     }
 
     fn destination(id: &str) -> DestinationRecord {
@@ -6468,8 +6442,8 @@ mod tests {
     #[test]
     fn two_stores_of_one_source_keep_separate_cursors() {
         let mut journal = journal();
-        let first = EventSource::WorkerOutbox.consumer("session-1");
-        let second = EventSource::WorkerOutbox.consumer("session-2");
+        let first = EventSource::Attention.consumer("session-1");
+        let second = EventSource::Attention.consumer("session-2");
         journal.register_consumer(&first, 1).expect("registration");
         journal.register_consumer(&second, 1).expect("registration");
         journal

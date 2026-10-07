@@ -1,24 +1,29 @@
 //! Taking what the host recorded, and producing notifications from it.
 //!
-//! # Two sources, one journal, and a cursor committed with its effect
+//! # One source, one journal, and a cursor committed with its effect
 //!
-//! Attention decides announcements; the worker writes an outbox row beside every state transition.
-//! This producer consumes both, because they answer different questions: an announcement is *this
-//! condition wants a person*, and an outbox record is *this happened*. Neither source knows about
-//! the other, so this crate keeps a cursor for each, under its own consumer name, and both
-//! register before they rely on collection keeping anything for them.
+//! Attention decides announcements: *this condition wants a person*. The worker's receipt outbox
+//! says *this happened*, and no attention rule or alert maps a receipt transition to a
+//! notification, so this producer takes announcements and nothing else. It keeps a cursor for each
+//! attention store, under that store's own consumer name, and registers before it relies on
+//! collection keeping anything for it.
 //!
-//! The order is the same for both and it is the order crash-safety needs:
+//! The order is the order crash-safety needs:
 //!
-//! 1. read a page from the source, which takes nothing and moves nothing;
+//! 1. read a page from the store, which takes nothing and moves nothing;
 //! 2. commit the de-duplication record and the cursor **in this journal**, in one transaction;
-//! 3. produce the notifications, in a second transaction that the foreign key refuses unless step
-//!    two committed;
-//! 4. acknowledge upstream - `settle_announcements`, `note_outbox_consumed`.
+//! 3. settle the page with the store - `settle_announcements`;
+//! 4. produce the notifications, in a later transaction that the foreign key refuses unless step
+//!    two committed ([`Producer::finish_pending`]).
 //!
-//! A host that dies anywhere in that sequence is handed the same page again and the event keys
-//! absorb it. A host that dies between two and three has the event and no notification, which is
-//! section 16's *the host writes the underlying event first* holding even through a crash.
+//! While privacy mode is on, the generic alert a pending approval or question still owes is
+//! admitted in the transaction of step two instead.
+//!
+//! A host that dies before step three is handed the same page again and the event keys absorb it.
+//! A host that dies between steps two and four has the event and no notification, and a later pass
+//! produces from the notice the event carries; that is section 16's *the host writes the
+//! underlying event first* holding even through a crash. The privacy-mode alert has no such
+//! window, because it is written with its event.
 //!
 //! # The privacy generation travels with the work
 //!
@@ -318,11 +323,11 @@ impl Notice {
 
 /// One underlying event that is worth recording and warrants no notification.
 ///
-/// The worker outbox carries every state transition, and most of them are nobody's notification.
-/// Taking them is still what makes this journal a registered consumer with a claim on collection,
-/// and the empty notice is what says the event needs nothing produced from it.
+/// An announcement the host decided needs nothing produced is still taken, so that its cursor
+/// moves and it is not offered again; the empty notice is what says the event needs nothing
+/// produced from it.
 #[must_use]
-pub fn observed(
+fn observed(
     key: EventKey,
     source_cursor: u64,
     session_id: Option<SessionId>,
@@ -458,12 +463,6 @@ pub fn authority_digest(rule: &DeliveryRule, scope: Option<&RecipientScope>) -> 
             text
         })
 }
-
-/// What a caller answers for one worker outbox record: what to notify about, and what to say.
-///
-/// `None` is a record worth taking and nobody's notification, which is most of them.
-pub type ProductionOf<'a> =
-    &'a dyn Fn(&kr_worker::persistence::outbox::OutboxRecord) -> Option<(Notice, Vec<ContentLine>)>;
 
 /// What producing from one page did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -680,9 +679,6 @@ pub struct Producer {
 /// How many unproduced events one page of recovery reads.
 pub const MAX_PENDING_PER_PAGE: usize = 256;
 
-/// How many outbox records one pass takes from a worker's journal.
-pub const MAX_OUTBOX_PAGE: u64 = 256;
-
 impl Producer {
     /// Builds a producer over one delivery journal.
     ///
@@ -709,10 +705,10 @@ impl Producer {
 
     /// Takes every announcement one attention store is offering, and settles them afterwards.
     ///
-    /// The order is the attention store's settlement rule and the outbox consumer rule together:
-    /// take, record durably with the cursor, then settle. A host that dies before the settlement
-    /// is offered the same announcements again and the event keys absorb them; one that dies
-    /// before the local transaction has settled nothing, so nothing is lost either way.
+    /// The order is the attention store's settlement rule: take, record durably with the cursor,
+    /// then settle. A host that dies before the settlement is offered the same announcements again
+    /// and the event keys absorb them; one that dies before the local transaction has settled
+    /// nothing, so nothing is lost either way.
     ///
     /// `scope` names the store, because a cursor is a position in one store and nothing else.
     /// `offer` is how the host holds back an announcement it is not ready to hand over, such as a
@@ -908,73 +904,6 @@ impl Producer {
             records,
             spent,
         })
-    }
-
-    /// Takes one page of a worker's outbox, and tells the worker afterwards.
-    ///
-    /// Registration comes first and is repeated on every pass, because a consumer that has not
-    /// registered has no claim on what collection removes. The acknowledgement comes after the
-    /// local transaction, for the same reason the attention settlement does.
-    ///
-    /// Every record is taken, which is what makes this journal a registered consumer of the whole
-    /// stream rather than of the part it happens to notify about. What decides whether a record
-    /// becomes a notification is `production`, and it is asked **before** the cursor moves: what
-    /// it answers is committed with the cursor, so a host that stops immediately afterwards has
-    /// everything it needs to finish the notification. A record it answers `None` for is committed
-    /// as decided - taken, nothing to produce - so a recovery pass never has to guess whether an
-    /// empty notice means silence or a notice that was never written.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DeliveryError::Source`] when the worker's journal cannot be read or told,
-    /// [`DeliveryError::Encoding`] when a production cannot be encoded, and
-    /// [`DeliveryError::JournalUnavailable`] when this journal cannot be written.
-    pub fn take_from_outbox(
-        &mut self,
-        worker: &mut kr_worker::journal::Journal,
-        scope: &str,
-        session_id: Option<SessionId>,
-        now_ms: u64,
-        production: ProductionOf<'_>,
-    ) -> Result<Vec<(EventKey, kr_worker::persistence::outbox::OutboxRecord)>> {
-        let consumer = EventSource::WorkerOutbox.consumer(scope);
-        self.journal.register_consumer(&consumer, now_ms)?;
-        let cursor = self
-            .journal
-            .consumer_cursor(&consumer)?
-            .map_or(0, |held| held.cursor);
-        worker
-            .note_outbox_consumed(&consumer, cursor, 0)
-            .map_err(|error| DeliveryError::Source(error.to_string()))?;
-        let page = worker
-            .outbox_after(cursor, MAX_OUTBOX_PAGE)
-            .map_err(|error| DeliveryError::Source(error.to_string()))?;
-        if page.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::with_capacity(page.len());
-        let mut taken = Vec::with_capacity(page.len());
-        let mut highest = cursor;
-        for record in page {
-            let key = EventKey::outbox(&record.event.event_id);
-            let event = match production(&record) {
-                Some((notice, lines)) => notice.taken_with(record.cursor, lines)?,
-                None => observed(
-                    key.clone(),
-                    record.cursor,
-                    session_id,
-                    record.event.recorded_at_ms,
-                ),
-            };
-            events.push(event);
-            highest = highest.max(record.cursor);
-            taken.push((key, record));
-        }
-        let applied = self.journal.take_events(&consumer, &events, highest)?;
-        worker
-            .note_outbox_consumed(&consumer, highest, applied as u64)
-            .map_err(|error| DeliveryError::Source(error.to_string()))?;
-        Ok(taken)
     }
 
     /// The journal, for reads a caller needs.
@@ -1917,16 +1846,16 @@ mod tests {
         );
     }
 
-    /// A worker event nobody notifies about is decided as it is taken, and one that does notify
+    /// An event nobody notifies about is decided as it is taken, and one that does notify
     /// commits what it will be built from before the cursor moves past it.
     #[test]
-    fn a_worker_event_is_decided_or_committed_with_everything_it_needs() {
+    fn an_event_is_decided_or_committed_with_everything_it_needs() {
         let mut producer = producer();
         let notice = notice(1_000);
-        let quiet = EventKey::outbox(&Uuid::from_bytes([8; 16]));
+        let quiet = EventKey::announcement(None, "a-quiet-item", 8);
         producer
             .take(
-                EventSource::WorkerOutbox,
+                EventSource::Attention,
                 SCOPE,
                 &[
                     observed(quiet.clone(), 1, None, TimestampMs::new(900)),
@@ -2559,10 +2488,10 @@ mod tests {
     #[test]
     fn an_event_that_warrants_no_notification_is_still_taken_and_still_finished() {
         let mut producer = producer();
-        let key = EventKey::outbox(&Uuid::from_bytes([4; 16]));
+        let key = EventKey::announcement(None, "a-quiet-item", 4);
         producer
             .take(
-                EventSource::WorkerOutbox,
+                EventSource::Attention,
                 SCOPE,
                 &[observed(key.clone(), 3, None, TimestampMs::new(900))],
                 3,

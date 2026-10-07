@@ -2017,7 +2017,7 @@ mod tests {
     }
 
     fn consumer() -> String {
-        EventSource::WorkerOutbox.consumer("session-1")
+        EventSource::Attention.consumer("session-1")
     }
 
     /// The one external destination these tests deliver to.
@@ -2202,7 +2202,7 @@ mod tests {
 
         /// Admits one delivery to the webhook and claims it, so it is on the wire.
         fn delivery_on_the_wire(&self, byte: u8) -> NotificationId {
-            let event = Uuid::from_bytes([byte; 16]);
+            let event = EventKey::announcement(None, "an-item", u64::from(byte));
             let notification_id = NotificationId::new(Uuid::from_bytes([byte + 100; 16]));
             self.delivery
                 .with(|producer| {
@@ -2211,7 +2211,7 @@ mod tests {
                         .take_events(
                             &consumer(),
                             &[TakenEvent {
-                                key: EventKey::outbox(&event),
+                                key: event.clone(),
                                 source_cursor: u64::from(byte),
                                 session_id: None,
                                 recorded_at_ms: at(0),
@@ -2223,7 +2223,7 @@ mod tests {
                     journal
                         .admit(&DeliveryRecord {
                             notification_id,
-                            event: EventKey::outbox(&event),
+                            event: event.clone(),
                             destination_id: DestinationId::new("hook").expect("an identifier"),
                             state: DeliveryState::Admitted,
                             privacy_generation: 0,

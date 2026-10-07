@@ -742,9 +742,9 @@ impl Environment {
     /// Admits one notice for a webhook and claims it, as a delivery pass does, so it is on the
     /// wire. Nothing the daemon runs carries it, so nothing but this test settles it.
     fn delivery_on_the_wire(&self) -> NotificationId {
-        let event = Uuid::from_bytes([0x44; 16]);
+        let event = EventKey::announcement(None, "an-item", 0x44);
         let notification_id = NotificationId::new(Uuid::from_bytes([0x45; 16]));
-        let consumer = EventSource::WorkerOutbox.consumer("session-1");
+        let consumer = EventSource::Attention.consumer("session-1");
         self.controller()
             .delivery
             .with(|producer| {
@@ -757,7 +757,7 @@ impl Environment {
                     .take_events(
                         &consumer,
                         &[TakenEvent {
-                            key: EventKey::outbox(&event),
+                            key: event.clone(),
                             source_cursor: 1,
                             session_id: None,
                             recorded_at_ms: now(),
@@ -769,7 +769,7 @@ impl Environment {
                 journal
                     .admit(&DeliveryRecord {
                         notification_id,
-                        event: EventKey::outbox(&event),
+                        event: event.clone(),
                         destination_id: DestinationId::new("hook").expect("an identifier"),
                         state: DeliveryState::Admitted,
                         privacy_generation: 0,

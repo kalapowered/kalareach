@@ -12,7 +12,7 @@
 //! | [`budget`] | The host's own burst and sustained account, and the five-minute collapse |
 //! | [`push`] | The send-and-receipt seam, the retry schedule and what each gateway answer means |
 //! | [`external`] | Webhook, Slack, email, Discord and Telegram delivery, and the uncertainty a destination without idempotency leaves |
-//! | [`producer`] | Taking from attention and from the worker outbox, and producing notifications from what was taken |
+//! | [`producer`] | Taking from attention, and producing notifications from what was taken |
 //! | [`privacy`] | The content-bearing outbox privacy mode fences, cancels and reconciles |
 //! | [`DeliveryError`] | The failures above |
 //!
@@ -24,12 +24,13 @@
 //! two transactions, so a host that dies between them has the event and no notification, which is
 //! the direction section 16 asks for. Nothing here compares timestamps to decide the order.
 //!
-//! **A consumer's cursor is committed with its effect.** Taking a page from either source writes
-//! the de-duplication record, the notifications produced from it and the cursor in one
-//! transaction. The upstream acknowledgement - `settle_announcements` for attention,
-//! `note_outbox_consumed` for the worker outbox - happens after that transaction, so a crash in
-//! between replays a page this journal already holds and the de-duplication record absorbs it.
-//! Both consumers register before they rely on collection keeping anything for them.
+//! **A consumer's cursor is committed with its effect.** Taking a page from an attention store
+//! writes the de-duplication record and the cursor in one transaction; the notifications are
+//! produced from the event in a later one, and while privacy mode is on the generic alert is
+//! written in the first. The upstream acknowledgement - `settle_announcements` - happens after
+//! that transaction, so a crash in between replays a page this journal already holds and the
+//! de-duplication record absorbs it. The consumer registers before it relies on collection
+//! keeping anything for it.
 //!
 //! **Nothing about the work reaches a provider in the clear.** The alert is one of six sentences
 //! from [`kr_protocol::push::PushAlert`]. The preview is sealed to the destination's
