@@ -957,9 +957,11 @@ jobs:
 
       # The suites that drive a session through the worker's pseudo-console, and the control
       # daemon's project, shell, privacy and description methods over a worker, one to a step. A case
-      # in them that reads a Unix terminal's output (a Windows pseudo-console draws the screen
-      # itself), takes a Unix shell package, or needs Git (this platform runs none) is ignored on
-      # this platform with its reason, which `cargo test` prints beside the case.
+      # in them that reads a Unix terminal's output, echo or input behaviour (a Windows
+      # pseudo-console draws the screen itself, answers the terminal's queries, and holds back an
+      # unfinished sequence and a lone Escape), takes a Unix shell package, or needs Git (this
+      # platform runs none) is ignored on this platform with its reason, which `cargo test` prints
+      # beside the case.
       - name: Test the project and workspace methods through the daemon
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --test project
