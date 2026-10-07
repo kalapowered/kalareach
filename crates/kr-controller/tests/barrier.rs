@@ -339,6 +339,36 @@ impl Pause {
     }
 }
 
+/// Keeps this runtime serving sockets and timers while a task of the worker is stopped.
+///
+/// A worker task that waits, inside a pause or for a lock, holds a thread of this runtime, as the
+/// worker's own process would hold one of its own. When every other thread is asleep waiting for
+/// work, nothing then reads a socket or fires a timer until that thread comes back: the daemon's
+/// announcement would sit unread, and a test that waits for the answer would be waiting for the
+/// release it has not yet given. A task that always has something to do next keeps one thread
+/// polling them.
+struct Awake {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Awake {
+    fn keep() -> Self {
+        Self {
+            task: tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        }
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// KR-REQ-09.12, KR-REQ-09.13, KR-ACC-022: the revocation reports `pending` while the worker is
 /// isolated, holds when the worker acknowledges, names what may already have been dispatched, and
 /// kills nothing.
@@ -1750,7 +1780,7 @@ struct Hosted {
     environment_id: EnvironmentId,
     session_id: SessionId,
     runtime: Arc<SessionRuntime>,
-    _service: Arc<WorkerService>,
+    service: Arc<WorkerService>,
 }
 
 /// Starts a daemon, creates a session through it, and performs the worker's side of the
@@ -1974,7 +2004,7 @@ async fn hosted_worker() -> Hosted {
         environment_id,
         session_id,
         runtime,
-        _service: service,
+        service,
     }
 }
 
@@ -2085,9 +2115,9 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
         .expect("connects to the worker");
     let local = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
 
-    // The session is held, so the mutation below takes the dispatch boundary and then waits for
-    // it. That is the pause: the action is inside the boundary, with nothing else able to enter.
-    let paused = Pause::hold(&hosted.runtime).await;
+    // The worker stops the next mutation it takes the moment it holds the dispatch boundary, so
+    // the action is inside the boundary, with nothing else able to enter and nothing else held.
+    let (inside, release) = hosted.service.pause_inside_boundary();
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
@@ -2121,38 +2151,32 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
         let answered = submit(&mut client, attach).await;
         (client, answered)
     });
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
-        .await
-        .expect("the waiting thread finishes");
+    // The worker says so once the mutation holds the boundary. Until then the revocation below
+    // could be the one that takes it, and the case would be about a different order. The wait is
+    // on a blocking thread, because the stopped mutation holds a thread of the runtime it shares.
+    // The bound only keeps a mutation that never arrives from holding the suite up.
+    let arrived =
+        tokio::task::spawn_blocking(move || inside.recv_timeout(Duration::from_secs(30)).is_ok())
+            .await
+            .expect("the waiting thread finishes");
+    assert!(arrived, "the mutation never took the dispatch boundary");
     assert!(
         !attaching.is_finished(),
-        "the mutation is inside the boundary, waiting for the session"
+        "the mutation is inside the boundary, stopped there"
     );
 
     // The revocation is announced while the mutation is in there. It cannot read the journal
-    // between the acceptance and the marker, because the fence takes the same boundary.
-    let revoking = tokio::spawn({
-        let controller = Arc::clone(&hosted.controller);
-        async move { controller.revoke_authority().await }
-    });
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
-        .await
-        .expect("the waiting thread finishes");
-    paused.release().await;
-
-    let (_client, answered) = tokio::time::timeout(Duration::from_secs(30), attaching)
-        .await
-        .expect("the mutation is answered")
-        .expect("the attaching task finishes");
-    assert!(
-        matches!(answered, Outcome::Ok(_)),
-        "the action was admitted before the revocation and it happened: {answered:?}"
-    );
-    let first = tokio::time::timeout(Duration::from_secs(60), revoking)
-        .await
-        .expect("the revocation reports")
-        .expect("the revoking task finishes")
-        .expect("the revocation is recorded");
+    // between the acceptance and the marker, because the fence takes the same boundary, and a
+    // worker that cannot take it refuses without waiting. So the daemon's first report comes back
+    // while the mutation is still stopped, once something keeps the runtime reading its sockets.
+    let awake = Awake::keep();
+    let first = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
     // The first report says pending for this worker, and that is the contract rather than a
     // failure: the worker was inside a dispatch transition when the announcement arrived, and
     // section 9 makes a worker that has not answered pending rather than assumed. What it must not
@@ -2162,6 +2186,17 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
         first.workers[0].detail.contains("not complete"),
         "{:?}",
         first.workers[0].detail
+    );
+    release.send(()).expect("the mutation is waiting for this");
+    drop(awake);
+
+    let (_client, answered) = tokio::time::timeout(Duration::from_secs(30), attaching)
+        .await
+        .expect("the mutation is answered")
+        .expect("the attaching task finishes");
+    assert!(
+        matches!(answered, Outcome::Ok(_)),
+        "the action was admitted before the revocation and it happened: {answered:?}"
     );
 
     // The effect happened once, and the receipt says so.

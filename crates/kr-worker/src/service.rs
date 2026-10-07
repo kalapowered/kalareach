@@ -255,6 +255,16 @@ pub struct WorkerService {
     /// tests.
     #[cfg(feature = "testing")]
     facts_holds_begun: std::sync::atomic::AtomicUsize,
+    /// A pause inside the dispatch boundary, taken by the next mutation as soon as it holds the
+    /// boundary, which this host's own tests arm to have a mutation inside it while something else
+    /// arrives. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    boundary_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl WorkerService {
@@ -473,6 +483,8 @@ impl WorkerService {
             facts_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            boundary_pause: Mutex::new(None),
         })
     }
 
@@ -809,6 +821,51 @@ impl WorkerService {
         self.facts_holds_begun
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Stops the next mutation inside the dispatch boundary, the moment it holds it, for this
+    /// host's own tests.
+    ///
+    /// Nothing else is held while it waits, so what a test does meanwhile meets a worker whose
+    /// boundary is taken and whose session is free, which is what a mutation in the middle of its
+    /// work leaves. Returns the end that says the mutation has arrived, and the end that lets it
+    /// go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_inside_boundary(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .boundary_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_inside_boundary(&self) {
+        let armed = self
+            .boundary_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own pause"
+    )]
+    const fn wait_inside_boundary(&self) {}
 
     /// Records one request or mutation as it arrives, for this host's own tests.
     #[cfg(feature = "testing")]
@@ -3819,6 +3876,7 @@ impl WorkerService {
             .dispatch
             .lock()
             .expect("the dispatch barrier is not poisoned");
+        self.wait_inside_boundary();
         // Section 9's time contract, before anything whose answer depends on an expiry. A wake, a
         // reboot or a step of the wall clock is revalidated here, on this mutation's own way
         // through, rather than left for a maintenance tick that may be a minute away.
