@@ -332,7 +332,12 @@ mod launch {
             gateway = gateway.in_session(Arc::clone(&session));
         }
         if probing {
-            gateway = gateway.with_launch_probe(standin.probe(&[]));
+            // The stand-in is a program the machine may be slow to start, and what these cases
+            // decide is the mode it prints, so the launch waits for it as long as the other cases
+            // here do.
+            gateway = gateway
+                .with_launch_probe(standin.probe(&[]))
+                .with_probe_deadline(super::GENEROUS);
         }
         let intent = broker
             .prepare_launch(

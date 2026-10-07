@@ -595,6 +595,13 @@ pub struct NativeGateway {
     /// deadline a single write gets, and so tell a writer this supervision ended from a writer
     /// that ran out of its own time: with both at one value, either could be what happened.
     teardown: std::time::Duration,
+    /// How long this gateway gives its launch probe to print its answer and end.
+    ///
+    /// It is [`crate::broker::probe::DEADLINE`] for every gateway this product binds. It is a
+    /// field rather than the constant at the one place that waits on it so that a test can give a
+    /// probe the time a loaded machine takes to start a program, and decide by what the probe
+    /// printed rather than by how soon it printed.
+    probe_deadline: std::time::Duration,
     /// The last process a launch of this gateway started, for this host's own tests.
     ///
     /// A launch that fails after its process started returns no process, and this is how a test
@@ -894,6 +901,18 @@ impl NativeGateway {
         self
     }
 
+    /// Sets how long this gateway gives its launch probe to print its answer and end.
+    ///
+    /// It exists so that this host's own tests can give a probe a program the machine is slow to
+    /// start, and read the mode that program prints, instead of racing the deadline a launch gives.
+    /// It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_probe_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.probe_deadline = deadline;
+        self
+    }
+
     /// Binds the endpoint this launch publishes.
     ///
     /// # Errors
@@ -924,6 +943,7 @@ impl NativeGateway {
         }
         Ok(Self {
             teardown: TEARDOWN_DEADLINE,
+            probe_deadline: crate::broker::probe::DEADLINE,
             broker,
             endpoint,
             observatory,
@@ -1274,11 +1294,13 @@ impl NativeGateway {
         let Some(probe) = self.launch_probe.as_ref() else {
             return Ok(intent);
         };
-        let probed = crate::broker::probe::run(
+        let probed = crate::broker::probe::run_within(
             std::path::Path::new(&intent.profile.binary.resolved_path),
             probe,
             &intent.profile.arguments,
             &self.launch.working_directory,
+            self.probe_deadline,
+            crate::broker::probe::MAX_OUTPUT_BYTES,
         );
         if let Some(mode) = probed.mode.as_deref()
             && probe.refuses_in_service_session(mode)
