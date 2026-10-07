@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_controller::authority::{AdmissionContext, AdmittedMutation, AuthorityBarrier};
+use kr_controller::error::ControllerError;
 use kr_controller::registry::{LaunchPhase, Registry};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -908,33 +909,42 @@ struct Daemon {
 }
 
 async fn daemon_host() -> Daemon {
+    daemon_host_on(Clocks::system()).await
+}
+
+/// A daemon that measures its deadlines on `clocks`, which a test can move by hand.
+async fn daemon_host_on(clocks: Clocks) -> Daemon {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
     let registry_path = environment.registry_database();
     let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let controller = Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        secret_store: StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(CountingSupervisor {
-            started: Arc::clone(&started),
-        }),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: build(),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
-    })
+    let controller = Controller::start_on_clocks(
+        ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(CountingSupervisor {
+                started: Arc::clone(&started),
+            }),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        },
+        clocks,
+    )
     .await
     .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
@@ -1044,9 +1054,19 @@ async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_ins
 /// The contention is real: one task holds the daemon's registry lock while the other's admission
 /// expires waiting for it. That is the case a check before the wait cannot catch, because before
 /// the wait the admission still stood.
+///
+/// The daemon measures its deadlines on a clock this test moves, so the order is the test's and
+/// not the machine's: the holder has the registry, the write is queued for it, and only then does
+/// the lifetime run out. A real delay would have to be long enough for the holder to get there on
+/// a loaded machine and short enough to end inside the lifetime, and no length is both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_mutation_admitted_before_its_deadline_is_refused_when_the_lock_wait_outlasts_it() {
-    let daemon = daemon_host().await;
+    let clock = ManualClock::new();
+    let daemon = daemon_host_on(Clocks {
+        continuous: Arc::new(clock.clone()),
+        wall: WallClock::system(),
+    })
+    .await;
     let client = LocalClient::connect(&daemon.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -1074,35 +1094,47 @@ async fn a_mutation_admitted_before_its_deadline_is_refused_when_the_lock_wait_o
         "the admission stands before the wait"
     );
 
-    // One task holds the registry for two seconds; the other's admission expires inside its wait.
+    // One task holds the registry, says so, and keeps it until the test lets it go. The receiver
+    // ends when the sender is dropped, so a test that panics does not leave the daemon locked.
+    let (holds, held) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = Arc::clone(&daemon.controller);
-    let held = AdmittedMutation { ..live };
+    let carried = AdmittedMutation { ..live };
     let holding = tokio::spawn(async move {
         holder
-            .enter_admitted(&held, |_| {
-                // A blocking sleep inside the closure, because the closure is what holds the lock
+            .enter_admitted(&carried, move |_| {
+                holds.send(()).expect("the test is waiting");
+                // A blocking wait inside the closure, because the closure is what holds the lock
                 // and nothing is awaited inside it.
-                std::thread::sleep(Duration::from_secs(2));
+                let _ = released.recv();
                 Ok(())
             })
             .await
     });
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100)))
-        .await
-        .expect("the waiting thread finishes");
+    held.await.expect("the holder has the registry");
 
-    let waited = daemon.controller.enter_admitted(&live, |_| Ok(())).await;
+    // The other write is driven until it is *in* the wait: one poll, and it answers pending,
+    // because the registry it needs is the one the holder has.
+    let mut waiting = Box::pin(daemon.controller.enter_admitted(&live, |_| Ok(())));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        std::future::Future::poll(waiting.as_mut(), &mut context).is_pending(),
+        "the write is queued for the registry rather than done"
+    );
+
+    // The registry stays held past the lifetime, and then it is free.
+    clock.advance(Duration::from_secs(2));
+    release.send(()).expect("the holder is waiting for this");
     assert!(
         holding.await.expect("the holder finishes").is_ok(),
         "the task that got there first wrote under an admission that still stood"
     );
-    let Err(error) = waited else {
+    let Err(error) = waiting.await else {
         panic!("a mutation whose lifetime ran out while it waited is refused inside the write");
     };
-    assert_eq!(
-        error.code(),
-        ErrorCode::PermissionDenied,
-        "refused rather than written: {error}"
+    assert!(
+        matches!(error, ControllerError::WindowExpired { .. }),
+        "refused for its lifetime rather than written: {error}"
     );
 }
 
