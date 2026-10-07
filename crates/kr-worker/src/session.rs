@@ -2973,13 +2973,13 @@ impl Session {
                 && !self.forwarding_held.contains_key(&id)
             {
                 // Already forwarding, and continuing: the boundary rule is about the moment
-                // forwarding *begins*, and this stream has not stopped. Two cases are not that.
-                // Three cases are not that. A subscriber that has been told to resynchronise is
-                // waiting for a fresh screen; one that is asking for a screen right now is
-                // beginning again from whatever it is given; and one already waiting for a
-                // boundary is still waiting for it, whatever it was being served when it asked.
-                // For all three the screen and the bytes after it have to meet at a boundary like
-                // any other transition, so the exemption does not apply.
+                // forwarding *begins*, and this stream has not stopped. Three cases are not that.
+                // A subscriber that has been told to resynchronise is waiting for a fresh screen;
+                // one that is asking for a screen right now is beginning again from whatever it is
+                // given; and one already waiting for a boundary is still waiting for it, whatever
+                // it was being served when it asked. For all three the screen and the bytes after
+                // it have to meet at a boundary like any other transition, so the exemption does
+                // not apply.
                 self.forwarding_held.remove(&id);
                 self.attachments.hold_forwarding(id, false);
                 continue;
