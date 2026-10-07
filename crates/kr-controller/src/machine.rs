@@ -31,10 +31,10 @@
 //! list of held records back after a wait, and the call's own reads and writes take what they take.
 //!
 //! A new record is written to a temporary file in the same directory, flushed, renamed over the
-//! record, and the directory is flushed after it. The record's name holds a whole record
-//! throughout: the old one until the rename, the new one after it. Windows can leave the name
-//! resolving to nothing for an instant while a rename replaces it, so a read that finds nothing
-//! waits for the step that may be replacing the record and reads again. A step that fails before the
+//! record, and the directory is flushed after it. The record's name holds a whole record whenever
+//! it resolves: the old one until the rename, the new one after it. Windows can leave the name
+//! resolving to nothing for an instant while a rename replaces it, so a read of this store that
+//! finds nothing waits for the step that may be replacing the record and reads again. A step that fails before the
 //! rename leaves the old record and says so. One that fails after it has published the new record,
 //! which every later read returns, and says that whether the change survives a crash is not known.
 //! The first record is written the same way and given its name by a link instead, which never
