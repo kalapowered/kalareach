@@ -1337,8 +1337,9 @@ jobs:
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
   # the performance measurements, on the platform whose service manager, process table, disk images
-  # and pseudo-terminals the host's macOS paths are written against. It runs beside the companion's
-  # macOS leg rather than inside it, so neither waits for the other.
+  # and pseudo-terminals the host's macOS paths are written against. It runs on two runners beside
+  # the companion's macOS leg, so that none of them waits for another: the lint and the tests on
+  # one, the demonstrations and the measurements on the other.
   #
   # What it leaves to the other jobs, because they run it natively and nothing in it differs on
   # macOS: formatting and the generated-file checks (rust), the TypeScript packages (typescript),
@@ -1349,10 +1350,22 @@ jobs:
   # host provides comes after a step that shows the host provides it, or runs where its own output
   # says whether it ran.
   macos:
-    name: macos
+    name: ${{ matrix.name }}
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      # Two runners, one definition. They set up the same way and then divide the work, so that the
+      # tests and the demonstrations do not wait for one another: `tests` runs the lint and the
+      # workspace's tests, and `demonstrations` the end-to-end demonstrations and the performance
+      # measurements. A step that names neither part is both's.
+      matrix:
+        include:
+          - name: macos
+            part: tests
+          - name: macos-demonstrations
+            part: demonstrations
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
     # hangs is ended and the steps after it still report. This one is under GitHub's six hours.
     timeout-minutes: 355
@@ -1448,7 +1461,7 @@ jobs:
         timeout-minutes: 10
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: macos
+          name: ${{ matrix.name }}
 
       - name: Build the test components
         timeout-minutes: 10
@@ -1511,14 +1524,14 @@ jobs:
       # From here each step runs whatever the one before it did, unless the job itself was
       # cancelled, so each reports its own result, and any one of them failing fails the job.
       - name: Clippy
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # The rust job's documentation step for this platform's own code: a doc comment on an item
       # only macOS compiles is read by this build and no other. The crates are that step's.
       - name: Documentation without warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 9
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -1542,7 +1555,7 @@ jobs:
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   the two steps after this one run.
       - name: Test
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 70
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
@@ -1584,7 +1597,7 @@ jobs:
       # step and deleted after it: internal rather than removable, and another filesystem from
       # /private/tmp.
       - name: The cases that need another filesystem
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -1689,7 +1702,7 @@ jobs:
       # rust job runs its timed suites serially, so that no other case of their suites shares this
       # runner's three processors with them. A case that did not pass here by name fails the step.
       - name: The timed cases, one at a time
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -1713,7 +1726,7 @@ jobs:
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind.
       - name: End-to-end demonstrations
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 45
         run: bash scripts/end-to-end.sh
 
@@ -1722,7 +1735,7 @@ jobs:
       # Built here, so the machine can then be let settle and the script's own builds find nothing
       # to do: a figure taken while a build is still winding down is a figure about the build.
       - name: Build what the measurements run
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 60
         run: |
           cargo build --locked --release --workspace
@@ -1731,7 +1744,7 @@ jobs:
       # Until the load average over the last minute is under one and a half, or ten minutes have
       # passed; the script records the load at the edges of every measurement either way.
       - name: Let the machine settle
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 12
         run: |
           for _ in $(seq 1 60); do
@@ -1749,7 +1762,7 @@ jobs:
       # named and is asserted by the macos-reference job; the idle memory bound and the other
       # figures are asserted here.
       - name: Performance measurements
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 45
         run: bash scripts/performance.sh
 
@@ -1760,7 +1773,7 @@ jobs:
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-evidence-macos
+          name: test-evidence-${{ matrix.name }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
