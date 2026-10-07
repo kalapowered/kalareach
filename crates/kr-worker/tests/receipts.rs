@@ -4224,6 +4224,39 @@ fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_onc
     assert_eq!(session.collect_expired(), 0);
 }
 
+/// KR-REQ-09.19: an establishment made before a worker began is not one for the clock that worker
+/// has come to doubt. A worker that restarts on a journal recording its clock as unresolved stays
+/// distrusted although the owner established the clock while it was down: the owner may have done
+/// so before the clock went wrong. The next establishment ends it.
+#[test]
+fn a_worker_started_after_an_establishment_does_not_follow_it() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    drop(session);
+
+    machine.owner_establishes(&floor);
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the establishment was made before this worker began"
+    );
+    assert_eq!(session.collect_expired(), 0);
+
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert_eq!(session.collect_expired(), 1);
+}
+
 /// KR-REQ-09.12, 09.13: a fence report bigger than one acknowledgement is delivered a page at a
 /// time from the journal, every page encodes inside one control frame, and the pages together name
 /// every affected action however many there are.
