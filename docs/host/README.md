@@ -1204,7 +1204,9 @@ To paint the buffer that is not showing, the restoration enters it through mode 
 and leaves it (retaining what was painted) before installing anything, since leaving restores the
 cursor and may turn off line-feed/new-line mode on some terminals, undoing anything that was put in.
 When the primary buffer is showing, the other buffer is painted immediately after the soft reset,
-and the reset is repeated to forget the cursor that entering saved. When the alternate buffer is
+and the reset is repeated to forget the cursor that entering saved. Each reset follows a carriage
+return and a plain rendition, because xterm's reset saves a fresh cursor that keeps a pending wrap
+and leaves faint, crossed-out and doubly underlined set. When the alternate buffer is
 showing, the primary buffer is painted between leaving and re-entering the alternate buffer. The
 second entry to the alternate buffer saves a plain cursor (the default pen and shape, no link, at
 home). Mode 47 is not one the profile tracks, and a restoration never asks a terminal for it. A
