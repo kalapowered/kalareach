@@ -50,9 +50,10 @@ pub struct Attachment {
     /// the canonical screen rather than trusting the terminal to already match it. The host asks
     /// again whenever the session's output goes quiet and whenever the session's size changes, so a
     /// screen that has become one a restoration can carry gives the attachment the stream back,
-    /// and a report of a new window from a terminal that is not being sent the stream asks again
-    /// of the screen the session holds then. A caller shown the live screen alone is asked once,
-    /// when that is recorded, because no screen it is drawn can carry everything.
+    /// and a window report from a terminal that is not being sent the stream asks again of the
+    /// screen the session holds then, whether the window is new or the terminal has been told to
+    /// begin again. A caller shown the live screen alone is asked once, when that is recorded,
+    /// because no screen it is drawn can carry everything.
     pub restoration_continues: bool,
     /// Whether this attachment is waiting for a parser-ground boundary before it may forward.
     ///
@@ -664,8 +665,8 @@ impl AttachmentTable {
     /// property of that screen rather than of the session: the same grid restores completely for
     /// one terminal and not for another the moment a pending wrap or a saved cursor appears. So
     /// does the host's own check of whether a restoration drawn now would carry everything, for an
-    /// attachment a screen it could not carry is keeping on a projection, and for one whose window
-    /// has just changed.
+    /// attachment a screen it could not carry is keeping on a projection, for one whose window has
+    /// just changed and for one the session has told to begin again.
     pub fn note_restoration(&mut self, id: AttachmentId, continues: bool) {
         let Some(ordinal) = self.by_id.get(&id) else {
             return;

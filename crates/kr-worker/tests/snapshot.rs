@@ -2697,7 +2697,7 @@ async fn a_report_repeating_the_window_of_a_terminal_told_to_begin_again_is_answ
     assert_eq!(
         reported(&host, &mut reader, attached.attachment_id).await,
         (Some(kept_off.0), kept_off.1),
-        "and the screen it is drawn on subscribing says the same"
+        "and it stays off the stream through its next subscription"
     );
 }
 

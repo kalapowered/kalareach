@@ -454,12 +454,12 @@ fn a_restoration_writes_the_plain_state_in_every_buffer_it_visits() {
     }
 }
 
-/// A restoration changes no keyboard state of a terminal beyond what its `Keyboard` argument allows,
-/// and no title stack: a soft reset is how kitty and foot would empty a keyboard stack, foot would
-/// empty its title stack, and xterm, foot and WezTerm would reset `modifyOtherKeys`, and the stacks
-/// are the person's own. A terminal nobody asked about its keyboard has no sequence about it
-/// written at all; one that was asked has the flags in force and the `modifyOtherKeys` level
-/// installed, and never a push or a pop.
+/// A restoration changes no keyboard state of a terminal beyond what its `Keyboard` argument
+/// allows, and no title stack: a soft reset is how kitty and foot would empty a keyboard stack,
+/// foot would empty its title stack, and xterm, foot and WezTerm would reset `modifyOtherKeys`,
+/// and the stacks are the person's own. A terminal nobody asked about its keyboard has no sequence
+/// about it written at all; one that was asked has the flags in force and the `modifyOtherKeys`
+/// level installed, and never a push or a pop.
 #[test]
 fn a_restoration_leaves_the_keyboard_and_title_stacks_the_terminal_holds_alone() {
     let stream = b"shell\r\n\x1b[>4;2m\x1b[>1u\x1b[>5u\x1b]2;title\x07\x1b[22;0t";
