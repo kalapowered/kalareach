@@ -655,13 +655,13 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     );
 
     // The shell was resized rather than replaced: the same application reports the phone's size.
-    // This comes first because an attachment that still holds a direct stream is told its view is
-    // no longer continuous when the application next writes, so a window signal the application
-    // takes late holds that notice back just as it holds back the report.
     reported_after_resize(&wired.runtime, wired.session_id, None, b"kr-size:16 48\n").await;
-    // Both attachments learn, and they learn the same thing: the size changed under all of them,
-    // so each is told its view is no longer continuous.
-    expect_resynchronised(
+    // Both attachments learn, and both learn it where the size moved, without the application
+    // writing anything: the size changed under all of them, so what each holds is no longer
+    // continuous. The phone is the session's size now, so it is told to begin again and asks for
+    // its screen. The desk is not, so it is installed again in band, with a reset that names the
+    // geometry, and is not told to begin again over the screen it has just been sent.
+    expect_reset_in_band(
         &mut desk,
         LIVENESS_DEADLINE,
         "the desk's view of a session at another size is not continuous with what it had",
@@ -1888,6 +1888,42 @@ async fn expect_resynchronised(client: &mut LocalClient, within: Duration, what:
         "{what}: waited {:?} for a session.resync notification",
         started.elapsed()
     );
+}
+
+/// Waits for a client to be sent a projection reset for a change of geometry, and fails with how
+/// long it waited when it never is.
+async fn expect_reset_in_band(client: &mut LocalClient, within: Duration, what: &str) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, client.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}: waited {:?} for a projection reset",
+                    started.elapsed()
+                )
+            })
+            .expect("the connection is open");
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        assert!(
+            notification.event_type.as_str() != "session.resync",
+            "{what}: the client was told to begin again instead of being reset in band"
+        );
+        if notification.event_type.as_str() == "session.projection.reset" {
+            let reset: kr_protocol::projection::ProjectionReset =
+                notification.payload.to_typed().expect("a reset decodes");
+            assert_eq!(
+                reset.reason,
+                kr_protocol::projection::ProjectionResetReason::Geometry,
+                "{what}"
+            );
+            return;
+        }
+    }
 }
 
 /// Waits for this client to be told that its view is no longer continuous.

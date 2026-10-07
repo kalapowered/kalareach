@@ -56,6 +56,10 @@ struct Host {
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    /// The control daemon's identity, to forward a paired device's requests as the daemon does.
+    controller: Arc<kr_ipc::verify::ControllerIdentity>,
+    /// The boot the daemon proves its generation against.
+    boot: kr_protocol::identity::BootIdentity,
 }
 
 impl Host {
@@ -149,9 +153,10 @@ async fn host_with(
     );
     let store =
         kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
-    let controller =
+    let controller = Arc::new(
         kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
-            .expect("a controller identity");
+            .expect("a controller identity"),
+    );
 
     let config = SessionConfig {
         session_id,
@@ -199,7 +204,7 @@ async fn host_with(
             endpoint.clone(),
             ServiceBinding {
                 environment_id,
-                boot_identity: boot,
+                boot_identity: boot.clone(),
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
@@ -216,6 +221,8 @@ async fn host_with(
         session_id,
         environment_id,
         endpoint,
+        controller,
+        boot,
     }
 }
 
@@ -611,6 +618,49 @@ async fn collect_output_until(
         let ControlFrame::Notification(notification) = frame else {
             continue;
         };
+        if notification.event_type.as_str() != "session.output" {
+            continue;
+        }
+        if let Ok(event) = notification
+            .payload
+            .to_typed::<kr_protocol::recovery::OutputEvent>()
+        {
+            seen.push((event.cursor.get(), event.bytes.as_slice().to_vec()));
+        }
+    }
+    seen
+}
+
+/// Collects the output batches a client receives until `enough` is satisfied, and fails at once if
+/// the session tells it to begin again first.
+///
+/// What a test waits for here is the stream going on reaching a terminal. A terminal that is told to
+/// begin again is sent nothing more until it subscribes, so a wait for the next output would run
+/// out its whole deadline before saying what went wrong.
+async fn collect_output_unless_told(
+    client: &mut LocalClient,
+    what: &str,
+    mut enough: impl FnMut(&[(u64, Vec<u8>)]) -> bool,
+) -> Vec<(u64, Vec<u8>)> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen = Vec::new();
+    while !enough(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => {
+                panic!("the connection ended while waiting for {what}: {error}: {seen:?}")
+            }
+            Err(_) => panic!("waited {:?} for {what}: {seen:?}", started.elapsed()),
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        assert!(
+            notification.event_type.as_str() != "session.resync",
+            "the session told the client to begin again while it waited for {what}: {seen:?}"
+        );
         if notification.event_type.as_str() != "session.output" {
             continue;
         }
@@ -2394,31 +2444,44 @@ async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_h
     );
 }
 
-/// KR-REQ-08.78 and KR-REQ-08.82: a window report from a terminal that is on the stream never
-/// takes it off the stream for what the screen holds. The terminal here panned a taller session
-/// by a line before the session took its size, so a window it stored differs from the one it
-/// reports now, and the line the application wrapped after that reached it as bytes: the report
-/// says it is still on the stream, and no resynchronisation follows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_drawn() {
+/// A terminal that panned a taller session by two lines, after the session took the size of its
+/// window and told it to begin again.
+///
+/// Everything stays alive for the length of the test: the owner holds the size, and a dropped
+/// connection detaches its attachment.
+struct Panned {
+    host: Host,
+    typist: Typist,
+    terminal: Attached,
+    reader: LocalClient,
+    marker: kr_protocol::recovery::ResyncRequired,
+    short: Dimensions,
+    _owner: Attached,
+}
+
+/// Builds the screen the next three tests start from: the application has written `x`, and then
+/// waits for a line before it wraps one, and for another before it writes `next`.
+async fn panned_terminal() -> Panned {
     let tall = Dimensions::new(4, 5);
     let short = Dimensions::new(4, 3);
     let host = host_with(
-        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'abcdef'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'abcdef'; read -r _; \
+         printf 'next'; read -r _",
         tall,
         None,
         1024 * 1024,
     )
     .await;
     produced(&host.runtime, b"x").await;
-    let mut typist = typist(&host).await;
-    let mut owner = attach_claiming(&host, tall, None).await;
+    let typist = typist(&host).await;
+    let owner = attach_claiming(&host, tall, None).await;
     let mut terminal = attach(&host, short, Some("xterm-256color")).await;
-    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+    let reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    // A window shorter than the session can start at a line below the first, and the host keeps it.
-    report_viewport(
+    // A window shorter than the session can start at a line below the first, and the host keeps
+    // it. That stored window is what a later report from the terminal differs from.
+    let panned = report_viewport(
         &host,
         &mut terminal,
         short,
@@ -2427,8 +2490,16 @@ async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_
         )),
     )
     .await;
+    assert_eq!(
+        panned.position.0,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(2)
+        )),
+        "the host keeps the window two lines down the taller session"
+    );
 
-    // The session takes the terminal's size, and the terminal is drawn the screen as bytes.
+    // The session takes the terminal's size, and the terminal is told to begin again.
+    let mut owner = owner;
     let resized: kr_protocol::attachment::GeometryResult = owner
         .client
         .mutate(
@@ -2452,7 +2523,35 @@ async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_
         "the resize to tell the terminal to begin again",
     )
     .await;
-    resubscribe(&host, &mut terminal, resync_of(&events).cursor.get()).await;
+    let marker = resync_of(&events);
+    Panned {
+        host,
+        typist,
+        terminal,
+        reader,
+        marker,
+        short,
+        _owner: owner,
+    }
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.82: a window report from a terminal that is on the stream never
+/// takes it off the stream for what the screen holds. The terminal here panned a taller session
+/// by two lines before the session took its size, so a window it stored differs from the one it
+/// reports now, and the line the application wrapped after that reached it as bytes: the report
+/// says it is still on the stream, and the stream goes on reaching it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_drawn() {
+    let Panned {
+        host,
+        mut typist,
+        mut terminal,
+        mut reader,
+        marker,
+        short,
+        ..
+    } = panned_terminal().await;
+    resubscribe(&host, &mut terminal, marker.cursor.get()).await;
     assert_eq!(
         reported(&host, &mut reader, terminal.attachment_id).await,
         (Some(TerminalPresentationMode::Direct), None),
@@ -2467,6 +2566,354 @@ async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_
         (report.presentation, report.presentation_reason.0),
         (TerminalPresentationMode::Direct, None),
         "a terminal on the stream is not taken off it by a report"
+    );
+
+    // And the stream goes on reaching it: nothing told it to begin again.
+    typist.release(&host).await;
+    collect_output_unless_told(
+        &mut terminal.client,
+        "the application's next output",
+        |seen| carries(&joined(seen), b"next"),
+    )
+    .await;
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.82: a terminal the session has told to begin again is sent nothing
+/// until it subscribes, so a line the application wraps in between does not reach it, and its
+/// window report is answered from the screen the session holds, which is the one it will be
+/// drawn. What it is drawn then says the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_told_to_begin_again_is_answered_from_the_screen_it_will_be_drawn() {
+    let Panned {
+        host,
+        mut typist,
+        mut terminal,
+        mut reader,
+        marker,
+        short,
+        ..
+    } = panned_terminal().await;
+    typist.release(&host).await;
+    produced(&host.runtime, b"abcdef").await;
+    let kept_off = (
+        TerminalPresentationMode::Viewport,
+        Some(PresentationReason::RestorationIncomplete),
+    );
+    let report = report_viewport(&host, &mut terminal, short, None).await;
+    assert_eq!(
+        (report.presentation, report.presentation_reason.0),
+        kept_off,
+        "the wrapped line did not reach the terminal, and keeps it off the stream"
+    );
+    resubscribe(&host, &mut terminal, marker.cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, terminal.attachment_id).await,
+        (Some(kept_off.0), kept_off.1),
+        "and the screen it is drawn on subscribing says the same"
+    );
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.82: a terminal held on a projection by the screen it was drawn is
+/// handed the stream again when the session's size changes to one that screen can be carried at,
+/// without waiting for the application to write. One row wraps at eight columns and not at twelve,
+/// and the terminal that takes the session to twelve is the one that was kept off the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_terminal_is_handed_the_stream_when_a_resize_leaves_a_screen_that_can_be_carried() {
+    let narrow = Dimensions::new(8, 5);
+    let wide = Dimensions::new(12, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abcdefghij'; read -r _; printf 'after'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abcdefghij").await;
+    let mut typist = typist(&host).await;
+    let mut owner = attach_claiming(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, owner.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::RestorationIncomplete)
+        ),
+        "the line the application wrapped cannot be drawn as one"
+    );
+
+    // The terminal takes the session to twelve columns, where the same text is one row. It is the
+    // session's size and nothing else keeps it off the stream, so the answer is the screen's.
+    let resized: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: wide,
+                expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(resized.geometry.dimensions, wide);
+    assert_eq!(
+        reported(&host, &mut reader, owner.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "the screen is carried at the new size, and nothing wrote to prompt the answer"
+    );
+
+    // It is told to begin again, is drawn the screen, and what the application writes next
+    // reaches it as the stream.
+    let events = collect_until_resync(
+        &mut owner.client,
+        "the resize to tell the terminal to begin again",
+    )
+    .await;
+    resubscribe(&host, &mut owner, resync_of(&events).cursor.get()).await;
+    typist.release(&host).await;
+    collect_output_unless_told(&mut owner.client, "the application's next output", |seen| {
+        carries(&joined(seen), b"after")
+    })
+    .await;
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.80: a terminal that a resize leaves on a projection is installed
+/// once. It is sent the new screen in band, and the output that follows continues it: nothing
+/// tells it to begin again over the screen it was just sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_a_resize_leaves_projected_is_installed_once() {
+    let tall = Dimensions::new(4, 5);
+    let short = Dimensions::new(4, 3);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'ab'; read -r _",
+        tall,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"x").await;
+    let mut typist = typist(&host).await;
+    let mut owner = attach_claiming(&host, tall, None).await;
+    let mut terminal = attach(&host, tall, Some("xterm-256color")).await;
+    assert_eq!(
+        terminal.presentation,
+        Some(TerminalPresentationMode::Direct)
+    );
+
+    // The session takes a shorter size, so the terminal is no longer the session's size and is
+    // sent the new screen as a projection on the stream it is reading.
+    let resized: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: short,
+                expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(resized.geometry.dimensions, short);
+    let installed = collect_until_installed(&mut terminal.client).await;
+    assert!(
+        installed
+            .iter()
+            .all(|event| !matches!(event, Event::Resync(_))),
+        "the screen arrives in band: {installed:?}"
+    );
+
+    // What the application writes next continues that screen.
+    typist.release(&host).await;
+    let next = collect_until_drawn_or_told(
+        &mut terminal.client,
+        "the application's next output as an update",
+        |seen| updated_text(seen).iter().any(|row| row.contains("xab")),
+    )
+    .await;
+    assert!(
+        next.iter().all(|event| !matches!(event, Event::Resync(_))),
+        "nothing tells the terminal to begin again over the screen it was just sent: {next:?}"
+    );
+    assert!(updated_text(&next).iter().any(|row| row.contains("xab")));
+}
+
+/// A paired device's connection, as the control daemon opens one for it.
+async fn device_connection(host: &Host) -> LocalClient {
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+        .await
+        .expect("connects as the daemon");
+    client
+        .writer()
+        .write_message(&ControlFrame::ControllerRole(
+            kr_protocol::local::ControllerConnectionRole::Proxy,
+        ))
+        .await
+        .expect("declares the role");
+    match client.recv().await.expect("the worker answers") {
+        ControlFrame::ControllerRole(kr_protocol::local::ControllerConnectionRole::Proxy) => {}
+        other => panic!("the worker answered {other:?}"),
+    }
+    let identity = Arc::clone(&host.controller);
+    let boot = host.boot.clone();
+    client
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    client
+}
+
+/// One mutation forwarded for a paired device, as the control daemon forwards it, and its answer.
+async fn forwarded_for_device<T: serde::Serialize>(
+    host: &Host,
+    client: &mut LocalClient,
+    method: Method,
+    params: &T,
+) -> kr_protocol::envelope::ParamsValue {
+    use kr_protocol::envelope::{MutationRequest, Outcome};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2_000_000);
+    let request_id =
+        kr_protocol::ids::RequestId::new(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let actor = kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(
+            kr_protocol::scalars::Uuid::from_bytes([9; 16]),
+        )),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(
+            kr_protocol::scalars::Uuid::from_bytes([8; 16]),
+        )),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [7; 16],
+        )),
+    };
+    let frame = ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+        mutation: MutationRequest {
+            request_id,
+            method: method.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            target: target(host),
+            params: kr_protocol::envelope::ParamsValue::from_typed(params).expect("encodes"),
+            grant_id: Nullable::null(),
+            expected: kr_protocol::envelope::ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("forwarded")
+                .expect("a window identifier"),
+            requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
+        },
+        actor,
+        grant_rights: [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
+            kr_ipc::clock::boot_elapsed_ms() + 30_000,
+        ),
+        history: None,
+    }));
+    client
+        .writer()
+        .write_message(&frame)
+        .await
+        .expect("writes the request");
+    loop {
+        match client.recv().await.expect("the worker answers") {
+            ControlFrame::Response(response) if response.request_id == request_id => {
+                return match response.outcome {
+                    Outcome::Ok(value) => value,
+                    Outcome::Error(error) => {
+                        panic!("{} is admitted: {error:?}", method.as_str())
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.82: a paired device is shown the live screen alone, so a screen
+/// drawn for it never carries everything, and it is told so from the moment it attaches: the
+/// attach says what keeps it off the stream, and so does its first window report, rather than
+/// saying it is handed the stream until its subscription says it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_shown_the_live_screen_alone_is_kept_off_the_stream_from_its_attach() {
+    let session = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'shell'; read -r _",
+        session,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"shell").await;
+    let kept_off = (
+        TerminalPresentationMode::Viewport,
+        Some(PresentationReason::RestorationIncomplete),
+    );
+
+    let mut device = device_connection(&host).await;
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let attached: kr_protocol::attachment::SessionAttachResult = forwarded_for_device(
+        &host,
+        &mut device,
+        Method::SessionAttach,
+        &SessionAttachParams {
+            session_id: host.session_id,
+            mode: AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(session),
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            requested,
+        },
+    )
+    .await
+    .to_typed()
+    .expect("an attachment");
+    assert_eq!(
+        (
+            attached.attachment.presentation.as_ref().copied(),
+            attached.attachment.presentation_reason
+        ),
+        (Some(kept_off.0), kept_off.1),
+        "the attach says the live screen alone keeps the device off the stream"
+    );
+
+    let report: kr_protocol::attachment::AttachmentViewportResult = forwarded_for_device(
+        &host,
+        &mut device,
+        Method::AttachmentViewport,
+        &kr_protocol::attachment::AttachmentViewportParams {
+            attachment_id: attached.attachment.attachment_id,
+            dimensions: session,
+            position: Nullable(None),
+            column: kr_protocol::scalars::U64::ZERO,
+        },
+    )
+    .await
+    .to_typed()
+    .expect("a report");
+    assert_eq!(
+        (report.presentation, report.presentation_reason.0),
+        kept_off,
+        "and so does its first window report"
     );
 }
 
