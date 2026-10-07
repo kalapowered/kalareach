@@ -56,16 +56,18 @@ fn actor(name: &str) -> ActorId {
     ActorId::new(name).expect("a principal")
 }
 
-/// A revocation's barrier once the daemon has announced it as often as it takes.
+/// A revocation's barrier once the daemon has announced it again as often as a busy worker needs.
 ///
-/// A worker refuses an announcement that arrives while its dispatch boundary is held, and says to
-/// come again: a generation another link installs, a mutation and a maintenance pass each hold it
-/// for a moment, and a refused announcement is `pending` for that worker, which is the contract
-/// and not a failure. The refusal also stops the evidence pages that follow an acknowledgement, so
-/// the names of what the fence took back arrive with the announcements that follow. A test that
-/// needs the whole of a revocation therefore announces again, as the daemon does for a worker it
-/// reported pending, until `settled` accepts the report, and never reads the first answer as the
-/// last.
+/// A worker takes its dispatch boundary without waiting when an announcement arrives, and refuses
+/// the announcement while anything else holds it: the generation another of the daemon's links
+/// presents, a mutation and a maintenance pass each hold it for a moment. A refused announcement
+/// leaves that worker `pending`, which section 9 makes the answer and not a failure, and a
+/// refused page of the evidence that follows an acknowledgement leaves the names it carried to the
+/// next announcement. The daemon announces again when a status read, a start, a proxied request, a
+/// remote dispatch or a later barrier does, and nothing schedules one for the revocation itself,
+/// so a test that needs the whole of a report announces again until `settled` accepts it, as
+/// those events would, and never reads the first answer as the last. Each announcement is bounded
+/// by the deadline, and so is the wait for the answer.
 async fn announced_until(
     controller: &Controller,
     first: kr_protocol::action::RevocationBarrier,
@@ -74,14 +76,14 @@ async fn announced_until(
     let mut barrier = first;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !settled(&barrier) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the revocation did not settle however often it was announced: {barrier:?}"
-        );
         tokio::task::yield_now().await;
-        barrier = controller
-            .announce_authority_revision()
+        barrier = tokio::time::timeout_at(deadline, controller.announce_authority_revision())
             .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the revocation did not settle within a minute of announcements: {barrier:?}"
+                )
+            })
             .expect("the revocation is announced again");
     }
     barrier
@@ -2017,12 +2019,12 @@ async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has
     // holds only then.
     paused.release().await;
     eprintln!("marker: the mutation answered");
-    let barrier = tokio::time::timeout(Duration::from_secs(30), revoking)
+    let first = tokio::time::timeout(Duration::from_secs(30), revoking)
         .await
         .expect("the revocation reports")
         .expect("the revoking task finishes")
         .expect("the revocation is recorded");
-    assert!(barrier.holds(), "{barrier:?}");
+    let barrier = announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
     assert_eq!(
         hosted.runtime.state().as_str(),
         "live",
@@ -2176,12 +2178,12 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
     // Announced again, which is what a daemon does for a worker it reported pending. The barrier
     // holds now, and what it says about the action is what the receipt says: the fence read it
     // after its marker, so it is named rather than rejected.
-    let barrier = hosted
+    let again = hosted
         .controller
         .announce_authority_revision()
         .await
         .expect("the revocation is announced again");
-    assert!(barrier.holds(), "{barrier:?}");
+    let barrier = announced_until(&hosted.controller, again, |barrier| barrier.holds()).await;
     let reported = barrier
         .workers
         .iter()
@@ -2424,7 +2426,12 @@ async fn a_retry_the_worker_answers_with_a_receipt_reaches_the_caller_as_one() {
 }
 
 /// KR-REQ-09.13: a fence whose evidence does not fit one acknowledgement is delivered in pages,
-/// and the revocation's report names every action.
+/// and the revocation's report names every action once the daemon has collected them all.
+///
+/// A page the worker refuses because its dispatch boundary is held is asked for again only by a
+/// later announcement, and nothing schedules one for the revocation: that is the open part of the
+/// naming row, and this case announces again itself ([`announced_until`]) so that it decides what
+/// the pages carry and not when the daemon next announces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
     let hosted = hosted_worker().await;
@@ -2455,7 +2462,8 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
             && barrier
                 .workers
                 .iter()
-                .any(|worker| worker.rejected_actions.len() == affected)
+                .find(|worker| worker.session_id == hosted.session_id)
+                .is_some_and(|worker| worker.rejected_actions.len() == affected)
     })
     .await;
     let reported = barrier
