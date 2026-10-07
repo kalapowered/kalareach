@@ -1817,7 +1817,9 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// One daemon and one worker it really spawned, verified through the real rendezvous.
 struct Hosted {
-    /// First, so a worker served apart has ended before the temporary tree is removed.
+    /// First, so it ends before the worker whose runtime it runs on.
+    awake: std::sync::OnceLock<Awake>,
+    /// Next, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
     _temp: Arc<kr_ipc::testing::TempHost>,
     controller: Arc<Controller>,
@@ -1837,11 +1839,17 @@ impl Hosted {
     /// Such a task waits on a thread, and on this test's runtime that thread could be one the
     /// test's own waits need, so a worker whose tasks a test stops is served apart
     /// ([`hosted_worker_apart`]).
+    ///
+    /// From the first call to the end of the case the worker's runtime has a task that keeps one
+    /// of its threads polling ([`Awake`]), because serving apart protects this test's waits and
+    /// not the worker's own reads: the thread a stopped task holds may be the one that reads the
+    /// worker's sockets.
     fn service_to_stop(&self) -> &Arc<WorkerService> {
-        assert!(
-            self._apart.is_some(),
-            "a worker whose tasks a test stops is served apart"
-        );
+        let apart = self
+            ._apart
+            .as_ref()
+            .expect("a worker whose tasks a test stops is served apart");
+        self.awake.get_or_init(|| apart.keep_awake());
         &self.service
     }
 }
@@ -2122,6 +2130,7 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
         "the session is created: {created:?}"
     );
     Hosted {
+        awake: std::sync::OnceLock::new(),
         _apart: apart_worker,
         _temp: Arc::clone(&daemon.temp),
         controller: Arc::clone(&daemon.controller),
@@ -2140,6 +2149,7 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 struct ApartWorker {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ApartWorker {
@@ -2154,45 +2164,73 @@ impl ApartWorker {
         let (ready, started) = tokio::sync::oneshot::channel();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
+            let apart = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
                 .enable_all()
                 .build()
-                .expect("a runtime for the worker")
-                .block_on(async move {
-                    let runtime = Arc::new(
-                        SessionRuntime::start(
-                            session,
-                            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-                        )
-                        .expect("starts the runtime"),
-                    );
-                    let service = Arc::new(
-                        WorkerService::new(
-                            Arc::clone(&runtime),
-                            identity,
-                            endpoint.clone(),
-                            binding,
-                        )
+                .expect("a runtime for the worker");
+            let handle = apart.handle().clone();
+            apart.block_on(async move {
+                let runtime = Arc::new(
+                    SessionRuntime::start(
+                        session,
+                        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+                    )
+                    .expect("starts the runtime"),
+                );
+                let service = Arc::new(
+                    WorkerService::new(Arc::clone(&runtime), identity, endpoint.clone(), binding)
                         .expect("a worker service"),
-                    );
-                    let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
-                    let _ = ready.send((Arc::clone(&runtime), Arc::clone(&service)));
-                    tokio::select! {
-                        _ = service.serve(listener) => {}
-                        _ = stopped => {}
-                    }
-                });
+                );
+                let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
+                let _ = ready.send((Arc::clone(&runtime), Arc::clone(&service), handle));
+                tokio::select! {
+                    _ = service.serve(listener) => {}
+                    _ = stopped => {}
+                }
+            });
         });
-        let (runtime, service) = started.await.expect("the worker starts");
+        let (runtime, service, handle) = started.await.expect("the worker starts");
         (
             runtime,
             service,
             Self {
                 stop: Some(stop),
                 thread: Some(thread),
+                runtime: handle,
             },
         )
+    }
+
+    /// Keeps this worker's runtime reading its sockets and firing its timers while one of its tasks
+    /// is stopped.
+    fn keep_awake(&self) -> Awake {
+        Awake {
+            task: self.runtime.spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        }
+    }
+}
+
+/// A task that always has something to do next on a worker's runtime, which keeps one of the
+/// runtime's threads polling its sockets and timers while another is stopped.
+///
+/// A worker task that waits, inside a pause or for a lock, holds a thread of the runtime it runs
+/// on, as the worker's own process would hold one of its own. When that is the thread that was
+/// reading the runtime's sockets and every other thread is asleep, nothing reads a socket or fires
+/// a timer until it comes back: the daemon's announcement would sit unread until the daemon's own
+/// bound on the exchange ran out, and a case that waits for the worker to refuse it would be
+/// waiting for the release it has not yet given.
+struct Awake {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -2402,6 +2440,7 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
     // between the acceptance and the marker, because the fence takes the same boundary, and a
     // worker that cannot take it refuses without waiting. So the daemon's first report comes back
     // while the mutation is still stopped.
+    let refused = hosted.service.refusals_for_the_boundary();
     let first = tokio::time::timeout(
         Duration::from_secs(60),
         hosted.controller.revoke_authority(),
@@ -2412,7 +2451,14 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
     // The first report says pending for this worker, and that is the contract rather than a
     // failure: the worker was inside a dispatch transition when the announcement arrived, and
     // section 9 makes a worker that has not answered pending rather than assumed. What it must not
-    // say is that the barrier held over an action it had not accounted for.
+    // say is that the barrier held over an action it had not accounted for. The worker refused the
+    // announcement because the mutation held the boundary: a report that came back because the
+    // daemon's bound on the exchange ran out would be pending for another reason, and the case
+    // would not have met the race it is about.
+    assert!(
+        hosted.service.refusals_for_the_boundary() > refused,
+        "the announcement was not refused for the boundary the mutation held"
+    );
     assert_eq!(first.pending(), vec![hosted.session_id], "{first:?}");
     assert!(
         first.workers[0].detail.contains("not complete"),
