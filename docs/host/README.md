@@ -3818,23 +3818,24 @@ A wall-clock rollback beyond five seconds marks wall-clock trust unresolved. Tha
 expiry-based collection and refuses objects whose expiry cannot otherwise be proved. It does **not**
 disable a non-expiring personal owner grant, or a fresh online action bounded by this boot's
 continuous clock: neither depends on the wall clock. A forward step expires conservatively, and a
-rollback never enlarges a lifetime. A previously expired object never revives, because its
-expiration tombstone answers whatever the clock later reads.
+rollback beyond the rate allowance below never enlarges a lifetime. A previously expired object
+never revives, because its expiration tombstone answers whatever the clock later reads.
 
 The rollback is measured against the furthest point this host could ever *prove* the clock had
-reached, projected forward by the continuous time since, less 100 parts per million, so a
-continuous clock its time service does not correct is not read as a rollback. The price is slack
-of the same rate: about a minute a week of lag goes unseen. Measuring against the previous reading
-alone would forgive a little slippage, then forgive the next against the moved mark, and enough of
-those would give a deadline back indefinitely. The same proven reading is what a UTC deadline is
-compared against, with the platform's own uncertainty bound added to it, so an object expires when
-it cannot still be valid rather than when a forgiving clock says so.
+reached, projected forward by the continuous time since, less 100 parts per million. A continuous
+clock that its time service does not correct is therefore not read as a rollback. Two records
+project this way: the workers' contract above, and the daemon's own record of the wall clock, which
+the workers do not share and which projects its anchor the same way. Measuring against the previous
+reading alone would forgive a little slippage, then forgive the next against the moved mark, and
+enough of those would give a deadline back indefinitely.
 
-The daemon keeps its own record of the wall clock, which the workers' contract above does not
-share. It projects its anchor on the continuous clock less 100 parts per million, so a continuous
-clock up to that fast never raises distrust. A rollback gains slack of the same rate times the time
-since the anchor was last raised: 6 ms for each minute, about a minute for a host nobody read for a
-week.
+The rate has a price, and it is the same for both records. A wall clock that lags the continuous
+clock by no more than 100 parts per million is never read as a rollback, however long that lasts, so
+it can lose 6 ms for each minute, about a minute a week, without being seen. A single step back is
+seen once it exceeds five seconds plus that rate times the time since the mark or anchor was last
+raised. The same proven reading is what a UTC deadline is compared against, with the platform's own
+uncertainty bound added to it, so a UTC deadline can be decided that much late. Past that slack, an
+object expires when it cannot still be valid rather than when a forgiving clock says so.
 
 The owner can end this with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move the mark and anchor to the time the effect runs, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
 

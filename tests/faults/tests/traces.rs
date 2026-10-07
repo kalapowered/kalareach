@@ -42,9 +42,9 @@ fn a_takeover_during_a_paste_closes_it_and_refuses_the_rest_of_it() {
 /// KR-REQ-27.05, clock rollback; KR-REQ-29.03: a suspension between two expiry reads and two
 /// wall-clock rollbacks, replayed from their retained trace on simulated time: the sleep counts
 /// against a continuous deadline whichever read sees it first, a rollback inside the tolerance
-/// gives a UTC deadline nothing back, one past it leaves UTC deadlines unproven, and nothing
-/// expired revives. The objects are the time contract's own; a grant store's expiry is the
-/// product's grant tests'.
+/// gives a UTC deadline nothing back beyond the rate allowance, one past it leaves UTC deadlines
+/// unproven, and nothing expired revives. The objects are the time contract's own; a grant store's
+/// expiry is the product's grant tests'.
 #[test]
 fn a_suspension_between_expiry_reads_and_a_rollback_past_the_tolerance() {
     replays("time-rollback-and-suspension");
