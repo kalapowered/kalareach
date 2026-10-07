@@ -48,7 +48,14 @@ use crate::identity::{RecordedRepository, Revised};
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
+///
+/// A change to the store's tables, to a column or to a value kept in them raises it, with the step
+/// that brings an earlier store forward; a column added while it stood still would reach a store at
+/// this version only by luck, and the stored-format lock fails until it has been raised.
 pub const SCHEMA_VERSION: i64 = 9;
+
+/// The oldest schema version this build brings forward: the first the store has had.
+pub const OLDEST_SCHEMA_VERSION: i64 = 1;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -721,11 +728,12 @@ impl Store {
                     )
                     .map_err(ProjectError::store)?;
             }
-            // A store at this version was written by this build or by one that shares its version,
-            // and a column added while the version stood still would otherwise never arrive. So
-            // every column this build reads that has no value to compute is added when it is
-            // missing, whatever the version says; the version moves on only for a change of
-            // contents.
+            // A store at this version was written by this build, or by an earlier one that moved
+            // a store to this version while adding only some of the columns, so every column this
+            // build reads that has no value to compute is added when it is missing. A column added
+            // from now on raises the version and has its step below: the stored-format lock fails
+            // until it has been raised, and a release that cannot read the new column then refuses
+            // the store by its version.
             Some(version) if version == SCHEMA_VERSION => add_missing_columns(&transaction)?,
             // Forward only. `CREATE TABLE IF NOT EXISTS` leaves a table that already exists
             // exactly as it was, so a store written by an earlier build has the tables and not

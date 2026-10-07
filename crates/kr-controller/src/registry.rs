@@ -56,8 +56,20 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
 
-/// The schema version this build reads.
+/// The schema version this build reads: the version of the whole registry file.
+///
+/// The file has four writers, and each creates and migrates its own tables when it is opened:
+/// [`Registry`], [`crate::grants::GrantDirectory`], [`crate::service::net::devices::DeviceDirectory`] and
+/// [`crate::service::net::invitations::prepare`]. A change to the tables or to a value kept in them, by any of the four,
+/// raises this version, with a step in [`Registry::migrate`] that may be empty when the writer's own
+/// idempotent open does the work. The stored-format lock fails until it has been raised. The
+/// registry's own open runs first at a daemon's start, and [`Registry::bring_forward`] runs the four
+/// in that order, so a file that records `N` holds no table of a later schema than `N`.
 pub const SCHEMA_VERSION: i64 = 7;
+
+/// The oldest schema version this build brings forward. A writer that stops handling an older
+/// shape raises this past the last version that wrote it.
+pub const OLDEST_SCHEMA_VERSION: i64 = 1;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,7 +420,9 @@ impl Registry {
     }
 
     /// Brings a registry that is behind this build's schema forward, as a daemon's start would,
-    /// and says what it did; `None` when there was nothing to bring.
+    /// and says what it did; `None` when there was nothing to bring. The registry's own tables go
+    /// through its chain of steps, and the file's other writers then open the file as they do at a
+    /// daemon's start, so that every table in it is at the shape the version it records stands for.
     ///
     /// For an update, which carries the registry of an environment whose daemon has not run since
     /// an earlier schema step to the schema its own release reads, so that it can be classed by
@@ -491,7 +505,7 @@ impl Registry {
         let [from] = versions[..] else {
             return Ok(None);
         };
-        if !(1..SCHEMA_VERSION).contains(&from) {
+        if !(OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&from) {
             return Ok(None);
         }
         Self::refuse_a_lost_table(&peek, from)?;
@@ -528,6 +542,21 @@ impl Registry {
                 ),
             }
         })?;
+        // The rest of the file's chain, in the order a daemon's start runs it: the file records the
+        // version the whole of it is at, so the other writers' tables are brought to their shape now
+        // and not when a daemon next opens them, which a later release may no longer be able to do.
+        Self::bring_the_other_writers_forward(path).map_err(|error| {
+            let cause = match error {
+                ControllerError::RegistryUnavailable { detail } => detail,
+                other => other.to_string(),
+            };
+            ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "this registry recorded schema version {from} when it was opened and its \
+                     other tables could not be brought to schema version {SCHEMA_VERSION}: {cause}"
+                ),
+            }
+        })?;
         let blocked: i64 = registry
             .connection
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
@@ -545,6 +574,14 @@ impl Registry {
             from,
             to: SCHEMA_VERSION,
         }))
+    }
+
+    /// Opens the file's other three writers, each of which creates and migrates its own tables
+    /// when it is opened, in the order a daemon's start opens them.
+    fn bring_the_other_writers_forward(path: &std::path::Path) -> Result<()> {
+        drop(crate::grants::GrantDirectory::open(path)?);
+        let devices = crate::service::net::devices::DeviceDirectory::open(path)?;
+        crate::service::net::invitations::prepare(&devices)
     }
 
     /// Refuses a registry that recorded schema version `from` and has lost an evidence table.
@@ -3934,6 +3971,63 @@ mod tests {
         assert_eq!(
             Registry::bring_forward(&path, environment()).expect("nothing to do"),
             None
+        );
+    }
+
+    /// The registry file has four writers, and the version it records stands for all of them: the
+    /// carry opens the others after its own steps, so a table of theirs that was a shape behind is
+    /// brought to the shape of the version the file now records, and the pairing tables exist.
+    #[test]
+    fn the_carry_brings_every_writer_of_the_file_forward_and_not_only_the_registry_s_own_tables() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        behind_registry(&path, 3);
+        // The other writers have been at the file, and are a shape behind: a column each of their
+        // migrations adds is not there, and the pairing tables were never made.
+        drop(crate::grants::GrantDirectory::open(&path).expect("the grant store opens"));
+        drop(
+            crate::service::net::devices::DeviceDirectory::open(&path)
+                .expect("the device store opens"),
+        );
+        let columns_of = |table: &str| -> Vec<String> {
+            let connection = Connection::open(&path).expect("opens");
+            let mut statement = connection
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .expect("prepares");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("columns")
+        };
+        Connection::open(&path)
+            .expect("opens")
+            .execute_batch(
+                "ALTER TABLE authority_receipts DROP COLUMN refusal_code;
+                 ALTER TABLE authority_receipts DROP COLUMN refusal_detail;
+                 ALTER TABLE network_devices DROP COLUMN notification_preview;
+                 DROP TABLE IF EXISTS host_owner;",
+            )
+            .expect("sets the file back a shape");
+        assert!(!columns_of("authority_receipts").contains(&"refusal_code".to_owned()));
+        assert!(!columns_of("network_devices").contains(&"notification_preview".to_owned()));
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(carried.map(|carried| carried.to), Some(SCHEMA_VERSION));
+        assert!(columns_of("authority_receipts").contains(&"refusal_code".to_owned()));
+        assert!(columns_of("authority_receipts").contains(&"refusal_detail".to_owned()));
+        assert!(columns_of("network_devices").contains(&"notification_preview".to_owned()));
+        assert!(
+            !columns_of("host_owner").is_empty(),
+            "the pairing tables exist"
+        );
+        assert_eq!(
+            files_in(directory.path())
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["registry.sqlite3".to_owned()],
+            "a closed registry is still one file"
         );
     }
 

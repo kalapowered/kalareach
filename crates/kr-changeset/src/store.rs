@@ -40,6 +40,9 @@ use crate::error::{ChangeSetError, Result};
 /// so this build refuses it rather than reading around what is missing.
 pub const SCHEMA_VERSION: i64 = 3;
 
+/// The oldest schema version this build opens: it reads no other, and refuses an earlier one.
+pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
+
 /// The directory, under the environment's state directory, that this service owns.
 pub const CHANGESETS_DIRECTORY: &str = "changesets";
 

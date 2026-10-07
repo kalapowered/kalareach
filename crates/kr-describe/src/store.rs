@@ -38,7 +38,10 @@ use crate::profile::ProfileRevision;
 use crate::summary::{MAX_SUMMARIES_PER_SESSION, SummaryRecord};
 
 /// The schema version this build writes and reads.
-const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The oldest schema version this build opens: it reads no other.
+pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 
 /// A name a person pinned.
 #[derive(Clone, Debug, PartialEq, Eq)]

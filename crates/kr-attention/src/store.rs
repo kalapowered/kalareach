@@ -112,8 +112,9 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// each of its intervals is measured from, and a row that predates those columns carries none.
 pub const SCHEMA_VERSION: i64 = 10;
 
-/// The schema before the one this build writes, which [`migrate_from_nine`] brings forward.
-const PREVIOUS_SCHEMA_VERSION: i64 = 9;
+/// The oldest schema this build brings forward, the one before the one it writes: see
+/// [`migrate_from_nine`].
+pub const OLDEST_SCHEMA_VERSION: i64 = 9;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1656,7 +1657,7 @@ impl Store {
             .optional()?;
         match recorded {
             Some(version) if version == SCHEMA_VERSION => {}
-            Some(version) if version == PREVIOUS_SCHEMA_VERSION => {
+            Some(version) if version == OLDEST_SCHEMA_VERSION => {
                 migrate_from_nine(&mut connection)?;
             }
             Some(_) => return Err(unreadable("schema version")),

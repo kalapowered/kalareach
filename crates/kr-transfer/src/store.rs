@@ -72,6 +72,9 @@ pub enum Noting {
     Held,
 }
 
+/// The oldest schema version this build brings forward: the first the store has had.
+pub const OLDEST_SCHEMA_VERSION: i64 = 1;
+
 /// The configurable resource limits of one environment.
 ///
 /// Section 14 calls these configurable resource limits rather than subscription restrictions. A

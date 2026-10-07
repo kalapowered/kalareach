@@ -78,7 +78,10 @@ use crate::push::DeliveryModule;
 pub const PRIVACY_RECORD: &str = "privacy.sqlite3";
 
 /// The schema version this build reads and writes.
-const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The oldest schema version this build opens: it reads no other.
+pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 
 /// The first wait before a refused step is tried again.
 const FIRST_RETRY_MS: u64 = 1_000;

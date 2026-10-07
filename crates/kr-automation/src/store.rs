@@ -66,6 +66,9 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 7;
 /// The version whose journals [`WorkflowStore::open`] brings forward to this build's.
 const SCHEMA_WITH_VARIABLES: u32 = 6;
 
+/// The oldest schema version this build brings forward; a journal below it is refused.
+pub const WORKFLOW_OLDEST_SCHEMA_VERSION: u32 = SCHEMA_WITH_VARIABLES;
+
 /// Where the environment variables are in the array form of a session's parameters: the values
 /// of its fields in the order the type declares them, `environment_snapshot` the eighth.
 const ENVIRONMENT_SNAPSHOT_POSITION: usize = 7;

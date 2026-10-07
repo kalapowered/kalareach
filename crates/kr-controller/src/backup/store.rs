@@ -50,6 +50,9 @@ pub const SCHEMA_VERSION: i64 = 7;
 /// section 24 keeps host migrators for.
 const VERSION_WITHOUT_UPLOADS: i64 = 6;
 
+/// The oldest schema version this build brings forward.
+pub const OLDEST_SCHEMA_VERSION: i64 = VERSION_WITHOUT_UPLOADS;
+
 /// Whether this host may go on producing for one generation.
 ///
 /// This is permission, and nothing else. What a service holds is [`Remote`], recorded beside it:

@@ -75,10 +75,10 @@ use crate::error::{DeliveryError, Result};
 /// journal written under a version below 6 or above 8 is refused rather than read with the
 /// columns of another shape, matched against bindings this build no longer computes the same way,
 /// or trusted to hold no request it should not.
-const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The oldest schema this build brings forward rather than refusing.
-const OLDEST_SCHEMA_VERSION: i64 = 6;
+pub const OLDEST_SCHEMA_VERSION: i64 = 6;
 
 /// The binding a notification is given when its destination is removed while an attempt is on the
 /// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
