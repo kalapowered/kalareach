@@ -2188,6 +2188,18 @@ impl Session {
         // place, and the row it names is what the attachment holds from here.
         let anchor = self.engine.resolve_position(position, dimensions);
         let column = self.engine.resolve_column(column, dimensions);
+        let moved =
+            before_window.is_none_or(|window| window.anchor != anchor || window.column != column);
+        if (moved || before_dimensions != Some(dimensions))
+            && self.content_scope(attachment_id) != crate::render::Scope::LiveScreen
+        {
+            // What the last screen could not carry says nothing about the one this window is drawn
+            // next, so it is forgotten with the window: a terminal that is the session's size
+            // again, or back on the live screen, is handed the stream if its other conditions hold,
+            // and the screen it is then drawn decides afresh. A caller shown the live screen alone
+            // keeps it, because no screen it is drawn can carry everything.
+            self.attachments.note_restoration(attachment_id, true);
+        }
         let (presentation, presentation_reason) =
             self.attachments
                 .viewport(attachment_id, dimensions, anchor, column)?;
@@ -2207,8 +2219,6 @@ impl Session {
         let no_longer_continuous = before != Some(presentation)
             || (presentation == TerminalPresentationMode::Viewport
                 && before_dimensions != Some(dimensions));
-        let moved =
-            before_window.is_none_or(|window| window.anchor != anchor || window.column != column);
         if no_longer_continuous {
             let next = self.history.next_cursor();
             let oldest = self.history.oldest_retained_cursor();
@@ -3095,10 +3105,11 @@ impl Session {
     /// attachment that moves between the two, which draws it a screen of its own at a boundary.
     /// Nothing is drawn for anybody here, so nothing is counted among what renderings left out.
     ///
-    /// The question is asked once per screen, because it is a question about the screen: a quiet
-    /// moment at an output cursor already asked about has nothing new to find, and the join that
-    /// put an attachment on a projection asked it of the screen it was then. Terminals that would
-    /// be drawn the same restoration share one answer.
+    /// The question is asked once per output cursor, and terminals that would be drawn the same
+    /// restoration share one answer. A quiet moment at the cursor last asked about follows a read
+    /// that ended inside a sequence, or the end of the stream, and no terminal can begin
+    /// forwarding there. A change that the output does not make, such as a terminal's window
+    /// changing, is answered where it is made.
     fn reconsider_incomplete_restorations(&mut self) {
         let cursor = self.engine.output_cursor();
         if std::mem::replace(&mut self.reconsidered_at, cursor) == cursor {
