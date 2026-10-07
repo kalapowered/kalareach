@@ -1,0 +1,40 @@
+name: Restore the cargo cache
+description: >-
+  Restores the registry, the Git dependencies and the build output of the third-party crates that
+  the last run on the default branch saved for this job. The newest cache of the same toolchain is
+  taken when the dependencies have changed since, so only the crates that changed are built again.
+  The `cargo-cache-save` action, run last in the job, is what saves one.
+
+inputs:
+  name:
+    description: The job's name in the cache's key. Jobs that build different things do not share a cache.
+    required: true
+
+outputs:
+  cache-hit:
+    description: "'true' when the cache of exactly these dependencies was restored."
+    value: ${{ steps.restore.outputs.cache-hit }}
+  primary-key:
+    description: The key a cache of these dependencies is saved under.
+    value: ${{ steps.restore.outputs.cache-primary-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Name the dependencies
+      id: dependencies
+      shell: bash
+      run: echo "digest=$(bash scripts/cargo-dependency-key.sh)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore
+      id: restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ steps.dependencies.outputs.digest }}
+        restore-keys: |
+          cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
