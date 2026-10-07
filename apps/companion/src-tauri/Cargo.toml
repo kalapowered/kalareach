@@ -45,7 +45,6 @@ kr-ipc.workspace = true
 # The candidate's attempt budget, kept on this computer's disk under its own secret store.
 kr-pairing.workspace = true
 kr-protocol.workspace = true
-kr-voice.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

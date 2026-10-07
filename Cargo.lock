@@ -1323,7 +1323,6 @@ dependencies = [
  "kr-pairing",
  "kr-protocol",
  "kr-transport",
- "kr-voice",
  "kr-width",
  "objc2",
  "objc2-foundation",

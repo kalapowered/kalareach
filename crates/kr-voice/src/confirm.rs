@@ -63,7 +63,7 @@ pub fn issue_confirmation(
 
 /// Signs a challenge the way a paired device's ceremony does.
 ///
-/// Present so a test and a native client sign the same bytes. A host never calls it: a host that
+/// Present so a test and a paired device sign the same bytes. A host never calls it: a host that
 /// could produce a confirmation would be a host whose confirmations prove nothing.
 ///
 /// # Errors
@@ -348,6 +348,38 @@ mod tests {
         )
         .expect("the confirmation answers this action");
         assert!(ledger.is_empty(), "a confirmation is single use");
+    }
+
+    #[test]
+    fn a_proof_over_a_substituted_challenge_with_the_same_identity_is_refused() {
+        let key = AuthorisationKeyPair::generate().expect("a device key");
+        let mut ledger = ConfirmationLedger::new();
+        let plan = plan(VoiceAction::ApplyDiff, 3);
+        let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
+            .expect("a challenge");
+        ledger.issue(&request);
+        // The same identity, action, details and device, with a longer life, signed by the device's
+        // own key: every other check passes it, so only the comparison with the challenge this host
+        // issued refuses it.
+        let mut substitute = request.clone();
+        substitute.expires_at_ms = TimestampMs::new(request.expires_at_ms.get() + 3_600_000);
+        let proof = sign_confirmation(&key, &substitute).expect("a proof");
+
+        let error = verify_confirmation(
+            &mut ledger,
+            &plan,
+            action_id(9),
+            device(0xf1),
+            &proof,
+            key.public(),
+            request.expires_at_ms.get() + 1,
+        )
+        .expect_err("a substituted challenge is refused");
+        assert_eq!(error.reason(), Some(VoiceRefusal::ConfirmationMismatch));
+        assert!(
+            !ledger.is_empty(),
+            "a refused proof does not consume the challenge"
+        );
     }
 
     #[test]

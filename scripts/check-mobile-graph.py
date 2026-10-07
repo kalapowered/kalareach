@@ -53,7 +53,6 @@ SHARED = {
     "kr-plugin-sdk": "docs/plugins/sdk.md: the package contract types a client reads",
     "kr-protocol": "docs/protocol/README.md: wire types and the method table",
     "kr-transport": "docs/transport/README.md: how a client reaches a host",
-    "kr-voice": "docs/voice/client.md: the voice client's coordinator",
     "kr-width": "docs/terminal/README.md: the width model a phone measures with, the same tables as the desktop",
 }
 
@@ -78,6 +77,7 @@ HOST_ONLY = {
     "kr-plugin-runtime": "docs/plugins/runtime.md: where a plugin component runs",
     "kr-plugin-service": "docs/plugins/runtime.md: the worker's client of the plugin host",
     "kr-plugin-catalogue": "docs/plugins/catalogue.md: enrolment and activation on the host",
+    "kr-voice": "docs/voice/README.md: the coordinator a host runs for voice calls",
 }
 
 
