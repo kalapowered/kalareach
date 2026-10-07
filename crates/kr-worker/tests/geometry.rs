@@ -667,6 +667,10 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
         "the desk's view of a session at another size is not continuous with what it had",
     )
     .await;
+    assert!(
+        !wired.runtime.session().is_resynchronising(desk_attachment),
+        "and what it was sent in band is not thrown away: it is not told to begin again over it"
+    );
     expect_resynchronised(&mut phone, LIVENESS_DEADLINE, "and neither is the phone's").await;
 
     drop(desk);

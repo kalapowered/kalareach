@@ -241,23 +241,25 @@ fn a_restoration_saves_the_plain_state_whenever_it_enters_the_alternate_buffer()
 /// link is closed before the first cell is drawn.
 #[test]
 fn a_link_the_stream_left_open_is_closed_before_the_first_cell_is_drawn() {
-    // The screen's first row has no link, and the link the session had open is closed.
-    let written = items(&restoration_after(
-        b"plain \x1b]8;;http://example.invalid/\x1b\\linked\x1b]8;;\x1b\\ after",
-        Scope::WholeScreen,
-    ));
-    let first_text = written
-        .iter()
-        .position(|item| matches!(item, Item::Text(_)))
-        .expect("a cell is drawn");
-    let closed = written[..first_text]
-        .iter()
-        .any(|item| matches!(item, Item::Osc(command) if command == "8;;"));
-    assert!(
-        closed,
-        "no hyperlink is closed before the first cell: {:?}",
-        &written[..first_text]
-    );
+    for scope in SCOPES {
+        // The screen's first row has no link, and the link the session had open is closed.
+        let written = items(&restoration_after(
+            b"plain \x1b]8;;http://example.invalid/\x1b\\linked\x1b]8;;\x1b\\ after",
+            scope,
+        ));
+        let first_text = written
+            .iter()
+            .position(|item| matches!(item, Item::Text(_)))
+            .expect("a cell is drawn");
+        let closed = written[..first_text]
+            .iter()
+            .any(|item| matches!(item, Item::Osc(command) if command == "8;;"));
+        assert!(
+            closed,
+            "{scope:?}: no hyperlink is closed before the first cell: {:?}",
+            &written[..first_text]
+        );
+    }
 }
 
 /// Whether text is drawn under the link the stream left open, on a terminal that saves the open
@@ -338,24 +340,28 @@ fn a_restoration_is_drawn_while_the_cursor_is_hidden() {
             false,
         ),
     ] {
-        let written = items(&restoration_after(stream, Scope::WholeScreen));
-        let mut visible = false;
-        let mut drawn_while_visible = false;
-        for item in &written {
-            match item {
-                Item::Csi(sequence) if sequence == "!p" || sequence == "?25h" => visible = true,
-                Item::Csi(sequence) if sequence == "?25l" => visible = false,
-                Item::Text(_) => drawn_while_visible |= visible,
-                _ => {}
+        for scope in SCOPES {
+            let written = items(&restoration_after(stream, scope));
+            let mut visible = false;
+            let mut drawn_while_visible = false;
+            for item in &written {
+                match item {
+                    Item::Csi(sequence) if sequence == "!p" || sequence == "?25h" => {
+                        visible = true;
+                    }
+                    Item::Csi(sequence) if sequence == "?25l" => visible = false,
+                    Item::Text(_) => drawn_while_visible |= visible,
+                    _ => {}
+                }
             }
+            assert!(
+                !drawn_while_visible,
+                "{name} in {scope:?}: a cell is drawn with the cursor showing"
+            );
+            assert_eq!(
+                visible, shows,
+                "{name} in {scope:?}: the restoration ends with the session's own cursor"
+            );
         }
-        assert!(
-            !drawn_while_visible,
-            "{name}: a cell is drawn with the cursor showing"
-        );
-        assert_eq!(
-            visible, shows,
-            "{name}: the restoration ends with the session's own cursor"
-        );
     }
 }
