@@ -48,10 +48,11 @@ impl Controller {
     /// which records nothing here: its first attempt did. A prompt that names a draft and still has
     /// its window is told from a repeat by the worker's own receipt before anything is recorded.
     ///
-    /// A session that closed is closed to the prompt whichever way the daemon learns it: the closure
-    /// is recorded before the daemon looks for the worker, or while the prompt waits for the
-    /// daemon's link to it. A worker the registry lists and the directory does not hold is looked
-    /// for again before the session is said to be unknown.
+    /// A worker the registry records and the directory does not hold is looked for again before the
+    /// session is said to be unknown. A prompt for a session that closed is answered from the
+    /// closure, whether it was recorded before the daemon looked for the worker or, for a first
+    /// prompt, while it waited for the daemon's link to the worker. An exact repeat that finds a
+    /// worker to ask is owed that worker's receipt, whatever the registry has recorded since.
     ///
     /// # Errors
     ///
@@ -121,24 +122,27 @@ impl Controller {
                     .deadline
                     .saturating_duration_since(self.clock.now())
             });
-        // Nothing has been sent until the prompt is forwarded, so a prompt that finds no link to
-        // take, whether it waited too long, the worker is gone or its session is, has not reached
-        // the worker. If the session's closure was recorded meanwhile, the record is the answer.
+        // Nothing has been sent until the prompt is forwarded, so a first prompt that finds no link
+        // to take, whether it waited too long, the worker is gone or its session is, has not
+        // reached the worker. If the session's closure was recorded meanwhile, the record is the
+        // answer. An exact repeat is owed the receipt of its first attempt, which only the worker
+        // holds, so a closure does not answer it here: it goes on to the worker if there is a link,
+        // and is told what went wrong otherwise.
         let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
             Ok(Ok(link)) => link,
+            Ok(Err(error)) if accepted.is_none() => return Err(error),
             Ok(Err(error)) => return Err(self.closed_or(session_id, error).await),
             Err(_) => {
-                return Err(self
-                    .closed_or(
-                        session_id,
-                        ControllerError::Uncertain {
-                            detail: "the connection to the worker that owns this session did \
-                                     not come free in the time this prompt was given, so nothing \
-                                     was sent"
-                                .to_owned(),
-                        },
-                    )
-                    .await);
+                let error = ControllerError::Uncertain {
+                    detail: "the connection to the worker that owns this session did not come \
+                             free in the time this prompt was given, so nothing was sent"
+                        .to_owned(),
+                };
+                return Err(if accepted.is_none() {
+                    error
+                } else {
+                    self.closed_or(session_id, error).await
+                });
             }
         };
         // The admission is asked once the link is held, because holding it is where the wait was.
@@ -146,19 +150,20 @@ impl Controller {
         // sent for it. An exact repeat carries no deadline and goes on to the worker, which is
         // the only thing that knows whether it holds this action's receipt.
         //
-        // A closure recorded while the prompt queued is asked once the admission has been, under
+        // A closure recorded while a first prompt queued is asked once the admission has been, under
         // the lock a closure is recorded under, so that the closure answers and not whatever the
-        // worker of a session that has closed then does with the link. Once it is recorded, a prompt
-        // is answered from it, a repeat included, as it is when the closure came before the look at
-        // the directory; nothing is recorded or sent. A closure that lands after this check is a
-        // failure of the worker's own, which the exchange below answers as such.
+        // worker of a session that has closed then does with the link: nothing is recorded or sent
+        // for a session that is gone. An exact repeat is not asked, because the worker may hold the
+        // receipt it is owed, and a forward with no lifetime admits nothing new. A closure that
+        // lands after this check is a failure of the worker's own, which the exchange below
+        // answers as such.
         let checked = async {
             let registry = self.registry.lock().await;
             match self.check_admission(&registry, &carried) {
                 Ok(()) | Err(ControllerError::WindowExpired { .. }) if accepted.is_none() => {}
                 other => other?,
             }
-            if registry.closure(session_id)?.is_some() {
+            if accepted.is_some() && registry.closure(session_id)?.is_some() {
                 return Err(ControllerError::SessionClosed {
                     session: session_id.to_string(),
                 });
