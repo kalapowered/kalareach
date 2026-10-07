@@ -24,8 +24,8 @@ use super::workers::WORKER_EXCHANGE;
 /// next announcement continues from where this one stopped.
 const MAX_EVIDENCE_PAGES: usize = 64;
 
-/// How many times one announcement asks again for a page of evidence that a worker refused because
-/// its dispatch boundary was held, in all the pages it collects.
+/// How many times an announcement asks one worker again for a page of evidence that it refused
+/// because its dispatch boundary was held, in all the pages it collects from that worker.
 ///
 /// A worker takes the boundary without waiting and refuses an announcement while a mutation, a
 /// generation another link presents or a maintenance pass is inside it, which is a matter of
