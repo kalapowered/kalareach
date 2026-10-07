@@ -148,8 +148,9 @@ impl Host {
             .expect("runs kr")
     }
 
-    /// Runs `kr` on a pseudo-terminal of its own, which is its controlling terminal.
-    fn on_terminal(&self, arguments: &[&str]) -> OnTerminal {
+    /// Runs `kr` on a pseudo-terminal of its own, which is its controlling terminal, with the
+    /// variables in `extra` added to the environment.
+    fn on_terminal(&self, arguments: &[&str], extra: &[(&str, &str)]) -> OnTerminal {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 80,
@@ -165,6 +166,9 @@ impl Host {
             command.env(name, value);
         }
         command.env("TERM", "xterm-256color");
+        for (name, value) in extra {
+            command.env(name, value);
+        }
         command.cwd("/");
         let child = pty.slave.spawn_command(command).expect("starts kr");
         drop(pty.slave);
@@ -305,7 +309,7 @@ async fn the_owner_at_the_terminal_trusts_the_hosts_clock_again() {
         host.log()
     );
 
-    let mut terminal = host.on_terminal(&["host", "clock", "--establish"]);
+    let mut terminal = host.on_terminal(&["host", "clock", "--establish"], &[]);
     terminal
         .output
         .expect("This host's clock reads", "kr shows the time");
@@ -347,4 +351,30 @@ async fn the_clock_is_not_established_without_a_terminal() {
     );
     assert_eq!(host.clock_record(), (true, false), "{}", host.log());
     assert!(host.spent_confirmations().is_empty());
+}
+
+/// KR-REQ-10.53: a terminal inside a KalaReach session is not where the clock is confirmed. With
+/// `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real terminal before it asks anything, and
+/// the host still distrusts its clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clock_is_not_established_inside_a_session() {
+    let host = Host::start().await;
+    for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
+        let terminal = host.on_terminal(
+            &["host", "clock", "--establish"],
+            &[(variable, "00000000-0000-4000-8000-000000000001")],
+        );
+        let (succeeded, printed) = terminal.finish();
+        assert!(!succeeded, "{variable}: {printed}");
+        assert!(
+            printed.contains(&format!("{variable} is set")),
+            "{variable}: {printed}"
+        );
+        assert!(
+            !printed.contains("Type clock"),
+            "{variable}: nothing was asked: {printed}"
+        );
+        assert_eq!(host.clock_record(), (true, false), "{}", host.log());
+        assert!(host.spent_confirmations().is_empty());
+    }
 }
