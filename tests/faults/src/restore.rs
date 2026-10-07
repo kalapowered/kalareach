@@ -1298,7 +1298,7 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
 
 /// Where the two switches of the paint of the buffer that is not showing are in a restoration.
 ///
-/// A restoration begins by resetting the terminal in each buffer, which takes two switches of its
+/// A restoration begins by writing the plain state in each buffer, which takes two switches of its
 /// own, into the alternate buffer and out of it. After those it switches buffers three times when
 /// there is a buffer not showing: once to make the one that shows the one that does, and twice to
 /// paint the other, into it and out of it. With the primary buffer showing the paint comes first,
@@ -1389,9 +1389,9 @@ mod tests {
         );
     }
 
-    /// What a restoration begins with: a reset where the terminal is, into the alternate buffer, a
-    /// reset, out of it, and a reset.
-    const PROLOGUE: &[u8] = b"\x1b[!p\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[!p";
+    /// What a restoration begins with, the plain state itself left out: a save of the cursor where
+    /// the terminal is, into the alternate buffer, a save, out of it, and a save.
+    const PROLOGUE: &[u8] = b"\x1b7\x1b[?1049h\x1b7\x1b[?1049l\x1b7";
 
     fn after_the_prologue(rest: &[u8]) -> Vec<u8> {
         [PROLOGUE, rest].concat()
@@ -1400,10 +1400,10 @@ mod tests {
     #[test]
     fn reversing_the_switches_turns_only_the_paints_switches_the_other_way() {
         let primary =
-            after_the_prologue(b"\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing");
+            after_the_prologue(b"\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b7\x1b[?1049l\x1b[Hshowing");
         assert_eq!(
             with_the_switches_reversed(&primary),
-            after_the_prologue(b"\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[Hshowing")
+            after_the_prologue(b"\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b7\x1b[?1049l\x1b[Hshowing")
         );
         let alternate =
             after_the_prologue(b"\x1b[?1049h\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[Hshowing");
@@ -1546,7 +1546,7 @@ mod tests {
     fn a_fresh_engine_of_the_profile_finds_a_restoration_only_rendering() {
         assert!(
             outside_the_profile(
-                b"\x1b[!p\x1b[?1049h\x1b[Hone\x1b[?1049l\x1b[?25h\x1b]2;title\x1b\\",
+                b"\x1b7\x1b[?1049h\x1b[Hone\x1b[?1049l\x1b[?25h\x1b]2;title\x1b\\",
                 20,
                 3
             )
@@ -1584,11 +1584,11 @@ mod tests {
     fn cutting_the_other_buffer_removes_the_paint_and_nothing_of_the_switch_that_shows_a_buffer() {
         // The primary buffer showing: the other buffer is painted first.
         let primary = after_the_prologue(
-            b"\x1b[?1049h\x1b[H\x1b[2Jother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing",
+            b"\x1b[?1049h\x1b[H\x1b[2Jother\x1b[?1049l\x1b7\x1b[?1049l\x1b[Hshowing",
         );
         assert_eq!(
             without_the_buffer_not_showing(&primary),
-            after_the_prologue(b"\x1b[!p\x1b[?1049l\x1b[Hshowing")
+            after_the_prologue(b"\x1b7\x1b[?1049l\x1b[Hshowing")
         );
         // The alternate buffer showing: it is selected first, and the other buffer painted after.
         let alternate =

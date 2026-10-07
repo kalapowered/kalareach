@@ -1879,7 +1879,8 @@ impl Session {
         self.engine.palette_source()
     }
 
-    /// Records what a rendered restoration could not carry.
+    /// Records whether the screen an attachment was just given carried everything the raw stream
+    /// needs.
     ///
     /// Nothing is silently lost: the renderer counts every omission, and what it counted decides
     /// how the attachment that was given the screen is served from here, which is what the
@@ -3154,7 +3155,8 @@ impl Session {
     /// without moving the cursor, and reflows the screen, so it asks again; it can come between a
     /// read and the next quiet moment, when the last scalar of a run is still held back and is not
     /// on the screen that is asked, and that quiet moment moves the cursor and asks once more. A
-    /// terminal's own report of a new window asks the question where it is made.
+    /// terminal's own window report asks the question where it is made, when the window is new
+    /// and when the session has told the terminal to begin again.
     fn reconsider_incomplete_restorations(&mut self) {
         let asked = (
             self.engine.output_cursor(),

@@ -33,10 +33,10 @@
 //! every saved cursor, and kitty and foot empty the keyboard stack, which belongs to the person's
 //! other programs and not to this session. State the profile does not track stays as an earlier
 //! application left it. WezTerm's bidirectional mode and the character protection of xterm and
-//! Ghostty are two; a soft reset would clear them, and would clear the person's own state with
-//! them. So every part of the state a restoration draws under is
-//! written instead: the cursor hidden, the plain rendition, no open link, origin mode and left and
-//! right margins off, the whole screen as the scroll region, ASCII in `G0` and `G1` with `G0`
+//! Ghostty are two. The soft reset of xterm and WezTerm would clear them, and would clear the
+//! person's own state with them. So every part of the state a restoration draws under is written
+//! instead: the cursor hidden, the plain rendition, no open link, origin mode and left and right
+//! margins off, the whole screen as the scroll region, ASCII in `G0` and `G1` with `G0`
 //! selected, the default cursor shape, and the cursor at home, with autowrap and reverse video as
 //! the session has them, because kitty saves both with a cursor. Then `DECSC` saves the cursor,
 //! which keeps the position, the rendition, the character sets and origin mode on most terminals.
