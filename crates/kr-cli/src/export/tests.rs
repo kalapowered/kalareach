@@ -380,6 +380,35 @@ async fn an_exports_output_has_no_side_effect_and_says_what_was_dropped() {
     }
 }
 
+/// A soft reset is rendering, so a recording keeps it as the program wrote it: section 8 forwards
+/// it as it came, so a file that left it out would replay a screen the program never had. The file
+/// carries one written inside the alternate buffer byte for byte, and declares nothing dropped.
+#[tokio::test]
+async fn an_exports_output_carries_a_soft_reset_from_the_alternate_buffer() {
+    let written = b"shell\r\n\x1b[?1049halt\x1b[!pafter\r\n\x1b[?1049lprompt\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, written),
+        end(written.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(
+        file.output(),
+        written,
+        "the reset is carried where it was written"
+    );
+    assert!(
+        file.omission("bytes_not_carried").is_none(),
+        "nothing is declared dropped: {}",
+        file.0
+    );
+}
+
 /// The file says what it is, whose it is and how the session ended; what the archive does not keep
 /// is declared; and the chunks start at the cursor the output was retained at.
 #[tokio::test]
