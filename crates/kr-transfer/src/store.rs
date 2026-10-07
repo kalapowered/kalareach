@@ -35,8 +35,28 @@ use crate::authority::ObjectIdentity;
 use crate::error::{Result, TransferError};
 use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 
-/// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 2;
+/// The schema version this build reads, and the one a journal holds nothing of the sessions of
+/// earlier builds at ([`Noting`]).
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// The version a journal that an earlier build wrote is at until the sessions of earlier builds in
+/// it are settled ([`Store::settle_unseen_prompt_sessions`]), which moves it to [`SCHEMA_VERSION`].
+/// Remove it with the noting, once no supported upgrade starts from a build that wrote this
+/// version.
+const UNSETTLED_VERSION: i64 = 2;
+
+/// Where a journal stands with the sessions of earlier builds, whose agents may have been sent a
+/// prompt that names a draft without this host being told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Noting {
+    /// Nothing is noted and nothing is owed: the journal was made by a build that serves such a
+    /// prompt only to the daemon, or its noted sessions were settled.
+    Done,
+    /// An earlier build wrote the journal and its sessions have not been noted.
+    Owed,
+    /// The sessions are noted and held until none of them can run a worker.
+    Held,
+}
 
 /// The configurable resource limits of one environment.
 ///
@@ -619,14 +639,6 @@ impl Store {
                          REFERENCES drafts (draft_id) ON DELETE CASCADE,
                      session_id BLOB NOT NULL,
                      sent_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS unseen_prompt_sessions (
-                     session_id  BLOB PRIMARY KEY,
-                     noted_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS unseen_prompts_noted (
-                     id          INTEGER PRIMARY KEY CHECK (id = 1),
-                     noted_at_ms INTEGER NOT NULL
                  );",
             )
             .map_err(TransferError::store)?;
@@ -649,7 +661,7 @@ impl Store {
             self.connection
                 .execute(
                     "UPDATE schema_version SET version = ?1",
-                    params![SCHEMA_VERSION],
+                    params![UNSETTLED_VERSION],
                 )
                 .map_err(TransferError::store)?;
         }
@@ -663,10 +675,11 @@ impl Store {
         self.add_column_if_absent("environment", "staging_fs", "BLOB")?;
         self.add_column_if_absent("scopes", "root_fs", "BLOB")?;
         let recorded = match recorded {
-            Some(1) => Some(SCHEMA_VERSION),
+            Some(1) => Some(UNSETTLED_VERSION),
             other => other,
         };
         match recorded {
+            // A journal this build makes has no earlier build's session to note.
             None => {
                 self.connection
                     .execute(
@@ -675,7 +688,7 @@ impl Store {
                     )
                     .map_err(TransferError::store)?;
             }
-            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if version == SCHEMA_VERSION || version == UNSETTLED_VERSION => {}
             Some(version) => {
                 return Err(TransferError::StoreUnavailable {
                     detail: format!(
@@ -1487,18 +1500,42 @@ impl Store {
         Ok(held.len())
     }
 
-    /// Returns whether the sessions a prompt may have reached unseen have been noted.
+    /// Returns where this journal stands with the sessions an earlier build's worker may have been
+    /// sent a prompt that names a draft, without this host being told.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the read fails.
-    pub fn unseen_prompt_sessions_noted(&self) -> Result<bool> {
-        self.connection
-            .query_row("SELECT COUNT(*) FROM unseen_prompts_noted", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|count| count > 0)
-            .map_err(TransferError::store)
+    pub fn noting(&self) -> Result<Noting> {
+        let marked: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'unseen_prompts_noted'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if marked > 0 {
+            let noted: i64 = self
+                .connection
+                .query_row("SELECT COUNT(*) FROM unseen_prompts_noted", [], |row| {
+                    row.get(0)
+                })
+                .map_err(TransferError::store)?;
+            if noted > 0 {
+                return Ok(Noting::Held);
+            }
+        }
+        let version: i64 = self
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .map_err(TransferError::store)?;
+        Ok(if version == SCHEMA_VERSION {
+            Noting::Done
+        } else {
+            Noting::Owed
+        })
     }
 
     /// Notes `sessions` as sessions whose agents may have been sent a prompt that names a draft
@@ -1514,6 +1551,18 @@ impl Store {
         at_ms: TimestampMs,
     ) -> Result<()> {
         let transaction = self.begin()?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS unseen_prompt_sessions (
+                     session_id  BLOB PRIMARY KEY,
+                     noted_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS unseen_prompts_noted (
+                     id          INTEGER PRIMARY KEY CHECK (id = 1),
+                     noted_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .map_err(TransferError::store)?;
         for session_id in sessions {
             transaction
                 .execute(
@@ -1539,15 +1588,86 @@ impl Store {
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the read fails.
     pub fn unseen_prompt_sessions(&self) -> Result<std::collections::BTreeSet<SessionId>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT session_id FROM unseen_prompt_sessions")
+        noted_sessions(&self.connection)
+    }
+
+    /// Puts what the noted sessions name under those sessions' retention, once, and forgets the
+    /// sessions, in one transaction: a journal that has lost the sessions holds what they named as
+    /// submitted. Returns how many attachments were put under a session.
+    ///
+    /// A published attachment that no prompt this host knows of has submitted, and that a noted
+    /// session names ([`Self::sessions_shielding`]), becomes submitted, to the session it belongs to
+    /// or, where it belongs to none, to the first session that names it. One session holds it from
+    /// then on, so the sweep reads no table to keep it. An attachment already submitted keeps its
+    /// own session, and one that names no noted session is not touched.
+    ///
+    /// Both tables go, and the journal moves to the schema version that holds nothing noted, which is
+    /// what tells the next start that there is nothing to note.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails, and writes nothing.
+    pub fn settle_unseen_prompt_sessions(&mut self, at_ms: TimestampMs) -> Result<usize> {
+        let transaction = self.begin()?;
+        let noted = noted_sessions(&transaction)?;
+        let mut settled = 0;
+        if !noted.is_empty() {
+            let unsubmitted: Vec<Uuid> = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT transfer_id FROM uploads
+                         WHERE state = ?1 AND submitted_at_ms IS NULL",
+                    )
+                    .map_err(TransferError::store)?;
+                let rows = statement
+                    .query_map(params![UploadState::Published.as_str()], |row| {
+                        uuid_column(row, 0)
+                    })
+                    .map_err(TransferError::store)?;
+                rows.collect::<std::result::Result<_, _>>()
+                    .map_err(TransferError::store)?
+            };
+            for transfer in unsubmitted {
+                let shielding =
+                    shielding_sessions(&transaction, TransferId::new(transfer), &noted)?;
+                let Some(session_id) = shielding.first() else {
+                    continue;
+                };
+                transaction
+                    .execute(
+                        "UPDATE uploads
+                         SET submitted_at_ms = ?2, session_id = COALESCE(session_id, ?3)
+                         WHERE transfer_id = ?1 AND submitted_at_ms IS NULL",
+                        params![
+                            uuid_sql(transfer),
+                            as_i64(at_ms.get()),
+                            uuid_sql(session_id.get())
+                        ],
+                    )
+                    .map_err(TransferError::store)?;
+                record_event(
+                    &transaction,
+                    "upload.submitted",
+                    &TransferId::new(transfer).to_string(),
+                    at_ms,
+                )?;
+                settled += 1;
+            }
+        }
+        transaction
+            .execute_batch(
+                "DROP TABLE IF EXISTS unseen_prompt_sessions;
+                 DROP TABLE IF EXISTS unseen_prompts_noted;",
+            )
             .map_err(TransferError::store)?;
-        let rows = statement
-            .query_map([], |row| uuid_column(row, 0))
+        transaction
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION],
+            )
             .map_err(TransferError::store)?;
-        rows.map(|row| row.map(SessionId::new).map_err(TransferError::store))
-            .collect()
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(settled)
     }
 
     /// Returns those of `unseen` that an attachment belongs to, or that a draft holding the
@@ -1563,37 +1683,7 @@ impl Store {
         transfer_id: TransferId,
         unseen: &std::collections::BTreeSet<SessionId>,
     ) -> Result<std::collections::BTreeSet<SessionId>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT session_id FROM uploads
-                     WHERE transfer_id = ?1 AND session_id IS NOT NULL
-                 UNION
-                 SELECT draft.session_id
-                     FROM draft_attachments AS binding
-                     JOIN drafts AS draft ON draft.draft_id = binding.draft_id
-                     WHERE binding.transfer_id = ?1 AND draft.session_id IS NOT NULL
-                 UNION
-                 SELECT upload.session_id
-                     FROM draft_attachments AS binding
-                     JOIN draft_attachments AS other ON other.draft_id = binding.draft_id
-                     JOIN uploads AS upload ON upload.transfer_id = other.transfer_id
-                     WHERE binding.transfer_id = ?1 AND upload.session_id IS NOT NULL",
-            )
-            .map_err(TransferError::store)?;
-        let rows = statement
-            .query_map(params![uuid_sql(transfer_id.get())], |row| {
-                uuid_column(row, 0)
-            })
-            .map_err(TransferError::store)?;
-        let mut shielding = std::collections::BTreeSet::new();
-        for row in rows {
-            let session_id = SessionId::new(row.map_err(TransferError::store)?);
-            if unseen.contains(&session_id) {
-                shielding.insert(session_id);
-            }
-        }
-        Ok(shielding)
+        shielding_sessions(&self.connection, transfer_id, unseen)
     }
 
     /// Returns the session a draft was sent to, when it was sent to one.
@@ -2913,6 +3003,69 @@ fn actor_column(
     })
 }
 
+/// The sessions noted as ones whose agents may have been sent a prompt that names a draft without
+/// this host being told. A journal that holds none has no table for them.
+fn noted_sessions(connection: &Connection) -> Result<std::collections::BTreeSet<SessionId>> {
+    let present: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'unseen_prompt_sessions'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(TransferError::store)?;
+    if present == 0 {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT session_id FROM unseen_prompt_sessions")
+        .map_err(TransferError::store)?;
+    let rows = statement
+        .query_map([], |row| uuid_column(row, 0))
+        .map_err(TransferError::store)?;
+    rows.map(|row| row.map(SessionId::new).map_err(TransferError::store))
+        .collect()
+}
+
+/// Those of `unseen` that an attachment belongs to, or that a draft holding the attachment names:
+/// by the session the draft targets, or by the session of another attachment the draft holds.
+fn shielding_sessions(
+    connection: &Connection,
+    transfer_id: TransferId,
+    unseen: &std::collections::BTreeSet<SessionId>,
+) -> Result<std::collections::BTreeSet<SessionId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT session_id FROM uploads
+                 WHERE transfer_id = ?1 AND session_id IS NOT NULL
+             UNION
+             SELECT draft.session_id
+                 FROM draft_attachments AS binding
+                 JOIN drafts AS draft ON draft.draft_id = binding.draft_id
+                 WHERE binding.transfer_id = ?1 AND draft.session_id IS NOT NULL
+             UNION
+             SELECT upload.session_id
+                 FROM draft_attachments AS binding
+                 JOIN draft_attachments AS other ON other.draft_id = binding.draft_id
+                 JOIN uploads AS upload ON upload.transfer_id = other.transfer_id
+                 WHERE binding.transfer_id = ?1 AND upload.session_id IS NOT NULL",
+        )
+        .map_err(TransferError::store)?;
+    let rows = statement
+        .query_map(params![uuid_sql(transfer_id.get())], |row| {
+            uuid_column(row, 0)
+        })
+        .map_err(TransferError::store)?;
+    let mut shielding = std::collections::BTreeSet::new();
+    for row in rows {
+        let session_id = SessionId::new(row.map_err(TransferError::store)?);
+        if unseen.contains(&session_id) {
+            shielding.insert(session_id);
+        }
+    }
+    Ok(shielding)
+}
+
 fn uuid_sql(value: Uuid) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
@@ -3100,12 +3253,15 @@ mod tests {
             .expect("writes a version-one journal");
         let store = Store::prepare(connection, environment()).expect("migrates and opens");
 
-        // The version moved, the column is there, and the reader that needs it works.
+        // The version moved, the column is there, and the reader that needs it works. The journal
+        // is one an earlier build wrote, so the sessions of earlier builds are still owed their
+        // noting.
         let version: i64 = store
             .connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("reads the version");
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, UNSETTLED_VERSION);
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Owed);
         assert!(
             store
                 .unfinished_claims()

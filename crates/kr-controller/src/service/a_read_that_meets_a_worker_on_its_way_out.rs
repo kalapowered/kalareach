@@ -925,7 +925,7 @@ async fn replaced(world: Silent, descriptor: bool) -> Silent {
 /// A daemon that recorded the scripted worker from its own ready report, as a daemon whose create
 /// had stopped waiting for the report does: nothing has read the worker since, and the
 /// reservation the create made is the registry's record of it.
-async fn reported_late(script: &Arc<Scripted>) -> Silent {
+pub(super) async fn reported_late(script: &Arc<Scripted>) -> Silent {
     reported(script, true).await
 }
 
@@ -1889,7 +1889,11 @@ async fn described(world: &Silent, include_closed: bool) -> Vec<SessionSummary> 
 
 /// Records one more create in the registry, as it stands before a worker has reported: reserved,
 /// asking for the shell and the directory given.
-async fn reserved(world: &Silent, shell: Option<&str>, cwd: &str) -> crate::registry::Reservation {
+pub(super) async fn reserved(
+    world: &Silent,
+    shell: Option<&str>,
+    cwd: &str,
+) -> crate::registry::Reservation {
     let intent = kr_cbor::to_canonical_vec(&kr_protocol::session::SessionCreateParams {
         environment_id: world.environment_id,
         presentation: kr_protocol::session::Presentation::Invisible,
