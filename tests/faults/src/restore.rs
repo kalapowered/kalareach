@@ -88,6 +88,18 @@ pub enum Strategy {
     ReversedSwitch,
 }
 
+/// What a direct client's terminal is in when the restoration reaches it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Beforehand {
+    /// Nothing has been sent to it.
+    #[default]
+    Fresh,
+    /// An earlier application ran in it and left it as applications do (see
+    /// [`Terminal::left_by_an_application`]), and it ignores the soft reset as Alacritty, Ghostty,
+    /// tmux and GNU screen do. The session's own output sends none to it.
+    LeftByAnApplication,
+}
+
 /// Which property a failure is of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Property {
@@ -559,6 +571,8 @@ pub(crate) struct Stage {
     columns: u16,
     rows: u16,
     strategy: Strategy,
+    /// What each direct client's terminal is in when its restoration reaches it.
+    beforehand: Beforehand,
     session: Session,
     session_id: SessionId,
     bytes: Vec<u8>,
@@ -582,6 +596,20 @@ pub(crate) struct Stage {
 /// Returns what stopped the run itself: a session that could not be opened, a client that could
 /// not attach or subscribe. What the run found is in the outcome's failures.
 pub fn run(corpus: &Corpus, strategy: Strategy) -> Result<Outcome, String> {
+    run_on(corpus, strategy, Beforehand::Fresh)
+}
+
+/// Runs one corpus as [`run`] does, with the direct client's terminal in the state `beforehand`
+/// names when its restoration reaches it.
+///
+/// # Errors
+///
+/// Returns what stopped the run itself, as [`run`] does.
+pub fn run_on(
+    corpus: &Corpus,
+    strategy: Strategy,
+    beforehand: Beforehand,
+) -> Result<Outcome, String> {
     let caused = caused(corpus)?;
     let switches = switches(corpus)?;
     let write_ends = corpus.write_ends();
@@ -613,6 +641,7 @@ pub fn run(corpus: &Corpus, strategy: Strategy) -> Result<Outcome, String> {
             TimeSources::system(),
             None,
         )?;
+        stage.beforehand = beforehand;
         for (point, leaves) in until.iter().copied().enumerate() {
             if point % stride == first {
                 stage.attach(Form::Direct, leaves, true)?;
@@ -682,6 +711,7 @@ impl Stage {
             columns,
             rows,
             strategy,
+            beforehand: Beforehand::Fresh,
             session,
             session_id,
             bytes,
@@ -750,7 +780,12 @@ impl Stage {
             until,
             stream: None,
             terminal: match form {
-                Form::Direct => Some(Terminal::new(columns, rows)?),
+                Form::Direct => Some(match self.beforehand {
+                    Beforehand::Fresh => Terminal::new(columns, rows)?,
+                    Beforehand::LeftByAnApplication => {
+                        Terminal::left_by_an_application(columns, rows)?
+                    }
+                }),
                 Form::Projected => None,
             },
             display: (form == Form::Direct).then(ProjectedDisplay::new),

@@ -99,7 +99,8 @@ pub struct View {
     pub other: Vec<Line>,
     /// The cursor, on a line of the showing buffer.
     pub cursor: ProjectedCursor,
-    /// The saved cursors.
+    /// The saved cursors, leaving out any that holds the state a restore with none saved puts
+    /// back: a terminal that saved that and a session that saved nothing hold the same thing.
     pub saved: Vec<SavedCursorState>,
     /// The scroll region.
     pub margins: MarginState,
@@ -202,7 +203,12 @@ impl View {
             lines,
             other,
             cursor: screen.cursor,
-            saved: screen.saved_cursors.clone(),
+            saved: screen
+                .saved_cursors
+                .iter()
+                .filter(|saved| !holds_the_default(saved))
+                .cloned()
+                .collect(),
             margins: screen.margins,
             rendition: screen.rendition,
             tab_stops: screen.tab_stops.clone(),
@@ -652,6 +658,22 @@ fn compare_lines(
             ));
         }
     }
+}
+
+/// Whether a saved cursor holds what a restore puts back when nothing was saved: home, the plain
+/// rendition, ASCII in both character sets with none shifted out, origin mode off, the default
+/// shape, no link and no pending wrap.
+fn holds_the_default(saved: &SavedCursorState) -> bool {
+    saved.column.get() == 0
+        && saved.row.get() == 0
+        && !saved.pending_wrap
+        && saved.rendition == CellRendition::PLAIN
+        && saved.charsets.g0 == "Ascii"
+        && saved.charsets.g1 == "Ascii"
+        && !saved.charsets.shift_out
+        && !saved.origin_mode
+        && saved.style.get() == 0
+        && !saved.hyperlink.is_present()
 }
 
 #[cfg(test)]
