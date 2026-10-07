@@ -121,7 +121,7 @@ fn voice_grant(controller: &Controller, device: &DeviceRecord, expires_at_ms: u6
 }
 
 /// The seam the coordinator reads this host's grants through, over the stores a daemon keeps.
-fn authority(controller: &Arc<Controller>) -> GrantAuthority {
+pub(super) fn authority(controller: &Arc<Controller>) -> GrantAuthority {
     GrantAuthority::new(
         Arc::clone(controller.sharing()),
         Arc::clone(controller.devices()),

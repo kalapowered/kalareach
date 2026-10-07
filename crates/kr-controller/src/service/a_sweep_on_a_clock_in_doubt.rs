@@ -16,7 +16,7 @@ use crate::service::Controller;
 use crate::service::net::tests::{daemon_on, manual_clocks};
 
 /// How many de-duplication records the transfer service holds.
-fn kept(temp: &kr_ipc::testing::TempHost) -> i64 {
+pub(super) fn kept(temp: &kr_ipc::testing::TempHost) -> i64 {
     let store = rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
         &temp.environment(),
     ))
@@ -27,7 +27,7 @@ fn kept(temp: &kr_ipc::testing::TempHost) -> i64 {
 }
 
 /// Makes every record the service holds as old as the clock can say.
-fn aged(temp: &kr_ipc::testing::TempHost) {
+pub(super) fn aged(temp: &kr_ipc::testing::TempHost) {
     let store = rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
         &temp.environment(),
     ))
@@ -40,7 +40,7 @@ fn aged(temp: &kr_ipc::testing::TempHost) {
         .expect("ages the record");
 }
 
-async fn swept(controller: &Arc<Controller>) {
+pub(super) async fn swept(controller: &Arc<Controller>) {
     controller
         .transfer()
         .sweep(&Arc::downgrade(controller))
