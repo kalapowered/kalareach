@@ -128,6 +128,55 @@ async fn authority_that_lapses_while_the_establishment_waits_stops_it() {
     }
 }
 
+/// KR-REQ-09.19, KR-REQ-10.05: a confirmation has a short life on the host's own monotonic clock,
+/// and the effect asks it again where it commits. The owner's answer is chosen, the challenge runs
+/// out while the effect waits (at either wait), and the effect is refused as needing a
+/// confirmation: nothing is written and the host still distrusts its clock. The control is a new
+/// confirmation inside its life, which establishes the clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_runs_out_while_the_establishment_waits_is_not_spent() {
+    for at in [At::BeforeTheClock, At::AfterTheConnection] {
+        let what = format!("{at:?}");
+        let (temp, controller, ..) = distrusting().await;
+        let door = Door::open(&temp, &controller).await;
+        let challenge = door.challenge().await;
+        door.answer(&challenge.request).await.expect("answered");
+        let pauses = &controller.owner_authority().pauses;
+        let (arrived, go) = match at {
+            At::BeforeTheClock => pauses.before_the_transaction.arm(),
+            At::AfterTheConnection => pauses.after_the_connection.arm(),
+        };
+        let attempt = tokio::spawn({
+            let door = door.clone();
+            async move { door.establish().await }
+        });
+        arrived.await.expect("the effect reached the wait");
+        controller
+            .owner_authority()
+            .pass(Duration::from_secs(10 * 60));
+        go.send(()).expect("the effect goes on");
+        let refused = attempt.await.expect("the effect ends");
+
+        assert_eq!(
+            code(refused),
+            ErrorCode::OwnerConfirmationRequired,
+            "{what}"
+        );
+        assert!(
+            !proven(&controller),
+            "{what}: the host still distrusts its clock"
+        );
+        assert_eq!(confirmed_at(&temp), None, "{what}: nothing was written");
+
+        let door = Door::open(&temp, &controller).await;
+        door.the_owner_establishes().await;
+        assert!(
+            proven(&controller),
+            "{what}: a new confirmation establishes it"
+        );
+    }
+}
+
 /// KR-REQ-09.19, KR-REQ-10.05: the signer of the confirmation an establishment chose can lose its
 /// authority before the effect commits. An owner device answers the challenge, the effect chooses
 /// that answer, the device is revoked while the effect waits, and the commit refuses: the answer

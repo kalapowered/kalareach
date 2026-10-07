@@ -284,6 +284,12 @@ impl Spendable {
 }
 
 impl OwnerAuthority {
+    /// Moves the monotonic clock the challenges' deadlines are decided on by `by`.
+    #[cfg(test)]
+    pub(crate) fn pass(&self, by: std::time::Duration) {
+        self.clock.pass(by);
+    }
+
     /// Builds the service for one host.
     #[must_use]
     pub fn new(
