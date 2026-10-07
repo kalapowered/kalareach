@@ -47,7 +47,7 @@ use kr_protocol::pairing::{
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId};
 
-use super::devices::{DeviceDirectory, DeviceRecord};
+use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
     ActionSubject, InvitationRows, PairingAction, another_subject, claim_effect, consume,
 };
@@ -209,7 +209,7 @@ impl SyncPause {
     }
 
     /// Waits here, blocking this thread, when the pause is armed.
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         let armed = self
             .0
             .lock()
@@ -226,8 +226,14 @@ impl SyncPause {
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct EstablishPauses {
+    /// How many establishments have been entered, which a test reads to know that its copies of one
+    /// action are on their way to the challenges.
+    pub(crate) entered: std::sync::atomic::AtomicUsize,
     /// After the confirmation is chosen, before the clock is taken.
     pub(crate) before_the_transaction: SyncPause,
+    /// After the transaction has begun and holds the directory's connection, before the
+    /// registration is asked again.
+    pub(crate) after_the_connection: SyncPause,
     /// Inside the commit's guard, after every row is written and checked, before the commit.
     pub(crate) inside_the_commit: SyncPause,
 }
@@ -1023,15 +1029,19 @@ impl OwnerAuthority {
     /// # Errors
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority,
-    /// `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of the clock stands, `ID_CONFLICT`
-    /// for a reused action, and whatever the admission or the records refuse with.
+    /// `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of the clock stands,
+    /// `ID_CONFLICT` for a reused action, and whatever the admission or the records refuse with.
     pub fn establish_clock(
         &self,
         caller: &Caller,
         action: (ActionId, Digest256),
         boot: BootEpoch,
-        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        guarded: &CommitFn,
     ) -> Result<HostClockEstablishResult> {
+        #[cfg(test)]
+        self.pauses
+            .entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.require_owner(caller)?;
         let rights = CanonicalSet::new();
         let expectation = self.expectation(
@@ -1057,7 +1067,7 @@ impl OwnerAuthority {
         #[cfg(test)]
         self.pauses.before_the_transaction.wait();
         let lifetimes = self.rows.lifetimes();
-        lifetimes.clock_trust().establish_with(
+        let established = lifetimes.clock_trust().establish_with(
             self.rows.directory(),
             boot,
             guarded,
@@ -1075,7 +1085,13 @@ impl OwnerAuthority {
                 self.pauses.inside_the_commit.wait();
                 Ok(())
             },
-        )?;
+        );
+        if let Err(error) = established {
+            // What the attempt found owed to the record is written whether or not it committed.
+            drop(state);
+            lifetimes.settle();
+            return Err(error);
+        }
         // Committed. The ledger forgets the challenge now, and what it answers cannot matter: the
         // record says the confirmation was spent, and a challenge that outlives that is not
         // spendable, because its answer is consumed in the record.

@@ -451,7 +451,8 @@ impl DeviceDirectory {
                      anchored_boot_ms INTEGER NOT NULL,
                      elapsed_ms INTEGER NOT NULL
                  );",
-            )
+            )?;
+            connection.execute_batch(crate::registry::CLOCK_CONTINUITY_SCHEMA)
         })?;
         // Forward-only, and applied to a table that already exists: `CREATE TABLE IF NOT EXISTS`
         // leaves an older table exactly as it was, and every read below names these columns. A
@@ -598,7 +599,7 @@ impl DeviceDirectory {
     /// begin or commit. Nothing is written unless it commits.
     pub(crate) fn guarded_transaction<T>(
         &self,
-        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        guarded: &CommitFn,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut connection = self
@@ -1401,12 +1402,10 @@ impl DeviceDirectory {
     }
 }
 
-/// Only a paired record answers a lookup.
-///
-/// A revoked device is not an unpaired candidate that may pair again through the same endpoint: it
-/// reaches the pre-authorisation surface, where pairing's own rules decide, and it reaches nothing
-/// else. What matters here is that it can never be *authorised*, and the handshake asks this
-/// exactly once for that purpose.
+/// What runs a commit it is handed while it holds whatever must stay true from the last check to
+/// the commit ([`DeviceDirectory::guarded_transaction`]).
+pub type CommitFn = dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync;
+
 /// Clears the decision, both holds, and marks the moment the owner established the clock at.
 ///
 /// One statement, so the owner's establishing is all or nothing. The mark and the anchor move with
@@ -1446,6 +1445,12 @@ pub(crate) fn establish_clock_in(
     Ok(())
 }
 
+/// Only a paired record answers a lookup.
+///
+/// A revoked device is not an unpaired candidate that may pair again through the same endpoint: it
+/// reaches the pre-authorisation surface, where pairing's own rules decide, and it reaches nothing
+/// else. What matters here is that it can never be *authorised*, and the handshake asks this
+/// exactly once for that purpose.
 /// Writes one device row inside a transaction the caller holds.
 ///
 /// The device record and its grant are one row, written in one statement: section 10 commits them

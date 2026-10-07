@@ -45,7 +45,7 @@ use kr_protocol::scalars::TimestampMs;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use kr_worker::action::time::DISCONTINUITY_TOLERANCE;
 
-use super::devices::{DeviceDirectory, ObservedUtc, establish_clock_in};
+use super::devices::{CommitFn, DeviceDirectory, ObservedUtc, establish_clock_in};
 use crate::error::Result;
 use crate::grants::policy::UtcFloor;
 use crate::registry::end_clock_continuity;
@@ -596,7 +596,7 @@ impl ClockTrust {
         &self,
         devices: &DeviceDirectory,
         boot: BootEpoch,
-        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        guarded: &CommitFn,
         during: impl FnOnce(&rusqlite::Connection, TimestampMs) -> Result<()>,
     ) -> Result<TimestampMs> {
         let mut state = self.held();

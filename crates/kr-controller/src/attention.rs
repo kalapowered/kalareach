@@ -914,6 +914,12 @@ impl AttentionModule {
         self.reading_and_debt().0
     }
 
+    /// Whether the host proves its wall clock for quiet hours now, as the next reading says.
+    #[cfg(test)]
+    pub(crate) fn quiet_hours_provable(&self) -> bool {
+        self.reading().wall_proven
+    }
+
     /// As [`Self::reading`], and whether the host owes its record a write that the reading found
     /// or had left. A forgetting is not made while a write is owed: what the host knows of its
     /// clock is ahead of its record.

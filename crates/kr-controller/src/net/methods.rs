@@ -28,6 +28,7 @@ use kr_protocol::preauth::PairStatusParams;
 use kr_protocol::scalars::Digest256;
 use kr_transport::clock::ContinuousInstant;
 
+pub use super::devices::CommitFn;
 pub use super::invitations::Admission;
 use super::owner::Caller;
 use super::pairing::PairingHost;
@@ -57,7 +58,7 @@ pub const fn serves(method: Method) -> bool {
 /// What a pairing mutation carries to its effect so that the effect can hold its registration
 /// standing through its commit: runs the commit it is handed while the registration, the fence and
 /// the deadline it was admitted under are held ([`Controller::pairing_guard`]).
-pub type CommitGuard = Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
+pub type CommitGuard = Arc<CommitFn>;
 
 impl Controller {
     /// Returns the admission check of one mutation: its connection's registration under the
@@ -117,8 +118,10 @@ impl Controller {
             deadline: Some(deadline),
         };
         Arc::new(move |commit| {
+            #[cfg(test)]
+            controller.owner.pauses.after_the_connection.wait();
             controller
-                .under_registration(&carried, || commit())
+                .under_registration(&carried, commit)
                 .and_then(|committed| committed)
         })
     }
@@ -252,7 +255,12 @@ impl Controller {
                         // reaches a host only over its network: asking would leave a challenge
                         // nobody can answer.
                         if !on_the_network && owner.enrolment()? == HostEnrolment::Enrolled {
-                            return Err(not_on_network());
+                            return Err(ControllerError::NotConfigured(
+                                "this host has an owner, whose device is the only thing that can \
+                                 confirm its clock, and it is not on the network; select a \
+                                 network and restart it"
+                                    .to_owned(),
+                            ));
                         }
                         owner.request_clock(&caller, action, admission.as_ref())
                     })

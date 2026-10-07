@@ -763,12 +763,11 @@ impl Registry {
                      in_force      INTEGER NOT NULL,
                      created_at_ms INTEGER NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS clock_continuity (
-                     boot_epoch        BLOB PRIMARY KEY NOT NULL,
-                     lost_at_ms        INTEGER NOT NULL,
-                     established_at_ms INTEGER
-                 );",
+                 ",
             )
+            .map_err(ControllerError::registry)?;
+        self.connection
+            .execute_batch(CLOCK_CONTINUITY_SCHEMA)
             .map_err(ControllerError::registry)?;
         let recorded: Option<i64> = self
             .connection
@@ -2494,7 +2493,17 @@ const fn source_name(source: ProcessStartSource) -> &'static str {
     }
 }
 
-/// Reads back what [`source_name`] wrote, and refuses anything else.
+/// The table that records, for each boot, that its clock continuity was lost and when its owner
+/// established the clock again.
+///
+/// The registry creates it with its other tables, and so does the device directory, which ends a
+/// boot's lost continuity in the same transaction as the trust record it writes.
+pub(crate) const CLOCK_CONTINUITY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS clock_continuity (
+         boot_epoch        BLOB PRIMARY KEY NOT NULL,
+         lost_at_ms        INTEGER NOT NULL,
+         established_at_ms INTEGER
+     );";
+
 /// Ends `boot`'s lost clock continuity at `at_ms` on `connection`, when it was lost.
 ///
 /// The owner's establishment of the clock writes this row in the same transaction as the trust
@@ -2522,6 +2531,7 @@ pub(crate) fn end_clock_continuity(
     Ok(())
 }
 
+/// Reads back what [`source_name`] wrote, and refuses anything else.
 fn source_from(text: &str) -> Result<ProcessStartSource> {
     match text {
         "linux_proc_stat" => Ok(ProcessStartSource::LinuxProcStat),
