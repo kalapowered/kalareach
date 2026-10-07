@@ -1943,12 +1943,6 @@ fn entry_command() -> String {
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
 }
 
-/// Returns the skill package's own files, for a check that they are what the manifest says.
-#[must_use]
-pub fn packaged_files() -> Vec<(&'static str, &'static str)> {
-    files().to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

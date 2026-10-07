@@ -268,12 +268,6 @@ impl Reviews {
         self.subjects.values()
     }
 
-    /// Returns one actor's acknowledgements.
-    #[must_use]
-    pub fn acknowledgements(&self, actor: &ActorId) -> Option<&BTreeMap<String, ReviewAck>> {
-        self.acks.get(actor)
-    }
-
     /// Returns every actor's acknowledgements.
     #[must_use]
     pub const fn all_acknowledgements(&self) -> &BTreeMap<ActorId, BTreeMap<String, ReviewAck>> {

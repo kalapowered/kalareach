@@ -88,9 +88,9 @@ use kr_protocol::gateway::{DownstreamRequestId, PendingKind, PendingResource, Pe
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId,
-    BrokerBindingId, CapabilityId, CapabilityRevision, GatewayConnectionId, LaunchProfileId,
-    PendingResourceId, PluginId, PublisherId, SessionId, SourceEventHandle, SourceGeneration,
-    StreamCursor, UpstreamMethod, UpstreamRequestId,
+    BrokerBindingId, CapabilityId, GatewayConnectionId, LaunchProfileId, PendingResourceId,
+    PluginId, PublisherId, SessionId, SourceEventHandle, SourceGeneration, StreamCursor,
+    UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 
@@ -2477,24 +2477,6 @@ impl Broker {
         now: TimestampMs,
     ) -> usize {
         self.state().capabilities.invalidate(change, reason, now)
-    }
-
-    /// Rechecks one capability before an action is dispatched.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::UnsupportedCapability`] or [`BrokerError::StaleBinding`] as the
-    /// record requires.
-    pub fn recheck_capability(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        capability_id: &CapabilityId,
-        read_at: Option<CapabilityRevision>,
-    ) -> Result<()> {
-        self.state()
-            .capabilities
-            .recheck(application_instance_id, capability_id, read_at)
-            .map(|_| ())
     }
 
     // -- arbitration --------------------------------------------------------------------------

@@ -286,14 +286,6 @@ impl Delivery {
         }
     }
 
-    /// Returns the cursor this delivery begins at.
-    #[must_use]
-    pub const fn starts_at(&self) -> u64 {
-        match self {
-            Self::Bytes { cursor, .. } | Self::Screen { cursor, .. } => *cursor,
-        }
-    }
-
     /// Returns the bytes to draw.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {

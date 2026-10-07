@@ -137,12 +137,6 @@ impl DescriptionFence {
         }
     }
 
-    /// Returns how many sessions are fenced.
-    #[must_use]
-    pub fn fenced_sessions(&self) -> usize {
-        self.fenced.lock().map_or(0, |held| held.len())
-    }
-
     /// Publishes a description under the fence's lock if the session is not fenced, not cancelled,
     /// and has not exceeded its whole-job deadline.
     ///

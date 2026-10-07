@@ -195,14 +195,6 @@ impl Installation {
             None => Ok(false),
         }
     }
-
-    /// Returns every content hash this installation needs, including its manifest.
-    #[must_use]
-    pub fn all_payloads(&self) -> Vec<PayloadDigest> {
-        let mut digests = vec![self.package_digest];
-        digests.extend(self.payloads.iter().copied());
-        digests
-    }
 }
 
 /// Returns every payload a reclaim must keep.

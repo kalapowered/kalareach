@@ -62,35 +62,6 @@ impl ControlState {
         Self::default()
     }
 
-    /// Records the state of one capability.
-    #[must_use]
-    pub fn with_capability(mut self, capability: PluginCapability, state: CapabilityState) -> Self {
-        self.capabilities.retain(|(held, _)| *held != capability);
-        self.capabilities.push((capability, state));
-        self
-    }
-
-    /// Records every right the actor holds.
-    #[must_use]
-    pub fn with_rights(mut self, rights: impl IntoIterator<Item = ActionRight>) -> Self {
-        self.rights = Some(rights.into_iter().collect());
-        self
-    }
-
-    /// Records the binding's state.
-    #[must_use]
-    pub fn in_binding_state(mut self, state: BindingState) -> Self {
-        self.binding_state = Some(state);
-        self
-    }
-
-    /// Records every node present in the document being rendered.
-    #[must_use]
-    pub fn with_present_nodes(mut self, nodes: impl IntoIterator<Item = NodeId>) -> Self {
-        self.present_nodes = Some(nodes.into_iter().collect());
-        self
-    }
-
     /// Records whether one presentation fact holds.
     #[must_use]
     pub fn with_flag(mut self, flag: PresentationFlag, holds: bool) -> Self {

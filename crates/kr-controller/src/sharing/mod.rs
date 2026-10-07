@@ -648,25 +648,6 @@ impl SharingService {
             .map(|record| record.grant)
             .collect())
     }
-
-    /// Every right one device currently holds, across its live grants.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the store cannot be read.
-    pub fn rights_held_by(
-        &self,
-        device_id: DeviceId,
-        now_ms: u64,
-    ) -> Result<CanonicalSet<ActionRight>> {
-        let mut held: CanonicalSet<ActionRight> = CanonicalSet::from_iter([]);
-        for grant in self.grants_held_by(device_id, now_ms)? {
-            for right in &grant.actions {
-                held.insert(*right);
-            }
-        }
-        Ok(held)
-    }
 }
 
 /// Whether a grant is finished: expired or revoked.

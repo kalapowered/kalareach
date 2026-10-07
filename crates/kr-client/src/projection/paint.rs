@@ -29,7 +29,7 @@
 
 use kr_protocol::projection::{
     CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign,
-    ProjectedBuffer, ProjectedHyperlink, ProjectedRow,
+    ProjectedBuffer, ProjectedHyperlink,
 };
 use kr_width::{cells_for, is_zero_width};
 
@@ -1238,17 +1238,6 @@ fn specification(colour: kr_protocol::projection::Rgb) -> Vec<u8> {
         colour.red, colour.green, colour.blue
     )
     .into_bytes()
-}
-
-/// Whether a row's runs agree with the pinned width model about every one of their cell spans.
-///
-/// A caller that wants the comparison without drawing anything asks this. It is the same check the
-/// painter makes per run, which is what keeps the two answers from drifting apart.
-#[must_use]
-pub fn row_encodes_exactly(row: &ProjectedRow) -> bool {
-    row.runs
-        .iter()
-        .all(|run| cells_for(&run.text) as u64 == run.cells.get())
 }
 
 /// A link to `uri` with `params`, for the tests below.

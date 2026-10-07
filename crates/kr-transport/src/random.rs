@@ -6,7 +6,7 @@
 //! neither is generated from anything weaker.
 
 use kr_crypto::secret::Secret;
-use kr_protocol::ids::{ActionId, ActionWindowId, ConnectionId, RemoteDispatchLeaseId};
+use kr_protocol::ids::{ActionWindowId, ConnectionId, RemoteDispatchLeaseId};
 use kr_protocol::scalars::{Nonce256, Uuid};
 
 use crate::error::Result;
@@ -54,15 +54,6 @@ pub fn fresh_uuid_v4() -> Result<Uuid> {
 /// As [`fresh_uuid_v4`].
 pub fn fresh_connection_id() -> Result<ConnectionId> {
     Ok(ConnectionId::new(fresh_uuid_v4()?))
-}
-
-/// Returns a fresh action identity.
-///
-/// # Errors
-///
-/// As [`fresh_uuid_v4`].
-pub fn fresh_action_id() -> Result<ActionId> {
-    Ok(ActionId::new(fresh_uuid_v4()?))
 }
 
 /// Returns a fresh remote dispatch lease identity.

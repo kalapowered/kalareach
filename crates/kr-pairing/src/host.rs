@@ -638,12 +638,6 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         Ok(())
     }
 
-    /// Returns the owner that issued this invitation.
-    #[must_use]
-    pub const fn issuing_owner(&self) -> &OwnerContext {
-        &self.issuing_owner
-    }
-
     /// Returns how many candidate slots are in use.
     #[must_use]
     pub fn live_candidates(&self) -> usize {

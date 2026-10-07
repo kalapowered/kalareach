@@ -32,7 +32,7 @@ use kr_plugin_sdk::capability::{
 use kr_plugin_sdk::catalogue::{IndexEntry, QualificationResult};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::text::DisabledReason;
-use kr_protocol::ids::{CapabilityRevision, EnvironmentId};
+use kr_protocol::ids::CapabilityRevision;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
 
 use crate::error::{CatalogueError, CatalogueResult};
@@ -324,23 +324,13 @@ fn disabled_reason(
     })
 }
 
-/// Returns an evidence subject naming only an environment.
-#[must_use]
-pub fn environment_subject(environment_id: EnvironmentId) -> EvidenceSubject {
-    EvidenceSubject {
-        environment_id,
-        application: Nullable(None),
-        terminal: Nullable(None),
-        desktop_generation: Nullable(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kr_plugin_sdk::example::example_manifest;
     use kr_plugin_sdk::text::{Label, Summary};
     use kr_plugin_sdk::version::PackageVersion;
+    use kr_protocol::ids::EnvironmentId;
     use kr_protocol::scalars::Uuid;
 
     use crate::ceiling::InstallationGrant;

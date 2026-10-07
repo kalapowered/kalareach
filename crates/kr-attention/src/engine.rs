@@ -582,12 +582,6 @@ impl Engine {
         self.items.get(key)
     }
 
-    /// Returns one actor's acknowledgements.
-    #[must_use]
-    pub fn acknowledgements(&self, actor: &ActorId) -> Option<&BTreeMap<AttentionKey, ItemAck>> {
-        self.acks.get(actor)
-    }
-
     /// Returns every actor's acknowledgements.
     #[must_use]
     pub const fn all_acknowledgements(

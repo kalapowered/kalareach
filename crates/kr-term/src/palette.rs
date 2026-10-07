@@ -8,8 +8,6 @@
 //! Where the palette came from is recorded, because "the user's terminal told us during the probe"
 //! and "the profile default" are different facts and the session has to be able to say which.
 
-use crate::error::TermError;
-
 /// An sRGB colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb {
@@ -143,12 +141,6 @@ impl DynamicColour {
             Self::SelectionBackground => 17,
             Self::SelectionForeground => 19,
         }
-    }
-
-    /// The reset selector, OSC 110 to 119.
-    #[must_use]
-    pub const fn reset_selector(self) -> u32 {
-        self.selector() + 100
     }
 }
 
@@ -295,11 +287,6 @@ impl Palette {
         self.source
     }
 
-    /// Records that an authorised actor changed the palette after creation.
-    pub const fn mark_explicit_change(&mut self) {
-        self.source = PaletteSource::ExplicitChange;
-    }
-
     /// An indexed colour.
     #[must_use]
     pub fn indexed(&self, index: u8) -> Rgb {
@@ -342,17 +329,6 @@ impl Palette {
     pub fn reset_all(&mut self) {
         self.reset_all_indexed();
         self.dynamic = self.initial;
-    }
-
-    /// Parses a colour specification, naming the failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TermError::ColourSpec`] when the specification is not one kr-vt/1 accepts.
-    pub fn parse_spec(spec: &str) -> Result<Rgb, TermError> {
-        Rgb::parse(spec).ok_or_else(|| TermError::ColourSpec {
-            spec: spec.to_owned(),
-        })
     }
 }
 

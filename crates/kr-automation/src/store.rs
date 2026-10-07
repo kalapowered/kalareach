@@ -2517,18 +2517,6 @@ impl WorkflowStore {
         self.read(|journal| journal.save_definition(definition, None, installed_at_ms))
     }
 
-    /// Loads the latest revision of a workflow definition with its operational state.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be read.
-    pub fn get_latest_definition(
-        &self,
-        workflow_id: WorkflowId,
-    ) -> Result<Option<InstalledDefinition>> {
-        self.read(|journal| journal.latest_definition(workflow_id))
-    }
-
     /// Loads an exact revision of a workflow definition with its operational state.
     ///
     /// # Errors

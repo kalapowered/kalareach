@@ -3900,12 +3900,6 @@ fn method_version_from(value: i64) -> Result<MethodVersion> {
         .map_err(|_| unavailable_detail("a stored method version is out of range"))
 }
 
-/// Builds an action identifier from a fresh random value.
-#[must_use]
-pub fn new_action_id() -> ActionId {
-    ActionId::new(kr_ipc::new_uuid())
-}
-
 /// Builds a request identifier for a host-originated call.
 #[must_use]
 pub const fn request_id(value: u64) -> RequestId {

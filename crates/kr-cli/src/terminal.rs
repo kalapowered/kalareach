@@ -445,12 +445,6 @@ impl KeyboardState {
         modify_other_keys: None,
     };
 
-    /// Returns whether the terminal answered either query.
-    #[must_use]
-    pub const fn is_known(&self) -> bool {
-        self.kitty.is_some() || self.modify_other_keys.is_some()
-    }
-
     /// Returns the sequences that give the terminal its keyboard protocols back.
     ///
     /// The level goes back to the terminal's own initial value and then the state that was read is

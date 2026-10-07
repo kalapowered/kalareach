@@ -53,15 +53,6 @@ impl GrantKind {
             Self::SessionInvitation => kr_protocol::invitation::InviteGrantKind::SessionInvitation,
         }
     }
-
-    /// Returns the kind a wire name names.
-    #[must_use]
-    pub const fn from_protocol(kind: kr_protocol::invitation::InviteGrantKind) -> Self {
-        match kind {
-            kr_protocol::invitation::InviteGrantKind::PersonalOwner => Self::PersonalOwner,
-            kr_protocol::invitation::InviteGrantKind::SessionInvitation => Self::SessionInvitation,
-        }
-    }
 }
 
 /// Builds the grant a session invitation proposes by default: `session.view` for one hour.

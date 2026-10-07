@@ -105,34 +105,10 @@ impl ConnectionActor {
         self
     }
 
-    /// Returns the ingress the host recorded.
-    #[must_use]
-    pub const fn ingress(&self) -> ActorIngress {
-        self.ingress
-    }
-
     /// Returns the connection identity.
     #[must_use]
     pub const fn connection_id(&self) -> ConnectionId {
         self.connection_id
-    }
-
-    /// Returns the controller generation that admitted the connection.
-    #[must_use]
-    pub const fn controller_generation(&self) -> ControllerGeneration {
-        self.controller_generation
-    }
-
-    /// Returns the principal the host assigned.
-    #[must_use]
-    pub const fn actor_id(&self) -> &ActorId {
-        &self.actor_id
-    }
-
-    /// Returns true when this connection's requests arrived as QUIC early data.
-    #[must_use]
-    pub const fn is_early_data(&self) -> bool {
-        self.early_data
     }
 
     /// Builds the envelope for one request, under the grant it was checked against.

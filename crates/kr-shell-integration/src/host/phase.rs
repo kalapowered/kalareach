@@ -81,21 +81,6 @@ impl PhaseGate {
         }
     }
 
-    /// Builds a gate for a session that claims none of this contract.
-    ///
-    /// A `native_compat` session is terminal-only from the start: it never registers a root
-    /// integration, so its input forwards like any application's and its Ctrl-D is the shell's own.
-    /// [`Self::reports_ready`] stays false for it, because what it reports is managed
-    /// qualification; such a session is created and reported ready by its own launch path.
-    #[must_use]
-    pub const fn terminal_only() -> Self {
-        Self {
-            phase: IntegrationPhase::TerminalOnly,
-            kind: None,
-            history: Vec::new(),
-        }
-    }
-
     /// Returns the current phase.
     #[must_use]
     pub const fn phase(&self) -> IntegrationPhase {

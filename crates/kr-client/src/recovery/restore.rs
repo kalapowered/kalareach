@@ -79,12 +79,6 @@ impl ServiceAccess {
     pub const fn policy(&self) -> RetrievalPolicy {
         self.policy
     }
-
-    /// The origin it is access to.
-    #[must_use]
-    pub fn service_origin(&self) -> &str {
-        &self.service_origin
-    }
 }
 
 impl std::fmt::Debug for ServiceAccess {
@@ -197,12 +191,6 @@ impl FreshRestore {
             policy,
             access: None,
         }
-    }
-
-    /// Returns the kit this restore is working from.
-    #[must_use]
-    pub const fn kit(&self) -> &RecoveryKit {
-        &self.kit
     }
 
     /// Returns the retrieval policy.

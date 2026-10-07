@@ -27,7 +27,7 @@ use kr_protocol::limits::{
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 use kr_worker::broker::connectors::BridgeFacts;
 
-use super::bridge::{ReleaseKey, key_of};
+use super::bridge::ReleaseKey;
 use super::native_bridge::NativeBridges;
 
 /// What room a part leaves for the frame's own encoding beyond its records.
@@ -491,12 +491,6 @@ fn state(state: &kr_plugin_catalogue::ReleaseState) -> ReleaseState {
         grant_cap: capability_names(&state.grant_cap),
         ends_at_next_boundary: state.ends_at_next_boundary,
     }
-}
-
-/// Returns the key of a live release, for a caller that holds one.
-#[must_use]
-pub fn release_key(release: &LiveRelease) -> ReleaseKey {
-    key_of(release)
 }
 
 #[cfg(test)]

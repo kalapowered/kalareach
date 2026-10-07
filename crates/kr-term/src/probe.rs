@@ -70,15 +70,6 @@ impl SavedMode {
         }
     }
 
-    /// The state a terminal is in when nothing has changed it.
-    ///
-    /// What a restoration falls back to for a terminal that does not answer for the mode: the
-    /// cursor is shown and everything else is off, which is a terminal nobody has touched.
-    #[must_use]
-    pub const fn documented_default(self) -> bool {
-        matches!(self, Self::CursorVisible)
-    }
-
     /// What the mode is, in words, for a report a person reads.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -422,20 +413,6 @@ impl ProbeSession {
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         self.complete
-    }
-
-    /// Checks the deadline without feeding any bytes.
-    ///
-    /// # Errors
-    ///
-    /// Fails once the one-second bound has passed with the exchange unfinished.
-    pub const fn check_deadline(&self, now_ms: u64) -> Result<()> {
-        if !self.complete && now_ms > self.deadline_ms {
-            return Err(TermError::ProbeFailed {
-                reason: ProbeFailure::DeadlinePassed,
-            });
-        }
-        Ok(())
     }
 }
 

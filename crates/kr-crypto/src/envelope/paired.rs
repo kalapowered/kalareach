@@ -89,11 +89,6 @@ impl PairedSenders {
     pub fn is_empty(&self) -> bool {
         self.by_key_id.is_empty()
     }
-
-    /// Returns every paired identifier, in order.
-    pub fn key_ids(&self) -> impl Iterator<Item = KeyId> + '_ {
-        self.by_key_id.keys().copied()
-    }
 }
 
 /// Opens one delivered mailbox item against the senders this device has paired with.

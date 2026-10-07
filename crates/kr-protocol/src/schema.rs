@@ -132,7 +132,7 @@ use crate::machine::{
     MachineSplitParams, MachineStepResult,
 };
 use crate::mailbox::{EnvelopePlaintext, ForwardedAuthority, SealedEnvelope};
-use crate::method::{Method, REGISTRY};
+use crate::method::REGISTRY;
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
     OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
@@ -982,12 +982,6 @@ fn render(value: &Value) -> String {
     let mut text = serde_json::to_string_pretty(value).expect("generated JSON is serialisable");
     text.push('\n');
     text
-}
-
-/// Returns the schema name every method uses, for cross-checking the table against the enum.
-#[must_use]
-pub fn method_names() -> Vec<&'static str> {
-    Method::ALL.iter().map(|method| method.as_str()).collect()
 }
 
 /// Returns the schema of one type, for tests that assert a single shape.

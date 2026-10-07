@@ -206,12 +206,6 @@ impl Profile {
     pub fn identity(&self) -> String {
         format!("{PROFILE_NAME}/{PROFILE_REVISION}")
     }
-
-    /// Whether the profile advertises `capability`.
-    #[must_use]
-    pub fn advertises(&self, capability: Capability) -> bool {
-        CAPABILITIES.contains(&capability)
-    }
 }
 
 impl Default for Profile {

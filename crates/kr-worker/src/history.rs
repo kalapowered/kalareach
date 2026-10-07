@@ -519,12 +519,6 @@ impl OutputHistory {
         self.retaining = true;
     }
 
-    /// Returns whether output is being retained.
-    #[must_use]
-    pub const fn is_retaining(&self) -> bool {
-        self.retaining
-    }
-
     /// Removes every byte of retained output, and returns what went.
     ///
     /// The bytes are the resident window and the spool together; the records are the spool

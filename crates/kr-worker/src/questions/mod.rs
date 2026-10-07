@@ -554,12 +554,6 @@ fn expiry_events(expired: Vec<Resolved>, now: Now) -> Vec<QuestionEvent> {
         .collect()
 }
 
-/// Returns whether an answer would be refused for naming a state that has already been reached.
-#[must_use]
-pub fn already_resolved(question: &Question) -> Option<QuestionState> {
-    question.state.is_resolved().then_some(question.state)
-}
-
 /// Returns the answer a question carries, if any.
 #[must_use]
 pub fn answer_of(question: &Question) -> Option<&QuestionAnswer> {

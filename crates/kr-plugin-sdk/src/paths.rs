@@ -191,19 +191,6 @@ impl PackagePath {
     pub fn collision_key(&self) -> String {
         self.0.to_ascii_lowercase()
     }
-
-    /// Returns true when this path needs a directory where `other` needs a file.
-    ///
-    /// `a/b` needs `a` to be a directory and `A` needs it to be a file. One of the two cannot be
-    /// extracted, and which one fails depends on the order a host happens to write them in.
-    #[must_use]
-    pub fn shadows(&self, other: &Self) -> bool {
-        let mine = self.collision_key();
-        let theirs = other.collision_key();
-        mine.len() > theirs.len()
-            && mine.starts_with(&theirs)
-            && mine.as_bytes().get(theirs.len()) == Some(&b'/')
-    }
 }
 
 fn is_drive_prefixed(value: &str) -> bool {

@@ -110,18 +110,6 @@ impl TaggedShape {
             any_variant,
         }
     }
-
-    /// The field whose text selects the variant.
-    #[must_use]
-    pub fn tag(&self) -> &str {
-        &self.tag
-    }
-
-    /// Every variant, by the text of its tag.
-    #[must_use]
-    pub const fn variants(&self) -> &BTreeMap<String, Arc<ObjectShape>> {
-        &self.variants
-    }
 }
 
 /// One object: the fields it declares and what happens to a key it does not.

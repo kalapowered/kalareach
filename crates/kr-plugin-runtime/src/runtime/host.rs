@@ -213,12 +213,6 @@ impl DocumentSink {
         self.used = used;
         true
     }
-
-    /// Returns how many bytes of this call's budget are spent.
-    #[must_use]
-    pub const fn used(&self) -> u64 {
-        self.used
-    }
 }
 
 impl Default for DocumentSink {

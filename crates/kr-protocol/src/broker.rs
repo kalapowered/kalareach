@@ -119,12 +119,6 @@ impl BrokerGrant {
     pub const fn may_create_approval(self) -> bool {
         matches!(self, Self::ApprovalInterpreter)
     }
-
-    /// Returns true when this grant permits preparing an effect against the upstream.
-    #[must_use]
-    pub const fn may_prepare_effect(self) -> bool {
-        matches!(self, Self::UpstreamAction)
-    }
 }
 
 impl fmt::Display for BrokerGrant {
@@ -1436,12 +1430,6 @@ impl InstanceCapabilityRecord {
             });
         }
         Ok(())
-    }
-
-    /// Returns true when this change invalidates the record.
-    #[must_use]
-    pub fn invalidated_by(&self, change: InstanceInvalidation) -> bool {
-        self.invalidated_by.contains(&change)
     }
 }
 
