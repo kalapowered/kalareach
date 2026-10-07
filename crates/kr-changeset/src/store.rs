@@ -1483,10 +1483,11 @@ impl Store {
 
     /// Returns the repository this host first found behind one independent clone.
     ///
-    /// An independent clone is its own repository, so the project service records no repository
-    /// identity for it and there is nothing outside this service to compare against. What there
-    /// is instead is what this host itself found the first time it read that workspace, kept here
-    /// so a repository substituted underneath the same path is refused rather than captured.
+    /// An independent clone is its own repository, which the project service holds to the Git
+    /// directory it recorded for the clone. What this host itself found the first time it read
+    /// that workspace is kept here as well, so a repository substituted underneath the same path
+    /// before the project service had a record of the clone's own is refused rather than
+    /// captured.
     ///
     /// # Errors
     ///

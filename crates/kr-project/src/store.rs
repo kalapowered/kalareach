@@ -2804,9 +2804,10 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         // its first successful open records the directory it finds
         // (`crate::identity::GitDirOutcome::Found`, written by `record_workspace_git_dir`), and
         // every open after that decides the directory by the record. Remove these entries, with
-        // that arm of the outcome and `record_workspace_git_dir`, once no supported upgrade starts
-        // from a store written before an independent clone's Git directory was recorded; a clone
-        // whose record is still missing by then is refused, and made again.
+        // the arm of `settle_workspace_records` that writes `Found` and `record_workspace_git_dir`,
+        // once no supported upgrade starts from a store written before an independent clone's Git
+        // directory was recorded; a clone whose record is still missing by then is refused, and
+        // made again.
         ("workspaces", "git_dir_device", "INTEGER"),
         ("workspaces", "git_dir_file_id", "INTEGER"),
         ("workspaces", "git_dir_fs", "BLOB"),

@@ -283,8 +283,9 @@ impl ChangeSetService {
         let opened = self
             .project
             .open_workspace_repository(resolved.summary.workspace_id)?;
-        // An independent clone is its own repository, and the project service records no
-        // identity for it. Two things are required of it instead. The first is what makes it
+        // An independent clone is its own repository, and the project service holds the clone's
+        // own Git directory to the record it made of it, so the repository it opened is the one
+        // that was recorded. Two things are required of it as well. The first is what makes it
         // an independent clone: its repository is **inside its own working tree**. A `.git`
         // file rewritten to point at somebody else's repository fails that, and so does a
         // working tree whose repository is elsewhere.
@@ -335,12 +336,13 @@ impl ChangeSetService {
 
     /// Records what repository this host found behind one independent clone, the first time.
     ///
-    /// Only a caller that is already writing calls this. An independent clone is its own
-    /// repository and the project service records no identity for it, so the first thing this
-    /// host captures from one is also what fixes which repository that workspace is. A record
-    /// that is the same repository under another device number, or that was made before
-    /// filesystems were recorded, takes what the repository is now. A shared workspace needs none
-    /// of it: the project service's own record is what that one is compared with.
+    /// Only a caller that is already writing calls this. The project service records an
+    /// independent clone's own Git directory when it makes the clone, and takes the one it finds
+    /// the first time it opens a clone made before that; this record is what the first capture
+    /// found, which still refuses a repository substituted before the project service took its
+    /// own. A record that is the same repository under another device number, or that was made
+    /// before filesystems were recorded, takes what the repository is now. A shared workspace
+    /// needs none of it: the project service's own record is what that one is compared with.
     ///
     /// # Errors
     ///

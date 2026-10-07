@@ -100,8 +100,9 @@ pub enum GitDirectory {
     /// checkout whose configuration sets `core.worktree` keeps it above its tree.
     Named(RecordedIdentity),
     /// The repository was made inside its tree, an independent clone or a repository this host
-    /// staged: its Git directory is the tree's own `.git`, and no other repository is its
-    /// repository, so Git's search for one is stopped above the tree.
+    /// staged: its Git directory is the tree's own `.git`, a directory and never a file or a link
+    /// to another repository, and no other repository is its repository, so Git's search for one
+    /// is stopped above the tree.
     ///
     /// `recorded` is the record of that directory. A clone an earlier build recorded, and a
     /// repository that has only just been published, have none yet: the directory found is the
@@ -158,19 +159,20 @@ impl GitDirectory {
         matches!(self, Self::InsideTree { .. })
     }
 
-    /// Refuses, before Git is asked anything, a tree whose own `.git` is not the directory that
-    /// was recorded for it. Nothing is decided where no record names one yet.
+    /// Refuses, before Git is asked anything, a tree whose own `.git` is not a directory, and one
+    /// that is not the directory recorded for it where a record names one. Git then never follows
+    /// a `.git` file or a link in the tree to another repository.
     fn decide_before_git(self, tree: &AuthorisedDirectory) -> Result<()> {
-        let Self::InsideTree {
-            recorded: Some(recorded),
-        } = self
-        else {
+        let Self::InsideTree { recorded } = self else {
             return Ok(());
         };
         let own = own_git_dir(tree)?;
-        own.check_recorded(recorded).map(|_| ()).map_err(|refusal| {
-            not_the_recorded_git_dir(recorded, tree.display_path(), own.identity(), &refusal)
-        })
+        match recorded {
+            Some(recorded) => own.check_recorded(recorded).map(|_| ()).map_err(|refusal| {
+                not_the_recorded_git_dir(recorded, tree.display_path(), own.identity(), &refusal)
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Decides the Git directory Git reported, before the repository's configuration is audited.

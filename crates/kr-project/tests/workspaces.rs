@@ -1040,9 +1040,8 @@ fn a_repository_whose_git_directory_is_above_its_tree_is_adopted_and_still_read(
 
 /// An independent clone that lost its own repository is not read as the repository around it, not
 /// even when that repository's configuration names the clone's tree as its working tree: Git then
-/// reports the recorded tree as the top level, and nothing else decides the repository's Git
-/// directory for an independent clone, so the search for the repository has to stop above the
-/// tree, and no `git status` starts.
+/// reports the recorded tree as the top level, the repository's Git directory is not the one
+/// recorded for the clone, and no `git status` starts.
 #[cfg(unix)]
 #[test]
 fn a_repository_around_an_independent_clone_that_names_its_tree_is_not_read_as_the_clone() {
@@ -1135,18 +1134,20 @@ fn a_clone_that_loses_its_repository_after_it_is_opened_is_not_read_as_the_repos
         .expect("the repository around the clone is given the clone's configuration");
     std::fs::remove_dir_all(tree.join(".git")).expect("the clone loses its repository");
 
-    assert!(
-        opened.recheck(profile).is_err(),
-        "the configuration read for the clone is not the repository around it"
-    );
+    let refusal = opened
+        .recheck(profile)
+        .expect_err("the configuration read for the clone is not the repository around it");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
 }
 
-/// Every request an opened independent clone builds stops Git's search for a repository above the
-/// clone's tree, so that whichever request is the first to look finds none instead of the
-/// repository around it.
+/// A request against an opened independent clone does not take the repository around the clone for
+/// the clone's, whichever request it is. The clone's `.git` is still the object the clone was
+/// opened with, so the directories a request is bound to are all as they were; what it no longer
+/// holds is the file that makes Git take it for a repository, and Git's search would go on above
+/// the tree.
 #[cfg(unix)]
 #[test]
-fn every_request_against_an_independent_clone_stops_the_search_above_its_tree() {
+fn a_request_against_an_opened_independent_clone_does_not_search_above_its_tree() {
     let fixture = Fixture::create();
     let around = ordinary_repository(fixture.work(), "around-requests");
     let project = adopted_with_changes(&fixture, "requests-source");
@@ -1158,14 +1159,29 @@ fn every_request_against_an_independent_clone_stops_the_search_above_its_tree() 
         IsolationMechanism::IndependentClone,
         123,
     );
+    let tree = around.join("clone");
     let opened = fixture
         .service()
         .open_workspace_repository(workspace_id)
         .expect("the clone opens");
-    let above = std::fs::canonicalize(&around).expect("the directory resolves");
-    let arguments = [std::ffi::OsStr::new("status")];
-    assert_eq!(opened.read(&arguments).ceiling, Some(above.as_path()));
-    assert_eq!(opened.write(&arguments).ceiling, Some(above.as_path()));
+    let profile = fixture.service().profile();
+    let arguments = [
+        std::ffi::OsStr::new("rev-parse"),
+        std::ffi::OsStr::new("--show-toplevel"),
+    ];
+    let toplevel = profile
+        .run_checked(&opened.read(&arguments))
+        .expect("the clone is its own repository");
+    assert_eq!(
+        std::fs::canonicalize(toplevel.trim()).expect("the top level resolves"),
+        std::fs::canonicalize(&tree).expect("the tree resolves")
+    );
+
+    std::fs::remove_file(tree.join(".git/HEAD")).expect("the clone's repository is not one");
+    assert!(
+        profile.run_checked(&opened.read(&arguments)).is_err(),
+        "Git finds no repository for the clone instead of the one around it"
+    );
 }
 
 /// A tree that lost its own repository is not audited as the repository around it, even when that
@@ -1276,6 +1292,59 @@ fn an_independent_clone_whose_git_directory_was_replaced_is_not_read() {
     assert!(
         !git_started_in(&started, &named),
         "no Git invocation started in a clone whose repository is not the recorded one"
+    );
+}
+
+/// A clone's `.git` is a directory, and a file in its place that names another repository is not
+/// followed: no Git invocation starts in the clone, whether or not a record names its repository.
+#[cfg(unix)]
+#[test]
+fn a_clone_whose_git_directory_is_a_file_naming_another_repository_is_not_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "file-git-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "file-git",
+        IsolationMechanism::IndependentClone,
+        124,
+    );
+    let tree = fixture.work().join("file-git");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    let elsewhere = ordinary_repository(fixture.work(), "elsewhere");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    // A clone recorded before Git directories were recorded has no record to refuse the file by.
+    journal
+        .execute(
+            "UPDATE workspaces SET git_dir_device = NULL, git_dir_file_id = NULL, git_dir_fs = NULL
+              WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+        )
+        .expect("the record is made as an earlier build made it");
+    std::fs::remove_dir_all(tree.join(".git")).expect("the clone's repository goes");
+    std::fs::write(
+        tree.join(".git"),
+        format!("gitdir: {}\n", elsewhere.join(".git").display()),
+    )
+    .expect("a file names another repository");
+
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 125);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the clone: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &named),
+        "no Git invocation started in a clone whose .git names another repository"
     );
 }
 
