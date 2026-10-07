@@ -62,6 +62,12 @@ impl std::fmt::Debug for Shown {
     }
 }
 
+impl std::fmt::Display for Shown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 const CANONICAL: (u64, u64) = (80, 24);
 
 struct Host {
