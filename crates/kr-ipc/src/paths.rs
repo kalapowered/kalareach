@@ -3842,6 +3842,36 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// An entry that names an identifier no account on this machine holds is refused as any other
+    /// account is. Such an entry is what a machine made from a copied image carries for accounts of
+    /// the machine it was copied from, and it is no more the owner's, nor an account that already
+    /// holds this machine, than a named account is: nothing here can tell it from an account that
+    /// exists elsewhere, and a machine that joins a domain can give it one. The owner's own list is
+    /// the control.
+    #[cfg(windows)]
+    #[test]
+    fn an_entry_naming_an_identifier_no_account_holds_is_refused_as_another_account_is() {
+        let root = temporary_root("acl-unknown");
+        let path = root.join("unknown");
+        windows::create_directory_with_list(&path, "D:P(A;;GA;;;OW)(A;;GRGX;;;S-1-5-21-1-2-3-4)")
+            .expect("creates");
+
+        let error = create_private_directory(&path).expect_err("refuses");
+
+        assert!(
+            matches!(
+                &error,
+                IpcError::DirectoryAccessRefused { detail, .. } if detail.contains("S-1-5-21-1-2-3-4")
+            ),
+            "an entry for an identifier no account holds is refused by name, got {error}"
+        );
+        let control = root.join("control");
+        windows::create_directory_with_list(&control, "D:P(A;;GA;;;OW)").expect("creates");
+        create_private_directory(&control).expect("the owner's own list is adopted");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_directory_that_inherits_its_list_is_adopted_but_is_not_a_boundary() {
