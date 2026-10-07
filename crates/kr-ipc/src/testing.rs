@@ -90,6 +90,50 @@ impl Drop for TempHost {
     }
 }
 
+/// A temporary directory of the kind this host makes its own directories: owner-only, with the
+/// same list on every platform, and removed when it is dropped.
+///
+/// `tempfile::tempdir()` makes a directory that inherits the access list of the temporary
+/// directory it is under. Where that list names an account besides its owner, which is so on a
+/// machine whose temporary directory carries an entry for another account, the host's owner-only
+/// check refuses every directory a test builds below it, and so does the check of a directory a
+/// test opens as one of the host's own. A test that hands a directory to code which checks it
+/// takes one made here, whose list is protected and so inherits nothing.
+///
+/// Like [`TempHost`], the name is short for a socket address.
+#[derive(Debug)]
+pub struct PrivateTempDir {
+    root: PathBuf,
+}
+
+impl PrivateTempDir {
+    /// Creates a fresh owner-only directory under the platform's temporary directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be created, which in a test means the environment is
+    /// unusable rather than that the case under test failed.
+    #[must_use]
+    pub fn create() -> Self {
+        let suffix = crate::new_uuid().to_string();
+        let root = std::env::temp_dir().join(format!("kr-{}", &suffix[..8]));
+        crate::paths::create_private_directory(&root).expect("an owner-only temporary directory");
+        Self { root }
+    }
+
+    /// Returns the directory's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// Returns the program that copies a file on this system.
 ///
 /// The usual two places first, then the search path, and a clear refusal when there is none. A
