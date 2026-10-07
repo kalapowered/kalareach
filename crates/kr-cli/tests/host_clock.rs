@@ -354,8 +354,8 @@ async fn the_clock_is_not_established_without_a_terminal() {
 }
 
 /// KR-REQ-10.53: a terminal inside a KalaReach session is not where the clock is confirmed. With
-/// `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real terminal before it asks anything, and
-/// the host still distrusts its clock.
+/// `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real terminal before it asks anything,
+/// and the host still distrusts its clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_clock_is_not_established_inside_a_session() {
     let host = Host::start().await;

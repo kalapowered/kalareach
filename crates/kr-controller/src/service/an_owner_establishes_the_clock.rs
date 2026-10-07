@@ -22,7 +22,9 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActionId, ActionWindowId, ActorId, ConnectionId, EnvironmentId, RequestId};
+use kr_protocol::ids::{
+    ActionId, ActionWindowId, ActorId, ConnectionId, DeviceId, EnvironmentId, RequestId,
+};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::pairing::{ConfirmationChannel, OwnerConfirmationRequest};
 use kr_protocol::scalars::{DurationMs, Nullable};
@@ -183,6 +185,30 @@ impl Door {
         .await
     }
 
+    /// Answers a challenge in an owner device's own ceremony, with the device's own key.
+    pub(super) async fn answer_as_device(
+        &self,
+        request: &OwnerConfirmationRequest,
+        keys: &kr_crypto::keys::DeviceKeys,
+    ) -> Result<OwnerConfirmationCompleteResult, ProtocolError> {
+        let proof = sign_confirmation(
+            &keys.authorisation,
+            request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof");
+        self.perform(self.mutation(
+            Method::OwnerConfirmationComplete,
+            ActionId::new(kr_ipc::new_uuid()),
+            TTL_MS,
+            &OwnerConfirmationCompleteParams {
+                proof,
+                bootstrap_signer: Nullable::null(),
+            },
+        ))
+        .await
+    }
+
     /// Spends a confirmation of the clock, under a fresh action identifier.
     pub(super) async fn establish(&self) -> Result<HostClockEstablishResult, ProtocolError> {
         self.perform(self.mutation(
@@ -263,6 +289,89 @@ pub(super) fn confirmed_at(temp: &kr_ipc::testing::TempHost) -> Option<i64> {
             |row| row.get(0),
         )
         .expect("the clock record is readable")
+}
+
+/// A paired device with `grant`'s rights, which never expire unless `expiry` says so.
+///
+/// Its keys are the ones it answers confirmations with; its record is committed to the host's
+/// device directory as a pairing would have committed it.
+pub(super) fn paired(
+    controller: &Controller,
+    keys: &kr_crypto::keys::DeviceKeys,
+    byte: u8,
+    rights: &[kr_protocol::rights::ActionRight],
+    expiry: kr_protocol::grant::GrantExpiry,
+) -> crate::service::net::devices::DeviceRecord {
+    use kr_protocol::grant::{EnvironmentSelector, Grant, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{AuthorityRevision, DeviceKeyRevision, GrantId};
+    use kr_protocol::pairing::{DeviceName, DevicePlatform};
+    use kr_protocol::scalars::{CanonicalSet, TimestampMs, Uuid};
+
+    let device_id = DeviceId::new(Uuid::from_bytes([byte; 16]));
+    let record = crate::service::net::devices::DeviceRecord {
+        device_id,
+        endpoint_id: *keys.transport.public(),
+        device_key_revision: DeviceKeyRevision::new(1),
+        authorisation: *keys.authorisation.public(),
+        stored_envelope: Some(*keys.stored_envelope.public()),
+        notification_preview: Some(*keys.notification_preview.public()),
+        device_name: DeviceName::new("A phone").expect("a name"),
+        platform: DevicePlatform::Android,
+        grant: Grant {
+            grant_id: GrantId::new(Uuid::from_bytes([byte; 16])),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([0; 16])),
+            recipient_device_id: device_id,
+            authority_revision: AuthorityRevision::new(1),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: rights.iter().copied().collect::<CanonicalSet<_>>(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry,
+            organisation: Nullable::null(),
+        },
+        paired_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        revoked_at_ms: None,
+        expired_at_ms: None,
+        committed_invitation_id: Some(kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
+            [byte; 16],
+        ))),
+    };
+    controller
+        .devices()
+        .commit(&record)
+        .expect("the pairing is committed");
+    record
+}
+
+/// A paired device whose grant ends at `expires_at_ms`, which this boot has not anchored yet.
+pub(super) fn expiring_device(
+    controller: &Controller,
+    expires_at_ms: u64,
+) -> crate::service::net::devices::DeviceRecord {
+    paired(
+        controller,
+        &kr_crypto::keys::DeviceKeys::generate().expect("keys"),
+        0x31,
+        &[kr_protocol::rights::ActionRight::SessionView],
+        kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(expires_at_ms),
+        },
+    )
+}
+
+/// Whether this host decides an expiring device's grant now: its end is measured on a clock the
+/// host proves.
+pub(super) fn decides(
+    controller: &Controller,
+    device: &crate::service::net::devices::DeviceRecord,
+) -> bool {
+    controller.lifetimes().paired(device).is_ok()
 }
 
 /// KR-REQ-09.19, KR-REQ-10.53: a confirmation of the clock is spent by the effect that names it and
@@ -386,10 +495,12 @@ pub(super) fn registry(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection
 /// KR-REQ-09.18, KR-REQ-09.19: an establishment is all or nothing, and a refusal leaves the owner's
 /// confirmation to try again. The record of the clock refuses the write that establishes it: the
 /// host still distrusts its clock and the confirmation stays answered, and once the record takes
-/// the write the same confirmation establishes the clock.
+/// the write the same confirmation establishes the clock. A restart after the refusal still finds
+/// the distrust on the record, and needs a new confirmation, since a challenge ends with its
+/// daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_tries_again() {
-    let (temp, controller, ..) = distrusting().await;
+    let (temp, controller, _continuous, _wall, clocks) = distrusting().await;
     let door = Door::open(&temp, &controller).await;
     let challenge = door.challenge().await;
     door.answer(&challenge.request).await.expect("answered");
@@ -410,12 +521,25 @@ async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_
     assert!(!proven(&controller), "the host still distrusts its clock");
     assert_eq!(confirmed_at(&temp), None, "nothing was written");
 
+    // A restart after the refusal: the distrust is on the record, and the challenge is gone.
+    drop(door);
+    stopped(controller).await;
+    let controller = daemon_on(&temp, clocks).await;
+    assert!(
+        !proven(&controller),
+        "the restart still finds the distrust on the record"
+    );
+    let door = Door::open(&temp, &controller).await;
+    assert_eq!(
+        code(door.establish().await),
+        ErrorCode::OwnerConfirmationRequired,
+        "no confirmation survives the daemon that issued it"
+    );
+
     registry
         .execute_batch("DROP TRIGGER refuse_the_establishment")
         .expect("the record takes the write");
-    door.establish()
-        .await
-        .expect("the same confirmation establishes the clock");
+    door.the_owner_establishes().await;
     assert!(proven(&controller));
 }
 
@@ -428,7 +552,7 @@ async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_
 async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
     let temp = kr_ipc::testing::TempHost::create();
     let (_continuous, _wall, clocks) = manual_clocks();
-    let controller = daemon_on(&temp, clocks).await;
+    let controller = daemon_on(&temp, clocks.clone()).await;
     assert!(proven(&controller), "the clock is proven where it starts");
     let registry = registry(&temp);
     registry
@@ -463,12 +587,32 @@ async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
     );
     assert_eq!(confirmed_at(&temp), None, "the owner confirmed nothing");
 
+    // A restart after the refusal finds the continuity still lost on the record.
+    drop(door);
+    stopped(controller).await;
+    let controller = daemon_on(&temp, clocks.clone()).await;
+    assert!(
+        controller.utc_floor().continuity_lost(),
+        "the restart still finds it lost"
+    );
+    let door = Door::open(&temp, &controller).await;
+    let challenge = door.challenge().await;
+    door.answer(&challenge.request).await.expect("answered");
+
     registry
         .execute_batch("DROP TRIGGER refuse_the_continuity")
         .expect("the record takes the write");
     door.establish()
         .await
         .expect("the same confirmation ends the lost continuity");
+    assert!(!controller.utc_floor().continuity_lost());
+    assert!(proven(&controller));
+
+    // A restart after the establishment keeps it ended, and one before it would have found the
+    // continuity lost: the record, not the daemon's memory, is what says so.
+    drop(door);
+    stopped(controller).await;
+    let controller = daemon_on(&temp, clocks).await;
     assert!(!controller.utc_floor().continuity_lost());
     assert!(proven(&controller));
 }
@@ -487,8 +631,7 @@ async fn a_commit_that_fails_leaves_the_confirmation_answered() {
         .devices()
         .with(|connection| {
             connection.execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE clock_probe_parent (id INTEGER PRIMARY KEY);
+                "CREATE TABLE clock_probe_parent (id INTEGER PRIMARY KEY);
                  CREATE TABLE clock_probe_child
                      (parent INTEGER REFERENCES clock_probe_parent (id)
                       DEFERRABLE INITIALLY DEFERRED);
@@ -511,7 +654,8 @@ async fn a_commit_that_fails_leaves_the_confirmation_answered() {
         .with(|connection| {
             connection.execute_batch(
                 "DROP TRIGGER clock_probe;
-                 PRAGMA foreign_keys = OFF;",
+                 DROP TABLE clock_probe_child;
+                 DROP TABLE clock_probe_parent;",
             )
         })
         .expect("the connection takes the commit");
@@ -535,6 +679,17 @@ async fn a_host_with_an_owner_and_no_network_is_not_asked_for_a_confirmation_nob
         before.initial_bootstrap,
         "no owner yet: the terminal confirms"
     );
+    let waiting = || {
+        controller
+            .owner_authority()
+            .pending(&crate::service::net::owner::Caller::local(
+                door.actor_id().clone(),
+            ))
+            .expect("the owner lists what it can answer")
+            .pending
+            .len()
+    };
+    assert_eq!(waiting(), 1, "the first challenge is waiting");
 
     registry(&temp)
         .execute(
@@ -553,8 +708,34 @@ async fn a_host_with_an_owner_and_no_network_is_not_asked_for_a_confirmation_nob
         ))
         .await;
     assert_eq!(code(refused), ErrorCode::HostNotConfigured);
+    assert_eq!(waiting(), 1, "and no challenge was left behind");
     assert!(
         !proven(&controller),
         "and the host still distrusts its clock"
     );
+}
+
+/// KR-REQ-09.17, KR-REQ-09.18, KR-REQ-09.19: an expiring device's grant is decided against the
+/// host's reading of UTC, and is not while the host distrusts it. A grant that ends tomorrow is
+/// refused as `CLOCK_UNTRUSTED` while the clock is in doubt, and decided once the owner has
+/// established it: the owner's word is what ends the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expiring_grant_is_decided_again_once_the_owner_establishes_the_clock() {
+    let (temp, controller, _continuous, wall, _clocks) = distrusting().await;
+    let tomorrow = wall.load(Ordering::SeqCst) + 86_400_000;
+    let device = expiring_device(&controller, tomorrow);
+
+    let refused = controller
+        .lifetimes()
+        .paired(&device)
+        .err()
+        .expect("a grant whose end cannot be measured is not decided");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        ErrorCode::ClockUntrusted,
+        "{refused}"
+    );
+
+    the_owner_establishes(&temp, &controller).await;
+    assert!(decides(&controller, &device));
 }

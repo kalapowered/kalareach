@@ -1084,7 +1084,6 @@ fn host_management_methods_require_the_host_manage_right() {
         "machine.join",
         "machine.merge",
         "machine.split",
-        "host.clock.establish",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(
@@ -1106,7 +1105,6 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "catalogue.add",
         "plugin.grant",
         "owner.confirmation.complete",
-        "host.clock.establish",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,
