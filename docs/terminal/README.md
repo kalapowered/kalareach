@@ -400,13 +400,17 @@ A soft reset needs no rule of its own for a direct terminal. Every soft reset ad
 projection, so each direct attachment is told to begin again and is drawn from the canonical
 screen, and the reset itself never reaches its terminal. Whichever buffer the reset came from, the
 terminal then shows the buffer the canonical screen shows. The only soft reset it reads is the
-restoration's own. That one follows a carriage return and a plain rendition, so what xterm's reset
-saves has no wrap pending and none of the faint, crossed-out or doubly underlined states is left
-set. The canonical screen keeps a pending wrap through the reset, as xterm's does, and a redraw
-cannot leave a wrap pending, so an attachment drawn while the wrap is still pending is shown a
-projection, as it is for a soft-wrapped row or any other state a redraw cannot carry. It is handed
-the stream again once the session's output goes quiet on a screen a redraw can carry. Otherwise the
-redraw leaves the attachment on the stream.
+restoration's own. The restoration runs one in each buffer, because xterm saves a fresh cursor only
+in the buffer that is showing and a terminal can be showing either when the restoration begins. It
+hides the cursor after each reset, because a reset makes the cursor show, and it closes any
+hyperlink the stream left open, which a reset does not do. Each reset follows a carriage return
+and a plain rendition, so what xterm's reset saves has no wrap pending and none of the faint,
+crossed-out or doubly underlined states is left set. The canonical screen keeps a pending wrap
+through the reset, as xterm's does, and a redraw cannot leave a wrap pending, so an attachment
+drawn while the wrap is still pending is shown a projection, as it is for a soft-wrapped row or any
+other state a redraw cannot carry. It is handed the stream again once the session's output goes
+quiet on a screen a redraw can carry, or once a change of the session's size leaves one.
+Otherwise the redraw leaves the attachment on the stream.
 
 A full reset is not among these behaviours, because the engine makes it match xterm. The library
 keeps whatever was saved across a full reset. A program that restores a cursor afterwards would land
