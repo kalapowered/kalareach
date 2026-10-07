@@ -132,16 +132,44 @@ pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usiz
     retained_carrying(runtime, marker, count, LIVENESS_DEADLINE).await;
 }
 
+/// What `marker` is on this platform's terminal.
+///
+/// A marker names what the terminal carried. A Unix terminal's line discipline turns the line feed
+/// that ends a line into a carriage return and a line feed, so a line an application ended with
+/// `\r\n` arrives as `\r\r\n`; Windows' pseudoconsole carries the line as it was written, `\r\n`.
+/// The markers in these suites spell the Unix form, and on Windows each `\r\r\n` in one is read as
+/// `\r\n`.
+fn on_this_terminal(marker: &[u8]) -> Vec<u8> {
+    if !cfg!(windows) {
+        return marker.to_vec();
+    }
+    let mut carried = Vec::with_capacity(marker.len());
+    let mut at = 0;
+    while at < marker.len() {
+        if marker[at..].starts_with(b"\r\r\n") {
+            carried.extend_from_slice(b"\r\n");
+            at += 3;
+        } else {
+            carried.push(marker[at]);
+            at += 1;
+        }
+    }
+    carried
+}
+
 /// Waits until the session's retained output carries `marker` `count` times, and returns that
 /// output, or fails when the session's shell has ended first or `within` has passed.
 ///
-/// The wait behind [`produced_times`], for a suite whose own bound is not the liveness one.
+/// The wait behind [`produced_times`], for a suite whose own bound is not the liveness one. The
+/// marker is read as this platform's terminal carries it ([`on_this_terminal`]).
 pub async fn retained_carrying(
     runtime: &SessionRuntime,
     marker: &[u8],
     count: usize,
     within: Duration,
 ) -> Vec<u8> {
+    let marker = on_this_terminal(marker);
+    let marker = marker.as_slice();
     let started = tokio::time::Instant::now();
     let deadline = started + within;
     loop {
