@@ -37,7 +37,7 @@ pub struct LibraryQualification {
     pub upstream_revision: &'static str,
     /// How the profile keeps the library inside its bounds.
     pub notes: &'static [&'static str],
-    /// Behaviour that differs from xterm and therefore constrains the direct compatibility profile.
+    /// Behaviour that constrains the direct compatibility profile.
     pub direct_mode_constraints: &'static [&'static str],
     /// The accessors the pinned revision adds to the upstream tree.
     pub qualified_additions: &'static [QualifiedAddition],
