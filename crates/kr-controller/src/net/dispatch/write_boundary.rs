@@ -141,7 +141,7 @@ fn output_for(
             controller: Arc::clone(controller),
             devices: Arc::clone(controller.devices()),
             pending: Arc::new(crate::service::net::devices::PendingExpiry::default()),
-            clock: Arc::new(crate::service::net::devices::ClockTrust::default()),
+            clock: Arc::clone(controller.lifetimes().clock_trust()),
             device_id: DeviceId::new(kr_ipc::new_uuid()),
             connection_id,
             grant_deadline: None,

@@ -1714,6 +1714,9 @@ async fn a_stored_organisation_grant_that_ran_out_admits_no_lease() {
         "anchored in this boot"
     );
     continuous.advance(std::time::Duration::from_millis(MINUTE_MS + 1_000));
+    // UTC lags the continuous clock by four seconds, which a wall clock may: it stays before the
+    // grant's expiry while the anchor has run out.
+    wall.fetch_add(MINUTE_MS - 3_000, Ordering::SeqCst);
     // The second grant's end is on record from an earlier reader, before anything in this daemon
     // anchored it.
     grants

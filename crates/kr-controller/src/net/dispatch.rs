@@ -201,7 +201,7 @@ impl RemoteConnection {
             device_id: device.device_id,
             devices: Arc::clone(controller.devices()),
             pending: Arc::new(super::devices::PendingExpiry::default()),
-            clock: Arc::new(super::devices::ClockTrust::default()),
+            clock: Arc::clone(controller.lifetimes().clock_trust()),
             connection_id,
             expired: AtomicBool::new(false),
             recorded: AtomicBool::new(false),
