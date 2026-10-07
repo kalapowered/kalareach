@@ -2278,11 +2278,13 @@ async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_scre
 /// KR-REQ-08.78 and KR-REQ-08.82: what a terminal was last given says nothing once its window
 /// changes, because the next screen is drawn for the window it has then. A terminal kept on a
 /// projection by a line the application wrapped, whose window shrinks and then returns to the
-/// session's size after the application has cleared the screen, is handed the stream when it
-/// returns, with no output from the application to prompt it.
+/// session's size, is still kept off the stream while the line is there, and is handed the stream
+/// when it returns after the application has cleared the screen, with no output from the
+/// application to prompt it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_screen_can_be_carried() {
     let narrow = Dimensions::new(4, 5);
+    let smaller = Dimensions::new(3, 5);
     let host = host_with(
         "stty -echo -echonl || exit 1; printf 'abcdef'; read -r _; \
          printf '\\033[H\\033[2J'; read -r _",
@@ -2297,30 +2299,40 @@ async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_scree
     let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
+    let wrapped = (
+        Some(TerminalPresentationMode::Viewport),
+        Some(PresentationReason::RestorationIncomplete),
+    );
     assert_eq!(
         reported(&host, &mut reader, attached.attachment_id).await,
-        (
-            Some(TerminalPresentationMode::Viewport),
-            Some(PresentationReason::RestorationIncomplete)
-        ),
+        wrapped,
         "the line the application wrapped cannot be drawn as one"
     );
 
-    // The window shrinks, so its size is the reason now, and the application clears the screen
-    // while that is so: nothing keeps the terminal off the stream but its own size.
-    let smaller = report_viewport(&host, &mut attached, Dimensions::new(3, 5), None).await;
+    // The window shrinks, so its size is the reason, and then returns while the line is still
+    // there: the screen the session holds still cannot be carried.
+    let report = report_viewport(&host, &mut attached, smaller, None).await;
     assert_eq!(
-        smaller.presentation_reason.0,
+        report.presentation_reason.0,
         Some(PresentationReason::SizeMismatch)
     );
+    let report = report_viewport(&host, &mut attached, narrow, None).await;
+    assert_eq!(
+        (report.presentation, report.presentation_reason.0),
+        (wrapped.0.expect("a mode"), wrapped.1),
+        "the wrapped line is still what keeps it off the stream"
+    );
+
+    // The window shrinks again and the application clears the screen while that is so, so nothing
+    // keeps the terminal off the stream but its own size.
+    report_viewport(&host, &mut attached, smaller, None).await;
     typist.release(&host).await;
     produced(&host.runtime, b"\x1b[2J").await;
 
-    // The window is the session's size again. The screen the session holds can be carried, so the
-    // report says the terminal is handed the stream, without the application writing anything.
-    let returned = report_viewport(&host, &mut attached, narrow, None).await;
+    // The window is the session's size again, and the screen the session holds can be carried.
+    let report = report_viewport(&host, &mut attached, narrow, None).await;
     assert_eq!(
-        (returned.presentation, returned.presentation_reason.0),
+        (report.presentation, report.presentation_reason.0),
         (TerminalPresentationMode::Direct, None)
     );
 }
