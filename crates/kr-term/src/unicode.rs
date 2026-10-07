@@ -114,16 +114,16 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          since, which xterm gives back there. A soft reset needs no rule of its own for a direct \
          terminal: every soft reset redraws each direct attachment from the canonical screen, an \
          attachment redrawn with a wrap pending is shown a projection, and it is handed the \
-         stream again once the screen can be carried. The one soft reset a terminal reads is the \
-         restoration's own, which follows a carriage return and a plain rendition, so xterm's \
+         stream again once the screen can be carried. The only soft resets a terminal reads are \
+         the restoration's own, which follow a carriage return and a plain rendition, so xterm's \
          reset has no wrap to keep and no faint, crossed-out or doubly underlined state to leave \
          set.",
         "ESC 8 restores a pending wrap. The library saves the wrap with the cursor and puts it \
          back, as xterm does, where Terminal.app and iTerm2 restore the position and not the \
          wrap, so the next character lands on the last column and not on the row below. A \
          terminal that does not give the wrap back places that character differently from the \
-         grid, so direct mode needs one that does. A restoration cannot set a saved wrap, because \
-         only a print into the last column sets one, so it counts one as not carried.",
+         grid. A restoration does not reproduce a saved wrap, because only a print into the last \
+         column sets one and it does not print that cell again, so it counts one as not carried.",
     ],
     qualified_additions: &[
         QualifiedAddition {

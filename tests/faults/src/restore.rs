@@ -1264,7 +1264,8 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
 /// and the switch that follows it is the one that leaves the primary buffer showing, so the first
 /// two of the three are the paint (`h`, `l`, `l`); with the alternate buffer showing the switch
 /// comes first and the paint is the other two (`h`, `l`, `h`). The offsets are those of the escape
-/// that begins each of the two switches, and `None` says the bytes are not such a restoration.
+/// that begins each of the two switches, and `None` says the bytes are not such a restoration: a
+/// restoration with nothing painted has only the first three switches, and is not one either.
 fn paint_switches(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut switches = Vec::new();
     let mut at = 0;
@@ -1277,14 +1278,21 @@ fn paint_switches(bytes: &[u8]) -> Option<(usize, usize)> {
         }
         at = start + 8;
     }
-    // The three that come last are the ones this describes, whatever came before them.
-    let last_three = switches
-        .len()
-        .checked_sub(3)
-        .map(|from| &switches[from..])?;
-    match last_three {
-        [(first, true), (second, false), (_, false)] => Some((*first, *second)),
-        [(_, true), (second, false), (third, true)] => Some((*second, *third)),
+    match switches.as_slice() {
+        [
+            (_, true),
+            (_, false),
+            (first, true),
+            (second, false),
+            (_, false),
+        ] => Some((*first, *second)),
+        [
+            (_, true),
+            (_, false),
+            (_, true),
+            (second, false),
+            (third, true),
+        ] => Some((*second, *third)),
         _ => None,
     }
 }
@@ -1340,19 +1348,32 @@ mod tests {
         );
     }
 
+    /// What a restoration begins with: a reset where the terminal is, into the alternate buffer, a
+    /// reset, out of it, and a reset.
+    const PROLOGUE: &[u8] = b"\x1b[!p\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[!p";
+
+    fn after_the_prologue(rest: &[u8]) -> Vec<u8> {
+        [PROLOGUE, rest].concat()
+    }
+
     #[test]
     fn reversing_the_switches_turns_only_the_paints_switches_the_other_way() {
-        let primary = b"\x1b[!p\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing";
+        let primary =
+            after_the_prologue(b"\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing");
         assert_eq!(
-            with_the_switches_reversed(primary),
-            b"\x1b[!p\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[Hshowing".to_vec()
+            with_the_switches_reversed(&primary),
+            after_the_prologue(b"\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[Hshowing")
         );
-        let alternate = b"\x1b[!p\x1b[?1049h\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[Hshowing";
+        let alternate =
+            after_the_prologue(b"\x1b[?1049h\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[Hshowing");
         assert_eq!(
-            with_the_switches_reversed(alternate),
-            b"\x1b[!p\x1b[?1049h\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[Hshowing".to_vec()
+            with_the_switches_reversed(&alternate),
+            after_the_prologue(b"\x1b[?1049h\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[Hshowing")
         );
         assert_eq!(with_the_switches_reversed(b"plain"), b"plain".to_vec());
+        // Nothing painted, so nothing to reverse.
+        let live = after_the_prologue(b"\x1b[?1049l\x1b[Hshowing");
+        assert_eq!(with_the_switches_reversed(&live), live);
     }
 
     fn bell(at: u64, completed_at: u64) -> Caused {
@@ -1521,17 +1542,19 @@ mod tests {
     #[test]
     fn cutting_the_other_buffer_removes_the_paint_and_nothing_of_the_switch_that_shows_a_buffer() {
         // The primary buffer showing: the other buffer is painted first.
-        let primary =
-            b"\x1b[!p\x1b[?1049h\x1b[H\x1b[2Jother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing";
+        let primary = after_the_prologue(
+            b"\x1b[?1049h\x1b[H\x1b[2Jother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing",
+        );
         assert_eq!(
-            without_the_buffer_not_showing(primary),
-            b"\x1b[!p\x1b[!p\x1b[?1049l\x1b[Hshowing".to_vec()
+            without_the_buffer_not_showing(&primary),
+            after_the_prologue(b"\x1b[!p\x1b[?1049l\x1b[Hshowing")
         );
         // The alternate buffer showing: it is selected first, and the other buffer painted after.
-        let alternate = b"\x1b[!p\x1b[?1049h\x1b[?1049l\x1b[H\x1b[2Jother\x1b[?1049h\x1b[Hshowing";
+        let alternate =
+            after_the_prologue(b"\x1b[?1049h\x1b[?1049l\x1b[H\x1b[2Jother\x1b[?1049h\x1b[Hshowing");
         assert_eq!(
-            without_the_buffer_not_showing(alternate),
-            b"\x1b[!p\x1b[?1049h\x1b[Hshowing".to_vec()
+            without_the_buffer_not_showing(&alternate),
+            after_the_prologue(b"\x1b[?1049h\x1b[Hshowing")
         );
         assert_eq!(without_the_buffer_not_showing(b"plain"), b"plain".to_vec());
     }
