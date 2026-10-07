@@ -309,6 +309,10 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
     (
+        "a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
         "owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem",
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
