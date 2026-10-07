@@ -511,8 +511,15 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
     ) {
+        #[cfg(feature = "testing")]
+        let pages = MAX_EVIDENCE_PAGES.min(
+            self.evidence_pages_limit
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        #[cfg(not(feature = "testing"))]
+        let pages = MAX_EVIDENCE_PAGES;
         let mut budget = EvidenceBudget {
-            pages: MAX_EVIDENCE_PAGES,
+            pages,
             retries: MAX_PAGE_RETRIES,
         };
         self.collect_fence_evidence(session_id, binding, revision, &mut budget)

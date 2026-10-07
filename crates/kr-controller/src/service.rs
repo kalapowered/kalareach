@@ -349,6 +349,11 @@ pub struct Controller {
     /// so that the worker can be made busy in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_an_acknowledgement: ReadPause,
+    /// How many pages of one worker's fence evidence this host's own tests let one announcement
+    /// collect, where they need fewer than the bound that is in force. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    evidence_pages_limit: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -673,6 +678,14 @@ impl Controller {
         &self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.after_an_acknowledgement.arm()
+    }
+
+    /// Lets one announcement collect at most `pages` pages of one worker's fence evidence, for this
+    /// host's own tests, so that a fence of a few pages is enough to reach the bound.
+    #[cfg(feature = "testing")]
+    pub fn limit_evidence_pages_for_tests(&self, pages: usize) {
+        self.evidence_pages_limit
+            .store(pages, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Replaces what this host holds of its qualification, for a test of the door on a host that

@@ -259,6 +259,25 @@ pub struct WorkerService {
     /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     refused_for_the_boundary: tokio::sync::watch::Sender<usize>,
+    /// The announcements of an authority revision this worker has been sent, in the order they
+    /// arrived, for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    announcements_received: std::sync::Mutex<Vec<ReceivedAnnouncement>>,
+}
+
+/// One announcement of an authority revision that reached a worker, as the worker recorded it for
+/// this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceivedAnnouncement {
+    /// Where this announcement stands among all that reached any worker of this process, so that
+    /// the announcements to several workers can be put in the order they were sent in.
+    pub sequence: u64,
+    /// The revision the announcement carried.
+    pub revision: u64,
+    /// How many of that revision's names the daemon already held: nought for an acknowledgement,
+    /// more for a page of the evidence that follows one.
+    pub evidence_from: u64,
 }
 
 impl WorkerService {
@@ -479,6 +498,8 @@ impl WorkerService {
             facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
+            #[cfg(feature = "testing")]
+            announcements_received: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -771,6 +792,17 @@ impl WorkerService {
     #[must_use]
     pub fn refusals_for_the_boundary(&self) -> usize {
         *self.refused_for_the_boundary.borrow()
+    }
+
+    /// Returns the announcements of an authority revision this worker has been sent so far, oldest
+    /// first, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn announcements_received(&self) -> Vec<ReceivedAnnouncement> {
+        self.announcements_received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Waits until more than `seen` announcements of an authority revision have been refused
@@ -2782,6 +2814,18 @@ impl WorkerService {
                     "this worker belongs to another environment",
                 ),
             );
+        }
+        #[cfg(feature = "testing")]
+        {
+            static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            self.announcements_received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ReceivedAnnouncement {
+                    sequence: SENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                    revision: notice.revision.get(),
+                    evidence_from: notice.evidence_from,
+                });
         }
         let Ok(_barrier) = self.dispatch.try_lock() else {
             #[cfg(feature = "testing")]

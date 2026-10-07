@@ -634,6 +634,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_an_acknowledgement: ReadPause::default(),
             #[cfg(feature = "testing")]
+            evidence_pages_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             after_the_environment_record_is_taken: crate::attention::Pause::default(),
