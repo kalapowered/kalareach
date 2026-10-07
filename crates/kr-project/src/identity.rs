@@ -277,10 +277,11 @@ impl OpenedRepository {
     ///
     /// The directory is opened and decided first, and Git starts in that object: a directory that
     /// took the place of the recorded tree, or a filesystem mounted over it, is refused before Git
-    /// is asked anything. A repository registered through a directory below its top level may be
-    /// found inside the recorded tree (`require_within`); one made inside its tree
-    /// ([`GitDirectory::InsideTree`]) is found at the tree itself, and its own `.git` must be a
-    /// directory, and the recorded one where a record names it, before Git starts. Git then
+    /// is asked anything. For a repository registered through a directory below its top level the
+    /// directory at the path may lie inside the recorded tree (`require_within`); for one made
+    /// inside its tree ([`GitDirectory::InsideTree`]) it is the tree itself, and the tree's own
+    /// `.git` must be a directory, and the recorded one where a record names it, before Git
+    /// starts. Git then
     /// reports the top level of the repository it finds, and that top level is decided before its
     /// configuration is audited: a repository whose top level is not the recorded tree, found
     /// inside or around it, is refused unaudited. Its Git directory is decided the same way
@@ -299,9 +300,10 @@ impl OpenedRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::IdentityChanged`] when the directory is neither the recorded tree
-    /// nor inside it, when the top level Git reports is not the recorded tree, when the Git
-    /// directory is not the recorded one, or what [`Self::open`] returns.
+    /// Returns [`ProjectError::IdentityChanged`] when the directory is not the recorded tree (nor
+    /// inside it, for a repository that was not made inside its tree), when the top level Git
+    /// reports is not the recorded tree, when the Git directory is not the recorded one, or what
+    /// [`Self::open`] returns.
     pub fn open_recorded_tree(
         profile: &RestrictedProfile,
         environment_id: EnvironmentId,
@@ -1086,11 +1088,11 @@ pub(crate) fn not_the_recorded_tree(
     }
 }
 
-/// Decides, for a repository reached through a location, that the working tree found at its place
-/// is the recorded one. It runs before anything of the repository is read and before Git is asked
-/// anything, and returns what the tree's record is to become. The repository's Git directory is
-/// decided once the descent has found it, before its configuration is audited
-/// ([`OpenedRepository::discovered`]).
+/// Decides that the directory found at a working tree's place is exactly the recorded tree, and
+/// returns what the tree's record is to become. It runs before anything of the repository is read
+/// and before Git is asked anything: for a repository reached through a location, and for one made
+/// inside its tree and opened by path. The repository's Git directory is decided once the descent
+/// or Git has found it, before its configuration is audited ([`OpenedRepository::discovered`]).
 ///
 /// # Errors
 ///

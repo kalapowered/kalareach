@@ -1188,6 +1188,37 @@ fn a_request_against_an_opened_independent_clone_does_not_search_above_its_tree(
     );
 }
 
+/// The first Git call of an open of an independent clone does not search above the clone's tree
+/// either: a clone whose `.git` is no longer a repository (its `HEAD` is gone, and the directory is
+/// still the object that was recorded) is one Git finds nothing for, and the repository around it
+/// is not what Git reports as the clone's top level.
+#[cfg(unix)]
+#[test]
+fn a_clone_that_is_not_a_repository_finds_none_above_it_when_it_is_opened() {
+    let fixture = Fixture::create();
+    let around = ordinary_repository(fixture.work(), "around-opening");
+    let project = adopted_with_changes(&fixture, "opening-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "clone",
+        IsolationMechanism::IndependentClone,
+        129,
+    );
+    std::fs::remove_file(around.join("clone/.git/HEAD"))
+        .expect("the clone's repository is not one");
+    let refusal = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect_err("Git finds no repository for the clone");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::UpstreamUnavailable,
+        "Git failed in the clone, rather than reporting the repository around it: {refusal}"
+    );
+}
+
 /// A tree that lost its own repository is not audited as the repository around it, even when that
 /// repository's configuration names the tree as its working tree and so passes for it: the Git
 /// directory it reports is not the recorded one, and nothing of it is read before it is refused.
