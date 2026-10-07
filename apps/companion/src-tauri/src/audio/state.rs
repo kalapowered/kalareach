@@ -3,20 +3,12 @@
 
 use serde::Serialize;
 
-/// Which of the two local silences a control acts on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Silence {
-    /// The person's own microphone.
-    Microphone,
-    /// The model's voice coming out of this device.
-    Playback,
-}
-
-/// What the call this device is holding is doing, as the screen draws it.
+/// What a call is doing, as the screen draws it.
 ///
-/// Read from the call itself rather than remembered anywhere else, so it stays true when nothing
+/// The screen reads it from the device rather than from any service, so it stays true when nothing
 /// can be reached. Section 15 ¶10 keeps local mute and closure working when the broker fails, and
 /// a screen told about its own microphone by a service would lose that at the moment it matters.
+/// This process holds no call, so it only ever reports [`NO_CALL`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct VoiceCallState {
     /// Whether this device is holding a call at all.

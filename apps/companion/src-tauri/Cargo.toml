@@ -60,16 +60,9 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
 ureq.workspace = true
 
-# The three desktop targets.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-opus.workspace = true
-opusic-sys.workspace = true
-webrtc.workspace = true
-
 [target.'cfg(target_os = "macos")'.dependencies]
 # The platform user-verification ceremony section 10 asks for on an unlocked owner device.
 block2.workspace = true
-coreaudio-rs.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["std", "NSString", "NSError"] }
 objc2-local-authentication = { workspace = true, features = ["std", "LAContext", "LAError", "block2"] }
