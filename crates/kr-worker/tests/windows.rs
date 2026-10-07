@@ -676,11 +676,14 @@ mod held_end {
                   which have no safe interface"
     )]
 
-    use windows_sys::Win32::Foundation::{DBG_CONTINUE, EXCEPTION_BREAKPOINT};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
+        INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugActiveProcessStop,
-        DebugSetProcessKillOnExit, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
-        WaitForDebugEvent,
+        CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess,
+        DebugActiveProcessStop, DebugSetProcessKillOnExit, EXCEPTION_DEBUG_EVENT,
+        EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
     };
 
     /// How long one debug event is waited for. The events are the process's own, and arrive as it
@@ -695,6 +698,9 @@ mod held_end {
         process: u32,
         /// The thread of the exit event this debugger has not answered, once it holds one.
         held: Option<u32>,
+        /// Keeps a debugger on the thread that attached it: a raw pointer is neither `Send` nor
+        /// `Sync`.
+        _thread: std::marker::PhantomData<*const ()>,
     }
 
     impl Debugger {
@@ -709,6 +715,7 @@ mod held_end {
             let debugger = Self {
                 process,
                 held: None,
+                _thread: std::marker::PhantomData,
             };
             // The attach is complete when the breakpoint the system breaks the process in with
             // has been seen and answered.
@@ -719,7 +726,7 @@ mod held_end {
                     let exception = unsafe { event.u.Exception };
                     exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT
                 };
-                debugger.answer(event.dwThreadId);
+                debugger.answer(&event, breakpoint);
                 if breakpoint {
                     return debugger;
                 }
@@ -740,10 +747,29 @@ mod held_end {
             event
         }
 
-        /// Lets the thread that raised the event it was waiting on go on.
-        fn answer(&self, thread: u32) {
+        /// Lets the thread that raised `event` go on, having closed the file the event gave this
+        /// debugger, which it has to. An exception is passed on to the process unless `expected`
+        /// says the debugger raised it.
+        fn answer(&self, event: &DEBUG_EVENT, expected: bool) {
+            // SAFETY: the code says which member of the union the event holds, and the handle is
+            // one the system gave this debugger with the event, to be closed once.
+            unsafe {
+                let file = match event.dwDebugEventCode {
+                    CREATE_PROCESS_DEBUG_EVENT => event.u.CreateProcessInfo.hFile,
+                    LOAD_DLL_DEBUG_EVENT => event.u.LoadDll.hFile,
+                    _ => std::ptr::null_mut(),
+                };
+                if !file.is_null() && file != INVALID_HANDLE_VALUE {
+                    CloseHandle(file);
+                }
+            }
+            let status = if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && !expected {
+                DBG_EXCEPTION_NOT_HANDLED
+            } else {
+                DBG_CONTINUE
+            };
             // SAFETY: the call names an event this debugger was given and has not answered.
-            let answered = unsafe { ContinueDebugEvent(self.process, thread, DBG_CONTINUE) };
+            let answered = unsafe { ContinueDebugEvent(self.process, event.dwThreadId, status) };
             assert_ne!(answered, 0, "the event is answered");
         }
 
@@ -757,7 +783,7 @@ mod held_end {
                     self.held = Some(event.dwThreadId);
                     return;
                 }
-                self.answer(event.dwThreadId);
+                self.answer(&event, false);
             }
         }
     }
@@ -781,7 +807,9 @@ mod held_end {
 /// collected once it has finished.
 #[test]
 fn a_process_that_is_already_ending_is_not_a_failure_to_end() {
-    let job = kr_worker::windows::job::AgentJob::create().expect("a job");
+    // Kill-on-close, so that a process the debugger could not be attached to is ended with the job
+    // whichever way the test ends.
+    let job = kr_worker::windows::job::AgentJob::create_owning().expect("a job");
     let mut child = start_in(&job, "ping.exe", &["-n", "600", "127.0.0.1"]);
     let mut debugger = held_end::Debugger::attach(child.id());
     child.kill().expect("a running process is ended");
