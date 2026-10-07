@@ -894,6 +894,24 @@ pub enum HostCommand {
     /// Show the machine group an environment records for itself, or take one owner-approved step
     /// that changes it.
     Machine(MachineArguments),
+    /// Trust this host's clock again, as its owner.
+    Clock(ClockArguments),
+}
+
+/// `kr host clock`.
+///
+/// A host that finds its clock going backwards stops forgetting by it and stops deciding expiring
+/// grants against it, and only its owner ends that. A host with no owner yet is confirmed at this
+/// terminal; a host with one is confirmed on an owner device.
+#[derive(Args)]
+pub struct ClockArguments {
+    /// Trust the host's clock again. The command shows the time the host reads, and asks the owner
+    /// to confirm it is right.
+    #[arg(long, required = true)]
+    pub establish: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr host machine`.
