@@ -1201,9 +1201,10 @@ profile, together with the keyboard stack the session holds; the virtual title s
 markers; the right-hand side of a row wider than the window; and a pending wrap, whether the
 cursor's or a saved cursor's, that the window shows. A terminal given a screen that left out any of
 these but the right-hand side of a row is not handed the stream afterwards. Its attachment is shown
-a projection, with the reason `restoration_incomplete` unless an earlier reason in the CLI
-reference's list holds, such as `no_terminal_profile`, until the session's screen is one a
-restoration can carry.
+a projection, with the reason `restoration_incomplete`, until the session's screen is one a
+restoration can carry. An earlier reason in [the CLI reference's
+list](../cli/README.md#--json-shapes), such as `no_terminal_profile`, is reported in its place and
+keeps the projection for as long as it holds.
 
 A restoration begins by writing the plain state its screen is drawn under and saving the cursor with
 `ESC 7`. The state is the cursor hidden, the plain rendition, no open link, origin mode and left and

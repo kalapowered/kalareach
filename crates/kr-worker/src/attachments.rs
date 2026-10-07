@@ -665,9 +665,9 @@ impl AttachmentTable {
     /// property of that screen rather than of the session: the same grid restores completely for
     /// one terminal and not for another the moment a pending wrap or a saved cursor appears. So
     /// does the host's own check of whether a restoration drawn now would carry everything, for an
-    /// attachment a screen it could not carry is keeping on a projection, and, when that terminal
-    /// reports its window, for one whose window has just changed and for one the session has told
-    /// to begin again.
+    /// attachment a screen it could not carry is keeping on a projection, and, when its terminal
+    /// reports its window, for one whose window has just changed or that the session has told to
+    /// begin again.
     pub fn note_restoration(&mut self, id: AttachmentId, continues: bool) {
         let Some(ordinal) = self.by_id.get(&id) else {
             return;
