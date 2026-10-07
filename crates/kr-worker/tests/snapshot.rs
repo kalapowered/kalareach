@@ -747,9 +747,9 @@ async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
     // and the alternate character set designated as G1.
     let host = host(
         "printf 'hello from the session\\r\\n'; \
-         printf '\\033]2;a session with a title\\033\\\\'; \
+         printf '\\033]2;a session with a title\\033\\134'; \
          printf '\\033[22;2t'; \
-         printf '\\033]2;the title on top\\033\\\\'; \
+         printf '\\033]2;the title on top\\033\\134'; \
          printf '\\0337'; \
          printf '\\033[3;18r'; \
          printf '\\033[?1000h'; \
@@ -1191,8 +1191,8 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
     // A bell, a clipboard write, a desktop notification, a title change, a hyperlink and a query,
     // all before anybody attaches. Only two of those are state; the rest happened.
     let host = host(
-        "printf '\\a'; printf '\\033]52;c;c2VjcmV0\\033\\\\'; printf '\\033]99;;hello\\033\\\\'; \
-         printf '\\033]2;a title\\033\\\\'; printf '\\033]8;;https://example.invalid/g\\033\\\\linked\\033]8;;\\033\\\\\\r\\n'; \
+        "printf '\\a'; printf '\\033]52;c;c2VjcmV0\\033\\134'; printf '\\033]99;;hello\\033\\134'; \
+         printf '\\033]2;a title\\033\\134'; printf '\\033]8;;https://example.invalid/g\\033\\134linked\\033]8;;\\033\\134\\r\\n'; \
          printf '\\033[c'; read -r _",
     )
     .await;
@@ -1262,8 +1262,8 @@ async fn links_to_one_target_with_different_identifiers_reach_a_client_as_differ
     let target = "https://example.invalid/guide";
     let host = host(&format!(
         "stty -echo -echonl || exit 1; \
-         printf '\\033]8;id=a;{target}\\033\\\\one\\033]8;;\\033\\\\\\r\\n'; \
-         printf '\\033]8;id=b:name=x;{target}\\033\\\\two\\033]8;;\\033\\\\\\r\\n'; exec cat"
+         printf '\\033]8;id=a;{target}\\033\\134one\\033]8;;\\033\\134\\r\\n'; \
+         printf '\\033]8;id=b:name=x;{target}\\033\\134two\\033]8;;\\033\\134\\r\\n'; exec cat"
     ))
     .await;
     produced(&host.runtime, b"two\x1b]8;;\x1b\\\r\r\n").await;
@@ -1365,7 +1365,7 @@ fn link(uri: &str, params: &str) -> ProjectedHyperlink {
 )]
 async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     let host = host(
-        "printf '\\033]8;;https://example.invalid/guide\\033\\\\the guide\\033]8;;\\033\\\\\\r\\n'; read -r _",
+        "printf '\\033]8;;https://example.invalid/guide\\033\\134the guide\\033]8;;\\033\\134\\r\\n'; read -r _",
     )
     .await;
     produced(&host.runtime, b"the guide\x1b]8;;\x1b\\\r\r\n").await;
@@ -2740,7 +2740,7 @@ async fn a_viewport_that_names_an_evicted_row_is_given_the_oldest_page_and_the_m
 )]
 async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
     let host = host_with(
-        "printf '\\033]8;;https://example.invalid/deep\\033\\\\the deep link\\033]8;;\\033\\\\\\r\\n'; \
+        "printf '\\033]8;;https://example.invalid/deep\\033\\134the deep link\\033]8;;\\033\\134\\r\\n'; \
          i=0; while [ $i -lt 200 ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; read -r _",
         Dimensions::new(CANONICAL.0, CANONICAL.1),
         None,
