@@ -32,7 +32,9 @@
 //!
 //! A new record is written to a temporary file in the same directory, flushed, renamed over the
 //! record, and the directory is flushed after it. The record's name holds a whole record
-//! throughout: the old one until the rename, the new one after it. A step that fails before the
+//! throughout: the old one until the rename, the new one after it. Windows can leave the name
+//! resolving to nothing for an instant while a rename replaces it, so a read that finds nothing
+//! waits for the step that may be replacing the record and reads again. A step that fails before the
 //! rename leaves the old record and says so. One that fails after it has published the new record,
 //! which every later read returns, and says that whether the change survives a crash is not known.
 //! The first record is written the same way and given its name by a link instead, which never
@@ -276,19 +278,36 @@ impl MachineStore {
         if store.read()?.is_none() {
             store.mint(now_ms, deadline)?;
         }
-        store.group()?;
+        store.current()?;
         Ok(store)
     }
 
     /// Reads the environment's group.
     ///
-    /// No lock is needed to read: the record's name always holds a whole record.
+    /// A read holds nothing while the record's name resolves, and what it finds is a whole record:
+    /// the old one until a step's rename, the new one after it. A name that resolves to nothing is
+    /// not yet a missing record, because Windows can answer so for an instant while a rename
+    /// replaces a name. The read then waits for the step of this process that may be replacing the
+    /// record, which holds the writer lock until the new record has its name, and reads again.
+    /// Only this process replaces the record, because the singleton lock keeps every other away,
+    /// so a record that is still not there then is missing.
     ///
     /// # Errors
     ///
-    /// Returns a storage failure when the record is missing, damaged or another environment's.
+    /// Returns a storage failure when the record is missing, damaged or another environment's, or
+    /// when a step held the record for longer than a read waits for one.
     pub fn group(&self) -> Result<MachineGroup> {
-        self.read_by_name()?
+        if let Some(record) = self.read_by_name()? {
+            return Ok(record);
+        }
+        let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
+        let _after_the_step = self.writer(deadline, "read the machine group record")?;
+        self.current()
+    }
+
+    /// Reads the record while the caller holds it, so that no step of this process is replacing it.
+    fn current(&self) -> Result<MachineGroup> {
+        self.read()?
             .ok_or_else(|| self.unreadable("the record is missing"))
     }
 
@@ -376,7 +395,7 @@ impl MachineStore {
         let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
         self.check_lock(lock)?;
         let _holding = self.writer(deadline, "write the machine group record")?;
-        let current = self.group()?;
+        let current = self.current()?;
         if current.expected() != expected {
             return Err(ControllerError::Refused {
                 code: ErrorCode::DraftConflict,
