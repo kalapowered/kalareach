@@ -45,7 +45,6 @@ use common::{
     take_the_keys,
 };
 
-/// The session's own size. An attachment of exactly this size takes the stream directly.
 /// Whether `bytes` carry a bell: a BEL that is not inside a string. A BEL that ends an
 /// operating-system command, as one does a window title, is that command's terminator and not a
 /// bell, and a Windows pseudo-console ends the title it writes that way.
@@ -93,6 +92,7 @@ impl std::fmt::Display for Shown {
     }
 }
 
+/// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
 
 struct Host {
@@ -517,17 +517,13 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console writes no line ending after a clipboard sequence, which is what this case waits for"
-)]
 async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     // A bell, a clipboard write and some text, all before anybody attaches. What the attachment
     // gets is the text, on a screen; what it must not get is the bell or the clipboard write, which
     // were events when they happened and are not events now.
     let host = host(
         "stty -echo -echonl || exit 1; \
-         printf 'visible-line\\a\\033]52;c;aGVsbG8=\\033\\\\\\n'; read -r _; \
+         printf 'visible-line\\a\\033]52;c;aGVsbG8=\\033\\134\\n'; read -r _; \
          printf 'kr-joined.\\n'; read -r _",
     )
     .await;
@@ -632,7 +628,7 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     // put it on every attached device.
     let host = host(
         "stty -echo -echonl || exit 1; read -r _; \
-         printf '\\a\\033]52;c;c2VjcmV0\\033\\\\kr-rang.\\n'; read -r _; \
+         printf '\\a\\033]52;c;c2VjcmV0\\033\\134kr-rang.\\n'; read -r _; \
          printf 'kr-after.\\n'; read -r _",
     )
     .await;
@@ -718,7 +714,7 @@ const CLIPBOARD_WRITE: &[u8] = b"\x1b]52;c;c2VjcmV0\x1b\\";
 
 /// The application begins a clipboard write, waits for a line, and finishes it.
 const SPLIT_CLIPBOARD_WRITE: &str = "stty -echo -echonl || exit 1; printf '\\033]52;c;c2Vj'; read -r _; \
-     printf 'cmV0\\033\\\\kr-rang.\\n'; read -r _";
+     printf 'cmV0\\033\\134kr-rang.\\n'; read -r _";
 
 /// KR-REQ-08.06, KR-REQ-08.38: a side effect that began before a terminal of another size joined,
 /// and was completed after, reaches the terminal holding the input lease whole. It is neither
@@ -790,7 +786,7 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
     let gate = std::env::temp_dir().join(format!("kalareach-gate-{}", kr_ipc::new_uuid()));
     let host = host(&format!(
         "stty -echo -echonl || exit 1; while [ ! -e '{}' ]; do sleep 0.1; done; \
-         printf '\\a\\033]52;c;c2VjcmV0\\033\\\\kr-rang.\\n'; sleep 120",
+         printf '\\a\\033]52;c;c2VjcmV0\\033\\134kr-rang.\\n'; sleep 120",
         gate.display()
     ))
     .await;
