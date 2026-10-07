@@ -358,7 +358,8 @@ These are the behaviours the profile records as constraints on direct mode. The 
 bugs in the canonical state, but mean that a physical terminal needs to be qualified against them in
 order for direct mode to be offered. The third is a difference in where the pinned library leaves
 the cursor; both terminals tested report a different column from the library's. The fourth is where
-a soft reset leaves the buffer, and the fifth is what it leaves saved:
+a soft reset leaves the buffer, the fifth is what it leaves saved, and the sixth is what a restored
+cursor does with a pending wrap:
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -395,6 +396,13 @@ a soft reset leaves the buffer, and the fifth is what it leaves saved:
   so the cursor stays where the reset left it. Putting these right would need the engine to put a
   saved cursor back, rendition and character sets included, and nothing but a sequence that moves
   the screen can.
+- **`ESC 8` gives a pending wrap back.** The library saves the wrap with the cursor and restores it,
+  as xterm does, so after `ESC 7`, a move and `ESC 8` the next character goes to the row below.
+  Terminal.app and iTerm2 restore the position and not the wrap, and the next character lands on the
+  last column (`autowrap.pending-survives-save-and-restore`). The same bytes then place the next
+  character in different cells, so direct mode needs a terminal that gives the wrap back. A
+  restoration cannot set a saved wrap, because only a print into the last column sets one, and it
+  counts the wrap as something it did not carry.
 
 A soft reset needs no rule of its own for a direct terminal. Every soft reset advances the
 projection, so each direct attachment is told to begin again and is drawn from the canonical
@@ -1430,10 +1438,10 @@ at the last column leaves the grid's cursor one column short of the last, where 
 answer the last (`wide.wide-character-two-cells-from-the-edge`). The pinned terminal library leaves
 the cursor on the character's first cell there, and the grid reports the library's column. A
 cursor-left after a full row moves the grid's cursor and neither terminal's, and neither restores a
-pending wrap with `ESC 8`. A zero-width space and a Devanagari conjunct take a cell more in both
-than the grid's width model gives them. Here the two terminals agree with each other and the grid is
-the one apart. Which of them is right is a question for the profile, and the records do not decide
-it.
+pending wrap with `ESC 8`, which the grid does, as xterm does. A zero-width space and a Devanagari
+conjunct take a cell more in both than the grid's width model gives them. Here the two terminals
+agree with each other and the grid is the one apart. Which of them is right is a question for the
+profile, and the records do not decide it.
 
 Terminal.app alone differs on the save and restore forms `CSI s`, `CSI u` and mode 1048, on left and
 right margins (mode 69), on cursor movement inside a scroll region, on reverse index at the top of

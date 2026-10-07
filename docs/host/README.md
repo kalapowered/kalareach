@@ -1193,10 +1193,13 @@ but no further output will be written to it other than any enqueued side effects
 written or recorded as described below, after which the new screen will be sent.
 
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
-apply. What it leaves out is counted rather than assumed away: the saved cursor and keyboard
-negotiation of the buffer that is not showing, the virtual title stack, soft-wrap markers, the
-right-hand side of a row wider than the window, and a pending wrap, whether the cursor's or a saved
-cursor's, that the window shows. `Session::restoration_losses` is the count.
+apply. What it leaves out is counted rather than assumed away: the rows of the buffer that is not
+showing, for a client shown the live screen alone; the saved cursor of the buffer that is not
+showing, and a saved cursor of the showing buffer that lies outside the window; the keyboard
+negotiation of the buffer that is not showing, and the keyboard stack the session holds; the
+virtual title stack; soft-wrap markers; the right-hand side of a row wider than the window; and a
+pending wrap, whether the cursor's or a saved cursor's, that the window shows.
+`Session::restoration_losses` is the count.
 
 A restoration begins with a soft reset wherever the terminal is. It then enters the alternate
 buffer, resets there, returns to the primary buffer and resets again. xterm saves a fresh cursor
