@@ -3739,7 +3739,10 @@ fn replaced(changed: usize, becomes_so: impl FnOnce() -> bool, what: &str) -> Re
 }
 
 macro_rules! text_enum {
-    ($to:ident, $from:ident, $type:ty, $fallback:expr, $($variant:ident => $text:literal),+ $(,)?) => {
+    ($to:ident, $from:ident, $words:ident, $type:ty, $fallback:expr, $($variant:ident => $text:literal),+ $(,)?) => {
+        /// The texts this value is stored as, and the text of the value any other text is read as.
+        const $words: (&[&str], &str) = (&[$($text),+], $to($fallback));
+
         /// Returns the stored text of one value.
         #[must_use]
         pub const fn $to(value: $type) -> &'static str {
@@ -3762,6 +3765,7 @@ macro_rules! text_enum {
 text_enum!(
     origin_text,
     origin_of,
+    ORIGIN_WORDS,
     ProjectOrigin,
     ProjectOrigin::Adopted,
     Initialised => "initialised",
@@ -3772,6 +3776,7 @@ text_enum!(
 text_enum!(
     project_state_text,
     project_state_of,
+    PROJECT_STATE_WORDS,
     ProjectState,
     ProjectState::Detached,
     Ready => "ready",
@@ -3782,6 +3787,7 @@ text_enum!(
 text_enum!(
     operation_state_text,
     operation_state_of,
+    OPERATION_STATE_WORDS,
     OperationState,
     OperationState::Unknown,
     Staging => "staging",
@@ -3796,6 +3802,7 @@ text_enum!(
 text_enum!(
     destination_state_text,
     destination_state_of,
+    DESTINATION_STATE_WORDS,
     DestinationState,
     DestinationState::Occupied,
     Absent => "absent",
@@ -3807,6 +3814,7 @@ text_enum!(
 text_enum!(
     transport_text,
     transport_of,
+    TRANSPORT_WORDS,
     RemoteTransport,
     RemoteTransport::LocalPath,
     Https => "https",
@@ -3817,6 +3825,7 @@ text_enum!(
 text_enum!(
     adoption_flow_text,
     adoption_flow_of,
+    ADOPTION_FLOW_WORDS,
     AdoptionFlow,
     AdoptionFlow::ExistingCheckout,
     ExistingCheckout => "existing_checkout",
@@ -3825,6 +3834,7 @@ text_enum!(
 text_enum!(
     workspace_kind_text,
     workspace_kind_of,
+    WORKSPACE_KIND_WORDS,
     WorkspaceKind,
     WorkspaceKind::SharedExisting,
     SharedExisting => "shared_existing",
@@ -3834,6 +3844,7 @@ text_enum!(
 text_enum!(
     isolation_text,
     isolation_of,
+    ISOLATION_WORDS,
     IsolationMechanism,
     IsolationMechanism::IndependentClone,
     GitWorktree => "git_worktree",
@@ -3843,6 +3854,7 @@ text_enum!(
 text_enum!(
     workspace_state_text,
     workspace_state_of,
+    WORKSPACE_STATE_WORDS,
     WorkspaceState,
     WorkspaceState::RemovalPending,
     Ready => "ready",
@@ -3854,6 +3866,7 @@ text_enum!(
 text_enum!(
     retention_text,
     retention_of,
+    RETENTION_WORDS,
     RetentionPolicy,
     RetentionPolicy::KeepEverything,
     KeepEverything => "keep_everything",
@@ -3863,6 +3876,7 @@ text_enum!(
 text_enum!(
     retained_kind_text,
     retained_kind_of,
+    RETAINED_KIND_WORDS,
     RetainedKind,
     RetainedKind::DirtyContent,
     DirtyContent => "dirty_content",
@@ -3873,11 +3887,37 @@ text_enum!(
 text_enum!(
     choice_text,
     choice_of,
+    CHOICE_WORDS,
     InclusionChoice,
     InclusionChoice::Exclude,
     Include => "include",
     Exclude => "exclude",
 );
+
+/// The words the store matches stored text against by hand, each with the text any other text is
+/// read as. A stored value that no variant has the text of is read as the fallback, with no error,
+/// so a text added or renamed here changes what an earlier store means: the stored-format lock
+/// holds these, and fails until the store's version is raised.
+#[must_use]
+pub fn vocabularies() -> Vec<String> {
+    [
+        ("origin", ORIGIN_WORDS),
+        ("project_state", PROJECT_STATE_WORDS),
+        ("operation_state", OPERATION_STATE_WORDS),
+        ("destination_state", DESTINATION_STATE_WORDS),
+        ("transport", TRANSPORT_WORDS),
+        ("adoption_flow", ADOPTION_FLOW_WORDS),
+        ("workspace_kind", WORKSPACE_KIND_WORDS),
+        ("isolation", ISOLATION_WORDS),
+        ("workspace_state", WORKSPACE_STATE_WORDS),
+        ("retention", RETENTION_WORDS),
+        ("retained_kind", RETAINED_KIND_WORDS),
+        ("choice", CHOICE_WORDS),
+    ]
+    .iter()
+    .map(|(name, (words, fallback))| format!("{name}: {} else {fallback}", words.join(", ")))
+    .collect()
+}
 
 /// Returns the wire form of a counter, for a caller building a summary.
 #[must_use]

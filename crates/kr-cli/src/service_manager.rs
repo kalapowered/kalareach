@@ -93,7 +93,7 @@ pub const RECORD_FILE: &str = "controller-service.json";
 pub const LOCK_FILE: &str = "controller-service.lock";
 
 /// The version of the record this build writes and reads.
-const RECORD_VERSION: u32 = 1;
+pub const RECORD_VERSION: u32 = 1;
 
 /// The largest record, or definition, this build reads: far more than it ever writes.
 const READ_LIMIT: u64 = 64 * 1024;

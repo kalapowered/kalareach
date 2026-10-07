@@ -1,0 +1,598 @@
+{
+  "format": 1,
+  "stores": [
+    {
+      "entry": {
+        "store": "agent-tool-actions",
+        "scope": "environment",
+        "path": "agent-tools/actions/*.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "7215d2c700261e7b1a7e530074cf4497fa563a3c5a70301e72574fc12241bf2d",
+      "kept": [
+        "AgentToolsInstallResult",
+        "ActionRecord (crates/kr-controller/src/agent_tools.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "agent-tools",
+        "scope": "environment",
+        "path": "agent-tools/*.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "e196baec5f87a0b899ccfce6eec82b6681aaf86ea7ea220176b22943c2b320be",
+      "kept": [
+        "ChangeManifest",
+        "InstallationRecord (crates/kr-controller/src/agent_tools.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "attention",
+        "scope": "environment",
+        "path": "attention.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "attention_schema"
+        },
+        "version": 10,
+        "migrates_from": 9
+      },
+      "digest": "440635d01a227c895f04f0c43c77a9e72e865dfc39cba99024d3185b300e38ce",
+      "kept": [
+        "AttentionAcknowledgeResult",
+        "AttentionQuietHoursResult",
+        "ReviewAcknowledgeResult",
+        "VisitAcknowledgeResult",
+        "HostTimeState"
+      ]
+    },
+    {
+      "entry": {
+        "store": "backup",
+        "scope": "environment",
+        "path": "backup.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "schema_version"
+        },
+        "version": 7,
+        "migrates_from": 6
+      },
+      "digest": "b11d51e934f8f92d54dea612364f4c420bed7f66265f93918ae7a27086a371be",
+      "kept": [
+        "ArchiveDescriptor"
+      ]
+    },
+    {
+      "entry": {
+        "store": "catalogue",
+        "scope": "environment",
+        "path": "catalogue/catalogue.sqlite3",
+        "recording": {
+          "kind": "sqlite_user_version"
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "7e043cefb9c2b609ff1490481135e3371a02f047afe482ba9f927c5d2482aafb",
+      "kept": [
+        "EnrolmentBudgets",
+        "CapabilityRequest",
+        "MetadataVersions (crates/kr-plugin-catalogue/src/trust.rs)",
+        "words of capability names"
+      ]
+    },
+    {
+      "entry": {
+        "store": "changesets",
+        "scope": "environment",
+        "path": "changesets/changesets.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "schema_version"
+        },
+        "version": 3,
+        "migrates_from": 3
+      },
+      "digest": "77be3dbc4780ffc6c8b81f1bffeac5cc3a7e2299a1a98988e73e8fad42831e4e",
+      "kept": [
+        "ChangeSetVersionRecord",
+        "MaterialisationRecord",
+        "MaterialisationResult",
+        "CapturedPath",
+        "Exclusion",
+        "Manifest, DeletedPath (crates/kr-changeset/src/version.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "configuration",
+        "scope": "configuration",
+        "path": "config.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 1
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "93c624e80efa4eeece86c9c54a060d0c47f932ed35e0aad4097f573b21bcce1b",
+      "kept": [
+        "ConfigurationDocument"
+      ]
+    },
+    {
+      "entry": {
+        "store": "controller-service",
+        "scope": "environment",
+        "path": "controller-service.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "fa1df84daa385febbde35116b754c8e3a446a6b2a7073a64320a925139c254de",
+      "kept": [
+        "Record, Manager (crates/kr-cli/src/service_manager.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "delivery",
+        "scope": "environment",
+        "path": "delivery.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "delivery_schema"
+        },
+        "version": 8,
+        "migrates_from": 6
+      },
+      "digest": "b8b1360989308c6f51393e6dafc1db1347c035535e310e3cdde7c6f0cf50e0f3",
+      "kept": [
+        "PushDeliveryRequest",
+        "SealedEnvelope",
+        "Production, Notice (crates/kr-delivery/src/producer.rs)",
+        "PreviewBody (crates/kr-delivery/src/preview.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "descriptions",
+        "scope": "environment",
+        "path": "descriptions.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "describe_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "17b9097e7c13361de3d7e47dea07c9cae6339faa4c215c62fb1d7ecea9edf418",
+      "kept": []
+    },
+    {
+      "entry": {
+        "store": "environments",
+        "scope": "environment",
+        "path": "environments.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "1115bca3bf7b726124dd1b4de466616dd8890af3eb1942f33864b3b8c4ba3804",
+      "kept": [
+        "EnvironmentEnrolment",
+        "Record, Observation, ScopedChannel, EnrolmentInstance (crates/kr-controller/src/bridge/store.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "install-record",
+        "scope": "install",
+        "path": "install.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "format",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "c4220a15d96688caf8eb19165f043832e556f39afb26447ac7dfe49017b7889e",
+      "kept": [
+        "Record, Transaction, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "machine-group",
+        "scope": "environment",
+        "path": "machine-group",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "0eac13e8d0ee5a58661b99541e1a6571ec7947ffa6a0fdaa4b7a40f7f5b57785",
+      "kept": [
+        "MachineGroup, Change, Step (crates/kr-controller/src/machine.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "native-bridges",
+        "scope": "environment",
+        "path": "native-bridges/*.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "af7418ea95fa5c6f3370de3637cbdadf61df925a9c8d63f671deea55789c81be",
+      "kept": [
+        "Journal, State, Release, Change, Publication, Kept (crates/kr-controller/src/catalogue/native_bridge/journal.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "privacy",
+        "scope": "environment",
+        "path": "privacy.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "privacy_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "2b9f5c9d66960d0b002be60e3b827b08311d36127dd999e4fff42efa8fb0fd9d",
+      "kept": []
+    },
+    {
+      "entry": {
+        "store": "projects",
+        "scope": "environment",
+        "path": "projects/projects.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "schema_version"
+        },
+        "version": 8,
+        "migrates_from": 1
+      },
+      "digest": "6bba0ee429c4f1b5474a5c4870834efefe52212a473aea1c555b9b75b5faeae9",
+      "kept": [
+        "ProjectInitResult",
+        "ProjectCloneResult",
+        "ProjectAdoptResult",
+        "ProjectOperationCancelResult",
+        "WorkspaceCreateResult",
+        "WorkspaceRemoveResult",
+        "ProjectLocationAuthoriseResult",
+        "ProjectLocationWithdrawResult",
+        "ProjectLocationAttachResult",
+        "ProjectSummary",
+        "OperationRecord",
+        "CreationAnswer (crates/kr-project/src/service.rs)",
+        "words of stored text of the project store"
+      ]
+    },
+    {
+      "entry": {
+        "store": "registry",
+        "scope": "environment",
+        "path": "registry.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "schema_version"
+        },
+        "version": 7,
+        "migrates_from": 1
+      },
+      "digest": "61b32d84da7f1f6419e00953044ee2cc5e001b00946e8c13f4b87c4fd2d0f281",
+      "kept": [
+        "SessionCreateParams",
+        "ClosureRecord",
+        "ConfigurationDocument",
+        "Grant",
+        "InvitationPreview",
+        "GrantCreateResult",
+        "RevocationResult",
+        "DeviceKeysCompleteResult",
+        "DevicePreviewKeyUpdateResult",
+        "MachineStepResult",
+        "VoiceGrantResult",
+        "VoiceDelegateResult",
+        "PairingSecurityEvent",
+        "OwnerConfirmationRequest",
+        "OwnerConfirmationProof",
+        "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation (crates/kr-controller/src/grants/durable.rs)",
+        "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
+        "KeyDeclaration (crates/kr-controller/src/net/devices.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "shell-entries",
+        "scope": "state_root",
+        "path": "shell-entries.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "f3430d312f5e8f626cca2921122e261960b1b49696c207762638e1b7fff4fb5e",
+      "kept": [
+        "Recorded, RecordedEntry (crates/kr-shell-integration/src/host/startup.rs)"
+      ]
+    },
+    {
+      "entry": {
+        "store": "terminal-preference",
+        "scope": "environment",
+        "path": "terminal.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "df500c37c46022ab618eb4609c3ba3f3bc6561d01aeeed0c4e000afefc922eac",
+      "kept": [
+        "words of the preference document"
+      ]
+    },
+    {
+      "entry": {
+        "store": "transfers",
+        "scope": "environment",
+        "path": "transfers/transfers.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "schema_version"
+        },
+        "version": 2,
+        "migrates_from": 1
+      },
+      "digest": "fcd677920d44122ee57f1a19b345a8e4a92c5cc12c80fcb36b7b78b4a29ceb9c",
+      "kept": [
+        "UploadBeginResult",
+        "UploadChunkResult",
+        "UploadFinishResult",
+        "UploadCancelResult",
+        "DraftCreateResult",
+        "DraftUpdateResult",
+        "AgentDraftAddAttachmentResult",
+        "AttachmentPreview"
+      ]
+    },
+    {
+      "entry": {
+        "store": "workflows",
+        "scope": "environment",
+        "path": "workflows.db",
+        "recording": {
+          "kind": "sqlite_user_version"
+        },
+        "version": 7,
+        "migrates_from": 6
+      },
+      "digest": "940c00f2f0d4e1bbe95f839d2115bf39adb16aeba0b9dfa0a21fc6480b19c2aa",
+      "kept": [
+        "WorkflowDefinition",
+        "NodeOutput",
+        "WorkflowInstallResult",
+        "WorkflowEnableResult",
+        "WorkflowPauseResult",
+        "WorkflowRunResult",
+        "ShellCommandParams",
+        "RunTestsParams",
+        "RequestReviewParams",
+        "AttentionNoticeParams",
+        "SessionCreateParams",
+        "StoredEvent (crates/kr-automation/src/store.rs)"
+      ]
+    }
+  ],
+  "named": [
+    {
+      "scope": "environment",
+      "path": "*.partial",
+      "reason": "a temporary file an interrupted write left; nothing reads it"
+    },
+    {
+      "scope": "environment",
+      "path": ".*.tmp",
+      "reason": "a temporary file an interrupted write left; nothing reads it"
+    },
+    {
+      "scope": "environment",
+      "path": ".config.lock",
+      "reason": "the lock on the configuration document; empty"
+    },
+    {
+      "scope": "environment",
+      "path": ".machine-group.*",
+      "reason": "a temporary file an interrupted step left; nothing reads it"
+    },
+    {
+      "scope": "environment",
+      "path": "backup",
+      "reason": "the backup service's staging area: objects in the archive's own formats"
+    },
+    {
+      "scope": "environment",
+      "path": "boot",
+      "reason": "the boot the environment last ran in; a record that does not decode is read as none and written again, which costs one pass over sessions of an earlier boot"
+    },
+    {
+      "scope": "environment",
+      "path": "capabilities",
+      "reason": "the capability revision, a number as text; an environment whose record cannot be read keeps revision zero"
+    },
+    {
+      "scope": "environment",
+      "path": "catalogue",
+      "reason": "the plugin catalogue's repositories: TUF metadata and package payloads in the formats TUF and the package format fix, and each repository's trust checkpoint under datastore/ in TUF's metadata form; the catalogue's database is the store of that name"
+    },
+    {
+      "scope": "environment",
+      "path": "controller-identity",
+      "reason": "a marker that the controller's keys were made, which names the kind of key store; read as absent when it cannot be read"
+    },
+    {
+      "scope": "environment",
+      "path": "controller-service.lock",
+      "reason": "the lock on the service definition; empty"
+    },
+    {
+      "scope": "environment",
+      "path": "controller.lock",
+      "reason": "the daemon's singleton lock, which holds its process number as text"
+    },
+    {
+      "scope": "environment",
+      "path": "controller.log",
+      "reason": "the daemon's log, as text"
+    },
+    {
+      "scope": "environment",
+      "path": "environment",
+      "reason": "the environment's identity, written once as text and never changed"
+    },
+    {
+      "scope": "environment",
+      "path": "jobs",
+      "reason": "per-session launch definitions and their diagnostics, named by session and read by the daemon that started them"
+    },
+    {
+      "scope": "environment",
+      "path": "login-session",
+      "reason": "written only on Windows, which keeps no store of releases; a record that does not decode is an error that names it"
+    },
+    {
+      "scope": "environment",
+      "path": "models",
+      "reason": "the description model's files and their markers, downloaded content that a marker compared whole with the one expected says is complete"
+    },
+    {
+      "scope": "environment",
+      "path": "plugin-cache",
+      "reason": "compiled plugin components, a cache written again when absent"
+    },
+    {
+      "scope": "environment",
+      "path": "power.json",
+      "reason": "a document the sleep setting used to live in; nothing reads it"
+    },
+    {
+      "scope": "environment",
+      "path": "secrets",
+      "reason": "the secret store's fallback files, one per name, in the secret store's own format"
+    },
+    {
+      "scope": "environment",
+      "path": "services",
+      "reason": "plugin service directories"
+    },
+    {
+      "scope": "environment",
+      "path": "sessions",
+      "reason": "the per-session journals, which keep the archive's own rule (kr host import-journals)"
+    },
+    {
+      "scope": "environment",
+      "path": "spool",
+      "reason": "output history, a bounded spool the archive's own rule reads"
+    },
+    {
+      "scope": "environment",
+      "path": "terminfo",
+      "reason": "terminal descriptions compiled from the build's own, written again when absent"
+    },
+    {
+      "scope": "environment",
+      "path": "workers",
+      "reason": "one working directory per worker"
+    },
+    {
+      "scope": "state_root",
+      "path": ".*.tmp",
+      "reason": "a temporary file an interrupted write left; nothing reads it"
+    },
+    {
+      "scope": "state_root",
+      "path": "entry-locks",
+      "reason": "the locks that keep two writers of one startup file apart; empty files"
+    },
+    {
+      "scope": "state_root",
+      "path": "environment-id",
+      "reason": "written once, as text, and never changed: a build reads no other form"
+    },
+    {
+      "scope": "state_root",
+      "path": "environments",
+      "reason": "the state directories of the environments, each of which is named under its own scope"
+    },
+    {
+      "scope": "state_root",
+      "path": "host",
+      "reason": "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root is a frozen form (two paths separated by a NUL byte) that a change replaces with a file of another name"
+    },
+    {
+      "scope": "state_root",
+      "path": "kept-answers",
+      "reason": "answers a person gave that the host has not taken, kept on this device by the client; not host state, so not a store of the host's (an unreadable one is reported by name)"
+    },
+    {
+      "scope": "state_root",
+      "path": "machine-merge-plan",
+      "reason": "the client's merge plan, kept on this device; not host state (an unreadable one is reported by name and moved aside by the person)"
+    },
+    {
+      "scope": "state_root",
+      "path": "machine-merge-plan.lock",
+      "reason": "the lock on the merge plan; empty"
+    },
+    {
+      "scope": "state_root",
+      "path": "run",
+      "reason": "the runtime root on a platform whose default state root holds it; nothing in it outlives a boot"
+    }
+  ]
+}

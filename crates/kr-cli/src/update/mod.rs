@@ -42,6 +42,8 @@
 //! for the next run, which starts that daemon before anything else.
 
 #[cfg(unix)]
+mod formats;
+#[cfg(unix)]
 mod handover;
 #[cfg(unix)]
 mod inventory;
@@ -97,7 +99,7 @@ pub fn said(error: &InstallError) -> Shown {
 }
 
 /// The store record's format this build writes, and the newest it reads.
-const RECORD_FORMAT: u32 = 1;
+pub const RECORD_FORMAT: u32 = 1;
 
 /// The store's record, `install.json`: what an update needs that the store's directories do not
 /// say. Which release is current is `current` itself, never this.
@@ -115,6 +117,12 @@ pub struct Record {
     /// The update under way, from before its first stop to its settling.
     #[serde(default)]
     pub update: Option<Transaction>,
+    /// The newest update channel root this host has switched to a release of. A release carries
+    /// the root it was built with, and a host trusts the newest of this and its current release's,
+    /// so that going back to an older release does not bring back a key the channel has retired.
+    /// Absent until a switch settles with a root newer than the current release's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_root: Option<serde_json::Value>,
 }
 
 kr_client::debug_as_name!(Record);
@@ -346,6 +354,8 @@ pub struct Updated {
     pub unreached: Vec<Unreached>,
     /// Whether this was a check only, which changed nothing.
     pub checked_only: bool,
+    /// Whether this went back to an older release rather than forward to a newer one.
+    pub rolled_back: bool,
 }
 
 /// An environment's registry an update brought forward to the schema its release reads, because no
@@ -435,6 +445,7 @@ impl Updated {
             .with("source", crate::shown::release(&self.source))
             .with("target", crate::shown::release(&self.target))
             .with("checked_only", self.checked_only)
+            .with("rolled_back", self.rolled_back)
             .with(
                 "restarted",
                 self.restarted
@@ -486,7 +497,12 @@ impl Updated {
             )];
         }
         let mut lines = vec![shown!(
-            "updated this host from release {} to {}",
+            "{} this host from release {} to {}",
+            if self.rolled_back {
+                "rolled back"
+            } else {
+                "updated"
+            },
             crate::shown::release(&self.source),
             crate::shown::release(&self.target)
         )];
@@ -845,14 +861,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         recover(&store, &mut record).await?;
     }
     let current_manifest = installed_manifest(&store, &source)?;
-    let trusted =
-        release::ChannelRoot::read(&store.release_directory(&source))?.ok_or_else(|| {
-            CliError::Other(shown!(
-                "release {} carries no update channel root, so no release can be checked for this \
-             host; the update is refused",
-                crate::shown::release(&source)
-            ))
-        })?;
+    let trusted = trusted_root(&store, &record, &source)?;
     let staging = store.staging().join(kr_ipc::new_uuid().to_string());
     let staged = stage_archive(
         &store,
@@ -874,6 +883,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             carried: Vec::new(),
             unreached: Vec::new(),
             checked_only: check,
+            rolled_back: false,
         });
     }
     // The release is in the store now, and stays there, staged, whatever the rest of this run
@@ -882,6 +892,123 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         record.staged = Some(target.release.clone());
         record.write(&store)?;
     }
+    carry_out(
+        &store,
+        &update_lock,
+        &mut record,
+        source,
+        target,
+        check,
+        false,
+    )
+    .await
+}
+
+/// `kr host rollback`: goes back to the release `to` names, or to the one this host was on before
+/// its last switch.
+///
+/// A rollback is a switch like an update: the same inventory of live workers, the same handover
+/// of each control daemon, the same record of what was done and the same recovery of a run that
+/// stopped part way. It differs in where the release comes from, which is the store, where it was
+/// sealed when it was taken in and has been kept since, and in what it requires of it: that it
+/// is older than the release now current.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] when there is no release to go back to or the one named is not
+/// older, and what an update returns otherwise, [`CliError::UpdateDeferred`] (exit 9) when
+/// something live holds it, and a refusal naming every store the older release cannot read as it
+/// is, with nothing switched.
+#[cfg(unix)]
+pub async fn rollback(to: Option<&str>) -> Result<Updated> {
+    let (store, source) = this_release_store()?;
+    let update_lock = store
+        .try_lock_update()
+        .map_err(|error| CliError::Other(said(&error)))?
+        .ok_or_else(|| {
+            CliError::UpdateDeferred(Shown::said(
+                "another update of this host is running; run kr host rollback again once it has \
+                 finished",
+            ))
+        })?;
+    ensure_current(&store, &source)?;
+    let mut record = Record::read(&store)?;
+    if record.update.is_some() {
+        recover(&store, &mut record).await?;
+    }
+    let target = match to {
+        Some(name) => ReleaseName::new(name).map_err(|_| {
+            CliError::Usage(Shown::said(
+                "the name given to --to is not the name of a release: a release is named by its \
+                 version and the first twelve digits of its commit, and kr host versions lists \
+                 this host's",
+            ))
+        })?,
+        None => record.previous.clone().ok_or_else(|| {
+            CliError::Usage(Shown::said(
+                "this host records no release it was on before its last switch, so there is none \
+                 to go back to by default: name one with --to; kr host versions lists the releases \
+                 it keeps",
+            ))
+        })?,
+    };
+    if target == source {
+        return Err(CliError::Usage(shown!(
+            "release {} is already current",
+            crate::shown::release(&target)
+        )));
+    }
+    let kept = store
+        .releases()
+        .map_err(|error| CliError::Other(said(&error)))?;
+    if !kept.contains(&target) {
+        return Err(CliError::Usage(shown!(
+            "release {} is not in this host's store, which keeps the releases kr host versions \
+             lists",
+            crate::shown::release(&target)
+        )));
+    }
+    let current = installed_manifest(&store, &source)?;
+    let manifest = installed_manifest(&store, &target).map_err(|_| {
+        CliError::Other(shown!(
+            "release {} is in the store, and its manifest is not one this kr reads: a release that \
+             lists no store it reads is not one this host can go back to",
+            crate::shown::release(&target)
+        ))
+    })?;
+    if manifest.sequence >= current.sequence {
+        return Err(CliError::Usage(shown!(
+            "release {} is not older than the current release {}: kr host rollback goes back to an \
+             older release, and kr host update --archive moves to a newer one",
+            crate::shown::release(&target),
+            crate::shown::release(&source)
+        )));
+    }
+    carry_out(
+        &store,
+        &update_lock,
+        &mut record,
+        source,
+        manifest,
+        false,
+        true,
+    )
+    .await
+}
+
+/// Everything a switch to `target` does once the release is in the store: the survey of the
+/// environments, the first look at the live workers, the handover and the switch, and the
+/// removal of the releases nothing needs.
+#[cfg(unix)]
+async fn carry_out(
+    store: &Store,
+    update_lock: &kr_ipc::install::StoreLock,
+    record: &mut Record,
+    source: ReleaseName,
+    target: kr_protocol::update::ReleaseManifest,
+    check: bool,
+    rolled_back: bool,
+) -> Result<Updated> {
     let inventory::Surveyed {
         environments,
         unreached,
@@ -892,11 +1019,12 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         carried: Vec::new(),
         unreached,
         check,
+        rolled_back,
     };
     let restarted = match proceed(
-        &store,
-        &update_lock,
-        &mut record,
+        store,
+        update_lock,
+        record,
         (&environments, &reached),
         (&source, &target),
         &mut report,
@@ -909,7 +1037,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
     let removed = if check {
         Vec::new()
     } else {
-        collect(&store, &record, &update_lock)
+        collect(store, record, update_lock)
     };
     Ok(Updated {
         source,
@@ -919,6 +1047,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         carried: report.carried,
         unreached: report.unreached,
         checked_only: check,
+        rolled_back,
     })
 }
 
@@ -933,6 +1062,9 @@ struct Report {
     carried: Vec<CarriedRegistry>,
     unreached: Vec<Unreached>,
     check: bool,
+    /// Whether the switch goes back to an older release, which the messages that say what to run
+    /// again name.
+    rolled_back: bool,
 }
 
 #[cfg(unix)]
@@ -1005,6 +1137,7 @@ async fn proceed(
                 return Err(deferred(
                     target,
                     inventory::Holding::Unretained(stated).said(target),
+                    report.rolled_back,
                 ));
             }
         }
@@ -1028,6 +1161,38 @@ async fn proceed(
         report,
     )
     .await
+}
+
+/// The root an update to this host is checked against: the newest of the current release's and the
+/// one the store recorded when it switched to a release that carried a newer.
+#[cfg(unix)]
+fn trusted_root(
+    store: &Store,
+    record: &Record,
+    source: &ReleaseName,
+) -> Result<release::ChannelRoot> {
+    let current =
+        release::ChannelRoot::read(&store.release_directory(source))?.ok_or_else(|| {
+            CliError::Other(shown!(
+                "release {} carries no update channel root, so no release can be checked for this \
+             host; the update is refused",
+                crate::shown::release(source)
+            ))
+        })?;
+    let Some(kept) = record.trusted_root.clone() else {
+        return Ok(current);
+    };
+    let kept = release::ChannelRoot::kept(kept)?;
+    match kept.version().cmp(&current.version()) {
+        std::cmp::Ordering::Greater => Ok(kept),
+        std::cmp::Ordering::Less => Ok(current),
+        std::cmp::Ordering::Equal if kept.is(&current) => Ok(current),
+        std::cmp::Ordering::Equal => Err(CliError::Other(shown!(
+            "release {} carries an update channel root, and the store recorded another of the same \
+             version: this host trusts neither, and no release can be checked for it",
+            crate::shown::release(source)
+        ))),
+    }
 }
 
 /// The manifest of a release already in the store.
@@ -1093,11 +1258,22 @@ fn stage_archive(
 /// What an update that waits returns: [`CliError::UpdateDeferred`], exit 9, naming the target,
 /// what held it and what to do.
 #[cfg(unix)]
-fn deferred(target: &kr_protocol::update::ReleaseManifest, held: Shown) -> CliError {
+fn deferred(
+    target: &kr_protocol::update::ReleaseManifest,
+    held: Shown,
+    rolled_back: bool,
+) -> CliError {
+    let (what, command) = if rolled_back {
+        ("rollback", "rollback")
+    } else {
+        ("update", "update")
+    };
     CliError::UpdateDeferred(shown!(
-        "the update to {} waits: {}; run kr host update again once that has changed",
+        "the {} to {} waits: {}; run kr host {} again once that has changed",
+        what,
         crate::shown::release(&target.release),
-        held
+        held,
+        command
     ))
 }
 
@@ -1210,7 +1386,7 @@ async fn hand_over(
         }
         let held_by = match handover::hold(environment, None).await {
             Ok(_) => continue,
-            Err(CliError::UpdateDeferred(said)) => deferred(target, said),
+            Err(CliError::UpdateDeferred(said)) => deferred(target, said, report.rolled_back),
             Err(error) => error,
         };
         drop(install);
@@ -1253,7 +1429,7 @@ async fn hand_over(
             let _ = handover::hold(environment, Some(gone_by)).await;
         }
         drop(install);
-        return Err(undo(store, record, deferred(target, said)).await);
+        return Err(undo(store, record, deferred(target, said, report.rolled_back)).await);
     }
     // Each environment's lock, in the order of their identities: the daemons told to stop are
     // waited for, and any other holder was looked for above.
@@ -1278,6 +1454,17 @@ async fn hand_over(
         drop(held);
         drop(install);
         return Err(undo(store, record, error).await);
+    }
+    // Every store the target lists, read where the target's manifest says it is, before anything is
+    // brought forward: a switch the target cannot read the stores for is refused with nothing
+    // changed, and every daemon it stopped is started again.
+    if holding.is_none() {
+        let refusals = formats::check(target, store, &every);
+        if !refusals.is_empty() {
+            drop(held);
+            drop(install);
+            return Err(undo(store, record, formats::refusal(target, &refusals)).await);
+        }
     }
     if holding.is_none() {
         for environment in &every {
@@ -1315,7 +1502,7 @@ async fn hand_over(
     if let Some(held_by) = holding {
         drop(held);
         drop(install);
-        return Err(undo(store, record, deferred(target, held_by)).await);
+        return Err(undo(store, record, deferred(target, held_by, report.rolled_back)).await);
     }
     if let Err(error) = store.switch(&target.release, update_lock, &install) {
         drop(held);
@@ -1547,6 +1734,22 @@ fn forget_update(store: &Store, record: &mut Record) {
 #[cfg(unix)]
 fn settle(store: &Store, record: &mut Record) -> Result<()> {
     if let Some(update) = record.update.take() {
+        // The newest root of the one recorded, the release left and the release switched to: each
+        // was trusted when it was current, and the newest of them is never given up.
+        let mut newest: Option<release::ChannelRoot> = record
+            .trusted_root
+            .clone()
+            .and_then(|kept| release::ChannelRoot::kept(kept).ok());
+        for release in [&update.source, &update.target] {
+            if let Ok(Some(root)) = release::ChannelRoot::read(&store.release_directory(release))
+                && newest
+                    .as_ref()
+                    .is_none_or(|known| root.version() > known.version())
+            {
+                newest = Some(root);
+            }
+        }
+        record.trusted_root = newest.map(|root| root.to_kept());
         record.previous = Some(update.source);
         if record.staged.as_ref() == Some(&update.target) {
             record.staged = None;
@@ -1662,6 +1865,12 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// `kr host update` on a platform that keeps no store.
 #[cfg(not(unix))]
 pub async fn update(_archive: Option<&std::path::Path>, _check: bool) -> Result<Updated> {
+    Err(unsupported())
+}
+
+/// `kr host rollback` on a platform that keeps no store.
+#[cfg(not(unix))]
+pub async fn rollback(_to: Option<&str>) -> Result<Updated> {
     Err(unsupported())
 }
 
@@ -2014,6 +2223,7 @@ mod tests {
                 reason: Shown::said("its environment identity could not be looked at"),
             }],
             checked_only,
+            rolled_back: false,
         };
         let said = |lines: Vec<Shown>| {
             lines
@@ -2067,6 +2277,7 @@ mod tests {
             ],
             unreached: vec![unreached("one"), unreached("two")],
             check,
+            rolled_back: false,
         };
         let said = |error: &CliError| error.said().to_string();
 
@@ -2124,6 +2335,7 @@ mod tests {
             carried: Vec::new(),
             unreached: vec![unreached("one")],
             check: true,
+            rolled_back: false,
         }
         .annotate(CliError::UpdateDeferred(Shown::said("it waits")));
         let text = said(&checked);
@@ -2137,6 +2349,7 @@ mod tests {
             carried: Vec::new(),
             unreached: Vec::new(),
             check: false,
+            rolled_back: false,
         }
         .annotate(CliError::Other(Shown::said("it failed")));
         assert_eq!(said(&plain), "it failed");

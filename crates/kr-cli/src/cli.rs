@@ -889,6 +889,9 @@ pub enum HostCommand {
     /// Update this host to a newer release: its control daemons are handed over, and every live
     /// session goes on with the release it started from.
     Update(UpdateArguments),
+    /// Go back to an older release this host keeps: its control daemons are handed over as an
+    /// update hands them over, and every live session goes on with the release it started from.
+    Rollback(RollbackArguments),
     /// Show the releases this host keeps, and which one is current.
     Versions,
     /// Show the machine group an environment records for itself, or take one owner-approved step
@@ -1004,6 +1007,15 @@ pub struct UpdateArguments {
     /// Check the release and what holds an update now, and change nothing.
     #[arg(long)]
     pub check: bool,
+}
+
+/// `kr host rollback`.
+#[derive(Args)]
+pub struct RollbackArguments {
+    /// The release to go back to, `<version>+<commit12>`, as `kr host versions` lists it. Without
+    /// it, the release this host was on before its last switch.
+    #[arg(long)]
+    pub to: Option<String>,
 }
 
 /// `kr host startup`.

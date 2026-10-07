@@ -39,7 +39,7 @@ const MAX_RECORD_LEN: u64 = 1024 * 1024;
 ///
 /// Remove the absent-version default on [`Record::version`] once no supported upgrade starts from
 /// a file written before the format was recorded.
-const RECORD_VERSION: u32 = 1;
+pub const RECORD_VERSION: u32 = 1;
 
 /// What was last observed about one enrolment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

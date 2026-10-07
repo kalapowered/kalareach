@@ -359,6 +359,10 @@ pub struct ReleaseManifest {
     pub retained_levels: Vec<CompatibilityLevel>,
     /// The qualified shell packages under `shells/`.
     pub shells: Vec<ReleaseShell>,
+    /// Every store the release's programs read, with the versions of each they read. A host
+    /// switches to a release only when every store it keeps is at a version this says the release
+    /// reads. Never empty.
+    pub stores: Vec<ReleaseStore>,
     /// Every file of the release but this manifest.
     pub files: Vec<ReleaseFile>,
 }
@@ -536,6 +540,77 @@ pub enum FileMode {
     Executable,
 }
 
+/// One store a release's programs read: where a host keeps it, how its format version is
+/// recorded there, and the versions of it the release reads.
+///
+/// A host that switches to a release looks for each store the release lists where the release says
+/// it is, reads the version recorded there and refuses the switch when it is outside
+/// `migrates_from..=version`, naming the store. It needs no table of its own, so a store a
+/// release adds is found by a host of an earlier release.
+///
+/// A store keeps its name, scope, path and recording for as long as its data is kept: a release
+/// that moves a store lists a new one, and the old file stays, at a version past what any earlier
+/// release reads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseStore {
+    /// The store's name, which a refusal says: lower-case letters, digits, `-` and `_`.
+    pub store: String,
+    /// Where its path starts.
+    pub scope: StoreScope,
+    /// Where it is, relative to the scope, its parts separated by `/`. A path that ends in
+    /// `/*.json` is every record of that name in a directory.
+    pub path: String,
+    /// How its version is recorded.
+    pub recording: Recording,
+    /// The version of the store this release writes.
+    pub version: u32,
+    /// The oldest version of the store this release brings forward when it opens it.
+    pub migrates_from: u32,
+}
+
+/// Where a store's path starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreScope {
+    /// The store of releases itself.
+    Install,
+    /// The root of an environment's state, shared by every environment of that root.
+    StateRoot,
+    /// One environment's own state directory.
+    Environment,
+    /// An environment's configuration document, wherever that environment keeps it: the path is
+    /// the document's name, `config.json`.
+    Configuration,
+    /// A scope a later release names. A host that reads it refuses the switch and says so.
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a store records its version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Recording {
+    /// The one row of a table of a SQLite database.
+    SqliteTable {
+        /// The table, which holds one integer column named `version` and one row.
+        table: String,
+    },
+    /// SQLite's `user_version` of a database.
+    SqliteUserVersion,
+    /// A member of a JSON record.
+    JsonMember {
+        /// The member, a whole number.
+        member: String,
+        /// The version of a record that lacks the member.
+        #[serde(default)]
+        absent: u32,
+    },
+    /// A way of recording a later release names. A host that reads it refuses the switch and says
+    /// so.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The longest path of a file in a release.
 pub const MAX_RELEASE_PATH_LEN: usize = 1024;
 
@@ -636,6 +711,14 @@ pub enum ManifestError {
         first: String,
         /// The other.
         second: String,
+    },
+    /// Its list of stores is empty, or one of them cannot be looked for.
+    #[error("it lists the store `{store}`, which {reason}")]
+    Store {
+        /// The store's name, as the manifest writes it.
+        store: String,
+        /// What is wrong with it.
+        reason: &'static str,
     },
 }
 
@@ -783,8 +866,8 @@ impl ReleaseManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError`] when the document is not a release manifest, or lists files a host
-    /// cannot install.
+    /// Returns [`ManifestError`] when the document is not a release manifest, or lists files or
+    /// stores a host cannot take.
     pub fn read_document(bytes: &[u8]) -> Result<Self, ManifestError> {
         let envelope: Envelope = serde_json::from_slice(bytes)
             .map_err(|error| ManifestError::Malformed(error.to_string()))?;
@@ -825,6 +908,90 @@ impl ReleaseManifest {
                     prefix.push('/');
                 }
                 prefix.push_str(part);
+            }
+        }
+        self.check_stores()
+    }
+
+    /// Checks that the stores a manifest lists can be looked for: there is at least one, each name
+    /// is used once, and each path stays inside its scope. A scope or a way of recording this build
+    /// does not know is not refused here: a host refuses the switch that needs it, naming the store.
+    fn check_stores(&self) -> Result<(), ManifestError> {
+        let refuse = |store: &str, reason: &'static str| ManifestError::Store {
+            store: store.to_owned(),
+            reason,
+        };
+        if self.stores.is_empty() {
+            return Err(refuse("", "is none: a release lists every store it reads"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for store in &self.stores {
+            let name = store.store.as_str();
+            if name.is_empty()
+                || name.len() > 64
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+                })
+            {
+                return Err(refuse(
+                    name,
+                    "has a name that is not 1 to 64 of a-z, 0-9, - and _",
+                ));
+            }
+            if !seen.insert(name) {
+                return Err(refuse(name, "is listed twice"));
+            }
+            if store.migrates_from > store.version {
+                return Err(refuse(
+                    name,
+                    "migrates from a version above the one it writes",
+                ));
+            }
+            if store.path.is_empty() || store.path.len() > 256 {
+                return Err(refuse(
+                    name,
+                    "has an empty path or one longer than a store's are",
+                ));
+            }
+            let parts: Vec<&str> = store.path.split('/').collect();
+            for (index, part) in parts.iter().enumerate() {
+                let last = index + 1 == parts.len();
+                let glob = last && index > 0 && *part == "*.json";
+                if !glob
+                    && (part.is_empty()
+                        || *part == "."
+                        || *part == ".."
+                        || part.chars().any(|character| {
+                            character.is_control() || matches!(character, '\\' | ':' | '*')
+                        }))
+                {
+                    return Err(refuse(
+                        name,
+                        "has a path that is not relative or names a part a system reads differently",
+                    ));
+                }
+            }
+            if store.scope == StoreScope::Configuration && store.path != "config.json" {
+                return Err(refuse(
+                    name,
+                    "keeps its configuration under a name other than config.json",
+                ));
+            }
+            if let Recording::SqliteTable { table } = &store.recording
+                && (table.is_empty()
+                    || !table
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+            {
+                return Err(refuse(
+                    name,
+                    "records its version in a table with a name SQL cannot take",
+                ));
+            }
+            if let Recording::JsonMember { member, .. } = &store.recording
+                && member.is_empty()
+            {
+                return Err(refuse(name, "records its version in a member with no name"));
             }
         }
         Ok(())
@@ -1099,7 +1266,23 @@ mod tests {
             public_majors: vec![1],
             retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
             shells: Vec::new(),
+            stores: vec![store("registry", 7, 1)],
             files,
+        }
+    }
+
+    /// A store a release reads: the registry's database, at `version`, brought forward from
+    /// `migrates_from`.
+    fn store(name: &str, version: u32, migrates_from: u32) -> ReleaseStore {
+        ReleaseStore {
+            store: name.to_owned(),
+            scope: StoreScope::Environment,
+            path: format!("{name}.sqlite"),
+            recording: Recording::SqliteTable {
+                table: "schema_version".to_owned(),
+            },
+            version,
+            migrates_from,
         }
     }
 
@@ -1215,7 +1398,7 @@ mod tests {
     fn a_manifest_is_read_from_its_document_past_members_a_later_release_adds() {
         let written = manifest(vec![file("bin/kr")]);
         let mut signed = serde_json::to_value(&written).expect("encodes");
-        signed["stores"] = serde_json::json!([{"store": "registry", "version": 6}]);
+        signed["notes"] = serde_json::json!([{"about": "registry", "version": 6}]);
         let document = serde_json::json!({
             "signed": signed,
             "signatures": [{"keyid": "00", "sig": "00"}],
@@ -1232,6 +1415,107 @@ mod tests {
         let mut outside = document;
         outside["signed"]["files"][0]["path"] = serde_json::json!("bin/../../escape");
         assert!(ReleaseManifest::read_document(outside.to_string().as_bytes()).is_err());
+    }
+
+    /// A manifest lists the stores its release reads, and a list that a host cannot look for is
+    /// refused before anything is installed: none at all, a name twice, a range that runs backwards,
+    /// and a path that leaves its scope.
+    #[test]
+    fn a_manifest_lists_stores_a_host_can_look_for() {
+        let with = |stores: Vec<ReleaseStore>| ReleaseManifest {
+            stores,
+            ..manifest(vec![file("bin/kr")])
+        };
+        assert!(
+            with(vec![store("registry", 7, 1), store("transfers", 2, 1)])
+                .check()
+                .is_ok()
+        );
+        let mut refused = vec![
+            ("none", Vec::new()),
+            (
+                "twice",
+                vec![store("registry", 7, 1), store("registry", 7, 1)],
+            ),
+            ("backwards", vec![store("registry", 1, 7)]),
+            ("an empty name", vec![store("", 1, 1)]),
+            ("a name in capitals", vec![store("Registry", 1, 1)]),
+        ];
+        for path in [
+            "",
+            "/registry.sqlite",
+            "../registry.sqlite",
+            "a//b",
+            "a\\b",
+            "a*b",
+            "*.json",
+            "a/*.json/b",
+        ] {
+            refused.push((
+                path,
+                vec![ReleaseStore {
+                    path: path.to_owned(),
+                    ..store("registry", 7, 1)
+                }],
+            ));
+        }
+        refused.push((
+            "a configuration under another name",
+            vec![ReleaseStore {
+                scope: StoreScope::Configuration,
+                path: "other.json".to_owned(),
+                ..store("config", 1, 1)
+            }],
+        ));
+        for (what, stores) in refused {
+            assert!(
+                matches!(with(stores).check(), Err(ManifestError::Store { .. })),
+                "{what}"
+            );
+        }
+        // The control: a directory of records, and the configuration under its own name.
+        assert!(
+            with(vec![
+                ReleaseStore {
+                    path: "native-bridges/*.json".to_owned(),
+                    recording: Recording::JsonMember {
+                        member: "version".to_owned(),
+                        absent: 0,
+                    },
+                    ..store("native-bridges", 1, 1)
+                },
+                ReleaseStore {
+                    scope: StoreScope::Configuration,
+                    path: "config.json".to_owned(),
+                    ..store("config", 1, 1)
+                },
+            ])
+            .check()
+            .is_ok()
+        );
+    }
+
+    /// A scope, or a way of recording a version, that a later release names is read as one this
+    /// build does not know and is not refused with the whole manifest: the host that meets it refuses
+    /// the switch and names the store.
+    #[test]
+    fn a_scope_or_a_recording_a_later_release_names_is_read_and_not_refused() {
+        let written = manifest(vec![file("bin/kr")]);
+        let mut signed = serde_json::to_value(&written).expect("encodes");
+        signed["stores"] = serde_json::json!([{
+            "store": "ledger",
+            "scope": "volume",
+            "path": "ledger.db",
+            "recording": {"kind": "footer", "offset": 16},
+            "version": 2,
+            "migrates_from": 1,
+            "note": "a member a later release adds"
+        }]);
+        let document = serde_json::json!({"signed": signed, "signatures": []});
+        let read = ReleaseManifest::read_document(document.to_string().as_bytes())
+            .expect("a manifest that names a later release's scope is read");
+        assert_eq!(read.stores[0].scope, StoreScope::Unknown);
+        assert_eq!(read.stores[0].recording, Recording::Unknown);
     }
 
     /// A document that names a member twice is refused by every reading of it, the same value
@@ -1264,7 +1548,7 @@ mod tests {
     fn signed_members_keep_what_this_build_does_not_know() {
         let written = manifest(vec![file("bin/kr")]);
         let mut value = serde_json::to_value(&written).expect("encodes");
-        value["stores"] = serde_json::json!([]);
+        value["notes"] = serde_json::json!([]);
         let members: SignedMembers = serde_json::from_value(value.clone()).expect("reads");
         assert_eq!(serde_json::to_value(&members).expect("encodes"), value);
         assert_eq!(members.manifest().expect("a manifest"), written);

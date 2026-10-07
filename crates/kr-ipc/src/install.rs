@@ -1202,7 +1202,8 @@ mod tests {
     use super::*;
     use kr_protocol::hello::PackageVersion;
     use kr_protocol::update::{
-        CommitId, CompatibilityLevel, FloorSystem, FloorVersion, ManifestKind, OsFloor,
+        CommitId, CompatibilityLevel, FloorSystem, FloorVersion, ManifestKind, OsFloor, Recording,
+        ReleaseStore, StoreScope,
     };
 
     /// A store of this test's own, removed with it.
@@ -1421,6 +1422,16 @@ mod tests {
             public_majors: vec![1],
             retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
             shells: Vec::new(),
+            stores: vec![ReleaseStore {
+                store: "registry".to_owned(),
+                scope: StoreScope::Environment,
+                path: "registry.sqlite".to_owned(),
+                recording: Recording::SqliteTable {
+                    table: "schema_version".to_owned(),
+                },
+                version: 7,
+                migrates_from: 1,
+            }],
             files: Vec::new(),
         };
         serde_json::json!({ "signed": manifest, "signatures": [] }).to_string()

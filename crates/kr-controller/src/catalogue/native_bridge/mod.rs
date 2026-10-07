@@ -53,6 +53,10 @@ pub(crate) mod json;
 mod shapes;
 mod tree;
 
+/// The shape a package's native-bridge journal is written in, recorded in it as `version`. A
+/// journal of any other shape is refused rather than read.
+pub const JOURNAL_VERSION: u32 = journal::VERSION;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

@@ -62,9 +62,10 @@ use crate::error::{ControllerError, Result};
 /// [`Registry`], [`crate::grants::GrantDirectory`], [`crate::service::net::devices::DeviceDirectory`] and
 /// [`crate::service::net::invitations::prepare`]. A change to the tables or to a value kept in them, by any of the four,
 /// raises this version, with a step in [`Registry::migrate`] that may be empty when the writer's own
-/// idempotent open does the work. The stored-format lock fails until it has been raised. The
-/// registry's own open runs first at a daemon's start, and [`Registry::bring_forward`] runs the four
-/// in that order, so a file that records `N` holds no table of a later schema than `N`.
+/// idempotent open does the work. The stored-format lock fails until it has been raised. A migration
+/// opens the other three before it writes the version, at a daemon's start and when an update
+/// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
+/// for.
 pub const SCHEMA_VERSION: i64 = 7;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
@@ -233,9 +234,16 @@ fn immutable_uri(path: &std::path::Path) -> Option<String> {
     Some(uri)
 }
 
-/// Opens a registry file to read it alone: no lock, no log, no shared memory, and nothing made
-/// beside it.
-fn open_immutable(path: &std::path::Path) -> Result<Connection> {
+/// Opens a SQLite file to read it alone: no lock, no log, no shared memory, and nothing made
+/// beside it. Any store's file is read this way by an update that checks what a release reads; the
+/// caller holds the lock that keeps its writer out, and has taken in what a log held
+/// ([`Registry::take_in_its_log`]).
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] when the path cannot be named to SQLite or the
+/// file cannot be opened.
+pub fn open_immutable(path: &std::path::Path) -> Result<Connection> {
     let uri = immutable_uri(path).ok_or_else(|| ControllerError::RegistryUnavailable {
         detail: format!(
             "{} is not a path this build can name to SQLite as a file to read alone",
@@ -249,6 +257,85 @@ fn open_immutable(path: &std::path::Path) -> Result<Connection> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(ControllerError::registry)
+}
+
+/// How a database records its version.
+#[derive(Clone, Copy, Debug)]
+pub enum RecordedIn<'a> {
+    /// The one row of a table, in a column named `version`.
+    Table(&'a str),
+    /// SQLite's own `user_version`.
+    UserVersion,
+}
+
+/// The version a database file records, where the file is there, read as the file alone.
+///
+/// For an update that checks what a release reads. A file that is not a regular file, a link and
+/// a pipe among them, is refused before anything is opened; what a daemon that ended by a signal
+/// left in a log or a journal is taken into the file first ([`Registry::take_in_its_log`]); and a
+/// table that holds no version, or several, is refused, where a file that is not there is `None`.
+/// The caller holds the lock that keeps the store's writer out.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] naming what stops the version being read.
+pub fn recorded_version(path: &std::path::Path, recorded: RecordedIn<'_>) -> Result<Option<i64>> {
+    let refuse = |detail: String| ControllerError::RegistryUnavailable { detail };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(refuse("this database is not a regular file".to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(refuse(format!(
+                "this database could not be looked at: {error}"
+            )));
+        }
+    }
+    let mut shared_memory = path.as_os_str().to_owned();
+    shared_memory.push("-shm");
+    match std::fs::symlink_metadata(&shared_memory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(refuse(
+                "the shared-memory file beside this database is not a regular file".to_owned(),
+            ));
+        }
+        Err(error) => {
+            return Err(refuse(format!(
+                "what is beside this database could not be looked at: {error}"
+            )));
+        }
+    }
+    Registry::take_in_its_log(path)?;
+    let connection = open_immutable(path)?;
+    match recorded {
+        RecordedIn::Table(table) => {
+            if !table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || table.is_empty()
+            {
+                return Err(refuse("a table name SQL cannot take".to_owned()));
+            }
+            let mut statement = connection
+                .prepare(&format!("SELECT version FROM {table}"))
+                .map_err(|_| refuse("it has no table that records a version".to_owned()))?;
+            let rows: Vec<i64> = statement
+                .query_map([], |row| row.get(0))
+                .and_then(Iterator::collect)
+                .map_err(ControllerError::registry)?;
+            match rows[..] {
+                [only] => Ok(Some(only)),
+                [] => Err(refuse("it records no version".to_owned())),
+                _ => Err(refuse("it records more than one version".to_owned())),
+            }
+        }
+        RecordedIn::UserVersion => connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map(Some)
+            .map_err(ControllerError::registry),
+    }
 }
 
 /// Every schema version a registry records: one row, in every registry this host wrote.
@@ -370,7 +457,7 @@ impl Registry {
             Ok(_) => return Ok(false),
             Err(error) => {
                 return Err(refuse(format!(
-                    "this registry could not be looked at: {error}"
+                    "this database could not be looked at: {error}"
                 )));
             }
         }
@@ -383,13 +470,13 @@ impl Registry {
                 Ok(metadata) if metadata.is_file() => holds |= metadata.len() > 0,
                 Ok(_) => {
                     return Err(refuse(format!(
-                        "what is beside this registry under the name {} is not a regular file",
+                        "what is beside this database under the name {} is not a regular file",
                         beside.to_string_lossy()
                     )));
                 }
                 Err(error) => {
                     return Err(refuse(format!(
-                        "what is beside this registry could not be looked at: {error}"
+                        "what is beside this database could not be looked at: {error}"
                     )));
                 }
             }
@@ -412,7 +499,7 @@ impl Registry {
             .map_err(ControllerError::registry)?;
         if blocked != 0 {
             return Err(refuse(
-                "this registry's write-ahead log could not be taken in while another connection uses it"
+                "this database's write-ahead log could not be taken in while another connection uses it"
                     .to_owned(),
             ));
         }
@@ -420,9 +507,9 @@ impl Registry {
     }
 
     /// Brings a registry that is behind this build's schema forward, as a daemon's start would,
-    /// and says what it did; `None` when there was nothing to bring. The registry's own tables go
-    /// through its chain of steps, and the file's other writers then open the file as they do at a
-    /// daemon's start, so that every table in it is at the shape the version it records stands for.
+    /// and says what it did; `None` when there was nothing to bring. The file's other writers open
+    /// it first, as they do at a daemon's start, and the registry's own tables go through its chain
+    /// of steps, so that every table in the file is at the shape the version it records stands for.
     ///
     /// For an update, which carries the registry of an environment whose daemon has not run since
     /// an earlier schema step to the schema its own release reads, so that it can be classed by
@@ -542,21 +629,6 @@ impl Registry {
                 ),
             }
         })?;
-        // The rest of the file's chain, in the order a daemon's start runs it: the file records the
-        // version the whole of it is at, so the other writers' tables are brought to their shape now
-        // and not when a daemon next opens them, which a later release may no longer be able to do.
-        Self::bring_the_other_writers_forward(path).map_err(|error| {
-            let cause = match error {
-                ControllerError::RegistryUnavailable { detail } => detail,
-                other => other.to_string(),
-            };
-            ControllerError::RegistryUnavailable {
-                detail: format!(
-                    "this registry recorded schema version {from} when it was opened and its \
-                     other tables could not be brought to schema version {SCHEMA_VERSION}: {cause}"
-                ),
-            }
-        })?;
         let blocked: i64 = registry
             .connection
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
@@ -576,9 +648,13 @@ impl Registry {
         }))
     }
 
-    /// Opens the file's other three writers, each of which creates and migrates its own tables
-    /// when it is opened, in the order a daemon's start opens them.
-    fn bring_the_other_writers_forward(path: &std::path::Path) -> Result<()> {
+    /// Opens the file's other three writers, each of which creates and migrates its own tables when
+    /// it is opened, in the order a daemon's start opens them. A registry that lives only in memory
+    /// has no other writer.
+    fn bring_the_other_writers_forward(&self) -> Result<()> {
+        let Some(path) = self.connection.path().filter(|path| !path.is_empty()) else {
+            return Ok(());
+        };
         drop(crate::grants::GrantDirectory::open(path)?);
         let devices = crate::service::net::devices::DeviceDirectory::open(path)?;
         crate::service::net::invitations::prepare(&devices)
@@ -811,6 +887,12 @@ impl Registry {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(ControllerError::registry)?;
+        // The other writers first and the version last: a file that records a version has all four
+        // writers at the shape that version stands for. A file of a later version is refused below
+        // as it is, without a table of theirs being made in it.
+        if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
+            self.bring_the_other_writers_forward()?;
+        }
         match recorded {
             None => {
                 self.connection

@@ -286,6 +286,19 @@ pub fn release(release: &kr_protocol::update::ReleaseName) -> Shown {
     shown!("{}", Checked(release.as_str().to_owned()))
 }
 
+/// What a store's name says, as a release's manifest gives it: itself when it is a name a manifest
+/// may give (1 to 64 of `a-z`, `0-9`, `-` and `_`), and that it is not one otherwise.
+#[must_use]
+pub fn store_name(text: &str) -> Shown {
+    checked(
+        text,
+        (1..=64).contains(&text.len())
+            && text.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            }),
+    )
+}
+
 /// What a device's platform says: the protocol's own name for it.
 #[must_use]
 pub fn platform(platform: kr_protocol::pairing::DevicePlatform) -> Shown {

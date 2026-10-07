@@ -1158,7 +1158,7 @@ const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 /// The format of the record this build writes, recorded in it as `version`. A record that states
 /// none was written before the format was recorded and is read as this one; a record of a later
 /// format is not one this build writes, and is refused.
-const ENTRY_RECORD_VERSION: u32 = 1;
+pub const ENTRY_RECORD_VERSION: u32 = 1;
 
 /// The startup files `kr shell install` has put an entry in, for each shell.
 ///

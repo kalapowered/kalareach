@@ -138,6 +138,49 @@ impl ChannelRoot {
         Ok(Some(Self { signed }))
     }
 
+    /// Reads a root the store kept, and checks it against itself as a release's is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when it is not root metadata or is not signed by its own root keys.
+    pub fn kept(value: serde_json::Value) -> Result<Self> {
+        let signed: tough::schema::Signed<tough::schema::Root> = serde_json::from_value(value)
+            .map_err(|error| {
+                CliError::Other(shown!(
+                    "the update channel's root this host kept is not root metadata: {}",
+                    Shown::json(&error)
+                ))
+            })?;
+        signed.signed.verify_role(&signed).map_err(|_| {
+            CliError::Other(Shown::said(
+                "the update channel's root this host kept is not signed by the root keys it names",
+            ))
+        })?;
+        Ok(Self { signed })
+    }
+
+    /// The root as the store keeps it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root cannot be written as JSON, which a root read from JSON can be.
+    #[must_use]
+    pub fn to_kept(&self) -> serde_json::Value {
+        serde_json::to_value(&self.signed).expect("a root is JSON")
+    }
+
+    /// The root's version.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.signed.signed.version.get()
+    }
+
+    /// Whether `other` is this very root.
+    #[must_use]
+    pub fn is(&self, other: &Self) -> bool {
+        self.signed == other.signed
+    }
+
     /// Checks that `next`, the root a release carries, is this root or the one that follows it:
     /// the next version, signed by a threshold of this root's root keys as well as its own.
     ///
@@ -167,7 +210,7 @@ impl ChannelRoot {
     }
 
     /// Reads a release's `release.json` and checks it: a threshold of the keys this root names for
-    /// its targets role signed the manifest, and the manifest lists files a host can install.
+    /// its targets role signed the manifest, and the manifest lists files and stores a host can take.
     ///
     /// # Errors
     ///
@@ -189,8 +232,8 @@ impl ChannelRoot {
         })?;
         signed.signed.0.manifest().map_err(|_| {
             CliError::Other(Shown::said(
-                "the release's manifest is not one this build reads, or lists files a host \
-                 cannot install",
+                "the release's manifest is not one this build reads, or lists files or stores a \
+                 host cannot take",
             ))
         })
     }
@@ -205,8 +248,8 @@ impl ChannelRoot {
 pub fn read_manifest(document: &[u8]) -> Result<ReleaseManifest> {
     ReleaseManifest::read_document(document).map_err(|_| {
         CliError::Other(Shown::said(
-            "the release's manifest is not one this build reads, or lists files a host cannot \
-             install",
+            "the release's manifest is not one this build reads, or lists files or stores a host \
+             cannot take",
         ))
     })
 }

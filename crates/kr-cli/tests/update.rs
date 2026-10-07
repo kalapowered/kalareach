@@ -35,11 +35,12 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Digest256, Nullable, U64, Uuid};
 use kr_protocol::update::{
     CommitId, CompatibilityLevel, FileMode, FloorSystem, FloorVersion, HandoverStep,
-    HostUpdateHandoverParams, ManifestKind, OsFloor, ReleaseFile, ReleaseManifest, ReleaseName,
-    ReleasePath, SignedMembers,
+    HostUpdateHandoverParams, ManifestKind, OsFloor, Recording, ReleaseFile, ReleaseManifest,
+    ReleaseName, ReleasePath, ReleaseStore, SignedMembers, StoreScope,
 };
 use serde_json::Value;
 
+mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
@@ -66,6 +67,8 @@ fn build() -> BuildId {
 struct Keys {
     root: Ed25519KeyPair,
     targets: Ed25519KeyPair,
+    /// The targets key a rotation of the channel's root names in place of `targets`.
+    next_targets: Ed25519KeyPair,
     stranger: Ed25519KeyPair,
 }
 
@@ -80,6 +83,7 @@ fn keys() -> &'static Keys {
         Keys {
             root: pair(),
             targets: pair(),
+            next_targets: pair(),
             stranger: pair(),
         }
     })
@@ -103,6 +107,17 @@ fn signature(pair: &Ed25519KeyPair, message: &[u8]) -> tough::schema::Signature 
 /// A channel root at `version` naming `root_key` for its root role and the targets key for its
 /// targets role, signed by each of `signers`.
 fn channel_root(version: u64, root_key: &Ed25519KeyPair, signers: &[&Ed25519KeyPair]) -> String {
+    channel_root_naming(version, root_key, &keys().targets, signers)
+}
+
+/// A channel root at `version` naming `root_key` for its root role and `targets_key` for its
+/// targets role, signed by each of `signers`.
+fn channel_root_naming(
+    version: u64,
+    root_key: &Ed25519KeyPair,
+    targets_key: &Ed25519KeyPair,
+    signers: &[&Ed25519KeyPair],
+) -> String {
     use tough::schema::{RoleKeys, RoleType, Root, Signed};
 
     let one = NonZeroU64::new(1).expect("one");
@@ -113,13 +128,10 @@ fn channel_root(version: u64, root_key: &Ed25519KeyPair, signers: &[&Ed25519KeyP
     };
     let mut keys_named = HashMap::new();
     keys_named.insert(key_id(root_key), tough::sign::Sign::tuf_key(root_key));
-    keys_named.insert(
-        key_id(&keys().targets),
-        tough::sign::Sign::tuf_key(&keys().targets),
-    );
+    keys_named.insert(key_id(targets_key), tough::sign::Sign::tuf_key(targets_key));
     let mut roles = HashMap::new();
     roles.insert(RoleType::Root, named(root_key));
-    roles.insert(RoleType::Targets, named(&keys().targets));
+    roles.insert(RoleType::Targets, named(targets_key));
     roles.insert(RoleType::Snapshot, named(root_key));
     roles.insert(RoleType::Timestamp, named(root_key));
     let root = Root {
@@ -276,6 +288,20 @@ fn module_tree() -> [(&'static str, &'static str); 2] {
     ]
 }
 
+/// The stores a release assembled here declares it reads: every store this build declares, at the
+/// versions it writes and migrates from.
+fn release_stores() -> Vec<ReleaseStore> {
+    static STORES: OnceLock<Vec<ReleaseStore>> = OnceLock::new();
+    STORES
+        .get_or_init(|| {
+            stored_formats::table::table()
+                .into_iter()
+                .map(|store| store.entry)
+                .collect()
+        })
+        .clone()
+}
+
 /// What one release assembled here is.
 struct Assembled {
     manifest: ReleaseManifest,
@@ -331,6 +357,7 @@ impl Assembled {
                 public_majors: vec![1],
                 retained_levels: vec![retained],
                 shells: Vec::new(),
+                stores: release_stores(),
                 files,
             },
             root: root.to_owned(),
@@ -356,6 +383,18 @@ impl Assembled {
                 .iter()
                 .any(|name| file.path.as_str() == format!("bin/{name}"))
         });
+        self
+    }
+
+    /// This release as one that reads `stores` and no others would have been assembled.
+    fn reading(mut self, stores: Vec<ReleaseStore>) -> Self {
+        self.manifest.stores = stores;
+        self
+    }
+
+    /// This release as one that lists no store would have been assembled.
+    fn without_stores(mut self) -> Self {
+        self.manifest.stores.clear();
         self
     }
 
@@ -410,14 +449,15 @@ impl Assembled {
     /// copy of its own: the archive is hundreds of megabytes of programs, and a test that packed its
     /// own would repeat what another has already done.
     fn archive(&self, archive: &Path) {
+        self.archive_signed(archive, &keys().targets);
+    }
+
+    /// Gives `archive` the release as an archive whose manifest `signer` signed.
+    fn archive_signed(&self, archive: &Path, signer: &Ed25519KeyPair) {
         static PACKED: OnceLock<Mutex<HashMap<String, Arc<OnceLock<PathBuf>>>>> = OnceLock::new();
         // Two releases that are signed alike are packed alike: the signature covers every file's
         // digest, and the channel root is one of the files.
-        let identity = format!(
-            "{}\n{}",
-            signed_document(&self.manifest, &keys().targets),
-            self.root
-        );
+        let identity = format!("{}\n{}", signed_document(&self.manifest, signer), self.root);
         let packed = Arc::clone(
             PACKED
                 .get_or_init(Mutex::default)
@@ -434,7 +474,7 @@ impl Assembled {
                 .expect("a directory for the archive")
                 .keep();
             let tree = directory.join(&top);
-            self.write(&tree);
+            self.write_signed(&tree, signer);
             let packed = directory.join("release.tar.gz");
             pack(&tree, &top, &packed);
             std::fs::remove_dir_all(&tree).expect("the tree goes");
@@ -1062,6 +1102,83 @@ impl Host {
         (created["display_number"].to_string(), session_id)
     }
 
+    /// Creates a session with a release's `kr` whose root shell starts a stand-in agent, a process
+    /// of its own that outlasts anything the shell does, and then goes on as the shell.
+    ///
+    /// Returns the session's display number and identifier, and the identity the kernel gives the
+    /// agent's process.
+    fn new_session_with_an_agent(
+        &self,
+        kr: &Path,
+        name: &str,
+    ) -> (
+        String,
+        SessionId,
+        kr_protocol::identity::ProcessStartIdentity,
+    ) {
+        let directory = self.scratch(&format!("agent-{name}"));
+        let pid_file = directory.join("pid");
+        // Named for the shell it goes on as, because the worker recognises a shell by its name.
+        let shell = directory.join("sh");
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n/bin/sleep 600 &\nprintf '%s\\n' \"$!\" > '{pid}.partial'\n\
+                 mv '{pid}.partial' '{pid}'\nexec /bin/sh \"$@\"\n",
+                pid = pid_file.display()
+            ),
+        )
+        .expect("the stand-in agent's shell");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        let cwd = self.tree.root().display().to_string();
+        let output = self.run(
+            kr,
+            &[
+                "new",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                &shell.display().to_string(),
+                "--startup",
+                "interactive",
+                "--json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "kr new: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let created: Value = serde_json::from_slice(&output.stdout).expect("kr printed JSON");
+        let session_id = created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses");
+        let started = Instant::now();
+        let pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the session's shell did not start its agent"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let agent = kr_ipc::identity::started_process_identity(pid).expect("the agent runs");
+        (created["display_number"].to_string(), session_id, agent)
+    }
+
     /// What a session's worker states about its build, from its answer to a hello.
     async fn worker_build(&self, session_id: SessionId) -> String {
         let descriptor = kr_ipc::descriptor::read(&self.tree.environment(), session_id)
@@ -1447,6 +1564,35 @@ fn kr_host_install_refuses_a_release_that_lacks_a_program_a_host_runs() {
     );
     let said = String::from_utf8_lossy(&refused.stderr);
     assert!(said.contains("`kr-plugin-host`"), "{said}");
+    assert_eq!(host.store.current().ok().flatten(), None);
+
+    let whole = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&whole);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(whole.name().clone())
+    );
+}
+
+/// KR-REQ-26.10: `kr host install` refuses a tree whose signed manifest lists no store, because the
+/// stores a release reads are what a host checks before it switches to the release, and the same
+/// release with its stores is installed into the same store.
+#[test]
+fn kr_host_install_refuses_a_release_that_lists_no_store() {
+    let host = Host::bare();
+    let store = host.store.root().display().to_string();
+    let lacking = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).without_stores();
+    let tree = host.scratch("lacking").join(lacking.name().as_str());
+    lacking.write(&tree);
+    let refused = host.run(
+        &tree.join("bin").join("kr"),
+        &["host", "install", "--store", &store],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a release that lists no store is refused"
+    );
     assert_eq!(host.store.current().ok().flatten(), None);
 
     let whole = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
@@ -3243,6 +3389,7 @@ fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, St
         public_majors: vec![1],
         retained_levels: vec![CompatibilityLevel::of(PACKAGE_VERSION)],
         shells: Vec::new(),
+        stores: release_stores(),
         files: files
             .iter()
             .map(|(path, contents)| ReleaseFile {
@@ -3295,7 +3442,7 @@ fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
     }
     // A signed document changed afterwards, by one member this build does not even read.
     let mut changed: Value = serde_json::from_str(&document).expect("JSON");
-    changed["signed"]["stores"] = serde_json::json!([]);
+    changed["signed"]["notes"] = serde_json::json!([]);
     assert!(root.verify(changed.to_string().as_bytes()).is_err());
     // And one that names a member twice with the same value, which leaves the canonical form and
     // the signature as they were: refused by the updater, as by every program of the release.
@@ -4558,4 +4705,831 @@ async fn an_identity_that_is_there_and_not_trusted_still_stops_the_update() {
     );
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Going back                                                                                    */
+/* -------------------------------------------------------------------------------------------- */
+
+/// The stores a release assembled here declares it reads, with the registry's versions given.
+fn reading_the_registry_at(migrates_from: u32, version: u32) -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| {
+            if store.store == "registry" {
+                ReleaseStore {
+                    migrates_from,
+                    version,
+                    ..store
+                }
+            } else {
+                store
+            }
+        })
+        .collect()
+}
+
+/// The registry's schema version, as the daemon wrote it.
+fn registry_version() -> u32 {
+    u32::try_from(kr_controller::registry::SCHEMA_VERSION).expect("a small number")
+}
+
+/// KR-REQ-26.10: `kr host rollback` goes back to the release this host was on before its last
+/// switch, as an update goes forward: the control daemon is handed over and started again from the
+/// older release, the release left is kept as the one to go back to, and no live session is moved.
+/// A session started under the older release and one started under the newer keep their workers,
+/// and so does the agent in the shell of each, through the update and through the rollback.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_goes_back_to_the_release_before_and_moves_no_live_session() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let (old_display, old_session, old_agent) =
+        host.new_session_with_an_agent(&host.program(one.name(), Program::Kr), "old");
+    let old_worker = host.worker_process(old_session);
+
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["rolled_back"], false, "{said}");
+    let (new_display, new_session, new_agent) =
+        host.new_session_with_an_agent(&host.program(two.name(), Program::Kr), "new");
+    let new_worker = host.worker_process(new_session);
+    assert_eq!(
+        host.worker_build(new_session).await,
+        format!("kr-worker/{}", two.name())
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["rolled_back"], true, "{said}");
+    assert_eq!(said["source"], two.name().as_str(), "{said}");
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        said["restarted"],
+        serde_json::json!([host.tree.environment_id().to_string()]),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "the older release is current"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the control daemon was started again, from the older release"
+    );
+    let record = host.record();
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+    assert!(record["update"].is_null(), "the rollback settled: {record}");
+    assert!(
+        host.store.release_directory(two.name()).is_dir(),
+        "the release left is kept"
+    );
+
+    // No session moved: each worker is the process it was, on the release it started from, and
+    // each agent runs on.
+    for (session, worker, agent, release) in [
+        (old_session, &old_worker, &old_agent, &one),
+        (new_session, &new_worker, &new_agent, &two),
+    ] {
+        assert_eq!(
+            &host.worker_process(session),
+            worker,
+            "the worker of the session started under {} is the process it was",
+            release.name()
+        );
+        assert_eq!(
+            host.worker_build(session).await,
+            format!("kr-worker/{}", release.name())
+        );
+        assert!(
+            !matches!(
+                kr_ipc::identity::process_state(agent),
+                kr_ipc::identity::ProcessState::Ended
+            ),
+            "the agent in the shell of the session started under {} runs on",
+            release.name()
+        );
+    }
+    let (_, versions) = host.kr_json(&["host", "versions", "--json"]);
+    let state_of = |name: &ReleaseName| {
+        versions["releases"]
+            .as_array()
+            .and_then(|releases| {
+                releases
+                    .iter()
+                    .find(|kept| kept["release"] == name.as_str())
+            })
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(state_of(one.name())["current"], true, "{versions}");
+    assert_eq!(state_of(two.name())["previous"], true, "{versions}");
+    assert_eq!(
+        state_of(two.name())["held"],
+        true,
+        "the session started under the release left holds it: {versions}"
+    );
+
+    // A session started now runs the older release again.
+    let (display, session_id) = host.new_session(&host.store.stable(Program::Kr));
+    assert_eq!(
+        host.worker_build(session_id).await,
+        format!("kr-worker/{}", one.name())
+    );
+    for display in [&display, &old_display, &new_display] {
+        host.close(&host.store.stable(Program::Kr), display);
+    }
+}
+
+/// KR-REQ-26.10: a rollback is refused, naming the store, when a store as it stands is at a version
+/// the older release does not read, and nothing is switched: the registry a daemon of this build
+/// wrote is at this build's schema version, and a release that reads the one before cannot take it.
+/// The daemon the rollback stopped serves again from the release still current.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
+    let mut host = Host::bare();
+    let older = registry_version() - 1;
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        .reading(reading_the_registry_at(1, older));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = host.tree.environment().registry_database();
+    let recorded = |path: &Path| -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads")
+    };
+    assert_eq!(
+        recorded(&registry),
+        i64::from(registry_version()),
+        "the daemon of this build wrote the registry at this build's version"
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("registry")
+            && message.contains(&host.tree.environment_id().to_string())
+            && message.contains(&format!("schema version {}", registry_version()))
+            && message.contains(&format!("versions 1 to {older}")),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again, from the release still current"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], one.name().as_str(), "{record}");
+    assert_eq!(
+        recorded(&registry),
+        i64::from(registry_version()),
+        "the registry was left as it was"
+    );
+}
+
+/// KR-REQ-26.10: an update is held to the same rule, forward: a release that reads a version of the
+/// registry above the one a host's registry is at, and one that migrates from a version above it,
+/// are both refused naming the store, with nothing switched.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
+    let (host, one, _two, _archive) = host_to_update().await;
+    let beyond = registry_version() + 1;
+    let scratch = host.scratch("archives");
+    // A release that reads only versions the registry has not reached.
+    let ahead = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .reading(reading_the_registry_at(beyond, beyond));
+    let archive = scratch.join("ahead.tar.gz");
+    ahead.archive(&archive);
+
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("registry")
+            && message.contains(&format!("schema version {}", registry_version()))
+            && message.contains(&format!("versions {beyond} to {beyond}")),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves again"
+    );
+}
+
+/// KR-REQ-26.10: a store of a host's that is too old for the release switched to is named as well,
+/// and so is a store whose version cannot be read: an environment whose transfer journal is at
+/// version 1 against a release that migrates from 2, and one whose record of enrolments is not
+/// JSON. The control, in the same environment, is the store that is in range, which is not named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
+    let (host, one, _two, _archive) = host_to_update().await;
+    let idle = Idle::new(&host.store);
+    let environment = idle.temp.environment();
+    let transfers = kr_transfer::staging::StagingArea::store_path(&environment);
+    std::fs::create_dir_all(transfers.parent().expect("a directory")).expect("transfers/");
+    drop(
+        kr_transfer::store::Store::open(&transfers, idle.temp.environment_id())
+            .expect("a transfer journal"),
+    );
+    rusqlite::Connection::open(&transfers)
+        .expect("opens")
+        .execute("UPDATE schema_version SET version = 1", [])
+        .expect("an earlier version, which the check reads and nothing else");
+    std::fs::write(
+        environment.state_dir().join("environments.json"),
+        b"{ not JSON",
+    )
+    .expect("a record that is not JSON");
+
+    // The release reads transfer journals from version 2, and the record of enrolments as a JSON
+    // object that states its version.
+    let stores: Vec<ReleaseStore> = release_stores()
+        .into_iter()
+        .map(|store| match store.store.as_str() {
+            "transfers" => ReleaseStore {
+                migrates_from: 2,
+                ..store
+            },
+            _ => store,
+        })
+        .collect();
+    assert!(
+        stores.iter().any(|store| store.store == "environments"),
+        "the release lists the record of enrolments"
+    );
+    let target = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(stores);
+    let archive = host.scratch("archives").join("target.tar.gz");
+    target.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    let named = idle.environment_id();
+    assert!(
+        message.contains(&format!("transfers of environment {named}"))
+            && message.contains("schema version 1")
+            && message.contains("versions 2 to 2"),
+        "the journal that is too old is named: {said}"
+    );
+    assert!(
+        message.contains(&format!("environments of environment {named}"))
+            && message.contains("is not JSON"),
+        "the record that cannot be read is named: {said}"
+    );
+    assert!(
+        !message.contains(&format!("registry of environment {named}")),
+        "the registry is at a version the release reads, so it is not named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "nothing was switched"
+    );
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: a rollback waits, exit 9, for a live session whose level the older
+/// release's daemon does not retain, as an update does, with nothing stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_waits_for_a_session_the_older_release_does_not_retain() {
+    let mut host = Host::bare();
+    let another = if PACKAGE_VERSION.major == 0 {
+        PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
+    } else {
+        PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
+    };
+    let one = Assembled::new(
+        "0.1.0+aaaaaaaaaaaa",
+        1,
+        CompatibilityLevel::of(another),
+        the_root(),
+    );
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (display, _) = host.new_session(&host.store.stable(Program::Kr));
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "a rollback that waits exits 9: {said}"
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "the rollback to {} waits: session {display} runs kr-worker/{}",
+            one.name(),
+            two.name()
+        )) && message.contains("kr host rollback again"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "nothing was stopped"
+    );
+    host.close(&host.store.stable(Program::Kr), &display);
+}
+
+/// KR-REQ-26.10: a rollback needs a release to go back to, and it is refused, usage, when there is
+/// none recorded, when the one named is not in the store, when it is not older than the current
+/// release, and when it is the current release.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_needs_an_older_release_in_the_store() {
+    let (host, one, two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "no earlier release is recorded: {said}"
+    );
+    let (output, said) =
+        host.kr_json(&["host", "rollback", "--to", "0.9.0+eeeeeeeeeeee", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a release the store does not keep: {said}"
+    );
+    let (output, said) = host.kr_json(&["host", "rollback", "--to", "not a release", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "not a release name: {said}");
+    let (output, said) = host.kr_json(&["host", "rollback", "--to", one.name().as_str(), "--json"]);
+    assert_eq!(output.status.code(), Some(2), "the current release: {said}");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(output.status.success(), "{said}");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(output.status.success(), "{said}");
+    // Now the newer release is the one recorded as before the last switch, and it is not older.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a rollback does not go forward: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    let _ = two;
+}
+
+/// KR-REQ-26.10: going back does not bring back a key the channel retired. Release two carries the
+/// next version of the channel's root, which names a new targets key in place of the first. An
+/// update that waits trusts nothing it has not switched to, so it can be run again once what held
+/// it has gone; once the host has switched to release two, a rollback to release one, whose own
+/// root is the first, still trusts the second: an archive signed with the retired key is refused
+/// and one signed with the new key is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
+    let mut host = Host::bare();
+    let rotated = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
+    let another = if PACKAGE_VERSION.major == 0 {
+        PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
+    } else {
+        PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
+    };
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    // It retains another level than the session below runs at, so its update waits for the session.
+    let two = Assembled::new(
+        "0.2.0+bbbbbbbbbbbb",
+        2,
+        CompatibilityLevel::of(another),
+        &rotated,
+    );
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let (display, session) = host.new_session(&host.store.stable(Program::Kr));
+    let session_worker = host.worker_process(session);
+    let scratch = host.scratch("archives");
+    let archive_two = scratch.join("two.tar.gz");
+    two.archive(&archive_two);
+    let update = |archive: &Path| {
+        host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ])
+    };
+
+    let (output, said) = update(&archive_two);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "waits for the session: {said}"
+    );
+    assert!(
+        host.record()["trusted_root"].is_null(),
+        "an update that waits has switched to nothing, so it trusts nothing new: {}",
+        host.record()
+    );
+    host.close(&host.store.stable(Program::Kr), &display);
+    host.worker_ended(&session_worker).await;
+    // The session has gone; the same archive is taken now, though its manifest is signed by the key
+    // the first root names and the root it carries names another.
+    let (output, said) = update(&archive_two);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.record()["trusted_root"]["signed"]["version"],
+        2,
+        "the switch settled, so the host trusts the second root: {}",
+        host.record()
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.record()["trusted_root"]["signed"]["version"],
+        2,
+        "going back does not give the second root up"
+    );
+
+    // A later release of the second root, signed with the key that root retired: refused.
+    let three = Assembled::new(
+        "0.3.0+cccccccccccc",
+        3,
+        CompatibilityLevel::of(PACKAGE_VERSION),
+        &rotated,
+    );
+    let with_retired_key = scratch.join("three-retired.tar.gz");
+    three.archive_signed(&with_retired_key, &keys().targets);
+    let (output, said) = update(&with_retired_key);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an archive signed with the retired key is refused: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    // The control: the same release signed with the key the second root names is taken.
+    let with_new_key = scratch.join("three-new.tar.gz");
+    three.archive_signed(&with_new_key, &keys().next_targets);
+    let (output, said) = update(&with_new_key);
+    assert!(
+        output.status.success(),
+        "an archive signed with the new key is taken: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(three.name().clone())
+    );
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* The stored formats                                                                            */
+/* -------------------------------------------------------------------------------------------- */
+
+/// A host whose daemon has run: a session created and closed, and the daemon stopped through its own
+/// door, so that what it kept is on disk as a stopped daemon leaves it.
+async fn a_host_whose_daemon_has_run() -> Host {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let (display, session) = host.new_session(&host.store.stable(Program::Kr));
+    let worker = host.worker_process(session);
+    host.close(&host.store.stable(Program::Kr), &display);
+    host.worker_ended(&worker).await;
+    assert!(
+        host.stop_the_daemon().await,
+        "the daemon is stopped through its own door"
+    );
+    // The pairing tables are made when the daemon's network endpoint opens, which this host's daemon
+    // does not reach: the file is given them as that start gives them.
+    let registry = host.tree.environment().registry_database();
+    let devices = kr_controller::service::net::devices::DeviceDirectory::open(&registry)
+        .expect("the device store opens");
+    kr_controller::service::net::invitations::prepare(&devices).expect("the pairing tables");
+    drop(devices);
+    host
+}
+
+/// What this build says of every store, with the definitions of each database as the daemon's files
+/// hold them.
+fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
+    let environment = host.tree.environment();
+    stored_formats::table::table()
+        .iter()
+        .map(|store| {
+            let ddl = match store.entry.recording {
+                Recording::SqliteTable { .. } | Recording::SqliteUserVersion => {
+                    let file = environment.state_dir().join(&store.entry.path);
+                    assert!(
+                        file.is_file(),
+                        "the daemon made the store {} at {}",
+                        store.entry.store,
+                        file.display()
+                    );
+                    stored_formats::ddl_of(&file).expect("the database's definitions")
+                }
+                _ => Vec::new(),
+            };
+            stored_formats::observe(store, &ddl).expect("what the store keeps is read")
+        })
+        .collect()
+}
+
+/// KR-REQ-26.10, KR-REQ-24.30: every store has a format version, and `stored-formats.lock` maps each
+/// to the version the code writes and a digest of what the version stands for: the tables a real
+/// daemon made, the types it keeps and the words it matches by hand. A change to any of them moves
+/// the digest, and this fails until the version has been raised and the lock written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
+    let host = a_host_whose_daemon_has_run().await;
+    let found =
+        stored_formats::findings(&stored_formats::Lock::committed(), &observed_stores(&host));
+    assert!(
+        found.is_empty(),
+        "stored-formats.lock does not match the code:\n{}",
+        found.join("\n")
+    );
+}
+
+/// KR-REQ-26.10: a state root's files are all named. After a daemon has run and a session has been
+/// made and closed, every entry of the state root and of the environment's directory is a store's or
+/// is named in the lock with the reason it has no version, and a file that nothing names is found,
+/// whether it is beside the stores or inside a directory a store owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_file_of_a_state_root_goes_unnamed() {
+    let host = a_host_whose_daemon_has_run().await;
+    let table = stored_formats::table::table();
+    let named = stored_formats::table::named();
+    let root = host.tree.paths().state_root().to_path_buf();
+    let unnamed = stored_formats::unnamed(&root, &table, &named);
+    assert!(unnamed.is_empty(), "named by nothing: {unnamed:?}");
+
+    let environment = host.tree.environment();
+    let prefix = format!(
+        "environments/{}",
+        kr_ipc::paths::short_prefix(host.tree.environment_id())
+    );
+    std::fs::write(environment.state_dir().join("stray"), b"nothing names this").expect("a file");
+    std::fs::write(
+        environment
+            .state_dir()
+            .join("changesets")
+            .join("stray.record"),
+        b"nor this",
+    )
+    .expect("a file in a directory a store owns");
+    std::fs::copy(
+        environment.registry_database(),
+        environment
+            .state_dir()
+            .join("projects")
+            .join("another.sqlite"),
+    )
+    .expect("a database beside a store's");
+    let unnamed = stored_formats::unnamed(&root, &table, &named);
+    for expected in [
+        format!("{prefix}/stray"),
+        format!("{prefix}/changesets/stray.record"),
+        format!("{prefix}/projects/another.sqlite"),
+    ] {
+        assert!(
+            unnamed.contains(&expected),
+            "{expected} is found: {unnamed:?}"
+        );
+    }
+    assert_eq!(unnamed.len(), 3, "and nothing else: {unnamed:?}");
+}
+
+/// Writes `stored-formats.lock` from the code and a daemon's files, refusing a change that would
+/// bring the lock past a version that was not raised.
+///
+/// Run it after raising the version of a store whose tables or values changed:
+/// `cargo test -p kr-cli --test update write_the_lock -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "writes stored-formats.lock"]
+async fn write_the_lock() {
+    let host = a_host_whose_daemon_has_run().await;
+    let committed = std::fs::read(stored_formats::lock_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<stored_formats::Lock>(&bytes).ok());
+    let lock = stored_formats::write(
+        committed.as_ref(),
+        &observed_stores(&host),
+        &stored_formats::table::named(),
+    )
+    .unwrap_or_else(|refused| panic!("the lock is not written:\n{}", refused.join("\n")));
+    std::fs::write(stored_formats::lock_path(), lock.text()).expect("writes the lock");
+}
+
+/// KR-REQ-26.10: the check says what to do about each way the code and the lock can differ, and the
+/// writer refuses the ways that are a change nobody gave a version to: a digest that moved while the
+/// version stood still, a version that went down and a store that is kept somewhere else.
+#[test]
+fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
+    let store = |version: u32, digest: &str, path: &str| stored_formats::Observed {
+        entry: ReleaseStore {
+            store: "registry".to_owned(),
+            scope: StoreScope::Environment,
+            path: path.to_owned(),
+            recording: Recording::SqliteTable {
+                table: "schema_version".to_owned(),
+            },
+            version,
+            migrates_from: 1,
+        },
+        digest: digest.to_owned(),
+        kept: Vec::new(),
+    };
+    let lock = stored_formats::write(None, &[store(7, "aa", "registry.sqlite")], &[])
+        .expect("a first lock is written");
+    assert!(
+        stored_formats::findings(&lock, &[store(7, "aa", "registry.sqlite")]).is_empty(),
+        "the lock matches itself"
+    );
+
+    // The tables or a kept value changed and the version stood still.
+    let moved = [store(7, "bb", "registry.sqlite")];
+    let found = stored_formats::findings(&lock, &moved);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("registry") && found[0].contains("raise the version"),
+        "{found:?}"
+    );
+    let refused = stored_formats::write(Some(&lock), &moved, &[]).expect_err("is not written");
+    assert!(refused[0].contains("raise it first"), "{refused:?}");
+
+    // The version was raised, and the lock is behind; then it is written.
+    let raised = [store(8, "bb", "registry.sqlite")];
+    let found = stored_formats::findings(&lock, &raised);
+    assert!(found[0].contains("write the lock"), "{found:?}");
+    let written = stored_formats::write(Some(&lock), &raised, &[]).expect("is written");
+    assert!(stored_formats::findings(&written, &raised).is_empty());
+
+    // A version that went down, and a store kept somewhere else, are not written either.
+    assert!(
+        stored_formats::write(Some(&written), &[store(7, "aa", "registry.sqlite")], &[]).is_err()
+    );
+    assert!(
+        stored_formats::write(Some(&written), &[store(8, "bb", "elsewhere.sqlite")], &[]).is_err()
+    );
+    // And a store the lock lists that the code does not declare is found.
+    assert!(!stored_formats::findings(&written, &[]).is_empty());
+}
+
+/// What the digest leaves out and what it keeps: the words of a doc comment, the spacing and the
+/// comments of the SQL, and the name of a type move nothing; a column, a property, a word and a
+/// quoted default do.
+#[test]
+fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
+    use stored_formats::{normalise_schema, normalise_sql};
+
+    assert_eq!(
+        normalise_sql("CREATE TABLE t (\n  a INTEGER, -- the first\n  b TEXT /* second */\n)"),
+        normalise_sql("CREATE TABLE t (a INTEGER,b TEXT)")
+    );
+    assert_ne!(
+        normalise_sql("CREATE TABLE t (a TEXT DEFAULT 'x  y')"),
+        normalise_sql("CREATE TABLE t (a TEXT DEFAULT 'x y')"),
+        "a quoted default is kept as it is"
+    );
+    assert_ne!(
+        normalise_sql("CREATE TABLE t (a INTEGER)"),
+        normalise_sql("CREATE TABLE t (a INTEGER, b TEXT)")
+    );
+
+    let schema = |name: &str, doc: &str, property: &str| {
+        serde_json::json!({
+            "$ref": format!("#/$defs/{name}"),
+            "$defs": { name: {
+                "description": doc,
+                "type": "object",
+                "properties": { property: { "type": "string", "description": "a field" } },
+            }},
+        })
+    };
+    assert_eq!(
+        normalise_schema(&schema("Create", "the first words", "intent")),
+        normalise_schema(&schema("Created", "other words", "intent")),
+        "neither a doc comment nor the name of a type moves it"
+    );
+    assert_ne!(
+        normalise_schema(&schema("Create", "words", "intent")),
+        normalise_schema(&schema("Create", "words", "purpose")),
+        "a property does"
+    );
+    assert_eq!(
+        normalise_schema(&schema("Create", "words", "description"))["properties"]["description"]["type"],
+        "string",
+        "a property that is called description is a property, not prose"
+    );
 }

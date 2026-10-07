@@ -978,6 +978,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+            HostCommand::Rollback(rollback) => {
+                let updated = kr_cli::update::rollback(rollback.to.as_deref()).await?;
+                if cli.json {
+                    output::document(&updated.document());
+                } else {
+                    for line in updated.lines() {
+                        output::say(&line);
+                    }
+                }
+                Ok(Completion::Done)
+            }
             HostCommand::Machine(machine) => kr_cli::machine::run(&paths, machine, cli.json).await,
             HostCommand::Clock(clock) => {
                 kr_cli::pair::establish_clock(&paths, &clock, cli.json).await?;
