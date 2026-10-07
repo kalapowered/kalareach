@@ -421,6 +421,7 @@ jobs:
         run: df -h /
 
       - name: Save the cargo cache
+        if: ${{ !cancelled() }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
@@ -1011,6 +1012,7 @@ jobs:
           -p kr-voice -p kr-worker
 
       - name: Save the cargo cache
+        if: ${{ !cancelled() }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
@@ -1777,7 +1779,7 @@ jobs:
         run: df -h /System/Volumes/Data
 
       - name: Save the cargo cache
-        if: ${{ success() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
@@ -1785,7 +1787,7 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
       - name: Save the release build output
-        if: ${{ success() && matrix.part == 'demonstrations' }}
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
@@ -1875,6 +1877,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save the cargo cache
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
