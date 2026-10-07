@@ -329,32 +329,43 @@ fn fenced(actor_id: &ActorId, byte: u8) -> kr_protocol::action::FencedAction {
 /// about, a paused worker that could already be inside a dispatch transition.
 struct Pause {
     release: Option<std::sync::mpsc::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
+
+/// How long a holder of a worker's session or dispatch boundary is given to take it.
+///
+/// A liveness bound and not a measurement: a holder takes it as soon as nothing else holds it, and
+/// one that has not by now never will, which the case then reports instead of waiting for.
+const HOLD_DEADLINE: Duration = Duration::from_secs(120);
 
 impl Pause {
     async fn hold(runtime: &Arc<SessionRuntime>) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        let (held, confirmed) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let runtime = Arc::clone(runtime);
-        let task = tokio::task::spawn_blocking(move || {
+        // A thread of its own and not one of the runtime's blocking pool: a holder that never
+        // gets the session must not be what keeps this test's runtime from ending.
+        let thread = std::thread::spawn(move || {
             let _session = runtime.session();
-            held.send(()).expect("the test is waiting");
+            let _ = held.send(());
             // Held until the test releases it. The receiver ends when the sender is dropped, so a
             // test that panics does not leave the worker locked for the rest of the suite.
             let _ = wait.recv();
         });
-        confirmed.recv().expect("the session is held");
+        tokio::time::timeout(HOLD_DEADLINE, confirmed)
+            .await
+            .expect("the session was not held in time")
+            .expect("the holder ended without holding the session");
         Self {
             release: Some(release),
-            task: Some(task),
+            thread: Some(thread),
         }
     }
 
     async fn release(mut self) {
         drop(self.release.take());
-        if let Some(task) = self.task.take() {
-            task.await.expect("the holding thread finishes");
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the holding thread finishes");
         }
     }
 }
@@ -2715,31 +2726,34 @@ fn seed_undispatched_intents(hosted: &Hosted, device: &ActorId, count: usize) {
 /// is inside it.
 struct HeldBoundary {
     release: Option<std::sync::mpsc::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HeldBoundary {
     async fn take(service: &Arc<WorkerService>) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        let (held, confirmed) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let service = Arc::clone(service);
-        let task = tokio::task::spawn_blocking(move || {
+        let thread = std::thread::spawn(move || {
             let _boundary = service.hold_the_dispatch_boundary();
-            held.send(()).expect("the test is waiting");
+            let _ = held.send(());
             // Held until the test lets it go, or until the test ends without doing so.
             let _ = wait.recv();
         });
-        confirmed.recv().expect("the boundary is held");
+        tokio::time::timeout(HOLD_DEADLINE, confirmed)
+            .await
+            .expect("the boundary was not held in time")
+            .expect("the holder ended without holding the boundary");
         Self {
             release: Some(release),
-            task: Some(task),
+            thread: Some(thread),
         }
     }
 
     async fn release(mut self) {
         drop(self.release.take());
-        if let Some(task) = self.task.take() {
-            task.await.expect("the holding thread finishes");
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the holding thread finishes");
         }
     }
 }
