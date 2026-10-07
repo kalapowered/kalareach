@@ -2791,10 +2791,9 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         // directories were recorded with their filesystem: its first successful check decides it
         // by its device number and inode, as every record was decided, and a use that writes
         // records the filesystem it found (`Settled::Revised`). Remove these entries, with the
-        // handling of a record
-        // without a filesystem in `kr_transfer::filesystem::settle`, once no supported upgrade
-        // starts from a store written before filesystems were recorded; a record that no use has
-        // settled by then is refused, and recorded again.
+        // handling of a record without a filesystem in `kr_transfer::filesystem::settle`, once no
+        // supported upgrade starts from a store written before filesystems were recorded; a record
+        // that no use has settled by then is refused, and recorded again.
         ("projects", "git_dir_fs", "BLOB"),
         ("projects", "work_tree_fs", "BLOB"),
         ("workspaces", "tree_fs", "BLOB"),

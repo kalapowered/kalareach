@@ -1296,9 +1296,11 @@ impl ProjectService {
     /// the name after the publication is refused unread. The repository was made inside its tree,
     /// and is found there.
     ///
-    /// `published` is the directory the publication checked against the staged witness, which the
-    /// caller still holds open: the repository opened is required to be that object, so a number
-    /// that a filesystem gave another directory once the published one was gone decides nothing.
+    /// `published` is the directory the publication checked against the staged identity, which the
+    /// caller still holds open, and the repository opened is required to be that object. Both
+    /// numbers are read in this run, so the comparison is exact where a record's is not (a recorded
+    /// inode is accepted under another device number when the directory above has that device),
+    /// and the held handle keeps its number from being given to another directory.
     fn open_published(
         &self,
         destination: &Destination,
@@ -1339,7 +1341,7 @@ impl ProjectService {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "this operation published the directory {} and {} now holds {found}; nothing \
-                     of it is read or recorded",
+                     of it is recorded",
                     published.identity(),
                     crate::git::redact(&destination.path().display().to_string())
                 )
