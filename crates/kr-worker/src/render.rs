@@ -26,23 +26,29 @@
 //! line-feed/new-line mode and shift-out off on some terminals. So the switches come before
 //! anything that would be undone, and what they leave saved is what the session has saved.
 //!
-//! xterm keeps one saved cursor for each buffer. Its soft reset saves a fresh one in the buffer that
-//! is showing and leaves the other alone, and `?1049h` saves one in the buffer that is showing when
-//! it comes. A terminal can be showing either buffer when a restoration begins, and the one it is
-//! not showing can hold a cursor an earlier application saved there, so a restoration begins by
-//! resetting the terminal in each buffer, which leaves both fresh whichever it started in. A reset
-//! does not close a hyperlink, so one the stream left open is closed at the same point. A reset makes
-//! the cursor show, so the cursor is hidden again after every reset and is shown, or left hidden,
-//! only by the cursor's own operation at the end: nobody watches it travel across the repaint.
+//! xterm keeps one saved cursor for each buffer. Its soft reset saves a fresh one in the buffer
+//! that is showing and leaves the other alone, and `?1049h` saves one in the buffer that is showing
+//! when it comes. A terminal can be showing either buffer when a restoration begins, and the one it
+//! is not showing can hold a cursor an earlier application saved there, so a restoration begins by
+//! resetting the terminal in each buffer, which leaves both fresh whichever it started in. Each
+//! reset is followed by a move home, so a terminal that ignores the reset still saves the plain
+//! state at the next switch. A reset makes the cursor show, so the cursor is hidden again after
+//! every reset and is shown, or left hidden, only by the cursor's own operation at the end: nobody
+//! watches it travel across the repaint.
+//!
+//! A soft reset does not always close a hyperlink, and a switch can give back a link the terminal
+//! saved with its cursor, so the hyperlink is closed after every switch, and the pen is taken as
+//! unknown after one. The stream the terminal was handed can have left a link open, and one the
+//! writer did not open would otherwise attach to the first cells it draws.
 //!
 //! When the primary buffer is the one that is showing, the other buffer is painted right after
 //! those resets, and the reset is repeated: the repeat forgets the cursor that entering the other
 //! buffer saved, as a session that never saved one has none. When the alternate buffer is showing,
 //! the switch back into it saves the plain state.
 //!
-//! Each soft reset comes after a carriage return and a plain rendition. It is the only soft reset a
-//! direct terminal reads, and xterm's saves a fresh cursor that keeps a wrap the terminal had
-//! pending and leaves faint, crossed-out and doubly underlined set; the return and the plain
+//! Each soft reset comes after a carriage return and a plain rendition. They are the only soft
+//! resets a direct terminal reads, and xterm's saves a fresh cursor that keeps a wrap the terminal
+//! had pending and leaves faint, crossed-out and doubly underlined set; the return and the plain
 //! rendition leave it nothing to keep.
 //!
 //! What a byte stream still cannot carry is named here rather than approximated, and every one of
@@ -332,10 +338,7 @@ impl Writer {
             RestoreOp::SetDimensions { .. } => {}
             RestoreOp::SelectBuffer { buffer } => {
                 self.active = *buffer;
-                match buffer {
-                    ActiveBuffer::Primary => self.csi(b"?1049l"),
-                    ActiveBuffer::Alternate => self.csi(b"?1049h"),
-                }
+                self.switch_buffer(*buffer == ActiveBuffer::Alternate);
                 // Before the palette, the modes and everything else a switch could undo. A
                 // restoration that shows the primary buffer has painted the other one by now.
                 self.paint_inactive_buffer();
@@ -429,9 +432,9 @@ impl Writer {
     /// Writes a soft reset with nothing in front of it for xterm's reset to keep, and then hides
     /// the cursor.
     ///
-    /// A restoration's reset is the only one a direct terminal reads, because the application's own
-    /// make every direct terminal begin again rather than reaching it. xterm's reset saves a fresh
-    /// cursor at home that keeps any wrap the terminal had pending, and it leaves faint,
+    /// A restoration's resets are the only ones a direct terminal reads, because the application's
+    /// own make every direct terminal begin again rather than reaching it. xterm's reset saves a
+    /// fresh cursor at home that keeps any wrap the terminal had pending, and it leaves faint,
     /// crossed-out and doubly underlined set. A return clears the wrap and a plain rendition
     /// clears the three, both before the reset, so what the reset saves and the pen it leaves are
     /// what this writer says they are.
@@ -447,7 +450,7 @@ impl Writer {
         self.pen = Some(Rendition::default());
     }
 
-    /// Puts both buffers' saved cursors and the open link in a state this writer knows.
+    /// Puts both buffers' saved cursors in a state this writer knows.
     ///
     /// xterm's soft reset saves a fresh cursor only in the buffer that is showing, and `?1049h`
     /// saves one in the buffer that is showing when it comes, whichever that is. The terminal
@@ -459,16 +462,34 @@ impl Writer {
     /// in. The cursor saved on the way into the alternate buffer is the first thing the primary
     /// buffer's reset forgets.
     ///
-    /// A reset does not close a hyperlink, and the stream the terminal was handed can have left
-    /// one open, so it is closed here: a link this writer did not open would otherwise attach to
-    /// the first cells drawn.
+    /// Each reset is followed by a move home. A terminal that ignores the reset has nothing else
+    /// to make what the next switch saves the plain state, and the switch saves the position it
+    /// finds.
     fn reset_both_buffers(&mut self) {
         self.soft_reset();
+        self.csi(b"H");
+        self.switch_buffer(true);
+        self.soft_reset();
+        self.csi(b"H");
+        self.switch_buffer(false);
+        self.soft_reset();
+        self.csi(b"H");
+    }
+
+    /// Writes one switch between the buffers, and forgets what this writer knew of the pen and the
+    /// open hyperlink.
+    ///
+    /// A switch changes the terminal under the writer. Entering saves the cursor and leaving
+    /// restores it, and the cursor a terminal saves can hold the pen and the hyperlink the
+    /// application left in force: a soft reset does not always close a link, and some terminals
+    /// give back at the switch a link the saved cursor held, in the buffer the writer did not
+    /// reset. So the pen is unknown after a switch, as it is at the start, and the link is closed
+    /// again rather than assumed closed: a link this writer did not open would otherwise attach to
+    /// the next cells drawn.
+    fn switch_buffer(&mut self, alternate: bool) {
+        self.csi(if alternate { b"?1049h" } else { b"?1049l" });
+        self.pen = None;
         self.close_link();
-        self.csi(b"?1049h");
-        self.soft_reset();
-        self.csi(b"?1049l");
-        self.soft_reset();
     }
 
     /// Writes one CSI sequence.
@@ -891,16 +912,11 @@ impl Writer {
             // What the switch saves for the buffer that is showing: the default cursor shape.
             self.csi(b"0 q");
         }
-        self.csi(match active {
-            ActiveBuffer::Primary => b"?1049h",
-            ActiveBuffer::Alternate => b"?1049l",
-        });
+        self.switch_buffer(active == ActiveBuffer::Primary);
         self.active = match active {
             ActiveBuffer::Primary => ActiveBuffer::Alternate,
             ActiveBuffer::Alternate => ActiveBuffer::Primary,
         };
-        self.pen = None;
-        self.link = None;
         self.csi(b"H");
         self.erase(b"2J");
         // The other buffer's rows have their own stable identifiers, which are not the active
@@ -929,13 +945,8 @@ impl Writer {
             self.csi(b"H");
         }
         // And back, before anything of the active buffer is drawn.
-        self.csi(match active {
-            ActiveBuffer::Primary => b"?1049l",
-            ActiveBuffer::Alternate => b"?1049h",
-        });
+        self.switch_buffer(active == ActiveBuffer::Alternate);
         self.active = active;
-        self.pen = None;
-        self.link = None;
     }
 
     fn install_margins(&mut self, margins: Margins) {
@@ -1601,7 +1612,15 @@ mod tests {
             Keyboard::Install,
             Scope::WholeScreen,
         );
-        assert_eq!(rendered.bytes, b"\x1b[?1049h\x1b[?7h".to_vec());
+        let switches: Vec<(u16, bool)> = dec_switches(&rendered.bytes)
+            .into_iter()
+            .map(|(_, mode, set)| (mode, set))
+            .collect();
+        assert_eq!(
+            switches,
+            vec![(1049, true), (7, true)],
+            "the buffer is entered once, by the selection, and the mode that names it adds nothing"
+        );
     }
 
     #[test]

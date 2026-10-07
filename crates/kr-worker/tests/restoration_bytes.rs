@@ -1,4 +1,4 @@
-//! What a restoration writes to a physical terminal, read back from the screens a real engine holds.
+//! What a restoration writes to a physical terminal, read back from screens a real engine holds.
 //!
 //! The bytes are the product's own output for a screen a real stream produced, and what is checked
 //! is what a terminal does with them, so a small reader follows the sequences as a terminal would.
@@ -91,21 +91,20 @@ fn dimensions() -> Dimensions {
 }
 
 /// The restoration a terminal of the session's size is drawn after `stream` has been written.
-fn restoration_after(stream: &[u8]) -> Vec<u8> {
+fn restoration_after(stream: &[u8], scope: Scope) -> Vec<u8> {
     let mut engine = TerminalEngine::new(
         dimensions(),
         std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
     )
     .expect("a canonical grid");
     engine.feed(0, stream, LaneGate::default());
-    let (_, restoration, _) = engine.restoration(
-        dimensions(),
-        LaneGate::default(),
-        Keyboard::Install,
-        Scope::WholeScreen,
-    );
+    let (_, restoration, _) =
+        engine.restoration(dimensions(), LaneGate::default(), Keyboard::Install, scope);
     restoration.bytes
 }
+
+/// Both scopes a restoration is drawn in: the whole screen, and the live screen alone.
+const SCOPES: [Scope; 2] = [Scope::WholeScreen, Scope::LiveScreen];
 
 /// The screens the tests draw: each buffer showing, and the other one holding something. The
 /// alternate buffer is entered through mode 1047, which saves no cursor, so the session holds no
@@ -153,38 +152,99 @@ fn a_restoration_leaves_no_saved_cursor_the_session_does_not_hold() {
         ("primary", PRIMARY_SHOWING, true),
         ("alternate", ALTERNATE_SHOWING, false),
     ] {
-        let written = items(&restoration_after(stream));
-        for starts_on_alternate in [false, true] {
-            let (primary, alternate) = fresh_slots(&written, starts_on_alternate);
-            let began = if starts_on_alternate {
-                "alternate"
-            } else {
-                "primary"
-            };
+        for scope in SCOPES {
+            let written = items(&restoration_after(stream, scope));
+            for starts_on_alternate in [false, true] {
+                let (primary, alternate) = fresh_slots(&written, starts_on_alternate);
+                let began = if starts_on_alternate {
+                    "alternate"
+                } else {
+                    "primary"
+                };
+                assert!(
+                    alternate,
+                    "{name} showing in {scope:?}, terminal began on the {began} buffer: the \
+                     alternate buffer's saved cursor is not fresh"
+                );
+                // With the alternate buffer showing, the way back into it saves a plain cursor in
+                // the primary buffer, which is what a fresh one holds.
+                assert!(
+                    primary || !primary_showing,
+                    "{name} showing in {scope:?}, terminal began on the {began} buffer: the \
+                     primary buffer's saved cursor is not fresh"
+                );
+            }
+        }
+    }
+}
+
+/// What a terminal that ignores the soft reset saves when the alternate buffer is entered: the
+/// position and the rendition it finds. Every entry a restoration makes must find the plain state
+/// (the cursor at home, the default rendition), because the application's own restore, in either
+/// buffer, goes to what was saved, and nothing else makes it so on a terminal with no reset to
+/// rely on.
+fn entries_that_save_something_else(items: &[Item]) -> Vec<usize> {
+    let (mut home, mut plain) = (false, false);
+    let mut found = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        match item {
+            Item::Csi(sequence) => {
+                let last = sequence.chars().last().expect("a final byte");
+                if sequence == "H" || sequence == "1;1H" {
+                    home = true;
+                } else if "ABCDEFGHdefa`".contains(last) {
+                    home = false;
+                }
+                if last == 'm' {
+                    plain = sequence == "0m";
+                }
+                if sequence == "?1049h" && !(home && plain) {
+                    found.push(at);
+                }
+                if sequence == "?1049h" || sequence == "?1049l" {
+                    // A switch restores or replaces the cursor: nothing is known after it.
+                    home = false;
+                    plain = false;
+                }
+            }
+            Item::Text(_) | Item::Esc(_) => home = false,
+            Item::Control(byte) if *byte != b'\r' => home = false,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// A terminal that ignores the soft reset saves, on every entry into the alternate buffer, the
+/// position and rendition it is in. A restoration that begins on the alternate buffer, with the
+/// cursor wherever the application left it, must not be saved there.
+#[test]
+fn a_restoration_saves_the_plain_state_whenever_it_enters_the_alternate_buffer() {
+    for (name, stream) in [
+        ("primary", PRIMARY_SHOWING),
+        ("alternate", ALTERNATE_SHOWING),
+    ] {
+        for scope in SCOPES {
+            let written = items(&restoration_after(stream, scope));
+            let entered = entries_that_save_something_else(&written);
             assert!(
-                alternate,
-                "{name} showing, terminal began on the {began} buffer: the alternate buffer's \
-                 saved cursor is not fresh"
-            );
-            // With the alternate buffer showing, the way back into it saves a plain cursor in the
-            // primary buffer, which is what a fresh one holds.
-            assert!(
-                primary || !primary_showing,
-                "{name} showing, terminal began on the {began} buffer: the primary buffer's \
-                 saved cursor is not fresh"
+                entered.is_empty(),
+                "{name} showing in {scope:?}: entries at items {entered:?} do not find the cursor \
+                 at home in the default rendition: {written:?}"
             );
         }
     }
 }
 
-/// A soft reset does not close a hyperlink, so one the stream left open when the restoration begins
-/// would be on every cell drawn before the restoration's own first link. The link is closed before
-/// the first cell is drawn.
+/// A soft reset does not always close a hyperlink, so one the stream left open when the
+/// restoration begins would be on every cell drawn before the restoration's own first link. The
+/// link is closed before the first cell is drawn.
 #[test]
 fn a_link_the_stream_left_open_is_closed_before_the_first_cell_is_drawn() {
     // The screen's first row has no link, and the link the session had open is closed.
     let written = items(&restoration_after(
         b"plain \x1b]8;;http://example.invalid/\x1b\\linked\x1b]8;;\x1b\\ after",
+        Scope::WholeScreen,
     ));
     let first_text = written
         .iter()
@@ -198,6 +258,70 @@ fn a_link_the_stream_left_open_is_closed_before_the_first_cell_is_drawn() {
         "no hyperlink is closed before the first cell: {:?}",
         &written[..first_text]
     );
+}
+
+/// Whether text is drawn under the link the stream left open, on a terminal that saves the open
+/// hyperlink with the cursor: entering the alternate buffer saves the link in force (unless that
+/// buffer already shows), and leaving it gives back the saved one, wherever the terminal shows.
+fn draws_under_the_streams_link(items: &[Item], starts_on_alternate: bool) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Link {
+        None,
+        Streams,
+        Own,
+    }
+    // An application saved a cursor while its link was open, and the link is still open.
+    let (mut link, mut saved) = (Link::Streams, Link::Streams);
+    let mut on_alternate = starts_on_alternate;
+    for item in items {
+        match item {
+            Item::Osc(command) => {
+                let mut parts = command.splitn(3, ';');
+                if parts.next() == Some("8") {
+                    link = if parts.nth(1).is_some_and(str::is_empty) {
+                        Link::None
+                    } else {
+                        Link::Own
+                    };
+                }
+            }
+            Item::Csi(sequence) if sequence == "?1049h" => {
+                if !on_alternate {
+                    saved = link;
+                }
+                on_alternate = true;
+            }
+            Item::Csi(sequence) if sequence == "?1049l" => {
+                link = saved;
+                on_alternate = false;
+            }
+            Item::Text(_) if link == Link::Streams => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A switch of buffer can give back a hyperlink that the cursor it restores had saved, in a
+/// buffer the restoration did not close it in, so the link is closed again after every switch,
+/// whichever buffer the terminal began on and whichever scope is drawn.
+#[test]
+fn a_switch_of_buffer_does_not_bring_the_streams_link_back() {
+    for (name, stream) in [
+        ("primary", PRIMARY_SHOWING),
+        ("alternate", ALTERNATE_SHOWING),
+    ] {
+        for scope in SCOPES {
+            let written = items(&restoration_after(stream, scope));
+            for starts_on_alternate in [false, true] {
+                assert!(
+                    !draws_under_the_streams_link(&written, starts_on_alternate),
+                    "{name} showing in {scope:?}, alternate first: {starts_on_alternate}: text \
+                     is drawn under the link the stream left open: {written:?}"
+                );
+            }
+        }
+    }
 }
 
 /// A soft reset makes the cursor show, and so does the mode the session tracks for it. A cursor
@@ -214,7 +338,7 @@ fn a_restoration_is_drawn_while_the_cursor_is_hidden() {
             false,
         ),
     ] {
-        let written = items(&restoration_after(stream));
+        let written = items(&restoration_after(stream, Scope::WholeScreen));
         let mut visible = false;
         let mut drawn_while_visible = false;
         for item in &written {
