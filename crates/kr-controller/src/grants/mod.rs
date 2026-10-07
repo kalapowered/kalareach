@@ -331,6 +331,30 @@ impl Permitted {
     }
 }
 
+/// Whether a request may be decided while this boot's clock continuity is lost, because it is the
+/// owner's way of ending that.
+///
+/// A host that cannot prove its clock decides nothing by it, so a grant whose use the host bounds
+/// by time (a bounded offline validity, an exclusive organisation management) is refused until the
+/// owner establishes the clock. The owner's explicit retrust is how that ends, and a retrust the
+/// unproven clock refused would leave only a reboot. So the owner's confirmation of the clock is
+/// decided as it would be on a clock the host proves: asking for the challenge, answering it and
+/// spending it. What it needs of the grant is all that still holds. The grant never expires, since
+/// an expiring grant cannot be proven in force without the clock, and it is a personal grant,
+/// since an organisation's answers to a lease the organisation signed. Every other rule of the
+/// decision still applies, and so does the check inside the effect that the signer is a live owner
+/// device.
+fn may_end_the_loss(grant: &Grant, method: Method) -> bool {
+    matches!(
+        method,
+        Method::OwnerConfirmationRequest
+            | Method::OwnerConfirmationPending
+            | Method::OwnerConfirmationComplete
+            | Method::HostClockEstablish
+    ) && grant.expiry == kr_protocol::grant::GrantExpiry::Never
+        && !grant.organisation.is_present()
+}
+
 /// Intersects one grant with the host's current policy for one request.
 ///
 /// The order matters and is deliberate:
@@ -396,7 +420,7 @@ pub fn decide(
     // are asked about whatever the grant's own expiry is. A lapse found here is owed its record by
     // the caller, which writes the floor it stood on.
     if policy.stands_on_the_clock(grant, request.ingress) {
-        if continuity_lost {
+        if continuity_lost && !may_end_the_loss(grant, request.method) {
             return Err(Refusal::ClockUnproven);
         }
         if policy.utc_floor().is_owed() {

@@ -2511,6 +2511,115 @@ pub(crate) mod tests {
         drop(controller);
     }
 
+    /// KR-REQ-09.19: what the exemption for the owner's confirmation of the clock covers, and
+    /// nothing else. While this boot's clock continuity is lost, a never-expiring personal grant
+    /// that holds host management and stands on the clock (a bounded offline validity) is decided
+    /// for the four methods that ask for, answer and spend the confirmation of the clock, and is
+    /// refused as unproven for every other. The same four methods are refused for a grant that
+    /// expires, which cannot be proven in force without the clock, and for an organisation's grant,
+    /// which answers to a lease. Once the owner establishes the clock, every method is decided
+    /// again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_owners_confirmation_of_the_clock_is_decided_while_continuity_is_lost() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        let now = wall.load(std::sync::atomic::Ordering::SeqCst);
+        choose_offline_bound(&controller, now, 86_400_000);
+        let revision = controller.policy().authority_revision();
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        let owner = |grant: Grant, record: GrantRecord| {
+            let grant = Grant {
+                actions: [ActionRight::SessionView, ActionRight::HostManage]
+                    .into_iter()
+                    .collect(),
+                ..grant
+            };
+            let record = GrantRecord {
+                grant: grant.clone(),
+                ..record
+            };
+            (grant, record)
+        };
+        let (lasting, lasting_record) = owner(lasting, lasting_record);
+        let (expiring, expiring_record) = {
+            let (grant, record) = granted(
+                GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(now + 3_600_000),
+                },
+                revision,
+            );
+            owner(grant, record)
+        };
+        let (organisational, organisational_record) = {
+            let (grant, record) = granted(GrantExpiry::Never, revision);
+            let (grant, record) = owner(grant, record);
+            let grant = Grant {
+                organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                    organisation_id: kr_protocol::ids::OrganisationId::new(kr_ipc::new_uuid()),
+                    policy_revision: revision,
+                }),
+                ..grant
+            };
+            let record = GrantRecord {
+                grant: grant.clone(),
+                ..record
+            };
+            (grant, record)
+        };
+        let asked = |method: Method| AccessRequest {
+            method,
+            ..listing(&temp, now)
+        };
+        let unproven = |decided: std::result::Result<super::DeviceDecision, CeilingRefusal>| {
+            matches!(
+                decided,
+                Err(CeilingRefusal::Refused(Refusal::ClockUnproven))
+            )
+        };
+        let confirmations = [
+            Method::OwnerConfirmationRequest,
+            Method::OwnerConfirmationPending,
+            Method::OwnerConfirmationComplete,
+            Method::HostClockEstablish,
+        ];
+
+        controller.utc_floor().lose_continuity();
+        for method in confirmations {
+            controller
+                .decide_for_device(&lasting, &lasting_record, asked(method))
+                .unwrap_or_else(|refused| {
+                    panic!("{method:?} is decided for the owner device: {refused:?}")
+                });
+            assert!(
+                unproven(controller.decide_for_device(&expiring, &expiring_record, asked(method))),
+                "{method:?} is refused for a grant that expires"
+            );
+            assert!(
+                unproven(controller.decide_for_device(
+                    &organisational,
+                    &organisational_record,
+                    asked(method)
+                )),
+                "{method:?} is refused for an organisation's grant"
+            );
+        }
+        assert!(
+            unproven(controller.decide_for_device(
+                &lasting,
+                &lasting_record,
+                asked(Method::SessionList)
+            )),
+            "every other method is refused as unproven"
+        );
+
+        controller.utc_floor().establish_continuity();
+        controller
+            .decide_for_device(&lasting, &lasting_record, asked(Method::SessionList))
+            .expect("once the clock is established every method is decided again");
+        drop(controller);
+    }
+
     /// The control for the lost floor: ordinary reopening. The same worker's reading past the
     /// expiry, the same unrecorded refusal, then a restart that finds the file in place. The new
     /// daemon keeps the word, writes it down as it starts, which covers what the worker owed, and
