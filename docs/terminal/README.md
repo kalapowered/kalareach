@@ -390,10 +390,11 @@ a soft reset leaves the buffer, and the fifth is what it leaves saved:
   underlined states stay set in xterm, whose reset leaves them and whose save keeps them; the
   library clears the whole pen. A cursor a program saved in the other buffer before the reset, and
   has not saved again since, comes back there in xterm; here a restore goes home. Entering the
-  alternate buffer through mode 1049 is such a save, so the usual case is a program that leaves the
-  alternate buffer after a soft reset. Putting these right would need the engine to put a saved
-  cursor back, rendition and character sets included, and nothing but a sequence that moves the
-  screen can.
+  alternate buffer through mode 1049 is such a save. A program that leaves the alternate buffer
+  after a soft reset gets that cursor back in xterm; here the library does nothing on that leave,
+  so the cursor stays where the reset left it. Putting these right would need the engine to put a
+  saved cursor back, rendition and character sets included, and nothing but a sequence that moves
+  the screen can.
 
 A soft reset needs no rule of its own for a direct terminal. Every soft reset advances the
 projection, so each direct attachment is told to begin again and is drawn from the canonical
