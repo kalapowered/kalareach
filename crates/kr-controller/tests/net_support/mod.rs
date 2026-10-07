@@ -339,12 +339,15 @@ impl Host {
     }
 
     /// Stops the daemon and its network the way its process ending would.
+    ///
+    /// It does not wait for the tasks that still hold the daemon to end: a suite that starts
+    /// another daemon on the tree does that through [`Self::restart`], which waits for them, and
+    /// one that ends here leaves nothing that reads what they still write.
     pub async fn stop(self) {
         self.clients.abort();
         let _ = self.clients.await;
         self.network.shutdown().await;
         drop(self.controller);
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
