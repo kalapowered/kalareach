@@ -67,9 +67,9 @@ a tree or a pipe an elevated process made is still that administrator's own. An 
 already holds the machine that way is not something these checks keep out, and a token filtered
 down to what a standard user holds trusts no pipe that group owns. An entry for an identifier
 that no account on the machine holds, such as a copied image carries, is refused like any other
-account. The state and runtime directories are checked by the same rule. A name another account created first while the host was
-not listening is refused rather than served or trusted, and the host does not start on a name
-another account holds.
+account. The state and runtime directories are checked by the same rule. A name another account
+created first while the host was not listening is refused rather than served or trusted, and the
+host does not start on a name another account holds.
 
 A session's output spool is created the same way rather than inheriting the process umask, because
 it holds the terminal's own output: mode 0700 on Unix, and on Windows the owner-only access list of
