@@ -269,6 +269,11 @@ pub struct WorkerService {
     /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     refused_for_the_boundary: tokio::sync::watch::Sender<usize>,
+    /// Where the next authority revision announcement says it holds the dispatch boundary, which
+    /// this host's own tests arm to know that an announcement has reached the handler. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    announcement_watch: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl WorkerService {
@@ -491,6 +496,8 @@ impl WorkerService {
             boundary_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
+            #[cfg(feature = "testing")]
+            announcement_watch: Mutex::new(None),
         })
     }
 
@@ -900,6 +907,45 @@ impl WorkerService {
         reason = "it is the shipped form of a method that reads this service's own pause"
     )]
     const fn wait_inside_boundary(&self) {}
+
+    /// Says, once, when the next authority revision announcement holds the dispatch boundary, for
+    /// this host's own tests.
+    ///
+    /// The announcement goes on from there, so a test that holds the session meets a handler that
+    /// has taken the boundary and waits for the session: that is the moment a worker is isolated
+    /// in the middle of an announcement, which a test cannot tell from the outside. Returns the
+    /// end that receives the message.
+    #[cfg(feature = "testing")]
+    pub fn announcement_inside_boundary(&self) -> std::sync::mpsc::Receiver<()> {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        *self
+            .announcement_watch
+            .lock()
+            .expect("the watch is not poisoned") = Some(arrived);
+        watch
+    }
+
+    /// Says that an announcement holds the boundary, where one is watched. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    fn announced_inside_boundary(&self) {
+        let watching = self
+            .announcement_watch
+            .lock()
+            .expect("the watch is not poisoned")
+            .take();
+        if let Some(arrived) = watching {
+            let _ = arrived.send(());
+        }
+    }
+
+    /// The same, without the feature: nothing is watched.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own watch"
+    )]
+    const fn announced_inside_boundary(&self) {}
 
     /// Records one request or mutation as it arrives, for this host's own tests.
     #[cfg(feature = "testing")]
@@ -2867,6 +2913,7 @@ impl WorkerService {
                 ),
             );
         };
+        self.announced_inside_boundary();
         // The boundary is held now, and a replacement cannot arrive while it is: installing a
         // generation takes this same boundary before it changes the binding. The binding is looked
         // at again anyway, so that what follows depends on a check made here rather than on that

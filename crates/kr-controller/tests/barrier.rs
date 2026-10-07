@@ -121,6 +121,8 @@ fn submission(byte: u8, actor_id: &ActorId) -> Submission {
 
 /// One real worker, on one real socket, with one real journal.
 struct Worker {
+    /// First, so a worker served apart has ended before the temporary tree is removed.
+    _apart: Option<ApartWorker>,
     _temp: kr_ipc::testing::TempHost,
     runtime: Arc<SessionRuntime>,
     service: Arc<WorkerService>,
@@ -132,6 +134,18 @@ struct Worker {
 }
 
 async fn worker() -> Worker {
+    worker_serving(false).await
+}
+
+/// As [`worker`], with the worker's session runtime and connections on a runtime of their own, as
+/// [`hosted_worker_apart`] has them.
+async fn worker_apart() -> Worker {
+    worker_serving(true).await
+}
+
+/// The worker as [`worker`] makes it, served on this test's runtime, or on one of its own when
+/// `apart`.
+async fn worker_serving(apart: bool) -> Worker {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -175,35 +189,39 @@ async fn worker() -> Worker {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(
-        SessionRuntime::start(
-            session,
-            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-        )
-        .expect("starts the runtime"),
-    );
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
-    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            identity,
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot.clone(),
-                controller_public_key: *controller.public_key(),
-                controller_generation: ControllerGeneration::new(1),
-                journal_path: Some(environment.journal_database(session_id)),
-                build_id: build(),
-            },
-        )
-        .expect("a worker service"),
-    );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let binding = ServiceBinding {
+        environment_id,
+        boot_identity: boot.clone(),
+        controller_public_key: *controller.public_key(),
+        controller_generation: ControllerGeneration::new(1),
+        journal_path: Some(environment.journal_database(session_id)),
+        build_id: build(),
+    };
+    let (runtime, service, apart_worker) = if apart {
+        let (runtime, service, worker) =
+            ApartWorker::start(session, identity, endpoint.clone(), binding).await;
+        (runtime, service, Some(worker))
+    } else {
+        let runtime = Arc::new(
+            SessionRuntime::start(
+                session,
+                std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
+        );
+        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        let service = Arc::new(
+            WorkerService::new(Arc::clone(&runtime), identity, endpoint.clone(), binding)
+                .expect("a worker service"),
+        );
+        tokio::spawn(Arc::clone(&service).serve(listener));
+        (runtime, service, None)
+    };
     Worker {
+        _apart: apart_worker,
         _temp: temp,
         runtime,
         service,
@@ -375,13 +393,15 @@ impl Drop for Awake {
 /// isolated, holds when the worker acknowledges, names what may already have been dispatched, and
 /// kills nothing.
 ///
-/// The thread count is deliberate. In production the worker is its own process; here it shares this
-/// runtime, so isolating it blocks every one of its tasks that wants the session, and a runtime
-/// with only a handful of threads would starve the test that is doing the isolating. Sixteen is
-/// comfortably more than the worker's tasks plus its connections.
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+/// In production the worker is its own process; here its session runtime and its connections run
+/// on a runtime of their own, so isolating it blocks the tasks of that runtime that want the
+/// session and cannot stop the threads that serve this test. With the worker on this test's
+/// runtime, a task of the session that woke while the session was held (its monitor wakes on every
+/// child process this test binary's other cases end) could stop the thread that drives the
+/// runtime's sockets, and the announcement would never be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_resumes() {
-    let worker = worker().await;
+    let worker = worker_apart().await;
     let device = actor("device:phone");
 
     // One action this host really admitted, through its own endpoint and its own dispatch path,
@@ -417,19 +437,28 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
     // The revocation is announced while the worker is isolated. The exchange is kept alive on its
     // own task, because the worker will answer it once it is released and the answer is the
     // acknowledgement this barrier waits for.
+    let reaching = worker.service.announcement_inside_boundary();
     let announcement = notice(&worker, 4);
     let announcing = tokio::spawn(async move {
         let ack = client.announce_revision(announcement).await;
         (client, ack)
     });
 
-    // Long enough for the announcement to reach the worker and stop inside its handler. The wait
-    // is on a blocking thread rather than a timer: the worker shares this runtime, and every one
-    // of its tasks that wants the session is stopped while the session is held, so a timer this
-    // runtime has to fire is not something to depend on here.
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
-        .await
-        .expect("the waiting thread finishes");
+    // The worker says so once the announcement has taken its dispatch boundary and goes on to the
+    // session, which is held: the case is about an announcement that is inside the isolated
+    // worker's handler, and until it is, the check below would be about one that had not arrived.
+    // The wait is a blocking call on a blocking thread rather than a timer: the worker shares this
+    // runtime, and every one of its tasks that wants the session is stopped while the session is
+    // held, so a timer this runtime has to fire is not something to depend on here. The bound only
+    // keeps an announcement that never arrives from holding the suite up.
+    let reached =
+        tokio::task::spawn_blocking(move || reaching.recv_timeout(Duration::from_secs(30)).is_ok())
+            .await
+            .expect("the waiting thread finishes");
+    assert!(
+        reached,
+        "the announcement never took the worker's dispatch boundary"
+    );
     assert!(
         !announcing.is_finished(),
         "the isolated worker cannot acknowledge the revision"
@@ -1675,39 +1704,31 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
 }
 
 /// A real mutation through this daemon's own dispatch path, admitted while its lifetime was live
-/// and reaching its transaction after another holder released the lock.
+/// and reaching its transaction after that lifetime had gone.
 /// KR-REQ-07.10: a create request expires, and one that has expired starts nothing.
+///
+/// The daemon measures its deadlines on a clock this test moves. The create is stopped once the
+/// daemon has taken it and looked for an earlier answer to it, which is after the daemon has read
+/// the time it arrived and before it admits anything; the lifetime runs out there, and the create
+/// is then let go. A real delay would have to be long enough for the create to be taken on a
+/// loaded machine and short enough to end inside the lifetime, and no length is both. A lifetime
+/// that runs out while another task holds the store is
+/// `a_mutation_admitted_before_its_deadline_is_refused_when_the_lock_wait_outlasts_it`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anything() {
-    let daemon = daemon_host().await;
+    let clock = ManualClock::new();
+    let daemon = daemon_host_on(Clocks {
+        continuous: Arc::new(clock.clone()),
+        wall: WallClock::system(),
+    })
+    .await;
     let mut client = LocalClient::connect(&daemon.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    let connection = client.acknowledgement().connection_id;
-
-    // Another holder takes this daemon's store for a second and a half. The create below is
-    // admitted with three hundred milliseconds to live, so its own transaction is reached after
-    // its lifetime has gone: the case a check before the wait cannot catch.
-    let holder = Arc::clone(&daemon.controller);
-    let held = AdmittedMutation {
-        connection_id: connection,
-        admitted_revision: AuthorityRevision::new(1),
-        deadline: daemon
-            .controller
-            .continuous_now()
-            .checked_add(Duration::from_secs(120)),
-    };
-    let holding = tokio::spawn(async move {
-        holder
-            .enter_admitted(&held, |_| {
-                std::thread::sleep(Duration::from_millis(1_500));
-                Ok(())
-            })
-            .await
-    });
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100)))
-        .await
-        .expect("the waiting thread finishes");
+    // The create is stopped here once the daemon has taken it. A pause the daemon holds, rather
+    // than another task's hold on its store, because the create goes through the socket and
+    // nothing on this side says when the daemon has read the time it arrived.
+    let (arrived, go) = daemon.controller.pause_retained_lookup();
 
     let create = MutationRequest {
         request_id: RequestId::new(4),
@@ -1740,11 +1761,22 @@ async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anyt
         })
         .expect("encodes"),
     };
-    let outcome = submit(&mut client, create).await;
-    assert!(
-        holding.await.expect("the holder finishes").is_ok(),
-        "the task that got there first wrote under an admission that still stood"
-    );
+    let creating = tokio::spawn(async move {
+        let outcome = submit(&mut client, create).await;
+        (client, outcome)
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the daemon takes the create")
+        .expect("the pause belongs to this daemon");
+    // The create arrived with three hundred milliseconds to live, and two seconds pass before the
+    // daemon goes on with it.
+    clock.advance(Duration::from_secs(2));
+    go.send(()).expect("the create is waiting for this");
+    let (_client, outcome) = tokio::time::timeout(Duration::from_secs(30), creating)
+        .await
+        .expect("the daemon answers the create")
+        .expect("the creating task finishes");
     let Outcome::Error(error) = outcome else {
         panic!("a create that queued past its lifetime must not start a shell");
     };
@@ -1805,6 +1837,8 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// One daemon and one worker it really spawned, verified through the real rendezvous.
 struct Hosted {
+    /// First, so a worker served apart has ended before the temporary tree is removed.
+    _apart: Option<ApartWorker>,
     _temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
@@ -1819,6 +1853,25 @@ struct Hosted {
 /// Starts a daemon, creates a session through it, and performs the worker's side of the
 /// rendezvous in this process so the daemon ends up with a verified worker it can announce to.
 async fn hosted_worker() -> Hosted {
+    hosted_worker_serving(false).await
+}
+
+/// As [`hosted_worker`], with the worker's session runtime and connections on a runtime of their
+/// own.
+///
+/// In production the worker is its own process. A test that holds its session for as long as the
+/// daemon takes to give up on it (several seconds, each step of the daemon's round bounded) would
+/// stop every task of a worker that shares the test's runtime and wants the session, the session's
+/// own monitor among them, and a stopped task stops the thread that runs it: the thread that
+/// drives that runtime's sockets and timers among others, so that nothing of the daemon moved
+/// again. Served apart, the worker's stopped tasks stop only its own threads.
+async fn hosted_worker_apart() -> Hosted {
+    hosted_worker_serving(true).await
+}
+
+/// Starts the daemon and its worker as [`hosted_worker`] does, and serves the worker's connections
+/// on this test's runtime, or on one of their own when `apart`.
+async fn hosted_worker_serving(apart: bool) -> Hosted {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -1977,34 +2030,44 @@ async fn hosted_worker() -> Hosted {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(
-        SessionRuntime::start(
-            session,
-            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-        )
-        .expect("starts the runtime"),
-    );
     let endpoint = environment
         .worker_endpoint(specification.display_number)
         .expect("an endpoint");
-    let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            Arc::clone(&identity),
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot,
-                controller_public_key: specification.controller_public_key,
-                controller_generation: specification.controller_generation,
-                journal_path: Some(journal_path.clone()),
-                build_id: build(),
-            },
-        )
-        .expect("a worker service"),
-    );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let binding = ServiceBinding {
+        environment_id,
+        boot_identity: boot,
+        controller_public_key: specification.controller_public_key,
+        controller_generation: specification.controller_generation,
+        journal_path: Some(journal_path.clone()),
+        build_id: build(),
+    };
+    let (runtime, service, apart_worker) = if apart {
+        // The session's own tasks run there too: its monitor locks the session each time it wakes,
+        // and on this test's runtime a held session would stop the thread that runs it.
+        let (runtime, service, worker) =
+            ApartWorker::start(session, Arc::clone(&identity), endpoint.clone(), binding).await;
+        (runtime, service, Some(worker))
+    } else {
+        let runtime = Arc::new(
+            SessionRuntime::start(
+                session,
+                std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
+        );
+        let service = Arc::new(
+            WorkerService::new(
+                Arc::clone(&runtime),
+                Arc::clone(&identity),
+                endpoint.clone(),
+                binding,
+            )
+            .expect("a worker service"),
+        );
+        let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
+        tokio::spawn(Arc::clone(&service).serve(listener));
+        (runtime, service, None)
+    };
     let ready = {
         let session = runtime.session();
         kr_protocol::worker::WorkerReady {
@@ -2029,6 +2092,7 @@ async fn hosted_worker() -> Hosted {
         "the session is created: {created:?}"
     );
     Hosted {
+        _apart: apart_worker,
         _temp: temp,
         controller,
         client_endpoint,
@@ -2041,12 +2105,94 @@ async fn hosted_worker() -> Hosted {
     }
 }
 
+/// A worker whose session runtime and connections run on a runtime of their own, on a thread of
+/// their own, as a worker's do in its own process. It ends, with its runtime, when this is dropped.
+struct ApartWorker {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApartWorker {
+    /// Starts `session`'s runtime and a service for it on a runtime of their own, bound at
+    /// `endpoint` before this returns.
+    async fn start(
+        session: Session,
+        identity: Arc<WorkerIdentity>,
+        endpoint: kr_ipc::paths::Endpoint,
+        binding: ServiceBinding,
+    ) -> (Arc<SessionRuntime>, Arc<WorkerService>, Self) {
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("a runtime for the worker")
+                .block_on(async move {
+                    let runtime = Arc::new(
+                        SessionRuntime::start(
+                            session,
+                            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+                        )
+                        .expect("starts the runtime"),
+                    );
+                    let service = Arc::new(
+                        WorkerService::new(
+                            Arc::clone(&runtime),
+                            identity,
+                            endpoint.clone(),
+                            binding,
+                        )
+                        .expect("a worker service"),
+                    );
+                    let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
+                    let _ = ready.send((Arc::clone(&runtime), Arc::clone(&service)));
+                    tokio::select! {
+                        _ = service.serve(listener) => {}
+                        _ = stopped => {}
+                    }
+                });
+        });
+        let (runtime, service) = started.await.expect("the worker starts");
+        (
+            runtime,
+            service,
+            Self {
+                stop: Some(stop),
+                thread: Some(thread),
+            },
+        )
+    }
+}
+
+impl Drop for ApartWorker {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        // Waited for, so the worker is gone when the tree under it is removed; a worker that has
+        // not ended in ten seconds is left to end on its own.
+        if let Some(thread) = self.thread.take() {
+            let waiting = std::time::Instant::now();
+            while !thread.is_finished() && waiting.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
 /// KR-ACC-022: the whole sequence through this daemon's own revocation path - a worker isolated
 /// after its intents were durably accepted, a revocation announced while it cannot answer, the
 /// barrier reported pending in the meantime, and no affected undispatched action executed.
+///
+/// The worker is held for the daemon's whole round, which is as long as the daemon bounds its
+/// steps, and the worker's session runtime and connections run on a runtime of their own for it,
+/// so that the worker's stopped tasks cannot stop this runtime's threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has_fenced() {
-    let hosted = hosted_worker().await;
+    let hosted = hosted_worker_apart().await;
     let device = actor("device:phone");
     // An intent this worker accepted durably and never dispatched. That is what a worker holds
     // after it accepted an intent and stopped before its dispatch marker: the serial path writes
@@ -2064,14 +2210,41 @@ async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has
     // session while it is held: that is what isolation means here, and the state is read before
     // and after rather than during.
     assert_eq!(hosted.runtime.state().as_str(), "live");
+    assert!(
+        hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty(),
+        "nothing is pending before the revocation"
+    );
     let paused = Pause::hold(&hosted.runtime).await;
-    let revoking = tokio::spawn({
+    // The daemon's own round: it records the revocation, announces it to the worker within the
+    // bound it gives each step, and reports. The worker is held, so it cannot acknowledge, and the
+    // round ends with the worker pending. That report is what the case is about, and it comes when
+    // the round ends, not after a time fixed beforehand.
+    // The round runs on its own task, and this waits for its report on a blocking thread with a
+    // bound of the standard clock: a runtime that stopped could not fire a timer of its own, and
+    // the failure is then this case's, with the session released as it unwinds.
+    let (reported, report) = std::sync::mpsc::channel();
+    tokio::spawn({
         let controller = Arc::clone(&hosted.controller);
-        async move { controller.revoke_authority().await }
+        async move {
+            let _ = reported.send(controller.revoke_authority().await);
+        }
     });
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
+    let first = tokio::task::spawn_blocking(move || report.recv_timeout(Duration::from_secs(120)))
         .await
-        .expect("the waiting thread finishes");
+        .expect("the waiting thread finishes")
+        .expect("the revocation reports")
+        .expect("the revocation is recorded");
+    assert_eq!(
+        first.pending(),
+        vec![hosted.session_id],
+        "a worker that cannot answer is pending rather than complete"
+    );
+    assert!(!first.holds(), "{first:?}");
     let pending = hosted
         .controller
         .revision_pending()
@@ -2086,12 +2259,6 @@ async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has
     // Released. The worker answers, its fence rejects the undispatched intent, and the barrier
     // holds only then.
     paused.release().await;
-    eprintln!("marker: the mutation answered");
-    let first = tokio::time::timeout(Duration::from_secs(30), revoking)
-        .await
-        .expect("the revocation reports")
-        .expect("the revoking task finishes")
-        .expect("the revocation is recorded");
     let barrier = announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
     assert_eq!(
         hosted.runtime.state().as_str(),
