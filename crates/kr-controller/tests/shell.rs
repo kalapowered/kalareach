@@ -184,6 +184,10 @@ fn install_package(root: &Path, kind: ShellKind) {
 /// KR-REQ-07.18: a create that asks for a script invocation is refused before anything is spawned,
 /// so it never becomes an interactive shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 async fn a_managed_create_without_a_qualified_package_is_refused_before_anything_is_spawned() {
     let packages = tempfile::tempdir().expect("a directory");
     // The daemon is told where its packages are rather than being expected to find a variable: a
@@ -244,6 +248,10 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
 
 /// KR-REQ-07.16: the worker launches the package its daemon resolved, not one of its own.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 fn the_package_a_worker_launches_is_the_one_the_daemon_resolved() {
     let admitted = tempfile::tempdir().expect("a directory");
     install_package(admitted.path(), ShellKind::Zsh);
@@ -301,6 +309,10 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
 
 /// KR-REQ-07.16, KR-REQ-07.17.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 fn a_managed_session_launches_the_package_binary_with_this_platforms_arguments() {
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
@@ -438,6 +450,10 @@ fn the_environment_is_the_creators_snapshot_filtered_and_then_the_contexts_and_t
 
 /// KR-REQ-07.29, KR-REQ-07.30, KR-REQ-07.40.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     let home = tempfile::tempdir().expect("a directory");
     let state = tempfile::tempdir().expect("a directory");
@@ -637,6 +653,10 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 /// KR-REQ-07.50: the terminal is asked to run an argument vector in which the session's identity is
 /// an argument of its own, never text assembled into a command line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presentation_error() {
     let worker_build = worker_beside_this_test();
     // This test's daemon starts a real worker through the platform's own supervisor, so the tree
@@ -1864,6 +1884,10 @@ fn a_package_that_patches_nothing_is_qualified_only_as_the_psreadline_package() 
 /// would otherwise be published as a live session before its reader existed. That refusal leaves
 /// the claim unresolved, so the next request that goes looking for the session looks again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a managed shell here is a zsh, bash or fish package placed from /bin/cat, and the root shell is /bin/sh, which this platform has not got"
+)]
 async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_does() {
     use kr_controller::registry::{LaunchPhase, Registry};
     use kr_protocol::hello::PROTOCOL_VERSION;
