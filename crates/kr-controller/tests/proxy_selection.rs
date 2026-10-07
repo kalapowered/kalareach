@@ -28,7 +28,6 @@ use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
-use tokio::net::TcpListener;
 
 /// How long an exchange may take before the test gives up on it.
 const WATCHDOG: Duration = Duration::from_secs(20);
@@ -81,7 +80,7 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
     let proxy = ConnectProxy::refusing(403).await;
     let rendezvous = HttpsRendezvous::new(Some(proxy.url.parse().expect("a proxy address")))
         .expect("the rendezvous client");
-    let (origin, authority, service) = unreached().await;
+    let (origin, authority, service) = unreached();
     let origin = RendezvousOrigin::new(origin).expect("an origin");
     let locator = Locator::new("abcd").expect("a locator");
 
@@ -119,7 +118,7 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
 
     let tunnel = format!("CONNECT {authority} HTTP/1.1");
     assert_eq!(proxy.asked(), vec![tunnel.clone(), tunnel]);
-    heard_nothing(&service).await;
+    heard_nothing(&service);
 }
 
 /// KR-REQ-26.14: the rendezvous client a host's network setup builds from its document goes through
@@ -139,7 +138,7 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
     .expect("a usable selection")
     .expect("a host on the network");
     let rendezvous = setup.rendezvous.expect("a rendezvous client");
-    let (origin, authority, service) = unreached().await;
+    let (origin, authority, service) = unreached();
     let origin = RendezvousOrigin::new(origin).expect("an origin");
     let locator = Locator::new("abcd").expect("a locator");
 
@@ -183,7 +182,7 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
 
     let tunnel = format!("CONNECT {authority} HTTP/1.1");
     assert_eq!(proxy.asked(), vec![tunnel.clone(), tunnel]);
-    heard_nothing(&service).await;
+    heard_nothing(&service);
 }
 
 /// KR-REQ-26.14: delivery goes through the proxy the daemon started with. A webhook message to an
@@ -192,9 +191,7 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
 async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
     let proxy = ConnectProxy::refusing(502).await;
     let transports = ManagedTransports::new(Some(proxy.url.parse().expect("a proxy address")));
-    let hook = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
+    let hook = listening();
     let port = hook.local_addr().expect("an address").port();
     let origin = format!("http://127.0.0.1:{port}");
     let transport = transports
@@ -205,15 +202,13 @@ async fn delivery_goes_through_the_proxy_the_daemon_started_with() {
         .await
         .expect("the message ends");
     assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
-    heard_nothing(&hook).await;
+    heard_nothing(&hook);
 }
 
 /// A loopback address that is listened on and never answered: its origin, its authority, and the
 /// listener that says whether anything reached it.
-async fn unreached() -> (String, String, TcpListener) {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
+fn unreached() -> (String, String, std::net::TcpListener) {
+    let listener = listening();
     let authority = format!(
         "127.0.0.1:{}",
         listener.local_addr().expect("an address").port()
@@ -221,14 +216,23 @@ async fn unreached() -> (String, String, TcpListener) {
     (format!("https://{authority}"), authority, listener)
 }
 
-/// Asserts that nothing connected to `listener` within a moment.
-async fn heard_nothing(listener: &TcpListener) {
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), listener.accept())
-            .await
-            .is_err(),
-        "a request reached its destination without the proxy"
-    );
+/// A loopback listener that is asked for what has connected to it, and waits for nothing.
+fn listening() -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("a loopback port");
+    listener.set_nonblocking(true).expect("a listener to ask");
+    listener
+}
+
+/// Asserts that nothing connected to `listener`.
+///
+/// It is asked once the request has ended. A connection the client opened for it is complete by
+/// then and waits to be accepted, so nothing is left to arrive.
+fn heard_nothing(listener: &std::net::TcpListener) {
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        heard => panic!("a request reached its destination without the proxy: {heard:?}"),
+    }
 }
 
 /// Writes the configuration document the daemon reads when it starts.
