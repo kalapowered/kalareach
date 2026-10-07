@@ -3841,6 +3841,21 @@ grant's expiry from the same projected reading, through the host's clock floor, 
 
 The owner can end the daemon's distrust with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move its mark and anchor to the time the effect runs, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
 
+While the host's clock continuity is lost, the host decides nothing by its clock, so a grant it
+bounds by time, such as a bounded offline validity, is refused as `CLOCK_UNTRUSTED`. The four
+methods that ask for, answer and spend the owner's confirmation of the clock are decided as they
+would be on a clock the host proves, for an owner device whose grant is personal and never expires.
+Without that, a reboot would be the only way out. An expiring grant or an organisation's grant still
+waits, and so does every other method.
+
+Two kinds of host have no route to establish the clock. A host that has an owner and is off the
+network cannot be asked, because no owner device reaches it: `kr host clock --establish` refuses at
+once and says to select a network and restart. A host whose owner devices are all gone has no way to
+give a confirmation, because the terminal bootstrap is only for a host with no owner and revoking
+authority never becomes a weaker way to confirm. Until its network or an owner device returns, such
+a host keeps what it would have forgotten and decides no expiring grant by the clock, which errs
+toward keeping.
+
 A worker's own contract follows the owner's action. The daemon publishes each establishment in the
 clock floor that every worker maps: the time the owner established, and the machine's continuous
 reading taken with it. A worker follows it when its own wall clock still reads that time carried
