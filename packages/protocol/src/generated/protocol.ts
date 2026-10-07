@@ -20686,7 +20686,7 @@ export interface SavedCursorState {
    * Which buffer saved it.
    */
   buffer: 'primary' | 'alternate'
-  charsets: CharsetDesignations
+  charsets: CharsetState1
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -20714,9 +20714,9 @@ export interface SavedCursorState {
   style: string
 }
 /**
- * The character sets designated when it was saved.
+ * The designated character sets and the locking shift.
  */
-export interface CharsetDesignations {
+export interface CharsetState1 {
   /**
    * The set designated as G0.
    */
@@ -20725,6 +20725,10 @@ export interface CharsetDesignations {
    * The set designated as G1.
    */
   g1: string
+  /**
+   * Whether the shift-out set is selected.
+   */
+  shift_out: boolean
 }
 /**
  * The graphic rendition of a run of cells.
@@ -20928,7 +20932,7 @@ export interface ProjectionSnapshot {
    * Which buffer is active.
    */
   active_buffer: 'primary' | 'alternate'
-  charsets: CharsetState1
+  charsets: CharsetState2
   cursor: ProjectedCursor1
   /**
    * Whether the session has had to shorten content to stay inside a resident-state bound.
@@ -20994,7 +20998,7 @@ export interface ProjectionSnapshot {
 /**
  * The designated character sets and the locking shift.
  */
-export interface CharsetState1 {
+export interface CharsetState2 {
   /**
    * The set designated as G0.
    */

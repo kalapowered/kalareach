@@ -424,16 +424,6 @@ pub struct PaletteState {
     pub overrides: Vec<PaletteOverride>,
 }
 
-/// The character sets a saved cursor carries.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CharsetDesignations {
-    /// The set designated as G0.
-    pub g0: String,
-    /// The set designated as G1.
-    pub g1: String,
-}
-
 /// The designated character sets and the locking shift.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -474,8 +464,9 @@ pub struct SavedCursorState {
     pub pending_wrap: bool,
     /// The rendition saved with it.
     pub rendition: CellRendition,
-    /// The character sets designated when it was saved.
-    pub charsets: CharsetDesignations,
+    /// The character sets designated when it was saved, and which of them the locking shift had
+    /// selected. A restore puts the shift back as it was then, not as it is now.
+    pub charsets: CharsetState,
     /// Whether origin mode was set when it was saved.
     pub origin_mode: bool,
     /// The cursor-style number saved with it.
