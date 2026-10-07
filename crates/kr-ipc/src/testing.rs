@@ -26,7 +26,8 @@ pub const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 
 /// A host tree that removes itself when it is dropped.
 ///
-/// Its root is a [`PrivateTempDir`], so it is a directory this tree made and nothing else did.
+/// Its root is a [`PrivateTempDir`] with a shorter name, so it is a directory this tree made and
+/// nothing else did.
 #[derive(Debug)]
 pub struct TempHost {
     root: PrivateTempDir,
@@ -43,7 +44,13 @@ impl TempHost {
     /// unusable rather than that the case under test failed.
     #[must_use]
     pub fn create() -> Self {
-        let root = PrivateTempDir::create();
+        // Short on purpose: a Unix socket address is 104 bytes on macOS, and a command backend's
+        // socket in a test host's runtime directory is the root's length and 39 bytes more. A name
+        // this short can be taken, and then another is tried; it is never adopted.
+        let root = PrivateTempDir::create_named(|| {
+            let suffix = crate::new_uuid().to_string();
+            format!("kr-{}", &suffix[..8])
+        });
         let paths =
             HostPaths::new(root.path().join("r"), root.path().join("s")).expect("absolute roots");
         let environment_id = paths.open_environment_id().expect("environment identity");
