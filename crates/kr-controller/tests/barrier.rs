@@ -133,6 +133,15 @@ struct Worker {
     environment_id: EnvironmentId,
 }
 
+impl Worker {
+    /// The worker's runtime of its own, which a case that stops its tasks has to name.
+    fn apart(&self) -> &ApartWorker {
+        self._apart
+            .as_ref()
+            .expect("a worker whose tasks a test stops is served apart")
+    }
+}
+
 async fn worker() -> Worker {
     worker_serving(false).await
 }
@@ -339,7 +348,9 @@ struct Pause {
 const HOLD_DEADLINE: Duration = Duration::from_secs(120);
 
 impl Pause {
-    async fn hold(runtime: &Arc<SessionRuntime>) -> Self {
+    /// Holds the session of a worker served apart, which the case names with `_apart`: a task of
+    /// the worker that waits for the session waits on a thread of the worker's own runtime.
+    async fn hold(runtime: &Arc<SessionRuntime>, _apart: &ApartWorker) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let runtime = Arc::clone(runtime);
@@ -412,7 +423,7 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
     assert_eq!(worker.runtime.state().as_str(), "live");
 
     // The worker is isolated after its intents were durably accepted.
-    let paused = Pause::hold(&worker.runtime).await;
+    let paused = Pause::hold(&worker.runtime, worker.apart()).await;
     barrier.revoke(AuthorityRevision::new(4));
 
     // The revocation is announced while the worker is isolated. The exchange is kept alive on its
@@ -1817,9 +1828,7 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// One daemon and one worker it really spawned, verified through the real rendezvous.
 struct Hosted {
-    /// First, so it ends before the worker whose runtime it runs on.
-    awake: std::sync::OnceLock<Awake>,
-    /// Next, so a worker served apart has ended before the temporary tree is removed.
+    /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
     _temp: Arc<kr_ipc::testing::TempHost>,
     controller: Arc<Controller>,
@@ -1839,18 +1848,16 @@ impl Hosted {
     /// Such a task waits on a thread, and on this test's runtime that thread could be one the
     /// test's own waits need, so a worker whose tasks a test stops is served apart
     /// ([`hosted_worker_apart`]).
-    ///
-    /// From the first call to the end of the case the worker's runtime has a task that keeps one
-    /// of its threads polling ([`Awake`]), because serving apart protects this test's waits and
-    /// not the worker's own reads: the thread a stopped task holds may be the one that reads the
-    /// worker's sockets.
     fn service_to_stop(&self) -> &Arc<WorkerService> {
-        let apart = self
-            ._apart
-            .as_ref()
-            .expect("a worker whose tasks a test stops is served apart");
-        self.awake.get_or_init(|| apart.keep_awake());
+        let _ = self.apart();
         &self.service
+    }
+
+    /// The worker's runtime of its own, which a case that stops its tasks has to name.
+    fn apart(&self) -> &ApartWorker {
+        self._apart
+            .as_ref()
+            .expect("a worker whose tasks a test stops is served apart")
     }
 }
 
@@ -2130,7 +2137,6 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
         "the session is created: {created:?}"
     );
     Hosted {
-        awake: std::sync::OnceLock::new(),
         _apart: apart_worker,
         _temp: Arc::clone(&daemon.temp),
         controller: Arc::clone(&daemon.controller),
@@ -2147,9 +2153,10 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 /// A worker whose session runtime and connections run on a runtime of their own, on a thread of
 /// their own, as a worker's do in its own process. It ends, with its runtime, when this is dropped.
 struct ApartWorker {
+    /// First, so it ends before the runtime it wakes.
+    awake: Option<Awake>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    runtime: tokio::runtime::Handle,
 }
 
 impl ApartWorker {
@@ -2195,47 +2202,61 @@ impl ApartWorker {
             runtime,
             service,
             Self {
+                awake: Some(Awake::start(handle)),
                 stop: Some(stop),
                 thread: Some(thread),
-                runtime: handle,
             },
         )
     }
-
-    /// Keeps this worker's runtime reading its sockets and firing its timers while one of its tasks
-    /// is stopped.
-    fn keep_awake(&self) -> Awake {
-        Awake {
-            task: self.runtime.spawn(async {
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            }),
-        }
-    }
 }
 
-/// A task that always has something to do next on a worker's runtime, which keeps one of the
-/// runtime's threads polling its sockets and timers while another is stopped.
+/// What keeps a worker's runtime reading its sockets and firing its timers while one of its tasks
+/// is stopped: a thread that hands the runtime a task every few milliseconds, for as long as the
+/// worker lives.
 ///
 /// A worker task that waits, inside a pause or for a lock, holds a thread of the runtime it runs
 /// on, as the worker's own process would hold one of its own. When that is the thread that was
 /// reading the runtime's sockets and every other thread is asleep, nothing reads a socket or fires
 /// a timer until it comes back: the daemon's announcement would sit unread until the daemon's own
 /// bound on the exchange ran out, and a case that waits for the worker to refuse it would be
-/// waiting for the release it has not yet given.
+/// waiting for the release it has not yet given. A task handed to the runtime from outside wakes a
+/// sleeping thread, which polls the sockets and timers when it goes to sleep again. How often the
+/// task comes decides nothing: any interval wakes a thread in the end.
 struct Awake {
-    task: tokio::task::JoinHandle<()>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Awake {
+    fn start(runtime: tokio::runtime::Handle) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Until the sender is dropped.
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(Duration::from_millis(5))
+            {
+                drop(runtime.spawn(async {}));
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
 }
 
 impl Drop for Awake {
     fn drop(&mut self) {
-        self.task.abort();
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
 impl Drop for ApartWorker {
     fn drop(&mut self) {
+        drop(self.awake.take());
         drop(self.stop.take());
         // Waited for, so the worker is gone when the tree under it is removed; a worker that has
         // not ended in ten seconds is left to end on its own.
@@ -2287,7 +2308,7 @@ async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has
             .is_empty(),
         "nothing is pending before the revocation"
     );
-    let paused = Pause::hold(&hosted.runtime).await;
+    let paused = Pause::hold(&hosted.runtime, hosted.apart()).await;
     // The daemon's own round: it records the revocation, announces it to the worker within the
     // bound it gives each step, and reports. The worker is held, so it cannot acknowledge, and the
     // round ends with the worker pending. That report is what the case is about, and it comes when
@@ -2451,13 +2472,13 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
     // The first report says pending for this worker, and that is the contract rather than a
     // failure: the worker was inside a dispatch transition when the announcement arrived, and
     // section 9 makes a worker that has not answered pending rather than assumed. What it must not
-    // say is that the barrier held over an action it had not accounted for. The worker refused the
-    // announcement because the mutation held the boundary: a report that came back because the
-    // daemon's bound on the exchange ran out would be pending for another reason, and the case
-    // would not have met the race it is about.
+    // say is that the barrier held over an action it had not accounted for. The worker met the
+    // boundary the mutation held and refused for it, which is the race this case is about: a report
+    // that came back because the daemon's bound on the exchange ran out, with the announcement
+    // still unread, would be pending for another reason.
     assert!(
         hosted.service.refusals_for_the_boundary() > refused,
-        "the announcement was not refused for the boundary the mutation held"
+        "the worker did not meet the boundary the mutation held: {first:?}"
     );
     assert_eq!(first.pending(), vec![hosted.session_id], "{first:?}");
     assert!(
@@ -3074,13 +3095,15 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     let mut asked_everyone_both = false;
+    let mut last_report = String::from("none");
     let mut announcements = 0;
     let barrier = loop {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "within three minutes of announcements ({announcements} made) the names were not all \
-             collected, or no announcement asked every worker for both an acknowledgement and a \
-             page (asked: {asked_everyone_both})"
+            "before the case's three minutes ran out ({announcements} announcements made) the \
+             names were not all collected, the barrier did not hold, or no announcement asked \
+             every worker for both an acknowledgement and a page (asked: {asked_everyone_both}); \
+             the last report: {last_report}"
         );
         let before = daemon.controller.announcements_sent_for_tests().len();
         let announced = if announcements == 0 {
@@ -3091,7 +3114,7 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
         announcements += 1;
         let barrier = announced
             .unwrap_or_else(|_| {
-                panic!("an announcement ({announcements}) did not end within three minutes")
+                panic!("announcement {announcements} did not end before the case's time ran out")
             })
             .expect("the revocation is announced");
         let sent = daemon.controller.announcements_sent_for_tests()[before..].to_vec();
@@ -3125,6 +3148,7 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
         if barrier.holds() && collected && asked_everyone_both {
             break barrier;
         }
+        last_report = format!("{barrier:?}");
     };
     for hosted in &hosts {
         assert_eq!(
