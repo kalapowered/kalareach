@@ -1068,6 +1068,10 @@ mod a_voice_receipt_from_an_earlier_build;
 #[cfg(test)]
 mod a_sweep_on_a_clock_in_doubt;
 
+/// Every collection that lets go of a record by the wall clock, on the one host time contract.
+#[cfg(test)]
+mod one_clock_for_every_collection;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

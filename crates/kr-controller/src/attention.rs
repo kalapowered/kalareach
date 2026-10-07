@@ -2783,31 +2783,7 @@ impl AttentionModule {
                     return;
                 };
                 held.finish_again(reach.as_ref()).await;
-                let forgotten_at = forgot_at;
-                let Some((reading, forgot)) = held
-                    .deciding_on_the_blocking_pool(move |module, reading| {
-                        let mut forgot = forgotten_at;
-                        if let Ok(mut store) = module.store() {
-                            // Read with the store held: a closure and a replacement take the
-                            // store before they take a certificate away, so this tick never
-                            // decides on one they took.
-                            let certified = module.certificates();
-                            let _ = store.tick(reading, &|origin| certified.at(origin));
-                            // Expired records are let go of only on a wall clock this host can
-                            // prove, so a rollback cannot make a live record look expired.
-                            if module.time.may_collect_expired()
-                                && reading.wall_ms.get().saturating_sub(forgot) > FORGET_EVERY_MS
-                            {
-                                forgot = reading.wall_ms.get();
-                                let _ = store.forget_actions_before(
-                                    reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
-                                );
-                            }
-                        }
-                        (reading, forgot)
-                    })
-                    .await
-                else {
+                let Some((reading, forgot)) = held.tick_and_forget(forgot_at).await else {
                     return;
                 };
                 forgot_at = forgot;
@@ -2832,6 +2808,37 @@ impl AttentionModule {
                 let _ = tokio::time::timeout(wait, notified).await;
             }
         });
+    }
+
+    /// Runs the store's timers once, and lets go of the action records that have outlived their
+    /// retention when that is due: `forgotten_at` is the wall reading the last such pass was made
+    /// at. Returns the reading the pass decided under and the one to pass on next, or `None` when
+    /// the pool was shut down before the pass ran.
+    pub(crate) async fn tick_and_forget(
+        self: &Arc<Self>,
+        forgotten_at: u64,
+    ) -> Option<(HostReading, u64)> {
+        self.deciding_on_the_blocking_pool(move |module, reading| {
+            let mut forgot = forgotten_at;
+            if let Ok(mut store) = module.store() {
+                // Read with the store held: a closure and a replacement take the store before
+                // they take a certificate away, so this tick never decides on one they took.
+                let certified = module.certificates();
+                let _ = store.tick(reading, &|origin| certified.at(origin));
+                // Expired records are let go of only on a wall clock this host can prove, so a
+                // rollback cannot make a live record look expired.
+                if module.time.may_collect_expired()
+                    && reading.wall_ms.get().saturating_sub(forgot) > FORGET_EVERY_MS
+                {
+                    forgot = reading.wall_ms.get();
+                    let _ = store.forget_actions_before(
+                        reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
+                    );
+                }
+            }
+            (reading, forgot)
+        })
+        .await
     }
 
     /// Returns the earliest timer the next tick could decide.
