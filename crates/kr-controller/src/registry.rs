@@ -268,6 +268,31 @@ pub enum RecordedIn<'a> {
     UserVersion,
 }
 
+/// Why the version a database records could not be read.
+#[derive(Debug)]
+pub enum VersionRefusal {
+    /// The file is a link, a pipe or anything but a regular file.
+    NotARegularFile,
+    /// The shared-memory file beside it is not a regular file.
+    SharedMemoryNotARegularFile,
+    /// The file, or what is beside it, could not be looked at.
+    Unlooked(std::io::Error),
+    /// A write-ahead log or a rollback journal beside it could not be taken into the file.
+    LogNotTaken,
+    /// The file could not be opened to be read alone.
+    Unopened,
+    /// The table that records the version is not there.
+    NoTable,
+    /// The table holds no row.
+    NoVersion,
+    /// The table holds more than one row.
+    SeveralVersions,
+    /// The version is not a whole number a store records.
+    NotAVersion,
+    /// The version could not be read from the file.
+    Unread,
+}
+
 /// The version a database file records, where the file is there, read as the file alone.
 ///
 /// For an update that checks what a release reads. A file that is not a regular file, a link and
@@ -278,63 +303,54 @@ pub enum RecordedIn<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ControllerError::RegistryUnavailable`] naming what stops the version being read.
-pub fn recorded_version(path: &std::path::Path, recorded: RecordedIn<'_>) -> Result<Option<i64>> {
-    let refuse = |detail: String| ControllerError::RegistryUnavailable { detail };
+/// Returns the [`VersionRefusal`] that says what stops the version being read.
+pub fn recorded_version(
+    path: &std::path::Path,
+    recorded: RecordedIn<'_>,
+) -> std::result::Result<Option<i64>, VersionRefusal> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(refuse("this database is not a regular file".to_owned())),
+        Ok(_) => return Err(VersionRefusal::NotARegularFile),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(refuse(format!(
-                "this database could not be looked at: {error}"
-            )));
-        }
+        Err(error) => return Err(VersionRefusal::Unlooked(error)),
     }
     let mut shared_memory = path.as_os_str().to_owned();
     shared_memory.push("-shm");
     match std::fs::symlink_metadata(&shared_memory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
-            return Err(refuse(
-                "the shared-memory file beside this database is not a regular file".to_owned(),
-            ));
-        }
-        Err(error) => {
-            return Err(refuse(format!(
-                "what is beside this database could not be looked at: {error}"
-            )));
-        }
+        Ok(_) => return Err(VersionRefusal::SharedMemoryNotARegularFile),
+        Err(error) => return Err(VersionRefusal::Unlooked(error)),
     }
-    Registry::take_in_its_log(path)?;
-    let connection = open_immutable(path)?;
+    Registry::take_in_its_log(path).map_err(|_| VersionRefusal::LogNotTaken)?;
+    let connection = open_immutable(path).map_err(|_| VersionRefusal::Unopened)?;
     match recorded {
         RecordedIn::Table(table) => {
-            if !table
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                || table.is_empty()
+            if table.is_empty()
+                || !table
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             {
-                return Err(refuse("a table name SQL cannot take".to_owned()));
+                return Err(VersionRefusal::NoTable);
             }
             let mut statement = connection
                 .prepare(&format!("SELECT version FROM {table}"))
-                .map_err(|_| refuse("it has no table that records a version".to_owned()))?;
-            let rows: Vec<i64> = statement
+                .map_err(|_| VersionRefusal::NoTable)?;
+            let rows: Vec<rusqlite::types::Value> = statement
                 .query_map([], |row| row.get(0))
                 .and_then(Iterator::collect)
-                .map_err(ControllerError::registry)?;
-            match rows[..] {
-                [only] => Ok(Some(only)),
-                [] => Err(refuse("it records no version".to_owned())),
-                _ => Err(refuse("it records more than one version".to_owned())),
+                .map_err(|_| VersionRefusal::Unread)?;
+            match &rows[..] {
+                [rusqlite::types::Value::Integer(only)] => Ok(Some(*only)),
+                [_] => Err(VersionRefusal::NotAVersion),
+                [] => Err(VersionRefusal::NoVersion),
+                _ => Err(VersionRefusal::SeveralVersions),
             }
         }
         RecordedIn::UserVersion => connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map(Some)
-            .map_err(ControllerError::registry),
+            .map_err(|_| VersionRefusal::Unread),
     }
 }
 
@@ -652,9 +668,17 @@ impl Registry {
     /// it is opened, in the order a daemon's start opens them. A registry that lives only in memory
     /// has no other writer.
     fn bring_the_other_writers_forward(&self) -> Result<()> {
-        let Some(path) = self.connection.path().filter(|path| !path.is_empty()) else {
-            return Ok(());
+        // A registry in memory has no other writer. A path SQLite cannot give as text is one this
+        // build cannot name to the other writers either, and is refused rather than passed over.
+        let Some(path) = self.connection.path() else {
+            return Err(ControllerError::RegistryUnavailable {
+                detail: "this registry's path is not text, so its other writers cannot open it"
+                    .to_owned(),
+            });
         };
+        if path.is_empty() {
+            return Ok(());
+        }
         drop(crate::grants::GrantDirectory::open(path)?);
         let devices = crate::service::net::devices::DeviceDirectory::open(path)?;
         crate::service::net::invitations::prepare(&devices)
@@ -1121,7 +1145,7 @@ impl Registry {
     /// cannot finish stops the daemon's start with the cause and what to do about it: keeping the
     /// variables on disk is the worse outcome.
     ///
-    /// The file is shared with the grant and device stores, which open after this registry and
+    /// The file is shared with the grant and device stores, which open before this step runs and
     /// are rewritten by `VACUUM` with it; no table in it relies on an implicit row number, which
     /// `VACUUM` may change.
     ///
@@ -4058,7 +4082,7 @@ mod tests {
 
     /// The registry file has four writers, and the version it records stands for all of them: the
     /// carry opens the others after its own steps, so a table of theirs that was a shape behind is
-    /// brought to the shape of the version the file now records, and the pairing tables exist.
+    /// brought to the shape of a new file at this version, and the pairing tables exist.
     #[test]
     fn the_carry_brings_every_writer_of_the_file_forward_and_not_only_the_registry_s_own_tables() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -4071,17 +4095,6 @@ mod tests {
             crate::service::net::devices::DeviceDirectory::open(&path)
                 .expect("the device store opens"),
         );
-        let columns_of = |table: &str| -> Vec<String> {
-            let connection = Connection::open(&path).expect("opens");
-            let mut statement = connection
-                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
-                .expect("prepares");
-            statement
-                .query_map([], |row| row.get(0))
-                .expect("reads")
-                .collect::<rusqlite::Result<_>>()
-                .expect("columns")
-        };
         Connection::open(&path)
             .expect("opens")
             .execute_batch(
@@ -4091,17 +4104,48 @@ mod tests {
                  DROP TABLE IF EXISTS host_owner;",
             )
             .expect("sets the file back a shape");
-        assert!(!columns_of("authority_receipts").contains(&"refusal_code".to_owned()));
-        assert!(!columns_of("network_devices").contains(&"notification_preview".to_owned()));
+        // The tables of the file, with the columns of each: what a new file at this version has.
+        let shape_of = |path: &std::path::Path| -> std::collections::BTreeMap<String, Vec<String>> {
+            let connection = Connection::open(path).expect("opens");
+            let mut tables = connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .expect("prepares");
+            let names: Vec<String> = tables
+                .query_map([], |row| row.get(0))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("names");
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut columns = connection
+                        .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))
+                        .expect("prepares");
+                    let mut columns: Vec<String> = columns
+                        .query_map([], |row| row.get(0))
+                        .expect("reads")
+                        .collect::<rusqlite::Result<_>>()
+                        .expect("columns");
+                    columns.sort();
+                    (name, columns)
+                })
+                .collect()
+        };
+        let other = tempfile::tempdir().expect("a directory");
+        let new = other.path().join("registry.sqlite3");
+        drop(Registry::open(&new, environment()).expect("a new registry"));
+        assert_ne!(
+            shape_of(&path),
+            shape_of(&new),
+            "the file was set back, so the carry has something to do"
+        );
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
         assert_eq!(carried.map(|carried| carried.to), Some(SCHEMA_VERSION));
-        assert!(columns_of("authority_receipts").contains(&"refusal_code".to_owned()));
-        assert!(columns_of("authority_receipts").contains(&"refusal_detail".to_owned()));
-        assert!(columns_of("network_devices").contains(&"notification_preview".to_owned()));
-        assert!(
-            !columns_of("host_owner").is_empty(),
-            "the pairing tables exist"
+        assert_eq!(
+            shape_of(&path),
+            shape_of(&new),
+            "every writer's tables are at the shape of a new file"
         );
         assert_eq!(
             files_in(directory.path())

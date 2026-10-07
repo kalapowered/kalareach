@@ -25,7 +25,9 @@
 //!    told to stop, in turn. The first that answers that it does not stop ends the telling: the
 //!    daemons not yet told resume, and those told are waited for to have gone, up to thirty
 //!    seconds from the last telling, before anything is started again. Every environment's lock is
-//!    held, a registry that records an earlier schema than this release reads is brought forward
+//!    held, every store the new release lists is read where its manifest says it is and a version
+//!    the new release does not read refuses the switch (`formats`), a registry that records an
+//!    earlier schema than this release reads is brought forward
 //!    (`inventory::carry_forward`: the environment's daemon did not run since the earlier schema
 //!    step), and every record of every registry is classed (`inventory::classify`). A recorded
 //!    environment whose identity cannot be looked at because what holds it is gone is named in the
@@ -35,6 +37,10 @@
 //!    before, from the new release, and each is waited for to answer as a daemon of it.
 //! 7. Releases nothing needs are removed: not the current one, not the previous one, not one
 //!    staged for a later update, and not one a running process holds.
+//!
+//! `rollback` is the same switch to an older release the store keeps: it differs in where the
+//! release comes from, which is the store, and in what it requires of it, that it is older than the
+//! current release. Everything from the survey of the environments on is shared.
 //!
 //! The record of the update under way is written before each step that changes what runs, so a
 //! run that stops part way leaves what the next needs to finish it or undo it. It is let go of
@@ -101,9 +107,13 @@ pub fn said(error: &InstallError) -> Shown {
 /// The store record's format this build writes, and the newest it reads.
 pub const RECORD_FORMAT: u32 = 1;
 
+/// The longest store record this build reads: it holds a channel root, of which a release may
+/// carry one up to 1 MiB, written out in the record's own indented form, with room to spare.
+const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// The store's record, `install.json`: what an update needs that the store's directories do not
 /// say. Which release is current is `current` itself, never this.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// The record's format.
     pub format: u32,
@@ -120,9 +130,9 @@ pub struct Record {
     /// The newest update channel root this host has switched to a release of. A release carries
     /// the root it was built with, and a host trusts the newest of this and its current release's,
     /// so that going back to an older release does not bring back a key the channel has retired.
-    /// Absent until a switch settles with a root newer than the current release's.
+    /// Absent until the first switch settles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trusted_root: Option<serde_json::Value>,
+    pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
 }
 
 kr_client::debug_as_name!(Record);
@@ -199,7 +209,7 @@ impl Record {
     /// does not read.
     pub fn read(store: &Store) -> Result<Self> {
         let path = store.record();
-        let bytes = kr_ipc::paths::read_owner_only_file(&path, 1024 * 1024)?.ok_or_else(|| {
+        let bytes = kr_ipc::paths::read_owner_only_file(&path, RECORD_LIMIT)?.ok_or_else(|| {
             CliError::HostUnavailable(shown!(
                 "{} holds no store of releases",
                 Shown::root(store.root())
@@ -936,6 +946,22 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
     if record.update.is_some() {
         recover(&store, &mut record).await?;
     }
+    // The root this host trusts is read before anything is switched: a record of it that cannot be
+    // read, or that disagrees with a release's root of the same version, would let the settling
+    // that follows lower the trust it holds.
+    if let Some(kept) = record.trusted_root.clone() {
+        let kept = release::ChannelRoot::kept(kept)?;
+        if let Ok(Some(current)) = release::ChannelRoot::read(&store.release_directory(&source))
+            && current.version() == kept.version()
+            && !current.is(&kept)
+        {
+            return Err(CliError::Other(shown!(
+                "release {} carries an update channel root, and the store recorded another of the \
+                 same version: this host trusts neither, and nothing was switched",
+                crate::shown::release(&source)
+            )));
+        }
+    }
     let target = match to {
         Some(name) => ReleaseName::new(name).map_err(|_| {
             CliError::Usage(Shown::said(
@@ -1009,11 +1035,16 @@ async fn carry_out(
     check: bool,
     rolled_back: bool,
 ) -> Result<Updated> {
+    // What no state of the disk changes is refused before anything is surveyed or stopped.
+    let unlookable = formats::unlookable(&target);
+    if !unlookable.is_empty() {
+        return Err(formats::refusal(&target, &unlookable));
+    }
     let inventory::Surveyed {
         environments,
         unreached,
         reached,
-    } = inventory::environments(&store)?;
+    } = inventory::environments(store)?;
     // What the rest of the run learns that a person is told, whether it finishes or not.
     let mut report = Report {
         carried: Vec::new(),
@@ -1730,26 +1761,31 @@ fn forget_update(store: &Store, record: &mut Record) {
     let _ = record.write(store);
 }
 
-/// Records an update as settled: its target current, its source the previous release.
+/// Records an update as settled: its target current, its source the previous release, and the
+/// newest update channel root among the one recorded, the source's and the target's the root this
+/// host trusts from now on. A recorded root that cannot be read is left as it is, never replaced by
+/// an older one.
 #[cfg(unix)]
 fn settle(store: &Store, record: &mut Record) -> Result<()> {
     if let Some(update) = record.update.take() {
-        // The newest root of the one recorded, the release left and the release switched to: each
-        // was trusted when it was current, and the newest of them is never given up.
-        let mut newest: Option<release::ChannelRoot> = record
-            .trusted_root
-            .clone()
-            .and_then(|kept| release::ChannelRoot::kept(kept).ok());
-        for release in [&update.source, &update.target] {
-            if let Ok(Some(root)) = release::ChannelRoot::read(&store.release_directory(release))
-                && newest
-                    .as_ref()
-                    .is_none_or(|known| root.version() > known.version())
-            {
-                newest = Some(root);
+        // A recorded root that cannot be read is left exactly as it is.
+        match record.trusted_root.clone().map(release::ChannelRoot::kept) {
+            Some(Err(_)) => {}
+            recorded => {
+                let mut newest = recorded.and_then(std::result::Result::ok);
+                for release in [&update.source, &update.target] {
+                    if let Ok(Some(root)) =
+                        release::ChannelRoot::read(&store.release_directory(release))
+                        && newest
+                            .as_ref()
+                            .is_none_or(|known| root.version() > known.version())
+                    {
+                        newest = Some(root);
+                    }
+                }
+                record.trusted_root = newest.map(|root| root.to_kept());
             }
         }
-        record.trusted_root = newest.map(|root| root.to_kept());
         record.previous = Some(update.source);
         if record.staged.as_ref() == Some(&update.target) {
             record.staged = None;

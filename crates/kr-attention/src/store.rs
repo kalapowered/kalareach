@@ -113,7 +113,7 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 pub const SCHEMA_VERSION: i64 = 10;
 
 /// The oldest schema this build brings forward, the one before the one it writes: see
-/// [`migrate_from_nine`].
+/// `migrate_from_nine`.
 pub const OLDEST_SCHEMA_VERSION: i64 = 9;
 
 /// How long a write waits for another holder of the same file before it is refused.

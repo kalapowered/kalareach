@@ -71,7 +71,7 @@ use crate::error::{DeliveryError, Result};
 /// with, and binds a destination to it only when it has one, so every binding version 6 computed
 /// is computed the same way. Version 8 adds the time privacy mode was last turned off, which is
 /// how a decision made while it was on is told from one made after. A journal written under
-/// version 6 or 7 is brought forward in place, once, when it is opened ([`migrate_forward`]); a
+/// version 6 or 7 is brought forward in place, once, when it is opened (`migrate_forward`); a
 /// journal written under a version below 6 or above 8 is refused rather than read with the
 /// columns of another shape, matched against bindings this build no longer computes the same way,
 /// or trusted to hold no request it should not.

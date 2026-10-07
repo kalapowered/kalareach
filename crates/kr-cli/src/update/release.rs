@@ -138,19 +138,12 @@ impl ChannelRoot {
         Ok(Some(Self { signed }))
     }
 
-    /// Reads a root the store kept, and checks it against itself as a release's is checked.
+    /// Takes a root the store kept, and checks it against itself as a release's is checked.
     ///
     /// # Errors
     ///
-    /// Returns a refusal when it is not root metadata or is not signed by its own root keys.
-    pub fn kept(value: serde_json::Value) -> Result<Self> {
-        let signed: tough::schema::Signed<tough::schema::Root> = serde_json::from_value(value)
-            .map_err(|error| {
-                CliError::Other(shown!(
-                    "the update channel's root this host kept is not root metadata: {}",
-                    Shown::json(&error)
-                ))
-            })?;
+    /// Returns a refusal when it is not signed by its own root keys.
+    pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
         signed.signed.verify_role(&signed).map_err(|_| {
             CliError::Other(Shown::said(
                 "the update channel's root this host kept is not signed by the root keys it names",
@@ -160,13 +153,9 @@ impl ChannelRoot {
     }
 
     /// The root as the store keeps it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the root cannot be written as JSON, which a root read from JSON can be.
     #[must_use]
-    pub fn to_kept(&self) -> serde_json::Value {
-        serde_json::to_value(&self.signed).expect("a root is JSON")
+    pub fn to_kept(&self) -> tough::schema::Signed<tough::schema::Root> {
+        self.signed.clone()
     }
 
     /// The root's version.

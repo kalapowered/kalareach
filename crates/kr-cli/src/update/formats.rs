@@ -107,14 +107,40 @@ impl Refusal {
 pub fn refusal(target: &ReleaseManifest, refusals: &[Refusal]) -> CliError {
     let said = Shown::joined(refusals.iter().map(|refusal| refusal.said(target)), "; ");
     CliError::Other(shown!(
-        "the switch to {} was not made, and nothing was changed, because it cannot read the stores as they are: {}",
+        "the switch to {} was not made, and no store was brought forward, because it cannot read the stores as they are: {}",
         crate::shown::release(&target.release),
         said
     ))
 }
 
+/// The stores `target` lists in a way this build cannot look for: a scope or a way of recording a
+/// later release names. Nothing on disk changes that, so a switch to it is refused before anything
+/// is stopped.
+#[must_use]
+pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
+    target
+        .stores
+        .iter()
+        .filter_map(|listed| {
+            let what = if listed.scope == StoreScope::Unknown {
+                "a scope"
+            } else if listed.recording == Recording::Unknown {
+                "a way of recording its version"
+            } else {
+                return None;
+            };
+            Some(Refusal {
+                store: listed.store.clone(),
+                environment: None,
+                place: PathBuf::new(),
+                why: Why::Unknown(what),
+            })
+        })
+        .collect()
+}
+
 /// Looks at every store `target` lists, where the manifest says it is, and returns each that is at
-/// a version the target does not read.
+/// a version the target does not read, with those [`unlookable`] too.
 ///
 /// `environments` are the environments whose daemons have stopped and whose locks are held.
 #[must_use]
@@ -123,34 +149,29 @@ pub fn check(
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
 ) -> Vec<Refusal> {
-    let mut refusals = Vec::new();
+    let mut refusals = unlookable(target);
     for listed in &target.stores {
-        let unknown = if listed.scope == StoreScope::Unknown {
-            Some("a scope")
-        } else if listed.recording == Recording::Unknown {
-            Some("a way of recording its version")
-        } else {
-            None
-        };
-        if let Some(what) = unknown {
-            refusals.push(Refusal {
-                store: listed.store.clone(),
-                environment: None,
-                place: PathBuf::new(),
-                why: Why::Unknown(what),
-            });
+        if listed.scope == StoreScope::Unknown || listed.recording == Recording::Unknown {
             continue;
         }
         for (environment, directory) in directories(listed.scope, install, environments) {
-            for file in files(&directory, &listed.path) {
-                if let Some(why) = look(listed, &file) {
-                    refusals.push(Refusal {
-                        store: listed.store.clone(),
-                        environment,
-                        place: file,
-                        why,
-                    });
+            let mut refuse = |place: PathBuf, why: Why| {
+                refusals.push(Refusal {
+                    store: listed.store.clone(),
+                    environment,
+                    place,
+                    why,
+                });
+            };
+            match files(&directory, &listed.path) {
+                Ok(found) => {
+                    for file in found {
+                        if let Some(why) = look(listed, &file) {
+                            refuse(file, why);
+                        }
+                    }
                 }
+                Err(reason) => refuse(directory.join(&listed.path), Why::Unreadable(reason)),
             }
         }
     }
@@ -220,29 +241,43 @@ fn configuration_directories(environment: &Environment) -> Vec<PathBuf> {
 }
 
 /// The files a store's path names under a directory: the one file, or every record of a name in a
-/// directory.
-fn files(directory: &Path, path: &str) -> Vec<PathBuf> {
-    match path.strip_suffix("/*.json") {
-        None => vec![directory.join(path)],
-        Some(inner) => {
-            let Ok(entries) = std::fs::read_dir(directory.join(inner)) else {
-                return Vec::new();
-            };
-            let mut found: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "json")
-                        && path
-                            .file_name()
-                            .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
-                })
-                .collect();
-            found.sort();
-            found
+/// directory. A directory that is not there holds no record; one that cannot be listed is a store
+/// that cannot be read.
+fn files(directory: &Path, path: &str) -> Result<Vec<PathBuf>, Shown> {
+    let Some(inner) = path.strip_suffix("/*.json") else {
+        return Ok(vec![directory.join(path)]);
+    };
+    let entries = match std::fs::read_dir(directory.join(inner)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(shown!(
+                "the directory of its records could not be listed: {}",
+                Shown::io(&error)
+            ));
+        }
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            shown!(
+                "the directory of its records could not be listed: {}",
+                Shown::io(&error)
+            )
+        })?;
+        let path = entry.path();
+        let record = path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+            && path
+                .file_name()
+                .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
+        if record {
+            found.push(path);
         }
     }
+    found.sort();
+    Ok(found)
 }
 
 /// Reads the version one file records and says why the target does not read it, when it does not.
@@ -288,14 +323,12 @@ fn read(listed: &ReleaseStore, file: &Path) -> Result<Option<u32>, Shown> {
             })
             .transpose()
     };
-    let database =
-        |error: kr_controller::ControllerError| Shown::protocol(&error.to_protocol_error());
     match &listed.recording {
         Recording::SqliteTable { table } => {
-            number(recorded_version(file, RecordedIn::Table(table)).map_err(database)?)
+            number(recorded_version(file, RecordedIn::Table(table)).map_err(refused)?)
         }
         Recording::SqliteUserVersion => {
-            number(recorded_version(file, RecordedIn::UserVersion).map_err(database)?)
+            number(recorded_version(file, RecordedIn::UserVersion).map_err(refused)?)
         }
         Recording::JsonMember { member, absent } => json(
             file,
@@ -307,39 +340,77 @@ fn read(listed: &ReleaseStore, file: &Path) -> Result<Option<u32>, Shown> {
     }
 }
 
+/// What a database's refusal to say its version says.
+fn refused(refusal: kr_controller::registry::VersionRefusal) -> Shown {
+    use kr_controller::registry::VersionRefusal;
+
+    match refusal {
+        VersionRefusal::NotARegularFile => Shown::said("it is not a regular file"),
+        VersionRefusal::SharedMemoryNotARegularFile => {
+            Shown::said("the shared-memory file beside it is not a regular file")
+        }
+        VersionRefusal::Unlooked(error) => {
+            shown!("it could not be looked at: {}", Shown::io(&error))
+        }
+        VersionRefusal::LogNotTaken => Shown::said(
+            "what a daemon that ended by a signal left in its log could not be taken into it",
+        ),
+        VersionRefusal::Unopened => Shown::said("it could not be opened to be read"),
+        VersionRefusal::NoTable => Shown::said("it has no table that records a version"),
+        VersionRefusal::NoVersion => Shown::said("it records no version"),
+        VersionRefusal::SeveralVersions => Shown::said("it records more than one version"),
+        VersionRefusal::NotAVersion => Shown::said("it records a version that is not a number"),
+        VersionRefusal::Unread => Shown::said("its version could not be read"),
+    }
+}
+
+/// A member of a record: a whole number, or anything else.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Member {
+    Number(u64),
+    Other(serde::de::IgnoredAny),
+}
+
 /// Reads the version a JSON record states in `member`; `absent` where it states none. A record that
-/// is not JSON is an error, unless `lenient`, which is the configuration document: every release
-/// loads one it cannot read as defaults, so it has no version to refuse a switch for.
+/// cannot be read as a JSON object with a whole number there is refused, unless `lenient`, which is
+/// the configuration document: every release loads one it cannot read as defaults, so it has no
+/// version to refuse a switch for.
 fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<u32>, Shown> {
     let bytes = match kr_ipc::install::read_regular_file(file, RECORD_LIMIT) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) if lenient => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(Shown::said(
+                "it is not a regular file, or is larger than a record of its kind",
+            ));
+        }
         Err(error) => {
             return Err(shown!("it could not be read: {}", Shown::io(&error)));
         }
     };
-    let document: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(document) => document,
-        Err(_) if lenient => return Ok(None),
-        Err(_) => return Err(Shown::said("it is not JSON")),
-    };
-    let Some(object) = document.as_object() else {
+    let Ok(document) = serde_json::from_slice::<std::collections::BTreeMap<String, Member>>(&bytes)
+    else {
         return if lenient {
             Ok(None)
         } else {
             Err(Shown::said("it is not a JSON object"))
         };
     };
-    match object.get(member) {
+    match document.get(member) {
         None => Ok(Some(absent)),
-        Some(stated) => stated
-            .as_u64()
-            .and_then(|stated| u32::try_from(stated).ok())
-            .map(Some)
-            .ok_or_else(|| {
-                Shown::said("the member that records its version is not a whole number")
-            }),
+        Some(Member::Number(stated)) => match u32::try_from(*stated) {
+            Ok(stated) => Ok(Some(stated)),
+            Err(_) if lenient => Ok(None),
+            Err(_) => Err(Shown::said(
+                "the member that records its version is not a whole number",
+            )),
+        },
+        Some(Member::Other(_)) if lenient => Ok(None),
+        Some(Member::Other(_)) => Err(Shown::said(
+            "the member that records its version is not a whole number",
+        )),
     }
 }
 
