@@ -5330,7 +5330,7 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console does not echo the typed line into the retained output, which this case waits to see"
+    ignore = "on Windows the native interrupt ends the shell this case runs: a console control event interrupts its read, the loop ends and the shell exits with status 0, where a Unix shell that ignores SIGINT keeps reading, so the session is closed before it echoes what the sweep released"
 )]
 async fn an_interrupt_delivers_what_its_own_sweep_released() {
     let wired = unpumped().await;
