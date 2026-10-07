@@ -1563,30 +1563,6 @@ impl Registry {
         Ok(lost.is_some())
     }
 
-    /// Records that the owner established the clock at `at_ms`, which ends `boot`'s lost clock
-    /// continuity when it was lost.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
-    pub fn establish_clock_continuity(
-        &mut self,
-        boot: BootEpoch,
-        at_ms: TimestampMs,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE clock_continuity SET established_at_ms = ?2
-                  WHERE boot_epoch = ?1 AND established_at_ms IS NULL",
-                params![
-                    boot.get().to_be_bytes().as_slice(),
-                    i64::try_from(at_ms.get()).unwrap_or(i64::MAX)
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        Ok(())
-    }
-
     /// Records the authority revision one worker has acknowledged.
     ///
     /// # Errors
@@ -2546,6 +2522,33 @@ const fn source_name(source: ProcessStartSource) -> &'static str {
 }
 
 /// Reads back what [`source_name`] wrote, and refuses anything else.
+/// Ends `boot`'s lost clock continuity at `at_ms` on `connection`, when it was lost.
+///
+/// The owner's establishment of the clock writes this row in the same transaction as the trust
+/// record it ends the distrust in, so it takes the transaction's connection rather than the
+/// registry's own. A boot whose continuity was never lost has no row, and nothing is written.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+pub(crate) fn end_clock_continuity(
+    connection: &Connection,
+    boot: BootEpoch,
+    at_ms: TimestampMs,
+) -> Result<()> {
+    connection
+        .execute(
+            "UPDATE clock_continuity SET established_at_ms = ?2
+              WHERE boot_epoch = ?1 AND established_at_ms IS NULL",
+            params![
+                boot.get().to_be_bytes().as_slice(),
+                i64::try_from(at_ms.get()).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
 fn source_from(text: &str) -> Result<ProcessStartSource> {
     match text {
         "linux_proc_stat" => Ok(ProcessStartSource::LinuxProcStat),
@@ -2991,9 +2994,7 @@ mod tests {
         assert!(registry.clock_continuity_lost(boot).expect("readable"));
         assert!(!registry.clock_continuity_lost(other).expect("readable"));
 
-        registry
-            .establish_clock_continuity(boot, TimestampMs::new(4))
-            .expect("established");
+        end_clock_continuity(&registry.connection, boot, TimestampMs::new(4)).expect("established");
         assert!(!registry.clock_continuity_lost(boot).expect("readable"));
 
         registry

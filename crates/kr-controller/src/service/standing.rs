@@ -528,23 +528,4 @@ impl Controller {
         self.check_fence()?;
         Ok(effect())
     }
-
-    /// Ends this boot's lost clock continuity, now that the owner established the clock at
-    /// `established`.
-    ///
-    /// Recorded for the boot before it takes effect, so a restart of this daemon in the same boot
-    /// keeps the continuity it established rather than losing it again. A write that fails leaves
-    /// the continuity lost, which is the stricter answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry cannot be written.
-    pub(crate) async fn establish_clock_continuity(&self, established: TimestampMs) -> Result<()> {
-        self.registry
-            .lock()
-            .await
-            .establish_clock_continuity(self.boot_epoch, established)?;
-        self.utc_floor.establish_continuity();
-        Ok(())
-    }
 }

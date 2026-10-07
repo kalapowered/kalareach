@@ -185,7 +185,7 @@ impl OwnerAuthority for HostOwner {
                     destination_keys: Nullable(destination),
                     destination_rights: enlargement.rights.clone(),
                 }),
-                first_owner: false,
+                bootstrap: false,
             })
             .map_err(|error| error.to_protocol_error())
     }

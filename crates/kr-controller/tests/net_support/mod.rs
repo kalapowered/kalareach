@@ -327,7 +327,7 @@ impl Host {
                         destination_rights: CanonicalSet::new(),
                     },
                 ),
-                first_owner: false,
+                bootstrap: false,
             })
             .expect("a challenge");
         kr_pairing::confirm::sign_confirmation(

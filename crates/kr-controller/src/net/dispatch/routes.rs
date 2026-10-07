@@ -1244,9 +1244,14 @@ impl RemoteConnection {
                     Some(validated),
                     Some(accepted.deadline),
                 );
+                let guard = self.controller.pairing_guard(
+                    self.connection_id(),
+                    Some(validated),
+                    Some(accepted.deadline),
+                );
                 match self
                     .controller
-                    .pairing_write(caller, entry.method, mutation, admission)
+                    .pairing_write(caller, entry.method, mutation, admission, guard)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {

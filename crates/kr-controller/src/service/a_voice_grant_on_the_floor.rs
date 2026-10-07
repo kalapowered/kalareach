@@ -564,11 +564,7 @@ async fn a_spent_delegation_is_forgotten_only_on_a_clock_this_host_can_prove() {
         !spend(),
         "a clock that went backwards and was not established again forgets nothing"
     );
-    controller
-        .lifetimes()
-        .clock_trust()
-        .establish(controller.devices())
-        .expect("the owner establishes the clock");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
     assert!(spend(), "an established clock has outlived the retention");
 }
 

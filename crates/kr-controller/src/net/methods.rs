@@ -15,9 +15,10 @@
 
 use std::sync::Arc;
 
+use kr_pairing::confirm::HostEnrolment;
 use kr_protocol::confirmation::{
-    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
-    OwnerConfirmationRequestParams,
+    ConfirmationSubject, HostClockEstablishParams, OwnerConfirmationCompleteParams,
+    OwnerConfirmationPendingParams, OwnerConfirmationRequestParams,
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId};
@@ -49,8 +50,14 @@ pub const fn serves(method: Method) -> bool {
             | Method::OwnerConfirmationRequest
             | Method::OwnerConfirmationPending
             | Method::OwnerConfirmationComplete
+            | Method::HostClockEstablish
     )
 }
+
+/// What a pairing mutation carries to its effect so that the effect can hold its registration
+/// standing through its commit: runs the commit it is handed while the registration, the fence and
+/// the deadline it was admitted under are held ([`Controller::pairing_guard`]).
+pub type CommitGuard = Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
 
 impl Controller {
     /// Returns the admission check of one mutation: its connection's registration under the
@@ -82,6 +89,40 @@ impl Controller {
         Arc::new(move || controller.check_registration(&carried))
     }
 
+    /// Returns the guard of one mutation's commit: its registration under the revision it was
+    /// admitted at and the deadline it was accepted with, held from the check to the end of the
+    /// commit it is handed ([`Self::under_registration`]).
+    ///
+    /// A mutation that carries no freshness at all may be answered from what this host already
+    /// holds and may not write, so its guard refuses.
+    pub(crate) fn pairing_guard(
+        self: &Arc<Self>,
+        connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
+        deadline: Option<ContinuousInstant>,
+    ) -> CommitGuard {
+        let (Some(admitted_revision), Some(deadline)) = (admitted, deadline) else {
+            return Arc::new(|_| {
+                Err(ControllerError::WindowExpired {
+                    detail: "this action carries no freshness, so it may be answered from what \
+                             this host holds and may not write"
+                        .to_owned(),
+                })
+            });
+        };
+        let controller = Arc::clone(self);
+        let carried = AdmittedMutation {
+            connection_id,
+            admitted_revision,
+            deadline: Some(deadline),
+        };
+        Arc::new(move |commit| {
+            controller
+                .under_registration(&carried, || commit())
+                .and_then(|committed| committed)
+        })
+    }
+
     /// Serves one pairing or owner-confirmation read.
     ///
     /// # Errors
@@ -94,9 +135,9 @@ impl Controller {
         method: Method,
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
-        let pairing = self.pairing_service()?;
         match method {
             Method::PairStatus => {
+                let pairing = self.pairing_service()?;
                 let params: PairStatusParams = decode(params)?;
                 if caller.device.is_some() {
                     blocking(move || pairing.device_status(&caller, &params)).await
@@ -104,9 +145,11 @@ impl Controller {
                     blocking(move || pairing.owner_status(&caller, &params)).await
                 }
             }
+            // The challenges are the daemon's, networked or not.
             Method::OwnerConfirmationPending => {
                 let _: OwnerConfirmationPendingParams = decode(params)?;
-                blocking(move || pairing.pending_confirmations(&caller)).await
+                let owner = Arc::clone(&self.owner);
+                blocking(move || owner.pending(&caller)).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read the pairing service serves",
@@ -127,19 +170,45 @@ impl Controller {
         if !serves(method) {
             return None;
         }
-        let pairing = self.pairing_service().ok()?;
         let digest = match mutation_digest(mutation, &caller) {
             Ok(digest) => digest,
             Err(error) => return Some(Err(error)),
         };
+        let action = (mutation.action_id, digest);
+        // The owner-confirmation methods and the establishment of the clock are answered from the
+        // daemon's own authority, which a host off the network has; the rest are the pairing
+        // service's, which only a host on the network has.
+        let owner = Arc::clone(&self.owner);
+        let pairing = if matches!(
+            method,
+            Method::OwnerConfirmationRequest
+                | Method::OwnerConfirmationComplete
+                | Method::HostClockEstablish
+        ) {
+            None
+        } else {
+            Some(self.pairing_service().ok()?)
+        };
         let mutation = mutation.clone();
-        tokio::task::spawn_blocking(move || pairing.retained(&caller, &mutation, digest))
-            .await
-            .unwrap_or_else(|_| {
-                Some(Err(ControllerError::Uncertain {
-                    detail: "the pairing lookup stopped before it answered".to_owned(),
-                }))
-            })
+        tokio::task::spawn_blocking(move || match (method, pairing) {
+            (Method::OwnerConfirmationRequest, _) => owner
+                .requested(&caller, action)
+                .map(|answer| answer.and_then(|answer| encode(&answer))),
+            (Method::OwnerConfirmationComplete, _) => owner
+                .completed(&caller, action)
+                .map(|answer| answer.and_then(|answer| encode(&answer))),
+            (Method::HostClockEstablish, _) => owner
+                .established(&caller, action)
+                .map(|answer| answer.and_then(|answer| encode(&answer))),
+            (_, Some(pairing)) => pairing.retained(&caller, &mutation, digest),
+            (_, None) => None,
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Some(Err(ControllerError::Uncertain {
+                detail: "the pairing lookup stopped before it answered".to_owned(),
+            }))
+        })
     }
 
     /// Serves one pairing or owner-confirmation mutation.
@@ -154,12 +223,42 @@ impl Controller {
         method: Method,
         mutation: &MutationRequest,
         admission: Admission,
+        guard: CommitGuard,
     ) -> Result<ParamsValue> {
-        let pairing = self.pairing_service()?;
         let action = (mutation.action_id, mutation_digest(mutation, &caller)?);
         match method {
+            // The effect that spends an owner's confirmation of the clock, and the confirmation
+            // of it, are the daemon's own: a host off the network has no pairing service and
+            // still has a clock. The effect is one blocking step, which a connection that goes
+            // away does not cut.
+            Method::HostClockEstablish => {
+                let _: HostClockEstablishParams = decode(&mutation.params)?;
+                let owner = Arc::clone(&self.owner);
+                let boot = self.boot_epoch;
+                blocking(move || owner.establish_clock(&caller, action, boot, guard.as_ref())).await
+            }
+            Method::OwnerConfirmationComplete => {
+                let params: OwnerConfirmationCompleteParams = decode(&mutation.params)?;
+                let owner = Arc::clone(&self.owner);
+                blocking(move || owner.complete(&caller, &params, action, admission.as_ref())).await
+            }
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
+                if matches!(params.subject, ConfirmationSubject::EstablishClock) {
+                    let owner = Arc::clone(&self.owner);
+                    let on_the_network = self.network_guard().is_some();
+                    return blocking(move || {
+                        // A host that has an owner is confirmed by an owner device, and a device
+                        // reaches a host only over its network: asking would leave a challenge
+                        // nobody can answer.
+                        if !on_the_network && owner.enrolment()? == HostEnrolment::Enrolled {
+                            return Err(not_on_network());
+                        }
+                        owner.request_clock(&caller, action, admission.as_ref())
+                    })
+                    .await;
+                }
+                let pairing = self.pairing_service()?;
                 // A repository's root and an installation are described by the catalogue, from
                 // the exact request and the records it holds, and the pairing service issues the
                 // challenge for what it resolved.
@@ -197,14 +296,8 @@ impl Controller {
                 })
                 .await
             }
-            Method::OwnerConfirmationComplete => {
-                let params: OwnerConfirmationCompleteParams = decode(&mutation.params)?;
-                blocking(move || {
-                    pairing.complete_confirmation(&caller, &params, action, admission.as_ref())
-                })
-                .await
-            }
             Method::PairInvite => {
+                let pairing = self.pairing_service()?;
                 let params: PairInviteParams = decode(&mutation.params)?;
                 let network_config = self
                     .network_guard()
@@ -216,6 +309,7 @@ impl Controller {
                 .await
             }
             Method::PairConfirm => {
+                let pairing = self.pairing_service()?;
                 let params: PairConfirmParams = decode(&mutation.params)?;
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
@@ -223,6 +317,7 @@ impl Controller {
                     .await
             }
             Method::PairCancel => {
+                let pairing = self.pairing_service()?;
                 let params: PairCancelParams = decode(&mutation.params)?;
                 blocking(move || pairing.cancel(&caller, &params, action, &admission)).await
             }
@@ -261,6 +356,11 @@ where
                 detail: "the pairing step stopped before it answered".to_owned(),
             })??;
     ParamsValue::from_typed(&answer)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
+    ParamsValue::from_typed(value)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 

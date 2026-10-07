@@ -33,8 +33,7 @@ use kr_pairing::host::{
 };
 use kr_pairing::platform::{InvitationState, LivePeer, PairingClock};
 use kr_protocol::confirmation::{
-    CLOCK_PURPOSE, ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
-    OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
+    ConfirmationDisplay, ConfirmationSubject, HostClockEstablishResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
@@ -276,7 +275,8 @@ pub struct PairingHost {
     authorisation: AuthorisationKeyPair,
     clock: HostPairingClock,
     rows: InvitationRows,
-    owner: OwnerAuthority,
+    /// The daemon's owner authority, which this service shares with every other holder of it.
+    owner: Arc<OwnerAuthority>,
     /// The rendezvous service code invitations are offered through, when this host has one.
     rendezvous: Option<Arc<dyn Rendezvous>>,
     /// The invitation this host is offering. One at a time: an invitation is single use, and a
@@ -303,7 +303,8 @@ impl std::fmt::Debug for PairingHost {
 }
 
 impl PairingHost {
-    /// Builds the pairing service of one daemon over its durable records.
+    /// Builds the pairing service of one daemon over its durable records and the daemon's owner
+    /// authority.
     ///
     /// `authorisation` is the host's own authorisation key pair, whose public half `identity`
     /// declares. `rendezvous` is the service code invitations are offered through; a host without
@@ -314,14 +315,9 @@ impl PairingHost {
         authorisation: AuthorisationKeyPair,
         clock: HostPairingClock,
         rows: InvitationRows,
+        owner: Arc<OwnerAuthority>,
         rendezvous: Option<Arc<dyn Rendezvous>>,
     ) -> Arc<Self> {
-        let owner = OwnerAuthority::new(
-            identity.device_id,
-            identity.endpoint_id,
-            clock.clone(),
-            rows.clone(),
-        );
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             identity,
@@ -343,7 +339,7 @@ impl PairingHost {
 
     /// Returns the owner-confirmation service.
     #[must_use]
-    pub const fn owner(&self) -> &OwnerAuthority {
+    pub fn owner(&self) -> &OwnerAuthority {
         &self.owner
     }
 
@@ -397,7 +393,7 @@ impl PairingHost {
                         grant_kind: *grant_kind,
                         proposed_grant: proposed_grant.clone(),
                     },
-                    first_owner: is_owner_grant(*grant_kind, proposed_grant),
+                    bootstrap: is_owner_grant(*grant_kind, proposed_grant),
                 }
             }
             ConfirmationSubject::ConfirmDevice { invitation_id } => {
@@ -423,17 +419,12 @@ impl PairingHost {
                         candidate: bound.view,
                         proposed_grant: invitation.proposed_grant.clone(),
                     },
-                    first_owner: is_owner_grant(invitation.grant_kind, &invitation.proposed_grant),
+                    bootstrap: is_owner_grant(invitation.grant_kind, &invitation.proposed_grant),
                 }
             }
-            ConfirmationSubject::EstablishClock => Resolved {
-                action: SensitiveAction::ChangeHostAuthority,
-                digest: clock_digest()?,
-                destination: None,
-                rights: CanonicalSet::new(),
-                display: ConfirmationDisplay::EstablishClock,
-                first_owner: false,
-            },
+            ConfirmationSubject::EstablishClock => {
+                return self.owner.request_clock(caller, action, admission);
+            }
             ConfirmationSubject::CatalogueAdd(_) | ConfirmationSubject::PluginInstall(_) => {
                 // These two are the catalogue's to describe: what an owner is shown comes from
                 // the repository's own records and its verified release, which only the daemon's
@@ -461,7 +452,7 @@ impl PairingHost {
                     destination: described.destination_keys.0,
                     rights: described.destination_rights.clone(),
                     display: ConfirmationDisplay::Described(described.clone()),
-                    first_owner: false,
+                    bootstrap: false,
                 }
             }
         };
@@ -496,33 +487,6 @@ impl PairingHost {
             return requested;
         }
         self.owner.request(caller, resolved, action, admission)
-    }
-
-    /// `owner.confirmation.pending`: the challenges an owner can still answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PERMISSION_DENIED` for a caller without owner authority.
-    pub fn pending_confirmations(&self, caller: &Caller) -> Result<OwnerConfirmationPendingResult> {
-        self.owner.pending(caller)
-    }
-
-    /// `owner.confirmation.complete`: verifies and records an answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal [`OwnerAuthority::complete`] decides.
-    pub fn complete_confirmation(
-        &self,
-        caller: &Caller,
-        params: &OwnerConfirmationCompleteParams,
-        action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
-    ) -> Result<OwnerConfirmationCompleteResult> {
-        if let Some(completed) = self.owner.completed(caller, action) {
-            return completed;
-        }
-        self.owner.complete(caller, params, action, admission)
     }
 
     /// `pair.invite`: issues one invitation under a fresh owner confirmation naming its grant.
@@ -1060,23 +1024,6 @@ impl PairingHost {
         self.recorded_status(caller, params.invitation_id)
     }
 
-    /// Consumes an answered clock confirmation, immediately before the clock is trusted again.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OWNER_CONFIRMATION_REQUIRED` without an answered confirmation naming the clock.
-    pub fn accept_clock(&self) -> Result<()> {
-        let rights = CanonicalSet::new();
-        let expectation = self.owner.expectation(
-            SensitiveAction::ChangeHostAuthority,
-            clock_digest()?,
-            None,
-            &rights,
-        );
-        self.owner
-            .consume_for(&expectation, "establish this host's clock")
-    }
-
     /// Answers the issuing owner from the durable record, once the invitation object is gone.
     fn recorded_status(
         &self,
@@ -1219,6 +1166,9 @@ impl PairingHost {
             ActionSubject::Ended(invitation_id) => self
                 .recorded_status(caller, invitation_id)
                 .and_then(|answer| encode(&answer)),
+            ActionSubject::ClockEstablished(confirmation_id) => {
+                encode(&HostClockEstablishResult { confirmation_id })
+            }
         })
     }
 
@@ -1811,10 +1761,6 @@ const fn kind_of(kind: InviteGrantKind) -> GrantKind {
 /// Returns true when a proposal is a personal owner grant, which is what establishes an owner.
 fn is_owner_grant(kind: InviteGrantKind, proposed: &ProposedGrant) -> bool {
     kind == InviteGrantKind::PersonalOwner && proposed.actions.contains(&ActionRight::HostManage)
-}
-
-fn clock_digest() -> Result<Digest256> {
-    kr_pairing::confirm::action_digest(&CLOCK_PURPOSE).map_err(refusal)
 }
 
 /// Returns the origin a code invitation reserves at: the one named, or this host's default.
