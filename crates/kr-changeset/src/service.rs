@@ -371,9 +371,10 @@ impl ChangeSetService {
     /// independent clone's own Git directory when it makes the clone, and takes the one it finds
     /// the first time an open that writes (a capture, a removal's measurement, a recovery) meets a
     /// clone made before that; this record is what the first capture found, which still refuses a
-    /// repository substituted before the project service took its own. A record that is the same repository under another device number, or that was made
-    /// before filesystems were recorded, takes what the repository is now. A shared workspace
-    /// needs none of it: the project service's own record is what that one is compared with.
+    /// repository substituted before the project service took its own. A record that is the same
+    /// repository under another device number, or that was made before filesystems were recorded,
+    /// takes what the repository is now. A shared workspace needs none of it: the project
+    /// service's own record is what that one is compared with.
     ///
     /// # Errors
     ///
