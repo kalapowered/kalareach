@@ -54,11 +54,13 @@
 //! the identifier is not a claim: a caller that presents a key and a signature has already proved
 //! which installation it is.
 //!
-//! An identifier is 128 bits, so it names a key rather than proving one. A service therefore keeps
-//! the whole key it first saw against that identifier and compares against the key, not the
-//! identifier, on every later request: a different key under the same identifier is refused rather
-//! than admitted, which is what makes replacing an installation key a deliberate step rather than a
-//! side effect of asking.
+//! An identifier is 128 bits, so it names a key rather than proving one. A service that keeps an
+//! installation record, as the push gateway does for registration, therefore keeps the whole key it
+//! first saw against that identifier and compares against the key, not the identifier: replacing a
+//! recorded key is a deliberate step, taken by a registration whose challenge the new key signs,
+//! and not a side effect of asking. The storage methods keep no such record: the signature verifies
+//! under the key the request presents, and the identifier that key derives has to equal the one the
+//! body names.
 
 use kr_cbor::{CborError, sha256, signing_value};
 use schemars::JsonSchema;
@@ -346,8 +348,8 @@ impl ServiceRequestSignature {
 /// one.
 ///
 /// It names a key; it does not stand in for one. A 128-bit value is short enough that a service
-/// compares the whole key it recorded against the key presented, and treats the identifier as the
-/// index it looks that key up by.
+/// that records installations compares the whole key it recorded against the key presented, and
+/// treats the identifier as the index it looks that key up by.
 #[must_use]
 pub fn installation_id(key: &AuthorisationKey) -> InstallationId {
     let digest = sha256(key.as_bytes());

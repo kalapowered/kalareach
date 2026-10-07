@@ -701,9 +701,12 @@ formatted with hyphens. It is derived rather than asserted: a caller that presen
 signature has already proved which installation it is, so no request body is taken to say who the
 caller is. A storage body does name its installation, but the service compares that name with the
 identifier the key derives and refuses a mismatch. An identifier is 128 bits, so it names a key
-rather than standing in for one: a service records the whole key it first saw, looks it up by the
-identifier, and compares against the key. A later request carrying a different key is refused, which
-makes replacing an installation key a deliberate step rather than a side effect of asking.
+rather than standing in for one. A service that keeps an installation record, as the push gateway
+does for registration, records the whole key it first saw, looks it up by the identifier, and
+compares against the key. Replacing a recorded key is then a deliberate step, taken by a registration
+whose challenge the new key signs, and not a side effect of asking. The storage methods keep no such
+record. The service checks the signature under the key the request presents, and the identifier that
+key derives has to equal the one the body names.
 
 Each of the eight `storage.*` methods lists `account_token` beside `service_credential` in its
 `required_rights`. This token must have the scope `backup.write`, and it names the account whose
