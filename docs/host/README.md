@@ -3550,8 +3550,8 @@ whatever is left is forced, and as the record is written.
 ## The transfer service
 
 The daemon hosts the environment's transfer service, which owns `transfers.sqlite` and a private
-staging directory under the state directory. The daemon owns three things about it: admission, the
-endpoints and the retention.
+staging directory under the state directory. The daemon owns four things about it: admission, the
+endpoints, the retention and the end of a closed session's insertions.
 
 Admission is the ordinary path. A transfer read is checked against current authority before and
 after it runs. A transfer mutation carries an action window, is checked against the method registry,
@@ -3589,6 +3589,14 @@ hourly sweep expires
 unfinished uploads after twenty-four hours, unused attachments after seven days, and download
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
+
+A session whose worker has ended has no agent to take what was offered to it. When the daemon
+records the closure it ends that session's insertions: each binding no upstream evidence confirmed
+becomes `failed`, and a binding or the record of a new prompt for a draft of the session is refused
+with `SESSION_CLOSED` from then on. The completed upload keeps its identity. The write runs on its own
+task, so a closure does not wait for it. The daemon repeats it for every closure the registry holds
+at each start, before it serves a transfer, and at each sweep, which makes up for a write that did
+not happen or failed.
 
 Everything beneath an authorised root is reached through `AuthorisedDirectory` and
 `AuthorisedFile`, which hold handles rather than names: what a handle is asked about is the

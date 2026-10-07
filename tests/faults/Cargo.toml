@@ -36,6 +36,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The digest an upload declares.
+kr-cbor.workspace = true
 # A session attached over the worker's own endpoint, with the product's client.
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }

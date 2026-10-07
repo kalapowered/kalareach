@@ -4517,6 +4517,7 @@ name = "kr-faults"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "kr-cbor",
  "kr-cli",
  "kr-client",
  "kr-controller",

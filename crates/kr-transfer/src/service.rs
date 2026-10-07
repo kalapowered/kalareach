@@ -2071,8 +2071,10 @@ impl TransferService {
     ///
     /// Returns [`TransferError::DraftConflict`] for a stale revision,
     /// [`TransferError::IdConflict`] when the action identifier carried another payload,
-    /// [`TransferError::WrongState`] when the attachment is not published, and
-    /// [`TransferError::InvalidArgument`] when the declared contribution does not admit it.
+    /// [`TransferError::WrongState`] when the attachment is not published,
+    /// [`TransferError::SessionEnded`] when the session of the draft or of the attachment has
+    /// ended, and [`TransferError::InvalidArgument`] when the declared contribution does not admit
+    /// it.
     pub fn draft_add_attachment(
         &self,
         actor: &ActorId,
@@ -2253,6 +2255,30 @@ impl TransferService {
         }
     }
 
+    /// Records `sessions` as ended, because they have no worker any more, and ends the offers made
+    /// to their agents.
+    ///
+    /// An insertion is the adapter's offer of an attachment to a live session's agent, so it ends
+    /// with the session's worker. Every binding that no upstream evidence confirmed, of a draft that
+    /// targets one of the sessions or was sent to one or of an upload that is the session's, is
+    /// failed, and its draft takes a revision.
+    /// An insertion the agent accepted stays accepted, and the completed upload is untouched: its
+    /// handle, its bytes and its digest are what they were. A binding or a prompt for a draft of an
+    /// ended session is refused from then on ([`TransferError::SessionEnded`]). The call is the same
+    /// for a session already ended. Returns how many bindings it failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be written; nothing is
+    /// recorded then.
+    pub fn end_session_insertions(&self, sessions: &BTreeSet<SessionId>) -> Result<usize> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+        let now = self.clock.now_ms();
+        self.locked()?.end_sessions(sessions, now)
+    }
+
     /// Records what an adapter reported about one binding.
     ///
     /// A failure keeps the draft and the completed upload. Acceptance requires upstream evidence,
@@ -2260,7 +2286,9 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::UnknownDraft`] when nothing is named, or
+    /// Returns [`TransferError::UnknownDraft`] when nothing is named,
+    /// [`TransferError::SessionEnded`] when the draft's session has ended (a report that arrives
+    /// after the session's worker did cannot change what that end decided), or
     /// [`TransferError::InvalidArgument`] when the attachment is not bound to that draft.
     pub fn record_insertion_outcome(
         &self,

@@ -2309,6 +2309,33 @@ impl Registry {
             .transpose()
     }
 
+    /// Returns every session a closure is recorded for, without reading the records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn closed_sessions(&self) -> Result<Vec<SessionId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT session_id FROM tombstones")
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(ControllerError::registry)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            let bytes: [u8; 16] = row
+                .map_err(ControllerError::registry)?
+                .as_slice()
+                .try_into()
+                .map_err(|_| ControllerError::registry("a tombstone names no session"))?;
+            sessions.push(SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                bytes,
+            )));
+        }
+        Ok(sessions)
+    }
+
     /// Records a closed session and removes its worker row.
     ///
     /// # Errors

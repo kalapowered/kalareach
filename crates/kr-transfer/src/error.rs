@@ -134,6 +134,12 @@ pub enum TransferError {
     /// Local inter-process communication failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
+    /// The session the draft belongs to has ended.
+    ///
+    /// Nothing is offered to the agent of a session whose worker is gone, so a binding or a prompt
+    /// for its draft is refused rather than recorded as an offer that cannot have been made.
+    #[error("the session this draft belongs to has ended")]
+    SessionEnded,
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -218,6 +224,7 @@ impl TransferError {
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
             Self::Retained { code, .. } => *code,
             Self::Ipc(error) => error.code(),
+            Self::SessionEnded => ErrorCode::SessionClosed,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::NotAdmitted(refusal) => refusal.code,
         }

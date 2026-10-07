@@ -777,6 +777,502 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
     assert_eq!(after.revision, reread.revision);
 }
 
+/// KR-REQ-24.09: ending a session fails what its agent never confirmed and leaves what it did, for
+/// a draft that was sent to the session. The binding the agent accepted stays accepted, a prompt,
+/// a binding or an adapter's late report for the ended session is refused, and an upload that
+/// belongs to the ended session cannot be bound to a draft that names none.
+#[test]
+fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
+    let harness = Harness::create();
+    let session = SessionId::new(Uuid::from_bytes([21; 16]));
+    let sessionless = |harness: &Harness| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    application_instance_id: Nullable::null(),
+                    text: "no session yet".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let bind = |harness: &Harness, draft: &kr_protocol::transfer::DraftRecord, name: &str| {
+        let handle = harness.publish(&pattern(70 + name.len()), "image/png", name);
+        let bound = harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: draft.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+        (bound.draft, handle)
+    };
+
+    // A draft that names no session, two bindings, one of them accepted by the agent, then sent.
+    let (draft_one, first) = bind(&harness, &sessionless(&harness), "first.png");
+    let (draft_one, second) = bind(&harness, &draft_one, "second.png");
+    harness
+        .service
+        .record_insertion_outcome(
+            &harness.actor,
+            draft_one.draft_id,
+            second.transfer_id,
+            &InsertionOutcome::AcceptedByAgent {
+                upstream_evidence: "the agent's own part".to_owned(),
+            },
+        )
+        .expect("records the agent's evidence");
+    harness
+        .service
+        .record_prompt(
+            &harness.actor,
+            draft_one.draft_id,
+            session,
+            &Admission::none(),
+        )
+        .expect("sends the draft to the session");
+
+    let accepted_before = harness
+        .service
+        .draft(&harness.actor, draft_one.draft_id)
+        .expect("reads the draft")
+        .attachments
+        .into_iter()
+        .find(|attachment| attachment.handle.transfer_id == second.transfer_id)
+        .expect("the accepted binding is there");
+
+    let failed = harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([session]))
+        .expect("ends the session's insertions");
+    assert_eq!(failed, 1, "only the binding nobody confirmed");
+    let read = harness
+        .service
+        .draft(&harness.actor, draft_one.draft_id)
+        .expect("reads the draft");
+    let state_of = |transfer_id| {
+        read.attachments
+            .iter()
+            .find(|attachment| attachment.handle.transfer_id == transfer_id)
+            .expect("the binding is there")
+            .state
+    };
+    assert_eq!(state_of(first.transfer_id), InsertionState::Failed);
+    assert_eq!(
+        state_of(second.transfer_id),
+        InsertionState::AcceptedByAgent
+    );
+    let accepted_after = read
+        .attachments
+        .iter()
+        .find(|attachment| attachment.handle.transfer_id == second.transfer_id)
+        .expect("the accepted binding is there");
+    assert_eq!(
+        accepted_after, &accepted_before,
+        "an insertion the agent accepted is untouched, evidence and all"
+    );
+
+    // The session has ended: a later prompt, binding and report are each refused as such.
+    let other = sessionless(&harness);
+    let prompt = harness
+        .service
+        .record_prompt(&harness.actor, other.draft_id, session, &Admission::none())
+        .expect_err("a prompt for an ended session");
+    assert_eq!(prompt.code(), ErrorCode::SessionClosed);
+    let report = harness
+        .service
+        .record_insertion_outcome(
+            &harness.actor,
+            draft_one.draft_id,
+            first.transfer_id,
+            &InsertionOutcome::AcceptedByAgent {
+                upstream_evidence: "a report that came late".to_owned(),
+            },
+        )
+        .expect_err("a report for an ended session");
+    assert_eq!(report.code(), ErrorCode::SessionClosed);
+
+    // An upload that belongs to the ended session cannot be offered to a draft that names none.
+    let owned = harness
+        .begin_for(
+            &pattern(90),
+            "image/png",
+            "owned.png",
+            Nullable::some(session),
+        )
+        .expect("reserves an upload for the session");
+    harness
+        .send_all(owned.transfer_id, &pattern(90))
+        .expect("sends it");
+    let owned = harness
+        .finish(owned.transfer_id, &pattern(90))
+        .expect("publishes it")
+        .handle;
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: other.draft_id,
+                expected_revision: other.revision,
+                transfer_id: owned.transfer_id,
+                contribution: contribution(&owned, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect_err("an upload of an ended session");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed);
+}
+
+/// KR-REQ-24.09: an insertion whose upload belongs to the session that ends fails with it, though
+/// its draft names no session and was never sent to one, and an insertion whose upload belongs to
+/// another session stays. The draft takes one revision for the one binding.
+#[test]
+fn ending_a_session_fails_an_insertion_whose_upload_it_owns_though_the_draft_names_none() {
+    let harness = Harness::create();
+    let ending = SessionId::new(Uuid::from_bytes([31; 16]));
+    let staying = SessionId::new(Uuid::from_bytes([32; 16]));
+    let upload_of = |session: SessionId, name: &str| {
+        let bytes = pattern(60 + name.len());
+        let begun = harness
+            .begin_for(&bytes, "image/png", name, Nullable::some(session))
+            .expect("reserves an upload for the session");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends it");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes it")
+            .handle
+    };
+    let owned = upload_of(ending, "owned.png");
+    let other = upload_of(staying, "other.png");
+
+    let bound = |draft: &kr_protocol::transfer::DraftRecord,
+                 handle: &kr_protocol::transfer::AttachmentHandle| {
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: draft.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(handle, InsertionMethod::TypedSubmission),
+                },
+                None,
+            )
+            .expect("binds the attachment")
+            .draft
+    };
+    let created = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                text: "names no session".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    let current = bound(&bound(&created, &owned), &other);
+
+    let failed = harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([ending]))
+        .expect("ends the session's insertions");
+    assert_eq!(failed, 1, "only the binding whose upload the session owns");
+    let read = harness
+        .service
+        .draft(&harness.actor, current.draft_id)
+        .expect("reads the draft");
+    let state_of = |transfer_id| {
+        read.attachments
+            .iter()
+            .find(|attachment| attachment.handle.transfer_id == transfer_id)
+            .expect("the binding is there")
+            .state
+    };
+    assert_eq!(state_of(owned.transfer_id), InsertionState::Failed);
+    assert_eq!(state_of(other.transfer_id), InsertionState::Recorded);
+    assert_eq!(read.revision.get(), current.revision.get() + 1);
+}
+
+/// KR-REQ-24.09: the end of a session's worker fails the insertion its agent never confirmed, and
+/// that never makes a draft unreadable. A draft grown to the largest size the service takes is
+/// still readable afterwards, because a failed binding carries no reason text, and a binding for
+/// the ended session's draft is refused from then on.
+#[test]
+fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_readable() {
+    let harness = Harness::create();
+    let handle = harness.publish(&pattern(64), "image/png", "photo.png");
+    let created = draft(&harness);
+    let session = created.session_id.0.expect("a session");
+    let mut current = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: created.draft_id,
+                expected_revision: created.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect("binds the attachment")
+        .draft;
+
+    // Grow the text to the largest the service takes: a refused update changes nothing, so the
+    // search ends holding the last text that was accepted.
+    let (mut accepted, mut refused) = (0_usize, 1024 * 1024_usize);
+    while refused - accepted > 1 {
+        let middle = accepted + (refused - accepted) / 2;
+        match harness.service.draft_update(
+            &harness.actor,
+            &DraftUpdateParams {
+                draft_id: current.draft_id,
+                expected_revision: current.revision,
+                text: "a".repeat(middle),
+            },
+            None,
+        ) {
+            Ok(updated) => {
+                current = updated.draft;
+                accepted = middle;
+            }
+            Err(error) => {
+                assert_eq!(error.code(), ErrorCode::QuotaExceeded, "{error:?}");
+                refused = middle;
+            }
+        }
+    }
+    assert!(accepted > 1024, "the search found a limit near the budget");
+
+    let failed = harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([session]))
+        .expect("ends the session's insertions");
+    assert_eq!(failed, 1);
+    let read = harness
+        .service
+        .draft(&harness.actor, current.draft_id)
+        .expect("a draft at its size limit is still readable");
+    assert_eq!(read.attachments[0].state, InsertionState::Failed);
+    assert_eq!(read.text.len(), accepted, "the text is what it was");
+    let kept = &read.attachments[0].handle;
+    assert_eq!(
+        kept.transfer_id, handle.transfer_id,
+        "the file is what it was"
+    );
+    assert_eq!(kept.content_digest, handle.content_digest);
+    assert_eq!(kept.byte_len, handle.byte_len);
+
+    let late = harness.publish(&pattern(65), "image/png", "later.png");
+    let another = draft(&harness);
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: another.draft_id,
+                expected_revision: another.revision,
+                transfer_id: late.transfer_id,
+                contribution: contribution(&late, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect_err("a binding for an ended session is refused");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed);
+}
+
+/// KR-REQ-24.09: a binding found `recorded` for a session that is already ended is failed the next
+/// time the session is ended, because the end reads every `recorded` binding and not only those of
+/// sessions it newly ends. Such a binding is left by a build that does not know the record of ended
+/// sessions, running over a journal still at the unsettled version, and by a stop between the
+/// start's closure step and a settling that gives an unassigned upload to an ended session. SQL
+/// writes one here.
+#[test]
+fn a_binding_recorded_for_an_already_ended_session_is_failed_when_the_session_is_ended_again() {
+    let harness = Harness::create();
+    let handle = harness.publish(&pattern(64), "image/png", "photo.png");
+    let created = draft(&harness);
+    let session = created.session_id.0.expect("a session");
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: created.draft_id,
+                expected_revision: created.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect("binds the attachment");
+    let sessions = std::collections::BTreeSet::from([session]);
+    assert_eq!(
+        harness
+            .service
+            .end_session_insertions(&sessions)
+            .expect("ends the session's insertions"),
+        1
+    );
+    assert_eq!(
+        harness
+            .service
+            .end_session_insertions(&sessions)
+            .expect("ends them again"),
+        0,
+        "nothing is left to fail"
+    );
+
+    // A binding written beneath the service: asked, and not confirmed.
+    rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+        &harness.host.environment(),
+    ))
+    .expect("opens the journal")
+    .execute("UPDATE draft_attachments SET state = 'recorded'", [])
+    .expect("writes the binding");
+    let before = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect("reads the draft");
+    assert_eq!(before.attachments[0].state, InsertionState::Recorded);
+
+    assert_eq!(
+        harness
+            .service
+            .end_session_insertions(&sessions)
+            .expect("ends the session's insertions again"),
+        1
+    );
+    let after = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect("reads the draft");
+    assert_eq!(after.attachments[0].state, InsertionState::Failed);
+    let kept = &after.attachments[0].handle;
+    assert_eq!(
+        kept.transfer_id, handle.transfer_id,
+        "the file is what it was"
+    );
+    assert_eq!(kept.content_digest, handle.content_digest);
+}
+
+/// KR-REQ-24.09: an insertion whose upload names no session still fails with the session its draft
+/// targets, or the session its draft was sent to, and a late report for it is refused by the same
+/// session. The service gives a bound upload its draft's session, so SQL clears it here, as a
+/// journal written before it did would hold it.
+#[test]
+fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_session() {
+    let harness = Harness::create();
+    let targeted_session = SessionId::new(Uuid::from_bytes([41; 16]));
+    let sent_session = SessionId::new(Uuid::from_bytes([42; 16]));
+    let bind_for = |draft: &kr_protocol::transfer::DraftRecord, name: &str| {
+        let handle = harness.publish(&pattern(50 + name.len()), "image/png", name);
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: draft.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+                },
+                None,
+            )
+            .expect("binds the attachment")
+            .draft
+    };
+    let create = |session: Nullable<SessionId>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: session,
+                    application_instance_id: Nullable::null(),
+                    text: "a draft".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+
+    // One draft targets the first session. Another names none and is sent to the second.
+    let targeting = bind_for(&create(Nullable::some(targeted_session)), "targeted.png");
+    let sent = bind_for(&create(Nullable::null()), "sent.png");
+    harness
+        .service
+        .record_prompt(
+            &harness.actor,
+            sent.draft_id,
+            sent_session,
+            &Admission::none(),
+        )
+        .expect("sends the draft to the session");
+    rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+        &harness.host.environment(),
+    ))
+    .expect("opens the journal")
+    .execute("UPDATE uploads SET session_id = NULL", [])
+    .expect("clears the uploads' sessions");
+
+    let failed = harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([
+            targeted_session,
+            sent_session,
+        ]))
+        .expect("ends the sessions' insertions");
+    assert_eq!(failed, 2, "one by the draft's target, one by its prompt");
+    for draft in [targeting.draft_id, sent.draft_id] {
+        let read = harness
+            .service
+            .draft(&harness.actor, draft)
+            .expect("reads the draft");
+        assert_eq!(read.attachments[0].state, InsertionState::Failed);
+
+        // A late report is refused by the draft's own session, there being no other to match: the
+        // upload names none and the report carries none.
+        let report = harness
+            .service
+            .record_insertion_outcome(
+                &harness.actor,
+                draft,
+                read.attachments[0].handle.transfer_id,
+                &InsertionOutcome::AcceptedByAgent {
+                    upstream_evidence: "a report that came late".to_owned(),
+                },
+            )
+            .expect_err("a report for an ended session");
+        assert_eq!(report.code(), ErrorCode::SessionClosed);
+    }
+}
+
 /// The action a draft call is performed under: `id` is the caller's durable identifier, and the
 /// payload stands for what the call carries.
 fn draft_action(harness: &Harness, id: Uuid, method: &str, payload: &[u8]) -> Action {

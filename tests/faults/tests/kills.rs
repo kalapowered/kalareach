@@ -45,18 +45,24 @@ use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachPar
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    ActionId, AttachmentId, BuildId, EnvironmentId, InputLeaseEpoch, InputSequence, SessionEpoch,
-    SessionId,
+    ActionId, ActorId, AttachmentId, BuildId, DraftId, EnvironmentId, InputLeaseEpoch,
+    InputSequence, SessionEpoch, SessionId,
 };
 use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSnapshotParams, EventsSnapshotResult};
-use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
+use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, U64};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, Dimensions, Presentation, SESSION_CLOSED_EVENT,
     SessionCloseParams, SessionCreateParams, SessionCreateResult, SessionReadParams,
     SessionReadResult, SessionState, ShellMode,
+};
+
+use kr_protocol::transfer::{
+    AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
+    AttachmentHandle, ChunkDescriptor, DraftCreateParams, DraftCreateResult, DraftRecord,
+    InsertionMethod, InsertionState, UploadBeginParams, UploadChunkParams, UploadFinishParams,
 };
 
 #[path = "../../../crates/kr-controller/tests/teardown/mod.rs"]
@@ -108,6 +114,11 @@ const HALF_READY: &str = "KR_KILLS_READY";
 /// The client half's name, as the test harness selects it.
 const CLIENT_HALF: &str = "serve_a_client_half_for_the_kill_stage";
 
+/// The principal the daemon makes of a local client of this user.
+fn local_actor() -> ActorId {
+    ActorId::new(format!("local:{}", kr_ipc::paths::current_uid())).expect("a principal")
+}
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -156,7 +167,7 @@ struct Host {
     tree: teardown::Tree,
     environment_id: EnvironmentId,
     root_program: PathBuf,
-    _controller: Arc<Controller>,
+    controller: Arc<Controller>,
 }
 
 impl Host {
@@ -219,8 +230,145 @@ impl Host {
             tree,
             environment_id,
             root_program,
-            _controller: controller,
+            controller,
         }
+    }
+
+    /// Publishes a file for a session: the upload is made and finished in the transfer service,
+    /// which is set-up and not what the tests below are about.
+    fn publish_for(&self, session_id: SessionId, bytes: &[u8]) -> AttachmentHandle {
+        let service = self.controller.transfer().service();
+        let actor = local_actor();
+        let digest = Digest256::from_bytes(kr_cbor::sha256(bytes));
+        let length = U64::new(bytes.len() as u64);
+        let begun = service
+            .upload_begin(
+                &actor,
+                &UploadBeginParams {
+                    environment_id: self.environment_id,
+                    session_id: Nullable::some(session_id),
+                    device_id: Nullable::null(),
+                    declared_byte_len: length,
+                    declared_digest: digest,
+                    declared_media_type: "application/octet-stream".to_owned(),
+                    original_file_name: "notes.bin".to_owned(),
+                },
+                None,
+            )
+            .expect("reserves the upload");
+        assert_eq!(begun.layout.chunk_count, U64::new(1), "one chunk holds it");
+        service
+            .upload_chunk(
+                &actor,
+                &UploadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    chunk: ChunkDescriptor {
+                        index: U64::new(0),
+                        byte_len: length,
+                        digest,
+                    },
+                    bytes: Bytes::new(bytes.to_vec()),
+                },
+                None,
+            )
+            .expect("takes the chunk");
+        service
+            .upload_finish(
+                &actor,
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: length,
+                    declared_digest: digest,
+                },
+                None,
+            )
+            .expect("publishes the attachment")
+            .handle
+    }
+
+    /// What an adapter's offer of an attachment to a session's agent comes to at the daemon: a draft
+    /// that targets the session is created and the file is bound to it, both through the daemon's
+    /// own methods, as an insertion no upstream evidence has confirmed.
+    async fn offer_attachment(
+        &self,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) -> (DraftId, AttachmentHandle) {
+        let handle = self.publish_for(session_id, bytes);
+        let draft: DraftCreateResult = self
+            .daemon()
+            .await
+            .mutate(
+                Method::DraftCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(session_id),
+                &DraftCreateParams {
+                    environment_id: self.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(session_id),
+                    application_instance_id: Nullable::null(),
+                    text: "have a look at this".to_owned(),
+                },
+            )
+            .await
+            .expect("the create reaches the daemon")
+            .unwrap_or_else(|error| panic!("the daemon refused the draft: {error}"))
+            .to_typed()
+            .expect("decodes the draft");
+        let bound = self
+            .bind(
+                session_id,
+                draft.draft.draft_id,
+                draft.draft.revision,
+                &handle,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the daemon refused the binding: {error}"));
+        assert_eq!(bound.attachment.state, InsertionState::Recorded);
+        (draft.draft.draft_id, handle)
+    }
+
+    /// Binds a published file to a draft through the daemon.
+    async fn bind(
+        &self,
+        session_id: SessionId,
+        draft_id: DraftId,
+        expected_revision: kr_protocol::ids::DraftRevision,
+        handle: &AttachmentHandle,
+    ) -> Result<AgentDraftAddAttachmentResult, kr_protocol::error::ProtocolError> {
+        self.daemon()
+            .await
+            .mutate(
+                Method::AgentDraftAddAttachment,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(session_id),
+                &AgentDraftAddAttachmentParams {
+                    draft_id,
+                    expected_revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: AttachmentContribution {
+                        operation_id: "attach".to_owned(),
+                        accepted_media_types: vec![handle.declared_media_type.clone()],
+                        max_byte_len: U64::new(1024),
+                        max_count: U64::new(2),
+                        insertion_method: InsertionMethod::VerifiedComposerInsertion,
+                        external_destination: Nullable::null(),
+                        model_media_capability: false,
+                    },
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .map(|answer| answer.to_typed().expect("decodes the binding"))
+    }
+
+    /// The draft as the transfer service holds it.
+    fn draft(&self, draft_id: DraftId) -> DraftRecord {
+        self.controller
+            .transfer()
+            .service()
+            .draft(&local_actor(), draft_id)
+            .expect("reads the draft")
     }
 
     fn environment(&self) -> EnvironmentPaths {
@@ -850,6 +998,68 @@ async fn a_worker_killed_with_a_paste_open_and_output_flowing_ends_its_session_a
     let closure = host.closure(session_id).await;
     assert_eq!(closure.reason, ClosureReason::WorkerCrash, "{closure:?}");
     host.nothing_restarts(session_id).await;
+}
+
+/// KR-REQ-24.09: a worker's death invalidates the insertion its agent never confirmed and leaves
+/// the completed file's identity alone. A binding made after the end is refused, and the session
+/// that stays up keeps its insertion as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_workers_unconfirmed_insertion_fails_and_its_completed_upload_keeps_its_identity() {
+    let host = Host::start().await;
+    let (ended_work, kept_work) = (host.work("insertion-ended"), host.work("insertion-kept"));
+    let (ended, _) = host.create(&ended_work).await;
+    let (kept, _) = host.create(&kept_work).await;
+    let (ended_draft, ended_handle) = host
+        .offer_attachment(ended, b"for the session that ends")
+        .await;
+    let (kept_draft, kept_handle) = host
+        .offer_attachment(kept, b"for the session that stays")
+        .await;
+    let before = host.draft(ended_draft);
+
+    let worker = host.worker_of(ended).await;
+    kill_worker(&worker).await;
+    let closure = host.closure(ended).await;
+    assert_eq!(closure.reason, ClosureReason::WorkerCrash, "{closure:?}");
+
+    let after = until("the dead worker's insertion to fail", || {
+        let draft = host.draft(ended_draft);
+        (draft.attachments[0].state == InsertionState::Failed).then_some(draft)
+    })
+    .await;
+    assert!(after.revision.get() > before.revision.get(), "{after:?}");
+    assert_eq!(
+        after.attachments[0].handle, ended_handle,
+        "the completed file's identity is what it was"
+    );
+    let service = host.controller.transfer().service();
+    assert_eq!(
+        service
+            .attachment_handle(&local_actor(), ended_handle.transfer_id)
+            .expect("the upload is still published"),
+        ended_handle
+    );
+
+    // Nothing is offered to the agent of a session that has ended: a later binding is refused.
+    let late = host.publish_for(ended, b"too late for the session that ended");
+    let refusal = host
+        .bind(ended, ended_draft, after.revision, &late)
+        .await
+        .expect_err("a binding for an ended session is refused");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::SessionClosed,
+        "{refusal:?}"
+    );
+
+    // The control: the session whose worker lives has the insertion it had.
+    let held = host.draft(kept_draft);
+    assert_eq!(
+        held.attachments[0].state,
+        InsertionState::Recorded,
+        "{held:?}"
+    );
+    assert_eq!(held.attachments[0].handle, kept_handle);
 }
 
 /// The control: the same session closed on request instead is closed as requested, every terminal

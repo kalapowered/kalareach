@@ -874,6 +874,9 @@ impl Controller {
         // though it had: the next start tries again, and nothing serves a device from a directory
         // behind the journal in the meantime.
         controller.recover_preview_keys()?;
+        // Every closure the registry holds is known to the transfer journal before anything is
+        // served, so a binding for a closed session is refused from the first request.
+        crate::transfer::end_the_insertions_of_closed_sessions(&controller).await?;
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
