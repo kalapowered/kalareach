@@ -459,6 +459,15 @@ pub(super) struct Served {
     _temp: kr_ipc::testing::TempHost,
 }
 
+/// What is left of a [`Served`] once its daemon is taken from it ([`Served::into_daemon`]): the
+/// worker, stopped before the tree they share is removed.
+pub(super) struct Standing {
+    /// Declared first, so the worker is stopped before anything else is let go.
+    _stopping: Stopping,
+    /// Declared last, so the tree is removed after the worker's handles to it are gone.
+    _temp: kr_ipc::testing::TempHost,
+}
+
 /// What stops the worker of a [`Served`] when the fixture goes.
 struct Stopping {
     service: Arc<kr_worker::service::WorkerService>,
@@ -683,6 +692,18 @@ impl Served {
             session_id,
             _temp: temp,
         }
+    }
+
+    /// The daemon, apart from what keeps the rest of the fixture standing: the worker, and the tree
+    /// they share, until the returned [`Standing`] is dropped.
+    pub(super) fn into_daemon(self) -> (Arc<Controller>, Standing) {
+        let Self {
+            _stopping,
+            controller,
+            _temp,
+            ..
+        } = self;
+        (controller, Standing { _stopping, _temp })
     }
 
     /// A daemon and a real worker, with the row the registry holds of a worker it has recorded.

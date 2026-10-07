@@ -25,6 +25,8 @@ use super::capabilities::{DesktopReading, capability_revision, resolved_desktop}
 use super::inhibition::DemandScan;
 use super::{Clocks, Controller, net};
 
+#[cfg(test)]
+use super::BlockingPause;
 #[cfg(any(feature = "testing", test))]
 use super::ReadPause;
 
@@ -657,6 +659,8 @@ impl Controller {
             before_a_created_session_is_read: ReadPause::default(),
             #[cfg(test)]
             before_a_worker_is_made_known: ReadPause::default(),
+            #[cfg(test)]
+            before_a_descriptor_is_written: BlockingPause::default(),
             #[cfg(test)]
             stopped_at: std::sync::Mutex::new(None),
             boot_identity: setup.boot_identity,

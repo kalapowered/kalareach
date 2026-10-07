@@ -222,15 +222,30 @@ impl Controller {
     /// Writes a worker's descriptor, on a thread that may block: the write waits for the disk twice
     /// and, where a rename is refused for a moment, tries again for seconds, which a thread that
     /// serves every other client of this daemon must not spend.
-    async fn write_descriptor(&self, worker: &KnownWorker) -> Result<()> {
-        let paths = self.paths.clone();
+    ///
+    /// The thread keeps the daemon until the write has ended. A write that was begun is finished
+    /// whatever becomes of the task that waits for it, and the environment's lock goes with the
+    /// daemon: a write that went on after the daemon had let the environment go could leave a
+    /// descriptor beside a closure after the next daemon's start had looked for one. A daemon that
+    /// is already being let go writes on the thread it is on, which it keeps until the write ends.
+    pub(super) async fn write_descriptor(&self, worker: &KnownWorker) -> Result<()> {
+        let Some(daemon) = self.me.upgrade() else {
+            return Ok(kr_ipc::descriptor::publish(
+                &self.paths,
+                &worker.descriptor,
+            )?);
+        };
         let descriptor = worker.descriptor.clone();
-        tokio::task::spawn_blocking(move || kr_ipc::descriptor::publish(&paths, &descriptor))
-            .await
-            .map_err(|_| {
-                ControllerError::supervision("the thread that writes a descriptor did not finish")
-            })?
-            .map_err(ControllerError::from)
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            daemon.before_a_descriptor_is_written.wait();
+            kr_ipc::descriptor::publish(&daemon.paths, &descriptor)
+        })
+        .await
+        .map_err(|_| {
+            ControllerError::supervision("the thread that writes a descriptor did not finish")
+        })?
+        .map_err(ControllerError::from)
     }
 
     /// Removes a session's published descriptor, which a closed session has none of.
