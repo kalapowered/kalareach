@@ -1929,8 +1929,8 @@ async fn hosted_worker_apart() -> Hosted {
 
 /// Creates one more session through `daemon` and performs the worker's side of the rendezvous in
 /// this process, so the daemon has one more verified worker it can announce to. The worker's
-/// session runtime and its connections run on this test's runtime, or on a runtime of their own
-/// when `apart`.
+/// session runtime, and the connections it serves, run on this test's runtime, or on a runtime of
+/// their own when `apart`.
 async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     let environment = daemon.environment.clone();
     let environment_id = daemon.environment_id;
