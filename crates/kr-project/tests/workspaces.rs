@@ -1180,7 +1180,11 @@ fn a_request_against_an_opened_independent_clone_does_not_search_above_its_tree(
     std::fs::remove_file(tree.join(".git/HEAD")).expect("the clone's repository is not one");
     assert!(
         profile.run_checked(&opened.read(&arguments)).is_err(),
-        "Git finds no repository for the clone instead of the one around it"
+        "a read finds no repository for the clone instead of the one around it"
+    );
+    assert!(
+        profile.run_checked(&opened.write(&arguments)).is_err(),
+        "a write finds none either"
     );
 }
 
@@ -1292,6 +1296,54 @@ fn an_independent_clone_whose_git_directory_was_replaced_is_not_read() {
     assert!(
         !git_started_in(&started, &named),
         "no Git invocation started in a clone whose repository is not the recorded one"
+    );
+}
+
+/// A path that leads to a directory inside an independent clone is not the clone: the path became
+/// a link to a directory in the clone's own place that holds another repository, and no Git
+/// invocation starts there.
+#[cfg(unix)]
+#[test]
+fn a_directory_inside_an_independent_clone_is_not_read_as_the_clone() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "inside-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "inside-clone",
+        IsolationMechanism::IndependentClone,
+        126,
+    );
+    let tree = fixture.work().join("inside-clone");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 127);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the clone is counted: {held:?}"
+    );
+
+    // The clone moves aside, another repository is made inside it, and the clone's path becomes a
+    // link to that directory.
+    let moved = fixture.work().join("inside-clone.moved");
+    std::fs::rename(&tree, &moved).expect("the clone moves aside");
+    let elsewhere = ordinary_repository(&moved, "inside");
+    std::os::unix::fs::symlink(&elsewhere, &tree).expect("the path leads to the directory");
+    let inside = std::fs::canonicalize(&elsewhere).expect("the directory resolves");
+    let held = measured(&fixture, workspace_id, 128);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the clone: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &inside),
+        "no Git invocation started in a directory inside the clone"
     );
 }
 

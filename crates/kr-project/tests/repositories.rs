@@ -2055,54 +2055,96 @@ fn on_publication(
     started
 }
 
-/// Puts another repository where `published` is, and the published one beside it.
+/// How what is at a published repository's path is replaced.
 #[cfg(unix)]
-fn another_repository_takes_the_place_of(published: &Path, other: &Path) {
-    std::fs::rename(published, published.with_extension("published"))
-        .expect("the published repository moves away");
-    let copied = std::process::Command::new("cp")
-        .arg("-R")
-        .arg(other)
-        .arg(published)
-        .status()
-        .expect("cp runs");
-    assert!(copied.success(), "another repository takes the name");
+#[derive(Clone, Copy)]
+enum Replacement {
+    /// Another repository takes the name.
+    Another,
+    /// The name becomes a link to a directory inside the published repository's place, which holds
+    /// another repository: a path that leads to a directory inside what was published.
+    InsideIt,
+}
+
+/// Moves the published repository to `<published>.published` and puts what `how` says at its path.
+#[cfg(unix)]
+fn replace_published(published: &Path, other: &Path, how: Replacement) {
+    let moved = published.with_extension("published");
+    std::fs::rename(published, &moved).expect("the published repository moves away");
+    let copy_into = |to: &Path| {
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(other)
+            .arg(to)
+            .status()
+            .expect("cp runs");
+        assert!(copied.success(), "another repository is copied in");
+    };
+    match how {
+        Replacement::Another => copy_into(published),
+        Replacement::InsideIt => {
+            let inside = moved.join("inside");
+            copy_into(&inside);
+            std::os::unix::fs::symlink(&inside, published).expect("a link to the directory");
+        }
+    }
 }
 
 /// What took the place of a repository a moment after it was published is not read as the
 /// published one: the object at the destination is decided by the identity staged for it before
-/// Git is asked anything there, and nothing of what is there is audited.
+/// Git is asked anything there, and nothing of what is there is audited. Nor is a directory inside
+/// what was published, which a path that became a link leads to.
 #[cfg(unix)]
 #[test]
 fn a_repository_that_takes_a_published_destinations_place_is_not_read_as_the_published_one() {
-    let mut fixture = Fixture::create();
-    let other = ordinary_repository(fixture.work(), "other");
-    let published = fixture.work().join("fresh");
-    let named = std::fs::canonicalize(fixture.work())
-        .expect("the directory resolves")
-        .join("fresh");
-    let started = on_publication(&mut fixture, move |_, list| {
-        // Nothing has read the destination yet: what is listed from here on is what the host does
-        // with whatever is there.
-        list.lock().expect("the list is held").clear();
-        another_repository_takes_the_place_of(&published, &other);
-    });
-    let refusal = fixture
-        .service()
-        .project_init(
-            &actor(),
-            &ProjectInitParams {
-                destination: destination(fixture.environment_id(), fixture.work(), "fresh"),
-                label: "fresh".to_owned(),
-                initial_branch: Nullable(Some("main".to_owned())),
-            },
-            Some(&action("project.init", 90)),
-        )
-        .expect_err("another repository at the destination is not the one that was published");
-    assert!(
-        !support::git_started_in(&started, &named),
-        "no Git invocation started in what took the name: {refusal}"
-    );
+    for (label, how, where_git_would_run, seed) in [
+        ("another repository", Replacement::Another, "fresh", 90),
+        (
+            "a directory inside it",
+            Replacement::InsideIt,
+            "fresh.published/inside",
+            94,
+        ),
+    ] {
+        let mut fixture = Fixture::create();
+        let other = ordinary_repository(fixture.work(), "other");
+        let published = fixture.work().join("fresh");
+        let moved = fixture.work().join("fresh.published");
+        let named = std::fs::canonicalize(fixture.work())
+            .expect("the directory resolves")
+            .join(where_git_would_run);
+        let started = on_publication(&mut fixture, move |_, list| {
+            // Nothing has read the destination yet: what is listed from here on is what the host
+            // does with whatever is there.
+            list.lock().expect("the list is held").clear();
+            replace_published(&published, &other, how);
+        });
+        let refusal = fixture
+            .service()
+            .project_init(
+                &actor(),
+                &ProjectInitParams {
+                    destination: destination(fixture.environment_id(), fixture.work(), "fresh"),
+                    label: "fresh".to_owned(),
+                    initial_branch: Nullable(Some("main".to_owned())),
+                },
+                Some(&action("project.init", seed)),
+            )
+            .expect_err("what is at the destination is not the repository that was published");
+        assert!(
+            moved.is_dir(),
+            "{label}: the replacement happened: {refusal}"
+        );
+        assert_eq!(
+            refusal.code(),
+            ErrorCode::OutcomeUnknown,
+            "{label}: {refusal}"
+        );
+        assert!(
+            !support::git_started_in(&started, &named),
+            "{label}: no Git invocation started in what took the name: {refusal}"
+        );
+    }
 }
 
 /// And so it does for a repository published beneath a location: what took the name after the
@@ -2123,12 +2165,13 @@ fn a_repository_that_takes_a_published_places_beneath_a_location_is_not_read_as_
         92,
     );
     let published = parent.join("fresh");
+    let moved = parent.join("fresh.published");
     let named = std::fs::canonicalize(&parent)
         .expect("the directory resolves")
         .join("fresh");
     let started = on_publication(&mut fixture, move |_, list| {
         list.lock().expect("the list is held").clear();
-        another_repository_takes_the_place_of(&published, &other);
+        replace_published(&published, &other, Replacement::Another);
     });
     let refusal = fixture
         .service()
@@ -2148,6 +2191,8 @@ fn a_repository_that_takes_a_published_places_beneath_a_location_is_not_read_as_
             Some(&action("project.init", 93)),
         )
         .expect_err("another repository at the destination is not the one that was published");
+    assert!(moved.is_dir(), "the replacement happened: {refusal}");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown, "{refusal}");
     assert!(
         !support::git_started_in(&started, &named),
         "no Git invocation started in what took the name: {refusal}"
@@ -2165,6 +2210,7 @@ fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read
     let mut fixture = Fixture::create();
     let other = ordinary_repository(fixture.work(), "other");
     let published = fixture.work().join("fresh");
+    let moved = fixture.work().join("fresh.published");
     let named = std::fs::canonicalize(fixture.work())
         .expect("the directory resolves")
         .join("fresh");
@@ -2181,7 +2227,7 @@ fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read
                 std::fs::set_permissions(&git_directory, std::fs::Permissions::from_mode(0o755))
                     .expect("the repository can be read again");
                 list.lock().expect("the list is held").clear();
-                another_repository_takes_the_place_of(&published, &other);
+                replace_published(&published, &other, Replacement::Another);
             }
         }
     });
@@ -2202,6 +2248,9 @@ fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read
         fixture.work().join("fresh/.git"),
         std::fs::Permissions::from_mode(0o755),
     );
+    // The second open is the one that ran after the replacement, so the publication was finished.
+    assert!(moved.is_dir(), "the replacement happened: {refusal}");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown, "{refusal}");
     assert!(
         !support::git_started_in(&started, &named),
         "no Git invocation started in what took the name: {refusal}"

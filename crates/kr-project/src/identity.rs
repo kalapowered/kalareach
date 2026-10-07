@@ -102,7 +102,8 @@ pub enum GitDirectory {
     /// The repository was made inside its tree, an independent clone or a repository this host
     /// staged: its Git directory is the tree's own `.git`, a directory and never a file or a link
     /// to another repository, and no other repository is its repository, so Git's search for one
-    /// is stopped above the tree.
+    /// is stopped above the tree. The directory at its path is the tree itself, never a directory
+    /// inside it.
     ///
     /// `recorded` is the record of that directory. A clone an earlier build recorded, and a
     /// repository that has only just been published, have none yet: the directory found is the
@@ -274,16 +275,18 @@ impl OpenedRepository {
     /// that tree, and that the repository Git finds is the recorded one, before anything else is
     /// done.
     ///
-    /// The directory is opened and decided by `require_within` first, and Git starts in that
-    /// object: a directory that took the place of the recorded tree, or a filesystem mounted over
-    /// it, is refused before Git is asked anything. A tree whose own `.git` the record names is
-    /// refused there too when that directory is not the recorded one. Git then reports the top
-    /// level of the repository it finds, and that top level is decided before its configuration
-    /// is audited: a repository whose top level is not the recorded tree, found inside or around
-    /// it, is refused unaudited. Its Git directory is decided the same way ([`GitDirectory`]), so
-    /// a repository around the tree whose configuration names the tree as its working tree, and
-    /// so reports the recorded tree as its top level, is refused before its configuration is
-    /// read.
+    /// The directory is opened and decided first, and Git starts in that object: a directory that
+    /// took the place of the recorded tree, or a filesystem mounted over it, is refused before Git
+    /// is asked anything. A repository registered through a directory below its top level may be
+    /// found inside the recorded tree (`require_within`); one made inside its tree
+    /// ([`GitDirectory::InsideTree`]) is found at the tree itself, and its own `.git` must be a
+    /// directory, and the recorded one where a record names it, before Git starts. Git then
+    /// reports the top level of the repository it finds, and that top level is decided before its
+    /// configuration is audited: a repository whose top level is not the recorded tree, found
+    /// inside or around it, is refused unaudited. Its Git directory is decided the same way
+    /// ([`GitDirectory`]), so a repository around the tree whose configuration names the tree as
+    /// its working tree, and so reports the recorded tree as its top level, is refused before its
+    /// configuration is read.
     ///
     /// For a repository made inside its tree Git's search is stopped at the directory above the
     /// tree, and that ceiling stays on the opened repository for every request made against it,
@@ -321,7 +324,18 @@ impl OpenedRepository {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
         let ceiling = match recorded {
             Some(recorded) => {
-                let within = require_within(&work_tree, recorded.tree)?;
+                // A repository made inside its tree is at the tree's own place and nowhere below
+                // it, so the directory at its path is the tree itself. A directory inside the
+                // tree is what Git would start in when a link at the path names one, and a
+                // repository found there is not the one the record is for. Any other repository
+                // may have been registered through a directory below its top level.
+                let within = match recorded.git_dir {
+                    GitDirectory::InsideTree { .. } => {
+                        decide_tree_before_git(&work_tree, recorded.tree)?;
+                        work_tree.try_clone()?
+                    }
+                    GitDirectory::Named(_) => require_within(&work_tree, recorded.tree)?,
+                };
                 recorded.git_dir.decide_before_git(&within)?;
                 recorded
                     .git_dir
