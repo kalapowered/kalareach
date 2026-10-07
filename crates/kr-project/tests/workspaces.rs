@@ -1165,6 +1165,89 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
     );
 }
 
+/// A directory of the same filesystem bound over a directory between a repository's top level and
+/// the directory it was registered through is not read as the registered one: it has the device
+/// number the recorded tree has, and only its own mount tells it from the tree it covers, so the
+/// climb from it to the recorded tree stops at the mount and no Git invocation starts in it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
+fn a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it() {
+    volumes::with_volumes(
+        "a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it",
+        || {
+            let mut fixture = Fixture::create();
+            let started = watching_git(&mut fixture);
+            // The repository is registered through `middle/below`, two levels under its top.
+            let top = ordinary_repository(fixture.work(), "bound-whole");
+            write(
+                &top,
+                "middle/below/work.txt",
+                "uncommitted, two levels down\n",
+            );
+            let project = fixture
+                .service()
+                .project_adopt(
+                    &actor(),
+                    &ProjectAdoptParams {
+                        destination: destination(
+                            fixture.environment_id(),
+                            &top.join("middle"),
+                            "below",
+                        ),
+                        label: "below".to_owned(),
+                        flow: AdoptionFlow::ExistingCheckout,
+                    },
+                    Some(&action("project.adopt", 101)),
+                )
+                .expect("a directory inside a checkout is adopted")
+                .project
+                .project_repository_id;
+            let read = shared_workspace(&fixture, project, 102);
+            let bound = shared_workspace(&fixture, project, 103);
+            let named = std::fs::canonicalize(top.join("middle/below")).expect("it resolves");
+
+            // The registered directory is read where it is.
+            let _ = git_started_in(&started, &named);
+            let held = measured(&fixture, read, 104);
+            assert!(
+                held.iter()
+                    .any(|item| item.detail.contains("hold uncommitted work")),
+                "the registered directory is read where it is: {held:?}"
+            );
+            assert!(
+                git_started_in(&started, &named),
+                "Git is started in the registered directory"
+            );
+
+            // A directory of the same filesystem, with another `below` in it, is bound over
+            // `middle`: what is at the registered path is another object, and `..` from the root
+            // of the bound directory leads to the checkout's top level.
+            let elsewhere = fixture.work().join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("below")).expect("another directory tree");
+            write(&elsewhere, "below/theirs.txt", "not this workspace's\n");
+            let volume = volumes::Volume::bind(&elsewhere, &top.join("middle"))
+                .unwrap_or_else(|| volumes::not_attachable());
+            let held = measured(&fixture, bound, 105);
+            assert!(
+                held.iter().any(|item| item
+                    .detail
+                    .contains("could not read what this workspace holds")),
+                "the host says it could not inspect the tree: {held:?}"
+            );
+            assert!(
+                top.join("middle/below/theirs.txt").is_file(),
+                "the other directory is what is at the registered path"
+            );
+            assert!(
+                !git_started_in(&started, &named),
+                "no Git invocation started in the directory bound over the path"
+            );
+            volume.detach();
+        },
+    );
+}
+
 /// A repository inside the directory a repository was registered through is not read as the
 /// registered one: Git reports it as the top level, it is not the recorded tree, and its
 /// configuration is not read.

@@ -153,6 +153,25 @@ impl Volume {
         })
     }
 
+    /// Binds the directory `source` over `at`, a directory that exists, so that `at` shows
+    /// `source` and `..` from it leads to the directory `at` is in. The bound directory is on the
+    /// filesystem it is a directory of: it has that filesystem's device number and its own mount.
+    /// Returns `None` where this host will not.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn bind(source: &Path, at: &Path) -> Option<Self> {
+        std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(source)
+            .arg(at)
+            .status()
+            .is_ok_and(|status| status.success())
+            .then(|| Self {
+                at: at.to_path_buf(),
+                attached: true,
+            })
+    }
+
     /// Takes this filesystem off and attaches another, new and empty, at the same path.
     ///
     /// # Panics
