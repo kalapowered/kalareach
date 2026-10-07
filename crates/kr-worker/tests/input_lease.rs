@@ -1114,7 +1114,7 @@ async fn a_plain_escape_is_not_held_when_the_mode_is_off_and_no_paste_is_open() 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape in some runs, which it cannot tell from the start of a sequence, so the Escape does not always come back"
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
 )]
 async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
     let (_host, runtime, id, epoch) = with_no_paste_mode_on().await;
