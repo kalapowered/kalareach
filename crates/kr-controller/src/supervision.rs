@@ -1407,7 +1407,9 @@ pub struct InstalledTerminals {
 impl InstalledTerminals {
     /// Returns a presenter that reads one environment's saved preference.
     #[must_use]
-    pub const fn in_environment(state_dir: PathBuf) -> Self {
+    pub fn in_environment(state_dir: PathBuf) -> Self {
+        // A preference saved before its format was recorded is written again, stamped.
+        terminal::stamp_preference(&state_dir);
         Self { state_dir }
     }
 }

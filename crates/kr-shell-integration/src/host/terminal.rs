@@ -144,6 +144,35 @@ pub fn preference_document(id: &str) -> String {
         .to_string()
 }
 
+/// Writes the saved terminal preference again with its format stated, where the file is a document
+/// this build reads that states none: it was written before the format was recorded. A file this
+/// build does not read, and one that states a format, is left as it is.
+///
+/// Remove it, with the reading of a document that states no format, once no supported upgrade
+/// starts from one written before the format was recorded.
+pub fn stamp_preference(state_dir: &std::path::Path) {
+    let file = state_dir.join(PREFERENCE_FILE);
+    let Ok(about) = std::fs::metadata(&file) else {
+        return;
+    };
+    if about.len() > PREFERENCE_MAX_LEN {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(&file) else {
+        return;
+    };
+    let stated =
+        serde_json::from_slice::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(&bytes)
+            .is_ok_and(|members| members.contains_key(PREFERENCE_VERSION_KEY));
+    if stated {
+        return;
+    }
+    if let Some(chosen) = parse_preference(&bytes) {
+        let _ =
+            kr_ipc::paths::write_owner_only_file(&file, preference_document(&chosen).as_bytes());
+    }
+}
+
 /// Reads the terminal preference saved in an environment's state directory.
 ///
 /// No file, an unreadable one, a file longer than [`PREFERENCE_MAX_LEN`] and a document this build
@@ -627,6 +656,31 @@ mod tests {
             parse_preference(br#"{"terminal": "iterm2", "version": "one"}"#),
             None
         );
+    }
+
+    /// A preference saved before the format was recorded is written again with it stated, by the
+    /// daemon's start; one that states a format, and a file this build does not read, are left as
+    /// they are.
+    #[test]
+    fn a_preference_saved_before_the_format_was_recorded_is_written_again_stamped() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(PREFERENCE_FILE);
+        std::fs::write(&file, br#"{"terminal": "iterm2"}"#).expect("an older preference");
+        stamp_preference(directory.path());
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("reads"),
+            preference_document("iterm2"),
+            "written again with its format stated"
+        );
+        for kept in [
+            preference_document("kitty").into_bytes(),
+            br#"{"terminal": "iterm2", "version": 9}"#.to_vec(),
+            b"not a document".to_vec(),
+        ] {
+            std::fs::write(&file, &kept).expect("a file");
+            stamp_preference(directory.path());
+            assert_eq!(std::fs::read(&file).expect("reads"), kept, "left as it is");
+        }
     }
 
     #[test]

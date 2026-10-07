@@ -211,6 +211,7 @@ impl Store {
     /// understands.
     pub fn open(state_dir: &std::path::Path) -> Result<Self> {
         let path = state_dir.join("environments.json");
+        let mut unstamped = false;
         let mut record: Record = match kr_ipc::paths::read_owner_only_file(&path, MAX_RECORD_LEN)
             .map_err(|error| ControllerError::supervision(error.to_string()))?
         {
@@ -230,7 +231,8 @@ impl Store {
                 RECORD_VERSION
             )));
         }
-        // Whatever it recorded, it is written back in this build's format.
+        // A file written before the format was recorded is written again at once, stamped.
+        unstamped |= record.version < RECORD_VERSION && path.exists();
         record.version = RECORD_VERSION;
         // An enrolment written by a build that did not number its records gets a number now, so
         // every approved record here can be named. The evidence beside it carries no number, which
@@ -244,7 +246,11 @@ impl Store {
                     .insert(key, EnrolmentInstance(record.last_instance));
             }
         }
-        Ok(Self { path, record })
+        let store = Self { path, record };
+        if unstamped {
+            store.write()?;
+        }
+        Ok(store)
     }
 
     /// Records one owner-approved enrolment, replacing any record with the same identity.
@@ -710,6 +716,11 @@ mod tests {
         std::fs::write(&path, document.to_string()).expect("rewritten");
         let mut store = Store::open(directory.root()).expect("an unstamped file is read");
         assert_eq!(store.list(None, 0).len(), 1, "what it held is still held");
+        assert_eq!(
+            stamped(&path)["version"],
+            RECORD_VERSION,
+            "and the file is written again, stamped, as it is opened"
+        );
         store.enrol(enrolment(2, "debian"), 200).expect("enrolled");
         assert_eq!(stamped(&path)["version"], RECORD_VERSION);
 

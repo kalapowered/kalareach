@@ -1508,7 +1508,7 @@ impl InstallationRecord {
 /// returns what it produced the first time, the same identifier with a different payload is
 /// `ID_CONFLICT`, and a dispatch marker without a recorded outcome is `unknown` rather than
 /// something to do again. An installation changes files, so it needs all three.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ActionRecord {
     /// The format of the record: [`ACTION_RECORD_VERSION`] in every record this build writes, `0`
     /// in one that states none, which an earlier build wrote.
@@ -1556,6 +1556,17 @@ impl Installer {
             return Err(ControllerError::IdConflict {
                 token: action_id.to_string(),
             });
+        }
+        // A record written before the format was recorded is written again as it stands, stamped.
+        if record.version < ACTION_RECORD_VERSION {
+            self.write_action(
+                actor_id,
+                action_id,
+                &ActionRecord {
+                    version: ACTION_RECORD_VERSION,
+                    ..record.clone()
+                },
+            )?;
         }
         match (record.state.as_str(), record.result) {
             ("applied", Some(result)) => Ok(Some(decode_result(&result)?)),
@@ -2898,6 +2909,17 @@ mod tests {
         let read = |path: &Path| -> Value {
             serde_json::from_slice(&std::fs::read(path).expect("the record")).expect("JSON")
         };
+        assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
+
+        // A record written before the format was recorded is written again, stamped, when it is
+        // read for an answer.
+        let mut older = read(&path);
+        older.as_object_mut().expect("an object").remove("version");
+        std::fs::write(&path, older.to_string()).expect("rewritten");
+        let answered = installer
+            .retained(&actor, action, &digest)
+            .expect_err("a marker with no outcome is uncertain");
+        assert!(matches!(answered, ControllerError::Uncertain { .. }));
         assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
 
         let mut later = read(&path);

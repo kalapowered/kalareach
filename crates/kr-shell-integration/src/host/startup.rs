@@ -1268,10 +1268,17 @@ impl EntryRecord {
         kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
         let lock = FileLock::take(&self.path)
             .map_err(|error| kr_ipc::IpcError::io("lock", &self.path, error))?;
-        Ok(HeldRecord {
+        let held = HeldRecord {
             record: self,
             _lock: lock,
-        })
+        };
+        // A record written before the format was recorded is written again at once, stamped.
+        if std::fs::symlink_metadata(&self.path).is_ok()
+            && self.read()?.version < ENTRY_RECORD_VERSION
+        {
+            held.change(|_| {})?;
+        }
+        Ok(held)
     }
 
     /// Reads the record; there being none is a record that names nothing.
@@ -4705,12 +4712,18 @@ mod tests {
                 .expect("an unstamped record is read"),
             vec![zshrc.clone()]
         );
-        record
-            .hold()
-            .expect("holds")
-            .add(ShellKind::Bash, &[PathBuf::from("/home/someone/.bashrc")])
-            .expect("records");
-        assert_eq!(written(&record)["version"], ENTRY_RECORD_VERSION);
+        drop(record.hold().expect("holds"));
+        assert_eq!(
+            written(&record)["version"],
+            ENTRY_RECORD_VERSION,
+            "holding the record writes it again, stamped"
+        );
+        assert_eq!(
+            record
+                .files(ShellKind::Zsh)
+                .expect("what it named it still names"),
+            vec![zshrc.clone()]
+        );
 
         let mut later = written(&record);
         later["version"] = serde_json::json!(ENTRY_RECORD_VERSION + 1);

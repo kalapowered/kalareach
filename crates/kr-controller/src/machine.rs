@@ -226,6 +226,19 @@ pub trait Standing: std::fmt::Debug + Sync {
     ) -> Result<std::io::Result<()>>;
 }
 
+/// A publication that no authority is asked for: the record is written again as it stood.
+#[derive(Debug)]
+struct Unconditional;
+
+impl Standing for Unconditional {
+    fn while_standing(
+        &self,
+        publish: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> Result<std::io::Result<()>> {
+        Ok(publish())
+    }
+}
+
 /// Where a step takes this environment.
 #[derive(Clone, Copy, Debug)]
 enum Destination {
@@ -287,8 +300,20 @@ impl MachineStore {
         store.check_lock(lock)?;
         let _holding = store.writer(deadline, "open the machine group record")?;
         store.remove_leftovers();
-        if store.read()?.is_none() {
-            store.mint(now_ms, deadline)?;
+        match store.read()? {
+            None => store.mint(now_ms, deadline)?,
+            // A record written before the format was recorded is written again as it stood,
+            // stamped, so that it is not left behind for ever: no step changes it while the
+            // environment's group is not moved.
+            Some(record) if record.version < RECORD_VERSION => store.publish(
+                &MachineGroup {
+                    version: RECORD_VERSION,
+                    ..record
+                },
+                deadline,
+                &Unconditional,
+            )?,
+            Some(_) => {}
         }
         store.current()?;
         Ok(store)
@@ -2762,16 +2787,14 @@ mod tests {
             .expect("a record that names no format is read");
         assert_eq!(read.version, 0);
         assert_eq!(read.machine_id, created.machine_id);
-        store
-            .join(
-                &environment.lock,
-                some_group(),
-                read.expected(),
-                &approval(),
-                2_000,
-            )
-            .expect("a step on it");
+        // Opened again, the record is written again as it stood, stamped, with no step taken.
+        let reopened = environment.open();
         assert_eq!(version_of(&environment), json!(RECORD_VERSION));
+        let stamped = reopened.group().expect("reads the group");
+        assert_eq!(stamped.version, RECORD_VERSION);
+        assert_eq!(stamped.revision, created.revision);
+        assert_eq!(stamped.machine_id, created.machine_id);
+        assert_eq!(stamped.change, created.change);
     }
 
     /// Holds `directory` open with a handle that shares reading and deleting but not writing, which
