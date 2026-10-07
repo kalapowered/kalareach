@@ -40,16 +40,19 @@ pub const SCHEMA_VERSION: i64 = 3;
 
 /// The version a journal that an earlier build wrote is at until the sessions of earlier builds in
 /// it are settled ([`Store::settle_unseen_prompt_sessions`]), which moves it to [`SCHEMA_VERSION`].
-/// Remove it with the noting, once no supported upgrade starts from a build that wrote this
-/// version.
+///
+/// A journal can stay at this version for as long as a session of an earlier build runs, so a later
+/// schema step has to read it, or refuse it by name, and not carry it past settling. Remove this,
+/// with the noting, once no supported upgrade can start from a journal at this version, and have
+/// the build that removes it refuse such a journal.
 const UNSETTLED_VERSION: i64 = 2;
 
 /// Where a journal stands with the sessions of earlier builds, whose agents may have been sent a
 /// prompt that names a draft without this host being told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Noting {
-    /// Nothing is noted and nothing is owed: the journal was made by a build that serves such a
-    /// prompt only to the daemon, or its noted sessions were settled.
+    /// Nothing is noted and nothing is owed: the journal was made by this build or a later one, or
+    /// its noted sessions were settled.
     Done,
     /// An earlier build wrote the journal and its sessions have not been noted.
     Owed,
@@ -1516,9 +1519,12 @@ impl Store {
     ///
     /// A published attachment that no prompt this host knows of has submitted, and that a noted
     /// session names ([`Self::sessions_shielding`]), becomes submitted, to the session it belongs to
-    /// or, where it belongs to none, to the first session that names it. One session holds it from
-    /// then on, so the sweep reads no table to keep it. An attachment already submitted keeps its
-    /// own session, and one that names no noted session is not touched.
+    /// or, where it belongs to none, to the first session that names it by identifier. Every
+    /// assignment is read before any is written, so the order of the rows decides nothing. One
+    /// session holds the attachment from then on, so the sweep reads no table to keep it, and it
+    /// follows that session's retention alone and can be bound to no draft for another session. An
+    /// attachment already submitted keeps its own session, and one that names no noted session is
+    /// not touched.
     ///
     /// Both tables go, and the journal moves to the schema version that holds nothing noted, which is
     /// what tells the next start that there is nothing to note.
@@ -1546,12 +1552,18 @@ impl Store {
                 rows.collect::<std::result::Result<_, _>>()
                     .map_err(TransferError::store)?
             };
+            // Every assignment is read before any is written: an attachment given a session
+            // changes what names a session for the others that share a draft with it, and the
+            // result must not depend on the order the rows come in.
+            let mut assignments = Vec::new();
             for transfer in unsubmitted {
                 let shielding =
                     shielding_sessions(&transaction, TransferId::new(transfer), &noted)?;
-                let Some(session_id) = shielding.first() else {
-                    continue;
-                };
+                if let Some(session_id) = shielding.first() {
+                    assignments.push((transfer, *session_id));
+                }
+            }
+            for (transfer, session_id) in assignments {
                 transaction
                     .execute(
                         "UPDATE uploads

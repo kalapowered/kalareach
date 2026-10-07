@@ -912,8 +912,10 @@ impl TransferModule {
                 )
             })?;
             // The sessions of earlier builds that nothing can still send a prompt are settled
-            // first, so the sweep that follows reads none of them.
-            settle_the_sessions_of_earlier_builds(&service, &owner).map_err(ProtocolError::from)?;
+            // first, so the sweep that follows reads none of them. A settling that cannot be made
+            // now is made at the next sweep, and this one reads the noted sessions as it did, so
+            // it never stops an expiry.
+            let _ = settle_the_sessions_of_earlier_builds(&service, &owner);
             // The archive is the authority on what a session keeps. The sweep asks it once, after
             // it has read the attachments, so the answer is a view taken after them.
             let answers = ArchiveAnswers {
