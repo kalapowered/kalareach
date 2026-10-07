@@ -17,8 +17,8 @@
 //! * the **mark**, the highest wall reading seen, and the **anchor**, the furthest the wall clock
 //!   was proved to have reached with the continuous reading it was proved at. The reference a
 //!   reading is compared with is the later of the mark and the anchor projected forward by the
-//!   continuous clock, so a step back smaller than the time between two readings is found by
-//!   whoever reads next;
+//!   continuous clock, less a rate allowance for the continuous clock running fast, so a step
+//!   back smaller than the time between two readings is found by whoever reads next;
 //! * the **forgetting hold**, which withholds every forgetting and no grant decision, and the
 //!   **evidence hold**, which withholds attention's forgetting and quiet hours only: set when the
 //!   platform's time service is found unqualified while the owner has not confirmed the clock,
@@ -72,13 +72,32 @@ struct Anchor {
 }
 
 impl Anchor {
-    /// The earliest the wall clock can honestly read at `now`: the continuous clock is the ground
-    /// truth for elapsed time, so the anchor plus what has elapsed since is a lower bound.
+    /// The earliest the wall clock can honestly read at `now`: the anchor plus what has elapsed
+    /// since on the continuous clock, less the rate allowance ([`credited`]).
     fn projected(self, now: ContinuousInstant) -> u64 {
         let elapsed =
             u64::try_from(now.saturating_duration_since(self.at).as_millis()).unwrap_or(u64::MAX);
-        self.wall_ms.saturating_add(elapsed)
+        self.wall_ms.saturating_add(credited(elapsed))
     }
+}
+
+/// How far the continuous clock may run fast against the wall clock before the difference is a
+/// rollback, in parts per million.
+///
+/// The wall clock is disciplined by the platform's time service and the continuous clock is not,
+/// on macOS and Windows, so they differ by the oscillator's error: 20 ppm is about 1.7 s a day.
+/// A projection that credits every continuous millisecond would count that error as a rollback
+/// once it passed the tolerance, after days on a host that runs for weeks, and only an owner's
+/// retrust or a reboot would clear it. So the projection credits a millisecond less per 10,000 and
+/// a continuous clock up to this fast raises no distrust. The cost is stated once, here: a
+/// rollback gains slack of this rate times the time since the anchor was last raised, about 60
+/// seconds per week of uptime, which is small against the 30 days a record is kept.
+const RATE_ALLOWANCE_PPM: u64 = 100;
+
+/// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
+/// allowance.
+fn credited(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
 }
 
 /// What has been decided and not yet written down.
@@ -132,6 +151,12 @@ pub struct Standing {
     pub confirmed: bool,
     /// Something decided is not written down yet.
     pub owed: bool,
+    /// What the host knows of its clock is ahead of its record: a step forward whose write failed.
+    /// A restart now would measure a rollback against a record that is behind, so what depends on
+    /// the clock being proven is withheld until the record catches up.
+    pub anchor_owed: bool,
+    /// This boot's clock continuity is lost, taken in the same transition as the rest.
+    pub continuity_lost: bool,
 }
 
 /// One reading of the wall clock, with what this host holds against it, taken together.
@@ -225,10 +250,11 @@ impl ClockTrust {
     /// Reads the durable record into `state`, the first time anything asks.
     fn load(&self, state: &mut State, devices: &DeviceDirectory) -> Result<()> {
         let record = devices.clock_record()?;
-        // The boot clock first and the continuous clock after it, so what is projected from the
-        // restored anchor is never short.
-        let boot_ms = self.boot_clock.boot_elapsed_ms();
+        // The continuous clock first and the boot clock after it: the anchor is installed at the
+        // earlier instant with the time up to the later reading, so what is projected from it is
+        // never short.
         let at = self.clock.now();
+        let boot_ms = self.boot_clock.boot_elapsed_ms();
         state.mark_ms = record.observed_ms.unwrap_or(0);
         state.distrusted = record.untrusted_at_ms.is_some();
         state.confirmed = record.confirmed_at_ms.is_some();
@@ -237,17 +263,26 @@ impl ClockTrust {
         if let Some(stored) = record.anchor {
             // Within the boot it was written in, the boot clock says how long has passed since. In
             // another boot the wall reading stands and the continuous side starts from now.
-            let wall_ms = if stored.boot_value.as_slice() == self.boot.value.as_slice() {
+            let same_boot = stored.boot_value.as_slice() == self.boot.value.as_slice();
+            let wall_ms = if same_boot {
                 stored
                     .wall_ms
-                    .saturating_add(boot_ms.saturating_sub(stored.boot_ms))
+                    .saturating_add(credited(boot_ms.saturating_sub(stored.boot_ms)))
             } else {
                 stored.wall_ms
             };
             let anchor = Anchor { wall_ms, at };
             state.anchor = Some(anchor);
-            state.saved = Some(anchor);
             state.restored = Some(anchor);
+            if same_boot {
+                state.saved = Some(anchor);
+            } else {
+                // The record still names the boot before. Until it names this one, a restart in
+                // this boot would start from the wall reading again and lose what passed since,
+                // so the rebased anchor is owed its write.
+                state.saved = None;
+                state.owed.anchor = true;
+            }
         }
         state.loaded = true;
         Ok(())
@@ -270,11 +305,21 @@ impl ClockTrust {
         }
         let at = self.clock.now();
         let wall_ms = self.wall.now_ms();
+        // The durable mark is raised by the reading; when that write fails, what the mark and the
+        // anchor held in memory prove is decided all the same and the failure is answered after,
+        // so a rollback this reading saw is not lost with the write.
+        let mut store_error = None;
         let (latest, behind_mark) = match source {
-            Source::Stored => {
-                let observed = devices.utc_at_least(TimestampMs::new(wall_ms))?;
-                (observed.now.get(), observed.behind_ms)
-            }
+            Source::Stored => match devices.utc_at_least(TimestampMs::new(wall_ms)) {
+                Ok(observed) => (observed.now.get(), observed.behind_ms),
+                Err(error) => {
+                    store_error = Some(error);
+                    (
+                        state.mark_ms.max(wall_ms),
+                        state.mark_ms.saturating_sub(wall_ms),
+                    )
+                }
+            },
             Source::Watched => {
                 let behind = state.mark_ms.saturating_sub(wall_ms);
                 (state.mark_ms.max(wall_ms), behind)
@@ -326,23 +371,30 @@ impl ClockTrust {
             state.owed.evidence_hold = true;
         }
         let _ = self.write_owed(state, devices, latest);
+        if let Some(error) = store_error {
+            return Err(error);
+        }
         Ok(Moment {
             wall_ms,
             observed: ObservedUtc {
-                now: TimestampMs::new(latest),
+                // The later of the mark and the anchor projected on the continuous clock: a step
+                // back the tolerance forgives gives no grant the time it appeared to lose.
+                now: TimestampMs::new(latest.max(projected)),
                 behind_ms,
             },
-            standing: Self::standing(state),
+            standing: self.standing(state),
         })
     }
 
-    fn standing(state: &State) -> Standing {
+    fn standing(&self, state: &State) -> Standing {
         Standing {
             distrusted: state.distrusted,
             forgetting_hold: state.forgetting_hold,
             evidence_hold: state.evidence_hold,
             confirmed: state.confirmed,
             owed: state.owed.any(),
+            anchor_owed: state.owed.anchor,
+            continuity_lost: self.floor.continuity_lost(),
         }
     }
 
@@ -404,13 +456,15 @@ impl ClockTrust {
     pub fn sample(&self, devices: &DeviceDirectory) -> Result<Option<ObservedUtc>> {
         let moment = self.read(devices)?;
         Ok(
-            (!moment.standing.distrusted && !self.floor.continuity_lost())
+            (!moment.standing.distrusted && !moment.standing.continuity_lost)
                 .then_some(moment.observed),
         )
     }
 
     /// As [`Self::sample`], for a collection that lets go of a record by the wall clock: also
-    /// answered no while the forgetting hold stands.
+    /// answered no while the forgetting hold stands, and while a step forward this host has seen
+    /// is not written down, because a restart now would measure a rollback against a record that
+    /// is behind.
     ///
     /// # Errors
     ///
@@ -419,8 +473,9 @@ impl ClockTrust {
         let moment = self.read(devices)?;
         Ok((!moment.standing.distrusted
             && !moment.standing.forgetting_hold
-            && !self.floor.continuity_lost())
-        .then_some(moment.observed))
+            && !moment.standing.anchor_owed
+            && !moment.standing.continuity_lost)
+            .then_some(moment.observed))
     }
 
     /// One reading of the wall clock and what this host holds against it, taken together and
@@ -477,6 +532,7 @@ impl ClockTrust {
             proven: !standing.distrusted
                 && !standing.forgetting_hold
                 && !standing.evidence_hold
+                && !standing.anchor_owed
                 && (platform_qualified || standing.confirmed),
             owed: standing.owed,
         })
@@ -544,9 +600,10 @@ impl ClockTrust {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{OnceLock, Weak};
     use std::time::Duration;
 
-    use kr_ipc::clock::ManualSharedClock;
+    use kr_ipc::clock::{ManualSharedClock, SharedClock};
     use kr_protocol::identity::BootIdentitySource;
     use kr_protocol::scalars::Bytes;
     use kr_transport::clock::ManualClock;
@@ -555,12 +612,23 @@ mod tests {
 
     const START: u64 = 1_700_000_000_000;
     const MINUTE: Duration = Duration::from_secs(60);
+    const HOUR: Duration = Duration::from_secs(3_600);
+    const DAY: Duration = Duration::from_secs(86_400);
+    /// How fast the continuous clock runs against the wall clock in the tests of the rate
+    /// allowance: half of what the allowance covers.
+    const FIFTY_PPM: u64 = 50;
 
     fn boot(byte: u8) -> BootIdentity {
         BootIdentity {
             source: BootIdentitySource::MacosBootSessionUuid,
             value: Bytes::new(vec![byte; 16]),
         }
+    }
+
+    /// `by` on a clock that runs `ppm` parts per million fast.
+    fn fast(by: Duration, ppm: u64) -> Duration {
+        let ms = u64::try_from(by.as_millis()).expect("a duration");
+        Duration::from_millis(ms + ms * ppm / 1_000_000)
     }
 
     /// The machine a host runs on: its wall clock, and the boot clock of the boot it is in.
@@ -588,11 +656,16 @@ mod tests {
             self.wall.load(Ordering::SeqCst)
         }
 
-        /// Time passes while no run of the host is there to see it.
-        fn pass(&self, by: Duration) {
+        /// Time passes while no run of the host is there to see it, on a boot clock that runs
+        /// `ppm` parts per million fast against the wall clock.
+        fn pass_fast(&self, by: Duration, ppm: u64) {
             let ms = u64::try_from(by.as_millis()).expect("a duration");
             self.wall.fetch_add(ms, Ordering::SeqCst);
-            self.boot_clock.advance(by);
+            self.boot_clock.advance(fast(by, ppm));
+        }
+
+        fn pass(&self, by: Duration) {
+            self.pass_fast(by, 0);
         }
 
         /// The machine starts again: another boot, whose clock begins at nothing.
@@ -615,13 +688,26 @@ mod tests {
         }
 
         fn over(machine: &Machine, floor: Arc<UtcFloor>) -> Self {
-            let continuous = ManualClock::new();
+            Self::reading(
+                machine,
+                floor,
+                ManualClock::new(),
+                Arc::new(machine.boot_clock.clone()),
+            )
+        }
+
+        fn reading(
+            machine: &Machine,
+            floor: Arc<UtcFloor>,
+            continuous: ManualClock,
+            boot_clock: Arc<dyn SharedClock>,
+        ) -> Self {
             let wall = Arc::clone(&machine.wall);
             let trust = ClockTrust::new(
                 crate::service::WallClock::from_fn(move || wall.load(Ordering::SeqCst)),
                 floor,
                 Arc::new(continuous.clone()),
-                Arc::new(machine.boot_clock.clone()),
+                boot_clock,
                 machine.boot.clone(),
             );
             Self {
@@ -631,14 +717,15 @@ mod tests {
             }
         }
 
-        /// Time passes: every clock this run reads moves on.
-        fn pass(&self, by: Duration) {
-            self.machine.pass(by);
-            self.continuous.advance(by);
+        /// Time passes: every clock this run reads moves on, the continuous one `ppm` parts per
+        /// million fast against the wall clock.
+        fn pass_fast(&self, by: Duration, ppm: u64) {
+            self.machine.pass_fast(by, ppm);
+            self.continuous.advance(fast(by, ppm));
         }
 
-        fn distrusted(&self) -> bool {
-            self.trust.held().distrusted
+        fn pass(&self, by: Duration) {
+            self.pass_fast(by, 0);
         }
     }
 
@@ -668,23 +755,21 @@ mod tests {
         Watch,
     }
 
-    /// One read by `reader`, and whether the host distrusts its clock after it.
-    fn distrusts_after(run: &Run, devices: &DeviceDirectory, reader: Reader) -> bool {
+    /// One reading by `reader`.
+    fn read(run: &Run, devices: &DeviceDirectory, reader: Reader) -> Result<()> {
         match reader {
-            Reader::Sample => {
-                let _ = run.trust.sample(devices).expect("samples");
-            }
-            Reader::Observe => {
-                run.trust.observe(devices).expect("observes");
-            }
-            Reader::Watch => {
-                run.trust.watch(devices, true).expect("watches");
-            }
+            Reader::Sample => run.trust.sample(devices).map(|_| ()),
+            Reader::Observe => run.trust.observe(devices).map(|_| ()),
+            Reader::Watch => run.trust.watch(devices, true).map(|_| ()),
         }
-        run.distrusted()
     }
 
-    /// Makes the later readings of the store fail, as a full disk does, for a write of `column`.
+    /// Whether a grant is decided against the clock now.
+    fn proven(run: &Run, devices: &DeviceDirectory) -> bool {
+        run.trust.sample(devices).expect("samples").is_some()
+    }
+
+    /// Makes the later writes of the store fail, as a full disk does, for a write of `column`.
     fn refuse_writes_of(devices: &DeviceDirectory, column: &str) {
         devices
             .with(|connection| {
@@ -702,42 +787,43 @@ mod tests {
             .expect("the trigger goes");
     }
 
-    /// KR-REQ-09.17, KR-REQ-09.18: a step back smaller than the time between two readings is a rollback, found by
-    /// whoever reads next. The wall clock reads ten seconds behind where a minute of continuous time
-    /// put it, which a comparison with the last wall reading alone does not see. The controls are a
-    /// wall clock that moved with the continuous clock, which no reader distrusts, and one owner
-    /// retrust, which every reader trusts again.
+    /// KR-REQ-09.17, KR-REQ-09.18: a step back smaller than the time between two readings is a
+    /// rollback, found by whoever reads next and recorded for every reader. The wall clock reads ten
+    /// seconds behind where a minute of continuous time put it, which a comparison with the last
+    /// wall reading alone does not see. The wall clock is then put right again, so that only a
+    /// decision recorded by the reader that found it can be what the next grant is refused on. The
+    /// controls are a wall clock that moved with the continuous clock, which no reader distrusts,
+    /// and one owner retrust, which every reader trusts again.
     #[test]
     fn a_step_back_smaller_than_the_time_between_two_readings_is_found_by_whoever_reads() {
         for reader in [Reader::Sample, Reader::Observe, Reader::Watch] {
             let devices = DeviceDirectory::in_memory().expect("a directory");
             let machine = Machine::new();
             let run = Run::on(&machine);
-            assert!(!distrusts_after(&run, &devices, reader), "{reader:?} reads");
+            read(&run, &devices, reader).expect("reads");
 
             run.pass(MINUTE);
+            read(&run, &devices, reader).expect("reads");
             assert!(
-                !distrusts_after(&run, &devices, reader),
+                proven(&run, &devices),
                 "{reader:?}: a wall clock that kept up with the continuous clock is not distrusted"
             );
 
             run.continuous.advance(MINUTE);
             machine.boot_clock.advance(MINUTE);
             machine.set_wall(machine.wall() + 50_000);
+            read(&run, &devices, reader).expect("reads");
+            machine.set_wall(machine.wall() + 10_000);
             assert!(
-                distrusts_after(&run, &devices, reader),
-                "{reader:?} finds a wall clock ten seconds behind the continuous clock"
+                !proven(&run, &devices),
+                "{reader:?} found a wall clock ten seconds behind the continuous clock"
             );
-            assert!(
-                run.trust.sample(&devices).expect("samples").is_none(),
-                "{reader:?}: a grant is not decided against it"
-            );
+            assert!(!run.trust.watch(&devices, true).expect("watches").proven);
 
             run.trust
                 .establish(&devices)
                 .expect("the owner establishes");
-            assert!(!run.distrusted(), "{reader:?}: one retrust clears it");
-            assert!(run.trust.sample(&devices).expect("samples").is_some());
+            assert!(proven(&run, &devices), "{reader:?}: one retrust clears it");
             assert!(run.trust.watch(&devices, true).expect("watches").proven);
         }
     }
@@ -757,7 +843,7 @@ mod tests {
         let watched = run.trust.watch(&devices, true).expect("watches");
         assert!(!watched.proven, "the step back is found");
         machine.set_wall(START + 60_000);
-        assert!(run.trust.sample(&devices).expect("samples").is_none());
+        assert!(!proven(&run, &devices));
         assert!(
             devices
                 .clock_record()
@@ -769,83 +855,174 @@ mod tests {
 
         let restarted = Run::on(&machine);
         assert!(
-            restarted
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_none(),
+            !proven(&restarted, &store.open()),
             "a restart reads the distrust back"
         );
     }
 
-    /// KR-REQ-09.17, KR-REQ-09.18: what the host knew of its clock before a restart in the same boot is what it
-    /// measures a step back against after it. The wall clock is corrected back by ten seconds while
-    /// no run is there to see it; the mark on disk is behind the wall clock, so only the anchor
-    /// carried forward by the boot clock shows the correction.
+    /// KR-REQ-09.18: a mark the store refuses to take does not lose a rollback the reading found.
+    /// The reading is answered as an error, because a host that cannot tell decides nothing, and
+    /// what the mark and the anchor held in memory proved is decided all the same: once the store
+    /// takes writes again and the wall clock reads plausibly, the host still distrusts it.
+    #[test]
+    fn a_mark_that_cannot_be_written_does_not_lose_the_rollback_a_reading_found() {
+        for reader in [Reader::Sample, Reader::Observe] {
+            let store = Store::new();
+            let devices = store.open();
+            let machine = Machine::new();
+            let run = Run::on(&machine);
+            read(&run, &devices, reader).expect("reads");
+
+            refuse_writes_of(&devices, "observed_ms");
+            run.continuous.advance(MINUTE);
+            machine.boot_clock.advance(MINUTE);
+            machine.set_wall(machine.wall() + 50_000);
+            assert!(
+                read(&run, &devices, reader).is_err(),
+                "{reader:?}: the store refuses the mark"
+            );
+            allow_writes_of(&devices, "observed_ms");
+            machine.set_wall(machine.wall() + 10_000);
+            assert!(
+                !proven(&run, &devices),
+                "{reader:?}: the rollback that reading saw is not lost with its write"
+            );
+        }
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: what the host knew of its clock before a restart in the same
+    /// boot is what it measures a step back against after it. The wall clock is corrected back by
+    /// ten seconds while no run is there to see it; the mark on disk is behind the wall clock, so
+    /// only the anchor carried forward by the boot clock shows the correction.
     #[test]
     fn a_restart_in_the_same_boot_keeps_the_time_that_passed() {
         let store = Store::new();
         let machine = Machine::new();
         let first = Run::on(&machine);
-        assert!(
-            first
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_some()
-        );
+        assert!(proven(&first, &store.open()));
 
         machine.pass(MINUTE);
         machine.set_wall(machine.wall() - 10_000);
         let second = Run::on(&machine);
         assert!(
-            second
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_none(),
+            !proven(&second, &store.open()),
             "the wall clock reads ten seconds behind where the minute put it"
+        );
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: the restored anchor is never short of the time that passed
+    /// between the two readings the restart makes. The host reads its continuous clock and then the
+    /// boot clock; ten seconds pass right after the second reading, a descheduled thread's pause, and
+    /// the wall clock is corrected to read eight seconds behind where they put it. The restored
+    /// anchor stands at the earlier instant with the time up to the later reading, so the
+    /// correction is found; read the other way round the pause would be lost from the anchor.
+    #[test]
+    fn a_restart_paused_between_its_two_clock_readings_does_not_lose_the_pause() {
+        /// A boot clock that lets time pass right after its first reading.
+        struct Pausing {
+            inner: ManualSharedClock,
+            after_a_reading: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+
+        impl std::fmt::Debug for Pausing {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("Pausing")
+            }
+        }
+
+        impl SharedClock for Pausing {
+            fn boot_elapsed_ms(&self) -> u64 {
+                let reading = self.inner.boot_elapsed_ms();
+                let pause = self
+                    .after_a_reading
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+                reading
+            }
+        }
+
+        let store = Store::new();
+        let machine = Machine::new();
+        let first = Run::on(&machine);
+        assert!(proven(&first, &store.open()));
+        machine.pass(MINUTE);
+
+        let continuous = ManualClock::new();
+        let pause = {
+            let machine = machine.clone();
+            let continuous = continuous.clone();
+            move || {
+                continuous.advance(Duration::from_secs(10));
+                machine.boot_clock.advance(Duration::from_secs(10));
+                machine.set_wall(START + 62_000);
+            }
+        };
+        let boot_clock = Arc::new(Pausing {
+            inner: machine.boot_clock.clone(),
+            after_a_reading: std::sync::Mutex::new(Some(Box::new(pause))),
+        });
+        let restarted = Run::reading(&machine, Arc::new(UtcFloor::at(0)), continuous, boot_clock);
+        assert!(
+            !proven(&restarted, &store.open()),
+            "the pause is in the anchor, so a wall clock eight seconds behind is found"
         );
     }
 
     /// KR-REQ-09.17: a restart in another boot keeps the wall reading and starts the continuous
     /// side from now. The boot clock restarted, so what it reads says nothing of how long ago the
-    /// anchor was written: the second boot is an hour old when the host starts in it, and the
-    /// anchor must not be carried forward by that hour, which would make a clock that kept going
-    /// look behind. A wall clock behind the reading kept is still found.
+    /// anchor was written, and the anchor is not carried forward by it: the new boot is an hour
+    /// old when the host starts in it, and a clock that kept going is trusted. A wall clock behind
+    /// the reading kept is still found.
     #[test]
     fn a_restart_in_a_new_boot_keeps_the_wall_reading_and_not_the_boot_clock() {
         let store = Store::new();
         let mut machine = Machine::new();
         let first = Run::on(&machine);
-        assert!(
-            first
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_some()
-        );
+        assert!(proven(&first, &store.open()));
 
         machine.reboot();
-        machine.boot_clock.advance(Duration::from_secs(3_600));
+        machine.boot_clock.advance(HOUR);
         machine.set_wall(START + 30_000);
         let second = Run::on(&machine);
         assert!(
-            second
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_some(),
+            proven(&second, &store.open()),
             "a clock that kept going is trusted in the next boot"
         );
         machine.set_wall(START - 60_000);
         assert!(
-            second
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_none(),
+            !proven(&second, &store.open()),
             "and one that went back is not"
+        );
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: the anchor a restart in a new boot rebuilds is written against
+    /// that boot, so a second restart in it measures from there. The host reads once in the new
+    /// boot, goes down, the wall clock is corrected back ten seconds while it is down, and it
+    /// starts again in the same boot: the correction is found by the anchor, which the mark does
+    /// not show.
+    #[test]
+    fn a_second_restart_in_a_new_boot_keeps_the_time_that_passed() {
+        let store = Store::new();
+        let mut machine = Machine::new();
+        let first = Run::on(&machine);
+        assert!(proven(&first, &store.open()));
+
+        // The wall clock reads what the first boot last saw, so the first reading in the new boot
+        // is not a step forward that would be written for its own sake.
+        machine.reboot();
+        let second = Run::on(&machine);
+        assert!(proven(&second, &store.open()));
+
+        machine.pass(MINUTE);
+        machine.set_wall(machine.wall() - 10_000);
+        let third = Run::on(&machine);
+        assert!(
+            !proven(&third, &store.open()),
+            "the wall clock reads ten seconds behind where the minute put it"
         );
     }
 
@@ -872,17 +1049,15 @@ mod tests {
         machine.set_wall(peak - 60_000);
         let second = Run::on(&machine);
         assert!(
-            second
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_none(),
+            !proven(&second, &store.open()),
             "a rollback below the peak is found after the restart"
         );
     }
 
-    /// KR-REQ-09.18: a step whose write failed stays owed and is written again before the next
-    /// answer, so a restart does not forget the peak.
+    /// KR-REQ-09.18: a step whose write failed stays owed, withholds what depends on the record
+    /// while it is, and is written again by the next reading, which is not itself a step: a
+    /// restart does not forget the peak. A grant is decided meanwhile, as the record is no part of
+    /// what it measures against.
     #[test]
     fn a_step_that_could_not_be_written_is_written_before_the_next_answer() {
         let store = Store::new();
@@ -896,7 +1071,16 @@ mod tests {
         machine.set_wall(peak);
         let watched = run.trust.watch(&devices, true).expect("watches");
         assert!(watched.owed, "the step is owed");
+        assert!(!watched.proven, "and what depends on the record waits");
         assert!(run.trust.owes_a_write());
+        assert!(
+            run.trust
+                .sample_for_forgetting(&devices)
+                .expect("samples")
+                .is_none(),
+            "no forgetting is decided until the record has caught up"
+        );
+        assert!(proven(&run, &devices), "a grant is decided as before");
         assert_ne!(
             devices
                 .clock_record()
@@ -908,8 +1092,11 @@ mod tests {
         );
 
         allow_writes_of(&devices, "anchor_wall_ms");
+        // Not a step: the wall clock reads a little behind the anchor.
+        machine.set_wall(peak - 100);
         let watched = run.trust.watch(&devices, true).expect("watches");
-        assert!(!watched.owed, "the next answer wrote it");
+        assert!(!watched.owed, "the next answer wrote what was owed");
+        assert!(watched.proven);
         assert_eq!(
             devices
                 .clock_record()
@@ -942,7 +1129,7 @@ mod tests {
             !watched.proven && watched.owed,
             "a forward correction does not take the decision back"
         );
-        assert!(run.trust.sample(&devices).expect("samples").is_none());
+        assert!(!proven(&run, &devices));
         assert!(
             devices
                 .clock_record()
@@ -955,17 +1142,11 @@ mod tests {
         let watched = run.trust.watch(&devices, true).expect("watches");
         assert!(!watched.proven && !watched.owed, "written by the reading");
         let restarted = Run::on(&machine);
-        assert!(
-            restarted
-                .trust
-                .sample(&store.open())
-                .expect("samples")
-                .is_none()
-        );
+        assert!(!proven(&restarted, &store.open()));
     }
 
     /// KR-REQ-09.19: an owner's establishing is complete when it reports success. A record that
-    /// refuses it leaves the decision standing.
+    /// refuses it leaves the decision standing, whatever the wall clock reads meanwhile.
     #[test]
     fn an_establish_the_record_refuses_leaves_the_decision_standing() {
         let devices = DeviceDirectory::in_memory().expect("a directory");
@@ -973,16 +1154,17 @@ mod tests {
         let run = Run::on(&machine);
         run.trust.sample(&devices).expect("samples");
         machine.set_wall(START - 60_000);
-        assert!(run.trust.sample(&devices).expect("samples").is_none());
+        assert!(!proven(&run, &devices));
 
         refuse_writes_of(&devices, "confirmed_at_ms");
         assert!(run.trust.establish(&devices).is_err());
-        assert!(run.distrusted(), "the decision stands");
+        machine.set_wall(START + 60_000);
+        assert!(!proven(&run, &devices), "the decision stands");
         allow_writes_of(&devices, "confirmed_at_ms");
         run.trust
             .establish(&devices)
             .expect("the owner establishes");
-        assert!(run.trust.sample(&devices).expect("samples").is_some());
+        assert!(proven(&run, &devices));
     }
 
     /// KR-REQ-09.19: a reader delayed across an owner's establishing takes its reading inside the
@@ -1015,7 +1197,76 @@ mod tests {
             watched.proven,
             "the owner's establishing is not undone by a reading from before it"
         );
-        assert!(!run.distrusted());
+        assert_eq!(
+            watched.wall_ms,
+            START + 10_000,
+            "the clock as it stood after"
+        );
+        assert!(proven(&run, &devices));
+    }
+
+    /// KR-REQ-09.18: every reading of the wall clock and of the continuous clock, by every way of
+    /// reading the host's clock and by an owner's establishing, is taken while the state lock is
+    /// held, so a caller that waited for the lock cannot contribute a reading from before it.
+    #[test]
+    fn every_reading_of_the_clocks_is_taken_inside_the_lock() {
+        /// A clock that says whether the state lock is held when it is read.
+        #[derive(Debug)]
+        struct Probed {
+            clock: ManualClock,
+            trust: Arc<OnceLock<Weak<ClockTrust>>>,
+        }
+
+        impl Probed {
+            fn check(&self) {
+                if let Some(trust) = self.trust.get().and_then(Weak::upgrade) {
+                    assert!(
+                        trust.state.try_lock().is_err(),
+                        "a clock was read outside the lock"
+                    );
+                }
+            }
+        }
+
+        impl ContinuousClock for Probed {
+            fn now(&self) -> ContinuousInstant {
+                self.check();
+                self.clock.now()
+            }
+        }
+
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let trust_cell = Arc::new(OnceLock::new());
+        let wall = Arc::new(Probed {
+            clock: ManualClock::new(),
+            trust: Arc::clone(&trust_cell),
+        });
+        let machine = Machine::new();
+        let reading = Arc::clone(&machine.wall);
+        let trust = Arc::new(ClockTrust::new(
+            crate::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || {
+                    wall.check();
+                    reading.load(Ordering::SeqCst)
+                }
+            }),
+            Arc::new(UtcFloor::at(0)),
+            Arc::clone(&wall) as Arc<dyn ContinuousClock>,
+            Arc::new(machine.boot_clock.clone()),
+            machine.boot.clone(),
+        ));
+        trust_cell
+            .set(Arc::downgrade(&trust))
+            .expect("the probe is set once");
+
+        trust.sample(&devices).expect("samples");
+        trust.sample_for_forgetting(&devices).expect("samples");
+        trust.observe(&devices).expect("observes");
+        trust.watch(&devices, true).expect("watches");
+        trust.settle(&devices).expect("settles");
+        trust.establish(&devices).expect("the owner establishes");
+        trust.sample(&devices).expect("samples");
     }
 
     /// KR-REQ-09.19: when the platform's time service does not qualify and the owner has not
@@ -1034,10 +1285,7 @@ mod tests {
             !first.trust.watch(&devices, false).expect("watches").proven,
             "an unqualified service proves nothing"
         );
-        assert!(
-            first.trust.sample(&devices).expect("samples").is_some(),
-            "a grant is decided as before"
-        );
+        assert!(proven(&first, &devices), "a grant is decided as before");
         assert!(
             first
                 .trust
@@ -1143,6 +1391,29 @@ mod tests {
         assert_eq!(floor.get(), START + 10_000);
     }
 
+    /// The moment a grant is decided against is never behind what the continuous clock says has
+    /// passed since the anchor: a wall clock four seconds short, which the tolerance forgives,
+    /// does not give a grant those four seconds back.
+    #[test]
+    fn a_step_back_the_tolerance_forgives_gives_no_grant_the_time_back() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        run.trust.sample(&devices).expect("samples");
+        run.continuous.advance(MINUTE);
+        machine.boot_clock.advance(MINUTE);
+        machine.set_wall(machine.wall() + 56_000);
+        let sampled = run
+            .trust
+            .sample(&devices)
+            .expect("samples")
+            .expect("four seconds short is forgiven");
+        assert!(
+            sampled.now.get() > START + 56_000,
+            "the grant is measured from where the minute put the clock, not from where it reads"
+        );
+    }
+
     /// While this boot's clock continuity is lost there is no reading anything may be decided
     /// against, whatever the wall clock says, until the owner establishes the clock.
     #[test]
@@ -1156,5 +1427,115 @@ mod tests {
         assert!(run.trust.sample(&devices).expect("readable").is_none());
         floor.establish_continuity();
         assert!(run.trust.sample(&devices).expect("readable").is_some());
+    }
+
+    /// KR-REQ-09.18: a continuous clock that runs fast against the wall clock raises no distrust.
+    /// Fifty parts per million is about four seconds a day; read every hour for thirty days and an
+    /// hour, the host never distrusts its clock, never withholds a forgetting and never withholds
+    /// attention. The rate allowance is what keeps the difference from accumulating until it is
+    /// taken for a rollback, which an owner's retrust or a reboot alone would clear.
+    #[test]
+    fn a_continuous_clock_that_runs_fast_raises_no_distrust_in_thirty_days() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        for hour in 0..30 * 24 + 1 {
+            run.pass_fast(HOUR, FIFTY_PPM);
+            assert!(proven(&run, &devices), "hour {hour}: no distrust");
+            assert!(
+                run.trust
+                    .sample_for_forgetting(&devices)
+                    .expect("samples")
+                    .is_some(),
+                "hour {hour}: no forgetting is withheld"
+            );
+            assert!(
+                run.trust.watch(&devices, true).expect("watches").proven,
+                "hour {hour}: attention is not withheld"
+            );
+        }
+    }
+
+    /// KR-REQ-09.18: the same host that nobody read for thirty days: one reading after a
+    /// continuous clock that ran fifty parts per million fast distrusts nothing. The wall clock
+    /// reads about two minutes behind the continuous clock, which the allowance for thirty days
+    /// covers.
+    #[test]
+    fn a_continuous_clock_that_ran_fast_unread_for_thirty_days_raises_no_distrust() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        assert!(proven(&run, &devices));
+        run.pass_fast(30 * DAY, FIFTY_PPM);
+        assert!(proven(&run, &devices));
+        assert!(run.trust.watch(&devices, true).expect("watches").proven);
+    }
+
+    /// KR-REQ-09.18: a rollback larger than the allowance at that point still withholds every
+    /// forgetting. After thirty days on a fast continuous clock, read every hour, a wall clock six
+    /// seconds behind where it stood is a rollback; and after thirty days nobody read, one six
+    /// minutes behind is.
+    #[test]
+    fn a_rollback_larger_than_the_allowance_is_found_after_thirty_days() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        for _ in 0..30 * 24 {
+            run.pass_fast(HOUR, FIFTY_PPM);
+            assert!(proven(&run, &devices));
+        }
+        machine.set_wall(machine.wall() - 6_000);
+        assert!(
+            run.trust
+                .sample_for_forgetting(&devices)
+                .expect("samples")
+                .is_none()
+        );
+        assert!(!run.trust.watch(&devices, true).expect("watches").proven);
+
+        let unread = Run::on(&Machine::new());
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        assert!(proven(&unread, &devices));
+        unread.pass_fast(30 * DAY, FIFTY_PPM);
+        unread.machine.set_wall(unread.machine.wall() - 360_000);
+        assert!(!proven(&unread, &devices));
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: a restart in the same boot keeps neither a false distrust nor a
+    /// missed rollback. After thirty days on a fast continuous clock the host goes down for a day
+    /// on a boot clock that is just as fast, and starts again: it trusts the clock. Another day, and
+    /// a wall clock corrected six minutes back while it was down: it does not.
+    #[test]
+    fn a_restart_after_thirty_days_on_a_fast_clock_keeps_neither_a_false_distrust_nor_a_missed_rollback()
+     {
+        let store = Store::new();
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        for _ in 0..30 * 24 + 1 {
+            run.pass_fast(HOUR, FIFTY_PPM);
+            assert!(proven(&run, &store.open()));
+        }
+
+        machine.pass_fast(DAY, FIFTY_PPM);
+        let restarted = Run::on(&machine);
+        assert!(
+            proven(&restarted, &store.open()),
+            "a day on a fast clock is no rollback after a restart"
+        );
+        assert!(
+            restarted
+                .trust
+                .watch(&store.open(), true)
+                .expect("watches")
+                .proven
+        );
+
+        machine.pass_fast(DAY, FIFTY_PPM);
+        machine.set_wall(machine.wall() - 360_000);
+        let corrected = Run::on(&machine);
+        assert!(
+            !proven(&corrected, &store.open()),
+            "the correction made while it was down is found"
+        );
     }
 }
