@@ -576,6 +576,10 @@ impl Engine {
             // the alternate one. A direct terminal reading the same bytes would be showing a
             // different buffer from the canonical grid from here on, so the attachment projects.
             // The buffer is asked first because it is a flag, and reading the sequence is not.
+            // A wrap pending at the reset is not a reason to ask for projection here. The reset
+            // advances the projection, which redraws every direct attachment from the canonical
+            // screen, and a redraw cannot leave a wrap pending, so an attachment redrawn with the
+            // wrap still pending is shown a projection whatever is asked of it here.
             if decision.apply_to_grid && self.grid.alternate_active() && is_soft_reset(&event.kind)
             {
                 disposition = DirectDisposition::RequireProjection;

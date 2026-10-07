@@ -2114,6 +2114,70 @@ async fn subscribing_again_while_the_parser_is_mid_sequence_is_served_a_projecti
     .await;
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.18: a soft reset redraws every terminal that was being handed the
+/// stream, and a terminal drawn with a wrap pending is shown a projection, because a redraw cannot
+/// leave a wrap pending and the next character would land in the wrong cell. On the same screen
+/// with no wrap pending, the reset leaves the terminal on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_projection() {
+    let narrow = Dimensions::new(4, 5);
+    for (printed, expected) in [
+        (
+            "d",
+            (
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::RestorationIncomplete),
+            ),
+        ),
+        ("", (Some(TerminalPresentationMode::Direct), None)),
+    ] {
+        // Three of the four columns are written, so no wrap is pending when the terminal attaches.
+        // The fourth is written by the same step that sends the soft reset, or not at all.
+        let host = host_with(
+            &format!(
+                "stty -echo -echonl || exit 1; printf 'abc'; read -r _; \
+                 printf '{printed}\\033[!p'; read -r _"
+            ),
+            narrow,
+            None,
+            1024 * 1024,
+        )
+        .await;
+        produced(&host.runtime, b"abc").await;
+        let mut typist = typist(&host).await;
+        let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+        assert_eq!(
+            attached.presentation,
+            Some(TerminalPresentationMode::Direct),
+            "a terminal of the session's own size on a settled stream is handed the stream"
+        );
+        typist.release(&host).await;
+        let events = collect_until_resync(
+            &mut attached.client,
+            &format!("the soft reset after {printed:?} to tell the terminal to begin again"),
+        )
+        .await;
+        let marker = resync_of(&events);
+        assert_eq!(
+            marker.reason,
+            kr_protocol::recovery::ResyncReason::ProjectionReset
+        );
+        // The terminal asks for the screen, as a client does when it is told to begin again.
+        resubscribe(&host, &mut attached, marker.cursor.get()).await;
+        let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        reported_as(
+            &host,
+            &mut reader,
+            attached.attachment_id,
+            expected,
+            &format!("the screen drawn after {printed:?} and a reset, to decide how it is served"),
+        )
+        .await;
+    }
+}
+
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {
