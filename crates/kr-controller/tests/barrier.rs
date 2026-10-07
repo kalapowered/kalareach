@@ -322,7 +322,7 @@ fn fenced(actor_id: &ActorId, byte: u8) -> kr_protocol::action::FencedAction {
 
 /// Holds the worker's session until it is released, which is how this suite isolates a worker.
 ///
-/// It runs on a blocking thread rather than in the test, because the lock is not reentrant and a
+/// It runs on a thread of its own rather than in the test, because the lock is not reentrant and a
 /// test that held it could not then ask the worker anything. While it is held the worker cannot
 /// reach its journal, so it cannot install an authority revision: an announcement that arrives
 /// stops inside the worker's own revocation handler, which is precisely the case section 9 warns
@@ -1929,8 +1929,8 @@ async fn hosted_worker_apart() -> Hosted {
 
 /// Creates one more session through `daemon` and performs the worker's side of the rendezvous in
 /// this process, so the daemon has one more verified worker it can announce to. The worker's
-/// session runtime, and the connections it serves, run on this test's runtime, or on a runtime of
-/// their own when `apart`.
+/// session runtime, and the connections the worker serves, run on this test's runtime, or on a
+/// runtime of their own when `apart`.
 async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
     let environment = daemon.environment.clone();
     let environment_id = daemon.environment_id;
@@ -3009,10 +3009,10 @@ async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
 /// acknowledgement. What is decided is the order of what the daemon asks and not what a worker
 /// answers, so it holds whatever refuses, times out or is slow at the moment: that only changes how
 /// many announcements it takes. Each announcement is checked, and the announcements go on until
-/// every name is collected and one of them has asked every worker for both its acknowledgement and a
-/// page. A daemon that asked for a worker's pages as soon as that worker had acknowledged would put
-/// one worker's page before the other's acknowledgement in that announcement, so the case cannot
-/// end without meeting the order it is there to refuse.
+/// every name is collected and one of them has asked every worker for both its acknowledgement and
+/// a page. A daemon that asked for a worker's pages as soon as that worker had acknowledged would
+/// put one worker's page before the other's acknowledgement in that announcement, so the case
+/// cannot end without meeting the order it is there to refuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_asks_for_any_page() {
     let daemon = hosted_daemon().await;
@@ -3032,7 +3032,9 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
     let barrier = loop {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the names were not all collected within three minutes of announcements"
+            "within three minutes of announcements ({announcements} made) the names were not all \
+             collected, or no announcement asked every worker for both an acknowledgement and a \
+             page (asked: {asked_everyone_both})"
         );
         let before = daemon.controller.announcements_sent_for_tests().len();
         let announced = if announcements == 0 {
@@ -3042,7 +3044,9 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
         };
         announcements += 1;
         let barrier = announced
-            .expect("the names were not all collected within three minutes of announcements")
+            .unwrap_or_else(|_| {
+                panic!("an announcement ({announcements}) did not end within three minutes")
+            })
             .expect("the revocation is announced");
         let sent = daemon.controller.announcements_sent_for_tests()[before..].to_vec();
         let mut paged = false;
