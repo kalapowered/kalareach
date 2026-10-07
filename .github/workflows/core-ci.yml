@@ -1719,10 +1719,13 @@ jobs:
           exit "$status"
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
-      # else, each of which must demonstrate something, and no process of the run left behind.
+      # else, each of which must demonstrate something, and no process of the run left behind. This
+      # leg builds the suites' test programs itself, which the other leg's test step did before the
+      # split, so with nothing cached the step carries their build as well as the demonstrations'
+      # twenty minutes.
       - name: End-to-end demonstrations
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: bash scripts/end-to-end.sh
 
       # Everything the script below builds before it measures: the release profile of the
