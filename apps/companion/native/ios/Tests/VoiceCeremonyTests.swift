@@ -199,9 +199,10 @@ final class VoiceCeremonyTests: XCTestCase {
 
     /// The exact bytes the host signs, for one fixed challenge.
     ///
-    /// The same two constants are asserted by the desktop ceremony tests, against the shared
-    /// protocol's own encoder, and by the Android ceremony tests. A client that signs anything else
-    /// produces proofs the host rejects, and no test of this client alone would notice.
+    /// The same two constants are asserted by the shared protocol's own tests
+    /// (`crates/kr-protocol/tests/voice_confirmation_vectors.rs`), against its own encoder, and by
+    /// the Android ceremony tests. A client that signs anything else produces proofs the host
+    /// rejects, and no test of this client alone would notice.
     func testSigningInputMatchesTheCrossLanguageVector() {
         let challenge = VoiceConfirmationChallenge(
             confirmationId: Data(repeating: 0x11, count: 16),
@@ -238,8 +239,9 @@ final class VoiceCeremonyTests: XCTestCase {
     private static let signerKeyIdVector = "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f"
 
     /// The encoder at every boundary where the head changes size, for multibyte text and for keys of
-    /// equal and unequal length. The bytes are the list the desktop test holds the host's own
-    /// encoder to, so all three clients agree with the host rather than with themselves.
+    /// equal and unequal length. The bytes are the list the host's encoder is held to in
+    /// `crates/kr-cbor/tests/phone_encoder_vectors.rs`, so both phones agree with the host rather
+    /// than with themselves.
     func testTheEncoderWritesTheHostsBytesAtEveryBoundary() {
         func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined() }
         let unsigned: [(UInt64, String)] = [

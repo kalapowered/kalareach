@@ -122,7 +122,6 @@
 
 /* Begin PBXFileReference section */
 		019E652DB2C27D9CDAB07505 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
-		01BA9EF81D56E832E4F72411 /* ceremony.rs */ = {isa = PBXFileReference; path = ceremony.rs; sourceTree = "<group>"; };
 		02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		090833DCE614DBBC5B713F32 /* ProofTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProofTests.swift; sourceTree = "<group>"; };
 		0F27CA2E0B14038A22B9EF0C /* identity.rs */ = {isa = PBXFileReference; path = identity.rs; sourceTree = "<group>"; };
@@ -370,7 +369,6 @@
 			children = (
 				20D78A09D280B9BA8932D5A2 /* buffer.rs */,
 				3059F574B246BBF7D8FD5B78 /* call.rs */,
-				01BA9EF81D56E832E4F72411 /* ceremony.rs */,
 				78C823D47F18DFFD2735CD80 /* codec.rs */,
 				CCDE8F6B0D2B775A6D9FFA85 /* control.rs */,
 				286BC5287B5926CF34F943B6 /* device.rs */,

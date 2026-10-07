@@ -2,8 +2,8 @@
 
 The companion application holds the parts of a voice call that belong on the device: capture,
 playback and the WebRTC connection in native code on each platform, the capture gate that decides
-when the microphone may carry speech, the voice screen, and the device-owner confirmation ceremony.
-It runs on macOS, iOS and Android.
+when the microphone may carry speech, and the voice screen. The device-owner confirmation ceremony
+is the phones' own. The application runs on macOS, iOS and Android.
 
 ## What a person is told before a call exists
 
@@ -152,14 +152,15 @@ The call controls keep them strictly separated:
 
 Actions requiring unlocked-screen confirmation (session closure, grant changes, arbitrary shell input,
 diff application, and external delivery) require a client-signed confirmation over the action hash:
-- **macOS**: `LAContext` with biometric / passcode evaluation, followed by Ed25519 signing.
 - **iOS**: `LocalAuthentication` (`evaluatePolicy(.deviceOwnerAuthentication)`), followed by CryptoKit Ed25519 signing.
 - **Android**: `BiometricPrompt`, followed by Ed25519 signing. From Android 11 it accepts a strong
   biometric or the device credential; before it, a strong biometric only, on a device with a secure
   lock screen, because the older way to allow the credential also admits weak biometrics.
-- A platform without owner presence refuses with `UNAVAILABLE` rather than falsely answering "verified".
+- A phone that cannot verify the owner's presence refuses the confirmation rather than falsely
+  answering "verified".
 - The signature binds the exact action hash and request ID with the paired device's identity key,
   never a session key. Provider text or model claims cannot produce a valid confirmation.
 
-The voice screen has no way to reach these ceremonies. A challenge the host sends it is shown with
-the host's words and the fact that the screen cannot sign it, and the host does not act on it.
+The desktop application holds no such ceremony. The voice screen has no way to reach these
+ceremonies. A challenge the host sends it is shown with the host's words and the fact that the
+screen cannot sign it, and the host does not act on it.

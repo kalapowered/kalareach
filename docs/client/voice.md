@@ -91,9 +91,8 @@ has not acted on it.
 
 `apps/companion/src-tauri/src/audio/` holds the desktop half: Opus encoding and decoding with
 packet-loss concealment at 48 kHz mono, a bounded PCM ring buffer at a 120 ms target depth, the
-macOS `VoiceProcessingIO` unit, the rules every control frame is held to, and the unlocked-screen
-ceremony. Opening a desktop call refuses, and says so, rather than answering with an offer no
-transport here could carry.
+macOS `VoiceProcessingIO` unit, and the rules every control frame is held to. Opening a desktop call
+refuses, and says so, rather than answering with an offer no transport here could carry.
 
 `apps/companion/native/ios/` and `apps/companion/native/android/` hold the phone's half: the
 platform's own WebRTC stack, the audio session and audio focus, Android's microphone foreground
@@ -101,15 +100,16 @@ service with its notification, and each platform's device-owner ceremony.
 
 ## The unlocked-screen ceremony (KR-REQ-15.13)
 
-Each platform authenticates the device owner and then signs the host's own challenge with the
-paired device's identity key: `LAContext` on macOS, `LocalAuthentication` on iOS, `BiometricPrompt`
-with a device-credential fallback on Android. A platform with no such ceremony refuses rather than
-answering that the owner was present. The signature covers the exact action the host named, so a
-confirmation for one action authorises nothing else, and no provider text can produce one.
+Each phone authenticates the device owner and then signs the host's own challenge with the paired
+device's identity key: `LocalAuthentication` on iOS, `BiometricPrompt` with a device-credential
+fallback on Android. A phone that cannot verify the owner refuses rather than answering that the
+owner was present, and the desktop application holds no such ceremony. The signature covers the
+exact action the host named, so a confirmation for one action authorises nothing else, and no
+provider text can produce one.
 
 | Platform | Capture and playback | Media stack | Device-owner ceremony |
 | --- | --- | --- | --- |
-| macOS | `VoiceProcessingIO` unit | `webrtc` (Rust) | `LAContext`, Ed25519 |
+| macOS | `VoiceProcessingIO` unit | `webrtc` (Rust) | none |
 | iOS | `AVAudioSession` (`.playAndRecord`) | `stasel/WebRTC` | `LocalAuthentication`, Ed25519 |
 | Android | `AudioRecord` and `AudioTrack` | `io.github.webrtc-sdk:android` | `BiometricPrompt`, Ed25519 |
 

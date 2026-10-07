@@ -176,9 +176,10 @@ class VoiceCeremonyTest {
     /**
      * The cross-language vector: the exact bytes the host signs, for one fixed challenge.
      *
-     * The same two constants are asserted by the desktop ceremony tests, against the shared
-     * protocol's own encoder, and by the iOS ceremony tests. A client that signs anything else
-     * produces proofs the host rejects, and no test of this client alone would notice.
+     * The same two constants are asserted by the shared protocol's own tests
+     * (`crates/kr-protocol/tests/voice_confirmation_vectors.rs`), against its own encoder, and by
+     * the iOS ceremony tests. A client that signs anything else produces proofs the host rejects,
+     * and no test of this client alone would notice.
      */
     @Test
     fun signing_input_matches_the_cross_language_vector() {
@@ -206,8 +207,9 @@ class VoiceCeremonyTest {
 
     /**
      * The encoder at every boundary where the head changes size, for multibyte text and for keys
-     * of equal and unequal length. The bytes are the list the desktop test holds the host's own
-     * encoder to, so all three clients agree with the host rather than with themselves.
+     * of equal and unequal length. The bytes are the list the host's encoder is held to in
+     * `crates/kr-cbor/tests/phone_encoder_vectors.rs`, so both phones agree with the host rather
+     * than with themselves.
      */
     @Test
     fun the_encoder_writes_the_hosts_bytes_at_every_boundary() {
