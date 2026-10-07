@@ -2717,6 +2717,80 @@ async fn a_held_terminal_is_handed_the_stream_when_a_resize_leaves_a_screen_that
     .await;
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.81: a terminal held on a projection by a wrapped line, taken to a
+/// screen that can be carried by a resize while the parser stands inside a sequence, is not handed
+/// the stream yet: forwarding begins at a boundary, so what it is kept off the stream by is the
+/// boundary, and the stream is handed to it once the sequence ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_that_frees_a_held_terminal_mid_sequence_leaves_it_waiting_for_the_boundary() {
+    let narrow = Dimensions::new(8, 5);
+    let wide = Dimensions::new(12, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abcdefghij'; read -r _; printf '\\033[1'; read -r _; \
+         printf 'm'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abcdefghij").await;
+    let mut typist = typist(&host).await;
+    let mut owner = attach_claiming(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, owner.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::RestorationIncomplete)
+        ),
+        "the line the application wrapped cannot be drawn as one"
+    );
+
+    // The application begins a sequence and leaves it unfinished, and the session then takes a
+    // size at which the same text is one row.
+    typist.release(&host).await;
+    produced(&host.runtime, b"\x1b[1").await;
+    let resized: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: wide,
+                expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(resized.geometry.dimensions, wide);
+    assert_eq!(
+        reported(&host, &mut reader, owner.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::AwaitingParserBoundary)
+        ),
+        "the screen can be carried now, and the parser stands inside a sequence"
+    );
+
+    // The sequence ends, and the terminal is handed the stream.
+    typist.release(&host).await;
+    presented_as(
+        &host,
+        &mut reader,
+        owner.attachment_id,
+        TerminalPresentationMode::Direct,
+        "once the parser is on ground it takes the stream back",
+    )
+    .await;
+}
+
 /// KR-REQ-08.78 and KR-REQ-08.80: a terminal that a resize leaves on a projection is installed
 /// once. It is sent the new screen in band, and the output that follows continues it: nothing
 /// tells it to begin again over the screen it was just sent.
