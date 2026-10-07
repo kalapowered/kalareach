@@ -63,8 +63,8 @@ pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
 ///
 /// A step is written down when the wall clock exceeds the anchor projected from what was last
 /// written by more than this, so time passing is not mistaken for a correction. The projection
-/// credits a little less than the time that passes ([`RATE_ALLOWANCE_PPM`]), so a clock that keeps
-/// pace is written about every 42 minutes.
+/// credits a little less than the time that passes ([`kr_ipc::clock::RATE_ALLOWANCE_PPM`]), so a
+/// clock that keeps pace is written about every 42 minutes.
 fn unwritten_step_ms() -> u64 {
     u64::try_from(DISCONTINUITY_TOLERANCE.as_millis()).unwrap_or(u64::MAX)
 }
@@ -79,32 +79,13 @@ struct Anchor {
 
 impl Anchor {
     /// The earliest the wall clock can honestly read at `now`: the anchor plus what has elapsed
-    /// since on the continuous clock, less the rate allowance ([`credited`]).
+    /// since on the continuous clock, less the rate allowance ([`kr_ipc::clock::credited`]).
     fn projected(self, now: ContinuousInstant) -> u64 {
         let elapsed =
             u64::try_from(now.saturating_duration_since(self.at).as_millis()).unwrap_or(u64::MAX);
-        self.wall_ms.saturating_add(credited(elapsed))
+        self.wall_ms
+            .saturating_add(kr_ipc::clock::credited(elapsed))
     }
-}
-
-/// How far the continuous clock may run fast against the wall clock before the difference is a
-/// rollback, in parts per million.
-///
-/// The wall clock is disciplined by the platform's time service and the continuous clock is not,
-/// on macOS and Windows, so they differ by the oscillator's error: 20 ppm is about 1.7 s a day.
-/// A projection that credits every continuous millisecond would count that error as a rollback
-/// once it passed the tolerance, after days on a host that runs for weeks, and only an owner's
-/// retrust or a reboot would clear it. So the projection credits a millisecond less per 10,000 and
-/// a continuous clock up to this fast raises no distrust; one faster than that still does. The
-/// cost is stated once, here: a rollback gains slack of this rate times the time since the anchor
-/// was last raised, 6 ms for each minute, about 60 seconds for a host nobody read for a week. That
-/// is small against the 30 days a record is kept.
-const RATE_ALLOWANCE_PPM: u64 = 100;
-
-/// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
-/// allowance.
-fn credited(elapsed_ms: u64) -> u64 {
-    elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
 }
 
 /// What has been decided and not yet written down.
@@ -272,9 +253,9 @@ impl ClockTrust {
             // another boot the wall reading stands and the continuous side starts from now.
             let same_boot = stored.boot_value.as_slice() == self.boot.value.as_slice();
             let wall_ms = if same_boot {
-                stored
-                    .wall_ms
-                    .saturating_add(credited(boot_ms.saturating_sub(stored.boot_ms)))
+                stored.wall_ms.saturating_add(kr_ipc::clock::credited(
+                    boot_ms.saturating_sub(stored.boot_ms),
+                ))
             } else {
                 stored.wall_ms
             };

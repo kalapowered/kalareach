@@ -113,6 +113,34 @@ pub fn transferred_deadline(destination_now: u64, remaining: Duration) -> Option
     Some(destination_now.saturating_add(remaining))
 }
 
+/// How far the continuous clock may run fast against the wall clock before the difference counts
+/// as a rollback, in parts per million.
+///
+/// The platform's time service keeps the wall clock, and on macOS and Windows nothing keeps the
+/// continuous clock (`mach_continuous_time`, `QueryInterruptTime`), so the two differ by the
+/// oscillator's error: 20 ppm is about 1.7 seconds a day. A projection that credits every
+/// continuous millisecond counts that error as a rollback once it passes the five-second
+/// tolerance, about three days at 20 ppm, and a healthy host then distrusts its own clock until its
+/// owner establishes it again. So a projection credits a millisecond less per 10,000
+/// ([`credited`]): a continuous clock up to this fast raises no distrust, and one faster than that
+/// still does.
+///
+/// Both of the host's time records project this way, the daemon's clock record and each worker's
+/// time contract, and this is the one statement of the rule and of its cost. A wall clock that
+/// falls behind the continuous clock by no more than this rate is never read as a rollback, however
+/// long that lasts, so it can lose this rate times the elapsed time (6 ms for each minute, about a
+/// minute a week) without being seen, and a UTC deadline decided against the proven reading can
+/// outlive its time by as much. A single step back is seen when it exceeds the tolerance plus this
+/// rate times the time since the record was last raised.
+pub const RATE_ALLOWANCE_PPM: u64 = 100;
+
+/// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
+/// allowance ([`RATE_ALLOWANCE_PPM`]).
+#[must_use]
+pub const fn credited(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
+}
+
 /// Returns the machine's continuous clock, in milliseconds since this boot.
 ///
 /// Comparable between processes on one boot, and meaningless across boots. Nothing derives a

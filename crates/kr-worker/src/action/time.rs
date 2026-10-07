@@ -390,39 +390,16 @@ struct HighWater {
     continuous_ms: u64,
 }
 
-/// How far the continuous clock may run fast against the wall clock before the difference counts
-/// as a rollback, in parts per million.
-///
-/// The platform's time service keeps the wall clock, and on macOS and Windows nothing keeps the
-/// continuous clock (`mach_continuous_time`, `QueryInterruptTime`), so the two differ by the
-/// oscillator's error: 20 ppm is about 1.7 seconds a day. A projection that credits every
-/// continuous millisecond counts that error as a rollback once it passes the five-second
-/// tolerance, about three days at 20 ppm, and a healthy worker then distrusts its own clock and
-/// stops collecting. So the projection credits a millisecond less per 10,000: a continuous clock up
-/// to this fast raises no distrust, and one faster than that still does.
-///
-/// The cost, stated once here: a wall clock that falls behind the continuous clock by no more than
-/// this rate is never read as a rollback, however long that lasts, so it can lose this rate times
-/// the elapsed time (6 ms for each minute, about a minute a week) without being seen, and a UTC
-/// deadline decided against the proven reading can outlive its time by as much. A single step back
-/// is seen when it exceeds the tolerance plus this rate times the time since the mark was last
-/// raised.
-const RATE_ALLOWANCE_PPM: u64 = 100;
-
-/// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
-/// allowance ([`RATE_ALLOWANCE_PPM`]).
-const fn credited(elapsed_ms: u64) -> u64 {
-    elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
-}
-
 impl HighWater {
     /// Returns the earliest the wall clock can honestly read now.
     ///
     /// The continuous clock is the ground truth for elapsed time, so the mark plus whatever has
-    /// elapsed since it was taken, less the rate allowance, is a lower bound on the present.
+    /// elapsed since it was taken, less the rate allowance
+    /// ([`kr_ipc::clock::RATE_ALLOWANCE_PPM`]), is a lower bound on the present.
     const fn projected(self, continuous_now: u64) -> u64 {
-        self.wall_ms
-            .saturating_add(credited(continuous_now.saturating_sub(self.continuous_ms)))
+        self.wall_ms.saturating_add(kr_ipc::clock::credited(
+            continuous_now.saturating_sub(self.continuous_ms),
+        ))
     }
 }
 
