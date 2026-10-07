@@ -321,6 +321,10 @@ pub struct Permitted {
     /// cannot move underneath the answer. A request whose only requirement is one of these leaves
     /// here permitted and unanswered.
     pub unresolved: Vec<RequiredAuthority>,
+    /// Whether the request was decided while this boot's clock continuity is lost, for a grant the
+    /// host decides by the clock: only the owner's confirmation of the clock is served then, and
+    /// the subject refuses any other ([`may_end_the_loss`]).
+    pub confirms_the_clock_only: bool,
 }
 
 impl Permitted {
@@ -337,13 +341,19 @@ impl Permitted {
 /// A host that cannot prove its clock decides nothing by it, so a grant whose use the host bounds
 /// by time (a bounded offline validity, an exclusive organisation management) is refused until the
 /// owner establishes the clock. The owner's explicit retrust is how that ends, and a retrust the
-/// unproven clock refused would leave only a reboot. So the owner's confirmation of the clock is
-/// decided as it would be on a clock the host proves: asking for the challenge, answering it and
-/// spending it. What it needs of the grant is all that still holds. The grant never expires, since
-/// an expiring grant cannot be proven in force without the clock, and it is a personal grant,
-/// since an organisation's answers to a lease the organisation signed. Every other rule of the
-/// decision still applies, and so does the check inside the effect that the signer is a live owner
-/// device.
+/// unproven clock refused would leave only a reboot. So the methods that ask for, answer and spend
+/// the owner's confirmation are decided as they would be on a clock the host proves. They are
+/// generic over what is confirmed, so the decision marks the request
+/// ([`Permitted::confirms_the_clock_only`]) and the subject serves the confirmation of the clock
+/// alone: a challenge for anything else is neither asked for, listed nor answered under it.
+///
+/// What it needs of the grant is all that still holds. The grant never expires, since an expiring
+/// grant cannot be proven in force without the clock, and it is a personal grant, since an
+/// organisation's answers to a lease the organisation signed. Every other rule of the decision
+/// still applies, and so does the check inside the effect that the signer is a live owner device.
+/// The offline bound or the managed lease is still decided from the reading this host has, which
+/// is the point at which it is unproven: a clock behind the truth could keep one alive that the
+/// truth has ended, for the length of one confirmation of the clock.
 fn may_end_the_loss(grant: &Grant, method: Method) -> bool {
     matches!(
         method,
@@ -419,9 +429,13 @@ pub fn decide(
     // reads the clock is the grant's expiry and this host's own time bounds on its use, so both
     // are asked about whatever the grant's own expiry is. A lapse found here is owed its record by
     // the caller, which writes the floor it stood on.
+    let mut confirms_the_clock_only = false;
     if policy.stands_on_the_clock(grant, request.ingress) {
-        if continuity_lost && !may_end_the_loss(grant, request.method) {
-            return Err(Refusal::ClockUnproven);
+        if continuity_lost {
+            if !may_end_the_loss(grant, request.method) {
+                return Err(Refusal::ClockUnproven);
+            }
+            confirms_the_clock_only = true;
         }
         if policy.utc_floor().is_owed() {
             return Err(Refusal::FloorUnrecorded);
@@ -514,6 +528,7 @@ pub fn decide(
         lease: intersection.lease,
         offline: intersection.offline,
         unresolved,
+        confirms_the_clock_only,
     })
 }
 

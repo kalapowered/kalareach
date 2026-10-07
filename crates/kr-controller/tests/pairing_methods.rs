@@ -883,13 +883,15 @@ async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
 }
 
 /// KR-REQ-09.17, KR-REQ-09.19, KR-REQ-10.52: an owner whose own authority the host decides by its
-/// clock can still establish that clock. The owner chose a bounded offline validity for personal
-/// remote access, so every request of the owner device reads the host's clock; the host then loses
-/// the continuity of its clock readings, and until the owner establishes the clock again it decides
-/// nothing by it. The owner device's reads are refused as `CLOCK_UNTRUSTED`, which is the right
-/// answer for them; its confirmation of the clock is not, because the owner's explicit retrust is
-/// what ends that state and cannot wait for the clock it repairs. The device asks, answers and
-/// spends the confirmation itself, and its reads are served again afterwards.
+/// clock can still establish that clock, and confirm nothing else meanwhile. The owner chose a
+/// bounded offline validity for personal remote access, so every request of the owner device reads
+/// the host's clock; the host then loses the continuity of its clock readings, and until the owner
+/// establishes the clock again it decides nothing by it. The owner device's reads are refused as
+/// `CLOCK_UNTRUSTED`, which is the right answer for them; its confirmation of the clock is not,
+/// because the owner's explicit retrust is what ends that state and cannot wait for the clock it
+/// repairs. The device asks, answers and spends the confirmation itself. A confirmation of
+/// anything else is not asked for, listed or answered under it: the local owner's challenge for an
+/// invitation stays unanswered by the device until the clock is established, and is answered then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_clock() {
     let owner_keys = keys();
@@ -899,6 +901,7 @@ async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_c
     let owner_record = host.owner.clone().expect("the owner device");
     let owner_device = host.owner_device.as_ref().expect("the owner device");
     let raw = RawDevice::connect(&host, owner_device, &owner_record).await;
+    let mut client = host.client().await;
     let now = kr_ipc::now_ms();
     host.controller()
         .update_policy(|policy| {
@@ -918,6 +921,18 @@ async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_c
         )
         .await
     };
+    let pending = || async {
+        raw.read(
+            Method::OwnerConfirmationPending,
+            &OwnerConfirmationPendingParams {},
+        )
+        .await
+        .map(|value| {
+            value
+                .to_typed::<OwnerConfirmationPendingResult>()
+                .expect("decodes")
+        })
+    };
     list()
         .await
         .expect("the owner device reads while the host proves its clock");
@@ -927,6 +942,57 @@ async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_c
         code(list().await),
         ErrorCode::ClockUntrusted,
         "nothing the host decides by its clock is served while its continuity is lost"
+    );
+
+    // The local owner asks for a confirmation of something else, which is not the clock's.
+    let grant = viewer();
+    let invitation = calls::request(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &grant),
+    )
+    .await
+    .expect("the local owner asks to issue an invitation");
+    assert!(
+        pending()
+            .await
+            .expect("the owner device lists what it can answer")
+            .pending
+            .is_empty(),
+        "the invitation's challenge is not listed under an unproven clock"
+    );
+    assert_eq!(
+        code(
+            raw.mutate(
+                Method::OwnerConfirmationRequest,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &OwnerConfirmationRequestParams {
+                    subject: issue_subject(InviteGrantKind::SessionInvitation, &grant),
+                },
+            )
+            .await
+        ),
+        ErrorCode::ClockUntrusted,
+        "and is not asked for"
+    );
+    let (invited_proof, _) = calls::sign(&invitation.request, &Signer::OwnerDevice(&owner_keys));
+    let answer_the_invitation = || async {
+        raw.mutate(
+            Method::OwnerConfirmationComplete,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &OwnerConfirmationCompleteParams {
+                proof: invited_proof.clone(),
+                bootstrap_signer: Nullable::null(),
+            },
+        )
+        .await
+    };
+    assert_eq!(
+        code(answer_the_invitation().await),
+        ErrorCode::ClockUntrusted,
+        "and is not answered"
     );
 
     let asked = raw
@@ -942,6 +1008,17 @@ async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_c
         .expect("the owner device asks")
         .to_typed::<OwnerConfirmationRequestResult>()
         .expect("decodes");
+    assert_eq!(
+        pending()
+            .await
+            .expect("the owner device lists what it can answer")
+            .pending
+            .iter()
+            .map(|listed| listed.request.confirmation_id)
+            .collect::<Vec<_>>(),
+        vec![asked.request.confirmation_id],
+        "the confirmation of the clock is listed, and it alone"
+    );
     let (proof, _) = calls::sign(&asked.request, &Signer::OwnerDevice(&owner_keys));
     raw.mutate(
         Method::OwnerConfirmationComplete,
@@ -967,6 +1044,9 @@ async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_c
     list()
         .await
         .expect("the owner device reads again once the clock is established");
+    answer_the_invitation().await.expect(
+        "and answers the invitation's challenge, which it was refused while the clock was unproven",
+    );
     host.stop().await;
 }
 

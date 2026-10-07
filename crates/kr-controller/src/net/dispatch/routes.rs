@@ -378,7 +378,10 @@ impl RemoteConnection {
                     .await
             }
             DeviceRead::Pairing => {
-                let caller = super::super::owner::Caller::device(self.device.clone());
+                let caller = super::super::owner::Caller::device(self.device.clone())
+                    .confirming_the_clock_only(
+                        decided.decision.decided.permitted.confirms_the_clock_only,
+                    );
                 match self
                     .controller
                     .pairing_read(caller, entry.method, &request.params)
@@ -1238,7 +1241,10 @@ impl RemoteConnection {
                         ),
                     );
                 }
-                let caller = super::super::owner::Caller::device(self.device.clone());
+                let caller = super::super::owner::Caller::device(self.device.clone())
+                    .confirming_the_clock_only(
+                        decided.decision.decided.permitted.confirms_the_clock_only,
+                    );
                 let admission = self.controller.pairing_admission(
                     self.connection_id(),
                     Some(validated),

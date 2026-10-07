@@ -247,6 +247,11 @@ impl Controller {
             }
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
+                if caller.confirms_the_clock_only
+                    && !matches!(params.subject, ConfirmationSubject::EstablishClock)
+                {
+                    return Err(crate::grants::continuity_lost());
+                }
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();

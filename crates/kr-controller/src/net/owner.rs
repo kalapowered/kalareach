@@ -65,6 +65,10 @@ pub struct Caller {
     pub ingress: ActorIngress,
     /// The caller's device record, for a paired device.
     pub device: Option<DeviceRecord>,
+    /// Whether the request was decided while this boot's clock continuity is lost, which serves
+    /// the owner's confirmation of the clock and no other
+    /// ([`crate::grants::Permitted::confirms_the_clock_only`]).
+    pub confirms_the_clock_only: bool,
 }
 
 impl Caller {
@@ -75,6 +79,7 @@ impl Caller {
             actor_id,
             ingress: ActorIngress::LocalIpc,
             device: None,
+            confirms_the_clock_only: false,
         }
     }
 
@@ -85,7 +90,16 @@ impl Caller {
             actor_id: record.principal(),
             ingress: ActorIngress::PairedDevice,
             device: Some(record),
+            confirms_the_clock_only: false,
         }
+    }
+
+    /// Marks a request decided while this boot's clock continuity is lost, which serves the
+    /// owner's confirmation of the clock and no other.
+    #[must_use]
+    pub const fn confirming_the_clock_only(mut self, only: bool) -> Self {
+        self.confirms_the_clock_only = only;
+        self
     }
 
     /// Returns the owner context an invitation this caller issues is bound to.
@@ -143,6 +157,13 @@ struct Entry {
     display: ConfirmationDisplay,
     bootstrap: bool,
     answer: Option<Answer>,
+}
+
+impl Entry {
+    /// Whether this is the challenge for the owner's confirmation of the host's clock.
+    const fn is_the_clocks(&self) -> bool {
+        matches!(self.display, ConfirmationDisplay::EstablishClock)
+    }
 }
 
 /// A verified answer, and the signer it was verified against.
@@ -785,7 +806,11 @@ impl OwnerAuthority {
         }
         let mut state = self.state();
         self.sweep(&mut state);
-        let mut pending: Vec<&Entry> = state.entries.values().collect();
+        let mut pending: Vec<&Entry> = state
+            .entries
+            .values()
+            .filter(|entry| !caller.confirms_the_clock_only || entry.is_the_clocks())
+            .collect();
         pending.sort_by_key(|entry| entry.order);
         Ok(OwnerConfirmationPendingResult {
             pending: pending
@@ -849,6 +874,9 @@ impl OwnerAuthority {
             return Err(confirmation_required(
                 "the proof answers a challenge this host did not issue",
             ));
+        }
+        if caller.confirms_the_clock_only && !entry.is_the_clocks() {
+            return Err(crate::grants::continuity_lost());
         }
         let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)

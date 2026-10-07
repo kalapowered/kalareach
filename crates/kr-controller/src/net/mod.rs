@@ -2586,11 +2586,15 @@ pub(crate) mod tests {
 
         controller.utc_floor().lose_continuity();
         for method in confirmations {
-            controller
+            let decided = controller
                 .decide_for_device(&lasting, &lasting_record, asked(method))
                 .unwrap_or_else(|refused| {
                     panic!("{method:?} is decided for the owner device: {refused:?}")
                 });
+            assert!(
+                decided.decided.permitted.confirms_the_clock_only,
+                "{method:?} is decided for the confirmation of the clock alone"
+            );
             assert!(
                 unproven(controller.decide_for_device(&expiring, &expiring_record, asked(method))),
                 "{method:?} is refused for a grant that expires"
@@ -2614,9 +2618,10 @@ pub(crate) mod tests {
         );
 
         controller.utc_floor().establish_continuity();
-        controller
+        let decided = controller
             .decide_for_device(&lasting, &lasting_record, asked(Method::SessionList))
             .expect("once the clock is established every method is decided again");
+        assert!(!decided.decided.permitted.confirms_the_clock_only);
         drop(controller);
     }
 
