@@ -156,6 +156,8 @@ pub fn distinct(handles: &[usize]) -> Vec<usize> {
 }
 
 #[cfg(windows)]
+pub(crate) use platform::end_process;
+#[cfg(windows)]
 pub use platform::{Child, Spec, StdinPipe, start};
 
 /// The calls with no safe form, and the handles they own.
@@ -256,20 +258,7 @@ mod platform {
         ///
         /// Returns the operating system's failure when a running process cannot be ended.
         pub fn kill(&mut self) -> std::io::Result<()> {
-            // SAFETY: the handle is this value's own and open for the call.
-            let ended = unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
-            if ended != 0 {
-                return Ok(());
-            }
-            let failure = std::io::Error::last_os_error();
-            // A process that has ended already refuses to be ended again, and so does one that
-            // is ending, whether it was ended or ended itself: it is not signalled until its last
-            // thread has gone, but it has its exit status from the moment it begins to end. Either
-            // is the outcome that was wanted. A process that is running has none.
-            match self.exit_status() {
-                Ok(Some(_)) => Ok(()),
-                _ => Err(failure),
-            }
+            end_process(&self.process)
         }
 
         /// Waits for the process to end.
@@ -313,19 +302,46 @@ mod platform {
             }
             Ok(std::process::ExitStatus::from_raw(code))
         }
+    }
 
-        /// Says how the process ended, where it has ended or is ending, without waiting.
-        ///
-        /// A process has an exit status from the moment it begins to end, before it is signalled
-        /// and can be waited for. While it runs, the system reports a status of its own, which a
-        /// process may also end with, so a process that is signalled is ended whatever it
-        /// reports.
-        fn exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-            // SAFETY: as for the wait.
-            let waited = unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 0) };
-            let status = self.status()?;
-            Ok((waited == WAIT_OBJECT_0 || status.code() != Some(STILL_ACTIVE)).then_some(status))
+    /// Ends the process `process` is a handle to, which a process that has ended already, or is
+    /// ending, is not a failure of.
+    ///
+    /// A process that has ended already refuses to be ended again, and so does one that is ending,
+    /// whether it was ended or ended itself: it is not signalled until its last thread has gone,
+    /// but it has its exit status from the moment it begins to end. Either is the outcome that was
+    /// wanted. A process that is running has no status, and its refusal is a failure. Every
+    /// process this host ends is ended here, so the rule is one rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when a running process cannot be ended.
+    pub(crate) fn end_process(process: &OwnedHandle) -> std::io::Result<()> {
+        // SAFETY: the handle is the caller's own and open for the call.
+        let ended = unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) };
+        if ended != 0 {
+            return Ok(());
         }
+        let failure = std::io::Error::last_os_error();
+        if has_exit_status(process) {
+            Ok(())
+        } else {
+            Err(failure)
+        }
+    }
+
+    /// Says whether the process has ended or is ending.
+    ///
+    /// While a process runs the system reports a status of its own, which a process may also end
+    /// with, so a process that is signalled is ended whatever it reports.
+    fn has_exit_status(process: &OwnedHandle) -> bool {
+        // SAFETY: the handle is the caller's own and open for the call.
+        let signalled =
+            unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } == WAIT_OBJECT_0;
+        let mut code = 0_u32;
+        // SAFETY: as above, and the code is a local this thread owns.
+        let read = unsafe { GetExitCodeProcess(process.as_raw_handle().cast(), &raw mut code) };
+        signalled || (read != 0 && code.cast_signed() != STILL_ACTIVE)
     }
 
     /// The write end of an agent's standard input, which what stops the agent can close and a
@@ -545,13 +561,10 @@ mod platform {
     /// Ends a process that was created and never resumed, and says why, and if it cannot be ended,
     /// that too: a suspended process nothing can reach is worse than a launch that failed.
     fn end_unstarted(process: &OwnedHandle, because: &str) -> std::io::Error {
-        // SAFETY: the handle is open for the call.
-        let ended = unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) };
-        if ended == 0 {
+        if let Err(failure) = end_process(process) {
             return std::io::Error::other(format!(
                 "a process was created and never started, because {because}, and then could not \
-                 be ended either: {}",
-                std::io::Error::last_os_error()
+                 be ended either: {failure}"
             ));
         }
         // SAFETY: as above.
