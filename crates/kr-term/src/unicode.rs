@@ -101,17 +101,23 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          measured against the grid report the last column. The grid reports the library's \
          column, so the difference is recorded and not corrected.",
         "A soft reset leaves a terminal on the buffer that is showing, where the library returns to \
-         the primary buffer. A direct attachment reading a soft reset while the alternate buffer is \
-         showing is moved to projection at that point, and the canonical grid is what it is shown.",
+         the primary buffer, so an application that goes on drawing after a soft reset from the \
+         alternate buffer draws on the primary buffer, which xterm would not. A direct terminal \
+         never reads the reset: it is redrawn from the canonical screen, which puts it on the \
+         primary buffer.",
         "A soft reset clears the saved cursor of both buffers, where xterm saves a fresh cursor in \
          the buffer that is showing, at home and with the wrap that was pending, and keeps the \
          other buffer's. A restore in the buffer the reset leaves showing goes home with the ASCII \
          sets and the shift in, in both. They differ in a wrap pending at the reset, in the faint, \
          crossed-out and doubly underlined states of the rendition, which xterm's reset leaves \
          set, and in a cursor saved in the other buffer before the reset and not saved again \
-         since, which xterm gives back there. A wrap pending at the reset needs no rule of its \
-         own: every soft reset redraws each direct attachment from the canonical screen, and an \
-         attachment redrawn with a wrap pending is shown a projection.",
+         since, which xterm gives back there. A soft reset needs no rule of its own for a direct \
+         terminal: every soft reset redraws each direct attachment from the canonical screen, an \
+         attachment redrawn with a wrap pending is shown a projection, and it is handed the \
+         stream again once the screen can be carried. The one soft reset a terminal reads is the \
+         restoration's own, which follows a carriage return and a plain rendition, so xterm's \
+         reset has no wrap to keep and no faint, crossed-out or doubly underlined state to leave \
+         set.",
     ],
     qualified_additions: &[
         QualifiedAddition {
