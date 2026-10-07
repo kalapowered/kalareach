@@ -508,8 +508,9 @@ mod platform {
 mod platform {
     use std::os::windows::io::AsHandle as _;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use interprocess::local_socket::tokio::Stream as PipeServer;
     use interprocess::local_socket::tokio::prelude::*;
@@ -777,18 +778,41 @@ mod platform {
         }
     }
 
+    /// How long the close of a connection waits for its caller to read what it was sent before the
+    /// pipe is closed with the rest unread.
+    const CLOSE_WAIT: Duration = Duration::from_secs(30);
+
+    /// The pause between looks at whether the caller has read what it was sent, which doubles up to
+    /// [`CLOSE_LOOK_LONGEST`].
+    const CLOSE_LOOK: Duration = Duration::from_millis(1);
+
+    /// The longest pause between looks.
+    const CLOSE_LOOK_LONGEST: Duration = Duration::from_millis(25);
+
+    /// How many connections may wait to close at once, each on a thread of its own. Past it a close
+    /// does not wait: the pipe is closed with what its caller has not read lost, which is what a
+    /// caller that reads so slowly that this many closes are waiting on it comes to.
+    const MAX_CLOSING: usize = 256;
+
+    /// How many connections are waiting to close now.
+    static CLOSING: AtomicUsize = AtomicUsize::new(0);
+
     /// Closes the accepting end of a connection without making any other connection wait for it.
     ///
-    /// A pipe's server end closed with bytes the caller has not read can lose them, so closing it
-    /// first flushes it, which waits until the caller has read everything or has gone. The pipe
-    /// library does that on one thread that every connection of the process shares, one handle at
-    /// a time, so a caller that is slow to read, or never reads, holds up every close queued behind
-    /// its own: those connections stay open, their callers never see them end, and whatever waits
-    /// for that waits for ever. A close that has something to deliver is given a thread of its own
-    /// instead, which flushes over a duplicate of the handle and only then lets the library close
-    /// the pipe, so everything the library is handed has already been read by its caller and its
-    /// flush returns at once. A caller that never reads keeps its own connection open, as it would
-    /// by holding it, and nothing else.
+    /// A pipe's server end closed with bytes the caller has not read can lose them, so a close
+    /// first waits until the caller has read them or has gone. The pipe library does that by
+    /// flushing the handle, on one thread that every connection of the process shares, one handle
+    /// at a time, so a caller that is slow to read, or never reads, holds up every close queued
+    /// behind its own: those connections stay open, their callers never see them end, and whatever
+    /// waits for that waits for ever.
+    ///
+    /// This asks the pipe instead. Where the caller has read everything, which is the common case,
+    /// the library is told there is nothing to flush and closes the handle there and then. Where it
+    /// has not, the wait is on a thread of its own, looking at the pipe at a growing pause, for at
+    /// most [`CLOSE_WAIT`] and with at most [`MAX_CLOSING`] such waits at once; then the handle is
+    /// closed, with the library told there is nothing to flush so that nothing waits on the shared
+    /// thread. A caller that never reads costs one parked thread for that long, and no other
+    /// connection anything.
     impl Drop for Accepted {
         fn drop(&mut self) {
             let Some(stream) = self.stream.take() else {
@@ -798,21 +822,36 @@ mod platform {
                 return;
             }
             let PipeServer::NamedPipe(pipe) = &stream;
-            let Ok(duplicate) = pipe.as_handle().try_clone_to_owned() else {
-                // The library's own close is what is left, and it delivers.
+            if !crate::paths::pipe_output_is_unread(pipe.as_handle()) {
+                pipe.inner().assume_flushed();
                 return;
-            };
-            let file = std::fs::File::from(duplicate);
-            // A thread that cannot be started leaves the closure, and the library's close with it,
-            // to this thread.
-            let _ = std::thread::Builder::new()
-                .name("kr-ipc pipe flush".to_owned())
+            }
+            if CLOSING.fetch_add(1, Ordering::AcqRel) >= MAX_CLOSING {
+                CLOSING.fetch_sub(1, Ordering::AcqRel);
+                pipe.inner().assume_flushed();
+                return;
+            }
+            // A thread that cannot be started leaves the closure, and the pipe with it, to be
+            // dropped here with nothing for the library to flush.
+            let waiting = std::thread::Builder::new()
+                .name("kr-ipc pipe close".to_owned())
                 .spawn(move || {
-                    // A flush of a pipe's handle waits for the caller to read what was written.
-                    let _ = file.sync_all();
-                    drop(file);
+                    let PipeServer::NamedPipe(pipe) = &stream;
+                    let deadline = Instant::now() + CLOSE_WAIT;
+                    let mut pause = CLOSE_LOOK;
+                    while crate::paths::pipe_output_is_unread(pipe.as_handle())
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(pause);
+                        pause = (pause * 2).min(CLOSE_LOOK_LONGEST);
+                    }
+                    pipe.inner().assume_flushed();
                     drop(stream);
+                    CLOSING.fetch_sub(1, Ordering::AcqRel);
                 });
+            if waiting.is_err() {
+                CLOSING.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
