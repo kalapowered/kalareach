@@ -4714,7 +4714,7 @@
         "installation",
         "transfer"
       ],
-      "summary": "Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed.",
+      "summary": "Abandon the upload. New parts and completions are fenced first, then the content stored for the upload is removed, and the hold is given back only once that removal is confirmed. The upload's record stays.",
       "version": 1
     },
     {

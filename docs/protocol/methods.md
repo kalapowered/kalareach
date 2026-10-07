@@ -288,7 +288,7 @@ links to its document.
 | `storage.upload.create` | write | `service_client` | Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists. |  |
 | `storage.upload.part` | write | `service_client` | Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content. |  |
 | `storage.upload.complete` | write | `service_client` | Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave. |  |
-| `storage.upload.abort` | write | `service_client` | Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed. |  |
+| `storage.upload.abort` | write | `service_client` | Abandon the upload. New parts and completions are fenced first, then the content stored for the upload is removed, and the hold is given back only once that removal is confirmed. The upload's record stays. |  |
 | `storage.object.read` | read | `service_client` | Read a bounded range of one stored object's ciphertext. The service holds no key for it. |  |
 | `storage.object.delete` | write | `service_client` | Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released. |  |
 
