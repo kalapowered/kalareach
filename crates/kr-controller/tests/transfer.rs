@@ -1321,6 +1321,347 @@ async fn a_restarted_daemon_resumes_an_upload_from_its_bitmap() {
     assert_eq!(finished.handle.byte_len, U64::new(bytes.len() as u64));
 }
 
+/// Publishes `bytes` for `session_id` and binds them to a new draft for it, as an insertion no
+/// upstream evidence has confirmed. Returns the draft and the file's handle.
+fn offer(
+    service: &kr_transfer::TransferService,
+    host: &Host,
+    session_id: SessionId,
+    bytes: &[u8],
+) -> (
+    kr_protocol::transfer::DraftRecord,
+    kr_protocol::transfer::AttachmentHandle,
+) {
+    let actor = test_actor();
+    let handle = publish_for(service, host, session_id, bytes);
+    let draft = service
+        .draft_create(
+            &actor,
+            &DraftCreateParams {
+                environment_id: host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session_id),
+                application_instance_id: Nullable::null(),
+                text: "have a look at this".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    let bound = bind(service, &draft, &handle).expect("binds the attachment");
+    assert_eq!(
+        bound.attachment.state,
+        kr_protocol::transfer::InsertionState::Recorded
+    );
+    (bound.draft, handle)
+}
+
+fn test_actor() -> kr_protocol::ids::ActorId {
+    kr_protocol::ids::ActorId::new("local:transfer-test").expect("a principal")
+}
+
+fn publish_for(
+    service: &kr_transfer::TransferService,
+    host: &Host,
+    session_id: SessionId,
+    bytes: &[u8],
+) -> kr_protocol::transfer::AttachmentHandle {
+    let actor = test_actor();
+    let begun = service
+        .upload_begin(
+            &actor,
+            &UploadBeginParams {
+                session_id: Nullable::some(session_id),
+                ..begin_params(host, bytes, "notes.bin")
+            },
+            None,
+        )
+        .expect("reserves the upload");
+    let (chunk, payload) = chunk_of(bytes, 0);
+    service
+        .upload_chunk(
+            &actor,
+            &kr_protocol::transfer::UploadChunkParams {
+                transfer_id: begun.transfer_id,
+                chunk,
+                bytes: payload,
+            },
+            None,
+        )
+        .expect("takes the chunk");
+    service
+        .upload_finish(
+            &actor,
+            &UploadFinishParams {
+                transfer_id: begun.transfer_id,
+                declared_byte_len: U64::new(bytes.len() as u64),
+                declared_digest: digest(bytes),
+            },
+            None,
+        )
+        .expect("publishes the attachment")
+        .handle
+}
+
+fn bind(
+    service: &kr_transfer::TransferService,
+    draft: &kr_protocol::transfer::DraftRecord,
+    handle: &kr_protocol::transfer::AttachmentHandle,
+) -> kr_transfer::Result<kr_protocol::transfer::AgentDraftAddAttachmentResult> {
+    service.draft_add_attachment(
+        &test_actor(),
+        &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+            draft_id: draft.draft_id,
+            expected_revision: draft.revision,
+            transfer_id: handle.transfer_id,
+            contribution: kr_protocol::transfer::AttachmentContribution {
+                operation_id: "attach".to_owned(),
+                accepted_media_types: vec![handle.declared_media_type.clone()],
+                max_byte_len: U64::new(1024),
+                max_count: U64::new(2),
+                insertion_method: kr_protocol::transfer::InsertionMethod::VerifiedComposerInsertion,
+                external_destination: Nullable::null(),
+                model_media_capability: false,
+            },
+        },
+        None,
+    )
+}
+
+/// Records a closure for `session_id` in the registry the daemon of `environment` uses, as the end
+/// of its worker leaves it before anything else acts on it.
+fn record_a_closure(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+) {
+    kr_controller::registry::Registry::open(environment.registry_database(), environment_id)
+        .expect("opens the daemon's registry")
+        .record_closure(&kr_protocol::session::ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::WorkerCrash,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        })
+        .expect("records the closure");
+}
+
+/// KR-REQ-24.09: a daemon that stopped after it recorded a session's closure and before it ended
+/// the insertions its agent never confirmed has them ended once its replacement has started: the
+/// insertion is failed, and a binding for the session is refused, whether or not a draft named the
+/// session when the closure was recorded. Another session's insertion stays. The start's own step
+/// does this before the daemon serves, and the first sweep, which runs the same step, would do it
+/// at once after, so the test cannot tell the two apart; the order is the code's, in `start.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_stopped_after_recording_a_closure_ends_its_insertions_when_the_next_starts()
+{
+    let first = host().await;
+    let environment_id = first.environment_id;
+    let (ended, unnamed, kept) = (
+        SessionId::new(kr_ipc::new_uuid()),
+        SessionId::new(kr_ipc::new_uuid()),
+        SessionId::new(kr_ipc::new_uuid()),
+    );
+    let service = first.controller.transfer().service();
+    let (ended_draft, ended_handle) = offer(service, &first, ended, &pattern(512));
+    let (kept_draft, _) = offer(service, &first, kept, &pattern(513));
+
+    // The daemon ends with two closures in its registry that it did not act on.
+    let temp = first.stop().await;
+    record_a_closure(&temp.environment(), environment_id, ended);
+    record_a_closure(&temp.environment(), environment_id, unnamed);
+
+    let second = host_on(temp).await;
+    let service = second.controller.transfer().service();
+    let actor = test_actor();
+    let ended_now = service
+        .draft(&actor, ended_draft.draft_id)
+        .expect("reads the draft");
+    assert_eq!(
+        ended_now.attachments[0].state,
+        kr_protocol::transfer::InsertionState::Failed,
+        "{ended_now:?}"
+    );
+    assert_eq!(
+        ended_now.attachments[0].handle, ended_handle,
+        "the file is what it was"
+    );
+
+    // A session no draft named when its closure was recorded refuses a draft's binding all the same.
+    let draft = service
+        .draft_create(
+            &actor,
+            &DraftCreateParams {
+                environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(unnamed),
+                application_instance_id: Nullable::null(),
+                text: "too late".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    let late = publish_for(service, &second, unnamed, &pattern(514));
+    let refusal = bind(service, &draft, &late).expect_err("a binding for a closed session");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed, "{refusal:?}");
+
+    let held = service
+        .draft(&actor, kept_draft.draft_id)
+        .expect("reads the draft");
+    assert_eq!(
+        held.attachments[0].state,
+        kr_protocol::transfer::InsertionState::Recorded,
+        "a session with no closure keeps its insertion: {held:?}"
+    );
+}
+
+/// KR-REQ-24.09: a closure written beneath a running daemon, which is what a hook whose write failed
+/// leaves, is acted on by the transfer sweep: the insertion is failed, and a session no draft named
+/// refuses a binding all the same, so a failed write does not leave the session open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sweep_ends_the_insertions_of_a_session_closed_beneath_a_running_daemon() {
+    let host = host().await;
+    let (session, unnamed) = (
+        SessionId::new(kr_ipc::new_uuid()),
+        SessionId::new(kr_ipc::new_uuid()),
+    );
+    let service = host.controller.transfer().service();
+    let (draft, _) = offer(service, &host, session, &pattern(512));
+
+    record_a_closure(&host.temp.environment(), host.environment_id, session);
+    record_a_closure(&host.temp.environment(), host.environment_id, unnamed);
+    host.controller
+        .transfer()
+        .sweep(&Arc::downgrade(&host.controller))
+        .await
+        .expect("the sweep runs");
+
+    let ended = service
+        .draft(&test_actor(), draft.draft_id)
+        .expect("reads the draft");
+    assert_eq!(
+        ended.attachments[0].state,
+        kr_protocol::transfer::InsertionState::Failed,
+        "{ended:?}"
+    );
+    let other = service
+        .draft_create(
+            &test_actor(),
+            &DraftCreateParams {
+                environment_id: host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(unnamed),
+                application_instance_id: Nullable::null(),
+                text: "too late".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    let late = publish_for(service, &host, unnamed, &pattern(514));
+    let refusal = bind(service, &other, &late).expect_err("a binding for a closed session");
+    assert_eq!(refusal.code(), ErrorCode::SessionClosed, "{refusal:?}");
+}
+
+/// A closure's write that waits for a thread holds nothing of the daemon, as a sweep that waits
+/// holds nothing, and writes nothing when its turn comes after the daemon has gone: the journal
+/// still holds the binding as recorded and no ended session, until the next start, which ends the
+/// insertions of every closure its registry holds, ends the insertion.
+///
+/// The runtime here has one blocking thread, which this test takes. The write is queued as it is
+/// asked for, so from then on it waits for that thread.
+#[test]
+fn a_closures_write_waiting_to_run_does_not_keep_its_daemon() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let first = host().await;
+        let environment_id = first.environment_id;
+        let session = SessionId::new(kr_ipc::new_uuid());
+        let (draft, _) = offer(
+            first.controller.transfer().service(),
+            &first,
+            session,
+            &pattern(512),
+        );
+
+        // The runtime's one blocking thread, taken until this test lets it go.
+        let (taken, taking) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let occupied = tokio::task::spawn_blocking(move || {
+            let _ = taken.send(());
+            let _ = held.recv();
+        });
+        taking.await.expect("the blocking thread is taken");
+
+        // The closure is recorded and its write queued, as a closure's end does them: from here
+        // the write waits for the thread.
+        record_a_closure(&first.temp.environment(), environment_id, session);
+        let daemon = Arc::downgrade(&first.controller);
+        let ending = first.controller.transfer().session_ended(&daemon, session);
+
+        let temp = first.stop().await;
+        let dropped = std::time::Instant::now();
+        while daemon.strong_count() > 0 && dropped.elapsed() < std::time::Duration::from_secs(5) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            daemon.strong_count(),
+            0,
+            "a write waiting for its thread keeps nothing of the daemon"
+        );
+
+        // Its turn comes after the daemon has gone: it does nothing, and says nothing is wrong.
+        let _ = release.send(());
+        occupied.await.expect("the blocking thread is let go");
+        ending
+            .await
+            .expect("a write whose daemon has gone does nothing");
+
+        // It wrote nothing: the binding is as it was and no session is recorded as ended.
+        {
+            let journal = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+                &temp.environment(),
+            ))
+            .expect("opens the journal");
+            let state: String = journal
+                .query_row("SELECT state FROM draft_attachments", [], |row| row.get(0))
+                .expect("reads the binding");
+            assert_eq!(state, "recorded", "a write with no daemon wrote nothing");
+            let ended: i64 = journal
+                .query_row("SELECT COUNT(*) FROM ended_sessions", [], |row| row.get(0))
+                .expect("reads the ended sessions");
+            assert_eq!(ended, 0, "a write with no daemon recorded no session");
+        }
+
+        // The next start ends the insertion: by its own step or by the first sweep, which runs
+        // the same step, and this test does not tell which.
+        let second = host_on(temp).await;
+        let ended = second
+            .controller
+            .transfer()
+            .service()
+            .draft(&test_actor(), draft.draft_id)
+            .expect("reads the draft");
+        assert_eq!(
+            ended.attachments[0].state,
+            kr_protocol::transfer::InsertionState::Failed,
+            "{ended:?}"
+        );
+    });
+}
+
 /// KR-REQ-14.07: each endpoint carries the methods its frame bound is for, and nothing else.
 ///
 /// The attachment endpoint exists because a 1 MiB chunk does not fit a control frame. Letting it

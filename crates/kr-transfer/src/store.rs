@@ -36,16 +36,27 @@ use crate::error::{Result, TransferError};
 use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 
 /// The schema version this build reads, and the one a journal holds nothing of the sessions of
-/// earlier builds at ([`Noting`]).
-pub const SCHEMA_VERSION: i64 = 3;
+/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions.
+pub const SCHEMA_VERSION: i64 = 4;
+
+/// The version of a journal that holds nothing of the sessions of earlier builds and may have no
+/// table of ended sessions: one that the build before that table made or settled. A journal that
+/// this build added the table to while it was at [`UNSETTLED_VERSION`], and that a build before that
+/// table then settled, has the table. The step to [`SCHEMA_VERSION`] adds the table where it is
+/// missing and moves the version in one transaction.
+///
+/// Remove this, with the step from it, once no supported upgrade can start from a journal at this
+/// version.
+const SETTLED_VERSION: i64 = 3;
 
 /// The version a journal that an earlier build wrote is at until the sessions of earlier builds in
 /// it are settled ([`Store::settle_unseen_prompt_sessions`]), which moves it to [`SCHEMA_VERSION`].
 ///
 /// A journal can stay at this version for as long as a session of an earlier build runs, so a later
-/// schema step has to read it, or refuse it by name, and not carry it past settling. Remove this,
-/// with the noting, once no supported upgrade can start from a journal at this version, and have
-/// the build that removes it refuse such a journal.
+/// schema step has to read it, or refuse it by name, and not carry it past settling. The step to
+/// [`SCHEMA_VERSION`] reads it: it adds its table and leaves the version, so settling still moves
+/// the journal. Remove this, with the noting, once no supported upgrade can start from a journal at
+/// this version, and have the build that removes it refuse such a journal.
 const UNSETTLED_VERSION: i64 = 2;
 
 /// Where a journal stands with the sessions of earlier builds, whose agents may have been sent a
@@ -650,16 +661,19 @@ impl Store {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(TransferError::store)?;
-        // Forward-only, and the step leaves the journal readable by the version it moves to.
+        // Forward-only, and each step leaves the journal readable by the version it moves to.
         // `CREATE TABLE IF NOT EXISTS` above does nothing to a table that already exists, so a
-        // column that a later version of the schema added is added here.
+        // column that a later version of the schema added is added here, and a table that a later
+        // version added is made in one transaction with the move of the version, where the step
+        // moves it.
         //
-        // This serves a version 1 store, which a build before the action subject was recorded
-        // wrote. The column and the version are written by two statements, not one transaction,
-        // and a start that stopped between them repeats the step safely, because the column is
-        // added only when it is absent. Remove this step, with `add_action_subject` and the
-        // `Some(1)` arm below it, once no supported upgrade starts from a version 1 store.
-        if recorded == Some(1) {
+        // Version 1 is what a build before the action subject was recorded wrote. The column and
+        // the version are written by two statements, not one transaction, and a start that
+        // stopped between them repeats the step safely, because the column is added only when it
+        // is absent. Remove this step, with `add_action_subject`, once no supported upgrade
+        // starts from a version 1 store.
+        let mut version = recorded;
+        if version == Some(1) {
             self.add_action_subject()?;
             self.connection
                 .execute(
@@ -667,6 +681,7 @@ impl Store {
                     params![UNSETTLED_VERSION],
                 )
                 .map_err(TransferError::store)?;
+            version = Some(UNSETTLED_VERSION);
         }
         // A store written before directory identities carried a filesystem has no column for it.
         // The columns are added here, empty, and each record's first successful check fills its
@@ -677,21 +692,15 @@ impl Store {
         // that no use has settled by then is refused, and registered again.
         self.add_column_if_absent("environment", "staging_fs", "BLOB")?;
         self.add_column_if_absent("scopes", "root_fs", "BLOB")?;
-        let recorded = match recorded {
-            Some(1) => Some(UNSETTLED_VERSION),
-            other => other,
-        };
-        match recorded {
-            // A journal this build makes has no earlier build's session to note.
-            None => {
-                self.connection
-                    .execute(
-                        "INSERT INTO schema_version (version) VALUES (?1)",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(TransferError::store)?;
-            }
-            Some(version) if version == SCHEMA_VERSION || version == UNSETTLED_VERSION => {}
+        match version {
+            // A journal this build makes has no earlier build's session to note, and comes to the
+            // current version with its table in one step.
+            None => self.add_ended_sessions(None)?,
+            // The sessions of earlier builds are still owed their settling, which alone moves the
+            // version, so the table is added and the version is left.
+            Some(UNSETTLED_VERSION) => self.add_ended_sessions(Some(UNSETTLED_VERSION))?,
+            Some(SETTLED_VERSION) => self.add_ended_sessions(Some(SETTLED_VERSION))?,
+            Some(SCHEMA_VERSION) => {}
             Some(version) => {
                 return Err(TransferError::StoreUnavailable {
                     detail: format!(
@@ -723,6 +732,44 @@ impl Store {
                 .map_err(TransferError::store)?;
         }
         Ok(())
+    }
+
+    /// The step to version 4: the table that records which sessions have ended, so that a binding or
+    /// a prompt for a draft of one is refused ([`Store::end_sessions`]).
+    ///
+    /// The table and the version are written in one transaction: a journal is never at version 3
+    /// with the table half made, and never at version 4 without it. `from` is the version the
+    /// journal is at, or `None` for one this build creates. A journal still at
+    /// [`UNSETTLED_VERSION`] gets the table and keeps its version, because the settling of the
+    /// sessions of earlier builds moves it. Once no supported upgrade starts from a journal at
+    /// [`SETTLED_VERSION`] or below, the table moves into the batch above, this step goes, and the
+    /// arm for a new journal writes the version row itself.
+    fn add_ended_sessions(&self, from: Option<i64>) -> Result<()> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(TransferError::store)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ended_sessions (
+                     session_id  BLOB PRIMARY KEY,
+                     ended_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .map_err(TransferError::store)?;
+        match from {
+            None => transaction.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            ),
+            Some(UNSETTLED_VERSION) => Ok(0),
+            Some(_) => transaction.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION],
+            ),
+        }
+        .map_err(TransferError::store)?;
+        transaction.commit().map_err(TransferError::store)
     }
 
     /// Adds the column that says which transfer an action claim acts on.
@@ -1404,7 +1451,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::InvalidArgument`] for each refusal above, and
+    /// Returns [`TransferError::InvalidArgument`] for each refusal above,
+    /// [`TransferError::SessionEnded`] when the session has ended, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn record_prompt(
         &mut self,
@@ -1436,6 +1484,7 @@ impl Store {
                 "this draft was sent to another session, so it cannot be sent to this one",
             ));
         }
+        refuse_ended_session(&transaction, draft_id, None, Some(session_id))?;
         let held: Vec<(Uuid, Option<Uuid>, bool)> = {
             let mut statement = transaction
                 .prepare(
@@ -2311,7 +2360,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    /// Returns [`TransferError::SessionEnded`] when the session of the draft, or of the upload,
+    /// has ended, and [`TransferError::StoreUnavailable`] when the write fails.
     pub fn bind_attachment(
         &mut self,
         binding: &BindingRow,
@@ -2325,6 +2375,12 @@ impl Store {
         if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
             return Ok(None);
         }
+        refuse_ended_session(
+            &transaction,
+            binding.draft_id,
+            Some(binding.transfer_id),
+            session_id,
+        )?;
         // An attachment uploaded without a session becomes that session's when it is bound to a
         // draft for one, in the same transaction as the binding. Recorded here rather than at
         // submission, so a second draft for another session finds the session already set and is
@@ -2427,6 +2483,107 @@ impl Store {
         )?;
         transaction.commit().map_err(TransferError::store)?;
         Ok(Some(DraftRevision::new(expected.get().saturating_add(1))))
+    }
+
+    /// Records `sessions` as ended and fails, in the same transaction, every insertion that no
+    /// upstream evidence confirmed and that belongs to one of them: its draft targets the session
+    /// or was sent to it, or its upload is the session's. Each draft that has one takes a
+    /// revision. Returns how many bindings it failed.
+    ///
+    /// A failed binding carries no reason text: the session's end is the reason, and a reason is
+    /// bytes added to a reply that may already be at its budget. The state word alone is shorter
+    /// than the one it replaces, so a draft that could be read can still be read.
+    ///
+    /// From the moment the transaction commits, a binding or a prompt for a draft of an ended
+    /// session is refused ([`TransferError::SessionEnded`]), so a binding that races the end is
+    /// either failed here or refused: the store's one lock orders them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails, and writes nothing.
+    pub fn end_sessions(
+        &mut self,
+        sessions: &std::collections::BTreeSet<SessionId>,
+        at_ms: TimestampMs,
+    ) -> Result<usize> {
+        let transaction = self.begin()?;
+        for session_id in sessions {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO ended_sessions (session_id, ended_at_ms) VALUES (?1, ?2)",
+                    params![uuid_sql(session_id.get()), as_i64(at_ms.get())],
+                )
+                .map_err(TransferError::store)?;
+        }
+        // The insertions no upstream evidence confirmed are few however many sessions have ended,
+        // so they are read once and matched against the set here.
+        type Held = (Uuid, Uuid, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+        let held: Vec<Held> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT binding.draft_id, binding.transfer_id, draft.session_id,
+                            prompt.session_id, upload.session_id
+                       FROM draft_attachments AS binding
+                       JOIN drafts AS draft ON draft.draft_id = binding.draft_id
+                       LEFT JOIN draft_prompts AS prompt ON prompt.draft_id = binding.draft_id
+                       LEFT JOIN uploads AS upload ON upload.transfer_id = binding.transfer_id
+                      WHERE binding.state = 'recorded'",
+                )
+                .map_err(TransferError::store)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        uuid_column(row, 0)?,
+                        uuid_column(row, 1)?,
+                        optional_uuid(row, 2)?,
+                        optional_uuid(row, 3)?,
+                        optional_uuid(row, 4)?,
+                    ))
+                })
+                .map_err(TransferError::store)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(TransferError::store)?
+        };
+        let mut failed = 0;
+        let mut drafts = Vec::new();
+        for (draft, transfer, targeted, sent, uploaded) in held {
+            let ended = [targeted, sent, uploaded]
+                .into_iter()
+                .flatten()
+                .any(|session| sessions.contains(&SessionId::new(session)));
+            if !ended {
+                continue;
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE draft_attachments
+                        SET state = 'failed', failure_detail = NULL, bound_at_ms = ?3
+                      WHERE draft_id = ?1 AND transfer_id = ?2 AND state = 'recorded'",
+                    params![uuid_sql(draft), uuid_sql(transfer), as_i64(at_ms.get())],
+                )
+                .map_err(TransferError::store)?;
+            failed += changed;
+            if changed > 0 && !drafts.contains(&draft) {
+                drafts.push(draft);
+            }
+        }
+        for draft in drafts {
+            transaction
+                .execute(
+                    "UPDATE drafts SET revision = revision + 1, updated_at_ms = ?2
+                      WHERE draft_id = ?1",
+                    params![uuid_sql(draft), as_i64(at_ms.get())],
+                )
+                .map_err(TransferError::store)?;
+            record_event(
+                &transaction,
+                "draft.attachment.failed",
+                &DraftId::new(draft).to_string(),
+                at_ms,
+            )?;
+        }
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(failed)
     }
 
     /// Returns every attachment bound to a draft, in binding order.
@@ -2855,6 +3012,43 @@ fn claim_action(
     }
 }
 
+/// Refuses a write for a draft whose session has ended, whether the draft targets it, was sent to
+/// it or holds an upload that belongs to it, or for a session the write is about to bind.
+fn refuse_ended_session(
+    transaction: &Transaction<'_>,
+    draft_id: DraftId,
+    transfer_id: Option<TransferId>,
+    also: Option<SessionId>,
+) -> Result<()> {
+    let ended: bool = transaction
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM ended_sessions
+                  WHERE session_id IN (
+                        SELECT session_id FROM drafts
+                         WHERE draft_id = ?1 AND session_id IS NOT NULL
+                        UNION
+                        SELECT session_id FROM draft_prompts WHERE draft_id = ?1
+                        UNION
+                        SELECT session_id FROM uploads
+                         WHERE transfer_id = ?2 AND session_id IS NOT NULL
+                        UNION
+                        SELECT ?3 WHERE ?3 IS NOT NULL))",
+            params![
+                uuid_sql(draft_id.get()),
+                transfer_id.map(|transfer| uuid_sql(transfer.get())),
+                also.map(|session| uuid_sql(session.get()))
+            ],
+            |row| row.get(0),
+        )
+        .map_err(TransferError::store)?;
+    if ended {
+        Err(TransferError::SessionEnded)
+    } else {
+        Ok(())
+    }
+}
+
 fn record_event(
     transaction: &Transaction<'_>,
     kind: &str,
@@ -3280,6 +3474,135 @@ mod tests {
                 .expect("reads the claims")
                 .is_empty()
         );
+    }
+
+    /// A journal at `version`, as a build before the record of ended sessions wrote it, with
+    /// `extra` run after the version row is written.
+    fn write_a_journal_at(path: &std::path::Path, version: i64, extra: &str) {
+        let connection = rusqlite::Connection::open(path).expect("opens");
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES ({version});
+                 {extra}"
+            ))
+            .expect("writes the journal");
+    }
+
+    fn recorded_version(path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version")
+    }
+
+    fn has_the_table_of_ended_sessions(path: &std::path::Path) -> bool {
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'ended_sessions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads the schema")
+            == 1
+    }
+
+    fn end_a_session(store: &mut Store) {
+        let session = SessionId::new(Uuid::from_bytes([7; 16]));
+        store
+            .end_sessions(
+                &std::collections::BTreeSet::from([session]),
+                TimestampMs::new(1000),
+            )
+            .expect("records the session as ended in the table the step made");
+    }
+
+    #[test]
+    fn a_journal_this_build_makes_is_at_the_current_version_with_the_table_of_ended_sessions() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+
+        let mut store = Store::open(&path, environment()).expect("creates and opens");
+        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(has_the_table_of_ended_sessions(&path));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+        end_a_session(&mut store);
+    }
+
+    #[test]
+    fn a_version_two_journal_gains_the_table_of_ended_sessions_and_keeps_its_version_until_settled()
+    {
+        // An earlier build's journal: its sessions are owed their noting, and only the settling of
+        // them moves the journal on, so the step for the table leaves the version at 2.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(&path, UNSETTLED_VERSION, "");
+        assert!(!has_the_table_of_ended_sessions(&path));
+
+        let mut store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), UNSETTLED_VERSION);
+        assert!(has_the_table_of_ended_sessions(&path));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Owed);
+        end_a_session(&mut store);
+
+        // Settling moves it to the current version and leaves the table with its row.
+        store
+            .settle_unseen_prompt_sessions(TimestampMs::new(2000))
+            .expect("settles");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(has_the_table_of_ended_sessions(&path));
+        let ended: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ended_sessions", [], |row| row.get(0))
+            .expect("counts the ended sessions");
+        assert_eq!(ended, 1, "settling keeps the session that was ended");
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+        drop(store);
+
+        // A start after it reads the journal as it is.
+        let reopened = Store::open(&path, environment()).expect("opens again");
+        assert_eq!(reopened.noting().expect("reads the noting"), Noting::Done);
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_three_journal_gains_the_table_of_ended_sessions_and_moves_to_version_four() {
+        // A journal whose sessions of earlier builds were settled: nothing is owed, so the one
+        // step adds the table and moves the version.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(&path, SETTLED_VERSION, "");
+        assert!(!has_the_table_of_ended_sessions(&path));
+
+        let mut store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(has_the_table_of_ended_sessions(&path));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+        end_a_session(&mut store);
+    }
+
+    #[test]
+    fn a_step_that_cannot_write_the_version_leaves_a_version_three_journal_without_the_table() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(
+            &path,
+            SETTLED_VERSION,
+            "CREATE TRIGGER refuse_the_version BEFORE UPDATE ON schema_version
+             BEGIN SELECT RAISE(ABORT, 'the version cannot be written'); END;",
+        );
+
+        let refusal = Store::open(&path, environment()).expect_err("the version cannot be written");
+        assert!(
+            format!("{refusal:?}").contains("the version cannot be written"),
+            "the open failed at the version write: {refusal:?}"
+        );
+        // The table and the version are one step: neither is there.
+        assert_eq!(recorded_version(&path), SETTLED_VERSION);
+        assert!(!has_the_table_of_ended_sessions(&path));
     }
 
     #[test]

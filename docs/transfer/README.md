@@ -204,6 +204,7 @@ migrations. Every state change commits together with the outbox row that announc
 | `snapshots`, `snapshot_chunks` | download snapshots, their chunk layout and the source facts they were taken against |
 | `scopes` | registered read scopes, with the stable filesystem identity each one was recorded for |
 | `drafts`, `draft_attachments` | drafts, the attachments bound to them and what became of each offer |
+| `ended_sessions` | the sessions whose workers have ended, which a binding or a prompt for one of their drafts is refused against |
 | `grants` | narrow read grants over one attachment each |
 | `actions` | retained mutation outcomes, keyed by actor and action identifier |
 | `events`, `cursors` | the outbox and its consumers' positions |
@@ -617,7 +618,15 @@ to avoid.
 asked. The binding starts at `recorded`, which says exactly that and no more. It reaches
 `accepted_by_agent` only when an adapter reports the upstream part or native draft binding, and
 nothing else sets it. A failure records `failed` with its reason and keeps both the draft and the
-published attachment, so a retry has something to retry with.
+published attachment, so a retry has something to retry with. When a session's closure is recorded,
+every binding that is still `recorded` becomes `failed` if its draft targets that session or was
+sent to it, or if its upload belongs to the session. The failure carries no reason text, and the
+draft takes a revision. From then on `SESSION_CLOSED` refuses a binding, the record of a new prompt
+or an adapter's report for a draft of that session, and a binding of an upload that belongs to it;
+an exact repeat of a prompt the worker can answer still gets its receipt. The write is queued after
+the registry records the closure, and the refusal starts when that write commits. A daemon that
+stopped before it acted on a closure does so at its next start, before it serves a transfer, and
+the hourly sweep does it again for a write that failed.
 
 The attachment and the draft must belong to the same principal, and to the same session where both
 name one. An attachment bound to one session would otherwise be retained against that session while
@@ -734,6 +743,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `ID_CONFLICT` | one action identifier used for two different payloads |
 | `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing this caller owns |
 | `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used, including a name the storage would not answer about |
+| `SESSION_CLOSED` | a binding, the record of a new prompt or an adapter's report for a draft of a session whose closure is recorded, or a binding of an upload that belongs to one |
 
 An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, and an
 identifier that names another principal's transfer or draft gets the same refusal with the same

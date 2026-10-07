@@ -685,6 +685,14 @@ impl Controller {
         }
         // The descriptions stop tracking it, and its facts are no longer read.
         self.describe_session_closed(record.session_id);
+        // What the session's agent was offered and never confirmed ends with its worker, on a task
+        // of its own: a closure is not held up by it. The write holds the daemon weakly until its
+        // turn and strongly while it works, as a sweep does, and a write that does not happen or
+        // fails is made up by the transfer sweep and by the next start.
+        let ending = self.transfer().session_ended(&self.me, record.session_id);
+        tokio::spawn(async move {
+            let _ = ending.await;
+        });
         // A closed session has no window to report on, and a create token that replays one is
         // answered from the closure record.
         self.presentations.lock().await.remove(&record.session_id);

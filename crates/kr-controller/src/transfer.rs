@@ -224,11 +224,13 @@ impl kr_transfer::service::AdmissionHook for TransferAdmission {
     }
 }
 
-/// Where a test stops one sweep: once the archive has answered which sessions retain, and before
-/// the sweep is given the answer.
+/// Where a test stops one sweep or one closure's write. A sweep stops once the archive has
+/// answered which sessions retain, and before the sweep is given the answer. A closure's write
+/// stops once its store call has returned, and before it lets the daemon go.
 ///
-/// A sweep carries one only when a test asked for that sweep ([`TransferModule::sweep_paused`]),
-/// so the daemon's own sweeps never stop. It exists only for this crate's unit tests.
+/// Either carries one only when a test asked for it ([`TransferModule::sweep_paused`],
+/// [`TransferModule::session_ended_paused`]), so the daemon's own never stop. It exists only for
+/// this crate's unit tests.
 #[cfg(test)]
 #[derive(Debug)]
 struct StorePause {
@@ -238,7 +240,7 @@ struct StorePause {
 
 #[cfg(test)]
 impl StorePause {
-    /// Says the sweep has arrived, and waits on its blocking thread until the test lets it go.
+    /// Says the stopped work has arrived, and waits on its blocking thread until the test lets it go.
     fn wait(self) {
         let _ = self.arrived.send(());
         let _ = self.go.recv();
@@ -381,6 +383,95 @@ impl TransferModule {
     #[must_use]
     pub fn service(&self) -> &Arc<TransferService> {
         &self.service
+    }
+
+    /// Queues the end of the insertions the agent of `session_id` never confirmed, because the
+    /// session's worker has ended ([`TransferService::end_session_insertions`]).
+    ///
+    /// The write is queued on a blocking thread as it is asked for, and the answer returned here
+    /// holds nothing of the daemon. While the write waits for its thread it holds the daemon
+    /// weakly, so a daemon let go meanwhile goes at once, and the write, when its turn comes, does
+    /// nothing: the next start ends the insertions of every closure the registry holds. Once the
+    /// write runs, it holds the daemon until it is done, because the daemon's hold on its
+    /// environment is what keeps a daemon started after it from opening the journal while this
+    /// write still works on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the journal cannot be written. The
+    /// sweep records every closure as ended again, so a session whose end was recorded before the
+    /// write failed does not keep its insertions for good.
+    pub fn session_ended(
+        &self,
+        daemon: &Weak<Controller>,
+        session_id: SessionId,
+    ) -> impl Future<Output = Result<()>> + Send + use<> {
+        self.queue_session_ended(
+            daemon,
+            session_id,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Queues the end of a closed session's insertions as an ordinary one is, and stops it once
+    /// its store work is done and before it lets the daemon go, until the test lets it go: the
+    /// receiver hears it arrive there, and the sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn session_ended_paused(
+        &self,
+        daemon: &Weak<Controller>,
+        session_id: SessionId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        impl Future<Output = Result<()>> + Send + use<>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        let pause = StorePause { arrived, go: going };
+        (
+            arrival,
+            go,
+            self.queue_session_ended(daemon, session_id, Some(pause)),
+        )
+    }
+
+    /// Queues the end [`TransferModule::session_ended`] describes. In this crate's unit tests it
+    /// carries the pause a test asked for, if any, and stops there.
+    fn queue_session_ended(
+        &self,
+        daemon: &Weak<Controller>,
+        session_id: SessionId,
+        #[cfg(test)] pause: Option<StorePause>,
+    ) -> impl Future<Output = Result<()>> + Send + use<> {
+        let daemon = Weak::clone(daemon);
+        let service = Arc::clone(&self.service);
+        let ended = tokio::task::spawn_blocking(move || {
+            let Some(owner) = daemon.upgrade() else {
+                return Ok(0);
+            };
+            let ended =
+                service.end_session_insertions(&std::collections::BTreeSet::from([session_id]));
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.wait();
+            }
+            drop(owner);
+            ended
+        });
+        async move {
+            ended
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the transfer service could not end a closed session's insertions"
+                        .to_owned(),
+                })?
+                .map(|_| ())
+                .map_err(|error| ControllerError::RegistryUnavailable {
+                    detail: error.to_string(),
+                })
+        }
     }
 
     /// Returns true when this daemon serves the method.
@@ -542,8 +633,8 @@ impl TransferModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, other than for a draft it does not hold: among
-    /// them a draft that is for another session, or holds an attachment that belongs to one, and
-    /// an admission that no longer stands.
+    /// them a draft that is for another session, or holds an attachment that belongs to one, a
+    /// session that has ended (`SESSION_CLOSED`), and an admission that no longer stands.
     pub(crate) async fn record_submission(
         &self,
         actor_id: &ActorId,
@@ -984,6 +1075,9 @@ impl TransferModule {
                 at_the_clock: std::sync::Mutex::new(at_the_clock),
             };
             let swept = service.sweep(&answers).map_err(Into::into);
+            // A closure whose insertions were not ended, because its write failed, has them ended
+            // here, and the session is refused from here on. A failure is left for the next sweep.
+            let _ = end_insertions_of_every_closure(&owner, &service);
             // Only now may the daemon go, and its environment with it.
             drop(owner);
             swept
@@ -1067,6 +1161,51 @@ fn sessions_that_may_run_a_worker(
         })
         .map(|(session_id, _)| session_id)
         .collect())
+}
+
+/// Records every session the registry holds a closure for as ended, and fails the insertions the
+/// agents of those sessions never confirmed ([`TransferService::end_session_insertions`]).
+///
+/// This is how a closure is acted on whatever happened to the write that followed it: the daemon
+/// stopped between the two, or the write failed. The registry's closures are the record, and what
+/// the transfer journal holds is made to agree with them.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be read or the
+/// journal cannot be written.
+fn end_insertions_of_every_closure(owner: &Controller, service: &TransferService) -> Result<()> {
+    let closed = owner
+        .registry_handle()
+        .blocking_lock()
+        .closed_sessions()?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    service
+        .end_session_insertions(&closed)
+        .map(|_| ())
+        .map_err(|error| ControllerError::RegistryUnavailable {
+            detail: error.to_string(),
+        })
+}
+
+/// Ends the insertions of every closure the registry holds before the daemon serves a transfer,
+/// so a closure recorded by a daemon that stopped before it acted on it refuses a binding for
+/// that session from the first request.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::RegistryUnavailable`] when the registry or the transfer journal
+/// cannot be read or written; the start does not go on then, as it does not for the sessions of
+/// earlier builds.
+pub async fn end_the_insertions_of_closed_sessions(controller: &Arc<Controller>) -> Result<()> {
+    let owner = Arc::clone(controller);
+    let service = Arc::clone(controller.transfer().service());
+    tokio::task::spawn_blocking(move || end_insertions_of_every_closure(&owner, &service))
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the transfer service could not end a closed session's insertions".to_owned(),
+        })?
 }
 
 /// Starts the environment's expiry sweep.
@@ -1304,6 +1443,50 @@ mod tests {
         // Once the sweep ends, its daemon goes, and another daemon takes the environment.
         let _ = go.send(());
         swept.await.expect("the sweep runs");
+        drop(started(|| Controller::start(setup(&temp, boot_identity.clone()))).await);
+    }
+
+    /// A closure's write holds its daemon until its store call has returned, as a sweep does,
+    /// though the task that waits on the write is dropped meanwhile, as a runtime that shuts down
+    /// drops it. The write here stops after its store call and before it lets the daemon go: for
+    /// as long as it stands there, every daemon started on the environment is refused; once it
+    /// goes on, one is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closures_write_that_has_begun_keeps_its_daemon_until_its_store_work_ends() {
+        use crate::service::net::tests::{daemon, setup, started};
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let boot_identity = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let controller = daemon(&temp).await;
+        let held = Arc::downgrade(&controller);
+
+        // A write that stops once its store call has returned, and says so.
+        let (arrived, go, ending) = controller
+            .transfer()
+            .session_ended_paused(&held, SessionId::new(kr_ipc::new_uuid()));
+        tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+            .await
+            .expect("the write reaches the end of its store work in time")
+            .expect("the write says it has arrived");
+
+        // The task that waits on the write is dropped and the daemon is let go while the write
+        // stands after its store call, before it lets the daemon go.
+        drop(ending);
+        drop(controller);
+        for _ in 0..25 {
+            match Controller::start(setup(&temp, boot_identity.clone())).await {
+                Err(ControllerError::AlreadyRunning { .. }) => {}
+                Ok(_) => panic!(
+                    "a daemon took the environment while an earlier daemon's write still held its daemon"
+                ),
+                Err(error) => panic!("a daemon was refused for another reason: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(held.strong_count() > 0, "the write still holds its daemon");
+
+        // Once the write ends, its daemon goes, and another daemon takes the environment.
+        let _ = go.send(());
         drop(started(|| Controller::start(setup(&temp, boot_identity.clone()))).await);
     }
 
