@@ -6,6 +6,7 @@
 //! crate that may claim a type is `Plain`:
 //!
 //! * [`Named`], a path the person named on this command line, returned to them;
+//! * [`UtcMoment`], a moment on this host's clock, as UTC down to the second;
 //! * [`Usage`], a usage failure as the command's own declarations and clap's classification say it,
 //!   with every value the person typed taken out;
 //! * [`tool_server`], a failure of the tool server by its kind;
@@ -28,6 +29,37 @@ use std::path::{Path, PathBuf};
 
 use kr_client::shown;
 use kr_client::shown::{Plain, Said, Shown};
+
+/// A moment on this host's clock, as UTC down to the second.
+///
+/// It is made of digits and this program's own words, so it is as plain as a number is.
+pub struct UtcMoment(String);
+
+/// Returns a moment, given in milliseconds since the epoch, as a person reads it.
+#[must_use]
+pub fn utc_moment(milliseconds: u64) -> UtcMoment {
+    let text = i64::try_from(milliseconds)
+        .ok()
+        .and_then(|milliseconds| jiff::Timestamp::from_millisecond(milliseconds).ok())
+        .map_or_else(
+            || "a time that cannot be shown".to_owned(),
+            |moment| {
+                moment
+                    .to_zoned(jiff::tz::TimeZone::UTC)
+                    .strftime("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+            },
+        );
+    UtcMoment(text)
+}
+
+impl fmt::Display for UtcMoment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for UtcMoment {}
 
 /// A path the person named on this command line.
 ///

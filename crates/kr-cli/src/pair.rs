@@ -1,9 +1,10 @@
 //! `kr pair`: issuing an invitation, approving the device that answers it, and withdrawing or
-//! reading one.
+//! reading one; and `kr host clock --establish`, which is the owner's confirmation of the host's
+//! clock and is obtained the same way.
 //!
 //! Every effect here is one of the host's pairing methods over this user's own local socket, and
-//! issuing an invitation and approving a device each need a fresh owner confirmation naming
-//! exactly that action. The command asks the host for the confirmation's challenge first, and the
+//! issuing an invitation, approving a device and establishing the host's clock each need a fresh
+//! owner confirmation naming exactly that action. The command asks the host for the confirmation's challenge first, and the
 //! host's answer says who can confirm it:
 //!
 //! * **A host with an owner.** An owner device confirms, in its own ceremony. The command says so
@@ -11,11 +12,12 @@
 //!   the challenge runs out.
 //! * **A host with no owner yet.** The first owner is established here, at this terminal. The
 //!   person confirms at the controlling terminal, typing `pair` to issue the owner invitation and,
-//!   to approve the device that answers it, the verification value that device shows. The command
+//!   to approve the device that answers it, the verification value that device shows; to establish
+//!   the host's clock the person reads the time the host gives and types `clock`. The command
 //!   then answers the challenge on the `local_bootstrap_terminal` channel with a key it makes for
 //!   that one answer. The host takes that channel only while it has no owner, and only for issuing
-//!   a personal owner invitation and approving the device that answers it; the pairing that
-//!   commits ends it for good.
+//!   a personal owner invitation, approving the device that answers it and establishing its
+//!   clock; the pairing that commits ends it for good.
 //!
 //! Answering on the terminal channel is guarded against starting by accident from inside a
 //! KalaReach session, which is where an agent runs. Standard input and output must be terminals,
@@ -37,7 +39,8 @@ use kr_ipc::paths::HostPaths;
 use kr_pairing::confirm::sign_confirmation;
 use kr_pairing::grants::{personal_owner_grant, session_invitation_grant};
 use kr_protocol::confirmation::{
-    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
+    ConfirmationSubject, HostClockEstablishParams, HostClockEstablishResult,
+    OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
@@ -57,7 +60,9 @@ use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 use crate::bind::{self, Membership};
-use crate::cli::{PairCancelArguments, PairCommand, PairInvitationArguments, PairInviteArguments};
+use crate::cli::{
+    ClockArguments, PairCancelArguments, PairCommand, PairInvitationArguments, PairInviteArguments,
+};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request, closed};
 use crate::resolve::{self, ATTACHMENT_VARIABLE, SESSION_VARIABLE};
@@ -68,6 +73,9 @@ pub const OWNER_DEVICE_POLL: Duration = Duration::from_secs(1);
 
 /// What a person types to issue a host's first owner invitation.
 pub const ISSUE_WORD: &str = "pair";
+
+/// What a person types to establish the host's clock again.
+pub const CLOCK_WORD: &str = "clock";
 
 /// The most of one typed line the command reads.
 const MAX_TYPED_LINE: u64 = 256;
@@ -136,6 +144,51 @@ async fn invite(
                 .is_some()
                 .then_some(environment.environment_id),
         )?);
+    }
+    Ok(())
+}
+
+/// `kr host clock --establish`: the owner trusts this host's clock again.
+///
+/// The host's clock is what an expiring grant, a retention period and the attention store's
+/// forgetting are measured on, and a host that found it going backwards decides none of them
+/// from it until its owner says it is right. The person is told the time this host reads, and
+/// confirms it at the terminal when the host has no owner, or on an owner device when it has one.
+///
+/// # Errors
+///
+/// Returns the host's refusal, a refusal of the first-owner guard, or a transport failure.
+pub async fn establish_clock(
+    paths: &HostPaths,
+    arguments: &ClockArguments,
+    json: bool,
+) -> Result<()> {
+    let build_id = crate::build_id();
+    let environment = resolve::select(paths, arguments.selector.environment.as_deref())?;
+    let target = ActionTarget::environment(environment.environment_id);
+    let mut client = resolve::open_controller(&environment.paths, build_id.clone()).await?;
+    let ceremony = Ceremony::EstablishClock {
+        reading_ms: kr_ipc::now_ms().get(),
+    };
+    let effect = Effect::EstablishClock(HostClockEstablishParams {});
+    let answer = confirmed(
+        &mut client,
+        target,
+        ConfirmationSubject::EstablishClock,
+        &ceremony,
+        &effect,
+        &build_id,
+    )
+    .await?;
+    let established: HostClockEstablishResult = decode(&answer)?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("confirmation_id", closed(&established.confirmation_id)),
+        );
+    } else {
+        output::line(&stdout_line!("This host's owner trusts its clock again."));
     }
     Ok(())
 }
@@ -269,6 +322,7 @@ fn report_status(invitation_id: InvitationId, result: &PairStatusResult, json: b
 enum Effect {
     Invite(PairInviteParams),
     Confirm(PairConfirmParams),
+    EstablishClock(HostClockEstablishParams),
 }
 
 /// What the person at this terminal confirms, when the host has no owner yet.
@@ -277,6 +331,8 @@ enum Ceremony<'a> {
     Issue { owner: bool },
     /// Approving the device that answered an invitation.
     Approve { candidate: &'a PairCandidateView },
+    /// Trusting this host's clock again, which reads `reading_ms` now.
+    EstablishClock { reading_ms: u64 },
 }
 
 impl Ceremony<'_> {
@@ -288,7 +344,9 @@ impl Ceremony<'_> {
                 ErrorCode::PermissionDenied,
                 "this host has no owner yet: pair its first owner with `kr pair invite --owner`",
             )),
-            Self::Issue { owner: true } | Self::Approve { .. } => Ok(()),
+            Self::Issue { owner: true } | Self::Approve { .. } | Self::EstablishClock { .. } => {
+                Ok(())
+            }
         }
     }
 
@@ -302,6 +360,11 @@ impl Ceremony<'_> {
             Self::Approve { candidate } => Some(owner_device_note(
                 candidate.platform,
                 &candidate.verification_value,
+            )),
+            Self::EstablishClock { reading_ms } => Some(shown!(
+                "This host's clock reads {}. Confirm on an owner device only if that is the time \
+                 now.",
+                crate::shown::utc_moment(*reading_ms)
             )),
         }
     }
@@ -337,6 +400,21 @@ impl Ceremony<'_> {
                         "that is not the verification value this host sees, so the device was not \
                          approved",
                     ));
+                }
+            }
+            Self::EstablishClock { reading_ms } => {
+                terminal.say(&stdout_line!(
+                    "This host's clock reads {}. If that is the time now, trusting it again lets \
+                     the host go on forgetting what has grown old by it and decide expiring \
+                     grants against it.",
+                    crate::shown::utc_moment(*reading_ms)
+                ))?;
+                let typed = terminal.ask(&stdout_line!(
+                    "Type {} to trust this host's clock: ",
+                    CLOCK_WORD
+                ))?;
+                if typed.trim() != CLOCK_WORD {
+                    return Err(not_confirmed("the clock was not established"));
                 }
             }
         }
@@ -433,11 +511,16 @@ async fn perform(
                 .mutate(Method::PairConfirm, action, target, params)
                 .await?
         }
+        Effect::EstablishClock(params) => {
+            client
+                .mutate(Method::HostClockEstablish, action, target, params)
+                .await?
+        }
     })
 }
 
-/// Refuses unless this is where a host's first owner may be confirmed: at an interactive
-/// terminal, outside every KalaReach session.
+/// Refuses unless this is where a host with no owner may be confirmed at a terminal: at an
+/// interactive terminal, outside every KalaReach session.
 async fn guard(build_id: &BuildId) -> Result<()> {
     if !std::io::stdin().is_terminal() || !output::is_terminal() {
         return Err(CliError::NotATerminal);
@@ -447,8 +530,8 @@ async fn guard(build_id: &BuildId) -> Result<()> {
             return Err(refused(
                 ErrorCode::PermissionDenied,
                 shown!(
-                    "{} is set, so this is inside a KalaReach session; a host's first owner is \
-                     confirmed at a terminal outside every session",
+                    "{} is set, so this is inside a KalaReach session; what a host with no owner \
+                     confirms is confirmed at a terminal outside every session",
                     variable
                 ),
             ));
@@ -459,7 +542,7 @@ async fn guard(build_id: &BuildId) -> Result<()> {
         Membership::Inside(session_id) => Err(refused(
             ErrorCode::PermissionDenied,
             shown!(
-                "this process is inside session {}; a host's first owner is confirmed at a \
+                "this process is inside session {}; what a host with no owner confirms is confirmed at a \
                  terminal outside every session",
                 session_id
             ),
@@ -467,8 +550,8 @@ async fn guard(build_id: &BuildId) -> Result<()> {
         Membership::Unknown(why) => Err(refused(
             ErrorCode::PermissionDenied,
             shown!(
-                "whether this process is inside a KalaReach session cannot be established ({}); a \
-                 host's first owner is confirmed only where it can",
+                "whether this process is inside a KalaReach session cannot be established ({}); what a \
+                 host with no owner confirms is confirmed only where it can",
                 why
             ),
         )),

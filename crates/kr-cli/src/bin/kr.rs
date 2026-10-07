@@ -979,6 +979,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::Machine(machine) => kr_cli::machine::run(&paths, machine, cli.json).await,
+            HostCommand::Clock(clock) => {
+                kr_cli::pair::establish_clock(&paths, &clock, cli.json).await?;
+                Ok(Completion::Done)
+            }
             HostCommand::Versions => {
                 let kept = kr_cli::update::versions()?;
                 if cli.json {
