@@ -24,11 +24,21 @@
 //!
 //! `?1049` saves the cursor on the way in and restores it on the way out, and the restore turns
 //! line-feed/new-line mode and shift-out off on some terminals. So the switches come before
-//! anything that would be undone, and what they leave saved is what the session has saved. When the
-//! primary buffer is the one that is showing, the other buffer is painted right after the soft reset
-//! that opens the restoration, and the reset is repeated: the repeat forgets the cursor that
-//! entering the other buffer saved, as a session that never saved one has none. When the alternate
-//! buffer is showing, the switch back into it saves the plain state.
+//! anything that would be undone, and what they leave saved is what the session has saved.
+//!
+//! xterm keeps one saved cursor for each buffer. Its soft reset saves a fresh one in the buffer that
+//! is showing and leaves the other alone, and `?1049h` saves one in the buffer that is showing when
+//! it comes. A terminal can be showing either buffer when a restoration begins, and the one it is
+//! not showing can hold a cursor an earlier application saved there, so a restoration begins by
+//! resetting the terminal in each buffer, which leaves both fresh whichever it started in. A reset
+//! does not close a hyperlink, so one the stream left open is closed at the same point. A reset makes
+//! the cursor show, so the cursor is hidden again after every reset and is shown, or left hidden,
+//! only by the cursor's own operation at the end: nobody watches it travel across the repaint.
+//!
+//! When the primary buffer is the one that is showing, the other buffer is painted right after
+//! those resets, and the reset is repeated: the repeat forgets the cursor that entering the other
+//! buffer saved, as a session that never saved one has none. When the alternate buffer is showing,
+//! the switch back into it saves the plain state.
 //!
 //! Each soft reset comes after a carriage return and a plain rendition. It is the only soft reset a
 //! direct terminal reads, and xterm's saves a fresh cursor that keeps a wrap the terminal had
@@ -56,9 +66,10 @@
 //!   last column instead of going to the next row, and the characters after it land one cell to
 //!   the left of where the grid puts them until the cursor is placed. A carriage return that
 //!   comes while the terminal's own wrap is pending leaves the terminal a row above the grid. A
-//!   saved cursor's pending wrap is not set either, and the terminals measured give a restored
-//!   cursor no pending wrap whatever a restoration does. The cost is the same, from the first
-//!   character printed after the restore.
+//!   saved cursor's pending wrap is not set either. Terminal.app and iTerm2 give a restored
+//!   cursor no pending wrap whatever a restoration does, and xterm gives back the wrap that was
+//!   pending when the cursor was saved, which only the same print could set. The cost is the
+//!   same, from the first character printed after the restore.
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
@@ -216,6 +227,9 @@ const ORIGIN_MODE: u16 = 6;
 
 /// DEC private mode 1048, which is a cursor save and restore rather than a state to be left in.
 const CURSOR_SAVE_MODE: u16 = 1048;
+
+/// DEC private mode 25, whether the cursor shows.
+const CURSOR_VISIBLE_MODE: u16 = 25;
 /// The string terminator this writer uses, which every profile in the repertoire accepts.
 const ST: &[u8] = b"\x1b\\";
 
@@ -299,7 +313,7 @@ impl Writer {
             // completely. It is not a hard reset: that would clear the scrollback the person can
             // still scroll back through, and reset a palette the next operation sets anyway.
             RestoreOp::ResetProjection { .. } => {
-                self.soft_reset();
+                self.reset_both_buffers();
                 if self.selected == ActiveBuffer::Primary {
                     // The other buffer is painted from here, in the terminal the reset has just
                     // put in order, and the reset is repeated: it forgets the cursor that going
@@ -347,6 +361,11 @@ impl Writer {
                     // rows are painted.
                     if entry.mode == ORIGIN_MODE {
                         self.origin_mode = entry.enabled;
+                        return;
+                    }
+                    // Whether the cursor shows is the cursor's own operation, which comes last,
+                    // so that nobody watches it travel across the repaint.
+                    if entry.mode == CURSOR_VISIBLE_MODE {
                         return;
                     }
                 }
@@ -407,7 +426,8 @@ impl Writer {
         }
     }
 
-    /// Writes a soft reset with nothing in front of it for xterm's reset to keep.
+    /// Writes a soft reset with nothing in front of it for xterm's reset to keep, and then hides
+    /// the cursor.
     ///
     /// A restoration's reset is the only one a direct terminal reads, because the application's own
     /// make every direct terminal begin again rather than reaching it. xterm's reset saves a fresh
@@ -415,11 +435,40 @@ impl Writer {
     /// crossed-out and doubly underlined set. A return clears the wrap and a plain rendition
     /// clears the three, both before the reset, so what the reset saves and the pen it leaves are
     /// what this writer says they are.
+    ///
+    /// The reset also makes the cursor show. The cursor's own operation decides whether it does,
+    /// and it comes last, so the cursor is hidden again at once and stays hidden while rows are
+    /// drawn.
     fn soft_reset(&mut self) {
         self.out.push(b'\r');
         self.csi(b"0m");
         self.csi(b"!p");
+        self.csi(b"?25l");
         self.pen = Some(Rendition::default());
+    }
+
+    /// Puts both buffers' saved cursors and the open link in a state this writer knows.
+    ///
+    /// xterm's soft reset saves a fresh cursor only in the buffer that is showing, and `?1049h`
+    /// saves one in the buffer that is showing when it comes, whichever that is. The terminal
+    /// shows either buffer when a restoration begins, and the buffer it is not showing can hold
+    /// a cursor an earlier application saved there, which the session knows nothing of: a restore
+    /// that comes before any save of the application's would go where that cursor was. So the
+    /// terminal is reset where it stands, in the alternate buffer and then in the primary one,
+    /// which leaves both slots fresh and the terminal in the primary buffer whichever it started
+    /// in. The cursor saved on the way into the alternate buffer is the first thing the primary
+    /// buffer's reset forgets.
+    ///
+    /// A reset does not close a hyperlink, and the stream the terminal was handed can have left
+    /// one open, so it is closed here: a link this writer did not open would otherwise attach to
+    /// the first cells drawn.
+    fn reset_both_buffers(&mut self) {
+        self.soft_reset();
+        self.close_link();
+        self.csi(b"?1049h");
+        self.soft_reset();
+        self.csi(b"?1049l");
+        self.soft_reset();
     }
 
     /// Writes one CSI sequence.
@@ -720,8 +769,8 @@ impl Writer {
             return;
         };
         // What can be installed is installed below. A wrap the cursor was saved with is not: this
-        // restoration sets none, and the terminals measured give a restored cursor no wrap in any
-        // case.
+        // restoration sets none, and Terminal.app and iTerm2 give a restored cursor no wrap in any
+        // case, where xterm gives back only a wrap that was pending when it saved the cursor.
         if cursor.pending_wrap {
             self.carried.pending_wrap = true;
         }

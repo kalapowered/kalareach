@@ -1257,13 +1257,14 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
 
 /// Where the two switches of the paint of the buffer that is not showing are in a restoration.
 ///
-/// A restoration switches buffers three times when there is a buffer not showing: once to make the
-/// one that shows the one that does, and twice to paint the other, into it and out of it. With the
-/// primary buffer showing the paint comes first, and the switch that follows it is the one that
-/// leaves the primary buffer showing, so the first two are the paint (`h`, `l`, `l`); with the
-/// alternate buffer showing the switch comes first and the paint is the other two (`h`, `l`, `h`).
-/// The offsets are those of the escape that begins each of the two switches, and `None` says the
-/// bytes are not such a restoration.
+/// A restoration begins by resetting the terminal in each buffer, which takes two switches of its
+/// own, into the alternate buffer and out of it. After those it switches buffers three times when
+/// there is a buffer not showing: once to make the one that shows the one that does, and twice to
+/// paint the other, into it and out of it. With the primary buffer showing the paint comes first,
+/// and the switch that follows it is the one that leaves the primary buffer showing, so the first
+/// two of the three are the paint (`h`, `l`, `l`); with the alternate buffer showing the switch
+/// comes first and the paint is the other two (`h`, `l`, `h`). The offsets are those of the escape
+/// that begins each of the two switches, and `None` says the bytes are not such a restoration.
 fn paint_switches(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut switches = Vec::new();
     let mut at = 0;
@@ -1276,7 +1277,12 @@ fn paint_switches(bytes: &[u8]) -> Option<(usize, usize)> {
         }
         at = start + 8;
     }
-    match switches.as_slice() {
+    // The three that come last are the ones this describes, whatever came before them.
+    let last_three = switches
+        .len()
+        .checked_sub(3)
+        .map(|from| &switches[from..])?;
+    match last_three {
         [(first, true), (second, false), (_, false)] => Some((*first, *second)),
         [(_, true), (second, false), (third, true)] => Some((*second, *third)),
         _ => None,
