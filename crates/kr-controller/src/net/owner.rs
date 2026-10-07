@@ -222,12 +222,13 @@ impl SyncPause {
     }
 }
 
-/// The two places the establishment of the clock can be stopped at in a test.
+/// The places the establishment of the clock can be stopped at in a test, and the count of those
+/// that have reached the challenges.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct EstablishPauses {
-    /// How many establishments have been entered, which a test reads to know that its copies of one
-    /// action are on their way to the challenges.
+    /// How many establishments are about to take the challenges, which a test reads to know that
+    /// its copies of one action are waiting for them.
     pub(crate) entered: std::sync::atomic::AtomicUsize,
     /// After the confirmation is chosen, before the clock is taken.
     pub(crate) before_the_transaction: SyncPause,
@@ -1038,10 +1039,6 @@ impl OwnerAuthority {
         boot: BootEpoch,
         guarded: &CommitFn,
     ) -> Result<HostClockEstablishResult> {
-        #[cfg(test)]
-        self.pauses
-            .entered
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.require_owner(caller)?;
         let rights = CanonicalSet::new();
         let expectation = self.expectation(
@@ -1050,6 +1047,10 @@ impl OwnerAuthority {
             None,
             &rights,
         );
+        #[cfg(test)]
+        self.pauses
+            .entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state();
         if let Some(answered) = self.established(caller, action) {
             return answered;
