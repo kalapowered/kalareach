@@ -513,6 +513,9 @@ struct WatchedLink {
     transit: Arc<Transit>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
+    /// Status questions the host answered, counted when the answer reaches the device, after the
+    /// time it takes on the way.
+    answered: Arc<AtomicUsize>,
     /// Status questions that got no answer from the host: the connection had ended, or the answer
     /// was a refusal.
     failed_statuses: Arc<AtomicUsize>,
@@ -542,6 +545,7 @@ impl WatchedLink {
             transit: Arc::new(Transit::default()),
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
+            answered: Arc::new(AtomicUsize::new(0)),
             failed_statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
@@ -658,6 +662,7 @@ impl HostLink for WatchedLink {
                 transit: Arc::clone(&self.transit),
                 severed: Arc::clone(&self.severed),
                 statuses: Arc::clone(&self.statuses),
+                answered: Arc::clone(&self.answered),
                 failed_statuses: Arc::clone(&self.failed_statuses),
             }) as Box<dyn Preauth>)
         })
@@ -703,6 +708,7 @@ struct Watched {
     transit: Arc<Transit>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
+    answered: Arc<AtomicUsize>,
     failed_statuses: Arc<AtomicUsize>,
 }
 
@@ -790,6 +796,9 @@ impl Preauth for Watched {
                 self.failed_statuses.fetch_add(1, Ordering::SeqCst);
             }
             tokio::time::sleep(back).await;
+            if answer.is_ok() {
+                self.answered.fetch_add(1, Ordering::SeqCst);
+            }
             answer
         })
     }
@@ -1632,8 +1641,12 @@ async fn a_device_pairs_directly_through_the_product_client() {
 /// connection at most four times in any ten seconds and sixteen times in all, which a device that
 /// asked once a second would pass within three seconds. The device keeps inside that budget while
 /// it waits, moves to a fresh connection before one has no questions left, and pairs once the
-/// owner approves, nearly a minute later: it is never refused, never ends and never shows that it
-/// lost its connection.
+/// owner approves, after the host has answered it more times than it answers one connection in
+/// all: it is never refused, never ends and never shows that it lost its connection.
+///
+/// The owner approves when that many answers have come, and not after a time fixed beforehand: a
+/// device that had stayed on one connection could not have been answered so often, and how long
+/// the device takes to be is how long its questions and answers take on the way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_their_time() {
     let owner_keys = keys();
@@ -1648,7 +1661,15 @@ async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_t
     let (attempt, mut shown) = device.redeem(&direct_text(&invited));
     let seen = record(shown.clone());
     awaiting_value(&mut shown).await;
-    tokio::time::sleep(Duration::from_secs(55)).await;
+    let watched = made(&link);
+    let in_all = PreAuthLimits::default().max_requests;
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while watched.answered.load(Ordering::SeqCst) <= in_all {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device is answered more times than one connection allows in all");
     calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
         .await
         .expect("the owner approves");
