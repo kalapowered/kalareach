@@ -365,7 +365,10 @@ impl ProjectService {
         for row in unfinished {
             match self.resolve_operation(&row, None) {
                 Ok(step) => match step {
-                    ResolvedStep::Completed | ResolvedStep::Cleaned | ResolvedStep::Closed => {}
+                    ResolvedStep::Completed
+                    | ResolvedStep::Refused
+                    | ResolvedStep::Cleaned
+                    | ResolvedStep::Closed => {}
                     ResolvedStep::Unresolved(path) => {
                         recovery.unresolved += 1;
                         if let Some(path) = path {
@@ -872,21 +875,15 @@ impl ProjectService {
             Err(error) => return Err(error),
         };
         match reconciled {
-            Reconciliation::Published(_) => {
-                self.finish_publication(row, destination, staged, staging)?;
-                Ok(ResolvedStep::Completed)
-            }
-            Reconciliation::Staged(_) => {
+            Reconciliation::Published => self.finish_publication(row, destination, staged, staging),
+            Reconciliation::Staged => {
                 // The rename did not land. Finishing it is the same operation rather than another
                 // clone, which is what reconciling against the create token means.
                 let Some(sibling) = staging else {
                     return Ok(ResolvedStep::Unresolved(None));
                 };
                 match publish(&sibling, destination, staged) {
-                    Ok(_) => {
-                        self.finish_publication(row, destination, staged, Some(sibling))?;
-                        Ok(ResolvedStep::Completed)
-                    }
+                    Ok(_) => self.finish_publication(row, destination, staged, Some(sibling)),
                     Err(error) => {
                         self.settle_failed_publication(row, destination, sibling, staged, &error)
                     }
@@ -919,11 +916,10 @@ impl ProjectService {
             Err(failure) => return Err(failure),
         };
         match reconciled {
-            Reconciliation::Published(_) => {
-                self.finish_publication(row, destination, staged, Some(sibling))?;
-                Ok(ResolvedStep::Completed)
+            Reconciliation::Published => {
+                self.finish_publication(row, destination, staged, Some(sibling))
             }
-            Reconciliation::Staged(_) => {
+            Reconciliation::Staged => {
                 let path = sibling.path().display().to_string();
                 // Removed as the directory this operation recorded creating, which nothing but
                 // the recorded identity proves.
@@ -1035,15 +1031,27 @@ impl ProjectService {
         Ok(ResolvedStep::Unresolved(named))
     }
 
+    /// Finishes a publication that landed: takes the repository at the destination into the
+    /// registry, as the object that was staged, and closes the operation.
+    ///
+    /// The bar is the one the run that published it applies: a repository whose configuration
+    /// names something no override removes is not taken into the registry, which is a promise to
+    /// serve it. The operation then fails with that refusal, and the repository stays where it was
+    /// published.
     fn finish_publication(
         &self,
         row: &OperationRow,
         destination: &Destination,
         staged: StagedWitness,
         staging: Option<StagingSibling>,
-    ) -> Result<()> {
+    ) -> Result<ResolvedStep> {
         let path = destination.path();
         let opened = self.open_published(destination, destination.admission(), staged)?;
+        if let Err(refusal) = opened.audit().require_neutralised() {
+            self.settle_failure(row, &refusal, OperationState::Failed)?;
+            self.clean_up_published_staging(row, destination, staging);
+            return Ok(ResolvedStep::Refused);
+        }
         let project = ProjectRow {
             project_repository_id: row.project_repository_id,
             environment_id: row.environment_id,
@@ -1073,32 +1081,44 @@ impl ProjectService {
             Some(&encoded),
             self.clock.now_ms(),
         )?;
-        // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
-        // cleanup that fails must not turn a landed publication into a failure: the path is
-        // recorded as one that is still there, with the reason, for the owner. Recording the note
-        // is cleanup too, so a journal that refuses it does not undo the publication either.
-        if let Some(sibling) = staging {
-            let path = sibling.path().display().to_string();
-            // The identity checked here is the *sibling's* own, which the row recorded when the
-            // directory was created. The published tree's identity is a different object: it is
-            // what came out of the sibling.
-            // No recorded identity, so nothing proves the directory at that name is this host's:
-            // the publication stands and the path is reported as still there.
-            let cleanup = row.staging_identity.map(|expected| {
-                self.remove_staging(
-                    sibling,
-                    destination,
-                    expected,
-                    StagingRecord::Operation(row.action_id),
-                )
-            });
-            let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
-            let why = cleanup.as_ref().and_then(Cleanup::why);
-            let _ = self.writable().and_then(|mut store| {
-                store.record_staging_path(row.action_id, &path, removed, why)
-            });
-        }
-        Ok(())
+        self.clean_up_published_staging(row, destination, staging);
+        Ok(ResolvedStep::Completed)
+    }
+
+    /// Takes away the staging sibling of a publication that landed, once the operation is settled.
+    ///
+    /// Removing the sibling is cleanup, and a cleanup that fails must not turn a landed
+    /// publication into a failure: the path is recorded as one that is still there, with the
+    /// reason, for the owner. Recording the note is cleanup too, so a journal that refuses it does
+    /// not undo the publication either.
+    fn clean_up_published_staging(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+        staging: Option<StagingSibling>,
+    ) {
+        let Some(sibling) = staging else {
+            return;
+        };
+        let path = sibling.path().display().to_string();
+        // The identity checked here is the *sibling's* own, which the row recorded when the
+        // directory was created. The published tree's identity is a different object: it is
+        // what came out of the sibling.
+        // No recorded identity, so nothing proves the directory at that name is this host's:
+        // the publication stands and the path is reported as still there.
+        let cleanup = row.staging_identity.map(|expected| {
+            self.remove_staging(
+                sibling,
+                destination,
+                expected,
+                StagingRecord::Operation(row.action_id),
+            )
+        });
+        let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
+        let why = cleanup.as_ref().and_then(Cleanup::why);
+        let _ = self
+            .writable()
+            .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed, why));
     }
 
     /// Returns a completed creation's answer from its rows, for an operation no action carries.
@@ -4247,6 +4267,10 @@ fn split_last(name: &RelativeName) -> Result<(Option<RelativeName>, RelativeName
 enum ResolvedStep {
     /// A publication that landed was completed.
     Completed,
+    /// A publication that landed was not taken into the registry, because the repository's
+    /// configuration names something no override removes: the operation is closed as failed, and
+    /// the repository stays where it was published.
+    Refused,
     /// Nothing was published, and the staged content was removed.
     Cleaned,
     /// Nothing was published and there was nothing to remove, so the operation is simply closed.

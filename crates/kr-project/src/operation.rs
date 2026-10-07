@@ -909,9 +909,9 @@ fn rename_no_replace(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reconciliation {
     /// The rename landed: the destination holds the object that was staged.
-    Published(ObjectIdentity),
+    Published,
     /// The rename did not land: the staging directory still holds it.
-    Staged(ObjectIdentity),
+    Staged,
     /// Neither name holds it, so this host cannot say what happened.
     Unknown,
 }
@@ -935,13 +935,13 @@ pub fn reconcile(
     if let Ok(published) = parent.subdirectory(destination.name())
         && staged.is_the_object_in(&published)
     {
-        return Ok(Reconciliation::Published(published.identity()));
+        return Ok(Reconciliation::Published);
     }
     if let Some(staging) = staging
         && let Ok(found) = staged_tree_in(&staging.directory)
         && staged.is_the_object_in(&found)
     {
-        return Ok(Reconciliation::Staged(found.identity()));
+        return Ok(Reconciliation::Staged);
     }
     Ok(Reconciliation::Unknown)
 }

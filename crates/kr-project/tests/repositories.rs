@@ -2758,3 +2758,71 @@ fn an_owner_reconciliation_is_admitted_and_claimed_before_it_removes_anything() 
     }
     assert!(staging("second-left").join("tree").is_dir());
 }
+
+/// A repository this host published whose configuration names something no override removes is not
+/// taken into the registry, whichever way its creation comes to its end: the operation that
+/// published it fails with the refusal, leaves no project record, and leaves nothing of its staging
+/// behind. The configuration changes between the publication and the first read of the published
+/// repository, which is when the run that published it meets it, and again when the reconciliation
+/// that follows a failure after the publication finishes it.
+#[cfg(unix)]
+#[test]
+fn a_published_repository_whose_configuration_no_override_removes_is_not_registered() {
+    let mut fixture = Fixture::create();
+    let published = fixture.work().join("fresh");
+    let planted = std::sync::atomic::AtomicBool::new(false);
+    fixture.after_publication(Arc::new(move || {
+        if !planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let mut configuration = std::fs::OpenOptions::new()
+                .append(true)
+                .open(published.join(".git/config"))
+                .expect("the published repository's configuration opens");
+            std::io::Write::write_all(
+                &mut configuration,
+                b"[remote \"origin\"]\n\tvcs = planted\n",
+            )
+            .expect("a key no override removes is written");
+        }
+    }));
+    let refusal = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "fresh"),
+                label: "fresh".to_owned(),
+                initial_branch: Nullable(Some("main".to_owned())),
+            },
+            Some(&action("project.init", 142)),
+        )
+        .expect_err("a repository whose configuration no override removes is not registered");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted, "{refusal}");
+    let listed = fixture
+        .service()
+        .project_list(&ProjectListParams {
+            environment_id: fixture.environment_id(),
+        })
+        .expect("the projects list")
+        .projects;
+    assert!(listed.is_empty(), "nothing was registered: {listed:?}");
+    let operation = fixture
+        .service()
+        .project_operation_cancel(
+            &actor(),
+            &ProjectOperationCancelParams {
+                operation_action_id: kr_protocol::ids::ActionId::new(
+                    action("project.init", 142).action_id,
+                ),
+                through_location_id: Nullable(None),
+            },
+            Performed::default(),
+        )
+        .expect("the operation's record is read")
+        .operation;
+    assert_eq!(operation.state, OperationState::Failed);
+    assert_eq!(
+        support::names_in(fixture.work()),
+        vec!["fresh".to_owned()],
+        "the published repository is where it was published, and no private sibling is left"
+    );
+}
