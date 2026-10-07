@@ -205,9 +205,9 @@ fn written_pid(directory: &Path, file: &str) -> Option<u32> {
 /// started, and records no mode. Neither the program nor its child is left running.
 ///
 /// The deadline has to pass after the program has started what it starts, and how soon it does that
-/// is the machine's to say. So the probe is given a longer deadline each time the program is found
-/// not to have started it yet, and what is decided is the state of the processes once a probe that
-/// the program was running in has been ended.
+/// is the machine's to say. So the probe is given a longer deadline, up to `GENEROUS`, each time the
+/// program is found not to have started it yet, and what is decided is the state of the processes
+/// once a probe that the program was running in has been ended.
 #[test]
 fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_started() {
     let mut deadline = if cfg!(windows) {
@@ -237,9 +237,9 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
         }
         assert!(
             deadline < GENEROUS,
-            "the program had not started what it starts within {deadline:?}"
+            "the program had not started what it starts within {deadline:?}: {probed:?}"
         );
-        deadline *= 2;
+        deadline = (deadline * 2).min(GENEROUS);
     };
     assert_eq!(probed.mode, None);
     assert!(
@@ -452,7 +452,7 @@ async fn kr_req_07_64_a_refused_mode_is_a_named_failure_in_a_service_session_and
 /// stand-in never prints, so this case decides by that and not by how soon the deadline passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_07_64_a_launch_whose_probe_gives_no_answer_goes_ahead_and_records_no_mode() {
-    let standin = Standin::running("sleep 600", "Start-Sleep -Seconds 600");
+    let standin = Standin::running("exec sleep 600", "Start-Sleep -Seconds 600");
     let profile = launch::launch(&standin, Some(Duration::from_secs(1)))
         .expect("a probe that gives no answer does not stop the launch");
     assert_eq!(profile.vendor_mode.0, None);
