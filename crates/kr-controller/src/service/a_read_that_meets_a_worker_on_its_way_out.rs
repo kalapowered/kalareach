@@ -310,7 +310,7 @@ impl Scripted {
     }
 
     /// How many connections this worker has accepted, from any daemon.
-    fn connections(&self) -> usize {
+    pub(super) fn connections(&self) -> usize {
         self.connections.load(Ordering::Acquire)
     }
 
@@ -932,7 +932,7 @@ async fn reported_late(script: &Arc<Scripted>) -> Silent {
 /// The same daemon stopped part way through recording the worker's report: the registry holds the
 /// worker's row and its descriptor is published, as they are before a daemon admits the worker,
 /// and the daemon never reached the worker. They are all a daemon that starts has to go by.
-async fn recorded_unreached(script: &Arc<Scripted>) -> Silent {
+pub(super) async fn recorded_unreached(script: &Arc<Scripted>) -> Silent {
     reported(script, false).await
 }
 

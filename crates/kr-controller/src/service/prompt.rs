@@ -48,6 +48,9 @@ impl Controller {
     /// which records nothing here: its first attempt did. A prompt that names a draft and still has
     /// its window is told from a repeat by the worker's own receipt before anything is recorded.
     ///
+    /// A worker the registry lists and the directory does not hold is looked for again before the
+    /// session is said to be unknown.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the worker gave, under its own code, the refusal the record met, that
@@ -95,6 +98,13 @@ impl Controller {
         accepted: Option<AcceptedDeadline>,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        // A worker that did not answer when this daemon started is not gone; it was busy, or it
+        // started slowly. A session the registry lists whose worker the directory does not hold is
+        // looked for again before the prompt is refused as for a session nobody holds, as a read
+        // of the session and a device's link to it do.
+        if self.directory.lock().await.get(session_id).is_none() {
+            let _ = self.recover_workers().await;
+        }
         let worker = self.directory.lock().await.get(session_id).cloned().ok_or(
             ControllerError::UnknownSession {
                 session: session_id.to_string(),
