@@ -358,15 +358,16 @@ impl Controller {
                         // revocation from reporting `pending` for it, and must not stop the
                         // announcement reaching the workers after it. Section 9 makes waiting the
                         // opposite of completion.
+                        let notice = kr_protocol::worker::AuthorityRevisionNotice {
+                            environment_id: self.paths.environment_id(),
+                            revision,
+                            evidence_from: 0,
+                        };
+                        #[cfg(feature = "testing")]
+                        self.record_announcement(session_id, &notice);
                         let answered = tokio::time::timeout(
                             WORKER_EXCHANGE,
-                            link.client().announce_revision(
-                                kr_protocol::worker::AuthorityRevisionNotice {
-                                    environment_id: self.paths.environment_id(),
-                                    revision,
-                                    evidence_from: 0,
-                                },
-                            ),
+                            link.client().announce_revision(notice),
                         )
                         .await;
                         match answered {
@@ -511,8 +512,15 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
     ) {
+        #[cfg(feature = "testing")]
+        let pages = MAX_EVIDENCE_PAGES.min(
+            self.evidence_pages_limit
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        #[cfg(not(feature = "testing"))]
+        let pages = MAX_EVIDENCE_PAGES;
         let mut budget = EvidenceBudget {
-            pages: MAX_EVIDENCE_PAGES,
+            pages,
             retries: MAX_PAGE_RETRIES,
         };
         self.collect_fence_evidence(session_id, binding, revision, &mut budget)
@@ -565,6 +573,8 @@ impl Controller {
                 else {
                     return;
                 };
+                #[cfg(feature = "testing")]
+                self.record_announcement(session_id, &notice);
                 match tokio::time::timeout(WORKER_EXCHANGE, link.client().announce_revision(notice))
                     .await
                 {

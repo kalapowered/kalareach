@@ -1673,16 +1673,16 @@ impl Controller {
             // a connection in the slot with an acknowledgement still on the wire, and the next
             // caller would read somebody else's answer as its own.
             let mut link = self.worker_client(&worker).await?;
-            let answered = link
-                .client()
-                .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-                    environment_id: self.paths().environment_id(),
-                    revision,
-                    // The first page of whatever its fence named: this worker has said nothing
-                    // about this revocation yet, so there is nothing to continue from.
-                    evidence_from: 0,
-                })
-                .await;
+            let notice = kr_protocol::worker::AuthorityRevisionNotice {
+                environment_id: self.paths().environment_id(),
+                revision,
+                // The first page of whatever its fence named: this worker has said nothing
+                // about this revocation yet, so there is nothing to continue from.
+                evidence_from: 0,
+            };
+            #[cfg(feature = "testing")]
+            self.record_announcement(session_id, &notice);
+            let answered = link.client().announce_revision(notice).await;
             match answered {
                 Ok(ack) => {
                     link.give_back();
