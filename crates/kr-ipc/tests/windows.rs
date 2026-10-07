@@ -518,8 +518,6 @@ async fn the_listener_names_the_process_at_the_other_end_of_the_pipe() {
 /// and the first, reading at last, gets every byte it was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread() {
-    use std::io::Read as _;
-
     use kr_ipc::endpoint::Connection;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -592,6 +590,62 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
         .expect("the first caller still reads what it was sent after its connection was closed");
     assert_eq!(&late, b"never read");
     drop(silent);
+}
+
+/// What a connection was sent is delivered to its caller however late the caller reads and
+/// however much was sent, and then the caller sees the connection end.
+///
+/// A write larger than the pipe's buffer is still going out when the listener closes its end, so
+/// the close is of a connection with a write in progress and with most of what it sent unread. The
+/// caller opens the pipe as a plain file and reads nothing until after the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_closed_with_a_large_write_unread_delivers_all_of_it_to_a_late_reader() {
+    use tokio::io::AsyncWriteExt as _;
+
+    const LENGTH: usize = 256 * 1024;
+    let sent: Vec<u8> = (0..LENGTH)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
+
+    let host = TempHost::create();
+    let endpoint = host
+        .environment()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let caller = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(local_name(&endpoint))
+        .expect("the caller opens the pipe");
+    let (mut connection, _) = tokio::time::timeout(PATIENCE, listener.accept())
+        .await
+        .expect("the caller was accepted in time")
+        .expect("the listener accepts it");
+    connection
+        .write_all(&sent)
+        .await
+        .expect("the caller is sent the bytes");
+    drop(connection);
+
+    let reading = tokio::task::spawn_blocking(move || {
+        let mut caller = caller;
+        let mut received = Vec::new();
+        let ended = caller.read_to_end(&mut received);
+        (received, ended)
+    });
+    let (received, ended) = tokio::time::timeout(PATIENCE, reading)
+        .await
+        .expect("the caller saw the connection end after the bytes")
+        .expect("the reader ran");
+    // The end is a clean one, or the platform says no process is at the other end: either way the
+    // bytes come first.
+    assert_eq!(
+        received.len(),
+        sent.len(),
+        "the caller was delivered every byte it was sent, and then {ended:?}"
+    );
+    assert!(received == sent, "and they are the bytes that were sent");
 }
 
 /// KR-REQ-11.52: what binds a caller to its own process and start time is the operating system's
