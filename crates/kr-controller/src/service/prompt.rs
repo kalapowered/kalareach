@@ -50,8 +50,9 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns the refusal the worker gave, under its own code, the refusal the record met, an
-    /// unknown session, or `OUTCOME_UNKNOWN` when the worker did not answer in time.
+    /// Returns the refusal the worker gave, under its own code, the refusal the record met, that
+    /// the session closed where its closure is recorded, an unknown session, or `OUTCOME_UNKNOWN`
+    /// when the worker did not answer in time.
     pub(super) async fn local_prompt(
         self: &Arc<Self>,
         actor_id: &kr_protocol::ids::ActorId,
@@ -62,6 +63,38 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
         let session_id = params.target.subject.session_id;
+        match self
+            .prompt_the_worker(
+                session_id,
+                actor_id,
+                mutation,
+                connection_id,
+                accepted,
+                carried,
+            )
+            .await
+        {
+            // Wherever the daemon finds no worker for the session, before the prompt is sent or
+            // because a closure took it while the prompt waited for its link, a session whose
+            // closure is recorded is closed, and the record is what says so.
+            Err(error @ ControllerError::UnknownSession { .. }) => {
+                Err(self.closed_or(session_id, error).await)
+            }
+            answered => answered,
+        }
+    }
+
+    /// Records the draft a prompt names, if it names one, and puts the prompt to the worker that
+    /// owns `session_id`, as [`Self::local_prompt`] describes.
+    async fn prompt_the_worker(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+        actor_id: &kr_protocol::ids::ActorId,
+        mutation: &MutationRequest,
+        connection_id: ConnectionId,
+        accepted: Option<AcceptedDeadline>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
         let worker = self.directory.lock().await.get(session_id).cloned().ok_or(
             ControllerError::UnknownSession {
                 session: session_id.to_string(),

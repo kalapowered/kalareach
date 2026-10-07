@@ -2571,6 +2571,87 @@ async fn a_local_prompt_the_worker_cannot_look_up_is_refused_and_its_draft_is_no
     world.serving.abort();
 }
 
+/// KR-REQ-09.12: a prompt a caller at this machine makes to a session that has closed is answered
+/// that the session closed, from the closure the host recorded, as a paired device's read of it is,
+/// and not that the session is unknown, which is the answer for a session the host has no record of.
+/// The prompt names a draft, and nothing is recorded for a session that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_for_a_session_that_closed_is_told_it_closed_and_not_that_it_is_unknown() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_transport::window::{AcceptedDeadline, DeadlineBound};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_link_that_is_not_given_back::Served;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = Served::start().await;
+    let controller = &world.controller;
+    let environment_id = controller.paths().environment_id();
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(300))
+            .expect("a deadline five minutes out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+    let admission = fake::admission(controller, accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id = a_draft_holding_an_attachment(controller, environment_id, &actor, "closed.bin");
+    controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+
+    let code_of = |answered: ControlFrame| match answered {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => error.code,
+        other => panic!("the prompt is refused: {other:?}"),
+    };
+    let closed = controller
+        .perform(
+            &actor,
+            admission.connection_id,
+            None,
+            a_local_prompt_to(
+                controller,
+                environment_id,
+                world.session_id,
+                &admission,
+                ActionId::new(kr_ipc::new_uuid()),
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+        )
+        .await;
+    assert_eq!(code_of(closed), ErrorCode::SessionClosed);
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "a draft was recorded as sent to a session that is gone"
+    );
+
+    let unknown = controller
+        .perform(
+            &actor,
+            admission.connection_id,
+            None,
+            a_local_prompt_to(
+                controller,
+                environment_id,
+                SessionId::new(kr_ipc::new_uuid()),
+                &admission,
+                ActionId::new(kr_ipc::new_uuid()),
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+        )
+        .await;
+    assert_eq!(code_of(unknown), ErrorCode::UnknownSession);
+}
+
 /// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal it notes
 /// every session the host knows, because each was started by a daemon of an earlier build whose
 /// worker may take a draft prompt this host is not told of, and a daemon that starts again over the
@@ -2898,7 +2979,28 @@ fn a_local_prompt(
     draft_id: Nullable<kr_protocol::ids::DraftId>,
     text: Nullable<kr_protocol::agent::PromptText>,
 ) -> MutationRequest {
-    let controller = &world.controller;
+    a_local_prompt_to(
+        &world.controller,
+        world.environment_id,
+        world.session_id,
+        admission,
+        action_id,
+        draft_id,
+        text,
+    )
+}
+
+/// A prompt a caller at this machine makes to `session_id` as `action_id`, naming a draft or
+/// carrying its text inline, under a window issued to `admission`'s connection.
+fn a_local_prompt_to(
+    controller: &crate::service::Controller,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: SessionId,
+    admission: &crate::authority::AdmittedMutation,
+    action_id: ActionId,
+    draft_id: Nullable<kr_protocol::ids::DraftId>,
+    text: Nullable<kr_protocol::agent::PromptText>,
+) -> MutationRequest {
     let window = controller
         .windows
         .issue(admission.connection_id, controller.boot_epoch)
@@ -2906,7 +3008,7 @@ fn a_local_prompt(
     let params = kr_protocol::agent::AgentPromptParams {
         target: kr_protocol::agent::AgentMutationTarget {
             subject: kr_protocol::agent::AgentSubject {
-                session_id: world.session_id,
+                session_id,
                 application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
                     kr_ipc::new_uuid(),
                 ),
@@ -2923,8 +3025,8 @@ fn a_local_prompt(
         action_id,
         grant_id: Nullable::null(),
         target: ActionTarget {
-            environment_id: world.environment_id,
-            session_id: Nullable::some(world.session_id),
+            environment_id,
+            session_id: Nullable::some(session_id),
             session_epoch: Nullable::some(SessionEpoch::V1),
             application_instance_id: Nullable::some(params.target.subject.application_instance_id),
             agent_binding_revision: Nullable::some(params.target.binding_revision),
