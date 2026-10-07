@@ -76,7 +76,6 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     hostReachable: true,
     delegations: [],
     requests: [],
-    firstAudioMs: null,
     admissionMeans: ADMISSION_MEANS,
     ...over
   }

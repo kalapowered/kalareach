@@ -17,8 +17,8 @@
 #   descriptions  scripts/bench-descriptions.sh               KR-PERF-009, where the host can hold
 #                                                             its budget
 #
-# KR-PERF-010 is measured on a paired phone with a connected media path to the voice provider, so a
-# run names it as not run here, with that reason.
+# KR-PERF-010 needs a paired phone with a connected media path to the voice provider, so a run names
+# it as not run here, with that reason.
 #
 # Every measurement writes its figures under KR_TEST_ARTIFACTS_DIR as Markdown sections headed by
 # the identifier they measure (`## KR-PERF-007 ...`), each with a verdict. For each identifier this
@@ -751,7 +751,7 @@ if selected descriptions; then
 fi
 if [ -z "$only" ]; then
   section "KR-PERF-010 voice, not run here" \
-    "reason            first audio is taken on a paired phone with a connected media path to the voice provider, where the phone adds the remote audio track, and the voice service records what starting each call took; neither is taken on a host"
+    "reason            first audio and delegation latency need a paired phone with a connected media path to the voice provider, and the voice service records what starting each call took; neither is taken on a host"
 fi
 
 # Which identifiers each step measures.

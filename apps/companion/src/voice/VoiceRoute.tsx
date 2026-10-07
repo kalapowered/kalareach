@@ -3,8 +3,8 @@
  *
  * Everything the screen shows comes back from somewhere else. The provider, the scope, the
  * disclosure and the grant's sentences are the host's answer to a preparation read; the session,
- * the model and the closing time are its answer to a start; the microphone, the speaker and the
- * first audio are what the call this device is holding reports. No action here changes what a
+ * the model and the closing time are its answer to a start; the microphone and the speaker are
+ * what the call this device is holding reports. No action here changes what a
  * person sees until an answer has arrived, so a control that failed leaves the screen saying what
  * is true rather than what was attempted.
  */
@@ -194,7 +194,6 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         ...running,
         capture: asCaptureState(state.capture),
         playing: state.playing,
-        firstAudioMs: state.first_audio_ms,
         brokerReachable: state.control !== 'unreachable'
       }
     })
@@ -352,7 +351,6 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
                 running: true,
                 capture: 'unavailable',
                 playing: false,
-                first_audio_ms: null,
                 control: 'none'
               })
             )

@@ -1365,7 +1365,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         })
       }
       const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
-      voice.call = { session: started, capture: voice.startCapture, playing: true, firstAudioMs: 410 }
+      voice.call = { session: started, capture: voice.startCapture, playing: true }
       return Promise.resolve({
         receipt: null,
         action_id: null,
@@ -1775,7 +1775,6 @@ interface VoiceState {
     session: VoiceSessionDescriptor
     capture: string
     playing: boolean
-    firstAudioMs: number | null
   } | null
   /** The delegations the provider has announced to this call. */
   delegations: string[]
@@ -1829,13 +1828,12 @@ export type VoiceTermsState = 'published' | 'closed' | 'unread'
 function voiceCallState(voice: VoiceState): VoiceCallState {
   const running = voice.call
   if (!running) {
-    return { running: false, capture: 'idle', playing: false, first_audio_ms: null, control: 'none' }
+    return { running: false, capture: 'idle', playing: false, control: 'none' }
   }
   return {
     running: true,
     capture: running.capture,
     playing: running.playing,
-    first_audio_ms: running.firstAudioMs,
     control: voice.brokerReachable ? 'connected' : 'unreachable'
   }
 }

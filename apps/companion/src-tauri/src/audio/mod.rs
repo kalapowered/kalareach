@@ -144,7 +144,6 @@ fn state_of(call: Option<&DesktopVoiceCall>) -> VoiceCallState {
         // refusal of an unheard claim is built on.
         capture: call.capture_state(),
         playing: !call.is_playback_muted(),
-        first_audio_ms: call.first_audio_ms(),
         // A desktop call opens no control channel to the voice service.
         control: "none",
     }

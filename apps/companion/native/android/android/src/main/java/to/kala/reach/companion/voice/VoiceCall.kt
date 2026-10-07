@@ -64,7 +64,7 @@ class VoiceCall private constructor(
         /** The provider sent something on its read-only channel. */
         fun onProviderEvent(bytes: ByteArray)
 
-        /** The first remote audio arrived. KR-PERF-010's first-audio figure is taken here. */
+        /** The first remote audio track arrived. It reports a track, not audible playback. */
         fun onFirstAudio()
     }
 

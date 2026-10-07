@@ -87,7 +87,6 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     hostReachable: true,
     delegations: [],
     requests: [],
-    firstAudioMs: null,
     admissionMeans: ADMISSION_MEANS,
     ...over
   }
@@ -225,7 +224,6 @@ describe('what the native layer reports about capture', () => {
         running: true,
         capture: 'muted_by_person',
         playing: false,
-        first_audio_ms: 410,
         control: 'unreachable'
       },
       ADMISSION_MEANS
@@ -235,7 +233,6 @@ describe('what the native layer reports about capture', () => {
     expect(built.closesAtMs).toBe(1_763_000_000_000)
     expect(built.capture).toBe('muted_by_person')
     expect(built.playing).toBe(false)
-    expect(built.firstAudioMs).toBe(410)
     expect(built.delegations).toEqual([])
     // Whether the voice service answers is the call's own report about its control channel.
     expect(built.brokerReachable).toBe(false)
