@@ -370,36 +370,6 @@ impl Pause {
     }
 }
 
-/// Keeps this runtime serving sockets and timers while a task of the worker is stopped.
-///
-/// A worker task that waits, inside a pause or for a lock, holds a thread of this runtime, as the
-/// worker's own process would hold one of its own. When every other thread is asleep waiting for
-/// work, nothing then reads a socket or fires a timer until that thread comes back: the daemon's
-/// announcement would sit unread, and a test that waits for the answer would be waiting for the
-/// release it has not yet given. A task that always has something to do next keeps one thread
-/// polling them.
-struct Awake {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Awake {
-    fn keep() -> Self {
-        Self {
-            task: tokio::spawn(async {
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            }),
-        }
-    }
-}
-
-impl Drop for Awake {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 /// KR-REQ-09.12, KR-REQ-09.13, KR-ACC-022: the revocation reports `pending` while the worker is
 /// isolated, holds when the worker acknowledges, names what may already have been dispatched, and
 /// kills nothing.
@@ -1860,6 +1830,22 @@ struct Hosted {
     service: Arc<WorkerService>,
 }
 
+impl Hosted {
+    /// The worker's service, for a test that stops one of its tasks or holds a lock one of them
+    /// wants.
+    ///
+    /// Such a task waits on a thread, and on this test's runtime that thread could be one the
+    /// test's own waits need, so a worker whose tasks a test stops is served apart
+    /// ([`hosted_worker_apart`]).
+    fn service_to_stop(&self) -> &Arc<WorkerService> {
+        assert!(
+            self._apart.is_some(),
+            "a worker whose tasks a test stops is served apart"
+        );
+        &self.service
+    }
+}
+
 /// One daemon, and the rendezvous every worker it starts is verified through.
 struct HostedDaemon {
     temp: Arc<kr_ipc::testing::TempHost>,
@@ -2351,9 +2337,12 @@ async fn a_revocation_through_the_daemon_holds_only_once_the_isolated_worker_has
 /// boundary a dispatch does, so it reads the action either before its marker or after it, never
 /// during. Here it is after: the effect happened, and what the revocation can honestly say is that
 /// it happened.
+///
+/// The worker is served apart, as a worker is in production: the mutation stopped inside the
+/// boundary stops a thread of the worker's own runtime and none that serves this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back() {
-    let hosted = hosted_worker().await;
+    let hosted = hosted_worker_apart().await;
     let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects to the worker");
@@ -2361,7 +2350,7 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
 
     // The worker stops the next mutation it takes the moment it holds the dispatch boundary, so
     // the action is inside the boundary, with nothing else able to enter and nothing else held.
-    let (inside, release) = hosted.service.pause_inside_boundary();
+    let (inside, release) = hosted.service_to_stop().pause_inside_boundary();
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
@@ -2412,8 +2401,7 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
     // The revocation is announced while the mutation is in there. It cannot read the journal
     // between the acceptance and the marker, because the fence takes the same boundary, and a
     // worker that cannot take it refuses without waiting. So the daemon's first report comes back
-    // while the mutation is still stopped, once something keeps the runtime reading its sockets.
-    let awake = Awake::keep();
+    // while the mutation is still stopped.
     let first = tokio::time::timeout(
         Duration::from_secs(60),
         hosted.controller.revoke_authority(),
@@ -2432,7 +2420,6 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
         first.workers[0].detail
     );
     release.send(()).expect("the mutation is waiting for this");
-    drop(awake);
 
     let (_client, answered) = tokio::time::timeout(Duration::from_secs(30), attaching)
         .await
@@ -2724,16 +2711,20 @@ fn seed_undispatched_intents(hosted: &Hosted, device: &ActorId, count: usize) {
 /// The worker's dispatch boundary, held on a thread of its own until the test lets it go: what an
 /// announcement meets while a mutation, a generation another link presents or a maintenance pass
 /// is inside it.
+///
+/// The worker is served apart. A task of the worker that wants the boundary while it is held, a
+/// generation another link presents or the maintenance pass among them, waits for it on a thread,
+/// and on this test's runtime that thread could be one this test's own waits need.
 struct HeldBoundary {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HeldBoundary {
-    async fn take(service: &Arc<WorkerService>) -> Self {
+    async fn take(hosted: &Hosted) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
-        let service = Arc::clone(service);
+        let service = Arc::clone(hosted.service_to_stop());
         let thread = std::thread::spawn(move || {
             let _boundary = service.hold_the_dispatch_boundary();
             let _ = held.send(());
@@ -2873,14 +2864,14 @@ fn worker_report(
 /// report has to be whole when the announcement returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_asked_for_again() {
-    let hosted = hosted_worker().await;
+    let hosted = hosted_worker_apart().await;
     let device = actor("device:phone");
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
     seed_undispatched_intents(&hosted, &device, affected);
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
-    let boundary = HeldBoundary::take(&hosted.service).await;
+    let boundary = HeldBoundary::take(&hosted).await;
     stopped
         .go
         .send(())
@@ -2919,14 +2910,14 @@ async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_aske
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_that_refuses_every_page_is_asked_a_bounded_number_of_times_and_its_names_stay_pending()
  {
-    let hosted = hosted_worker().await;
+    let hosted = hosted_worker_apart().await;
     let device = actor("device:phone");
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
     seed_undispatched_intents(&hosted, &device, affected);
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
-    let boundary = HeldBoundary::take(&hosted.service).await;
+    let boundary = HeldBoundary::take(&hosted).await;
     stopped
         .go
         .send(())
@@ -2976,7 +2967,7 @@ async fn a_worker_that_refuses_every_page_is_asked_a_bounded_number_of_times_and
 /// refusal as a page would stop a page short.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
-    let hosted = hosted_worker().await;
+    let hosted = hosted_worker_apart().await;
     hosted.controller.limit_evidence_pages_for_tests(2);
     let device = actor("device:phone");
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
@@ -2984,7 +2975,7 @@ async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
-    let boundary = HeldBoundary::take(&hosted.service).await;
+    let boundary = HeldBoundary::take(&hosted).await;
     stopped
         .go
         .send(())
