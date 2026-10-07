@@ -447,10 +447,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
     // The worker says so once the announcement has taken its dispatch boundary and goes on to the
     // session, which is held: the case is about an announcement that is inside the isolated
     // worker's handler, and until it is, the check below would be about one that had not arrived.
-    // The wait is a blocking call on a blocking thread rather than a timer: the worker shares this
-    // runtime, and every one of its tasks that wants the session is stopped while the session is
-    // held, so a timer this runtime has to fire is not something to depend on here. The bound only
-    // keeps an announcement that never arrives from holding the suite up.
+    // The worker says so through a standard channel end, so the wait is a blocking call on a
+    // blocking thread, and its bound is a duration of the standard clock. The bound only keeps an
+    // announcement that never arrives from holding the suite up.
     let reached =
         tokio::task::spawn_blocking(move || reaching.recv_timeout(Duration::from_secs(30)).is_ok())
             .await
@@ -1869,8 +1868,8 @@ async fn hosted_worker_apart() -> Hosted {
     hosted_worker_serving(true).await
 }
 
-/// Starts the daemon and its worker as [`hosted_worker`] does, and serves the worker's connections
-/// on this test's runtime, or on one of their own when `apart`.
+/// Starts the daemon and its worker as [`hosted_worker`] does, and runs the worker's session
+/// runtime and its connections on this test's runtime, or on a runtime of their own when `apart`.
 async fn hosted_worker_serving(apart: bool) -> Hosted {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
