@@ -3764,11 +3764,12 @@ rollback never enlarges a lifetime. A previously expired object never revives, b
 expiration tombstone answers whatever the clock later reads.
 
 The rollback is measured against the furthest point this host could ever *prove* the clock had
-reached, projected forward by the continuous time since. Measuring against the previous reading
-alone would forgive a little slippage, then forgive the next against the moved mark, and enough of
-those would give a deadline back indefinitely. The same proven reading is what a UTC deadline is
-compared against, with the platform's own uncertainty bound added to it, so an object expires when
-it cannot still be valid rather than when a forgiving clock says so.
+reached, projected forward by the continuous time since, less 100 parts per million, so a
+continuous clock its time service does not correct is not read as a rollback. Measuring against the
+previous reading alone would forgive a little slippage, then forgive the next against the moved
+mark, and enough of those would give a deadline back indefinitely. The same proven reading is what
+a UTC deadline is compared against, with the platform's own uncertainty bound added to it, so an
+object expires when it cannot still be valid rather than when a forgiving clock says so.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object

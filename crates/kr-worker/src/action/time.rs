@@ -390,14 +390,35 @@ struct HighWater {
     continuous_ms: u64,
 }
 
+/// How far the continuous clock may run fast against the wall clock before the difference counts
+/// as a rollback, in parts per million.
+///
+/// The platform's time service keeps the wall clock, and on macOS and Windows nothing keeps the
+/// continuous clock (`mach_continuous_time`, `QueryInterruptTime`), so the two differ by the
+/// oscillator's error: 20 ppm is about 1.7 seconds a day. A projection that credits every
+/// continuous millisecond counts that error as a rollback once it passes the five-second
+/// tolerance, about three days at 20 ppm, and a healthy worker then distrusts its own clock and
+/// stops collecting. So the projection credits a millisecond less per 10,000: a continuous clock up
+/// to this fast raises no distrust, and one faster than that still does. The cost, stated once
+/// here: rollback detection gains slack of this rate times the continuous time since the mark was
+/// last raised, 6 ms for each minute and about a minute after a week. A rollback inside that slack
+/// goes unseen, and a UTC deadline outlives the time it names by no more than the same slack.
+const RATE_ALLOWANCE_PPM: u64 = 100;
+
+/// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
+/// allowance ([`RATE_ALLOWANCE_PPM`]).
+const fn credited(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_sub(elapsed_ms.saturating_mul(RATE_ALLOWANCE_PPM) / 1_000_000)
+}
+
 impl HighWater {
     /// Returns the earliest the wall clock can honestly read now.
     ///
     /// The continuous clock is the ground truth for elapsed time, so the mark plus whatever has
-    /// elapsed since it was taken is a lower bound on the present.
+    /// elapsed since it was taken, less the rate allowance, is a lower bound on the present.
     const fn projected(self, continuous_now: u64) -> u64 {
         self.wall_ms
-            .saturating_add(continuous_now.saturating_sub(self.continuous_ms))
+            .saturating_add(credited(continuous_now.saturating_sub(self.continuous_ms)))
     }
 }
 
@@ -802,7 +823,9 @@ impl TimeContract {
                 // is where the clock should be, so anything materially above that is a
                 // correction rather than elapsed time. A step this host did not write down is a
                 // step a restart would measure the next rollback against, and the tolerance for
-                // telling a step from noise is the same one the detector uses.
+                // telling a step from noise is the same one the detector uses. The projection
+                // credits a little less than the time that passes, so a clock that keeps pace
+                // reads as a step about every 42 minutes and is written then.
                 let stepped = state.saved.is_none_or(|saved| {
                     wall_ms.saturating_sub(saved.projected(continuous_ms))
                         > millis(DISCONTINUITY_TOLERANCE)
