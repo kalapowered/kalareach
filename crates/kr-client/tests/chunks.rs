@@ -9,6 +9,7 @@
 //! suite; these are the cases a real daemon does not produce on demand.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use kr_client::Session;
@@ -47,6 +48,10 @@ use kr_protocol::transfer::{
 
 /// The lifetime every call in these tests requests.
 const TTL: DurationMs = DurationMs::new(60_000);
+
+/// How long a test waits for the host to see something that must happen: it fails a wait that
+/// never ends, and is not a measurement.
+const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn build() -> BuildId {
     BuildId::new("kr/0.1.0+test").expect("a build identity")
@@ -92,8 +97,8 @@ struct Script {
     /// The attachment-chunk endpoint stops reading once it has acknowledged the hello, and after
     /// this long sends a frame a lane does not carry, keeping the connection open.
     stop_reading_after: Option<std::time::Duration>,
-    /// After answering the first chunk, the attachment-chunk endpoint also answers the next
-    /// request identifier, which the lane has not issued.
+    /// Before answering the first chunk, the attachment-chunk endpoint answers the next request
+    /// identifier, which the lane has not issued.
     unsolicited_answer: bool,
     /// The first attachment-chunk connection refuses every chunk as a host refuses one whose window
     /// has expired.
@@ -118,6 +123,9 @@ struct Seen {
     windows: Vec<String>,
     /// The chunks each attachment-chunk connection carried, in order.
     legs: Vec<Vec<u64>>,
+    /// How many attachment-chunk connections the host has seen end, after reading all that had
+    /// been written to them.
+    legs_ended: usize,
     reservations: usize,
     publications: usize,
     statuses: usize,
@@ -155,6 +163,8 @@ struct Host {
     tree: TempHost,
     script: Script,
     seen: Mutex<Seen>,
+    /// Woken each time an attachment-chunk connection ends on the host's side.
+    ended: tokio::sync::Notify,
     staged: Mutex<HashMap<TransferId, Staged>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -179,6 +189,7 @@ impl Host {
             tree,
             script,
             seen: Mutex::new(Seen::default()),
+            ended: tokio::sync::Notify::new(),
             staged: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
         });
@@ -197,6 +208,29 @@ impl Host {
 
     fn seen(&self) -> Seen {
         self.seen.lock().expect("what the host saw").clone()
+    }
+
+    /// Waits until `count` attachment-chunk connections have ended on the host's side.
+    ///
+    /// The host reads a connection until it ends, and what it read before then is in what it saw,
+    /// so after this nothing a lane wrote to those connections is still on its way. A failed write
+    /// of an answer does not stop it reading.
+    async fn until_legs_ended(&self, count: usize) {
+        tokio::time::timeout(LIVENESS_DEADLINE, async {
+            loop {
+                // Asked to be woken before the count is read, so a connection that ends in
+                // between is not missed.
+                let changed = self.ended.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.seen().legs_ended >= count {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("the host sees the lane's connection end");
     }
 
     async fn session(&self) -> Session {
@@ -456,7 +490,13 @@ async fn serve(host: std::sync::Weak<Host>, listener: Listener, chunks: bool) {
         };
         let first = connections == 0;
         connections += 1;
-        tokio::spawn(converse(host, reader, writer, peer, leg, first));
+        tokio::spawn(async move {
+            converse(Arc::clone(&host), reader, writer, peer, leg, first).await;
+            if leg.is_some() {
+                host.seen.lock().expect("what the host saw").legs_ended += 1;
+                host.ended.notify_waiters();
+            }
+        });
     }
 }
 
@@ -546,6 +586,9 @@ async fn converse(
     }
     let mut carried = 0_usize;
     let mut unsolicited = host.script.unsolicited_answer;
+    // Whether the peer still takes what the host writes. A host whose writes fail goes on reading
+    // until the connection ends, so everything the peer wrote is in what the host saw.
+    let mut writable = true;
     loop {
         let frame = match (due.clone(), host.script.renewal_trigger.clone()) {
             (Some(renewal), Some(trigger)) => tokio::select! {
@@ -613,16 +656,20 @@ async fn converse(
                         }
                         if unsolicited && let Some(next) = next {
                             unsolicited = false;
-                            // The answer to this chunk, and then one to the request after it,
-                            // which the lane has not made.
-                            if writer
-                                .write_message(&answer(request_id, outcome))
-                                .await
-                                .is_err()
+                            // An answer to the request after this one, which the lane has not
+                            // made, ahead of the answer to this chunk.
+                            if writable
+                                && writer
+                                    .write_message(&answer(
+                                        RequestId::new(request_id.get() + 1),
+                                        typed(&next),
+                                    ))
+                                    .await
+                                    .is_err()
                             {
-                                return;
+                                writable = false;
                             }
-                            answer(RequestId::new(request_id.get() + 1), typed(&next))
+                            answer(request_id, outcome)
                         } else {
                             answer(request_id, outcome)
                         }
@@ -710,8 +757,8 @@ async fn converse(
             },
             _ => return,
         };
-        if writer.write_message(&reply).await.is_err() {
-            return;
+        if writable && writer.write_message(&reply).await.is_err() {
+            writable = false;
         }
     }
 }
@@ -1208,6 +1255,13 @@ async fn a_refused_reservation_may_be_asked_for_again() {
 
 /// A lane whose reader stopped at a frame it cannot carry sends nothing more, even though the
 /// connection is still open: the next call fails with what the reader said.
+///
+/// The host's frame is the first thing on the connection, ahead of any answer. A call made before
+/// the reader reaches it ends with what the reader said, and one made after goes nowhere, so the
+/// first call may or may not have put its chunk on the connection and the later ones never do.
+/// They carry a chunk of their own, index 1, which the host records whether or not it verifies.
+/// That a lane whose reader has stopped is not usable before a call is built is the lane's own
+/// test, `chunks::tests::a_lane_whose_reader_has_stopped_is_not_usable` in the crate.
 #[tokio::test]
 async fn a_lane_whose_reader_stopped_sends_nothing_more() {
     let host = Host::start(Script {
@@ -1222,7 +1276,6 @@ async fn a_lane_whose_reader_stopped_sends_nothing_more() {
         .open(reserved.transfer_id)
         .await
         .expect("a lane");
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let refused = lane
         .send_chunk(
@@ -1233,21 +1286,27 @@ async fn a_lane_whose_reader_stopped_sends_nothing_more() {
         .await
         .expect_err("the lane has stopped");
     assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
-    let again = lane
-        .send_chunk(
-            &host.target(),
-            &chunk_of(reserved.transfer_id, &bytes, 0),
-            TTL,
-        )
-        .await
-        .expect_err("the lane stays stopped");
-    assert!(matches!(again, ClientError::ConnectionEnded), "{again}");
-    // Time for a chunk that did go out to reach the host's record.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        host.seen().legs,
-        vec![Vec::<u64>::new()],
-        "no chunk went out"
+    // That call ended with the reader's failure, so the reader has stopped. Every call after it is
+    // refused, and each is a chance for a lane that did not refuse it to put its chunk on the
+    // connection, which is why there are several.
+    let later = pattern(UPLOAD_CHUNK_LEN + 10);
+    for _ in 0..8 {
+        let again = lane
+            .send_chunk(
+                &host.target(),
+                &chunk_of(reserved.transfer_id, &later, 1),
+                TTL,
+            )
+            .await
+            .expect_err("the lane stays stopped");
+        assert!(matches!(again, ClientError::ConnectionEnded), "{again}");
+    }
+    drop(lane);
+    host.until_legs_ended(1).await;
+    assert!(
+        !host.seen().legs.concat().contains(&1),
+        "no chunk went out after the lane stopped: {:?}",
+        host.seen().legs
     );
 }
 
@@ -1280,19 +1339,25 @@ async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
 
     let target = host.target();
     let chunk = chunk_of(reserved.transfer_id, &bytes, 0);
-    let call = tokio::spawn(async move { lane.send_chunk(&target, &chunk, TTL).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The call begins before the host is told to renew: it runs as far as its first wait, which
+    // is for the renewal its window is due for.
+    let mut call = std::pin::pin!(lane.send_chunk(&target, &chunk, TTL));
+    let waiting = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(call.as_mut().poll(context).is_pending())
+    })
+    .await;
     assert!(
-        host.seen().windows.is_empty(),
-        "the lane sends nothing under a window due for renewal"
+        waiting,
+        "the call has not finished before the host is told to renew"
     );
     trigger.notify_one();
     let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), call)
         .await
         .expect("the call ends")
-        .expect("the call's task")
         .expect("the chunk goes under the renewed window");
     assert_eq!(accepted.index, U64::new(0));
+    // Every chunk the host stored names the window it came under, so none went under the one the
+    // lane held while it waited.
     assert_eq!(host.seen().windows, vec!["window-2"]);
 }
 
@@ -1326,6 +1391,8 @@ async fn a_lane_whose_window_runs_out_unrenewed_has_lost_its_connection() {
     .expect("the call ends when the window does")
     .expect_err("no renewal came");
     assert!(matches!(lost, ClientError::ConnectionEnded), "{lost}");
+    drop(lane);
+    host.until_legs_ended(1).await;
     assert!(host.seen().windows.is_empty(), "nothing went out");
 }
 
@@ -1372,6 +1439,10 @@ async fn a_write_the_host_stopped_reading_ends_when_the_reader_does() {
 
 /// An answer to a request the lane has not issued ends the lane, so it can never be taken for the
 /// answer to the call the lane makes next.
+///
+/// The host answers the request after the first chunk's before it answers the chunk, so the lane
+/// reads that answer while it has made one call and no more: it is to a call the lane never made
+/// whatever call the lane makes next.
 #[tokio::test]
 async fn an_answer_to_a_call_the_lane_never_made_ends_the_lane() {
     let host = Host::start(Script {
@@ -1387,28 +1458,32 @@ async fn an_answer_to_a_call_the_lane_never_made_ends_the_lane() {
         .await
         .expect("a lane");
 
-    lane.send_chunk(
-        &host.target(),
-        &chunk_of(reserved.transfer_id, &bytes, 0),
-        TTL,
-    )
-    .await
-    .expect("the first chunk is answered");
-    // Time for the host's second answer, to a request the lane has not issued, to reach it.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let refused = lane
         .send_chunk(
             &host.target(),
-            &chunk_of(reserved.transfer_id, &bytes, 1),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
             TTL,
         )
         .await
         .expect_err("the lane ended at the answer nobody asked for");
     assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        host.seen().legs,
-        vec![vec![0]],
+    // Every call after it is refused, and each is a chance for a lane that did not refuse it to
+    // put its chunk on the connection, which is why there are several.
+    for _ in 0..8 {
+        let again = lane
+            .send_chunk(
+                &host.target(),
+                &chunk_of(reserved.transfer_id, &bytes, 1),
+                TTL,
+            )
+            .await
+            .expect_err("the lane has ended");
+        assert!(matches!(again, ClientError::ConnectionEnded), "{again}");
+    }
+    drop(lane);
+    host.until_legs_ended(1).await;
+    assert!(
+        !host.seen().legs.concat().contains(&1),
         "the second chunk never went out"
     );
 }

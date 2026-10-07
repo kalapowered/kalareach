@@ -580,6 +580,90 @@ fn refusal(code: ErrorCode, message: &'static str) -> ClientError {
 mod tests {
     use super::*;
 
+    /// The reader of a lane stops at a frame the lane cannot carry, and a lane whose reader has
+    /// stopped is not usable: a call built after that would go out on a connection nobody reads.
+    ///
+    /// The host acknowledges the hello and then sends a second acknowledgement, which a lane does
+    /// not carry. The test waits for the reader's own task to end, so `usable()`, the first step
+    /// of a call, is asked after the reader has stopped and before the lane has failed. Unix
+    /// only: the suites that drive a lane from a scripted host are not run on Windows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lane_whose_reader_has_stopped_is_not_usable() {
+        use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+        use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId};
+        use kr_protocol::local::{LocalHelloAck, LocalPeer};
+        use kr_protocol::scalars::{TimestampMs, U64, Uuid};
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment_id = host.environment_id();
+        let endpoint = host
+            .environment()
+            .attachment_chunk_endpoint()
+            .expect("an address");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let acknowledgement = ControlFrame::HelloAck(Box::new(LocalHelloAck {
+            selected_version: PROTOCOL_VERSION,
+            role: LocalRole::Controller,
+            connection_id: ConnectionId::new(Uuid::from_bytes([42; 16])),
+            environment_id,
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::BootTime,
+                value: Bytes::new(vec![1, 2, 3, 4]),
+            },
+            peer: LocalPeer {
+                uid: U64::new(0),
+                gid: U64::new(0),
+                pid: Nullable::null(),
+            },
+            action_window: ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window identifier"),
+                connection_id: ConnectionId::new(Uuid::from_bytes([42; 16])),
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(0),
+                valid_for_ms: DurationMs::new(60_000),
+            },
+            capabilities: CanonicalSet::new(),
+            max_receive: ReceiveLimits::default(),
+            build: None,
+        }));
+        let serving = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) = split(connection, StreamKind::AttachmentChunks);
+            let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
+                return;
+            };
+            writer
+                .write_message(&acknowledgement)
+                .await
+                .expect("the acknowledgement");
+            writer
+                .write_message(&acknowledgement)
+                .await
+                .expect("the frame a lane does not carry");
+            // Held open: the lane's side decides how it ends.
+            let _ = reader.read_message::<ControlFrame>().await;
+        });
+        let build = BuildId::new("kr-test/0").expect("a build");
+        let mut carrier = LocalCarrier::connect(&endpoint, environment_id, build)
+            .await
+            .expect("a lane");
+
+        tokio::time::timeout(Duration::from_secs(120), &mut carrier.reader)
+            .await
+            .expect("the reader stops: a wait that never ends fails the test, and measures nothing")
+            .expect("the reader's task");
+        let refused = carrier
+            .usable()
+            .expect_err("a lane whose reader has stopped");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+        assert!(
+            matches!(carrier.usable(), Err(ClientError::ConnectionEnded)),
+            "and it stays unusable"
+        );
+        serving.abort();
+    }
+
     #[test]
     fn a_full_chunk_fits_the_lane_and_not_a_control_connection() {
         let chunk = kr_protocol::limits::UPLOAD_CHUNK_LEN;
