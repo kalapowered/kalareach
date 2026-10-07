@@ -2230,10 +2230,11 @@ impl Session {
         // The terminal is on the stream when the hub sends it the application's bytes, which is
         // not the same as the table saying so: a terminal told to begin again is sent nothing
         // until it subscribes, and one that has not subscribed yet is sent nothing at all.
+        let resynchronising = self.hub.is_resynchronising(attachment_id);
         let on_the_stream = self.hub.presentation_of(attachment_id)
             == Some(crate::output::Presentation::Direct)
-            && !self.hub.is_resynchronising(attachment_id);
-        if (moved || before_dimensions != Some(dimensions))
+            && !resynchronising;
+        if (moved || before_dimensions != Some(dimensions) || resynchronising)
             && !on_the_stream
             && matches!(
                 presentation_reason,
@@ -2248,11 +2249,13 @@ impl Session {
             // next, and a screen that was carried when it was drawn can have changed since. A
             // terminal that is the session's size again, or back on the live screen, was not on
             // the stream, and has only this left to keep it off it, so the answer is asked of the
-            // screen the session holds now and the report says what it found. A terminal the hub
-            // is sending the application's bytes is left out whatever its stored window says:
-            // every byte that changed its screen reached it. A caller shown the live screen alone
-            // is left out because it was asked when its scope was recorded, and no screen it is
-            // drawn can carry everything.
+            // screen the session holds now and the report says what it found. So is a terminal the
+            // session has told to begin again, whatever window it repeats: the screen it will be
+            // drawn is the session's as it is now, and what its table holds is about the last one.
+            // A terminal the hub is sending the application's bytes is left out whatever its
+            // stored window says: every byte that changed its screen reached it. A caller shown
+            // the live screen alone is left out because it was asked when its scope was recorded,
+            // and no screen it is drawn can carry everything.
             self.ask_restoration(attachment_id, dimensions);
             (presentation, presentation_reason) =
                 self.attachments
