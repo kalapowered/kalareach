@@ -4,9 +4,9 @@
 //! lost clock continuity, and records its action, all in one transaction that commits while the
 //! connection's registration is held standing. The owner's confirmation, the registration, the
 //! fence this host may owe and the deadline the request was admitted under can each change while
-//! it waits for the clock or for the directory's connection, so each of these tests stops the
-//! effect at one of those waits with a pause of this host's own, changes one thing, and lets it go
-//! on.
+//! it waits for the clock or for the directory's connection, so these tests stop the effect at one
+//! of those waits, or inside its commit, with a pause of this host's own, change one thing, and let
+//! it go on.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -183,8 +183,9 @@ async fn a_signer_revoked_while_the_establishment_waits_cannot_spend_its_answer(
 /// checked and before the commit, and a withdrawal started there does not complete until the
 /// effect has committed: it reads the clock as established when it does.
 ///
-/// That the withdrawal waits is decided by the lock a withdrawal takes, which is the one thing
-/// that says so without a delay: the registrations are held while the effect commits.
+/// That the withdrawal waits is decided by the lock a withdrawal takes: the registrations are held
+/// while the effect commits, which is the one thing that says so without a delay. The thread's own
+/// reading afterwards shows the order the lock gave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
     let (temp, controller, ..) = distrusting().await;
@@ -217,6 +218,10 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
     assert!(
         controller.admitted.try_lock().is_err(),
         "the registrations are held while the effect commits"
+    );
+    assert!(
+        !withdrawal.is_finished(),
+        "the withdrawal has not completed inside the commit"
     );
     go.send(()).expect("the effect commits");
 
@@ -292,10 +297,11 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
     assert_eq!(retried.confirmation_id, challenge.request.confirmation_id);
 }
 
-/// KR-REQ-09.19: two copies of one action meet at the record. While the first is committing, an
-/// exact copy and a request that reuses the identifier wait for the challenges; when the first has
-/// committed, the copy is given its result without spending the second answered confirmation, and
-/// the reuse is refused without spending it either.
+/// KR-REQ-09.19: two copies of one action meet at the record. While the first holds the challenges
+/// and has not yet begun its transaction, an exact copy and a request that reuses the identifier
+/// wait for the challenges; when the first has committed, the copy is given its result without
+/// spending the second answered confirmation, and the reuse is refused without spending it either.
+/// A lookup made before the challenges would find no record and spend the second confirmation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_copies_of_one_action_establish_the_clock_once() {
     let (temp, controller, ..) = distrusting().await;
@@ -335,16 +341,18 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
         })
     };
 
-    let (arrived, go) = owner.pauses.inside_the_commit.arm();
+    let (arrived, go) = owner.pauses.before_the_transaction.arm();
     let committing = establish(30_000);
-    arrived.await.expect("the first copy reached its commit");
+    arrived
+        .await
+        .expect("the first copy chose its confirmation and holds the challenges");
     let copy = establish(30_000);
     let reuse = establish(30_001);
-    // Both are on their way to the challenges the first one holds before it is let go.
+    // Both are about to wait for the challenges the first one holds before it is let go.
     while owner.pauses.entered.load(Ordering::SeqCst) < 3 {
         tokio::task::yield_now().await;
     }
-    go.send(()).expect("the first copy commits");
+    go.send(()).expect("the first copy goes on");
 
     let result: HostClockEstablishResult = committing
         .await

@@ -392,8 +392,17 @@ async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the
         "a grant that expires is decided all the same"
     );
     assert!(
+        !controller
+            .lifetimes()
+            .clock_trust()
+            .watch(controller.devices(), true)
+            .expect("the host watches its clock")
+            .proven,
+        "quiet hours are not enforced on a clock the host holds, whatever the platform says"
+    );
+    assert!(
         !controller.attention().quiet_hours_provable(),
-        "quiet hours are not enforced on a clock the host holds"
+        "and attention reads the same"
     );
     assert!(
         collections.forgot_nothing().await,

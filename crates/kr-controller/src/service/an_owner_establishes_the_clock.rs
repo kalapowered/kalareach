@@ -365,13 +365,13 @@ pub(super) fn expiring_device(
     )
 }
 
-/// Whether this host decides an expiring device's grant now: its end is measured on a clock the
-/// host proves.
+/// Whether an expiring device's grant is in force now, as the host decides it everywhere it asks:
+/// its end is measured on a clock the host proves, and has not come.
 pub(super) fn decides(
     controller: &Controller,
     device: &crate::service::net::devices::DeviceRecord,
 ) -> bool {
-    controller.lifetimes().paired(device).is_ok()
+    controller.lifetimes().in_force(device).unwrap_or(false)
 }
 
 /// KR-REQ-09.19, KR-REQ-10.53: a confirmation of the clock is spent by the effect that names it and
@@ -492,14 +492,14 @@ pub(super) fn registry(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection
     registry
 }
 
-/// KR-REQ-09.18, KR-REQ-09.19: an establishment is all or nothing, and a refusal leaves the owner's
-/// confirmation to try again. The record of the clock refuses the write that establishes it: the
-/// host still distrusts its clock and the confirmation stays answered, and once the record takes
-/// the write the same confirmation establishes the clock. A restart after the refusal still finds
-/// the distrust on the record, and needs a new confirmation, since a challenge ends with its
-/// daemon.
+/// KR-REQ-09.18, KR-REQ-09.19: an establishment is all or nothing, and the record outlives the
+/// daemon. The record of the clock refuses the write that establishes it: the host still distrusts
+/// its clock, nothing is written, and the confirmation stays answered, which a second attempt shows
+/// by being refused by the record again and not for want of a confirmation. A restart after the
+/// refusal still finds the distrust on the record, and needs a new confirmation, since a challenge
+/// ends with its daemon; once the record takes the write, that one establishes the clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_tries_again() {
+async fn a_refused_write_of_the_clock_changes_nothing_and_a_restart_finds_the_distrust() {
     let (temp, controller, _continuous, _wall, clocks) = distrusting().await;
     let door = Door::open(&temp, &controller).await;
     let challenge = door.challenge().await;
@@ -520,6 +520,11 @@ async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_
     );
     assert!(!proven(&controller), "the host still distrusts its clock");
     assert_eq!(confirmed_at(&temp), None, "nothing was written");
+    assert_eq!(
+        code(door.establish().await),
+        ErrorCode::StorageUnavailable,
+        "the confirmation is still answered: the record refuses again"
+    );
 
     // A restart after the refusal: the distrust is on the record, and the challenge is gone.
     drop(door);
@@ -545,9 +550,11 @@ async fn a_refused_write_of_the_clock_changes_nothing_and_the_same_confirmation_
 
 /// KR-REQ-09.17, KR-REQ-09.19: a host whose clock continuity is lost, and which distrusts nothing
 /// else, is not freed by an establishment that failed. The record refuses the write that ends the
-/// continuity: the error is the answer and the host is as unproven as before, and the same
-/// confirmation ends it once the record takes the write. A start that found the floor gone leaves
-/// the boot's continuity lost, which is set here as it leaves it.
+/// continuity: the error is the answer and the host is as unproven as before, and the confirmation
+/// stays answered, which a second attempt shows by being refused by the record again. A restart
+/// finds the continuity still lost on the record, and needs a new confirmation, which ends it once
+/// the record takes the write; a restart after that finds it ended. A start that found the floor
+/// gone leaves the boot's continuity lost, which is set here as it leaves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -586,6 +593,11 @@ async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
         "and the host is as unproven as before"
     );
     assert_eq!(confirmed_at(&temp), None, "the owner confirmed nothing");
+    assert_eq!(
+        code(door.establish().await),
+        ErrorCode::StorageUnavailable,
+        "the confirmation is still answered: the record refuses again"
+    );
 
     // A restart after the refusal finds the continuity still lost on the record.
     drop(door);
@@ -604,7 +616,7 @@ async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
         .expect("the record takes the write");
     door.establish()
         .await
-        .expect("the same confirmation ends the lost continuity");
+        .expect("the new confirmation ends the lost continuity");
     assert!(!controller.utc_floor().continuity_lost());
     assert!(proven(&controller));
 
@@ -725,17 +737,23 @@ async fn an_expiring_grant_is_decided_again_once_the_owner_establishes_the_clock
     let tomorrow = wall.load(Ordering::SeqCst) + 86_400_000;
     let device = expiring_device(&controller, tomorrow);
 
-    let refused = controller
-        .lifetimes()
-        .paired(&device)
-        .err()
-        .expect("a grant whose end cannot be measured is not decided");
+    let refused = match controller.lifetimes().paired(&device) {
+        Err(error) => error,
+        Ok(_) => panic!("a grant whose end cannot be measured is not decided"),
+    };
     assert_eq!(
         refused.to_protocol_error().code,
         ErrorCode::ClockUntrusted,
         "{refused}"
     );
+    assert!(
+        !decides(&controller, &device),
+        "the grant is not in force while the clock is in doubt"
+    );
 
     the_owner_establishes(&temp, &controller).await;
-    assert!(decides(&controller, &device));
+    assert!(
+        decides(&controller, &device),
+        "the grant is in force again once the owner has established the clock"
+    );
 }
