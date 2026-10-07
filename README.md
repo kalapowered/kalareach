@@ -97,8 +97,10 @@ file, read as text, that names a relative path the tree does not have or that it
 lists below.
 
 Setup prepares the target, the JavaScript dependencies, the test components the plugin runtime's
-tests load, and the managed shell packages with the PSReadLine qualification. `--no-upstream-tests`
-leaves out the shells' own test suites, which continuous integration runs for Bash and Zsh.
+tests load, and the managed shell packages with the PSReadLine qualification. The packages build
+from upstream archives that `scripts/place-shell-sources.sh` puts in place first, from the URL each
+manifest names or from a listed mirror. `--no-upstream-tests` leaves out the shells' own test
+suites, which continuous integration runs for Bash and Zsh.
 
 <!-- clean-checkout: setup -->
 
@@ -106,6 +108,7 @@ leaves out the shells' own test suites, which continuous integration runs for Ba
 rustup target add wasm32-wasip2
 pnpm install --frozen-lockfile
 bash scripts/build-plugin-fixtures.sh
+bash scripts/place-shell-sources.sh --zsh --bash --fish
 bash scripts/build-shells.sh --zsh --bash --fish --no-upstream-tests
 pwsh -NoProfile -Command 'Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1; Publish-KalaReachQualification | Out-Null'
 ```

@@ -193,10 +193,19 @@ for entry in document.get("sessions", []):
 trap cleanup EXIT
 
 echo "1. the packages, from their pinned upstream releases and patch sets"
+# The upstream archives are placed first: each comes from the URL its manifest names or, when that
+# server does not answer, from a listed mirror, and the builder still checks it against the digest
+# the manifest pins. Every build below reads the same prefix, so each finds its archive in place and
+# fetches nothing.
+if ! bash scripts/place-shell-sources.sh --all > "$run_root/build.log" 2>&1; then
+  tail -20 "$run_root/build.log"
+  fail "the upstream archives could not be placed"
+  exit 1
+fi
 # The identity is a digest of the inputs, so a package that is already installed from these inputs
 # reports that nothing changed, and one that is not is built here. Either way what the corpus then
 # drives is a package this run stood behind.
-if ! bash scripts/build-shells.sh --all --no-upstream-tests > "$run_root/build.log" 2>&1; then
+if ! bash scripts/build-shells.sh --all --no-upstream-tests >> "$run_root/build.log" 2>&1; then
   tail -40 "$run_root/build.log"
   fail "the packages could not be built"
   exit 1

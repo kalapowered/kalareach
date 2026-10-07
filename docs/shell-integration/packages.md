@@ -378,11 +378,16 @@ alone. Bash does it in the block itself, which is why the block belongs at the e
 
 ## The identity, and rebuilding it
 
+`scripts/place-shell-sources.sh` puts each pinned archive where the build looks for it, from the
+manifest's URL or, when that server does not answer, a listed mirror. The build fetches only what is
+not there, and always verifies the digest.
+
 `scripts/build-shells.sh` fetches the pinned tarball, verifies its digest, applies the patches with
 no fuzz at all, copies the bridge sources in, configures, compiles, runs the shell's own test suite
 and installs the result:
 
 ```bash
+scripts/place-shell-sources.sh --all     # the pinned archives, first
 scripts/build-shells.sh --all            # every package it builds
 scripts/build-shells.sh --fish           # one
 scripts/build-shells.sh --all --check-patches          # apply the patches and stop
