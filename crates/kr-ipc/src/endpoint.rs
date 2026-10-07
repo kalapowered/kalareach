@@ -765,8 +765,10 @@ mod platform {
     /// waited for that waited for ever.
     ///
     /// The library is told there is nothing to flush, so a close never reaches that thread. The
-    /// operating system keeps what was written for the caller to read after the close, a write
-    /// still going out included, and the caller then sees the connection end.
+    /// operating system keeps what was written for the caller to read after the close, and the
+    /// caller then sees the connection end. A write that is still going out is kept by this
+    /// process, which holds its handle and buffer until the write completes: a caller that never
+    /// reads keeps one pipe instance and that last write until it reads or closes its end.
     impl Drop for Accepted {
         fn drop(&mut self) {
             let PipeServer::NamedPipe(pipe) = &self.stream;

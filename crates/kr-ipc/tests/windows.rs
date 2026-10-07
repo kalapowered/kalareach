@@ -582,8 +582,8 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
     );
     assert!(rest.is_empty(), "nothing more was sent: {rest:?}");
 
-    // Closing did not lose what the first caller was sent: its connection waited for it to read,
-    // and it reads every byte, late as it is.
+    // Closing did not lose what the first caller was sent: the pipe keeps it for the caller, who
+    // reads every byte, late as it is.
     let mut late = [0_u8; 10];
     (&silent)
         .read_exact(&mut late)
@@ -628,16 +628,20 @@ async fn a_connection_closed_with_a_large_write_unread_delivers_all_of_it_to_a_l
         .expect("the caller is sent the bytes");
     drop(connection);
 
-    let reading = tokio::task::spawn_blocking(move || {
+    // The caller reads on a thread of its own and reports back, so that a close that never lets
+    // it see the end fails this case at the bound and does not hold the test binary open for ever:
+    // a runtime waits for a blocking task it has spawned, and does not wait for a thread it has not.
+    let (report, hear) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut caller = caller;
         let mut received = Vec::new();
         let ended = caller.read_to_end(&mut received);
-        (received, ended)
+        let _ = report.send((received, ended));
     });
-    let (received, ended) = tokio::time::timeout(PATIENCE, reading)
+    let (received, ended) = tokio::task::spawn_blocking(move || hear.recv_timeout(PATIENCE))
         .await
-        .expect("the caller saw the connection end after the bytes")
-        .expect("the reader ran");
+        .expect("the wait for the caller ran")
+        .expect("the caller saw the connection end after the bytes");
     // The end is a clean one, or the platform says no process is at the other end: either way the
     // bytes come first.
     assert_eq!(
