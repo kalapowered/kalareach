@@ -3818,26 +3818,27 @@ A wall-clock rollback beyond five seconds marks wall-clock trust unresolved. Tha
 expiry-based collection and refuses objects whose expiry cannot otherwise be proved. It does **not**
 disable a non-expiring personal owner grant, or a fresh online action bounded by this boot's
 continuous clock: neither depends on the wall clock. A forward step expires conservatively, and a
-rollback beyond the rate allowance below never enlarges a lifetime. A previously expired object
+rollback enlarges a lifetime by no more than the rate allowance below. A previously expired object
 never revives, because its expiration tombstone answers whatever the clock later reads.
 
 The rollback is measured against the furthest point this host could ever *prove* the clock had
 reached, projected forward by the continuous time since, less 100 parts per million. A continuous
-clock that its time service does not correct is therefore not read as a rollback. Two records
-project this way: the workers' contract above, and the daemon's own record of the wall clock, which
-the workers do not share and which projects its anchor the same way. Measuring against the previous
-reading alone would forgive a little slippage, then forgive the next against the moved mark, and
-enough of those would give a deadline back indefinitely.
+clock that its time service does not correct, up to that much fast, is therefore not read as a
+rollback. Two records project this way: the workers' contract above, and the daemon's own record of
+the wall clock, which the workers do not share and which projects its anchor the same way. Measuring
+against the previous reading alone would forgive a little slippage, then forgive the next against
+the moved mark, and enough of those would give a deadline back indefinitely.
 
 The rate has a price, and it is the same for both records. A wall clock that lags the continuous
 clock by no more than 100 parts per million is never read as a rollback, however long that lasts, so
-it can lose 6 ms for each minute, about a minute a week, without being seen. A single step back is
-seen once it exceeds five seconds plus that rate times the time since the mark or anchor was last
-raised. The same proven reading is what a UTC deadline is compared against, with the platform's own
-uncertainty bound added to it, so a UTC deadline can be decided that much late. Past that slack, an
-object expires when it cannot still be valid rather than when a forgiving clock says so.
+it can lose 6 ms for each minute, about a minute a week, without being seen, and a UTC deadline can
+be decided that much late. A single step back is seen once it exceeds five seconds plus that rate
+times the time since the mark or anchor was last raised. The workers' contract compares a UTC
+deadline against this proven reading with the platform's own uncertainty bound added to it, so an
+object expires as soon as the reading, at its worst, reaches the deadline. The daemon decides a
+grant's expiry from the same projected reading, through the host's clock floor, without that bound.
 
-The owner can end this with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move the mark and anchor to the time the effect runs, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
+The owner can end the daemon's distrust with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move its mark and anchor to the time the effect runs, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
@@ -3923,8 +3924,8 @@ never more: a reminder that comes late is still a reminder, and one raised secon
 because somebody corrected a clock is an interruption nobody earned. The wall clock keeps the two
 jobs it can do: deciding quiet hours, and saying when something happened for a person reading the
 record. The store keeps no clock record of its own: it reads the wall clock through the host's one
-record of it, so a rollback found anywhere in the host is found here, and one owner retrust clears
-it everywhere.
+record of it, so a rollback the daemon finds is found here, and the owner's establishment of the
+clock ends it here.
 
 ### A session that ends
 

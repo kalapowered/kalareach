@@ -865,7 +865,8 @@ impl TimeContract {
     /// Returns the earliest the wall clock can honestly read now.
     ///
     /// Expiry against a UTC deadline uses this rather than the clock itself, so a reading the
-    /// tolerance forgave cannot give a deadline back the time it appeared to lose.
+    /// tolerance forgave cannot give a deadline back the time it appeared to lose, beyond what the
+    /// rate allowance gives.
     fn proven_wall_ms(&self, state: &TimeState) -> u64 {
         let now = self.wall.now_ms().get();
         state.high_water.map_or(now, |mark| {

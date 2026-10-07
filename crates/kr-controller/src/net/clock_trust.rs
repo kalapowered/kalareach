@@ -366,7 +366,8 @@ impl ClockTrust {
             wall_ms,
             observed: ObservedUtc {
                 // The later of the mark and the anchor projected on the continuous clock: a step
-                // back the tolerance forgives gives no grant the time it appeared to lose.
+                // back the tolerance forgives gives no grant the time it appeared to lose, beyond
+                // what the rate allowance gives.
                 now: TimestampMs::new(latest.max(projected)),
                 behind_ms,
             },
@@ -1546,7 +1547,7 @@ mod tests {
     /// Fifty parts per million is about four seconds a day; read every hour for thirty days and an
     /// hour, the host never distrusts its clock, never withholds a forgetting and never withholds
     /// attention. The rate allowance is what keeps the difference from accumulating until it is
-    /// taken for a rollback, which an owner's retrust or a reboot alone would clear.
+    /// taken for a rollback, which only the owner's retrust would clear.
     #[test]
     fn a_continuous_clock_that_runs_fast_raises_no_distrust_in_thirty_days() {
         let devices = DeviceDirectory::in_memory().expect("a directory");
