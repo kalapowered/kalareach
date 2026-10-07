@@ -88,7 +88,7 @@ settle() {
   while :; do
     read -r load _ <<<"$(load_average)"
     if [[ "$load" =~ $number ]] &&
-      awk -v load="$load" -v bound="$settle_load" 'BEGIN { exit !(load + 0 < bound + 0) }'; then
+      awk -v one_minute="$load" -v bound="$settle_load" 'BEGIN { exit !(one_minute + 0 < bound + 0) }'; then
       echo "  settled: the one-minute load was $load, under the $settle_load asked for, after $waits waits of ten seconds"
       return 0
     fi
