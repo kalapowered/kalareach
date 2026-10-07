@@ -311,14 +311,32 @@ impl Destination {
         Ok(self.reach()?.occupied(name)?)
     }
 
-    /// Opens the directory at the destination's name.
+    /// Opens the directory at the destination's name and requires it to be `made`, the directory
+    /// this operation made there and still holds open.
+    ///
+    /// Both handles were opened in this run, so a directory that is not the one `made` names is
+    /// another object, and nothing is written into it. The object `made` is on cannot give its
+    /// number to another while that handle is open.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when no directory is there, or the location's
-    /// refusal.
-    pub fn opened(&self) -> Result<AuthorisedDirectory> {
-        Ok(self.reach()?.subdirectory(&self.name)?)
+    /// Returns [`ProjectError::Destination`] when no directory is there, [`ProjectError::IdentityChanged`]
+    /// when the directory at the name is not the one that was made, or the location's refusal.
+    pub fn opened_as(&self, made: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
+        let found = self.reach()?.subdirectory(&self.name)?;
+        if found.identity() != made.identity() {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this operation made the directory {} and {} now holds {}; nothing is written \
+                     into it",
+                    made.identity(),
+                    crate::git::redact(&self.path().display().to_string()),
+                    found.identity()
+                )
+                .into(),
+            });
+        }
+        Ok(found)
     }
 }
 
@@ -730,12 +748,17 @@ fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
     })
 }
 
-/// Publishes the staged repository into the destination, replacing nothing.
+/// Publishes the staged repository into the destination, replacing nothing, and returns the
+/// published directory as the handle that was checked to be the staged object.
 ///
 /// The object published is required to be the one the caller recorded, so a replacement between
 /// the recording and the publication is refused rather than published under the same action. The
 /// publication is one effect through the destination's location, asked for once, immediately
 /// before it starts: the witness, the rename and the check of what the name then holds.
+///
+/// A caller that goes on to write into the published tree writes through the returned handle, or
+/// opens the destination again with [`Destination::opened_as`], and so never into whatever has
+/// since taken the name.
 ///
 /// # Errors
 ///
@@ -746,7 +769,7 @@ pub fn publish(
     staging: &StagingSibling,
     destination: &Destination,
     expected: StagedWitness,
-) -> Result<ObjectIdentity> {
+) -> Result<AuthorisedDirectory> {
     let parent = destination.reach()?;
     // The staged object is the recorded one, looked at before the rename, and on Windows before
     // every attempt at it: there the rename waits while another program holds a file inside the
@@ -790,7 +813,7 @@ pub fn publish(
             .into(),
         });
     }
-    Ok(published.identity())
+    Ok(published)
 }
 
 /// Renames one directory into another's single name, refusing to replace anything, once
@@ -1330,7 +1353,7 @@ mod tests {
             .expect("the staged repository is read");
 
         let published = publish(&sibling, &destination, witness).expect("the tree is published");
-        assert_eq!(published, witness.identity.object);
+        assert_eq!(published.identity(), witness.identity.object);
         assert_eq!(
             std::fs::read(destination.path().join("objects/pack")).expect("the published file"),
             b"staged\n"

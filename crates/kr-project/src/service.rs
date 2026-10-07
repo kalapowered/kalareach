@@ -39,7 +39,9 @@ use kr_protocol::project::{
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
 };
 use kr_protocol::scalars::{Nullable, U64, Uuid};
-use kr_transfer::{Clock, RecordedIdentity, RelativeName, Settled, SystemClock};
+use kr_transfer::{
+    AuthorisedDirectory, Clock, RecordedIdentity, RelativeName, Settled, SystemClock,
+};
 
 use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
@@ -167,8 +169,8 @@ pub struct ProjectService {
     /// location.
     #[cfg(feature = "git-fixtures")]
     reconciling: Option<Hook>,
-    /// What a test runs when a destination holds a published repository and nothing of it has
-    /// been read yet.
+    /// What a test runs when a destination holds a tree this service made and nothing of it has
+    /// been read or written yet.
     #[cfg(feature = "git-fixtures")]
     publication: Option<Hook>,
 }
@@ -252,9 +254,10 @@ impl ProjectService {
         self.reconciling = Some(Hook(act));
     }
 
-    /// Runs something at the moment a destination holds a repository this service published and
-    /// nothing of it has been read: after the rename that publishes it, and again when an
-    /// interrupted publication is finished, in each case before the destination is opened.
+    /// Runs something at the moment a destination holds a tree this service made and nothing of
+    /// it has been read or written: after the rename that publishes a repository, when an
+    /// interrupted publication is finished, and after a workspace's tree was made and before the
+    /// work is copied into it, in each case before the destination is opened.
     ///
     /// Compiled with the fixtures, so that a test can act in a window where no Git child runs for
     /// an interposition to act beside. Nothing in the service sets it.
@@ -2717,7 +2720,9 @@ impl ProjectService {
                     )
                 })?;
                 let cancel = Arc::new(Cancellation::default());
-                match row.isolation {
+                // The directory this host made the tree in, held open: the object the work is
+                // copied into and the one the record is made of, whatever takes its name later.
+                let made = match row.isolation {
                     Some(IsolationMechanism::GitWorktree) => {
                         // A worktree records its own path inside the repository's administrative
                         // state, so it is created at the path it will keep rather than staged and
@@ -2758,6 +2763,7 @@ impl ProjectService {
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),
                         )?;
+                        reserved
                     }
                     Some(IsolationMechanism::IndependentClone) | None => {
                         // The name goes on to the row before the directory exists, so recovery
@@ -2773,7 +2779,7 @@ impl ProjectService {
                         )?;
                         repository.recheck(&self.profile)?;
                         let staging = StagingSibling::create(destination, &name)?;
-                        let materialised = (|| -> Result<()> {
+                        let materialised = (|| -> Result<AuthorisedDirectory> {
                             // The sibling's own identity goes on to the row as soon as the
                             // directory exists. A recorded name is not authority to remove
                             // whatever holds it later: the cleanup removes this object or nothing.
@@ -2844,25 +2850,39 @@ impl ProjectService {
                                     ..WorkspaceUpdate::default()
                                 },
                             )?;
-                            publish(&staging, destination, staged)?;
-                            Ok(())
+                            publish(&staging, destination, staged)
                         })();
-                        if let Err(error) = materialised {
-                            // A creation that failed before its tree was published, or while it was
-                            // being published, leaves the sibling holding only what this creation
-                            // put there. It goes at once, through the handle this creation has held
-                            // since it made it, because recovery reaches no directory.
-                            self.clean_up_workspace_staging(row.workspace_id, destination, staging);
-                            return Err(error);
-                        }
+                        let published = match materialised {
+                            Ok(published) => published,
+                            Err(error) => {
+                                // A creation that failed before its tree was published, or while
+                                // it was being published, leaves the sibling holding only what
+                                // this creation put there. It goes at once, through the handle
+                                // this creation has held since it made it, because recovery
+                                // reaches no directory.
+                                self.clean_up_workspace_staging(
+                                    row.workspace_id,
+                                    destination,
+                                    staging,
+                                );
+                                return Err(error);
+                            }
+                        };
                         // Removing the sibling is cleanup, and a failure here does not undo a
                         // publication that landed: the name stays on the row with the reason.
                         // What is removed is the object whose identity the row holds.
                         self.clean_up_workspace_staging(row.workspace_id, destination, staging);
+                        published
                     }
+                };
+                #[cfg(feature = "git-fixtures")]
+                if let Some(hook) = &self.publication {
+                    (hook.0)();
                 }
-                // The new tree, opened through the destination once its location admits it.
-                let tree = destination.opened()?;
+                // The new tree, opened through the destination once its location admits it, and
+                // required to be the object this host made: a directory that took the name since
+                // gets none of the work and is never recorded as the workspace.
+                let tree = destination.opened_as(&made)?;
                 // The inclusion is a copy out of the source tree. The source is only read: an
                 // exclusion means this workspace holds the base's version of the path rather than
                 // the user's, and never that the original is cleaned, stashed or discarded.
@@ -3522,7 +3542,7 @@ impl ProjectService {
                 (parent, leaf)
             }
             None => (
-                kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?,
+                AuthorisedDirectory::open_root(self.environment_id, parent)?,
                 RelativeName::parse(name)?,
             ),
         };

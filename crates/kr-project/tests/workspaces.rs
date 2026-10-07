@@ -1507,6 +1507,94 @@ fn an_independent_clone_recorded_without_its_git_directory_is_held_to_the_one_it
     );
 }
 
+/// Creates a workspace that includes everything, in a destination that another directory takes the
+/// place of once the tree is made and before anything is copied into it. The creation is refused,
+/// nothing is copied into the directory that took the place, and the workspace's record never
+/// names it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn made_into_a_replaced_destination(isolation: IsolationMechanism, name: &str, seed: u8) {
+    let mut fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, &format!("{name}-source"));
+    let tree = fixture.work().join(name);
+    let made = fixture.work().join(format!("{name}-made"));
+    let replaced = tree.clone();
+    fixture.after_publication(std::sync::Arc::new(move || {
+        std::fs::rename(&replaced, &made).expect("the tree this host made moves away");
+        std::fs::create_dir(&replaced).expect("another directory takes its place");
+        std::fs::write(replaced.join("theirs.txt"), "not this workspace's\n")
+            .expect("a file in it");
+    }));
+
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: name.to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(isolation)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    name,
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", seed)),
+        )
+        .expect_err("a destination that is not the tree this host made gets no work");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert_eq!(
+        support::names_in(&tree),
+        vec!["theirs.txt".to_owned()],
+        "nothing of the user's uncommitted work was copied into the directory that took the place"
+    );
+    let listed = fixture
+        .service()
+        .workspace_list(&WorkspaceListParams {
+            environment_id: fixture.environment_id(),
+            project_repository_id: Nullable(Some(project)),
+        })
+        .expect("the workspaces list")
+        .workspaces;
+    let [workspace] = listed.as_slice() else {
+        panic!("the refused creation left one workspace row: {listed:?}");
+    };
+    assert_eq!(workspace.state, WorkspaceState::RemovalPending);
+    let (device, inode) = numbers_of(&tree);
+    if let Nullable(Some(recorded)) = workspace.filesystem_identity {
+        assert_ne!(
+            (recorded.device.get(), recorded.file_id.get()),
+            (
+                u64::try_from(device).expect("a device number"),
+                u64::try_from(inode).expect("an inode")
+            ),
+            "the record does not name the directory that took the place"
+        );
+    }
+}
+
+/// A repository made inside its destination and published is the tree the work is copied into: a
+/// directory that takes the destination's place after the publication is not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_destination_replaced_after_an_independent_clone_was_published_gets_no_work() {
+    made_into_a_replaced_destination(IsolationMechanism::IndependentClone, "replaced-clone", 130);
+}
+
+/// A linked worktree is made in the directory this host reserved for it, and that directory is the
+/// tree the work is copied into: a directory that takes the destination's place after the worktree
+/// was added is not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_destination_replaced_after_a_worktree_was_added_gets_no_work() {
+    made_into_a_replaced_destination(IsolationMechanism::GitWorktree, "replaced-worktree", 131);
+}
+
 /// A workspace tree on another filesystem that gives the directory at its path the numbers the
 /// recorded one had is not read as the workspace, and no Git invocation starts in it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
