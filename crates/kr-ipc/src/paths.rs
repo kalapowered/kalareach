@@ -764,7 +764,8 @@ mod windows {
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+        FILE_OPEN_REPARSE_POINT, FILE_PIPE_CLOSING_STATE, FILE_PIPE_LOCAL_INFORMATION,
+        FILE_SYNCHRONOUS_IO_NONALERT, FilePipeLocalInformation, NtOpenFile, NtQueryInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL,
@@ -895,6 +896,32 @@ mod windows {
         // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
         let code = unsafe { RtlNtStatusToDosError(status) };
         Err(std::io::Error::from_raw_os_error(code.cast_signed()))
+    }
+
+    /// Whether what was written to one end of a pipe is still waiting for the other end to read it.
+    ///
+    /// The pipe's outbound buffer holds what was written and not yet read, and the platform says
+    /// how much of its quota is free. A pipe whose other end has gone holds nothing to wait for, and
+    /// neither does one that cannot be asked.
+    pub(crate) fn pipe_output_is_unread(pipe: BorrowedHandle<'_>) -> bool {
+        // SAFETY: both structures are plain data the call fills, and zeroed is a valid value of
+        // each.
+        let mut information: FILE_PIPE_LOCAL_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is borrowed for the call, and the information buffer is the size the
+        // class `FilePipeLocalInformation` fills.
+        let status = unsafe {
+            NtQueryInformationFile(
+                pipe.as_raw_handle(),
+                &raw mut status_block,
+                (&raw mut information).cast(),
+                u32::try_from(std::mem::size_of::<FILE_PIPE_LOCAL_INFORMATION>()).unwrap_or(0),
+                FilePipeLocalInformation,
+            )
+        };
+        status == STATUS_SUCCESS
+            && information.NamedPipeState != FILE_PIPE_CLOSING_STATE
+            && information.WriteQuotaAvailable < information.OutboundQuota
     }
 
     /// The limit flags of the job this process runs in, or `None` when it runs in no job.
@@ -2330,6 +2357,8 @@ mod windows {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use self::windows::pipe_output_is_unread;
 #[cfg(windows)]
 pub use self::windows::{
     AccessListRefusal, FileAccess, check_access_list, current_job_limit_flags, open_child,
