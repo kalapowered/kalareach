@@ -1787,9 +1787,10 @@ returns to the live screen, and the others pass by themselves.
 
 An attachment kept off the stream by `restoration_incomplete` is handed it again when the session's
 output goes quiet on a screen a restoration can carry, for example once the line that wrapped has
-been cleared, or when its window changes and the screen it is then drawn can be carried. A client
-attached under a grant is shown the live screen alone, so it never has such a screen, because the
-rows of the other buffer are always left out, and its reason stays.
+been cleared, when the session's size changes to one that screen can be carried at, or when its own
+window changes and the screen it is then drawn can be carried. A client attached under a grant is
+shown the live screen alone, so it never has such a screen, because the rows of the other buffer are
+always left out: its attach says `restoration_incomplete`, and the reason stays.
 
 A closed session carries its record instead of a null: whose it is, how it closed, the owned
 processes the closure terminated and anything that survived it.

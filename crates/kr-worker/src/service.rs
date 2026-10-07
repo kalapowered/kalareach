@@ -6303,7 +6303,7 @@ impl WorkerService {
                 // narrowed by. Every other caller is drawn the live screen alone: section 10's
                 // live-screen exception never reaches the buffer that is not showing, and this
                 // build serves a grant no retained content beyond it.
-                let result = session.attach(&params, granted, attachment_id)?;
+                let mut result = session.attach(&params, granted, attachment_id)?;
                 if !owner {
                     // The one filter decides how much of the screen a caller is drawn. A grant's
                     // scope here is section 10's live-screen exception, and asking the filter
@@ -6312,6 +6312,15 @@ impl WorkerService {
                         crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
                     );
                     session.narrow_content(attachment_id, filter.screen_scope());
+                    // The attach answered before the scope was known, and the scope decides how
+                    // the attachment is served, so what it says about that is read again.
+                    if let Some(narrowed) = session
+                        .attachments()
+                        .into_iter()
+                        .find(|summary| summary.attachment_id == attachment_id)
+                    {
+                        result.attachment = narrowed;
+                    }
                     // And what the attachment was admitted to do ends with the authority behind
                     // it: a revision or the grant's own expiry takes its input lease away.
                     session.note_granted_attachment(attachment_id);
