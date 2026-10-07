@@ -2350,10 +2350,10 @@ impl TransferService {
     /// journal, which are the sessions of earlier builds, and notes nothing after.
     ///
     /// An attachment that none of those relations ties to a session, one held only by a draft that
-    /// names no session included, stays on the seven-day window of an unused attachment: the host
-    /// cannot tell which session a prompt it was not told of went to, and keeping every such
-    /// attachment while any noted session is retained would end that window for as long as a worker
-    /// of an earlier build runs.
+    /// names no session included, stays on the seven-day window of an unused attachment. The host
+    /// cannot tell which draft a prompt it was not told of sent, and keeping every attachment a
+    /// draft holds while any noted session is retained would end that window indefinitely, since
+    /// the registry keeps a record of every session it has listed.
     ///
     /// Remove this, with the journal's two tables and the sweep's reading of them, once no worker of
     /// a build before the one that serves draft prompts only to the daemon can still be running and
