@@ -634,8 +634,8 @@ async fn collect_output_until(
 /// Collects the output batches a client receives until `enough` is satisfied, and fails at once if
 /// the session tells it to begin again first.
 ///
-/// What a test waits for here is the stream going on reaching a terminal. A terminal that is told to
-/// begin again is sent nothing more until it subscribes, so a wait for the next output would run
+/// What a test waits for here is the stream going on reaching a terminal. A terminal that is told
+/// to begin again is sent nothing more until it subscribes, so a wait for the next output would run
 /// out its whole deadline before saying what went wrong.
 async fn collect_output_unless_told(
     client: &mut LocalClient,
