@@ -109,7 +109,9 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          sets and the shift in, in both. They differ in a wrap pending at the reset, in the faint, \
          crossed-out and doubly underlined states of the rendition, which xterm's reset leaves \
          set, and in a cursor saved in the other buffer before the reset and not saved again \
-         since, which xterm gives back there.",
+         since, which xterm gives back there. A wrap pending at the reset needs no rule of its \
+         own: every soft reset redraws each direct attachment from the canonical screen, and an \
+         attachment redrawn with a wrap pending is shown a projection.",
     ],
     qualified_additions: &[
         QualifiedAddition {
