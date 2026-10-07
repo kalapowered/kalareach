@@ -2409,13 +2409,13 @@ impl TransferService {
     /// What an earlier worker was sent stays with its session for as long as the session does, and
     /// the registry keeps a record of every session it has listed, so the sessions noted here are
     /// not retained any less as time passes. The noting ends instead when no session noted here can
-    /// run a worker, which every one of them reaches: the host then calls
-    /// [`Self::settle_unseen_prompt_sessions`], which puts what each names under its retention and
-    /// forgets the sessions.
+    /// run a worker, which each of them reaches once its worker has ended and the host has
+    /// confirmed it: the host then calls [`Self::settle_unseen_prompt_sessions`], which puts what
+    /// each names under its retention and forgets the sessions.
     ///
     /// Remove this, the settling, the sweep's reading of the noted sessions and the journal's
-    /// unsettled schema version once no supported upgrade starts from a build before the one that
-    /// serves draft prompts only to the daemon.
+    /// unsettled schema version once no supported upgrade can start from a journal still at that
+    /// version, and have the build that removes them refuse such a journal.
     ///
     /// # Errors
     ///
@@ -2445,8 +2445,9 @@ impl TransferService {
     /// The host calls this once no noted session can run a worker, because only then is what a
     /// session names, as the relations read it, all there will be: a session that cannot take a
     /// prompt cannot be sent one. A session whose worker is still running, or may be, is kept noted.
-    /// An attachment that two noted sessions name and that belongs to neither goes to the first of
-    /// them by identifier, and follows that session's retention from then on.
+    /// An attachment that a noted session names and that belongs to none becomes that session's: it
+    /// follows that session's retention alone from then on, and can be bound to no draft for
+    /// another session. Where two noted sessions name it, it goes to the first by identifier.
     ///
     /// Both tables the noting kept in the journal go with it, and the journal moves to the schema
     /// version that holds nothing noted ([`Noting::Done`]), so no later start notes the sessions
