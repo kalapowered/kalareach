@@ -717,7 +717,14 @@ fn windows() -> Vec<Step> {
         ),
         qualified_only(
             "the configuration lock",
-            &["test", "--locked", "-p", "kr-controller", "--lib", "config::"],
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "config::",
+            ],
             "config::",
         ),
         qualified_only(
@@ -768,6 +775,30 @@ fn windows() -> Vec<Step> {
             ],
             "a_share_that_names_a_current_decision::",
         ),
+        qualified_only(
+            "a read that meets a worker on its way out",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "service::a_read_that_meets_a_worker_on_its_way_out::",
+            ],
+            "service::a_read_that_meets_a_worker_on_its_way_out::",
+        ),
+        qualified_only(
+            "the dispatch that replaces a daemon while a worker goes",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "service::net::dispatch::tests::",
+            ],
+            "service::net::dispatch::tests::",
+        ),
         Step::cargo(
             Group::Rust,
             "the daemon's attention, barrier, configuration and diagnostics",
@@ -785,11 +816,7 @@ fn windows() -> Vec<Step> {
                 "--test",
                 "network_host",
             ],
-        )
-        .skipping(&[(
-            "the_startup_exchange_binds_a_worker_to_its_own_reservation",
-            "after the daemon refuses a claim and lets go of the connection, one run in ten does not see the connection end on this platform and waits out the case's bound",
-        )]),
+        ),
         Step::cargo(
             Group::Rust,
             "the forwarder",
