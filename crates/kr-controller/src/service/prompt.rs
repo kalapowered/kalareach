@@ -32,9 +32,10 @@ use super::{Controller, parse};
 /// The longest this daemon holds its link to a worker for the answer to one prompt when the prompt
 /// brought no deadline of its own.
 ///
-/// An exact repeat of a prompt carries the window its first attempt was admitted under, which this
-/// connection does not hold, so it arrives with no deadline and is answered from the worker's
-/// receipt. A worker that has stopped answering is let go of rather than held for whoever asks next.
+/// An exact repeat of a prompt made on a replacement connection carries the window its first attempt
+/// was admitted under, which this connection does not hold, so it arrives with no deadline and is
+/// answered from the worker's receipt. A worker that has stopped answering is let go of rather than
+/// held for whoever asks next.
 const REPEAT_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Controller {
@@ -43,16 +44,18 @@ impl Controller {
     ///
     /// The caller's envelope is forwarded, not replaced: the action identifier is the durable
     /// identity of the caller's action, and a repeat that reaches the worker by this route or by
-    /// its own socket finds the same receipt. `accepted` is the deadline this daemon accepted for a
-    /// first admission, and none for an exact repeat, which the worker answers from its record and
-    /// which records nothing here: its first attempt did. A prompt that names a draft and still has
+    /// its own socket finds the same receipt. `accepted` is the deadline this daemon accepted, and
+    /// none for a prompt whose window this connection does not hold, as an exact repeat made on a
+    /// replacement connection carries: the worker answers that from its record and nothing is
+    /// recorded here, because its first attempt recorded. A prompt that names a draft and still has
     /// its window is told from a repeat by the worker's own receipt before anything is recorded.
     ///
     /// A worker the registry records and the directory does not hold is looked for again before the
     /// session is said to be unknown. A prompt for a session that closed is answered from the
     /// closure, whether it was recorded before the daemon looked for the worker or while the prompt
-    /// waited for the daemon's link to it. An exact repeat is first put to the worker with no
-    /// lifetime, and a receipt the worker holds is the answer whatever the registry has recorded.
+    /// waited for the daemon's link to it. When the closure is recorded during that wait, the prompt
+    /// is put to the worker with no lifetime: a receipt or another refusal from the worker is the
+    /// answer, and the closure is the answer when the worker holds no receipt or does not answer.
     ///
     /// # Errors
     ///
@@ -145,8 +148,9 @@ impl Controller {
         let actor = local_actor(actor_id.clone(), connection_id, self.generation);
         // The admission is asked once the link is held, because holding it is where the wait was.
         // A deadline that ran out while this prompt queued is refused, and nothing is recorded or
-        // sent for it. An exact repeat carries no deadline and goes on to the worker, which is
-        // the only thing that knows whether it holds this action's receipt.
+        // sent for it. A prompt that carries no deadline, as an exact repeat from a replacement
+        // connection does, goes on to the worker, which is the only thing that knows whether it
+        // holds this action's receipt.
         //
         // Whether the session's closure is recorded is read under the same lock, which a closure is
         // recorded under, so that a closure that landed while the prompt queued is told from one
@@ -172,9 +176,10 @@ impl Controller {
             // sent for a session that is gone, but what a duplicate is owed is the receipt of its
             // first attempt, which only the worker holds, and it answers from one even as its
             // session ends. So the worker is asked with no lifetime, which cannot admit anything,
-            // and what it answers from a receipt is the answer. The refusal of a first admission
-            // that has no lifetime says it holds none, and the closure is the answer then. An
-            // exchange that fails or runs out has said nothing, and the link is let go.
+            // and any answer but the refusal of a first admission that has no lifetime is the
+            // answer: a receipt is what a duplicate is owed. That refusal says the worker holds
+            // none, and the closure is the answer then. An exchange that fails or runs out has said
+            // nothing, and the link is let go.
             let asked = tokio::time::timeout_at(
                 budget,
                 link.client()
