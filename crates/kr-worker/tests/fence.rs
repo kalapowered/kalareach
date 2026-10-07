@@ -5328,6 +5328,10 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
 /// let go of input that was. Those bytes are the application's from that moment: they reach it on
 /// the interrupt's own boundary rather than waiting for whatever happens next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console does not echo the typed line into the retained output, which this case waits to see"
+)]
 async fn an_interrupt_delivers_what_its_own_sweep_released() {
     let wired = unpumped().await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())

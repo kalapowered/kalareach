@@ -1217,6 +1217,10 @@ fn the_local_owner_is_the_local_ingress_holding_no_grant() {
 /// Section 10's live-screen exception is the most of the screen a grant is drawn, and the socket
 /// the daemon heard the caller on does not change what the caller holds, which is a grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_local_caller_under_a_grant_is_drawn_the_live_screen_alone() {
     let wired = wired(TWO_BUFFERS).await;
     common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;
@@ -1236,6 +1240,10 @@ async fn a_local_caller_under_a_grant_is_drawn_the_live_screen_alone() {
 /// KR-REQ-10.50: the local owner is drawn the whole screen on either socket, and a paired device
 /// the screen that is showing, as each always was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen() {
     let wired = wired(TWO_BUFFERS).await;
     common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;
@@ -1285,6 +1293,10 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
 /// this read; the worker holds every caller but the local owner to the same rule, whichever socket
 /// it came in on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
     let wired = wired(TWO_BUFFERS).await;
     common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;
@@ -1316,6 +1328,10 @@ async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
 /// KR-REQ-10.49: the local owner reads the session's retained output on either socket, as it
 /// always did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn the_local_owner_reads_the_retained_history_on_either_socket() {
     let wired = wired(TWO_BUFFERS).await;
     common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;

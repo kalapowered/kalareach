@@ -736,6 +736,10 @@ fn text_of(page: &ProjectionRowPage) -> Vec<String> {
 
 /// KR-REQ-08.78 and KR-REQ-08.83: a snapshot carries the whole of what a screen is, then its rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
     // A screen in a state of its own, so that what the snapshot carries is the session's answer
     // rather than the defaults agreeing with the defaults: a window title and one pushed onto the
@@ -1179,6 +1183,10 @@ async fn a_buffer_switch_sends_an_explicit_projection_reset() {
 
 /// KR-REQ-08.82: restoration emits rendering only, whatever the history contained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_projection_carries_no_side_effect_the_history_contained() {
     // A bell, a clipboard write, a desktop notification, a title change, a hyperlink and a query,
     // all before anybody attaches. Only two of those are state; the rest happened.
@@ -1246,6 +1254,10 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
 /// A client that was sent only the target would take two links an application kept apart for one,
 /// and a link that wraps for two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn links_to_one_target_with_different_identifiers_reach_a_client_as_different_links() {
     let target = "https://example.invalid/guide";
     let host = host(&format!(
@@ -1347,6 +1359,10 @@ fn link(uri: &str, params: &str) -> ProjectedHyperlink {
 
 /// KR-ACC-002: a hyperlink is still there, and still inert, after a reconnection and a resize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     let host = host(
         "printf '\\033]8;;https://example.invalid/guide\\033\\\\the guide\\033]8;;\\033\\\\\\r\\n'; read -r _",
@@ -2013,6 +2029,10 @@ async fn reported_as(
 /// was being served a moment before. Without that, the one case the rule exists for - the middle
 /// of a control sequence - reaches a terminal through the back door.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn subscribing_again_while_the_parser_is_mid_sequence_is_served_a_projection() {
     // Complete output first, so the attachment is forwarded the stream, and then a sequence that
     // stays open while this test subscribes again. Each step waits for a line this test types, so
@@ -2080,6 +2100,10 @@ async fn subscribing_again_while_the_parser_is_mid_sequence_is_served_a_projecti
 
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {
     // The application leaves the parser inside an incomplete control sequence and waits for a line
     // before it completes it. A terminal of the session's own size therefore cannot be handed the
@@ -2710,6 +2734,10 @@ async fn a_viewport_that_names_an_evicted_row_is_given_the_oldest_page_and_the_m
 /// KR-ACC-002 and section 8 line 495: the link ranges and the exact cells of a history page are
 /// the same after a reconnection, which is what activation and a copy selection each need.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
     let host = host_with(
         "printf '\\033]8;;https://example.invalid/deep\\033\\\\the deep link\\033]8;;\\033\\\\\\r\\n'; \
