@@ -1,14 +1,22 @@
 name: Restore the cargo cache
 description: >-
-  Restores the registry, the Git dependencies and the build output of the third-party crates that
-  the last run on the default branch saved for this job. The newest cache of the same toolchain is
-  taken when the dependencies have changed since, so only the crates that changed are built again.
-  The `cargo-cache-save` action, run last in the job, is what saves one.
+  Restores the registry and the build output of the third-party crates that a run on the default
+  branch saved for this entry. A run on another branch that finds no cache of exactly its
+  dependencies takes the newest one of the same settings, so that only the crates that changed
+  are built again; a run on the default branch builds from nothing instead, which is what keeps
+  a cache from growing. The `cargo-cache-save` action saves one.
 
 inputs:
   name:
-    description: The job's name in the cache's key. Jobs that build different things do not share a cache.
+    description: The entry's name in the key. Jobs that build different things do not share an entry.
     required: true
+  paths:
+    description: What the entry holds, one path on each line.
+    required: false
+    default: |
+      ~/.cargo/registry/index
+      ~/.cargo/registry/cache
+      target
 
 outputs:
   cache-hit:
@@ -21,20 +29,18 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Name the dependencies
-      id: dependencies
+    - name: Name the cache
+      id: key
       shell: bash
-      run: echo "digest=$(bash scripts/cargo-dependency-key.sh)" >> "$GITHUB_OUTPUT"
+      run: |
+        part="$(bash scripts/cargo-cache-key.sh)"
+        echo "part=$part" >> "$GITHUB_OUTPUT"
+        echo "settings=${part%%-*}" >> "$GITHUB_OUTPUT"
 
     - name: Restore
       id: restore
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
-        path: |
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-          target
-        key: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ steps.dependencies.outputs.digest }}
-        restore-keys: |
-          cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+        path: ${{ inputs.paths }}
+        key: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.part }}
+        restore-keys: ${{ github.ref != 'refs/heads/main' && format('cargo-v1-{0}-{1}-{2}-{3}-', inputs.name, runner.os, runner.arch, steps.key.outputs.settings) || '' }}

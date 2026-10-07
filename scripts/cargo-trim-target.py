@@ -122,7 +122,9 @@ def main():
             names[:] = []
     for profile in sorted(profiles):
         trim_profile(profile)
-    remove(os.path.join(target, "doc"))
+    documentation = os.path.join(target, "doc")
+    if os.path.exists(documentation):
+        remove(documentation)
 
 
 main()

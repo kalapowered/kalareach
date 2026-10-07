@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos, macos-demonstrations, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
 
@@ -107,7 +107,7 @@ jobs:
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: rust
+          name: linux
 
       - name: Build the test components
         run: bash scripts/build-plugin-fixtures.sh
@@ -421,7 +421,6 @@ jobs:
         run: df -h /
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
@@ -1012,12 +1011,10 @@ jobs:
           -p kr-voice -p kr-worker
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
-          targets: aarch64-pc-windows-msvc
 
   shell-packages:
     name: shell-packages
@@ -1041,10 +1038,9 @@ jobs:
           pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       - name: Restore the cargo cache
-        id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: shell-packages
+          name: linux
 
       # The upstream archives are pinned by digest in the manifests, so the cache that holds them
       # is named by those digests: a run that restores it fetches nothing, and a run that does not
@@ -1188,13 +1184,6 @@ jobs:
           cargo test --locked -p kr-shell-integration --test install_homes -- \
             --test-threads=1 --include-ignored
 
-      - name: Save the cargo cache
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/cargo-cache-save
-        with:
-          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
-          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
-
   typescript:
     name: typescript
     runs-on: ubuntu-24.04
@@ -1262,10 +1251,9 @@ jobs:
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
       - name: Restore the cargo cache
-        id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: companion
+          name: ${{ runner.os == 'Linux' && 'linux' || 'macos' }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1327,13 +1315,6 @@ jobs:
         run: |
           pnpm -C apps/companion build
           cargo build --locked -p companion-tauri --release --features custom-protocol
-
-      - name: Save the cargo cache
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/cargo-cache-save
-        with:
-          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
-          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
   # the performance measurements, on the platform whose service manager, process table, disk images
@@ -1461,7 +1442,19 @@ jobs:
         timeout-minutes: 10
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: ${{ matrix.name }}
+          name: macos
+
+      # The release profile's third-party output apart from the debug profile's, which the other leg
+      # saves: this leg is the one that builds in release, and an entry of its own keeps the debug
+      # profile's output from being saved twice.
+      - name: Restore the release build output
+        id: release-cache
+        if: ${{ matrix.part == 'demonstrations' }}
+        timeout-minutes: 10
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: macos-release
+          paths: target/release
 
       - name: Build the test components
         timeout-minutes: 10
@@ -1784,18 +1777,27 @@ jobs:
         run: df -h /System/Volumes/Data
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
+        if: ${{ success() && matrix.part == 'tests' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
+      - name: Save the release build output
+        if: ${{ success() && matrix.part == 'demonstrations' }}
+        timeout-minutes: 15
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.release-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.release-cache.outputs.cache-hit }}
+          paths: target/release
+
   # The idle measurement on a host that meets section 27's reference host: four processors and
-  # more than 8 GiB, the operating system and architecture recorded beside the figure. The macos
-  # job's runner is short of that host, so it records the idle processor figure and does not assert
-  # it; this job asserts it, with the memory bound, where nothing read falls short. Only the
-  # measurements run here: the tests are the macos job's.
+  # more than 8 GiB, the operating system and architecture recorded beside the figure. The
+  # macos-demonstrations job's runner is short of that host, so it records the idle processor
+  # figure and does not assert it; this job asserts it, with the memory bound, where nothing read
+  # falls short. Only the measurements run here: the tests are the macos job's.
   macos-reference:
     name: macos-reference
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
@@ -1873,7 +1875,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:

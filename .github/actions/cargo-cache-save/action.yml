@@ -3,7 +3,9 @@ description: >-
   Saves what `cargo-cache-restore` restores, from a run on the default branch that did not find a
   cache of exactly its dependencies. Every other run leaves the caches alone: the repository's
   caches hold ten gigabytes in all, and a cache saved from any other branch is used by that branch
-  alone and takes the room of one every branch uses. Run it last, with `if: ${{ !cancelled() }}`.
+  alone and takes the room of one every branch uses. Run it as the last step of the job, without a
+  condition of its own, so that a job that failed saves nothing: a build that stopped half way
+  would be saved under the key of a complete one and found there by every later run.
 
 inputs:
   primary-key:
@@ -12,40 +14,31 @@ inputs:
   cache-hit:
     description: The `cache-hit` that `cargo-cache-restore` returned.
     required: true
-  targets:
-    description: The targets the job built for besides its own, one triple on each line.
+  paths:
+    description: What the entry holds, one path on each line; what `cargo-cache-restore` was given.
     required: false
-    default: ""
+    default: |
+      ~/.cargo/registry/index
+      ~/.cargo/registry/cache
+      target
 
 runs:
   using: composite
   steps:
     - name: Take out this workspace's own build output
-      if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/task/T-CI-SPEED-1') && inputs.cache-hit != 'true'
+      if: github.ref == 'refs/heads/main' && inputs.cache-hit != 'true'
       shell: bash
-      env:
-        TARGETS: ${{ inputs.targets }}
       run: |
         # The third-party crates are what a later run reuses. This workspace's crates are built
         # again from the checkout whatever the cache holds, and their test programs are most of a
         # build directory's size.
-        cargo clean --locked --workspace
-        cargo clean --locked --workspace --release
-        cargo clean --locked --doc
-        while IFS= read -r triple; do
-          if [ -n "$triple" ]; then
-            cargo clean --locked --workspace --target "$triple"
-          fi
-        done <<< "$TARGETS"
-        du -sh ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target
+        if [ "$RUNNER_OS" = Windows ]; then python=python; else python=python3; fi
+        "$python" scripts/cargo-trim-target.py target
+        du -sh ~/.cargo/registry/index ~/.cargo/registry/cache target || true
 
     - name: Save
-      if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/task/T-CI-SPEED-1') && inputs.cache-hit != 'true'
+      if: github.ref == 'refs/heads/main' && inputs.cache-hit != 'true'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
-        path: |
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-          target
+        path: ${{ inputs.paths }}
         key: ${{ inputs.primary-key }}
