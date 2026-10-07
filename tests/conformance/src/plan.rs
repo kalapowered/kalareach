@@ -740,7 +740,7 @@ fn windows() -> Vec<Step> {
             "service::a_read_that_meets_a_worker_on_its_way_out::",
         ),
         qualified_only(
-            "the dispatch that replaces a daemon while a worker goes",
+            "the device dispatch",
             &[
                 "test",
                 "--locked",

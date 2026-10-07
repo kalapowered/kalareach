@@ -526,9 +526,10 @@ jobs:
 
       # The control daemon's own tests that this platform qualifies, one filter to a step: the
       # configuration lock, the bridge store's records, the host environment a session takes, the
-      # attention inbox's transport, the decision a device reads, and the cases that replace a
-      # daemon while a scripted worker goes (`service::a_read_that_meets_a_worker_on_its_way_out`
-      # and `service::net::dispatch::tests`).
+      # attention inbox's transport, the decision a device reads, a read that meets a worker on its
+      # way out (`service::a_read_that_meets_a_worker_on_its_way_out`), and the device dispatch
+      # (`service::net::dispatch::tests`), whose cases include the ones that replace a daemon while
+      # a scripted worker goes.
       # Quoted: a plain YAML scalar cannot end in a colon, and the filters do.
       - name: Test the configuration lock
         if: ${{ !cancelled() }}
@@ -554,7 +555,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: "cargo test --locked -p kr-controller --lib service::a_read_that_meets_a_worker_on_its_way_out::"
 
-      - name: Test the dispatch that replaces a daemon while a worker goes
+      - name: Test the device dispatch
         if: ${{ !cancelled() }}
         run: "cargo test --locked -p kr-controller --lib service::net::dispatch::tests::"
 
