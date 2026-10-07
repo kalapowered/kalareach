@@ -35,10 +35,10 @@
 //! it resolves: the old one until the rename, the new one after it. Windows can leave the name
 //! resolving to nothing for an instant while a rename replaces it, so a read of this store that
 //! finds nothing waits for the step that may be replacing the record and reads again. A step that
-//! fails before the rename leaves the old record and says so. One that fails after it has published the new record,
-//! which every later read returns, and says that whether the change survives a crash is not known.
-//! The first record is written the same way and given its name by a link instead, which never
-//! replaces a record that exists.
+//! fails before the rename leaves the old record and says so. One that fails after it has
+//! published the new record, which every later read returns, and says that whether the change
+//! survives a crash is not known. The first record is written the same way and given its name by a
+//! link instead, which never replaces a record that exists.
 //!
 //! The rename is the moment a step changes the record, so it is the moment the step's approval has
 //! to stand: the file is written and flushed first, and each attempt at the rename is made through
