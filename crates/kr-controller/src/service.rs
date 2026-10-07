@@ -194,6 +194,20 @@ impl ReadPause {
     }
 }
 
+/// One announcement of an authority revision that this daemon sent to a worker, as it recorded it
+/// for this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentAnnouncement {
+    /// The session whose worker the announcement was sent to.
+    pub session_id: SessionId,
+    /// The revision the announcement carried.
+    pub revision: u64,
+    /// How many of that revision's names the daemon already held: nought for the announcement a
+    /// worker acknowledges, more for a request for a page of the evidence that follows one.
+    pub evidence_from: u64,
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -349,6 +363,15 @@ pub struct Controller {
     /// so that the worker can be made busy in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_an_acknowledgement: ReadPause,
+    /// How many pages of one worker's fence evidence this host's own tests let one announcement
+    /// collect, where they need fewer than the bound that is in force. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    evidence_pages_limit: std::sync::atomic::AtomicUsize,
+    /// Every announcement of an authority revision this daemon has sent to a worker, in the order
+    /// it sent them, for this host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    announcements_sent: std::sync::Mutex<Vec<SentAnnouncement>>,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -673,6 +696,45 @@ impl Controller {
         &self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.after_an_acknowledgement.arm()
+    }
+
+    /// Returns every announcement of an authority revision this daemon has sent to a worker so far,
+    /// in the order it sent them, for this host's own tests. One is recorded as the daemon sends
+    /// it, before the worker has read it, so a worker that is slow or does not answer cannot change
+    /// the order.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn announcements_sent_for_tests(&self) -> Vec<SentAnnouncement> {
+        self.announcements_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records an announcement of an authority revision as this daemon sends it, for this host's
+    /// own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) fn record_announcement(
+        &self,
+        session_id: SessionId,
+        notice: &kr_protocol::worker::AuthorityRevisionNotice,
+    ) {
+        self.announcements_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SentAnnouncement {
+                session_id,
+                revision: notice.revision.get(),
+                evidence_from: notice.evidence_from,
+            });
+    }
+
+    /// Lets one announcement collect at most `pages` pages of one worker's fence evidence, for this
+    /// host's own tests, so that a fence of a few pages is enough to reach the bound.
+    #[cfg(feature = "testing")]
+    pub fn limit_evidence_pages_for_tests(&self, pages: usize) {
+        self.evidence_pages_limit
+            .store(pages, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Replaces what this host holds of its qualification, for a test of the door on a host that
