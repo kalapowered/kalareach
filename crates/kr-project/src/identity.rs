@@ -130,19 +130,20 @@ impl OpenedRepository {
         environment_id: EnvironmentId,
         path: &Path,
     ) -> Result<Self> {
-        Self::open_deciding(profile, environment_id, path, |_| Ok(()), |_| Ok(()))
+        Self::open_deciding(profile, environment_id, path, |_| Ok(None), |_| Ok(()))
     }
 
     /// Opens a working tree that a record names, and decides that the directory at its path is
     /// that tree before Git is asked anything there.
     ///
     /// The directory is opened and decided by `require_within` first, and Git starts in that
-    /// object. Git looks upward for the repository a directory belongs to, so the top level it
-    /// reports can be another directory than the one decided (a tree that lost its own `.git`
-    /// belongs to the repository around it): that top level is decided as well, before its
-    /// configuration is read or anything else is run in it. A directory that took the place of
-    /// the recorded tree, or a filesystem mounted over it, is refused without Git having been
-    /// started in it.
+    /// object. Git looks upward for the repository a directory belongs to, so its search is
+    /// stopped at the directory above the recorded tree: a tree that lost its own `.git` finds no
+    /// repository, rather than the one around it. Where the platform cannot say where the tree
+    /// is, the search is not stopped, and the top level Git reports is decided before its
+    /// configuration is audited or anything else is run in it, which refuses a repository
+    /// that is not the recorded tree. A directory that took the place of the recorded tree, or a
+    /// filesystem mounted over it, is refused without Git having been started in it.
     ///
     /// # Errors
     ///
@@ -159,7 +160,14 @@ impl OpenedRepository {
             profile,
             environment_id,
             path,
-            |named| require_within(named, tree),
+            |named| {
+                // The search for the repository ends above the recorded tree, where the platform
+                // says where that is.
+                let recorded = require_within(named, tree)?;
+                Ok(path_of(&recorded)
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf)))
+            },
             |top| {
                 top.check_recorded(tree)
                     .map(|_| ())
@@ -171,18 +179,18 @@ impl OpenedRepository {
     }
 
     /// Opens a working tree like [`Self::open`], with two decisions made before anything else is
-    /// done: `named` accepts the directory at the path before Git is asked anything, and `top`
-    /// accepts the top level Git reports before its configuration is read. Git starts in the
-    /// directory `named` saw.
+    /// done: `named` accepts the directory at the path before Git is asked anything, and says
+    /// where the search for the repository stops, and `top` accepts the top level Git reports
+    /// before its configuration is audited. Git starts in the directory `named` saw.
     fn open_deciding(
         profile: &RestrictedProfile,
         environment_id: EnvironmentId,
         path: &Path,
-        named: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
+        named: impl FnOnce(&AuthorisedDirectory) -> Result<Option<PathBuf>>,
         top: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
     ) -> Result<Self> {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
-        named(&work_tree)?;
+        let ceiling = named(&work_tree)?;
         // `--git-common-dir` rather than `--git-dir`: a linked worktree's own Git directory lives
         // inside the main one, and what identifies the repository is the object every worktree of
         // it shares.
@@ -199,8 +207,11 @@ impl OpenedRepository {
             OsStr::new("--show-toplevel"),
             OsStr::new("--is-inside-work-tree"),
         ];
-        let reported = profile
-            .run_checked(&GitRequest::read(path, &arguments).expecting(work_tree.identity()))?;
+        let mut request = GitRequest::read(path, &arguments).expecting(work_tree.identity());
+        if let Some(ceiling) = ceiling.as_deref() {
+            request = request.with_ceiling(ceiling);
+        }
+        let reported = profile.run_checked(&request)?;
         let mut lines = reported.lines();
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let own_dir_path = PathBuf::from(lines.next().unwrap_or_default());
@@ -224,7 +235,8 @@ impl OpenedRepository {
                 .into(),
             });
         }
-        // The top level is opened and decided before anything is read in the repository Git found.
+        // The top level is opened and decided before its configuration is audited, and before
+        // anything is run in the repository Git found.
         let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
         top(&tree)?;
         // The Git directory is opened as an object of its own, because for a linked worktree it
@@ -803,7 +815,7 @@ impl OpenedRepository {
 }
 
 /// Refuses, before Git is asked anything, when the directory found at a recorded path is neither
-/// the working tree a record names nor a directory inside it.
+/// the working tree a record names nor a directory inside it, and returns the recorded tree.
 ///
 /// A record names the top level of a working tree, and a repository that was registered through a
 /// directory below its top level keeps that directory's path, so the directory at a recorded path
@@ -814,9 +826,12 @@ impl OpenedRepository {
 /// elsewhere the device). Another filesystem mounted over the path ends the climb at its own
 /// root, and so does the root of the filesystem, and either refuses. Where a platform does not
 /// open a directory's parent from its handle, only the recorded tree itself is accepted.
-fn require_within(named: &AuthorisedDirectory, tree: RecordedIdentity) -> Result<()> {
+fn require_within(
+    named: &AuthorisedDirectory,
+    tree: RecordedIdentity,
+) -> Result<AuthorisedDirectory> {
     let refusal = match named.check_recorded(tree) {
-        Ok(_) => return Ok(()),
+        Ok(_) => return Ok(named.try_clone()?),
         Err(refusal) => refusal,
     };
     let mount_of = |directory: &AuthorisedDirectory| {
@@ -833,7 +848,7 @@ fn require_within(named: &AuthorisedDirectory, tree: RecordedIdentity) -> Result
                 break;
             }
             if above.check_recorded(tree).is_ok() {
-                return Ok(());
+                return Ok(above);
             }
             here = above;
         }
