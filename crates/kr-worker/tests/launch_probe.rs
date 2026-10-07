@@ -25,6 +25,13 @@ use common::LIVENESS_DEADLINE;
 /// How long a probe is given in the tests that do not test the deadline.
 const GENEROUS: Duration = Duration::from_secs(60);
 
+/// How long a launch waits for its probe in the cases that decide by the mode the stand-in prints.
+///
+/// The stand-in is a program the machine may be slow to start, so these cases wait for it as long
+/// as the others here do, and a probe that is late is not one they would take for a probe that
+/// printed nothing.
+const WAITING: Duration = GENEROUS;
+
 /// One platform's stand-in for the application: the program and the arguments that run `script`.
 struct Standin {
     program: PathBuf,
@@ -185,29 +192,55 @@ fn kr_req_07_64_a_program_that_prints_more_than_the_cap_records_no_mode() {
     );
 }
 
+/// The process identifier a stand-in wrote to `file` in `directory`, once it has written all of it.
+fn written_pid(directory: &Path, file: &str) -> Option<u32> {
+    std::fs::read_to_string(directory.join(file))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// KR-REQ-07.64: a program that never finishes is ended when its deadline passes, with what it
 /// started, and records no mode. Neither the program nor its child is left running.
+///
+/// The deadline has to pass after the program has started what it starts, and how soon it does that
+/// is the machine's to say. So the probe is given a longer deadline each time the program is found
+/// not to have started it yet, and what is decided is the state of the processes once a probe that
+/// the program was running in has been ended.
 #[test]
 fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_started() {
-    let here = directory();
-    let standin = Standin::running(
-        r#"echo $$ > main.pid; sleep 600 & echo $! > child.pid; wait"#,
-        r#"$PID | Out-File -Encoding ascii main.pid; $child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Out-File -Encoding ascii child.pid; Start-Sleep 600"#,
-    );
-    let probed = probe::run_within(
-        &standin.program,
-        &standin.probe(&[]),
-        &[],
-        here.path(),
-        // Long enough for the program to have written what it started, and no longer than a
-        // test should wait.
-        if cfg!(windows) {
-            Duration::from_secs(10)
-        } else {
-            Duration::from_secs(3)
-        },
-        probe::MAX_OUTPUT_BYTES,
-    );
+    let mut deadline = if cfg!(windows) {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(3)
+    };
+    let (here, probed) = loop {
+        let here = directory();
+        let standin = Standin::running(
+            r#"echo $$ > main.pid; sleep 600 & echo $! > child.pid; wait"#,
+            r#"$PID | Out-File -Encoding ascii main.pid; $child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Out-File -Encoding ascii child.pid; Start-Sleep 600"#,
+        );
+        let probed = probe::run_within(
+            &standin.program,
+            &standin.probe(&[]),
+            &[],
+            here.path(),
+            deadline,
+            probe::MAX_OUTPUT_BYTES,
+        );
+        if ["main.pid", "child.pid"]
+            .iter()
+            .all(|file| written_pid(here.path(), file).is_some())
+        {
+            break (here, probed);
+        }
+        assert!(
+            deadline < GENEROUS,
+            "the program had not started what it starts within {deadline:?}"
+        );
+        deadline *= 2;
+    };
     assert_eq!(probed.mode, None);
     assert!(
         probed
@@ -217,11 +250,7 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
         "{probed:?}"
     );
     for file in ["main.pid", "child.pid"] {
-        let pid: u32 = std::fs::read_to_string(here.path().join(file))
-            .unwrap_or_else(|error| panic!("{file}: the program started: {error}"))
-            .trim()
-            .parse()
-            .expect("a process identifier");
+        let pid = written_pid(here.path(), file).expect("a process identifier");
         let started = std::time::Instant::now();
         while kr_ipc::identity::process_start_identity(pid).is_ok() {
             assert!(
@@ -294,9 +323,12 @@ mod launch {
         }
     }
 
-    /// What a launch of `standin` as the agent, with its package's probe where `probing`,
-    /// records and refuses.
-    pub fn launch(standin: &Standin, probing: bool) -> Result<LaunchProfile, BrokerError> {
+    /// What a launch of `standin` as the agent, with its package's probe given `probe_deadline`
+    /// where there is one, records and refuses.
+    pub fn launch(
+        standin: &Standin,
+        probe_deadline: Option<std::time::Duration>,
+    ) -> Result<LaunchProfile, BrokerError> {
         let directory = tempfile::tempdir().expect("a directory");
         let private = directory.path().join("private");
         kr_ipc::paths::create_private_directory(&private).expect("a private directory");
@@ -331,13 +363,10 @@ mod launch {
         {
             gateway = gateway.in_session(Arc::clone(&session));
         }
-        if probing {
-            // The stand-in is a program the machine may be slow to start, and what these cases
-            // decide is the mode it prints, so the launch waits for it as long as the other cases
-            // here do.
+        if let Some(deadline) = probe_deadline {
             gateway = gateway
                 .with_launch_probe(standin.probe(&[]))
-                .with_probe_deadline(super::GENEROUS);
+                .with_probe_deadline(deadline);
         }
         let intent = broker
             .prepare_launch(
@@ -380,9 +409,9 @@ async fn kr_req_07_64_a_launch_records_the_mode_its_probe_read_and_a_probe_not_g
         r#"printf '{"mode":"disabled"}'"#,
         r#"[Console]::Out.Write('{"mode":"disabled"}')"#,
     );
-    let probing = launch::launch(&standin, true).expect("the launch goes ahead");
+    let probing = launch::launch(&standin, Some(WAITING)).expect("the launch goes ahead");
     assert_eq!(probing.vendor_mode.0.as_deref(), Some("disabled"));
-    let without = launch::launch(&standin, false).expect("the launch goes ahead");
+    let without = launch::launch(&standin, None).expect("the launch goes ahead");
     assert_eq!(
         without.vendor_mode.0, None,
         "a probe nobody gave the gateway is not run"
@@ -399,7 +428,7 @@ async fn kr_req_07_64_a_refused_mode_is_a_named_failure_in_a_service_session_and
         r#"printf '{"mode":"elevated"}'"#,
         r#"[Console]::Out.Write('{"mode":"elevated"}')"#,
     );
-    let outcome = launch::launch(&standin, true);
+    let outcome = launch::launch(&standin, Some(WAITING));
     #[cfg(windows)]
     let in_service_session = kr_ipc::starter::current_session().is_ok_and(|session| session == 0);
     #[cfg(not(windows))]
@@ -415,4 +444,16 @@ async fn kr_req_07_64_a_refused_mode_is_a_named_failure_in_a_service_session_and
         let profile = outcome.expect("the mode is not refused in this session");
         assert_eq!(profile.vendor_mode.0.as_deref(), Some("elevated"));
     }
+}
+
+/// KR-REQ-07.64: a launch whose probe gives no answer goes ahead and records no mode, in a service
+/// session as elsewhere. What the host could not read it does not guess at, and the application's
+/// own sandbox is left as it is: nothing is disabled and nothing is let out of the job. The
+/// stand-in never prints, so this case decides by that and not by how soon the deadline passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_07_64_a_launch_whose_probe_gives_no_answer_goes_ahead_and_records_no_mode() {
+    let standin = Standin::running("sleep 600", "Start-Sleep -Seconds 600");
+    let profile = launch::launch(&standin, Some(Duration::from_secs(1)))
+        .expect("a probe that gives no answer does not stop the launch");
+    assert_eq!(profile.vendor_mode.0, None);
 }
