@@ -5408,18 +5408,21 @@ async fn an_interrupt_delivers_what_its_own_sweep_released() {
         if contains(&retained(&wired.runtime.session()), b"waited") {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the interrupt kept what its own sweep released; the session is {:?} (closure {:?}) and \
-             the retained output is {}",
-            wired.runtime.state(),
-            wired
+        if std::time::Instant::now() >= deadline {
+            // Each of these takes the session's lock, and holds it only until the line ends.
+            let state = wired.runtime.state();
+            let closure = wired
                 .runtime
                 .session()
                 .closure()
-                .map(|record| (record.reason, record.root_exit_code)),
-            String::from_utf8_lossy(&retained(&wired.runtime.session())).escape_debug()
-        );
+                .map(|record| (record.reason, record.root_exit_code));
+            let output = retained(&wired.runtime.session());
+            panic!(
+                "the interrupt kept what its own sweep released; the session is {state:?} \
+                 (closure {closure:?}) and the retained output is {}",
+                String::from_utf8_lossy(&output).escape_debug()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     wired.close().await;
