@@ -5410,7 +5410,14 @@ async fn an_interrupt_delivers_what_its_own_sweep_released() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the interrupt kept what its own sweep released; the retained output is {}",
+            "the interrupt kept what its own sweep released; the session is {:?} (closure {:?}) and \
+             the retained output is {}",
+            wired.runtime.state(),
+            wired
+                .runtime
+                .session()
+                .closure()
+                .map(|record| (record.reason, record.root_exit_code)),
             String::from_utf8_lossy(&retained(&wired.runtime.session())).escape_debug()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
