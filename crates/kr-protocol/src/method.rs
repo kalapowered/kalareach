@@ -1465,8 +1465,9 @@ methods! {
     selectors: [Installation, Transfer],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: keyed("upload id"),
-    doc: "Abandon the upload. New parts and completions are fenced first, then the stored state is \
-          removed, and the hold is given back only once that removal is confirmed.";
+    doc: "Abandon the upload. New parts and completions are fenced first, then the content stored \
+          for the upload is removed, and the hold is given back only once that removal is \
+          confirmed. The upload's record stays.";
 
     StorageObjectRead = "storage.object.read", Services,
     effect: Read, ingress: [ServiceClient],
