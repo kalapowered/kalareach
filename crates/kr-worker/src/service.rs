@@ -826,8 +826,8 @@ impl WorkerService {
     /// host's own tests.
     ///
     /// Nothing else is held while it waits, so what a test does meanwhile meets a worker whose
-    /// boundary is taken and whose session is free, which is what a mutation in the middle of its
-    /// work leaves. Returns the end that says the mutation has arrived, and the end that lets it
+    /// boundary is taken and whose session is free, which is what a mutation leaves as it enters
+    /// the boundary. Returns the end that says the mutation has arrived, and the end that lets it
     /// go. The pause fires once.
     #[cfg(feature = "testing")]
     pub fn pause_inside_boundary(

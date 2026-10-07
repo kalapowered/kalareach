@@ -2184,9 +2184,9 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
         (client, answered)
     });
     // The worker says so once the mutation holds the boundary. Until then the revocation below
-    // could be the one that takes it, and the case would be about a different order. The wait is
-    // on a blocking thread, because the stopped mutation holds a thread of the runtime it shares.
-    // The bound only keeps a mutation that never arrives from holding the suite up.
+    // could be the one that takes it, and the case would be about a different order. The pause
+    // hands over standard channel ends, so the wait is a blocking call and runs on a blocking
+    // thread. The bound only keeps a mutation that never arrives from holding the suite up.
     let arrived =
         tokio::task::spawn_blocking(move || inside.recv_timeout(Duration::from_secs(30)).is_ok())
             .await
