@@ -1508,8 +1508,10 @@ impl Session {
         // The screen was reflowed, so a terminal kept off the stream by what the last one could
         // not carry is asked again of this one, before it is installed in the form it is then
         // given. Waiting for output would leave it projected for as long as the application is
-        // quiet.
+        // quiet. One that screen frees is not handed the stream while the parser stands inside a
+        // sequence, so the boundary is settled for it as well.
         self.reconsider_incomplete_restorations();
+        self.settle_forwarding(None);
         for attachment_id in self.hub.subscribers() {
             if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
                 let Ok(dimensions) = self.attachment_dimensions(attachment_id) else {
@@ -3153,17 +3155,20 @@ impl Session {
     /// A restoration that left something out keeps its terminal on a projection, and nothing about
     /// the terminal changes afterwards: what changes is the session's screen. The wrapped line
     /// scrolls off or is cleared, the wrap is no longer pending, the title stack is popped. The
-    /// answer is read from the screen as the engine has just settled it, and an attachment it now
-    /// favours is served the stream again through the change `deliver` makes for every
-    /// attachment that moves between the two, which draws it a screen of its own at a boundary.
-    /// Nothing is drawn for anybody here, so nothing is counted among what renderings left out.
+    /// answer is read from the screen as the engine holds it, which is the settled one when the
+    /// session's output has just gone quiet, and an attachment it now favours is served the stream
+    /// again through the change `deliver` makes for every attachment that moves between the two,
+    /// which draws it a screen of its own at a boundary. Nothing is drawn for anybody here, so
+    /// nothing is counted among what renderings left out.
     ///
     /// The question is asked once per output cursor and projection generation, and terminals that
     /// would be drawn the same restoration share one answer. A quiet moment at the cursor last
     /// asked about follows a read that ended inside a sequence, or the end of the stream, and no
     /// terminal can begin forwarding there. A change of the session's size moves the generation
-    /// without moving the cursor, and reflows the screen, so it asks again. A terminal's own report
-    /// of a new window asks the question where it is made.
+    /// without moving the cursor, and reflows the screen, so it asks again; it can come between a
+    /// read and the next quiet moment, when the last scalar of a run is still held back and is not
+    /// on the screen that is asked, and that quiet moment moves the cursor and asks once more. A
+    /// terminal's own report of a new window asks the question where it is made.
     fn reconsider_incomplete_restorations(&mut self) {
         let asked = (
             self.engine.output_cursor(),
