@@ -1838,7 +1838,7 @@ impl WorkerSupervisor for RendezvousSupervisor {
 struct Hosted {
     /// First, so a worker served apart has ended before the temporary tree is removed.
     _apart: Option<ApartWorker>,
-    _temp: kr_ipc::testing::TempHost,
+    _temp: Arc<kr_ipc::testing::TempHost>,
     controller: Arc<Controller>,
     client_endpoint: kr_ipc::paths::Endpoint,
     endpoint: kr_ipc::paths::Endpoint,
@@ -1849,29 +1849,21 @@ struct Hosted {
     service: Arc<WorkerService>,
 }
 
-/// Starts a daemon, creates a session through it, and performs the worker's side of the
-/// rendezvous in this process so the daemon ends up with a verified worker it can announce to.
-async fn hosted_worker() -> Hosted {
-    hosted_worker_serving(false).await
+/// One daemon, and the rendezvous every worker it starts is verified through.
+struct HostedDaemon {
+    temp: Arc<kr_ipc::testing::TempHost>,
+    environment: kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+    controller: Arc<Controller>,
+    client_endpoint: kr_ipc::paths::Endpoint,
+    rendezvous_endpoint: kr_ipc::paths::Endpoint,
+    launches: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<WorkerLaunch>>>,
 }
 
-/// As [`hosted_worker`], with the worker's session runtime and connections on a runtime of their
-/// own.
-///
-/// In production the worker is its own process. A test that holds its session for as long as the
-/// daemon takes to give up on it (several seconds, each step of the daemon's round bounded) would
-/// stop every task of a worker that shares the test's runtime and wants the session, the session's
-/// own monitor among them, and a stopped task stops the thread that runs it: the thread that
-/// drives that runtime's sockets and timers among others, so that nothing of the daemon moved
-/// again. Served apart, the worker's stopped tasks stop only its own threads.
-async fn hosted_worker_apart() -> Hosted {
-    hosted_worker_serving(true).await
-}
-
-/// Starts the daemon and its worker as [`hosted_worker`] does, and runs the worker's session
-/// runtime and its connections on this test's runtime, or on a runtime of their own when `apart`.
-async fn hosted_worker_serving(apart: bool) -> Hosted {
-    let temp = kr_ipc::testing::TempHost::create();
+/// Starts a daemon whose supervisor starts nothing and hands this process each launch it is asked
+/// for, with the endpoints a client and a worker reach it on.
+async fn hosted_daemon() -> HostedDaemon {
+    let temp = Arc::new(kr_ipc::testing::TempHost::create());
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
@@ -1908,6 +1900,46 @@ async fn hosted_worker_serving(apart: bool) -> Hosted {
     tokio::spawn(Arc::clone(&controller).serve_rendezvous(
         Listener::bind(&rendezvous_endpoint).expect("binds the rendezvous endpoint"),
     ));
+    HostedDaemon {
+        temp,
+        environment,
+        environment_id,
+        controller,
+        client_endpoint,
+        rendezvous_endpoint,
+        launches: Arc::new(std::sync::Mutex::new(launches)),
+    }
+}
+
+/// Starts a daemon, creates a session through it, and performs the worker's side of the
+/// rendezvous in this process so the daemon ends up with a verified worker it can announce to.
+async fn hosted_worker() -> Hosted {
+    add_worker(&hosted_daemon().await, false).await
+}
+
+/// As [`hosted_worker`], with the worker's session runtime and connections on a runtime of their
+/// own.
+///
+/// In production the worker is its own process. A test that holds its session for as long as the
+/// daemon takes to give up on it (several seconds, each step of the daemon's round bounded) would
+/// stop every task of a worker that shares the test's runtime and wants the session, the session's
+/// own monitor among them, and a stopped task stops the thread that runs it: the thread that
+/// drives that runtime's sockets and timers among others, so that nothing of the daemon moved
+/// again. Served apart, the worker's stopped tasks stop only its own threads.
+async fn hosted_worker_apart() -> Hosted {
+    add_worker(&hosted_daemon().await, true).await
+}
+
+/// Creates one more session through `daemon` and performs the worker's side of the rendezvous in
+/// this process, so the daemon has one more verified worker it can announce to. The worker's
+/// session runtime and its connections run on this test's runtime, or on a runtime of their own
+/// when `apart`.
+async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
+    let environment = daemon.environment.clone();
+    let environment_id = daemon.environment_id;
+    let client_endpoint = daemon.client_endpoint.clone();
+    let rendezvous_endpoint = daemon.rendezvous_endpoint.clone();
+    let launches = Arc::clone(&daemon.launches);
 
     // The create goes on its own task: the daemon answers it only once the worker it started has
     // reported ready, and reporting ready is what this test does next.
@@ -1955,6 +1987,8 @@ async fn hosted_worker_serving(apart: bool) -> Hosted {
     // The launch the daemon asked for. Nothing was started, so this process answers for it.
     let launch = tokio::task::spawn_blocking(move || {
         launches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv_timeout(Duration::from_secs(20))
             .expect("the daemon asks for a worker")
     })
@@ -2092,8 +2126,8 @@ async fn hosted_worker_serving(apart: bool) -> Hosted {
     );
     Hosted {
         _apart: apart_worker,
-        _temp: temp,
-        controller,
+        _temp: Arc::clone(&daemon.temp),
+        controller: Arc::clone(&daemon.controller),
         client_endpoint,
         endpoint,
         journal_path,
@@ -2761,6 +2795,61 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
     );
 }
 
+/// A revocation's announcement, stopped once a worker's acknowledgement is recorded and before the
+/// pages of evidence that follow it are asked for, with the end that lets it go on.
+struct Stopped {
+    announcing:
+        tokio::task::JoinHandle<kr_controller::Result<kr_protocol::action::RevocationBarrier>>,
+    go: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Revokes this host's authority and returns the announcement at the stop of the one worker.
+///
+/// The first announcement may itself be refused whole by whatever else is inside the worker's
+/// boundary at that moment, which leaves the worker pending and never reaches the stop: it is
+/// announced again until an acknowledgement does.
+async fn stopped_after_the_acknowledgement(controller: &Arc<Controller>) -> Stopped {
+    let mut revoking = true;
+    for _ in 0..50 {
+        let (mut arrived, go) = controller.stop_after_an_acknowledgement_for_tests();
+        let mut announcing = {
+            let controller = Arc::clone(controller);
+            tokio::spawn(async move {
+                if revoking {
+                    controller.revoke_authority().await
+                } else {
+                    controller.announce_authority_revision().await
+                }
+            })
+        };
+        revoking = false;
+        tokio::select! {
+            reached = &mut arrived => {
+                reached.expect("the announcement reached the stop");
+                return Stopped { announcing, go };
+            }
+            finished = &mut announcing => {
+                finished
+                    .expect("the announcing task finishes")
+                    .expect("the revocation is announced");
+            }
+        }
+    }
+    panic!("no announcement was acknowledged");
+}
+
+/// One worker's part of a revocation's report.
+fn worker_report(
+    barrier: &kr_protocol::action::RevocationBarrier,
+    session_id: SessionId,
+) -> &kr_protocol::action::WorkerBarrier {
+    barrier
+        .workers
+        .iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("this worker is in the report")
+}
+
 /// KR-REQ-09.13: a page of fence evidence that the worker refuses because its dispatch boundary
 /// is held is asked for again, so the revocation's report names every action its fence took back
 /// without another announcement.
@@ -2776,47 +2865,12 @@ async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_aske
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
     seed_undispatched_intents(&hosted, &device, affected);
 
-    // The first announcement may itself be refused by whatever else is inside the boundary at
-    // that moment, which leaves the worker pending and never reaches the stop: it is announced
-    // again until an acknowledgement does.
-    let revoke = {
-        let controller = Arc::clone(&hosted.controller);
-        move || {
-            let controller = Arc::clone(&controller);
-            tokio::spawn(async move { controller.revoke_authority().await })
-        }
-    };
-    let announce = {
-        let controller = Arc::clone(&hosted.controller);
-        move || {
-            let controller = Arc::clone(&controller);
-            tokio::spawn(async move { controller.announce_authority_revision().await })
-        }
-    };
-    let (mut arrived, mut go) = hosted.controller.stop_after_an_acknowledgement_for_tests();
-    let mut announcing = revoke();
-    let mut attempts = 0;
-    loop {
-        tokio::select! {
-            reached = &mut arrived => {
-                reached.expect("the announcement reached the stop");
-                break;
-            }
-            finished = &mut announcing => {
-                finished
-                    .expect("the announcing task finishes")
-                    .expect("the revocation is announced");
-                attempts += 1;
-                assert!(attempts < 50, "no announcement was acknowledged");
-                (arrived, go) = hosted.controller.stop_after_an_acknowledgement_for_tests();
-                announcing = announce();
-            }
-        }
-    }
-
+    let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
     let boundary = HeldBoundary::take(&hosted.service).await;
-    go.send(())
+    stopped
+        .go
+        .send(())
         .expect("the announcement is waiting at the stop");
     tokio::time::timeout(
         Duration::from_secs(60),
@@ -2826,17 +2880,13 @@ async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_aske
     .expect("the first page is refused while the boundary is held");
     boundary.release().await;
 
-    let barrier = tokio::time::timeout(Duration::from_secs(60), announcing)
+    let barrier = tokio::time::timeout(Duration::from_secs(60), stopped.announcing)
         .await
         .expect("the announcement returns")
         .expect("the announcing task finishes")
         .expect("the revocation is announced");
     assert!(barrier.holds(), "{barrier:?}");
-    let reported = barrier
-        .workers
-        .iter()
-        .find(|worker| worker.session_id == hosted.session_id)
-        .expect("this worker is in the report");
+    let reported = worker_report(&barrier, hosted.session_id);
     assert_eq!(
         reported.rejected_actions.len(),
         affected,
@@ -2844,6 +2894,181 @@ async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_aske
     );
     assert_eq!(reported.names_pending.get(), 0);
     assert_eq!(reported.omitted_actions.get(), 0);
+}
+
+/// KR-REQ-09.13: a worker that refuses every page of a fence's evidence is asked for the first of
+/// them a bounded number of times, and what it still owes is reported as pending, not waited for.
+///
+/// The worker's boundary is held from the moment it has acknowledged until the announcement
+/// returns, so it refuses every page the daemon asks for: the first ask and the ten retries after
+/// it. The report says the barrier holds, names what the acknowledgement carried and counts the
+/// rest as pending, and an announcement made after the worker is free names all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_that_refuses_every_page_is_asked_a_bounded_number_of_times_and_its_names_stay_pending()
+ {
+    let hosted = hosted_worker().await;
+    let device = actor("device:phone");
+    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    seed_undispatched_intents(&hosted, &device, affected);
+
+    let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
+    let refused = hosted.service.refusals_for_the_boundary();
+    let boundary = HeldBoundary::take(&hosted.service).await;
+    stopped
+        .go
+        .send(())
+        .expect("the announcement is waiting at the stop");
+    // It returns while the worker is still refusing, which is the bound.
+    let barrier = tokio::time::timeout(Duration::from_secs(120), stopped.announcing)
+        .await
+        .expect("the announcement returns although the worker refuses every page")
+        .expect("the announcing task finishes")
+        .expect("the revocation is announced");
+    assert_eq!(
+        hosted.service.refusals_for_the_boundary() - refused,
+        11,
+        "the first ask and ten retries, and no more"
+    );
+    assert!(barrier.holds(), "{barrier:?}");
+    let reported = worker_report(&barrier, hosted.session_id);
+    let named = reported.rejected_actions.len();
+    assert!(named > 0 && named < affected, "{named} of {affected}");
+    assert_eq!(
+        reported.names_pending.get(),
+        (affected - named) as u64,
+        "every name the acknowledgement did not carry is counted as pending"
+    );
+
+    boundary.release().await;
+    // Announced again until the report is whole: another holder of the boundary can refuse an
+    // announcement whole, and what this shows is that a later announcement completes the names.
+    let later = announced_until(&hosted.controller, barrier, |barrier| {
+        barrier.holds()
+            && worker_report(barrier, hosted.session_id)
+                .names_pending
+                .get()
+                == 0
+    })
+    .await;
+    let reported = worker_report(&later, hosted.session_id);
+    assert_eq!(reported.rejected_actions.len(), affected);
+}
+
+/// KR-REQ-09.13: a page the worker refuses for now uses none of the pages an announcement may
+/// collect, so a worker that was busy for a moment is still collected from to the end.
+///
+/// The announcement may collect two pages after the acknowledgement's, which is what a fence of
+/// this many names needs. The worker's boundary is taken before the first of them is asked for and
+/// let go once it has been refused, so the announcement asks again, and one that counted the
+/// refusal as a page would stop a page short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
+    let hosted = hosted_worker().await;
+    hosted.controller.limit_evidence_pages_for_tests(2);
+    let device = actor("device:phone");
+    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    seed_undispatched_intents(&hosted, &device, affected);
+
+    let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
+    let refused = hosted.service.refusals_for_the_boundary();
+    let boundary = HeldBoundary::take(&hosted.service).await;
+    stopped
+        .go
+        .send(())
+        .expect("the announcement is waiting at the stop");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.service.refused_for_the_boundary_beyond(refused),
+    )
+    .await
+    .expect("the first page is refused while the boundary is held");
+    boundary.release().await;
+
+    let barrier = tokio::time::timeout(Duration::from_secs(60), stopped.announcing)
+        .await
+        .expect("the announcement returns")
+        .expect("the announcing task finishes")
+        .expect("the revocation is announced");
+    let reported = worker_report(&barrier, hosted.session_id);
+    assert_eq!(reported.rejected_actions.len(), affected);
+    assert_eq!(reported.names_pending.get(), 0);
+}
+
+/// KR-REQ-09.13: an announcement asks every worker for its acknowledgement before it asks any
+/// worker for a page of evidence, so a worker that keeps refusing its pages, and is asked again for
+/// seconds, holds up no other worker's acknowledgement.
+///
+/// Two workers on one daemon, each with a fence of more than one page. The daemon records each
+/// announcement as it sends it, before any worker has read it: an acknowledgement asks from nought
+/// and a page asks from where the last one ended, so an announcement in which an acknowledgement
+/// follows a page asked one worker for its page before it had asked the other for its
+/// acknowledgement. What is decided is the order of what the daemon asks and not what a worker
+/// answers, so it holds whatever refuses, times out or is slow at the moment: that only changes how
+/// many announcements it takes to collect every name. Each announcement made until they are all
+/// collected is checked, and at least one of them has to have asked for pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_asks_for_any_page() {
+    let daemon = hosted_daemon().await;
+    let hosts = [
+        add_worker(&daemon, false).await,
+        add_worker(&daemon, false).await,
+    ];
+    let device = actor("device:phone");
+    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    for hosted in &hosts {
+        seed_undispatched_intents(hosted, &device, affected);
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut asked_for_pages = false;
+    let mut announcements = 0;
+    let barrier = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the names were not all collected within three minutes of announcements"
+        );
+        let before = daemon.controller.announcements_sent_for_tests().len();
+        let announced = if announcements == 0 {
+            daemon.controller.revoke_authority().await
+        } else {
+            daemon.controller.announce_authority_revision().await
+        };
+        announcements += 1;
+        let barrier = announced.expect("the revocation is announced");
+        let sent = daemon.controller.announcements_sent_for_tests()[before..].to_vec();
+        let mut paged = false;
+        for announcement in &sent {
+            if announcement.evidence_from > 0 {
+                paged = true;
+            } else {
+                assert!(
+                    !paged,
+                    "announcement {announcements} asked for a page of evidence before it asked \
+                     every worker for its acknowledgement: {sent:?}"
+                );
+            }
+        }
+        asked_for_pages |= paged;
+        let collected = hosts.iter().all(|hosted| {
+            let reported = worker_report(&barrier, hosted.session_id);
+            reported.names_pending.get() == 0 && reported.rejected_actions.len() == affected
+        });
+        if barrier.holds() && collected {
+            break barrier;
+        }
+    };
+    assert!(
+        asked_for_pages,
+        "no announcement asked for a page of evidence"
+    );
+    for hosted in &hosts {
+        assert_eq!(
+            worker_report(&barrier, hosted.session_id)
+                .omitted_actions
+                .get(),
+            0
+        );
+    }
 }
 
 /// Writes one mutation to this daemon and returns what it answered.
