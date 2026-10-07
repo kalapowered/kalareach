@@ -390,8 +390,6 @@ pub struct Session {
     interrupt_failed: Option<String>,
     /// Accepted bytes the root editor's machine is holding for a reader transition.
     held_input_bytes: usize,
-    /// What the renderings this session has produced could not carry.
-    restoration_losses: crate::render::Carried,
     /// The output cursor and the projection generation at which terminals kept on a projection by
     /// their screen were last asked whether a screen drawn now would carry everything.
     reconsidered_at: (u64, u64),
@@ -722,7 +720,6 @@ impl Session {
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             held_input_bytes: 0,
-            restoration_losses: crate::render::Carried::default(),
             reconsidered_at: (0, 0),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
@@ -1884,33 +1881,19 @@ impl Session {
 
     /// Records what a rendered restoration could not carry.
     ///
-    /// Nothing is silently lost: the renderer counts every omission, and this is where the session
-    /// keeps the count so a person asking the host doctor can be told.
+    /// Nothing is silently lost: the renderer counts every omission, and what it counted decides
+    /// how the attachment that was given the screen is served from here, which is what the
+    /// attachment's presentation and its reason report.
     fn note_restoration(
         &mut self,
         attachment_id: AttachmentId,
         restoration: &crate::render::Restoration,
     ) {
-        let carried = restoration.carried;
         // What this screen could not carry decides how the attachment that was given it is served
         // from here: a terminal that continues the raw stream from a screen missing the state the
         // application is about to address shows something the session does not have.
         self.attachments
-            .note_restoration(attachment_id, carried.continues_the_stream());
-        self.restoration_losses.inactive_rows += carried.inactive_rows;
-        self.restoration_losses.other_saved_cursors += carried.other_saved_cursors;
-        self.restoration_losses.title_stack += carried.title_stack;
-        self.restoration_losses.clipped_rows += carried.clipped_rows;
-        self.restoration_losses.soft_wraps += carried.soft_wraps;
-        self.restoration_losses.other_keyboard |= carried.other_keyboard;
-        self.restoration_losses.keyboard_stack += carried.keyboard_stack;
-        self.restoration_losses.pending_wrap |= carried.pending_wrap;
-    }
-
-    /// Returns what the renderings this session has produced could not carry.
-    #[must_use]
-    pub const fn restoration_losses(&self) -> crate::render::Carried {
-        self.restoration_losses
+            .note_restoration(attachment_id, restoration.carried.continues_the_stream());
     }
 
     /// Returns the terminal engine's rate-limited diagnostic totals.
