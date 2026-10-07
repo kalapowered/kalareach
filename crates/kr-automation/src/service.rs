@@ -166,12 +166,6 @@ impl StartedRun {
     pub const fn run_id(&self) -> WorkflowRunId {
         self.run_id
     }
-
-    /// The chain the run belongs to.
-    #[must_use]
-    pub const fn causal(&self) -> &CausalContext {
-        &self.causal
-    }
 }
 
 /// What one derived trigger came to for one workflow whose trigger it matched.

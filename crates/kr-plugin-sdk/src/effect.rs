@@ -385,15 +385,6 @@ impl ActionImplementation {
         matches!(self, Self::Component {})
     }
 
-    /// Returns true when this form needs the package to ship a connector table.
-    #[must_use]
-    pub const fn needs_connector(&self) -> bool {
-        matches!(
-            self,
-            Self::UpstreamMethod { .. } | Self::DecisionDestination { .. }
-        )
-    }
-
     /// Returns every declared parameter this form refers to.
     #[must_use]
     pub fn referenced_parameters(&self) -> Vec<&ParameterName> {

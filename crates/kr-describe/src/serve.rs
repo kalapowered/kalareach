@@ -238,20 +238,6 @@ impl Exit {
             Self::DaemonGone => 74,
         }
     }
-
-    /// Returns the end a process exit status stands for, when it stands for one.
-    #[must_use]
-    pub const fn of_code(code: i32) -> Option<Self> {
-        match code {
-            0 => Some(Self::Ended),
-            65 => Some(Self::WireBroken),
-            70 => Some(Self::ControlStalled),
-            71 => Some(Self::Overdue),
-            72 => Some(Self::ModelFailed),
-            74 => Some(Self::DaemonGone),
-            _ => None,
-        }
-    }
 }
 
 /// Reads the arguments a description process is started with: `--runtime-dir <directory>`, and

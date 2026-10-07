@@ -262,15 +262,6 @@ impl StreamCursors {
         self.needs_snapshot.insert(stream_id.clone());
     }
 
-    /// Forgets every stream, holding none of them to a snapshot.
-    pub fn discard_all(&mut self) {
-        self.received.clear();
-        self.applied.clear();
-        self.applied_cursor.clear();
-        self.since_discard.clear();
-        self.needs_snapshot.clear();
-    }
-
     /// Returns how many streams hold a usable position.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -346,7 +337,6 @@ crate::display_as_said!(RestorationStep);
 /// Drives one stream through the restoration order.
 #[derive(Clone)]
 pub struct Restoration {
-    stream_id: StreamId,
     step: RestorationStep,
 }
 
@@ -358,13 +348,7 @@ impl Restoration {
             Some(cursor) => RestorationStep::SubscribeFrom(cursor),
             None => RestorationStep::SubscribeFromStart,
         };
-        Self { stream_id, step }
-    }
-
-    /// Returns the stream being restored.
-    #[must_use]
-    pub const fn stream_id(&self) -> &StreamId {
-        &self.stream_id
+        Self { step }
     }
 
     /// Returns the step to perform now.

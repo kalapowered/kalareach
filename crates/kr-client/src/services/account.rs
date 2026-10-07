@@ -478,12 +478,6 @@ impl AttemptId {
     pub const fn value(self) -> u64 {
         self.0
     }
-
-    /// The identifier a native carrier reported.
-    #[must_use]
-    pub const fn from_value(value: u64) -> Self {
-        Self(value)
-    }
 }
 
 impl crate::shown::Said for AttemptId {
@@ -1650,12 +1644,6 @@ impl StoredGrant {
     #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
-    }
-
-    /// The account's address, once read.
-    #[must_use]
-    pub fn email(&self) -> Option<&str> {
-        self.email.as_deref()
     }
 
     /// The name on the account, once read.

@@ -383,12 +383,6 @@ impl ModeState {
         self.modify_other_keys = 0;
     }
 
-    /// The active buffer's Kitty keyboard flag stack, oldest first, for a snapshot.
-    #[must_use]
-    pub fn kitty_stack(&self) -> &[u8] {
-        &self.kitty[self.kitty_slot()].stack
-    }
-
     /// One buffer's Kitty keyboard negotiation, for a snapshot.
     ///
     /// Both buffers are carried, because a restored session may leave the alternate buffer later

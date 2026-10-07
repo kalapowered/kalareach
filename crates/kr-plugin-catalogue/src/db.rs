@@ -97,12 +97,6 @@ impl ReceiptKey {
         }
     }
 
-    /// Returns the actor.
-    #[must_use]
-    pub fn actor(&self) -> &str {
-        &self.actor
-    }
-
     /// Returns the action identifier.
     #[must_use]
     pub fn action(&self) -> &str {

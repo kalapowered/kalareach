@@ -240,14 +240,6 @@ impl core::fmt::Display for DebtId {
     }
 }
 
-impl GrantRevocation {
-    /// Returns true when this revocation affects `session_id`.
-    #[must_use]
-    pub fn affects_session(&self, session_id: SessionId) -> bool {
-        self.covers_every_session || self.sessions.contains(&session_id)
-    }
-}
-
 /// The host's grants.
 #[derive(Debug)]
 pub struct GrantDirectory {

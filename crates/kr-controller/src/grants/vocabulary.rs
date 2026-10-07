@@ -49,24 +49,6 @@ pub fn unconditional_rights_for(method: Method) -> Vec<ActionRight> {
     rights
 }
 
-/// Every method one right reaches, in registry order.
-///
-/// This is how a person reading a grant finds out what it lets somebody do. A right that reaches
-/// nothing is a right no method asks for, which the vocabulary test checks.
-#[must_use]
-pub fn methods_for(right: ActionRight) -> Vec<Method> {
-    REGISTRY
-        .iter()
-        .filter(|entry| {
-            entry
-                .required_rights
-                .iter()
-                .any(|required| required.authority == RequiredAuthority::Right { right })
-        })
-        .map(|entry| entry.method)
-        .collect()
-}
-
 fn entry(method: Method) -> &'static kr_protocol::authority::MethodEntry {
     REGISTRY
         .iter()

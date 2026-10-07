@@ -268,35 +268,6 @@ impl SignedService {
         self.answer(path, method, body, request_limit).await?.data()
     }
 
-    /// Sends one signed request under the instant its caller states, and returns the `data` of the
-    /// service's envelope.
-    ///
-    /// For a call whose signing time is part of what the caller records: an attempt the caller
-    /// wrote down as signed at one instant is signed at exactly that instant, never at a reading
-    /// taken here, because the record and the credential have to be the one value.
-    ///
-    /// The instant is still held to the window the service admits a signature in, against this
-    /// device's clock, and an attempt outside it is refused here rather than sent. The service
-    /// would refuse it either side of the window, so sending it would spend a request to learn what
-    /// this device can already see; and an attempt signed a while ago is one this client does not
-    /// carry to the service late, because nothing re-dates an attempt.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::call`], and [`ErrorCode::ClockUntrusted`] for an instant outside the window.
-    pub async fn call_at<B: Serialize>(
-        &self,
-        path: &str,
-        method: Method,
-        body: &B,
-        request_limit: usize,
-        signed_at_ms: u64,
-    ) -> Result<serde_json::Value> {
-        self.answer_at(path, method, body, request_limit, signed_at_ms)
-            .await?
-            .data()
-    }
-
     /// Sends one signed request, signed now, and returns what the service answered: its `data`, or
     /// the refusal it named, whole.
     ///
@@ -317,25 +288,6 @@ impl SignedService {
     ) -> Result<Answer> {
         Ok(self
             .dispatch(path, method, body, request_limit, None, None)
-            .await?)
-    }
-
-    /// Sends one signed request under the instant its caller states, and returns what the service
-    /// answered: its `data`, or the refusal it named, whole.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::answer`], and [`ErrorCode::ClockUntrusted`] for an instant outside the window.
-    pub(crate) async fn answer_at<B: Serialize>(
-        &self,
-        path: &str,
-        method: Method,
-        body: &B,
-        request_limit: usize,
-        signed_at_ms: u64,
-    ) -> Result<Answer> {
-        Ok(self
-            .dispatch(path, method, body, request_limit, Some(signed_at_ms), None)
             .await?)
     }
 

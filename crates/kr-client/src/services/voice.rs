@@ -95,12 +95,6 @@ pub const VOICE_CONTEXT_PER_MINUTE: u32 = 60;
 /// Context requests one call may make at once before it has to wait.
 pub const VOICE_CONTEXT_BURST: u32 = 10;
 
-/// Returns the control-socket path for one call.
-#[must_use]
-pub fn voice_control_path(call_id: &str) -> String {
-    format!("{VOICE_SESSIONS_PATH}/{}/control", encode_segment(call_id))
-}
-
 /// Returns the path that ends one call without a control socket.
 #[must_use]
 pub fn voice_close_path(call_id: &str) -> String {

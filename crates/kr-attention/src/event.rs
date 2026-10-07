@@ -155,20 +155,6 @@ impl Fingerprint {
         }
         text
     }
-
-    /// Reads a fingerprint back from [`Fingerprint::to_hex`]'s form.
-    #[must_use]
-    pub fn from_hex(text: &str) -> Option<Self> {
-        if text.len() != FINGERPRINT_BYTES * 2 {
-            return None;
-        }
-        let mut bytes = [0u8; FINGERPRINT_BYTES];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let at = index * 2;
-            *byte = u8::from_str_radix(text.get(at..at + 2)?, 16).ok()?;
-        }
-        Some(Self(bytes))
-    }
 }
 
 impl core::fmt::Debug for Fingerprint {

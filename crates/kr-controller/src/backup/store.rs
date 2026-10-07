@@ -2238,33 +2238,6 @@ impl BackupStore {
         Ok(true)
     }
 
-    /// Records the descriptor a generation was sealed with.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn record_descriptor(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-        descriptor: &[u8],
-    ) -> Result<()> {
-        self.connection
-            .run(
-                sql!(
-                    "UPDATE generations SET descriptor = ?3
-                 WHERE archive_id = ?1 AND backup_generation = ?2"
-                ),
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    descriptor,
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        Ok(())
-    }
-
     /// Returns one generation's record.
     ///
     /// # Errors

@@ -294,12 +294,6 @@ impl Lexer {
             .saturating_sub(self.text.len() as u64)
     }
 
-    /// Whether a completed text scalar is being held back for a possible combining mark.
-    #[must_use]
-    pub fn holds_text_tail(&self) -> bool {
-        !self.text.is_empty()
-    }
-
     /// Lexes `input`, appending every finished event to `out`.
     ///
     /// The final scalar of a trailing text run is held back until the next read, so that a

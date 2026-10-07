@@ -172,11 +172,6 @@ impl MockActionRunner {
             .unwrap()
             .insert(node_id.to_owned(), outcome);
     }
-
-    /// Lets the action of `node_id` be stopped once it has begun.
-    pub fn set_stoppable(&self, node_id: &str) {
-        self.stoppable.lock().unwrap().insert(node_id.to_owned());
-    }
 }
 
 impl ActionRunner for MockActionRunner {

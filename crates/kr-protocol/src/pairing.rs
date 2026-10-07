@@ -53,7 +53,7 @@ use crate::ids::{
 };
 use crate::rights::ActionRight;
 use crate::scalars::{
-    AuthorisationKey, Bytes, CanonicalSet, Digest256, EndpointKey, KeyId, Mac256, Nonce256,
+    AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId, Mac256, Nonce256,
     NotificationPreviewKey, Nullable, SecretBytes32, Signature64, StoredEnvelopeKey, TimestampMs,
 };
 
@@ -893,15 +893,6 @@ impl BundleDirection {
         match self {
             Self::ClientToHost => "client_to_host",
             Self::HostToClient => "host_to_client",
-        }
-    }
-
-    /// Returns the HKDF information string of the key that protects this direction.
-    #[must_use]
-    pub const fn info(self) -> &'static str {
-        match self {
-            Self::ClientToHost => INFO_CLIENT_TO_HOST,
-            Self::HostToClient => INFO_HOST_TO_CLIENT,
         }
     }
 }
@@ -2189,9 +2180,6 @@ pub struct GenerationCheckpoint {
     /// When the sending device observed it, in UTC milliseconds.
     pub observed_at_ms: TimestampMs,
 }
-
-/// Opaque bytes carried inside a pairing message, bounded by the pairing frame limit.
-pub type PairingPayload = Bytes;
 
 #[cfg(test)]
 mod tests {

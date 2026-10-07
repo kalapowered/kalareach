@@ -654,11 +654,6 @@ impl PluginClient {
         }
     }
 
-    /// Takes the next notice a binding produced, if one is waiting.
-    pub fn try_notice(&mut self) -> Option<Notice> {
-        self.notices.try_recv()
-    }
-
     /// Waits for the next notice a binding produced.
     pub async fn notice(&mut self) -> Option<Notice> {
         self.notices.recv().await

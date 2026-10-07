@@ -183,12 +183,6 @@ impl SessionLog {
         self.next_cursor
     }
 
-    /// Returns the oldest cursor the host can still serve.
-    #[must_use]
-    pub const fn oldest(&self) -> u64 {
-        self.oldest_cursor
-    }
-
     /// Returns every retained change, oldest first.
     pub fn changes(&self) -> impl Iterator<Item = &Change> {
         self.log.iter()

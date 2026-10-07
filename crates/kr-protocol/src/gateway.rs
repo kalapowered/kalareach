@@ -83,12 +83,6 @@ impl NativeMethodClass {
             Self::Unsupported => "unsupported",
         }
     }
-
-    /// Returns true when a request of this class can change what a rich client is showing.
-    #[must_use]
-    pub const fn affects_rich_state(self) -> bool {
-        matches!(self, Self::Mutation | Self::CredentialOrConfiguration)
-    }
 }
 
 impl fmt::Display for NativeMethodClass {
@@ -978,14 +972,6 @@ pub struct PendingResource {
     /// Section 11: "A pending opaque request is not an actionable approval UI until its
     /// interpretation is verified under the granted decoder."
     pub interpretation_verified: bool,
-}
-
-impl PendingResource {
-    /// Returns true when a client may offer this as an approval a person can answer.
-    #[must_use]
-    pub const fn is_actionable(&self) -> bool {
-        self.interpretation_verified && matches!(self.state, PendingState::Pending)
-    }
 }
 
 /// A transition a pending resource cannot make.

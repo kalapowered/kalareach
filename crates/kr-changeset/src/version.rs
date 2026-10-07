@@ -153,18 +153,6 @@ impl Manifest {
             .collect()
     }
 
-    /// Returns true when every captured path's content came from an immutable Git object.
-    ///
-    /// This is what an atomic snapshot **is** here: the object identifiers came from one index
-    /// listing, which is one instant, and a Git object never changes once it exists. A capture
-    /// that read one byte from the live working tree is not one.
-    #[must_use]
-    pub fn wholly_from_git_objects(&self) -> bool {
-        self.paths
-            .iter()
-            .all(|entry| entry.origin == ContentOrigin::GitObject)
-    }
-
     /// Refuses a manifest whose total exceeds what this host copies.
     ///
     /// # Errors

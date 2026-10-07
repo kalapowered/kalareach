@@ -152,26 +152,6 @@ pub enum LaunchAnswer {
     },
 }
 
-impl LaunchAnswer {
-    /// Returns this answer as a protocol error, when it is one.
-    #[must_use]
-    pub fn error(&self) -> Option<ProtocolError> {
-        match self {
-            Self::Installed(_) => None,
-            Self::Refused { reason, code } => Some(ProtocolError::new(
-                *code,
-                match *code {
-                    ErrorCode::OutcomeUnknown => format!(
-                        "nothing can say whether the launch installed a command: {}",
-                        reason.as_str()
-                    ),
-                    _ => format!("the launch installed no command: {}", reason.as_str()),
-                },
-            )),
-        }
-    }
-}
-
 /// One thing the machine asked the worker to do.
 ///
 /// A step per action, kept in the order the outcome listed them. The order is the contract's, not

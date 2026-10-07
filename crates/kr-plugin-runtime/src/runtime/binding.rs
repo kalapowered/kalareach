@@ -354,12 +354,6 @@ impl Runtime {
         &self.cache
     }
 
-    /// Returns the compilation pool.
-    #[must_use]
-    pub const fn pool(&self) -> &CompilePool {
-        &self.pool
-    }
-
     /// Returns how many bindings are live.
     ///
     /// Zero means no store, no instance and no binding thread exist. A host serving idle shells
@@ -1102,18 +1096,6 @@ impl BindingHandle {
             .await
     }
 
-    /// Replaces the facts the component reads about its binding.
-    ///
-    /// The latest replaces the last rather than queueing behind it: only the current facts are
-    /// worth telling a component, and a caller that revised them twice while a call was running
-    /// did not mean the component to be told the older set afterwards.
-    pub fn set_facts(&self, facts: BindingFacts) {
-        if let Ok(mut slot) = self.pending.facts.lock() {
-            *slot = Some(facts);
-        }
-        self.wake();
-    }
-
     /// Replaces the attachments the current draft holds. Coalesced, as the facts are.
     pub fn set_attachments(&self, attachments: Vec<AttachmentFact>) {
         if let Ok(mut slot) = self.pending.attachments.lock() {
@@ -1158,12 +1140,6 @@ impl BindingHandle {
                 outstanding: held,
                 limit: MAX_OUTSTANDING_CALLS,
             })
-    }
-
-    /// Returns how many calls are waiting for the binding's thread.
-    #[must_use]
-    pub fn outstanding_calls(&self) -> usize {
-        self.outstanding.load(Ordering::Acquire)
     }
 
     /// Returns how many calls into the component have finished.

@@ -507,31 +507,6 @@ pub const ROUTING_RECORD_BYTES: u64 = 256;
 /// The domain the value that claims a mailbox is derived under.
 pub const MAILBOX_CLAIM_DOMAIN: &str = "kr-mailbox-claim/1";
 
-/// What a service asks of a device that says a mailbox is its own.
-///
-/// A mailbox is addressed by the identifier of the recipient's stored-envelope key, and every
-/// paired peer of that recipient knows the key: it is what they seal to. So a service that served
-/// a mailbox to whoever asked for it would serve a person's items to their own peers, and a
-/// service that gave the mailbox to the first caller would let a peer take it. Neither is
-/// acceptable, and neither needs a pairing record to fix: what distinguishes the recipient from
-/// everybody who knows its public key is the private half.
-///
-/// The service generates one ephemeral X25519 keypair per challenge, derives the shared secret
-/// with the claimed recipient key, and asks for [`mailbox_claim_value`] of it. Only the holder of
-/// the recipient's private key can derive the same secret, so the answer proves possession without
-/// the private key leaving the device and without the service holding anything that could open an
-/// envelope: the secret is discarded with the challenge.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MailboxClaimChallenge {
-    /// The mailbox the challenge is about.
-    pub recipient_key_id: KeyId,
-    /// The service's ephemeral X25519 public key for this challenge, and for no other.
-    pub ephemeral_key: StoredEnvelopeKey,
-    /// When the challenge stops being answerable, in UTC milliseconds.
-    pub expires_at_ms: TimestampMs,
-}
-
 /// How long a claim challenge stays answerable, in milliseconds.
 pub const MAILBOX_CLAIM_LIFETIME_MS: u64 = 5 * 60 * 1000;
 

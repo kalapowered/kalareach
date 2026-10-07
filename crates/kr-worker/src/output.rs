@@ -700,19 +700,6 @@ impl OutputHub {
         let _ = subscriber.sender.send(delivery);
     }
 
-    /// Delivers a rendering of the canonical screen to one subscriber.
-    ///
-    /// Returns whether the subscriber was told to resynchronise.
-    pub fn publish_screen(
-        &mut self,
-        attachment_id: AttachmentId,
-        cursor: u64,
-        bytes: &Arc<Vec<u8>>,
-        oldest_retained_cursor: u64,
-    ) -> bool {
-        self.deliver_screen(attachment_id, cursor, bytes, oldest_retained_cursor)
-    }
-
     /// Delivers one projection event to one subscriber.
     ///
     /// A projected attachment is served state rather than bytes, and the state is computed for its
@@ -840,41 +827,6 @@ impl OutputHub {
             })
             .is_err()
         {
-            self.subscribers.remove(&attachment_id);
-        }
-        false
-    }
-
-    fn deliver_screen(
-        &mut self,
-        attachment_id: AttachmentId,
-        cursor: u64,
-        bytes: &Arc<Vec<u8>>,
-        oldest_retained_cursor: u64,
-    ) -> bool {
-        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
-            return false;
-        };
-        if subscriber.resynchronising {
-            return false;
-        }
-        let queued = subscriber.queued.load(Ordering::Acquire);
-        if queued.saturating_add(bytes.len()) > subscriber.limit {
-            if !subscriber.resynchronise(
-                ResyncReason::SendQueueFull,
-                cursor,
-                oldest_retained_cursor,
-            ) {
-                self.subscribers.remove(&attachment_id);
-            }
-            return true;
-        }
-        subscriber.queued.fetch_add(bytes.len(), Ordering::AcqRel);
-        let delivery = OutputDelivery::Screen {
-            cursor,
-            bytes: Arc::clone(bytes),
-        };
-        if subscriber.sender.send(delivery).is_err() {
             self.subscribers.remove(&attachment_id);
         }
         false

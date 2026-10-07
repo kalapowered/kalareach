@@ -283,15 +283,6 @@ impl DescriptionStore {
         from_sqlite(count, "pin count")
     }
 
-    /// Returns whether one session has a pin, as a count of nought or one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DescribeError::Store`] when the read fails.
-    pub fn pin_count_for(&self, session_id: &SessionId) -> Result<u64> {
-        Ok(u64::from(self.pinned(session_id)?.is_some()))
-    }
-
     /// Records a generated description with its provenance, unless the session has a pin.
     ///
     /// A session with a pin is refused here as well as at validation. The check is duplicated on

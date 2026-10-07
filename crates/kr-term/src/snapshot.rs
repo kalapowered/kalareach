@@ -11,7 +11,6 @@
 //! can ring, copy, notify, download, launch or ask anything.
 
 use crate::budget::GridSize;
-use crate::error::{Result, TermError};
 use crate::grid::{GridRow, Link, Rendition};
 use crate::modes::ModeKind;
 use crate::palette::{PaletteSource, Rgb};
@@ -323,26 +322,6 @@ pub struct Delta {
     pub hyperlink: Option<Option<Link>>,
 }
 
-impl Delta {
-    /// Checks that this delta continues from `held`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TermError::CursorGap`] when it does not, which the caller answers with a fresh
-    /// snapshot.
-    pub const fn check_base(&self, held: u64, generation: u64) -> Result<()> {
-        // The generation is part of the base. A projection reset can happen without a byte
-        // arriving, so the same cursor can name two different screens.
-        if self.base_cursor == held && self.projection_generation == generation {
-            return Ok(());
-        }
-        Err(TermError::CursorGap {
-            requested: held,
-            available: self.base_cursor,
-        })
-    }
-}
-
 /// A page of history rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryPage {
@@ -568,12 +547,6 @@ impl LiveForwardingHandoff {
             started_ms: now_ms,
             deadline_ms: now_ms + HANDOFF_WINDOW_MS,
         }
-    }
-
-    /// When the handoff started.
-    #[must_use]
-    pub const fn started_ms(&self) -> u64 {
-        self.started_ms
     }
 
     /// Decides what to do at `now_ms`, given the parser's state.

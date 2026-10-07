@@ -643,13 +643,6 @@ impl PushSenderRecord {
         matches!(self.state, PushSenderState::Active) && now_ms >= self.renewal_opens_at_ms()
     }
 
-    /// Returns true when the credential lasts no longer than section 16 permits.
-    #[must_use]
-    pub const fn credential_lifetime_within_maximum(&self, issued_at_ms: u64) -> bool {
-        let expires = self.credential_expires_at_ms.get();
-        expires > issued_at_ms && expires - issued_at_ms <= DELIVERY_CREDENTIAL_LIFETIME_MS
-    }
-
     /// Returns true when `proposed` leaves the destination, host key and rate policy untouched.
     ///
     /// # Errors

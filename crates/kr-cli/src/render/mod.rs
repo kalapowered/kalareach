@@ -76,19 +76,6 @@ impl ProjectedDisplay {
         }
     }
 
-    /// A terminal whose keyboard protocols are not this attachment's to change at all.
-    ///
-    /// What `--no-probe` on a terminal the host will not let type chooses: nobody was allowed to
-    /// ask this terminal what it had negotiated, and nobody is going to type into it either, so
-    /// nothing installs a protocol that nothing could put back and nothing would use.
-    #[must_use]
-    pub fn without_the_keyboard() -> Self {
-        Self {
-            keyboard: Keyboard::NOTHING,
-            ..Self::default()
-        }
-    }
-
     /// A terminal showing nothing yet, with each keyboard protocol decided on its own terms.
     ///
     /// `level` is whether the person at this terminal can type, because the `modifyOtherKeys` level

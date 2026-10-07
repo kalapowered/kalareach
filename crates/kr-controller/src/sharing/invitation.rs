@@ -47,19 +47,6 @@ pub struct InvitationRecord {
     pub issued_at_ms: u64,
 }
 
-impl InvitationRecord {
-    /// Where this invitation stands at `now_ms`, taking the deadline into account.
-    #[must_use]
-    pub fn state_at(&self, now_ms: u64) -> InvitationState {
-        match self.state {
-            InvitationState::Open if now_ms >= self.preview.expires_at_ms.get() => {
-                InvitationState::Expired
-            }
-            other => other,
-        }
-    }
-}
-
 /// Returns the state a stored wire string names.
 #[must_use]
 pub fn state_of(value: &str) -> Option<InvitationState> {

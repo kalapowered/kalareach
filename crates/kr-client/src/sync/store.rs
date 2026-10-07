@@ -1300,28 +1300,6 @@ impl SyncStore {
         outcome
     }
 
-    /// Reads an object and the note beside it under one hold of the lock.
-    ///
-    /// Together, because a publication decides from both: the revision it is sending and the
-    /// generation it expects to replace. Read separately, another writer could advance the object
-    /// between them, and this one would send an older revision against the newer position, which
-    /// is a comparison it would win, replacing content it had never seen.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::object`] and [`Self::checkpoint`].
-    pub fn object_and_checkpoint(
-        &self,
-        object_id: SyncObjectId,
-    ) -> Result<(Option<SyncObject>, Option<SyncCheckpoint>)> {
-        let guard = self.lock()?;
-        let outcome = self
-            .read_object(object_id)
-            .and_then(|object| Ok((object, self.read_checkpoint(object_id)?)));
-        drop(guard);
-        outcome
-    }
-
     /// Reads one stored object and checks that it is the object its own name says it is.
     ///
     /// The caller holds the lock.

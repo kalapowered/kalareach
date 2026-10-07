@@ -136,19 +136,6 @@ pub trait PairedDirectory: Send + Sync + std::fmt::Debug {
     fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer>;
 }
 
-/// An empty directory: every endpoint is unpaired.
-///
-/// A host with no devices paired yet uses this, and so does a host that serves only the
-/// pre-authorisation pairing surface.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoPairedDevices;
-
-impl PairedDirectory for NoPairedDevices {
-    fn paired_peer(&self, _endpoint_id: &EndpointKey) -> Option<PairedPeer> {
-        None
-    }
-}
-
 /// What the host produced from one `hello` and proof exchange.
 #[derive(Debug)]
 pub enum Admitted {

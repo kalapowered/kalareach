@@ -29,7 +29,6 @@ use kr_ipc::framed::{FrameReader, FrameWriter, split};
 use kr_ipc::paths::Endpoint;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_protocol::frame::StreamKind;
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
@@ -1197,15 +1196,6 @@ pub fn callable() -> &'static [CallKind] {
     &[CallKind::Snapshot, CallKind::Checkpoint, CallKind::Restore]
 }
 
-/// Returns the rights a component is told about by default.
-///
-/// The empty set. The `upstream` import reports what the actor holds so a component can present
-/// controls that will work, and a host with nothing to report reports nothing rather than
-/// guessing.
-#[must_use]
-pub fn no_rights() -> Vec<ActionRight> {
-    Vec::new()
-}
 /// Reads a component payload from inside the packages directory, and nowhere else.
 ///
 /// Blocking work, called off the executor and inside the registration's own deadline.

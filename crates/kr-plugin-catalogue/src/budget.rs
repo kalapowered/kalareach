@@ -306,18 +306,6 @@ impl BudgetLedger {
         self.payload_bytes
     }
 
-    /// Returns the metadata bytes accounted for.
-    #[must_use]
-    pub const fn metadata_bytes(&self) -> u64 {
-        self.metadata_bytes
-    }
-
-    /// Returns the index entries accounted for.
-    #[must_use]
-    pub const fn metadata_entries(&self) -> u64 {
-        self.metadata_entries
-    }
-
     /// Checks a metadata document against the metadata byte budget.
     ///
     /// A generation replaces the previous one rather than adding to it, so the whole snapshot is

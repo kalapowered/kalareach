@@ -667,13 +667,6 @@ impl ProfileDocument {
         self.digest
     }
 
-    /// Returns the document's SHA-256 in lowercase hexadecimal, which is how it is recorded in
-    /// provenance.
-    #[must_use]
-    pub fn digest_hex(&self) -> String {
-        hex_of(&self.digest)
-    }
-
     /// Builds the transcript a signature over this document covers.
     ///
     /// The identifier and the revision are covered beside the digest so a signature over one
@@ -767,16 +760,6 @@ impl ProfileTrust {
             .map_err(|_| DescribeError::ProfileSignatureInvalid)?;
         ModelProfile::from_document(signed.document.bytes())
     }
-}
-
-/// Renders bytes as lowercase hexadecimal.
-fn hex_of(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
-    }
-    out
 }
 
 /// The profiles this build ships, and the rules for choosing between them.

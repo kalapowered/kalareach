@@ -842,13 +842,6 @@ impl Catalogue {
         &self.limits
     }
 
-    /// Returns the adapters an organisation's policy allows, which every admission reads, or
-    /// `None` where every adapter the host qualifies is allowed.
-    #[must_use]
-    pub const fn allowed_adapters(&self) -> Option<&BTreeSet<PluginId>> {
-        self.allowed_adapters.as_ref()
-    }
-
     /// Puts the adapters an organisation's policy allows in force from the next admission, or
     /// every adapter with `None`, and returns whether that changed what was in force.
     ///
