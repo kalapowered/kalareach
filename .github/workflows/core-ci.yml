@@ -179,17 +179,17 @@ jobs:
           git --version
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
-      # Seventeen checks put a mount inside the tree they look at, from inside a mount namespace
+      # Eighteen checks put a mount inside the tree they look at, from inside a mount namespace
       # this account creates: seven put a bind mount there (three in change-set capture, two in the
-      # transfer authority and two in project locations), and ten mount another filesystem where a
-      # directory a service recorded was (three in the transfer service, four in the project
+      # transfer authority and two in project locations), and eleven mount another filesystem where
+      # a directory a service recorded was (three in the transfer service, five in the project
       # service and three in the change-set service). Ubuntu 24.04 denies an unprivileged account
       # that namespace unless AppArmor's restriction on it is lifted, and each check fails rather
       # than passes where it cannot make one, so the workspace test above leaves them out. This
       # step lifts the restriction for itself on this runner and puts it back however the step
-      # ends, shows the namespace refused before and given after, and runs the seventeen by name.
+      # ends, shows the namespace refused before and given after, and runs the eighteen by name.
       # A name that matched no test would run nothing and still exit 0, so the step counts the
-      # seventeen it saw pass.
+      # eighteen it saw pass.
       - name: Mount checks inside a mount namespace of this account's own
         # Whatever the steps before it did, like the boundary step above.
         if: ${{ !cancelled() }}
@@ -214,6 +214,7 @@ jobs:
             a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
             a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
             a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
+            a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
           )
           log="$RUNNER_TEMP/mount-checks.log"
           : >"$log"
@@ -251,7 +252,7 @@ jobs:
           cargo test --locked -p kr-transfer --test filesystems -- --ignored --exact --color never \
             "${checks[@]:7:3}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-project --test workspaces -- --ignored --exact --color never \
-            "${checks[@]:10:2}" 2>&1 | tee -a "$log" || failed=1
+            "${checks[@]:10:2}" "${checks[@]:17:1}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-project --lib -- --ignored --exact --color never \
             "${checks[@]:13:1}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-changeset --test filesystems -- --ignored --exact --color never \
@@ -1562,6 +1563,7 @@ jobs:
           --skip a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
           --skip a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
           --skip a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+          --skip a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
           --skip owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
           --skip a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
           --skip a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
@@ -1597,6 +1599,7 @@ jobs:
             a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
             a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
             a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+            a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
             owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
             git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
             a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
