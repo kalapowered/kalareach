@@ -118,6 +118,12 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          restoration's own, which follows a carriage return and a plain rendition, so xterm's \
          reset has no wrap to keep and no faint, crossed-out or doubly underlined state to leave \
          set.",
+        "ESC 8 restores a pending wrap. The library saves the wrap with the cursor and puts it \
+         back, as xterm does, where Terminal.app and iTerm2 restore the position and not the \
+         wrap, so the next character lands on the last column and not on the row below. A \
+         terminal that does not give the wrap back places that character differently from the \
+         grid, so direct mode needs one that does. A restoration cannot set a saved wrap, because \
+         only a print into the last column sets one, so it counts one as not carried.",
     ],
     qualified_additions: &[
         QualifiedAddition {
