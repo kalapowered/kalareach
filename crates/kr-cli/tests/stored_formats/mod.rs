@@ -210,7 +210,12 @@ pub fn digest(store: &Store, ddl: &[String]) -> Result<String, String> {
         kept.insert(item.label(), value);
     }
     let mut owned: Vec<String> = vec![store.entry.path.clone()];
-    owned.extend(store.owned.iter().map(|claim| claim.name.to_owned()));
+    owned.extend(
+        store
+            .owned
+            .iter()
+            .map(|claim| format!("{}: {}", claim.name, claim.children.join(", "))),
+    );
     owned.sort();
     let basis = json!({ "ddl": ddl, "kept": kept, "owned": owned });
     let bytes = canonical(&basis).into_bytes();
@@ -523,8 +528,39 @@ pub struct Observed {
 
 /// What differs between the code and the lock, in words that say what to do.
 #[must_use]
-pub fn findings(lock: &Lock, observed: &[Observed]) -> Vec<String> {
+pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<String> {
     let mut found = Vec::new();
+    for name in named {
+        let kept = lock
+            .named
+            .iter()
+            .find(|locked| locked.scope == name.scope && locked.path == name.name);
+        match kept {
+            None => found.push(format!(
+                "{} under the {} is named in the code and not in stored-formats.lock: write the lock",
+                name.name,
+                scope_name(name.scope)
+            )),
+            Some(locked) if locked.reason != name.reason => found.push(format!(
+                "the reason {} under the {} has no version gives differs from the lock's: write the lock",
+                name.name,
+                scope_name(name.scope)
+            )),
+            Some(_) => {}
+        }
+    }
+    for locked in &lock.named {
+        if !named
+            .iter()
+            .any(|name| name.scope == locked.scope && name.name == locked.path)
+        {
+            found.push(format!(
+                "the lock names {} under the {} and the code does not",
+                locked.path,
+                scope_name(locked.scope)
+            ));
+        }
+    }
     for now in observed {
         let name = &now.entry.store;
         let Some(locked) = lock
@@ -591,6 +627,17 @@ pub fn write(
 ) -> Result<Lock, Vec<String>> {
     let mut refused = Vec::new();
     if let Some(committed) = committed {
+        for locked in &committed.stores {
+            if !observed
+                .iter()
+                .any(|now| now.entry.store == locked.entry.store)
+            {
+                refused.push(format!(
+                    "the store {} would leave the lock: a store the code stops declaring is removed from the lock by hand, in a change that shows it",
+                    locked.entry.store
+                ));
+            }
+        }
         for now in observed {
             let Some(locked) = committed
                 .stores
@@ -697,7 +744,13 @@ fn claims_in(scope: StoreScope, table: &[Store], named: &[Named]) -> Vec<(String
                 ));
             }
         };
-    for store in table.iter().filter(|store| store.entry.scope == scope) {
+    // The configuration document is in an environment's state directory unless the environment keeps
+    // it elsewhere, so a run that finds one there finds a name that is claimed.
+    let in_scope = |store: &Store| {
+        store.entry.scope == scope
+            || (scope == StoreScope::Environment && store.entry.scope == StoreScope::Configuration)
+    };
+    for store in table.iter().filter(|store| in_scope(store)) {
         let parts: Vec<&str> = store.entry.path.split('/').collect();
         let sqlite = matches!(
             store.entry.recording,
@@ -706,7 +759,9 @@ fn claims_in(scope: StoreScope, table: &[Store], named: &[Named]) -> Vec<(String
         if parts.len() == 1 {
             claim(parts[0].to_owned(), Vec::new(), false, false, sqlite);
         } else {
-            let leaked: &'static str = Box::leak(parts[1..].join("/").into_boxed_str());
+            // The first part is the directory, and the second what it holds directly: a name, a
+            // pattern, or a directory of records that is looked into no further.
+            let leaked: &'static str = Box::leak(parts[1].to_owned().into_boxed_str());
             claim(parts[0].to_owned(), vec![leaked], false, false, false);
         }
         for owned in &store.owned {

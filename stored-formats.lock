@@ -14,7 +14,7 @@
         "version": 1,
         "migrates_from": 0
       },
-      "digest": "7215d2c700261e7b1a7e530074cf4497fa563a3c5a70301e72574fc12241bf2d",
+      "digest": "63aa3a1c41e66ca5062ccb98c95d2bbe11ba2e4516a8725fcf3d14edcc1cb05b",
       "kept": [
         "AgentToolsInstallResult",
         "ActionRecord (crates/kr-controller/src/agent_tools.rs)"
@@ -51,7 +51,7 @@
         "version": 10,
         "migrates_from": 9
       },
-      "digest": "440635d01a227c895f04f0c43c77a9e72e865dfc39cba99024d3185b300e38ce",
+      "digest": "b5ab0d1037646db041bb2f5e4d9698651c1471ffba3be7aae8bc419d94d8cc1a",
       "kept": [
         "AttentionAcknowledgeResult",
         "AttentionQuietHoursResult",
@@ -88,9 +88,19 @@
         "version": 1,
         "migrates_from": 0
       },
-      "digest": "7e043cefb9c2b609ff1490481135e3371a02f047afe482ba9f927c5d2482aafb",
+      "digest": "6699b8806b8192a662269fcf6d1ad6b2a468c0a0bc388f01d7c04575df597bc4",
       "kept": [
         "EnrolmentBudgets",
+        "CatalogueAddResult",
+        "CatalogueSyncResult",
+        "CataloguePinResult",
+        "CatalogueRemoveResult",
+        "PluginInstallResult",
+        "PluginRemoveResult",
+        "PluginPinResult",
+        "PluginEnableResult",
+        "PluginGrantResult",
+        "ProtocolError",
         "CapabilityRequest",
         "MetadataVersions (crates/kr-plugin-catalogue/src/trust.rs)",
         "words of capability names"
@@ -108,7 +118,7 @@
         "version": 3,
         "migrates_from": 3
       },
-      "digest": "77be3dbc4780ffc6c8b81f1bffeac5cc3a7e2299a1a98988e73e8fad42831e4e",
+      "digest": "b694caeafd36115d66bc1cd727a81ff08058a27a7424c8ecd61914c297125244",
       "kept": [
         "ChangeSetVersionRecord",
         "MaterialisationRecord",
@@ -221,7 +231,7 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "c4220a15d96688caf8eb19165f043832e556f39afb26447ac7dfe49017b7889e",
+      "digest": "cce6c71baa55e491352d9660a867408f7f10555648dae52d7e231aa6c0986990",
       "kept": [
         "Record, Transaction, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)"
       ]
@@ -257,9 +267,10 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "af7418ea95fa5c6f3370de3637cbdadf61df925a9c8d63f671deea55789c81be",
+      "digest": "75bad157991f441a1901251bf84d094e39ec0fc94e76f32bfcaa2622bfa3cbae",
       "kept": [
-        "Journal, State, Release, Change, Publication, Kept (crates/kr-controller/src/catalogue/native_bridge/journal.rs)"
+        "Journal, State, Release, RecordedFacts, Removal, Change, Staging, Publication, Kept (crates/kr-controller/src/catalogue/native_bridge/journal.rs)",
+        "Identity (crates/kr-controller/src/catalogue/native_bridge/tree.rs)"
       ]
     },
     {
@@ -289,7 +300,7 @@
         "version": 8,
         "migrates_from": 1
       },
-      "digest": "6bba0ee429c4f1b5474a5c4870834efefe52212a473aea1c555b9b75b5faeae9",
+      "digest": "86ddcc993cdc6ac5846bf257cf7ea5e0883d02abd876777fe1b58a1f9ec10b17",
       "kept": [
         "ProjectInitResult",
         "ProjectCloneResult",
@@ -318,7 +329,7 @@
         "version": 7,
         "migrates_from": 1
       },
-      "digest": "61b32d84da7f1f6419e00953044ee2cc5e001b00946e8c13f4b87c4fd2d0f281",
+      "digest": "a785dd83648e43fb40e824c6e5047b283b600a0899edb123b9ebd2ee62afd246",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -337,7 +348,8 @@
         "OwnerConfirmationProof",
         "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation (crates/kr-controller/src/grants/durable.rs)",
         "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
-        "KeyDeclaration (crates/kr-controller/src/net/devices.rs)"
+        "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
+        "words of launch phases"
       ]
     },
     {
@@ -388,7 +400,7 @@
         "version": 2,
         "migrates_from": 1
       },
-      "digest": "fcd677920d44122ee57f1a19b345a8e4a92c5cc12c80fcb36b7b78b4a29ceb9c",
+      "digest": "84716b9ffd239748c85f547dcc9d9e50daf363ec4f6cfda0a4d9395d43438122",
       "kept": [
         "UploadBeginResult",
         "UploadChunkResult",
@@ -411,7 +423,7 @@
         "version": 7,
         "migrates_from": 6
       },
-      "digest": "940c00f2f0d4e1bbe95f839d2115bf39adb16aeba0b9dfa0a21fc6480b19c2aa",
+      "digest": "9a713af0d46c27fe20cbf8255f9b8e99d1d6be5098afef691633a79dfff84c4f",
       "kept": [
         "WorkflowDefinition",
         "NodeOutput",
@@ -424,7 +436,7 @@
         "RequestReviewParams",
         "AttentionNoticeParams",
         "SessionCreateParams",
-        "StoredEvent (crates/kr-automation/src/store.rs)"
+        "StoredEvent, JournalEventKind (crates/kr-automation/src/store.rs)"
       ]
     }
   ],
@@ -497,7 +509,7 @@
     {
       "scope": "environment",
       "path": "jobs",
-      "reason": "per-session launch definitions and their diagnostics, named by session and read by the daemon that started them"
+      "reason": "per-session launch definitions and their diagnostics, named by session and read by every daemon's sweep, so a name does not change"
     },
     {
       "scope": "environment",

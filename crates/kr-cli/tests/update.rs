@@ -577,6 +577,15 @@ fn places() -> &'static (Mutex<usize>, std::sync::Condvar) {
     &PLACES
 }
 
+/// A stand-in for an agent that a session's shell started: a process that runs until the test lets go
+/// of the pipe it reads.
+struct Agent {
+    /// The identity the kernel gives its process.
+    identity: kr_protocol::identity::ProcessStartIdentity,
+    /// The pipe it reads, held open for as long as it should run.
+    _life: std::fs::File,
+}
+
 /// A host tree with a store of releases in it, and the daemons this test started.
 ///
 /// However a test ends, what it started ends with it: a daemon still serving the tree is handed
@@ -1105,26 +1114,33 @@ impl Host {
     /// Creates a session with a release's `kr` whose root shell starts a stand-in agent, a process
     /// of its own that outlasts anything the shell does, and then goes on as the shell.
     ///
-    /// Returns the session's display number and identifier, and the identity the kernel gives the
-    /// agent's process.
-    fn new_session_with_an_agent(
-        &self,
-        kr: &Path,
-        name: &str,
-    ) -> (
-        String,
-        SessionId,
-        kr_protocol::identity::ProcessStartIdentity,
-    ) {
+    /// The agent reads a pipe this test holds open, and ends when the test lets go of it, however
+    /// the test ends. Returns the session's display number and identifier, and the agent.
+    fn new_session_with_an_agent(&self, kr: &Path, name: &str) -> (String, SessionId, Agent) {
         let directory = self.scratch(&format!("agent-{name}"));
         let pid_file = directory.join("pid");
+        let life = directory.join("life");
+        let made = Command::new("mkfifo")
+            .arg(&life)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe is made");
+        // Open for reading and writing, which a pipe allows without waiting for the other end: the
+        // agent sees the end of its input when this descriptor is closed, and not before.
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&life)
+            .expect("the pipe is held");
         // Named for the shell it goes on as, because the worker recognises a shell by its name.
         let shell = directory.join("sh");
         std::fs::write(
             &shell,
             format!(
-                "#!/bin/sh\n/bin/sleep 600 &\nprintf '%s\\n' \"$!\" > '{pid}.partial'\n\
+                "#!/bin/sh\n/bin/cat < '{life}' > /dev/null &\n\
+                 printf '%s\\n' \"$!\" > '{pid}.partial'\n\
                  mv '{pid}.partial' '{pid}'\nexec /bin/sh \"$@\"\n",
+                life = life.display(),
                 pid = pid_file.display()
             ),
         )
@@ -1175,8 +1191,15 @@ impl Host {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        let agent = kr_ipc::identity::started_process_identity(pid).expect("the agent runs");
-        (created["display_number"].to_string(), session_id, agent)
+        let identity = kr_ipc::identity::started_process_identity(pid).expect("the agent runs");
+        (
+            created["display_number"].to_string(),
+            session_id,
+            Agent {
+                identity,
+                _life: hold,
+            },
+        )
     }
 
     /// What a session's worker states about its build, from its answer to a hello.
@@ -2044,10 +2067,8 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     assert_eq!(output.status.code(), Some(1), "{said}");
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
-        message.contains(&format!(
-            "environment {}'s registry could not be read: ",
-            other.environment_id()
-        )) && message.contains("not a file"),
+        message.contains(&other.environment_id().to_string())
+            && message.contains("is not a regular file"),
         "the pipe is refused by the reader, and never opened: {said}"
     );
     assert!(
@@ -4823,11 +4844,9 @@ async fn a_rollback_goes_back_to_the_release_before_and_moves_no_live_session() 
             host.worker_build(session).await,
             format!("kr-worker/{}", release.name())
         );
-        assert!(
-            !matches!(
-                kr_ipc::identity::process_state(agent),
-                kr_ipc::identity::ProcessState::Ended
-            ),
+        assert_eq!(
+            kr_ipc::identity::process_state(&agent.identity),
+            kr_ipc::identity::ProcessState::Running,
             "the agent in the shell of the session started under {} runs on",
             release.name()
         );
@@ -5053,7 +5072,7 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
     );
     assert!(
         message.contains(&format!("environments of environment {named}"))
-            && message.contains("is not JSON"),
+            && message.contains("environments.json cannot be read"),
         "the record that cannot be read is named: {said}"
     );
     assert!(
@@ -5111,11 +5130,8 @@ async fn a_rollback_waits_for_a_session_the_older_release_does_not_retain() {
     );
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
-        message.contains(&format!(
-            "the rollback to {} waits: session {display} runs kr-worker/{}",
-            one.name(),
-            two.name()
-        )) && message.contains("kr host rollback again"),
+        message.contains(one.name().as_str())
+            && message.contains(&format!("session {display} runs kr-worker/{}", two.name())),
         "{said}"
     );
     assert_eq!(
@@ -5176,7 +5192,8 @@ async fn a_rollback_needs_an_older_release_in_the_store() {
 /// update that waits trusts nothing it has not switched to, so it can be run again once what held
 /// it has gone; once the host has switched to release two, a rollback to release one, whose own
 /// root is the first, still trusts the second: an archive signed with the retired key is refused
-/// and one signed with the new key is taken.
+/// and one signed with the new key is taken. The archive release two came in, which only the retired
+/// key signed, is refused too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
     let mut host = Host::bare();
@@ -5256,6 +5273,19 @@ async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
         "going back does not give the second root up"
     );
 
+    // The release just left comes in an archive only the retired key signed, so it is not taken
+    // again from that archive.
+    let (output, said) = update(&archive_two);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the archive of the release left is signed by the retired key and is refused: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+
     // A later release of the second root, signed with the key that root retired: refused.
     let three = Assembled::new(
         "0.3.0+cccccccccccc",
@@ -5310,13 +5340,6 @@ async fn a_host_whose_daemon_has_run() -> Host {
         host.stop_the_daemon().await,
         "the daemon is stopped through its own door"
     );
-    // The pairing tables are made when the daemon's network endpoint opens, which this host's daemon
-    // does not reach: the file is given them as that start gives them.
-    let registry = host.tree.environment().registry_database();
-    let devices = kr_controller::service::net::devices::DeviceDirectory::open(&registry)
-        .expect("the device store opens");
-    kr_controller::service::net::invitations::prepare(&devices).expect("the pairing tables");
-    drop(devices);
     host
 }
 
@@ -5352,8 +5375,11 @@ fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     let host = a_host_whose_daemon_has_run().await;
-    let found =
-        stored_formats::findings(&stored_formats::Lock::committed(), &observed_stores(&host));
+    let found = stored_formats::findings(
+        &stored_formats::Lock::committed(),
+        &observed_stores(&host),
+        &stored_formats::table::named(),
+    );
     assert!(
         found.is_empty(),
         "stored-formats.lock does not match the code:\n{}",
@@ -5433,7 +5459,8 @@ async fn write_the_lock() {
 
 /// KR-REQ-26.10: the check says what to do about each way the code and the lock can differ, and the
 /// writer refuses the ways that are a change nobody gave a version to: a digest that moved while the
-/// version stood still, a version that went down and a store that is kept somewhere else.
+/// version stood still, a version that went down, a store that is kept somewhere else and a store
+/// that is dropped.
 #[test]
 fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
     let store = |version: u32, digest: &str, path: &str| stored_formats::Observed {
@@ -5453,13 +5480,13 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
     let lock = stored_formats::write(None, &[store(7, "aa", "registry.sqlite")], &[])
         .expect("a first lock is written");
     assert!(
-        stored_formats::findings(&lock, &[store(7, "aa", "registry.sqlite")]).is_empty(),
+        stored_formats::findings(&lock, &[store(7, "aa", "registry.sqlite")], &[]).is_empty(),
         "the lock matches itself"
     );
 
     // The tables or a kept value changed and the version stood still.
     let moved = [store(7, "bb", "registry.sqlite")];
-    let found = stored_formats::findings(&lock, &moved);
+    let found = stored_formats::findings(&lock, &moved, &[]);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(
         found[0].contains("registry") && found[0].contains("raise the version"),
@@ -5470,20 +5497,24 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
 
     // The version was raised, and the lock is behind; then it is written.
     let raised = [store(8, "bb", "registry.sqlite")];
-    let found = stored_formats::findings(&lock, &raised);
+    let found = stored_formats::findings(&lock, &raised, &[]);
     assert!(found[0].contains("write the lock"), "{found:?}");
     let written = stored_formats::write(Some(&lock), &raised, &[]).expect("is written");
-    assert!(stored_formats::findings(&written, &raised).is_empty());
+    assert!(stored_formats::findings(&written, &raised, &[]).is_empty());
 
-    // A version that went down, and a store kept somewhere else, are not written either.
+    // A version that went down, a store kept somewhere else and a store that is dropped are not
+    // written either.
     assert!(
         stored_formats::write(Some(&written), &[store(7, "aa", "registry.sqlite")], &[]).is_err()
     );
     assert!(
         stored_formats::write(Some(&written), &[store(8, "bb", "elsewhere.sqlite")], &[]).is_err()
     );
+    let dropped =
+        stored_formats::write(Some(&written), &[], &[]).expect_err("a dropped store is refused");
+    assert!(dropped[0].contains("would leave the lock"), "{dropped:?}");
     // And a store the lock lists that the code does not declare is found.
-    assert!(!stored_formats::findings(&written, &[]).is_empty());
+    assert!(!stored_formats::findings(&written, &[], &[]).is_empty());
 }
 
 /// What the digest leaves out and what it keeps: the words of a doc comment, the spacing and the

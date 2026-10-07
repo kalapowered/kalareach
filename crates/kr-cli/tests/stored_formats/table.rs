@@ -48,9 +48,10 @@ fn entry(
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn table() -> Vec<Store> {
+    use kr_controller::registry::LaunchPhase;
     use kr_protocol::{
-        action, archive, attention, automation, changeset, grant, hostinfo, invitation, machine,
-        mailbox, pairing, project, push, session, sharing, skill, transfer, voice,
+        action, archive, attention, automation, catalogue, changeset, grant, hostinfo, invitation,
+        machine, mailbox, pairing, project, push, session, sharing, skill, transfer, voice,
     };
 
     let mut stores = vec![
@@ -137,6 +138,20 @@ pub fn table() -> Vec<Store> {
                 Kept::Source(
                     "crates/kr-controller/src/net/devices.rs",
                     &["KeyDeclaration"],
+                ),
+                Kept::Words(
+                    "launch phases",
+                    [
+                        LaunchPhase::Reserved,
+                        LaunchPhase::Spawned,
+                        LaunchPhase::Claimed,
+                        LaunchPhase::Live,
+                        LaunchPhase::Fenced,
+                        LaunchPhase::Failed,
+                        LaunchPhase::Closed,
+                    ]
+                    .map(|phase| phase.as_str().to_owned())
+                    .to_vec(),
                 ),
             ],
         },
@@ -239,7 +254,10 @@ pub fn table() -> Vec<Store> {
                 protocol::<automation::RequestReviewParams>("RequestReviewParams"),
                 protocol::<automation::AttentionNoticeParams>("AttentionNoticeParams"),
                 protocol::<session::SessionCreateParams>("SessionCreateParams"),
-                Kept::Source("crates/kr-automation/src/store.rs", &["StoredEvent"]),
+                Kept::Source(
+                    "crates/kr-automation/src/store.rs",
+                    &["StoredEvent", "JournalEventKind"],
+                ),
             ],
         },
         Store {
@@ -254,6 +272,16 @@ pub fn table() -> Vec<Store> {
             owned: Vec::new(),
             kept: vec![
                 protocol::<hostinfo::configuration::EnrolmentBudgets>("EnrolmentBudgets"),
+                protocol::<catalogue::CatalogueAddResult>("CatalogueAddResult"),
+                protocol::<catalogue::CatalogueSyncResult>("CatalogueSyncResult"),
+                protocol::<catalogue::CataloguePinResult>("CataloguePinResult"),
+                protocol::<catalogue::CatalogueRemoveResult>("CatalogueRemoveResult"),
+                protocol::<catalogue::PluginInstallResult>("PluginInstallResult"),
+                protocol::<catalogue::PluginRemoveResult>("PluginRemoveResult"),
+                protocol::<catalogue::PluginPinResult>("PluginPinResult"),
+                protocol::<catalogue::PluginEnableResult>("PluginEnableResult"),
+                protocol::<catalogue::PluginGrantResult>("PluginGrantResult"),
+                protocol::<kr_protocol::error::ProtocolError>("ProtocolError"),
                 protocol::<kr_plugin_sdk::capability::CapabilityRequest>("CapabilityRequest"),
                 Kept::Source(
                     "crates/kr-plugin-catalogue/src/trust.rs",
@@ -438,17 +466,26 @@ pub fn table() -> Vec<Store> {
                 kr_controller::catalogue::native_bridge::JOURNAL_VERSION,
             ),
             owned: Vec::new(),
-            kept: vec![Kept::Source(
-                "crates/kr-controller/src/catalogue/native_bridge/journal.rs",
-                &[
-                    "Journal",
-                    "State",
-                    "Release",
-                    "Change",
-                    "Publication",
-                    "Kept",
-                ],
-            )],
+            kept: vec![
+                Kept::Source(
+                    "crates/kr-controller/src/catalogue/native_bridge/journal.rs",
+                    &[
+                        "Journal",
+                        "State",
+                        "Release",
+                        "RecordedFacts",
+                        "Removal",
+                        "Change",
+                        "Staging",
+                        "Publication",
+                        "Kept",
+                    ],
+                ),
+                Kept::Source(
+                    "crates/kr-controller/src/catalogue/native_bridge/tree.rs",
+                    &["Identity"],
+                ),
+            ],
         },
         Store {
             entry: entry(
@@ -662,7 +699,7 @@ pub fn named() -> Vec<Named> {
         content(
             StoreScope::Environment,
             "jobs",
-            "per-session launch definitions and their diagnostics, named by session and read by the daemon that started them",
+            "per-session launch definitions and their diagnostics, named by session and read by every daemon's sweep, so a name does not change",
         ),
         content(
             StoreScope::Environment,
