@@ -48,8 +48,10 @@ impl Controller {
     /// which records nothing here: its first attempt did. A prompt that names a draft and still has
     /// its window is told from a repeat by the worker's own receipt before anything is recorded.
     ///
-    /// A worker the registry lists and the directory does not hold is looked for again before the
-    /// session is said to be unknown.
+    /// A session that closed is closed to the prompt whichever way the daemon learns it: the closure
+    /// is recorded before the daemon looks for the worker, or while the prompt waits for the
+    /// daemon's link to it. A worker the registry lists and the directory does not hold is looked
+    /// for again before the session is said to be unknown.
     ///
     /// # Errors
     ///
@@ -119,23 +121,49 @@ impl Controller {
                     .deadline
                     .saturating_duration_since(self.clock.now())
             });
-        let mut link = tokio::time::timeout_at(budget, self.worker_client(&worker))
-            .await
-            .map_err(|_| ControllerError::Uncertain {
-                detail: "the connection to the worker that owns this session did not come free \
-                         in the time this prompt was given, so nothing was sent"
-                    .to_owned(),
-            })??;
+        // Nothing has been sent until the prompt is forwarded, so a prompt that finds no link to
+        // take, whether it waited too long, the worker is gone or its session is, has not reached
+        // the worker. If the session's closure was recorded meanwhile, the record is the answer.
+        let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
+            Ok(Ok(link)) => link,
+            Ok(Err(error)) => return Err(self.closed_or(session_id, error).await),
+            Err(_) => {
+                return Err(self
+                    .closed_or(
+                        session_id,
+                        ControllerError::Uncertain {
+                            detail: "the connection to the worker that owns this session did \
+                                     not come free in the time this prompt was given, so nothing \
+                                     was sent"
+                                .to_owned(),
+                        },
+                    )
+                    .await);
+            }
+        };
         // The admission is asked once the link is held, because holding it is where the wait was.
         // A deadline that ran out while this prompt queued is refused, and nothing is recorded or
         // sent for it. An exact repeat carries no deadline and goes on to the worker, which is
         // the only thing that knows whether it holds this action's receipt.
+        //
+        // A closure recorded while the prompt queued is asked once the admission has been, under
+        // the lock a closure is recorded under, so that the closure answers and not whatever the
+        // worker of a session that has closed then does with the link. Once it is recorded, a prompt
+        // is answered from it, a repeat included, as it is when the closure came before the look at
+        // the directory; nothing is recorded or sent. A closure that lands after this check is a
+        // failure of the worker's own, which the exchange below answers as such.
         let checked = async {
             let registry = self.registry.lock().await;
             match self.check_admission(&registry, &carried) {
-                Ok(()) | Err(ControllerError::WindowExpired { .. }) if accepted.is_none() => Ok(()),
-                other => other,
+                Ok(()) | Err(ControllerError::WindowExpired { .. }) if accepted.is_none() => {}
+                other => other?,
             }
+            if registry.closure(session_id)?.is_some() {
+                return Err(ControllerError::SessionClosed {
+                    session: session_id.to_string(),
+                });
+            }
+            Ok(())
         }
         .await;
         if let Err(error) = checked {
