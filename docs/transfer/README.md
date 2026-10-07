@@ -74,7 +74,8 @@ those sessions can run a worker, the host puts what each names under its retenti
 reading them. An attachment that none of them names stays on the seven-day window. The host cannot
 tell whether such a prompt sent it, and keeping all of them would keep the files of every such
 draft indefinitely. A local prompt for a session that has closed is refused as `SESSION_CLOSED` from
-its closure record, including one whose session closed while the prompt waited to reach the worker. A
+its closure record, a first prompt that waited for the worker included; an exact repeat the worker
+can answer gets its receipt. A
 prompt containing only prompt text, and therefore having no draft name, may be served to the worker on its
 own socket. A draft is sent to one session, and an attachment belongs to one. The
 attachments the draft holds, and any it gets later, can only be held by the session it was sent to.
