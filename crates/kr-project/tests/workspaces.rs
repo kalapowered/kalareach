@@ -10,7 +10,6 @@
 //! `tests/boundary.rs`.
 
 #![cfg(not(windows))]
-#![cfg(feature = "git-fixtures")]
 
 mod support;
 
@@ -1431,8 +1430,8 @@ fn a_clone_whose_git_directory_is_a_file_naming_another_repository_is_not_read()
     );
 }
 
-/// A clone recorded before its repository was takes the repository it has the first time it is
-/// opened, and is held to that one from then on.
+/// A clone recorded before its repository was takes the repository it has the first time a use
+/// that writes opens it, and is held to that one from then on.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn an_independent_clone_recorded_without_its_git_directory_is_held_to_the_one_it_is_found_with() {
@@ -1476,7 +1475,7 @@ fn an_independent_clone_recorded_without_its_git_directory_is_held_to_the_one_it
         .expect("the record is made as an earlier build made it");
     assert_eq!(recorded(), (None, None));
 
-    // The first read takes the repository the clone has, and reads it.
+    // The first removal's measurement takes the repository the clone has, and reads it.
     let _ = git_started_in(&started, &named);
     let held = measured(&fixture, workspace_id, 121);
     assert!(

@@ -20,7 +20,6 @@
 //!
 //! KR-ACC-030, KR-REQ-14.06, KR-REQ-14.21, KR-REQ-14.23 and KR-REQ-14.24.
 
-#![cfg(feature = "git-fixtures")]
 #![cfg_attr(
     windows,
     expect(

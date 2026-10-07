@@ -906,10 +906,12 @@ fn rename_no_replace(
 }
 
 /// What an interrupted publication turned out to be.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Reconciliation {
-    /// The rename landed: the destination holds the object that was staged.
-    Published,
+    /// The rename landed: the destination holds the object that was staged, and this is the
+    /// directory the witness was checked against, held open so that a later step is decided
+    /// against that object and not against whatever holds the name by then.
+    Published(AuthorisedDirectory),
     /// The rename did not land: the staging directory still holds it.
     Staged,
     /// Neither name holds it, so this host cannot say what happened.
@@ -935,7 +937,7 @@ pub fn reconcile(
     if let Ok(published) = parent.subdirectory(destination.name())
         && staged.is_the_object_in(&published)
     {
-        return Ok(Reconciliation::Published);
+        return Ok(Reconciliation::Published(published));
     }
     if let Some(staging) = staging
         && let Ok(found) = staged_tree_in(&staging.directory)

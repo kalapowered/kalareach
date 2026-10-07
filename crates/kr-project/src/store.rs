@@ -178,8 +178,8 @@ pub struct WorkspaceRow {
     pub identity: Option<RecordedIdentity>,
     /// The stable filesystem identity of an independent clone's own Git directory, which is the
     /// repository the clone is. Absent on any other workspace, which shares its project's
-    /// repository, and on a clone an earlier build recorded: its first successful open records the
-    /// directory it finds.
+    /// repository, and on a clone an earlier build recorded: the first open that writes (a capture,
+    /// a removal's measurement, a recovery) records the directory it finds.
     pub git_dir: Option<RecordedIdentity>,
     /// The path its working tree is at.
     pub display_path: String,
@@ -2789,8 +2789,9 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("workspaces", "relative_path", "TEXT"),
         // The filesystem each recorded directory was on. A row without one was written before
         // directories were recorded with their filesystem: its first successful check decides it
-        // by its device number and inode, as every record was decided, and records the filesystem
-        // it found (`Settled::Revised`). Remove these entries, with the handling of a record
+        // by its device number and inode, as every record was decided, and a use that writes
+        // records the filesystem it found (`Settled::Revised`). Remove these entries, with the
+        // handling of a record
         // without a filesystem in `kr_transfer::filesystem::settle`, once no supported upgrade
         // starts from a store written before filesystems were recorded; a record that no use has
         // settled by then is refused, and recorded again.
@@ -2801,7 +2802,7 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("operations", "staging_fs", "BLOB"),
         ("operations", "staged_fs", "BLOB"),
         // An independent clone's own Git directory. A clone an earlier build recorded has none:
-        // its first successful open records the directory it finds
+        // the first open that writes records the directory it finds
         // (`crate::identity::GitDirOutcome::Found`, written by `record_workspace_git_dir`), and
         // every open after that decides the directory by the record. Remove these entries, with
         // the arm of `settle_workspace_records` that writes `Found` and `record_workspace_git_dir`,

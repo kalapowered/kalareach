@@ -6,7 +6,6 @@
 //! other one from the fourth on as well. This is the first half, on its own in this test program
 //! so that no other test opens descriptors while it counts them.
 
-#![cfg(feature = "git-fixtures")]
 #![cfg(target_os = "linux")]
 
 mod support;

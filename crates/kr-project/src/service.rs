@@ -875,7 +875,9 @@ impl ProjectService {
             Err(error) => return Err(error),
         };
         match reconciled {
-            Reconciliation::Published => self.finish_publication(row, destination, staged, staging),
+            Reconciliation::Published(published) => {
+                self.finish_publication(row, destination, staged, &published, staging)
+            }
             Reconciliation::Staged => {
                 // The rename did not land. Finishing it is the same operation rather than another
                 // clone, which is what reconciling against the create token means.
@@ -883,7 +885,9 @@ impl ProjectService {
                     return Ok(ResolvedStep::Unresolved(None));
                 };
                 match publish(&sibling, destination, staged) {
-                    Ok(_) => self.finish_publication(row, destination, staged, Some(sibling)),
+                    Ok(published) => {
+                        self.finish_publication(row, destination, staged, &published, Some(sibling))
+                    }
                     Err(error) => {
                         self.settle_failed_publication(row, destination, sibling, staged, &error)
                     }
@@ -916,8 +920,8 @@ impl ProjectService {
             Err(failure) => return Err(failure),
         };
         match reconciled {
-            Reconciliation::Published => {
-                self.finish_publication(row, destination, staged, Some(sibling))
+            Reconciliation::Published(published) => {
+                self.finish_publication(row, destination, staged, &published, Some(sibling))
             }
             Reconciliation::Staged => {
                 let path = sibling.path().display().to_string();
@@ -1043,10 +1047,12 @@ impl ProjectService {
         row: &OperationRow,
         destination: &Destination,
         staged: StagedWitness,
+        published: &AuthorisedDirectory,
         staging: Option<StagingSibling>,
     ) -> Result<ResolvedStep> {
         let path = destination.path();
-        let opened = self.open_published(destination, destination.admission(), staged)?;
+        let opened =
+            self.open_published(destination, destination.admission(), staged, published)?;
         if let Err(refusal) = opened.audit().require_neutralised() {
             self.settle_failure(row, &refusal, OperationState::Failed)?;
             self.clean_up_published_staging(row, destination, staging);
@@ -1289,11 +1295,16 @@ impl ProjectService {
     /// asked anything there and before anything of it is audited, so another directory that took
     /// the name after the publication is refused unread. The repository was made inside its tree,
     /// and is found there.
+    ///
+    /// `published` is the directory the publication checked against the staged witness, which the
+    /// caller still holds open: the repository opened is required to be that object, so a number
+    /// that a filesystem gave another directory once the published one was gone decides nothing.
     fn open_published(
         &self,
         destination: &Destination,
         admission: Option<&ReadAdmission>,
         staged: StagedWitness,
+        published: &AuthorisedDirectory,
     ) -> Result<OpenedRepository> {
         #[cfg(feature = "git-fixtures")]
         if let Some(hook) = &self.publication {
@@ -1303,23 +1314,39 @@ impl ProjectService {
             tree: staged.identity,
             git_dir: GitDirectory::InsideTree { recorded: None },
         };
-        match destination.location() {
-            Some(held) => Ok(self
-                .open_through_deciding(
+        let opened = match destination.location() {
+            Some(held) => {
+                self.open_through_deciding(
                     held,
                     destination.name(),
                     admission.cloned(),
                     Some(recorded),
                 )?
-                .0),
-            None => Ok(OpenedRepository::open_recorded_tree(
-                &self.profile,
-                self.environment_id,
-                &destination.path(),
-                recorded,
-            )?
-            .0),
+                .0
+            }
+            None => {
+                OpenedRepository::open_recorded_tree(
+                    &self.profile,
+                    self.environment_id,
+                    &destination.path(),
+                    recorded,
+                )?
+                .0
+            }
+        };
+        let found = opened.identity().work_tree;
+        if found != published.identity() {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this operation published the directory {} and {} now holds {found}; nothing \
+                     of it is read or recorded",
+                    published.identity(),
+                    crate::git::redact(&destination.path().display().to_string())
+                )
+                .into(),
+            });
         }
+        Ok(opened)
     }
 
     /// Makes one operation's staging sibling and records it: the name before the directory exists,
@@ -2124,8 +2151,8 @@ impl ProjectService {
                         admission,
                     )
                 })?;
-                publish(&staging, destination, staged)?;
-                (Some(staged), destination.path(), Some(staging))
+                let made = publish(&staging, destination, staged)?;
+                (Some((staged, made)), destination.path(), Some(staging))
             }
             CreatePlan::Clone { remote, .. } => {
                 let staging = self.begin_staging(row, destination)?;
@@ -2137,15 +2164,15 @@ impl ProjectService {
                     stage_clone(&self.profile, staging, remote, cancel, admission)
                         .map_err(|error| unauthenticated_fetch(error, remote))
                 })?;
-                publish(&staging, destination, staged)?;
-                (Some(staged), destination.path(), Some(staging))
+                let made = publish(&staging, destination, staged)?;
+                (Some((staged, made)), destination.path(), Some(staging))
             }
         };
         // What was published is opened as the object that was staged, so that nothing of whatever
         // else is at the destination is read; a checkout that is adopted was staged by nobody, and
         // is opened as the directory the owner named.
-        let opened = match published {
-            Some(staged) => self.open_published(destination, admission, staged)?,
+        let opened = match &published {
+            Some((staged, made)) => self.open_published(destination, admission, *staged, made)?,
             None => self.open_adopted(destination, admission)?,
         };
         // A record in this host's registry is a promise to serve the repository, including its

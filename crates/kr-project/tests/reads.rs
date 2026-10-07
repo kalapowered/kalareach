@@ -11,8 +11,6 @@
 //! Elsewhere no platform confines what Git reads, and such an invocation is refused with the
 //! reason.
 
-#![cfg(feature = "git-fixtures")]
-
 mod support;
 
 use kr_project::git::ReadAdmission;

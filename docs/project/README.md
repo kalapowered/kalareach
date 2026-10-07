@@ -45,7 +45,8 @@ working tree.
   a directory inside the recorded tree is accepted for it.
 * One rule checks every recorded directory: the inode names it, the recorded filesystem says
   where. One that reports an identity is refused when it differs; the same under another device
-  number is accepted, and the record takes the number the next time a write opens it.
+  number is accepted. A project's record takes the number when the project is opened, and a
+  workspace's when a capture, a removal or a recovery opens it: a read or a preflight leaves it.
 
 Everything this host does to the filesystem itself goes through an open directory descriptor rather
 than a path: the same authority model the transfer service uses for a staging area and for a

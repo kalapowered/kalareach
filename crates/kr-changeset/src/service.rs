@@ -369,7 +369,7 @@ impl ChangeSetService {
     ///
     /// Only a caller that is already writing calls this. The project service records an
     /// independent clone's own Git directory when it makes the clone, and takes the one it finds
-    /// the first time it opens a clone made before that; this record is what the first capture
+    /// the first time a capture opens a clone made before that; this record is what the first capture
     /// found, which still refuses a repository substituted before the project service took its
     /// own. A record that is the same repository under another device number, or that was made
     /// before filesystems were recorded, takes what the repository is now. A shared workspace

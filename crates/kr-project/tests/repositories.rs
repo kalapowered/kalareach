@@ -10,7 +10,6 @@
 //! `tests/boundary.rs`.
 
 #![cfg(not(windows))]
-#![cfg(feature = "git-fixtures")]
 
 mod support;
 

@@ -52,9 +52,9 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The recovery tests put the journal into the state a crash leaves, which means writing the rows a
 # dying daemon would have left rather than asking the service to pretend.
 rusqlite = { workspace = true, features = ["bundled"] }
-# The crate's own tests build real repositories with installed Git and act in the seams the
-# `git-fixtures` feature compiles. They get the feature from here, so that a plain `cargo test`
-# runs them, and so that no build that is not a test build has it.
+# The crate's own tests act in the seams the `git-fixtures` feature compiles. They get the feature
+# from here, so that a plain `cargo test` has it, and so that no build that is not a test build
+# does.
 kr-project = { path = ".", features = ["git-fixtures"] }
 # The restricted-profile fixture is one committed document, read by the tests that plant it.
 serde_json.workspace = true
@@ -62,11 +62,9 @@ tempfile.workspace = true
 
 [features]
 # The seams the tests act in (`ProjectService::interpose`, `before_reconciling` and
-# `after_publication`, and the types and queries they use), which nothing in the service ever sets,
-# and the tests that build real repositories with the installed Git, including the
-# restricted-profile fixtures whose planted helpers must never run. No build enables it but a test
-# build of this crate and of the crates whose tests act in the seams: a build that ships this
-# crate has none of them, which `tests/shipped.rs` shows.
+# `after_publication`, and the types and queries they use), which nothing in the service ever sets.
+# No build enables it but a test build of this crate and of the crates whose tests act in the
+# seams: a build that ships this crate has none of them, which `tests/shipped.rs` shows.
 git-fixtures = []
 
 # The workspace forbids unsafe code, which a crate that applies an operating-system boundary to a
