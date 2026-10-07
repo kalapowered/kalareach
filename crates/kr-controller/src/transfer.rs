@@ -531,18 +531,20 @@ impl TransferModule {
     }
 
     /// Notes every session this host knows as one whose agent may be sent a prompt that names a
-    /// draft without this host being told, the first time a daemon of this build starts over the
-    /// transfer journal, and notes nothing at any start after.
+    /// draft without this host being told, the first time a daemon of this build starts over a
+    /// transfer journal an earlier build wrote, and notes nothing at any start after.
     ///
     /// A worker that outlived the daemon before this one is of an earlier build, and one of a build
     /// before the control daemon recorded the draft a prompt names takes such a prompt on its own
     /// socket, where this host is not told ([`kr_transfer::TransferService::note_unseen_prompt_sessions`]).
-    /// At the first start of this build every session this host knows was started by a daemon of an
-    /// earlier build, and a session started by this build's daemon afterwards has a worker that
-    /// refuses a draft prompt that does not come from the daemon, so noting is done once. The
-    /// sessions are the registry's, in every launch phase, and the archive's: a worker that has not
-    /// yet reported, one that has stopped answering and one that has ended are among them. A start
-    /// that cannot note them does not go on, because no sweep may run before the host has.
+    /// At the first start of this build over such a journal every session this host knows was started
+    /// by a daemon of an earlier build, and a session started by this build's daemon afterwards has a
+    /// worker that refuses a draft prompt that does not come from the daemon, so noting is done once.
+    /// A journal this build makes has no earlier session to note.
+    ///
+    /// The sessions are the registry's, in every launch phase, and the archive's: a worker that has
+    /// not yet reported, one that has stopped answering and one that has ended are among them. A
+    /// start that cannot note them does not go on, because no sweep may run before the host has.
     ///
     /// # Errors
     ///
@@ -557,7 +559,7 @@ impl TransferModule {
         let unavailable = |detail: String| ControllerError::RegistryUnavailable { detail };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let storage = |error: kr_transfer::TransferError| unavailable(error.to_string());
-            if service.unseen_prompt_sessions_noted().map_err(storage)? {
+            if service.noting().map_err(storage)? != kr_transfer::Noting::Owed {
                 return Ok(());
             }
             let known = owner.archive_retention()?.sessions();
@@ -909,6 +911,9 @@ impl TransferModule {
                     "the daemon this sweep was for has stopped",
                 )
             })?;
+            // The sessions of earlier builds that nothing can still send a prompt are settled
+            // first, so the sweep that follows reads none of them.
+            settle_the_sessions_of_earlier_builds(&service, &owner).map_err(ProtocolError::from)?;
             // The archive is the authority on what a session keeps. The sweep asks it once, after
             // it has read the attachments, so the answer is a view taken after them.
             let answers = ArchiveAnswers {
@@ -922,6 +927,84 @@ impl TransferModule {
             swept
         }))
     }
+}
+
+/// Ends the noting of the sessions of earlier builds once none of them can run a worker
+/// ([`TransferService::note_unseen_prompt_sessions`]), which puts what each names under its
+/// retention and forgets the sessions ([`TransferService::settle_unseen_prompt_sessions`]).
+///
+/// The noting was made because a worker of an earlier build may take a draft prompt this host is not
+/// told of. A session that cannot run a worker cannot be sent one, so what it names is all it will
+/// name. The registry is asked only while sessions are noted, and a registry that cannot be read
+/// leaves them noted. Settling removes the noting from the journal, so a journal that holds none
+/// costs a sweep one read.
+fn settle_the_sessions_of_earlier_builds(
+    service: &TransferService,
+    owner: &Controller,
+) -> kr_transfer::Result<()> {
+    if service.noting()? != kr_transfer::Noting::Held {
+        return Ok(());
+    }
+    let noted = service.unseen_prompt_sessions()?;
+    if !noted.is_empty() {
+        let running = sessions_that_may_run_a_worker(owner, &noted).map_err(|error| {
+            kr_transfer::TransferError::RetentionUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        if !running.is_empty() {
+            return Ok(());
+        }
+    }
+    service.settle_unseen_prompt_sessions()?;
+    Ok(())
+}
+
+/// Returns those of `sessions` whose worker may still be running.
+///
+/// A session whose closure is recorded has none, and neither has one whose launch failed or one the
+/// registry has no record of, which only the archive remembers. Any other session has a worker until
+/// the kernel says the process the registry recorded for it has ended: the worker's own record where
+/// there is one, otherwise the launcher's. That covers a launch that was fenced, which never reaches
+/// a closure record because its worker is never admitted. A process the kernel cannot be asked
+/// about, and one the registry records no process for, may be running.
+fn sessions_that_may_run_a_worker(
+    owner: &Controller,
+    sessions: &std::collections::BTreeSet<SessionId>,
+) -> Result<std::collections::BTreeSet<SessionId>> {
+    use crate::registry::LaunchPhase;
+
+    let mut candidates = Vec::new();
+    {
+        let registry = owner.registry_handle().blocking_lock();
+        let workers = registry.workers()?;
+        for session_id in sessions {
+            if registry.closure(*session_id)?.is_some() {
+                continue;
+            }
+            let reservation = registry.reservation_for_session(*session_id)?;
+            let worker = workers.iter().find(|row| row.session_id == *session_id);
+            let launch_over = reservation
+                .as_ref()
+                .is_some_and(|row| matches!(row.phase, LaunchPhase::Failed | LaunchPhase::Closed));
+            if worker.is_none() && (reservation.is_none() || launch_over) {
+                continue;
+            }
+            let process = worker
+                .map(|row| row.process_identity.clone())
+                .or_else(|| reservation.and_then(|row| row.launcher_identity));
+            candidates.push((*session_id, process));
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|(_, process)| {
+            process.as_ref().is_none_or(|identity| {
+                kr_ipc::identity::process_state(identity) != kr_ipc::identity::ProcessState::Ended
+            })
+        })
+        .map(|(session_id, _)| session_id)
+        .collect())
 }
 
 /// Starts the environment's expiry sweep.
