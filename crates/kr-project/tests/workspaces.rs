@@ -984,6 +984,60 @@ fn a_repository_around_a_workspace_tree_is_not_read_when_the_tree_loses_its_own(
     );
 }
 
+/// A checkout whose configuration sets `core.worktree` keeps its Git directory above its tree, and
+/// the owner adopts it by the tree's path: its workspace is read, because Git finds the repository
+/// by looking above the tree, and the Git directory is decided once Git has said where it is.
+#[cfg(unix)]
+#[test]
+fn a_repository_whose_git_directory_is_above_its_tree_is_adopted_and_still_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let split = ordinary_repository(fixture.work(), "split");
+    let tree = split.join("tree");
+    std::fs::create_dir(&tree).expect("the working tree beside the Git directory");
+    write(
+        &tree,
+        "mine.txt",
+        "work in a tree whose repository is above it\n",
+    );
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    support::git_raw(
+        &split,
+        [
+            std::ffi::OsStr::new("config"),
+            std::ffi::OsStr::new("core.worktree"),
+            named.as_os_str(),
+        ],
+    );
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), &split, "tree"),
+                label: "split".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 109)),
+        )
+        .expect("a checkout whose Git directory is above its tree is adopted by the tree's path")
+        .project
+        .project_repository_id;
+    let workspace_id = shared_workspace(&fixture, project, 110);
+
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 111);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the tree is read where it is: {held:?}"
+    );
+    assert!(
+        git_ran_in(&started, &named, "git status"),
+        "Git reads the status of the tree"
+    );
+}
+
 /// An independent clone that lost its own repository is not read as the repository around it, not
 /// even when that repository's configuration names the clone's tree as its working tree: Git then
 /// reports the recorded tree as the top level, and nothing else decides the repository's Git
