@@ -725,10 +725,11 @@ async fn spend_clock(
 
 /// KR-REQ-09.19, KR-REQ-10.52, KR-REQ-10.53: once a host has an owner, only an owner device
 /// confirms its clock. The terminal proof is refused, and so is the effect with no confirmation; a
-/// paired device that is not an owner device can neither ask for the confirmation nor spend one; the
-/// owner device answers the local owner's challenge, which the local owner then spends once; and an
-/// owner device runs the whole of it itself over its own connection, where a retry of the effect,
-/// on that connection and on a new one, is answered from its record and not performed again.
+/// paired device that is not an owner device can neither ask for the confirmation nor spend one;
+/// the owner device answers the local owner's challenge, which the local owner then spends once;
+/// and an owner device runs the whole of it itself over its own connection, where a retry of the
+/// effect, on that connection and on a new one, is answered from its record and not performed
+/// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
     let owner_keys = keys();

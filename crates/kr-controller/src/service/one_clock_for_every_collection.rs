@@ -352,11 +352,12 @@ async fn a_distrust_recorded_by_the_attention_store_is_carried_forward() {
 const EARLIER_BUILD_THAT_NEVER_TRUSTED: &[u8] =
     include_bytes!("../../tests/fixtures/earlier-attention-clock/never_trusted.cbor");
 
-/// KR-REQ-09.14, KR-REQ-09.19: a clock an earlier build never trusted holds every forgetting, and
-/// holds nothing else, until the owner establishes it. A daemon started over that file keeps the
-/// transfer record, the voice spend and the attention record that have outlived their retention,
+/// KR-REQ-09.14, KR-REQ-09.19: a clock an earlier build never trusted holds every forgetting and
+/// quiet hours, and holds no decision about a grant, until the owner establishes it. A daemon
+/// started over that file keeps the transfer record, the voice spend and the attention record that
+/// have outlived their retention, withholds quiet hours, and goes on deciding an expiring grant,
 /// the host's reading of its clock being proven all the while: the file cannot say whether only the
-/// platform's time service failed. The owner's establishment frees all three.
+/// platform's time service failed. The owner's establishment frees the three and quiet hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the_owner_says_so() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -371,6 +372,10 @@ async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the
     let controller = daemon_on(&temp, clocks).await;
     let collections = Collections::new(&temp, &controller);
     let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+    let device = super::an_owner_establishes_the_clock::expiring_device(
+        &controller,
+        wall.load(Ordering::SeqCst) + 2 * retention,
+    );
 
     assert!(collections.spend(), "a first spend");
     collections.age_one_of_each();
@@ -383,11 +388,23 @@ async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the
         "the host does not doubt its wall clock: only what forgets by it is held"
     );
     assert!(
+        super::an_owner_establishes_the_clock::decides(&controller, &device),
+        "a grant that expires is decided all the same"
+    );
+    assert!(
+        !controller.attention().quiet_hours_provable(),
+        "quiet hours are not enforced on a clock the host holds"
+    );
+    assert!(
         collections.forgot_nothing().await,
         "a clock an earlier build never trusted forgets nothing"
     );
 
     super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    assert!(
+        controller.attention().quiet_hours_provable(),
+        "the owner's word frees quiet hours"
+    );
     collections.pass().await;
     assert_eq!(kept(&temp), 0, "the transfer record is forgotten");
     assert_eq!(
@@ -433,6 +450,10 @@ async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms
         !watched(true),
         "a qualified reading of the platform's time service does not lift the hold"
     );
+    assert!(
+        !controller.attention().quiet_hours_provable(),
+        "quiet hours are not enforced under the hold"
+    );
     collections.age_one_of_each();
     wall.store(
         wall.load(Ordering::SeqCst) + retention + DAY,
@@ -450,6 +471,10 @@ async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms
     assert!(
         watched(false),
         "the owner's confirmation proves the clock without the platform's word"
+    );
+    assert!(
+        controller.attention().quiet_hours_provable(),
+        "and quiet hours are enforced again"
     );
     collections.pass().await;
     assert_eq!(
