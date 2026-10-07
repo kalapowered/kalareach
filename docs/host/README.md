@@ -3856,14 +3856,19 @@ authority never becomes a weaker way to confirm. Until its network or an owner d
 a host keeps what it would have forgotten and decides no expiring grant by the clock, which errs
 toward keeping.
 
-A worker's own contract follows the owner's action. The daemon publishes each establishment in the
-clock floor that every worker maps: the time the owner established, and the machine's continuous
-reading taken with it. A worker follows it when its own wall clock still reads that time carried
-forward by the continuous clock, within five seconds and the rate allowance. It then trusts its
-clock again, writes that down and keeps its expiration tombstones. A worker follows each
-establishment once, and only one made while it runs. If the wall clock has been stepped since, or
-the worker restarted on a journal that records its clock as unresolved, it stays distrusted until
-the owner establishes the clock again.
+A worker's own contract follows the owner's action where the worker maps the daemon's clock floor.
+The daemon publishes the owner's confirmation there: the time the owner established and the
+machine's continuous reading taken with it. It withdraws the confirmation when its own record
+distrusts the clock, and it states the confirmation again in a new boot while its record still holds
+the owner's word. A worker follows a confirmation it has not met before when its own wall clock is
+behind that time, carried forward by the continuous clock, by no more than five seconds and the rate
+allowance. It then trusts its clock again, whether it had distrusted it or not, keeps its expiration
+tombstones and writes its new mark down. From then on the owner is why it trusts its clock, so its
+time service stopping does not take that back. A worker follows each confirmation once. A wall clock
+stepped back since spends the confirmation without following it, and only the next one ends that
+distrust. A worker with nothing recorded, such as a new session, follows the confirmation in force.
+A worker that restarted on a journal recording its clock as unresolved does not follow a
+confirmation made before it restarted.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
