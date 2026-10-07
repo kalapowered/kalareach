@@ -565,11 +565,19 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
     drop(reading_end);
 
     let mut rest = Vec::new();
-    let ended = tokio::time::timeout(PATIENCE, reading.read_to_end(&mut rest)).await;
+    let ended = tokio::time::timeout(PATIENCE, reading.read_to_end(&mut rest))
+        .await
+        .expect(
+            "the second caller's connection was never seen to end while the first caller left \
+             its bytes unread",
+        );
+    // The end is a clean one, or the platform's broken pipe: either is the connection ending.
     assert!(
-        ended.is_ok(),
-        "the second caller's connection was never seen to end while the first caller left its \
-         bytes unread"
+        ended.is_ok()
+            || ended
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe),
+        "the second caller's connection ended with {ended:?}"
     );
     assert!(rest.is_empty(), "nothing more was sent: {rest:?}");
     drop(silent);
@@ -1135,22 +1143,42 @@ const EVERYONE: &str = "S-1-1-0";
 
 /// KR-REQ-05.03: a descriptor that is being retired is read as no descriptor.
 ///
-/// A file deleted while another handle on it is open stays under its name until that handle is
-/// closed, and nothing can open it meanwhile: the operating system refuses with "access is
-/// denied", the answer it gives for a list that refuses the account. It is not that. The name is
-/// retired, and a reader that meets it, such as a client listing sessions while the daemon closes
-/// one, has to find no descriptor, never a failure to read one.
+/// A file whose deletion is pending, because the handle that was to delete it has closed while
+/// another handle on it is still open, stays under its name until that last handle is closed, and
+/// nothing can open it meanwhile: the operating system refuses with "access is denied", the answer
+/// it gives for a list that refuses the account. It is not that. The name is retired, and a reader
+/// that meets it, such as a client listing sessions while the daemon closes one, has to find no
+/// descriptor, never a failure to read one.
+///
+/// The state is made here on purpose: this platform's plain removal deletes the name at once even
+/// while another handle is open, so a test that only removed the file would never meet it. A handle
+/// opened to delete the file on close, closed while a reader's handle is open, leaves it pending.
 #[test]
 fn a_descriptor_whose_removal_is_pending_is_read_as_no_descriptor() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // The right to delete, reading, and sharing with every other handle; and the flag that deletes
+    // the file when the handle closes.
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
     let host = TempHost::create();
     let environment = host.environment();
     let published = descriptor(&host, 6, "retiring");
     kr_ipc::descriptor::publish(&environment, &published).expect("publishes the descriptor");
-    // A reader that is part way through the file when the daemon retires it.
-    let reading = std::fs::File::open(environment.descriptor_file(published.session_id))
-        .expect("a reader holds the descriptor open");
+    let path = environment.descriptor_file(published.session_id);
+    // A reader that is part way through the file when its removal is decided.
+    let reading = std::fs::File::open(&path).expect("a reader holds the descriptor open");
+    let deleting = std::fs::OpenOptions::new()
+        .access_mode(DELETE | GENERIC_READ)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(&path)
+        .expect("a handle opened to delete the file on close");
+    drop(deleting);
 
-    kr_ipc::descriptor::retire(&environment, published.session_id).expect("retires it");
     let read = kr_ipc::descriptor::read(&environment, published.session_id);
 
     assert!(
