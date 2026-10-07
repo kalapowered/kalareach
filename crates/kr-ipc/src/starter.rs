@@ -3211,13 +3211,18 @@ mod tests {
         }
 
         /// A directory of one test's own under the temporary directory, removed when dropped.
+        ///
+        /// It is made as the host makes its own directories, owner-only with a list that inherits
+        /// nothing: a log opened in it is checked as one of the host's, and the temporary
+        /// directory above may carry entries for other accounts.
         struct Scratch(std::path::PathBuf);
 
         impl Scratch {
             fn create() -> Self {
                 let path =
                     std::env::temp_dir().join(format!("kr-starter-output-{}", crate::new_uuid()));
-                std::fs::create_dir(&path).expect("a directory of this test's own");
+                crate::paths::create_private_directory(&path)
+                    .expect("a directory of this test's own");
                 Self(path)
             }
         }
