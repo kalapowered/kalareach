@@ -1062,6 +1062,10 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
 
 /// KR-REQ-08.64: a plain Escape is not held when the mode is off and no paste is open.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
 async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
     let host = kr_ipc::testing::TempHost::create();
     // No bracketed paste, so an Escape is an Escape.
