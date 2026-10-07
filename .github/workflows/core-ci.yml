@@ -179,17 +179,17 @@ jobs:
           git --version
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
-      # Nineteen checks put a mount inside the tree they look at, from inside a mount namespace
-      # this account creates: seven put a bind mount there (three in change-set capture, two in the
-      # transfer authority and two in project locations), and twelve mount another filesystem where
-      # a directory a service recorded was (three in the transfer service, six in the project
-      # service and three in the change-set service). Ubuntu 24.04 denies an unprivileged account
-      # that namespace unless AppArmor's restriction on it is lifted, and each check fails rather
-      # than passes where it cannot make one, so the workspace test above leaves them out. This
-      # step lifts the restriction for itself on this runner and puts it back however the step
-      # ends, shows the namespace refused before and given after, and runs the nineteen by name.
-      # A name that matched no test would run nothing and still exit 0, so the step counts the
-      # nineteen it saw pass.
+      # Twenty checks put a mount inside the tree they look at, from inside a mount namespace
+      # this account creates: eight put a bind mount there (three in change-set capture, two in the
+      # transfer authority, two in project locations and one in project workspaces), and twelve
+      # mount another filesystem where a directory a service recorded was (three in the transfer
+      # service, six in the project service and three in the change-set service). Ubuntu 24.04
+      # denies an unprivileged account that namespace unless AppArmor's restriction on it is
+      # lifted, and each check fails rather than passes where it cannot make one, so the workspace
+      # test above leaves them out. This step lifts the restriction for itself on this runner and
+      # puts it back however the step ends, shows the namespace refused before and given after,
+      # and runs the twenty by name. A name that matched no test would run nothing and still exit
+      # 0, so the step counts the twenty it saw pass.
       - name: Mount checks inside a mount namespace of this account's own
         # Whatever the steps before it did, like the boundary step above.
         if: ${{ !cancelled() }}
@@ -216,6 +216,7 @@ jobs:
             a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
             a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
             a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it
+            a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it
           )
           log="$RUNNER_TEMP/mount-checks.log"
           : >"$log"
@@ -253,7 +254,7 @@ jobs:
           cargo test --locked -p kr-transfer --test filesystems -- --ignored --exact --color never \
             "${checks[@]:7:3}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-project --test workspaces -- --ignored --exact --color never \
-            "${checks[@]:10:2}" "${checks[@]:17:2}" 2>&1 | tee -a "$log" || failed=1
+            "${checks[@]:10:2}" "${checks[@]:17:3}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-project --lib -- --ignored --exact --color never \
             "${checks[@]:13:1}" 2>&1 | tee -a "$log" || failed=1
           cargo test --locked -p kr-changeset --test filesystems -- --ignored --exact --color never \
