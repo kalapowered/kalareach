@@ -363,8 +363,20 @@ impl Controller {
             let Some(binding) = self.bind_worker(session_id).await? else {
                 continue;
             };
+            let diag_started = std::time::Instant::now();
             let outcome = {
-                match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await {
+                let opened =
+                    tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await;
+                eprintln!(
+                    "DIAG announce {session_id} revision {revision}: link {} after {:?}",
+                    match &opened {
+                        Ok(Ok(_)) => "opened".to_owned(),
+                        Ok(Err(error)) => format!("failed {error}"),
+                        Err(_) => "timed out".to_owned(),
+                    },
+                    diag_started.elapsed()
+                );
+                match opened {
                     Ok(Ok(mut link)) => {
                         // Bounded, because a worker that will not answer must not stop the
                         // revocation from reporting `pending` for it, and must not stop the
@@ -381,6 +393,19 @@ impl Controller {
                             ),
                         )
                         .await;
+                        eprintln!(
+                            "DIAG announce {session_id} revision {revision}: answered {} after {:?}",
+                            match &answered {
+                                Ok(Ok(ack)) => format!(
+                                    "ack revision {} fence {}",
+                                    ack.revision.get(),
+                                    ack.fence.is_some()
+                                ),
+                                Ok(Err(error)) => format!("error {error}"),
+                                Err(_) => "timeout".to_owned(),
+                            },
+                            diag_started.elapsed()
+                        );
                         match answered {
                             Ok(Ok(ack)) => {
                                 link.give_back();

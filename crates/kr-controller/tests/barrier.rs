@@ -2825,8 +2825,10 @@ async fn a_worker_busy_with_its_pages_does_not_delay_the_acknowledgement_of_anot
     acknowledged_by_every_worker(&daemon.controller).await;
 
     let mut attempt = 0;
+    let diag_start = std::time::Instant::now();
     let (barrier, busy, other) = loop {
         attempt += 1;
+        eprintln!("DIAG attempt {attempt} at {:?}", diag_start.elapsed());
         assert!(
             attempt <= 5,
             "no revocation in {} left the other worker acknowledged when the busy worker refused its \
@@ -2836,8 +2838,25 @@ async fn a_worker_busy_with_its_pages_does_not_delay_the_acknowledgement_of_anot
         for hosted in &hosts {
             seed_more_undispatched_intents(hosted, &device, (attempt - 1) * affected, affected);
         }
-        let Some(stopped) = announced_to_the_stop(&daemon.controller, true).await else {
+        let diag_stop = announced_to_the_stop(&daemon.controller, true).await;
+        eprintln!(
+            "DIAG attempt {attempt}: stop {} at {:?}; pending {:?}; refusals a={} b={}",
+            diag_stop.is_some(),
+            diag_start.elapsed(),
+            daemon
+                .controller
+                .revision_pending()
+                .await
+                .expect("readable"),
+            hosts[0].service.refusals_for_the_boundary(),
+            hosts[1].service.refusals_for_the_boundary()
+        );
+        let Some(stopped) = diag_stop else {
             acknowledged_by_every_worker(&daemon.controller).await;
+            eprintln!(
+                "DIAG attempt {attempt}: settled at {:?}",
+                diag_start.elapsed()
+            );
             continue;
         };
         let pending = daemon
@@ -2878,12 +2897,19 @@ async fn a_worker_busy_with_its_pages_does_not_delay_the_acknowledgement_of_anot
         )
         .await
         .expect("the busy worker's first page is refused while its boundary is held");
-        let other_has_acknowledged = daemon
+        let diag_pending = daemon
             .controller
             .revision_pending()
             .await
-            .expect("the registry is readable")
-            .is_empty();
+            .expect("the registry is readable");
+        let other_has_acknowledged = diag_pending.is_empty();
+        eprintln!(
+            "DIAG attempt {attempt}: first refusal at {:?}; pending {:?}; refusals a={} b={}",
+            diag_start.elapsed(),
+            diag_pending,
+            hosts[0].service.refusals_for_the_boundary(),
+            hosts[1].service.refusals_for_the_boundary()
+        );
         boundary.release().await;
         let barrier = tokio::time::timeout(Duration::from_secs(60), stopped.announcing)
             .await
