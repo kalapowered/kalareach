@@ -1535,11 +1535,22 @@ impl Engine {
     ///
     /// Any held text tail is released first, so the snapshot describes a settled screen.
     pub fn snapshot(&mut self, viewport: Viewport, now_ms: u64) -> (Snapshot, FeedOutcome) {
-        let (mut snapshot, settled) = self.snapshot_without_rows(viewport, now_ms);
+        let settled = self.quiesce(now_ms);
+        (self.screen_with_rows(viewport), settled)
+    }
+
+    /// The screen for `viewport` with the rows of both buffers, without settling anything.
+    ///
+    /// [`Self::snapshot`] is this after the held text tail has been released. This is for the
+    /// caller that asks what a screen would be, such as what a restoration of it could not carry,
+    /// and is not going to hand it to anyone.
+    #[must_use]
+    pub fn screen_with_rows(&self, viewport: Viewport) -> Snapshot {
+        let mut snapshot = self.screen_state(viewport);
         snapshot.rows = self.grid.visible_rows();
         snapshot.inactive_rows = self.grid.inactive_rows();
         snapshot.hyperlinks = hyperlinks_of(&snapshot.rows);
-        (snapshot, settled)
+        snapshot
     }
 
     /// Takes a snapshot for `viewport` with its row vectors left empty.

@@ -45,7 +45,7 @@ use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
 use kr_term::lane::LaneGate;
 use kr_term::modes::KeyboardEncoding;
 use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
-use kr_term::snapshot::{Viewport, restoration_operations};
+use kr_term::snapshot::{Snapshot, Viewport, restoration_operations};
 
 use crate::error::{Result, WorkerError};
 use crate::render::{Restoration, render};
@@ -515,21 +515,28 @@ impl TerminalEngine {
         scope: crate::render::Scope,
     ) -> (u64, Restoration, Filtered) {
         let now_ms = self.now_ms();
-        let mut viewport = self.viewport_for(Window::live(dimensions));
-        let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
+        let viewport = self.viewport_for(Window::live(dimensions));
+        let (snapshot, settled) = self.engine.snapshot(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
-        // The page's own first row is what the window is anchored to. It is read from the snapshot
-        // rather than guessed at, because eviction and scrolling both move it.
-        if let Some(first) = snapshot.rows.first() {
-            viewport.top_row = first.stable_id;
-        }
-        snapshot.viewport = viewport;
-        let operations = restoration_operations(&snapshot);
-        (
-            snapshot.output_cursor,
-            render(&operations, viewport, keyboard, scope),
-            settled,
-        )
+        let (cursor, restoration) = rendered(snapshot, viewport, keyboard, scope);
+        (cursor, restoration, settled)
+    }
+
+    /// What a restoration drawn right now would not carry, without drawing one for anybody.
+    ///
+    /// The screen is read as it stands, so a caller that wants the settled one has settled it. It
+    /// is how the host finds out that a terminal it keeps on a projection because of what an
+    /// earlier restoration left out could be given the screen exactly now.
+    #[must_use]
+    pub fn carried_by_restoration(
+        &self,
+        dimensions: Dimensions,
+        keyboard: crate::render::Keyboard,
+        scope: crate::render::Scope,
+    ) -> crate::render::Carried {
+        let viewport = self.viewport_for(Window::live(dimensions));
+        let snapshot = self.engine.screen_with_rows(viewport);
+        rendered(snapshot, viewport, keyboard, scope).1.carried
     }
 
     /// Records where this session's initial palette came from.
@@ -935,6 +942,26 @@ impl TerminalEngine {
         }
         filtered
     }
+}
+
+/// Renders one snapshot of the screen for a terminal showing `viewport`, with the cursor it is at.
+fn rendered(
+    mut snapshot: Snapshot,
+    mut viewport: Viewport,
+    keyboard: crate::render::Keyboard,
+    scope: crate::render::Scope,
+) -> (u64, Restoration) {
+    // The page's own first row is what the window is anchored to. It is read from the snapshot
+    // rather than guessed at, because eviction and scrolling both move it.
+    if let Some(first) = snapshot.rows.first() {
+        viewport.top_row = first.stable_id;
+    }
+    snapshot.viewport = viewport;
+    let operations = restoration_operations(&snapshot);
+    (
+        snapshot.output_cursor,
+        render(&operations, viewport, keyboard, scope),
+    )
 }
 
 /// Returns the canonical grid size of a session's dimensions.
