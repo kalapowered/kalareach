@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kr_protocol::action::RevocationBarrier;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_transport::lease::WorkerBinding;
@@ -22,6 +23,31 @@ use super::workers::WORKER_EXCHANGE;
 /// more than this many pages keeps the rest, the report says how many have not arrived, and the
 /// next announcement continues from where this one stopped.
 const MAX_EVIDENCE_PAGES: usize = 64;
+
+/// How many times one announcement asks again for a page of evidence that a worker refused because
+/// its dispatch boundary was held, in all the pages it collects.
+///
+/// A worker takes the boundary without waiting and refuses an announcement while a mutation, a
+/// generation another link presents or a maintenance pass is inside it, which is a matter of
+/// moments. The pause before the first of these is [`PAGE_RETRY_PAUSE`] and it doubles up to
+/// [`PAGE_RETRY_LONGEST_PAUSE`], so the retries together wait about five seconds at most, which is
+/// one worker exchange. A worker still busy after that leaves the rest of its names to the next
+/// announcement, and the report says how many are outstanding.
+const MAX_PAGE_RETRIES: u32 = 10;
+
+/// The pause before the first retry of a refused page.
+const PAGE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest pause before a retry of a refused page.
+const PAGE_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What one announcement may spend collecting a worker's fence evidence.
+struct EvidenceBudget {
+    /// How many more page exchanges it may make.
+    pages: usize,
+    /// How many more times it may ask again for a page the worker refused for now.
+    retries: u32,
+}
 
 /// How far one restrictive change reaches when the barrier that retires it fences connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,11 +511,14 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
     ) {
-        let mut budget = MAX_EVIDENCE_PAGES;
+        let mut budget = EvidenceBudget {
+            pages: MAX_EVIDENCE_PAGES,
+            retries: MAX_PAGE_RETRIES,
+        };
         self.collect_fence_evidence(session_id, binding, revision, &mut budget)
             .await;
         for older in self.leases.evidence_outstanding(session_id, revision) {
-            if budget == 0 {
+            if budget.pages == 0 {
                 return;
             }
             self.collect_fence_evidence(session_id, binding, older, &mut budget)
@@ -503,15 +532,23 @@ impl Controller {
     /// It stops when the worker says nothing remains, when an exchange fails, or when the budget
     /// runs out: a worker that kept reporting names remaining would otherwise keep this daemon
     /// asking, and a revocation that cannot finish reporting is still a revocation that holds.
+    ///
+    /// A page the worker refuses because its dispatch boundary is held is asked for again after a
+    /// pause that doubles each time ([`MAX_PAGE_RETRIES`]), because the worker has said to come
+    /// again and the names are what the revocation's result owes section 9. The exchange was
+    /// answered to its end, so the link goes back and the worker's lease keeps renewing. A refusal
+    /// of any other kind, a failed exchange and a retry budget that has run out stop the
+    /// collection as before.
     async fn collect_fence_evidence(
         &self,
         session_id: SessionId,
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
-        budget: &mut usize,
+        budget: &mut EvidenceBudget,
     ) {
-        while *budget > 0 {
-            *budget -= 1;
+        let mut pause = PAGE_RETRY_PAUSE;
+        while budget.pages > 0 {
+            budget.pages -= 1;
             let Some(from) = self.leases.evidence_owed(session_id, revision) else {
                 return;
             };
@@ -533,14 +570,34 @@ impl Controller {
                 {
                     Ok(Ok(ack)) => {
                         link.give_back();
-                        Some(ack)
+                        Some(Some(ack))
+                    }
+                    // Refused for now: the answer was read to its end, so the link goes back and
+                    // the page is asked for again.
+                    Ok(Err(kr_ipc::IpcError::IdentityUnavailable { detail, .. }))
+                        if detail.starts_with(ErrorCode::ResourceUnavailable.as_str()) =>
+                    {
+                        link.give_back();
+                        Some(None)
                     }
                     // Closed with its path given up as the link goes out of scope.
                     Ok(Err(_)) | Err(_) => None,
                 }
             };
-            let Some(ack) = answered else {
+            let Some(answered) = answered else {
                 return;
+            };
+            let Some(ack) = answered else {
+                // The attempt was not a page: it does not count against the pages, and the
+                // retries have their own bound.
+                budget.pages += 1;
+                if budget.retries == 0 {
+                    return;
+                }
+                budget.retries -= 1;
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(PAGE_RETRY_LONGEST_PAUSE);
+                continue;
             };
             if !self
                 .leases
