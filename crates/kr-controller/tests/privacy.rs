@@ -335,6 +335,7 @@ impl Worker {
     }
 
     /// The number of the last pass the shell finished over the mark.
+    #[cfg(unix)]
     fn pass(&self) -> u64 {
         std::fs::read_to_string(self.project.join("pass"))
             .ok()
@@ -342,14 +343,16 @@ impl Worker {
             .unwrap_or(0)
     }
 
-    /// Waits until the worker has read every byte the shell printed, once the mark is empty.
+    /// Waits until the worker has read the output the shell printed after the worker's output
+    /// cursor stood at `since`, once the mark is empty.
     ///
     /// The shell finishes two passes after the mark was emptied: the second read the mark as it
     /// stands, and printed nothing, so the shell has said all it will say. What it recorded is then
     /// the whole of what it wrote to the terminal, and the worker has read it all when its cursor
     /// stands at the last byte of it. Nothing here is a delay: a worker that has not read what was
     /// written waits the test out.
-    async fn has_read_all_that_was_said(&self) {
+    #[cfg(unix)]
+    async fn has_read_all_that_was_said(&self, _since: u64) {
         let emptied_at = self.pass();
         until("the shell finishing two passes over the empty mark", || {
             self.pass() >= emptied_at + 2
@@ -360,6 +363,26 @@ impl Worker {
             self.runtime.session().output_cursor() == written
         })
         .await;
+    }
+
+    /// Waits until the worker has read output that arrived after its output cursor stood at
+    /// `since`.
+    ///
+    /// A Windows pseudo-console draws what the shell prints again, in sequences of its own, so the
+    /// bytes the worker reads are not the bytes the shell wrote and cannot be counted against
+    /// them. What can be waited for is output arriving after `since`, which the worker counts as it
+    /// appends it to its history, whether it keeps it or not.
+    #[cfg(windows)]
+    async fn has_read_all_that_was_said(&self, since: u64) {
+        until("the worker reading output that arrived", || {
+            self.runtime.session().output_cursor() > since
+        })
+        .await;
+    }
+
+    /// The worker's output cursor: how many bytes of output it has read.
+    fn output_cursor(&self) -> u64 {
+        self.runtime.session().output_cursor()
     }
 
     /// The action target of this session.
@@ -1000,10 +1023,6 @@ fn reaching(actions: &[ActionRight]) -> kr_protocol::pairing::ProposedGrant {
 /// output still arriving kept. A result of the generation before that comes back afterwards is
 /// recorded as a copy elsewhere, never as this host's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg_attr(
-    windows,
-    ignore = "the worker's output cursor is compared with the bytes the shell wrote, and a Windows pseudo-console draws the output again"
-)]
 async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_subsystem_through_its_steps()
  {
     let environment = Environment::start().await;
@@ -1098,13 +1117,14 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
     // still arriving not kept.
     environment.worker_holds(1, true).await;
     assert_eq!(worker.retained(), 0, "the retained output is removed");
+    let private_from = worker.output_cursor();
     worker.mark("what the session said while private");
     until("the shell printing it", || {
         worker.said().contains("while private")
     })
     .await;
     worker.mark("");
-    worker.has_read_all_that_was_said().await;
+    worker.has_read_all_that_was_said(private_from).await;
     assert_eq!(
         worker.retained(),
         0,
@@ -1131,10 +1151,6 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
 /// as retained, not erased. Turning it off records the next generation, retention starts again
 /// from that point, and nothing omitted while it was on comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg_attr(
-    windows,
-    ignore = "the worker's output cursor is compared with the bytes the shell wrote, and a Windows pseudo-console draws the output again"
-)]
 async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_is_listed() {
     let environment = Environment::start().await;
     let worker = &environment.worker;
@@ -1237,13 +1253,14 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     // While it is on, the session says something that is never kept. It falls silent before
     // privacy mode is turned off, and the worker has read everything it wrote by then, so all it
     // said is read while privacy mode is still on.
+    let private_from = worker.output_cursor();
     worker.mark("while private");
     until("the shell printing it", || {
         worker.said().contains("while private")
     })
     .await;
     worker.mark("");
-    worker.has_read_all_that_was_said().await;
+    worker.has_read_all_that_was_said(private_from).await;
     assert_eq!(worker.retained(), 0);
 
     // Turning it off: the next generation, recorded, and the worker told.
