@@ -2812,6 +2812,110 @@ async fn a_local_prompt_for_a_live_session_whose_worker_was_not_reached_at_start
     }
 }
 
+/// KR-REQ-09.12: a prompt a caller at this machine makes while another exchange holds the daemon's
+/// one link to the worker waits for its turn, and a session that closes meanwhile is closed to it:
+/// it is answered that the session closed, from the closure the host recorded, and nothing is
+/// recorded or sent for a session that is gone. It is not answered as a failure of the worker,
+/// whether the link it then gets still reaches the worker or the worker has ended and the daemon
+/// cannot open another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is_told_it_closed() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
+        self as scripted, Scripted, closure_of,
+    };
+
+    for worker_ended in [false, true] {
+        let script = Scripted::new();
+        script.accepts_prompts(true);
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let admission = fake::admission(controller, world.accepted).await;
+        let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let draft_id =
+            a_draft_holding_an_attachment(controller, world.environment_id, &actor, "waiting.bin");
+
+        // Another exchange holds the link, and the prompt queues behind it.
+        let mut held = controller
+            .worker_client(&world.worker)
+            .await
+            .expect("the daemon's own link");
+        let mutation = a_local_prompt(
+            &world,
+            &admission,
+            ActionId::new(kr_ipc::new_uuid()),
+            Nullable::some(draft_id),
+            Nullable::null(),
+        );
+        let prompting = tokio::spawn({
+            let controller = std::sync::Arc::clone(controller);
+            let actor = actor.clone();
+            async move {
+                controller
+                    .perform(&actor, admission.connection_id, None, mutation)
+                    .await
+            }
+        });
+        // The prompt is waiting for the slot once something besides the table and the holder has
+        // taken it: the slot is shared by all three.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while controller
+            .connections
+            .lock()
+            .await
+            .get(&world.session_id)
+            .map(std::sync::Arc::strong_count)
+            != Some(3)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the prompt did not queue for the worker's link"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        controller
+            .retire(&closure_of(world.session_id))
+            .await
+            .expect("the closure is recorded");
+        if worker_ended {
+            // The worker has gone and its link with it, so the daemon has none to hand over and
+            // none it can open.
+            world.serving.abort();
+            drop(held);
+        } else {
+            held.give_back();
+            drop(held);
+        }
+
+        let answered = prompting.await.expect("the prompt's task ends");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) = answered
+        else {
+            panic!("a prompt for a session that closed was taken: {answered:?}");
+        };
+        assert_eq!(
+            error.code,
+            ErrorCode::SessionClosed,
+            "worker ended: {worker_ended}: {error}"
+        );
+        assert!(
+            !is_submitted(controller, &actor, draft_id),
+            "a draft was recorded as sent to a session that is gone"
+        );
+        assert!(
+            prompts_the_worker_was_asked_to_take(&script).is_empty(),
+            "nothing was sent to the worker of a session that closed"
+        );
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal it notes
 /// every session the host knows, because each was started by a daemon of an earlier build whose
 /// worker may take a draft prompt this host is not told of, and a daemon that starts again over the
