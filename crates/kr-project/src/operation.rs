@@ -1219,12 +1219,12 @@ mod tests {
     /// into, both authorised for one environment, and the file.
     #[cfg(windows)]
     fn a_tree_to_publish() -> (
-        tempfile::TempDir,
+        kr_ipc::testing::PrivateTempDir,
         AuthorisedDirectory,
         AuthorisedDirectory,
         PathBuf,
     ) {
-        let root = tempfile::tempdir().expect("a directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
         let file = root.path().join("staging/tree/objects/pack");
         std::fs::create_dir_all(root.path().join("staging/tree/objects")).expect("a staged tree");
@@ -1425,7 +1425,7 @@ mod tests {
     /// opened and not created: a test of what is recorded about a staged tree and of its rename
     /// is not a test of who may change the sibling, which only a sibling that `create` makes is
     /// asked.
-    fn staged_by_plain_means() -> (tempfile::TempDir, Destination, StagingSibling) {
+    fn staged_by_plain_means() -> (kr_ipc::testing::PrivateTempDir, Destination, StagingSibling) {
         let (parent, destination) = a_destination();
         let name = StagingSibling::propose();
         std::fs::create_dir(parent.path().join(&name)).expect("the staging directory");
@@ -1436,8 +1436,8 @@ mod tests {
     }
 
     /// A destination named `published`, in a directory of its own.
-    fn a_destination() -> (tempfile::TempDir, Destination) {
-        let parent = tempfile::tempdir().expect("a directory to stage beside");
+    fn a_destination() -> (kr_ipc::testing::PrivateTempDir, Destination) {
+        let parent = kr_ipc::testing::PrivateTempDir::create();
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
         let destination = Destination::resolve(
             &DestinationRequest {
@@ -1457,7 +1457,7 @@ mod tests {
 
     /// A staging directory with something staged in it, beside a destination in a directory of
     /// its own.
-    fn staged() -> (tempfile::TempDir, Destination, StagingSibling) {
+    fn staged() -> (kr_ipc::testing::PrivateTempDir, Destination, StagingSibling) {
         let (parent, destination) = a_destination();
         let sibling = StagingSibling::create(&destination, &StagingSibling::propose())
             .expect("the staging directory is made");
