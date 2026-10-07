@@ -517,9 +517,9 @@ impl GrantLifetimes {
     /// collection of this host passes before it lets go of anything the wall clock says is old.
     /// The clock is sampled through the boundary every expiry decision goes through
     /// ([`ClockTrust::sample_for_forgetting`]), which answers no while the wall clock has gone
-    /// backwards and an owner has not established it again, while a hold on forgetting stands, and
-    /// while this boot's clock continuity is lost. The
-    /// floor must also be answerable at `reading_ms`: nothing is owed its record, and what is
+    /// backwards and an owner has not established it again, while a hold on forgetting stands,
+    /// while a step forward it has seen is not written down, and while this boot's clock continuity
+    /// is lost. The floor must also be answerable at `reading_ms`: nothing is owed its record, and what is
     /// written down covers the reading the retention is counted from. A record that cannot be
     /// shown to have outlived its retention is kept, because forgetting it lets the same action
     /// be submitted as a new one.

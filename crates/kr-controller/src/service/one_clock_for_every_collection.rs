@@ -231,8 +231,9 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
 /// attention store also needs the platform's time service or the owner's confirmation, which a
 /// test on a host with no qualified time service cannot assume.)
 ///
-/// The wall clock is computed from the continuous one, so that one step of the test moves both and
-/// the daemon's own readers, which run meanwhile, never see the two apart.
+/// The wall clock is computed from the continuous one, so that one step of the test moves both, and
+/// each step is taken while the clock decision's lock is held, so that a reader of the daemon's own
+/// that runs meanwhile takes both its readings before the step or both after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetting() {
     use kr_transport::clock::ContinuousClock as _;
@@ -265,7 +266,12 @@ async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetti
     };
     let thirty_days_and_an_hour = || {
         for hour in 0..30 * 24 + 1 {
-            continuous.advance(Duration::from_millis(3_600_000 + 180));
+            controller
+                .lifetimes()
+                .clock_trust()
+                .while_no_reader_reads(|| {
+                    continuous.advance(Duration::from_millis(3_600_000 + 180));
+                });
             assert!(trust().is_some(), "hour {hour}: the clock is still proven");
         }
     };

@@ -154,8 +154,9 @@ pub struct Standing {
     /// Something decided is not written down yet.
     pub owed: bool,
     /// What the host knows of its clock is ahead of its record: a step forward whose write failed.
-    /// A restart now would measure a rollback against a record that is behind, so what depends on
-    /// the clock being proven is withheld until the record catches up.
+    /// A restart now would measure a rollback against a record that is behind, so every
+    /// forgetting is withheld until the record catches up. Grants and quiet hours decide from the
+    /// clock now and are not.
     pub anchor_owed: bool,
     /// This boot's clock continuity is lost, taken in the same transition as the rest.
     pub continuity_lost: bool,
@@ -552,6 +553,15 @@ impl ClockTrust {
     #[must_use]
     pub fn owes_a_write(&self) -> bool {
         self.held().owed.any()
+    }
+
+    /// Holds the clock decision's lock while `body` runs, so that no reader is between its two
+    /// clock readings meanwhile: a test moves its clocks here, and a reader that runs in the
+    /// background takes both readings before the move or both after it.
+    #[cfg(test)]
+    pub(crate) fn while_no_reader_reads<T>(&self, body: impl FnOnce() -> T) -> T {
+        let _held = self.held();
+        body()
     }
 
     /// Establishes the clock again, at the moment an owner authenticated, and returns that moment.
@@ -1585,8 +1595,8 @@ mod tests {
 
     /// KR-REQ-09.17, KR-REQ-09.18: a restart in the same boot keeps neither a false distrust nor a
     /// missed rollback. After thirty days on a fast continuous clock the host goes down for two
-    /// days on a boot clock that is just as fast (8.6 s more than the wall clock, beyond even the
-    /// restored tolerance, so only the credit given to the restored anchor keeps it trusted), and
+    /// days on a boot clock that is just as fast (8.6 s more than the wall clock, beyond the
+    /// restored tolerance of 4.75 s, so only the credit given to the restored anchor keeps it trusted), and
     /// starts again: it trusts the clock. Two more days, and a wall clock corrected six minutes
     /// back while it was down: it does not.
     #[test]
