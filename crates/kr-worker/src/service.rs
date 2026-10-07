@@ -265,6 +265,10 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// How many announcements of an authority revision have been refused because the dispatch
+    /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    refused_for_the_boundary: tokio::sync::watch::Sender<usize>,
 }
 
 impl WorkerService {
@@ -485,6 +489,8 @@ impl WorkerService {
             facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
         })
     }
 
@@ -758,6 +764,34 @@ impl WorkerService {
         reason = "it is the shipped form of a method that reads this service's own pause"
     )]
     const fn wait_before_admission(&self) {}
+
+    /// Takes the dispatch boundary and holds it until the returned guard is dropped, for this
+    /// host's own tests: what an announcement of an authority revision meets while a mutation, a
+    /// generation another link presents or a maintenance pass is inside it.
+    ///
+    /// The guard is taken on the calling thread and has to be dropped on it.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_dispatch_boundary(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned")
+    }
+
+    /// How many announcements of an authority revision have been refused so far because the
+    /// dispatch boundary was held, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn refusals_for_the_boundary(&self) -> usize {
+        *self.refused_for_the_boundary.borrow()
+    }
+
+    /// Waits until more than `seen` announcements of an authority revision have been refused
+    /// because the dispatch boundary was held, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub async fn refused_for_the_boundary_beyond(&self, seen: usize) {
+        let mut refusals = self.refused_for_the_boundary.subscribe();
+        let _ = refusals.wait_for(|count| *count > seen).await;
+    }
 
     /// Takes the turn to write on the current attention connection and holds it until the
     /// returned guard is dropped, for this host's own tests.
@@ -2807,6 +2841,9 @@ impl WorkerService {
             );
         }
         let Ok(_barrier) = self.dispatch.try_lock() else {
+            #[cfg(feature = "testing")]
+            self.refused_for_the_boundary
+                .send_modify(|refusals| *refusals += 1);
             // Recorded so the fence happens whether or not the daemon ever announces again: the
             // host's own maintenance runs it inside the same boundary, and the next announcement
             // then finds it done. A refusal that left nothing behind would make progress depend on
