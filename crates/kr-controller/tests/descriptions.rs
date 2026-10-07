@@ -1269,6 +1269,10 @@ impl Environment {
 /// published the host has run exactly two jobs, so the input made none, and its facts moved the
 /// revision of none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the typed input is not echoed into the output on a Windows pseudo-console, which this case waits to see"
+)]
 async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job() {
     let mut environment = Environment::start(Setup::new()).await;
     let session_id = environment.workers[0].session_id;

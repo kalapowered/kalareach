@@ -1106,6 +1106,10 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
 
 /// KR-REQ-08.64, KR-PERF-002: a delimiter split across frames is recognised once, payload kept.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
 async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_payload() {
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(
@@ -2294,6 +2298,10 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
 /// prefix is that write's, so it carries that write's authority: the deadline of the write whose
 /// bytes have all been forwarded no longer applies to anything.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
 async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(
