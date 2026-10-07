@@ -354,11 +354,11 @@ empty: the pinned revision exposes everything section 8 asks a snapshot to carry
 
 #### What constrains the direct compatibility profile
 
-There are five differences from xterm. The first two are not bugs in the canonical state, but mean
-that a physical terminal needs to be qualified against them in order for direct mode to be offered.
-The third is a difference in where the pinned library leaves the cursor; both terminals tested
-report a different column from the library's. The fourth is where a soft reset leaves the buffer,
-and the fifth is what it leaves saved:
+These are the behaviours the profile records as constraints on direct mode. The first two are not
+bugs in the canonical state, but mean that a physical terminal needs to be qualified against them in
+order for direct mode to be offered. The third is a difference in where the pinned library leaves
+the cursor; both terminals tested report a different column from the library's. The fourth is where
+a soft reset leaves the buffer, and the fifth is what it leaves saved:
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -393,12 +393,12 @@ and the fifth is what it leaves saved:
   a saved cursor back, rendition and character sets included, and nothing but a sequence that moves
   the screen can.
 
-A full reset is not among the differences, because the engine makes it match. The library keeps
-whatever was saved across a full reset. A program that restores a cursor afterwards would land where
-it saved the cursor before the reset, while a terminal that follows xterm puts it at home. So the
-engine saves a fresh cursor in the buffer the reset leaves showing, from the cursor the reset has
-just homed, as xterm does. A restore after a full reset then finds the terminal as it starts. The
-buffer that is not showing keeps what it saved, which is also what xterm does.
+A full reset is not among these behaviours, because the engine makes it match xterm. The library
+keeps whatever was saved across a full reset. A program that restores a cursor afterwards would land
+where it saved the cursor before the reset, while a terminal that follows xterm puts it at home. So
+the engine saves a fresh cursor in the buffer the reset leaves showing, from the cursor the reset
+has just homed, as xterm does. A restore after a full reset then finds the terminal as it starts.
+The buffer that is not showing keeps what it saved, which is also what xterm does.
 
 ## The query broker
 
