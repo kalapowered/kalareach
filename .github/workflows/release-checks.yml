@@ -74,17 +74,28 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
         with:
-          path: |
+          name: graph
+          paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-tree-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Test the graph check
         run: python3 scripts/check-mobile-graph.py self-test
 
       - name: Read the companion's graph on each mobile target
         run: python3 scripts/check-mobile-graph.py check --locked
+
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+          paths: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
