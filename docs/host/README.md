@@ -3844,13 +3844,14 @@ The owner can end the daemon's distrust with the single action `host.clock.estab
 While the host's clock continuity is lost, the host decides nothing by its clock, so a grant it
 bounds by time, such as a bounded offline validity, is refused as `CLOCK_UNTRUSTED`. The owner's
 confirmation of the clock is the one exception, for an owner device whose grant is personal and
-never expires. Asking for the challenge, listing it, answering it and spending it are decided as
-they would be on a clock the host proves, and a challenge for anything else is neither asked for,
-listed nor answered meanwhile. Without that exception a reboot would be the only way out. An
-expiring grant or an organisation's grant still waits, and so does every other method. The offline
-bound or the managed lease of such a request is still decided from the reading the host has, which
-is the one that is unproven: a clock behind the truth could keep one alive that the truth has ended,
-for the length of one confirmation of the clock.
+never expires. Under that exception, asking for the challenge, listing it, answering it and spending
+it are decided as they would be on a clock the host proves, and a challenge for anything else is
+neither asked for, listed nor answered by that device. Without the exception a reboot would be the
+only way out. An expiring grant or an organisation's grant still waits, and so does every other
+method of a grant the host decides by the clock. The offline bound or the managed lease of such a
+request is still decided from the reading the host has, which is the one that is unproven: a clock
+behind the truth could keep one alive that the truth has ended, for the length of one confirmation
+of the clock.
 
 Two kinds of host have no route to establish the clock. A host that has an owner and is off the
 network cannot be asked, because no owner device reaches it: `kr host clock --establish` refuses at
@@ -3864,18 +3865,25 @@ which errs toward keeping. Losing the network or the owner devices alone restric
 A worker's own contract follows the owner's action where the worker maps the daemon's clock floor.
 The daemon publishes the owner's confirmation there: the time the owner established and the
 machine's continuous reading taken with it. It withdraws the confirmation when its own record
-distrusts the clock, and it states the confirmation again at its next reading while its record still
-holds the owner's word, which is how a worker that begins in a new boot learns of one made in an
-earlier boot. A worker follows a confirmation it has not met before when its own wall clock is
-behind that time, carried forward by the continuous clock, by no more than five seconds and the rate
-allowance, and is not behind a reading it took itself after the owner spoke. It then trusts its
-clock again, whether it had distrusted it or not, keeps its expiration tombstones and writes its new
-mark down. From then on the owner is why it trusts its clock, so its time service stopping does not
-take that back. A worker follows each confirmation once. A wall clock stepped back since spends the
-confirmation without following it, and a worker that still trusted its clock then distrusts it, as
-the daemon's record would. Only the next confirmation ends that distrust. A worker with nothing
-recorded, such as a new session, follows the confirmation in force. A worker that restarted on a
-journal recording its clock as unresolved does not follow a confirmation made before it restarted.
+distrusts the clock. While its record holds the owner's word and the floor shows no confirmation, it
+states the confirmation again at its next reading, with the reading it has just taken, unless the
+clock's continuity is lost. That restatement is how a worker that begins in a new boot learns of a
+confirmation made in an earlier boot, and how a publication the daemon did not complete is made
+good; it is not an action of the owner. A worker follows an action of the owner it has not met
+before when its own wall clock is behind that time, carried forward by the continuous clock, by no
+more than five seconds and the rate allowance, and is not more than five seconds behind a reading it
+took itself at or after the owner spoke. It then trusts its clock again, whether it had distrusted
+it or not, keeps its expiration tombstones and writes its new mark down. From then on the owner is
+why it trusts its clock, so its time service stopping does not take that back. A worker follows each
+confirmation once. A wall clock stepped back since spends the confirmation without following it, and
+a worker that still trusted its clock then distrusts it, as the daemon's record would. A pause
+between the daemon's two clock readings can ask more of the worker's clock than the owner's word
+did, and fails in the same direction. Only the next action of the owner ends that distrust. A worker
+with nothing recorded, such as a new session, follows at its first look the confirmation in force,
+whether the owner made it or the daemon states it again. A worker that is running, or that restarted
+on a journal recording its clock, follows no restatement and no confirmation made before it
+restarted. If the daemon stops after the commit of a second confirmation and before it publishes it,
+the earlier one stands, and a worker that followed it waits for the next action of the owner.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
