@@ -1196,8 +1196,7 @@ Rendering a screen back into bytes cannot carry everything a client that holds i
 apply. What it leaves out is counted rather than assumed away: the rows of the buffer that is not
 showing, for a client shown the live screen alone; the saved cursor of the buffer that is not
 showing, and a saved cursor of the showing buffer that lies outside the window; the keyboard
-negotiation of the buffer that is not showing, and that of the buffer that is showing when the
-terminal declared nothing about itself, together with the keyboard stack the session holds; the
+negotiation of the buffer that is not showing, and the keyboard stack the session holds; the
 virtual title stack; soft-wrap markers; the right-hand side of a row wider than the window; and a
 pending wrap, whether the cursor's or a saved cursor's, that the window shows.
 `Session::restoration_losses` is the count.
