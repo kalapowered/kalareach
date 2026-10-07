@@ -387,6 +387,8 @@ impl Controller {
                         // one control frame. The barrier holds on the first page, which is the
                         // acknowledgement itself; what these further exchanges complete is the
                         // naming section 9 requires, and each one is bounded like the first.
+                        #[cfg(feature = "testing")]
+                        self.after_an_acknowledgement.wait().await;
                         self.collect_owed_evidence(session_id, binding, revision)
                             .await;
                     }
