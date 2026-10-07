@@ -3869,27 +3869,29 @@ distrusts the clock. While its record holds the owner's word and the floor shows
 states the confirmation again at its next reading, with the reading it has just taken, unless the
 clock's continuity is lost. That restatement is how a worker that begins in a new boot learns of a
 confirmation made in an earlier boot, and how a publication the daemon did not complete is made good
-for workers that begin after it; it is not an action of the owner. A worker follows an action of the
-owner it has not met before when its own wall clock is behind that time, carried forward by the
-continuous clock, by no more than five seconds and the rate allowance, and is not more than five
-seconds behind a reading it took itself at or after the owner spoke, carried forward the same way.
-It then trusts its clock again, whether it had distrusted it or not, keeps its expiration tombstones
-and writes its new mark down. From then on the owner is why it trusts its clock, so its time service
-stopping does not take that back. A worker follows each confirmation once. A wall clock stepped back
-since spends the confirmation without following it, and a worker that still trusted its clock then
-distrusts it, as the daemon's record would. A pause between the daemon's two clock readings can ask
-more of the worker's clock than the owner's word did, and fails in the same direction. Only the next
-action of the owner ends that distrust. A worker with nothing recorded, such as a new session,
-follows at its first look at one the confirmation in force, whether the owner made it or the daemon
-states it again, unless its own detector has found a rollback by then; a look that finds nothing, or
-half of a publication, does not end that. A worker that is running, or that restarted on a journal
-recording its clock, follows no restatement and no confirmation made before it restarted, so a
-running worker that distrusts its clock waits for another action of the owner when a publication did
-not complete, and an exact retry of the action that did not publish answers from the record and
-publishes nothing. If the daemon stops after the commit of a second confirmation and before it
-publishes it, the earlier one stands: the workers that followed it wait for the next action of the
-owner, and if the owner had set the clock back before the second confirmation, each worker that
-trusted its clock distrusts it at its first look at that clock, for the rest of the boot.
+for workers that have not met a confirmation; it is not an action of the owner. A worker follows an
+action of the owner it has not met before when its own wall clock is behind that time, carried
+forward by the continuous clock, by no more than five seconds and the rate allowance, and is not
+more than five seconds behind its own mark, carried forward the same way, when the mark was raised
+at or after the owner spoke. It then trusts its clock again, whether it had distrusted it or not,
+keeps its expiration tombstones and writes its new mark down. From then on the owner is why it
+trusts its clock, so its time service stopping does not take that back. A worker follows each
+confirmation once. A wall clock stepped back since spends the confirmation without following it, and
+a worker that still trusted its clock then distrusts it, as the daemon's record would. A pause
+between the daemon's two clock readings can ask more of the worker's clock than the owner's word
+did, and fails in the same direction. Only the next action of the owner ends that distrust. A worker
+that began with nothing recorded, such as a new session, and has met no confirmation and found no
+rollback follows the first confirmation it meets, whether the owner made it or the daemon states it
+again, and answers for a restatement to its own mark whatever the mark's age; a look that finds
+nothing, or half of a publication, does not end that. A worker that has looked at a confirmation,
+has found a rollback, or restarted on a journal recording its clock follows no restatement and no
+confirmation made before it restarted, so such a worker that distrusts its clock waits for another
+action of the owner when a publication did not complete, and an exact retry of the action that did
+not publish answers from the record and publishes nothing. If the daemon stops after the commit of a
+second confirmation and before it publishes it, the earlier one stands: the workers that followed it
+wait for the next action of the owner, and if the owner had set the clock back before the second
+confirmation, each worker that trusted its clock and finds the clock behind it by more than the
+tolerance distrusts it until that action.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
