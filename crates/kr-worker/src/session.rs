@@ -3076,7 +3076,35 @@ impl Session {
     /// when a read finds nothing waiting.
     pub fn quiesce_output(&mut self) -> Vec<AttachmentId> {
         let filtered = self.engine.quiesce(self.lane_gate());
+        self.reconsider_incomplete_restorations();
         self.deliver(filtered)
+    }
+
+    /// Asks again of every terminal kept on a projection by the screen it was given whether a
+    /// screen drawn now would carry everything.
+    ///
+    /// A restoration that left something out keeps its terminal on a projection, and nothing about
+    /// the terminal changes afterwards: what changes is the session's screen. The wrapped line
+    /// scrolls off or is cleared, the wrap is no longer pending, the title stack is popped. The
+    /// answer is read from the screen as the engine has just settled it, and an attachment it now
+    /// favours is served the stream again through the change `deliver` makes for every
+    /// attachment that moves between the two, which draws it a screen of its own at a boundary.
+    /// Nothing is drawn for anybody here, so nothing is counted among what renderings left out.
+    fn reconsider_incomplete_restorations(&mut self) {
+        self.attachments
+            .set_carryable(self.engine.direct_is_carryable());
+        for attachment_id in self.attachments.held_by_restoration() {
+            let Ok(dimensions) = self.attachment_dimensions(attachment_id) else {
+                continue;
+            };
+            let keyboard = self.attachments.keyboard_control(attachment_id);
+            let scope = self.content_scope(attachment_id);
+            let carried = self
+                .engine
+                .carried_by_restoration(dimensions, keyboard, scope);
+            self.attachments
+                .note_restoration(attachment_id, carried.continues_the_stream());
+        }
     }
 
     /// Writes anything the host owes the application that the gate now allows.
