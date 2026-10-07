@@ -16,7 +16,7 @@ calls a maintained library, and the libraries are the ones below.
 | Verifying the signed metadata of a plugin catalogue, and a host's own update | the `tough` TUF client, built on `aws-lc-rs` |
 | TLS to a service and to a pairing room | `rustls`, with `ring` and the platform's certificate verifier |
 | The transport between devices | iroh |
-| The media path of a voice call | DTLS-SRTP in the `webrtc` crate with its `ring` backend on a desktop, the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
+| The media path of a voice call | DTLS-SRTP in the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
 | Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
 | Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module for the hashes, HMAC, HKDF and Ed25519 signatures that the tests recompute |
