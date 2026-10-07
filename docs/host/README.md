@@ -3789,8 +3789,9 @@ record in the same transaction as the pause.
 
 ## The host time contract
 
-`kr_worker::action::time` holds this host's time contract. It rests on three anchors and concludes
-only what each one supports.
+The host time contract has two records. `kr_worker::action::time` holds each worker's, which rests
+on three anchors and concludes only what each one supports. The daemon keeps one of its own
+(`kr_controller::net::clock_trust`) for what it forgets and for the grants it decides.
 
 What asks it is retention: section 9 stops expiry-based collection while the wall clock cannot be
 proved, and the session's journal prunes only when the contract says collection may run. The
@@ -3839,6 +3840,15 @@ object expires as soon as the reading, at its worst, reaches the deadline. The d
 grant's expiry from the same projected reading, through the host's clock floor, without that bound.
 
 The owner can end the daemon's distrust with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move its mark and anchor to the time the effect runs, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
+
+A worker's own contract follows the owner's action. The daemon publishes each establishment in the
+clock floor that every worker maps: the time the owner established, and the machine's continuous
+reading taken with it. A worker follows it when its own wall clock still reads that time carried
+forward by the continuous clock, within five seconds and the rate allowance. It then trusts its
+clock again, writes that down and keeps its expiration tombstones. A worker follows each
+establishment once, and only one made while it runs. If the wall clock has been stepped since, or
+the worker restarted on a journal that records its clock as unresolved, it stays distrusted until
+the owner establishes the clock again.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
