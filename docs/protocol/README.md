@@ -705,8 +705,8 @@ rather than standing in for one. A service that keeps an installation record, as
 does for registration, records the whole key it first saw, looks it up by the identifier, and
 compares against the key. Replacing a recorded key is then a deliberate step, taken by a registration
 whose challenge the new key signs, and not a side effect of asking. The storage methods keep no such
-record. The service checks the signature under the key the request presents, and the identifier that
-key derives has to equal the one the body names.
+record. They verify the signature under the key the request presents, then apply the name check
+above.
 
 Each of the eight `storage.*` methods lists `account_token` beside `service_credential` in its
 `required_rights`. This token must have the scope `backup.write`, and it names the account whose

@@ -527,7 +527,8 @@ pub struct StorageLimits {
 /// What a retention change answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSet {
-    /// Whether the change was made: false when it asked for what was already so.
+    /// Whether the change was made: false when it asked for what an existing record already held.
+    /// An account's first change always writes its record, at revision 1.
     pub changed: bool,
     /// Whether backup storage is on now.
     pub backup: BackupState,
@@ -539,6 +540,8 @@ pub struct RetentionSet {
 
 /// One principal's retention as it stands: whether backup storage is on, the retention the service
 /// has recorded for it, and the revision the next change names.
+///
+/// A principal with no record is backup off, with the default retention, at revision 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionState {
     /// Whether backup storage is on.
@@ -553,7 +556,7 @@ pub struct RetentionState {
 /// was decided against a revision the record has left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetentionAnswer {
-    /// The service made the change, or it asked for what was already so.
+    /// The service made the change, or it asked for what an existing record already held.
     Done(RetentionSet),
     /// The change was decided against a revision the record has left, so nothing was changed.
     ///
@@ -694,7 +697,7 @@ pub struct ObjectDeleted {
     pub purge_after: String,
     /// The bytes still charged until then.
     pub retained_bytes: u64,
-    /// The retention rules as the service publishes them.
+    /// The retention recorded for the account, as a status read reports it.
     pub retention: RetentionPolicy,
 }
 
