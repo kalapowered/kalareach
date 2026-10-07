@@ -662,6 +662,144 @@ fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
     job.terminate(1).expect("the job ends");
 }
 
+/// A process held at the end of its life, by a debugger that has not answered the event which says
+/// the process has exited.
+///
+/// A process that is ending is not yet ended: it cannot be ended again, and it is not signalled
+/// until its last thread has gone. A debugger holds it at that point for as long as it likes, which
+/// no wait and no race can do on a machine of any speed, so a test that needs the process in that
+/// state asks for it here rather than hoping to meet it.
+mod held_end {
+    #![expect(
+        unsafe_code,
+        reason = "attaching a debugger to a process and answering its events are native calls, \
+                  which have no safe interface"
+    )]
+
+    use windows_sys::Win32::Foundation::{DBG_CONTINUE, EXCEPTION_BREAKPOINT};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugActiveProcessStop,
+        DebugSetProcessKillOnExit, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
+        WaitForDebugEvent,
+    };
+
+    /// How long one debug event is waited for. The events are the process's own, and arrive as it
+    /// runs, so this bounds a hang and measures nothing.
+    const EVENT_PATIENCE_MS: u32 = 60_000;
+
+    /// The calling thread, as the debugger of one process.
+    ///
+    /// The thread that attaches is the thread the process's events are delivered to, so every call
+    /// on a value of this type is made on that thread.
+    pub struct Debugger {
+        process: u32,
+        /// The thread of the exit event this debugger has not answered, once it holds one.
+        held: Option<u32>,
+    }
+
+    impl Debugger {
+        /// Attaches to the running process `process`, and returns once the attach is complete.
+        pub fn attach(process: u32) -> Self {
+            // SAFETY: both calls take a process identifier and nothing this function owns.
+            unsafe {
+                assert_ne!(DebugActiveProcess(process), 0, "the process is attached to");
+                // The process is not ended when the debugger lets go of it.
+                DebugSetProcessKillOnExit(0);
+            }
+            let debugger = Self {
+                process,
+                held: None,
+            };
+            // The attach is complete when the breakpoint the system breaks the process in with
+            // has been seen and answered.
+            loop {
+                let event = debugger.next();
+                let breakpoint = event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && {
+                    // SAFETY: the code says the event holds an exception.
+                    let exception = unsafe { event.u.Exception };
+                    exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT
+                };
+                debugger.answer(event.dwThreadId);
+                if breakpoint {
+                    return debugger;
+                }
+            }
+        }
+
+        /// Waits for the process's next event.
+        fn next(&self) -> DEBUG_EVENT {
+            // SAFETY: an all-zero event is a valid value, and the call fills it in.
+            let mut event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+            // SAFETY: the pointer is to a live event of the type the call writes.
+            let waited = unsafe { WaitForDebugEvent(&raw mut event, EVENT_PATIENCE_MS) };
+            assert_ne!(waited, 0, "an event of the process arrived");
+            assert_eq!(
+                event.dwProcessId, self.process,
+                "the only process attached to is this one"
+            );
+            event
+        }
+
+        /// Lets the thread that raised the event it was waiting on go on.
+        fn answer(&self, thread: u32) {
+            // SAFETY: the call names an event this debugger was given and has not answered.
+            let answered = unsafe { ContinueDebugEvent(self.process, thread, DBG_CONTINUE) };
+            assert_ne!(answered, 0, "the event is answered");
+        }
+
+        /// Answers every event of the process up to the one that says it has exited, and leaves
+        /// that one unanswered: the process is then ending, and stays so until this value is
+        /// dropped.
+        pub fn hold_the_end(&mut self) {
+            loop {
+                let event = self.next();
+                if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+                    self.held = Some(event.dwThreadId);
+                    return;
+                }
+                self.answer(event.dwThreadId);
+            }
+        }
+    }
+
+    impl Drop for Debugger {
+        /// Lets the process finish ending, and lets go of it.
+        fn drop(&mut self) {
+            if let Some(thread) = self.held.take() {
+                // SAFETY: as for the answer.
+                unsafe { ContinueDebugEvent(self.process, thread, DBG_CONTINUE) };
+            }
+            // SAFETY: the call takes a process identifier. A process that has ended is no longer
+            // attached to, and the call then says so, which is the outcome wanted.
+            unsafe { DebugActiveProcessStop(self.process) };
+        }
+    }
+}
+
+/// A process that is ending refuses to be ended again, because the end it was given is under way.
+/// Ending it is not a failure: the outcome wanted is the one it is on its way to, and it is
+/// collected once it has finished.
+#[test]
+fn a_process_that_is_already_ending_is_not_a_failure_to_end() {
+    let job = kr_worker::windows::job::AgentJob::create().expect("a job");
+    let mut child = start_in(&job, "ping.exe", &["-n", "600", "127.0.0.1"]);
+    let mut debugger = held_end::Debugger::attach(child.id());
+    child.kill().expect("a running process is ended");
+    debugger.hold_the_end();
+    assert!(
+        child.try_wait().expect("its state is read").is_none(),
+        "the process is ending and has not finished"
+    );
+
+    let ended_again = child.kill();
+
+    drop(debugger);
+    child.wait().expect("the process finishes and is collected");
+    let _ = job.terminate(1);
+    ended_again.expect("a process that is ending is ended again without a failure");
+    child.kill().expect("and so is one that has finished");
+}
+
 /// A backend this test launched as a launch does: held by a session's job and by a job of its own,
 /// which the broker keeps with the end of the backend's input it writes, so stopping it is stopping
 /// that job.
