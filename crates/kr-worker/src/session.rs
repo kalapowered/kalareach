@@ -2195,15 +2195,19 @@ impl Session {
                 .viewport(attachment_id, dimensions, anchor, column)?;
         let scope = self.content_scope(attachment_id);
         if (moved || before_dimensions != Some(dimensions))
-            && presentation_reason
-                == Some(kr_protocol::attachment::PresentationReason::RestorationIncomplete)
+            && matches!(
+                presentation_reason,
+                None | Some(kr_protocol::attachment::PresentationReason::RestorationIncomplete)
+            )
             && scope != crate::render::Scope::LiveScreen
         {
             // What the last screen could not carry says nothing about the one this window is drawn
-            // next. A terminal that is the session's size again, or back on the live screen, has
-            // only that left to keep it off the stream, so the answer is asked of the screen the
-            // session holds now and the report says what it found. A caller shown the live screen
-            // alone is left out, because no screen it is drawn can carry everything.
+            // next, and a screen that was carried when it was drawn can have changed since. A
+            // terminal that is the session's size again, or back on the live screen, was not on
+            // the stream while its window was elsewhere, and has only this left to keep it off
+            // it, so the answer is asked of the screen the session holds now and the report says
+            // what it found. A caller shown the live screen alone is left out, because no screen
+            // it is drawn can carry everything.
             let keyboard = self.attachments.keyboard_control(attachment_id);
             let carried = self
                 .engine
