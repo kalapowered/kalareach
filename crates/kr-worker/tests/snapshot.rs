@@ -2646,6 +2646,61 @@ async fn a_terminal_told_to_begin_again_is_answered_from_the_screen_it_will_be_d
     );
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.82: a report that repeats the window a terminal already holds is
+/// answered from the screen the terminal will be drawn when the session has told it to begin
+/// again, as any other report is. The application enters the alternate buffer through mode 1049,
+/// which saves the primary buffer's cursor, and a screen drawn as bytes cannot save a cursor for
+/// the buffer that is not showing, so the screen the terminal will be drawn keeps it off the
+/// stream. A terminal that reports its size on a timer has to be told so by its next report and
+/// not that it is still on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_repeating_the_window_of_a_terminal_told_to_begin_again_is_answered_from_its_screen()
+ {
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abc'; read -r _; \
+         printf '\\033[?1049h\\033[Halt'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abc").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "a terminal of the session's own size on a settled stream is handed the stream"
+    );
+
+    typist.release(&host).await;
+    let events = collect_until_resync(
+        &mut attached.client,
+        "the switch to the alternate buffer to tell the terminal to begin again",
+    )
+    .await;
+    let kept_off = (
+        TerminalPresentationMode::Viewport,
+        Some(PresentationReason::RestorationIncomplete),
+    );
+    let report = report_viewport(&host, &mut attached, narrow, None).await;
+    assert_eq!(
+        (report.presentation, report.presentation_reason.0),
+        kept_off,
+        "the window it repeats is the one it holds, and the screen it will be drawn keeps it off"
+    );
+    resubscribe(&host, &mut attached, resync_of(&events).cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(kept_off.0), kept_off.1),
+        "and the screen it is drawn on subscribing says the same"
+    );
+}
+
 /// KR-REQ-08.78 and KR-REQ-08.82: a terminal held on a projection by the screen it was drawn is
 /// handed the stream again when the session's size changes to one that screen can be carried at,
 /// without waiting for the application to write. One row wraps at eight columns and not at twelve,
