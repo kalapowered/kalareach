@@ -1,16 +1,12 @@
-//! One desktop voice call: what the person holds locally, and what the far end may send it.
+//! One desktop voice call: what the person holds locally.
 //!
 //! Section 15 paragraph 2 is the hard constraint: native WebRTC and native platform audio own
 //! capture and playback, not a background WebView `getUserMedia` path. This end has the local
-//! half of that, and not the connection: the mute controls, the playback silence, the bounded
-//! queue of what the provider's channel delivered, and the platform device. Opening a call
-//! refuses, because negotiating one is what the desktop cannot do yet, and a call that says it
-//! opened when no audio can reach it is worse than one that says it cannot.
-//!
-//! Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only. The
-//! client sends zero bytes on it. What arrives is held, bounded, for whatever reads it.
+//! half of that, and not the connection: the mute controls, the playback silence and the platform
+//! device. Opening a call refuses, because this end negotiates no connection, and a call that says
+//! it opened when no audio can reach it is worse than one that says it cannot.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,15 +16,6 @@ use crate::audio::buffer::PcmRingBuffer;
 use crate::audio::device::AudioDevice;
 use crate::audio::gate::CaptureGate;
 use crate::error::{CommandError, Result};
-
-/// How many provider events are held before the oldest is dropped.
-pub const MAX_PENDING_PROVIDER_EVENTS: usize = 256;
-
-/// The largest single provider event this end will hold, in bytes.
-///
-/// The control socket's own frame bound. An event larger than a frame is not one this client can
-/// act on, and holding it would only be storing what the far end sent.
-pub const MAX_PROVIDER_EVENT_BYTES: usize = 4096;
 
 /// A running desktop voice call.
 ///
@@ -44,8 +31,6 @@ pub struct DesktopVoiceCall {
     render_ring: Arc<Mutex<PcmRingBuffer>>,
     /// Platform audio capture and render device.
     audio_device: Arc<Mutex<AudioDevice>>,
-    /// Milliseconds from answer acceptance to first received audio.
-    first_audio_ms: Arc<AtomicU64>,
     /// Time when the call was initiated. The gate's clock counts from here.
     start_time: Instant,
     /// Whether the call has been stopped.
@@ -59,8 +44,6 @@ pub struct DesktopVoiceCall {
     local_description: Mutex<Option<String>>,
     /// Accepted remote answer SDP.
     answer_sdp: Mutex<Option<String>>,
-    /// Events received from the provider's read-only data channel.
-    provider_events: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl DesktopVoiceCall {
@@ -82,12 +65,10 @@ impl DesktopVoiceCall {
             is_playback_muted: Arc::new(AtomicBool::new(false)),
             render_ring,
             audio_device,
-            first_audio_ms: Arc::new(AtomicU64::new(0)),
             start_time: Instant::now(),
             is_stopped: Arc::new(AtomicBool::new(false)),
             local_description: Mutex::new(None),
             answer_sdp: Mutex::new(None),
-            provider_events: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -189,7 +170,7 @@ impl DesktopVoiceCall {
     /// # Errors
     ///
     /// Returns `PERMISSION_DENIED` once the call has been stopped, and `RESOURCE_UNAVAILABLE`
-    /// otherwise, until this end can negotiate a connection.
+    /// otherwise: this end negotiates no connection.
     pub async fn offer(&self) -> Result<String> {
         if self.is_stopped.load(Ordering::Relaxed) {
             return Err(CommandError::refused("the call has already been stopped"));
@@ -282,46 +263,6 @@ impl DesktopVoiceCall {
         self.is_playback_muted.load(Ordering::SeqCst)
     }
 
-    /// Records incoming provider data channel bytes (read-only data channel).
-    ///
-    /// Bounded, and the oldest is dropped first. What arrives here is written by the provider, so
-    /// an unbounded queue would let the far end decide how much memory this process holds.
-    pub fn receive_provider_event(&self, bytes: Vec<u8>) {
-        if bytes.len() > MAX_PROVIDER_EVENT_BYTES {
-            return;
-        }
-        if let Ok(mut events) = self.provider_events.lock() {
-            while events.len() >= MAX_PENDING_PROVIDER_EVENTS {
-                events.remove(0);
-            }
-            events.push(bytes);
-        }
-    }
-
-    /// Consumes and returns all received provider data channel events.
-    #[must_use]
-    pub fn drain_provider_events(&self) -> Vec<Vec<u8>> {
-        self.provider_events
-            .lock()
-            .map(|mut guard| guard.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Records that the first remote audio packet has arrived (KR-PERF-010).
-    pub fn record_first_audio(&self) {
-        let elapsed = self.start_time.elapsed().as_millis() as u64;
-        let _ =
-            self.first_audio_ms
-                .compare_exchange(0, elapsed, Ordering::SeqCst, Ordering::Relaxed);
-    }
-
-    /// Milliseconds to first remote audio, or None if no audio received yet.
-    #[must_use]
-    pub fn first_audio_ms(&self) -> Option<u64> {
-        let ms = self.first_audio_ms.load(Ordering::Relaxed);
-        if ms == 0 { None } else { Some(ms) }
-    }
-
     /// Ends the call and releases audio resources.
     ///
     /// Local and immediate. Serialised against acceptance so capture cannot start after closure.
@@ -383,23 +324,6 @@ mod tests {
         assert!(call.is_playback_muted());
         call.set_playback_muted(false);
         assert!(!call.is_playback_muted());
-
-        // Data channel event reception (read-only)
-        call.receive_provider_event(b"test_event".to_vec());
-        let events = call.drain_provider_events();
-        assert_eq!(events, vec![b"test_event".to_vec()]);
-
-        // What the far end sends does not decide how much this process holds.
-        for index in 0..(MAX_PENDING_PROVIDER_EVENTS + 50) {
-            call.receive_provider_event(format!("event_{index}").into_bytes());
-        }
-        call.receive_provider_event(vec![0u8; MAX_PROVIDER_EVENT_BYTES + 1]);
-        let held = call.drain_provider_events();
-        assert_eq!(held.len(), MAX_PENDING_PROVIDER_EVENTS);
-        assert!(
-            held.iter()
-                .all(|event| event.len() <= MAX_PROVIDER_EVENT_BYTES)
-        );
 
         // Stop call
         call.stop();

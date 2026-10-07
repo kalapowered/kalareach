@@ -23,7 +23,7 @@ commands every other screen uses, and it draws only what an answer carried.
 | The sessions' names | `session.list` |
 | The model, the disclosure, the rate and the call limits | `voice.prepare`, in the managed service's words |
 | The voice session, the model, the call and when it closes | `voice.start` |
-| The microphone, the speaker and the first audio | the call this device is holding |
+| The microphone and the speaker | the call this device is holding |
 | A delegation's state and its words | `voice.delegate` |
 | What the host selected for the call | `voice.context`, a read from the host |
 

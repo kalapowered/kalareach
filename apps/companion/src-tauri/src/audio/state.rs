@@ -25,8 +25,6 @@ pub struct VoiceCallState {
     pub capture: &'static str,
     /// Whether the model's voice is coming out of this device.
     pub playing: bool,
-    /// Milliseconds from the answer being applied to the first audio out, once there has been one.
-    pub first_audio_ms: Option<u64>,
     /// The call's own control channel to the voice service: `none` when it holds none,
     /// `connected`, or `unreachable`.
     ///
@@ -41,6 +39,5 @@ pub(super) const NO_CALL: VoiceCallState = VoiceCallState {
     running: false,
     capture: "idle",
     playing: false,
-    first_audio_ms: None,
     control: "none",
 };

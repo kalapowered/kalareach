@@ -416,8 +416,6 @@ export interface VoiceCallState {
   readonly capture: string
   /** Whether the model's voice is coming out of this device. */
   readonly playing: boolean
-  /** Milliseconds from the answer being applied to the first audio out, once there has been one. */
-  readonly first_audio_ms: number | null
   /**
    * The call's own control channel to the voice service: `none` when it holds none, `connected`,
    * or `unreachable`. Whether the voice service is answering is read from here and nowhere else.

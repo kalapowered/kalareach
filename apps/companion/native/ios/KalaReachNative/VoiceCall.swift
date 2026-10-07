@@ -22,7 +22,7 @@ public protocol VoiceCallObserver: AnyObject {
     func voiceCall(_ call: VoiceCall, connectionChanged state: RTCPeerConnectionState)
     /// The provider sent something on its read-only channel.
     func voiceCall(_ call: VoiceCall, receivedProviderEvent data: Data)
-    /// The first remote audio arrived. Section 27's KR-PERF-010 first-audio figure is taken here.
+    /// The first remote audio track arrived. It reports a track, not audible playback.
     func voiceCallReceivedFirstAudio(_ call: VoiceCall)
 }
 

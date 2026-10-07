@@ -346,8 +346,6 @@ export interface RunningCall {
   readonly hostReachable: boolean
   readonly delegations: readonly Delegation[]
   readonly requests: readonly ContextRequest[]
-  /** Milliseconds from the answer being applied to the first remote audio. KR-PERF-010. */
-  readonly firstAudioMs: number | null
   /**
    * What an append acknowledgement does not establish, in the host's own words.
    *
@@ -361,8 +359,8 @@ export interface RunningCall {
  * The call the screen holds, built from what the host answered and what this device reports.
  *
  * The two halves are deliberately different sources. The session, the model and the closing time
- * are the host's; the microphone, the speaker and the first audio are this device's, read from the
- * call it is holding. Nothing here is a guess about either.
+ * are the host's; the microphone and the speaker are this device's, read from the call it is
+ * holding. Nothing here is a guess about either.
  */
 export function runningCallFrom(
   session: VoiceSessionDescriptor,
@@ -381,7 +379,6 @@ export function runningCallFrom(
     hostReachable: true,
     delegations: [],
     requests: [],
-    firstAudioMs: state.first_audio_ms,
     admissionMeans
   }
 }
