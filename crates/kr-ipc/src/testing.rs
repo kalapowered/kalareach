@@ -25,9 +25,11 @@ use crate::paths::{EnvironmentPaths, HostPaths};
 pub const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
 
 /// A host tree that removes itself when it is dropped.
+///
+/// Its root is a [`PrivateTempDir`], so it is a directory this tree made and nothing else did.
 #[derive(Debug)]
 pub struct TempHost {
-    root: PathBuf,
+    root: PrivateTempDir,
     paths: HostPaths,
     environment_id: EnvironmentId,
 }
@@ -41,12 +43,9 @@ impl TempHost {
     /// unusable rather than that the case under test failed.
     #[must_use]
     pub fn create() -> Self {
-        // Short on purpose: a Unix socket address is 104 bytes on macOS, and a temporary directory
-        // there already spends about half of that.
-        let suffix = crate::new_uuid().to_string();
-        let root = std::env::temp_dir().join(format!("kr-{}", &suffix[..8]));
-        crate::paths::create_private_tree(&root, &root).expect("owner-only temporary root");
-        let paths = HostPaths::new(root.join("r"), root.join("s")).expect("absolute roots");
+        let root = PrivateTempDir::create();
+        let paths =
+            HostPaths::new(root.path().join("r"), root.path().join("s")).expect("absolute roots");
         let environment_id = paths.open_environment_id().expect("environment identity");
         paths
             .environment(environment_id)
@@ -80,13 +79,7 @@ impl TempHost {
     /// Returns the root of the tree.
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Drop for TempHost {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        self.root.path()
     }
 }
 
@@ -100,9 +93,10 @@ impl Drop for TempHost {
 /// test opens as one of the host's own. A test that hands a directory to code which checks it
 /// takes one made here, whose list is protected and so inherits nothing.
 ///
-/// Like [`TempHost`], the name is short for a socket address. The directory is created
-/// exclusively: a name that is already taken is somebody else's directory, so another name is
-/// tried, and what is removed on drop is only ever what this value made.
+/// The name is short on purpose: a Unix socket address is 104 bytes on macOS, and a temporary
+/// directory there already spends about half of that. The directory is created exclusively: a name
+/// that is already taken is somebody else's directory, so another name is tried, and what is
+/// removed on drop is only ever what this value made. A [`TempHost`] is rooted in one.
 #[derive(Debug)]
 pub struct PrivateTempDir {
     root: PathBuf,
@@ -120,9 +114,17 @@ impl PrivateTempDir {
     /// unusable rather than that the case under test failed.
     #[must_use]
     pub fn create() -> Self {
-        for _ in 0..Self::ATTEMPTS {
+        Self::create_named(|| {
             let suffix = crate::new_uuid().to_string().replace('-', "");
-            let root = std::env::temp_dir().join(format!("kr-{}", &suffix[..12]));
+            format!("kr-{}", &suffix[..12])
+        })
+    }
+
+    /// Creates a fresh owner-only directory under the platform's temporary directory, named by the
+    /// names `next_name` gives in turn, and leaves alone every one of them that is already taken.
+    fn create_named(mut next_name: impl FnMut() -> String) -> Self {
+        for _ in 0..Self::ATTEMPTS {
+            let root = std::env::temp_dir().join(next_name());
             if crate::paths::create_new_private_directory(&root)
                 .expect("an owner-only temporary directory")
             {
@@ -349,7 +351,7 @@ mod tests {
 
     /// A private directory is made only where nothing is. A name that is already taken is another
     /// directory's, which two owners would share and either could remove, so the second maker is
-    /// told the name was taken and leaves what is there as it is.
+    /// told the name was taken, leaves what is there as it is, and takes the next name.
     #[test]
     fn a_private_directory_is_not_made_where_a_name_is_taken() {
         let first = PrivateTempDir::create();
@@ -359,11 +361,20 @@ mod tests {
             crate::paths::create_new_private_directory(first.path()).expect("asks for the name");
 
         assert!(!made, "a directory that was already there was made again");
+        let taken = first
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("a name")
+            .to_owned();
+        let free = format!("kr-free-{}", crate::new_uuid());
+        let mut names = [taken, free.clone()].into_iter();
+        let second = PrivateTempDir::create_named(|| names.next().expect("a name is left"));
+        assert_eq!(second.path().file_name(), Some(std::ffi::OsStr::new(&free)));
         assert_eq!(
             std::fs::read(first.path().join("kept")).expect("the file is still there"),
             b"the first owner's"
         );
-        assert_ne!(first.path(), PrivateTempDir::create().path());
     }
 
     /// The address the tests name as unanswered refuses a connection. A machine that answers there
