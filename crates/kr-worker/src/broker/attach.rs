@@ -600,7 +600,9 @@ pub struct NativeGateway {
     /// It is [`crate::broker::probe::DEADLINE`] for every gateway this product binds. It is a
     /// field rather than the constant at the one place that waits on it so that a test can give a
     /// probe the time a loaded machine takes to start a program, and decide by what the probe
-    /// printed rather than by how soon it printed.
+    /// printed rather than by how soon it printed. The bound a closure puts on the launches in
+    /// flight comes from [`crate::broker::probe::DEADLINE`] and not from this field, so a gateway
+    /// whose probe was given longer is not one a closure waits that long for.
     probe_deadline: std::time::Duration,
     /// The last process a launch of this gateway started, for this host's own tests.
     ///
