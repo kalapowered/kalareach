@@ -283,7 +283,13 @@ export KR_STATE_DIR="$run_root/s"
 kr="$run_root/bin/kr"
 
 managed_shell="$packages/zsh/$(cat "$packages/zsh/current")/bin/zsh"
-(cd "$run_root" && SHELL="$managed_shell" exec "$run_root/bin/kr-controller" \
+# The session's own home, so nothing this run does reaches the person's own startup files. An
+# invisible session has no creator to send its variables, so it starts with those of the daemon
+# that makes it: the home it reads its startup from and the shell it runs are the daemon's, and
+# the daemon is started in them.
+session_home="$run_root/home"
+mkdir -p "$session_home/.config"
+(cd "$run_root" && HOME="$session_home" SHELL="$managed_shell" exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
   --state-dir "$run_root/s" \
   --secret-store file \
@@ -374,11 +380,8 @@ print("" if document is None else document)
 ' "$1" "$2"
 }
 
-# The session's own home, so nothing this run does reaches the person's own startup files. The
-# customisation is one of the pinned set, installed the way its own documentation says to; the
+# The customisation is one of the pinned set, installed the way its own documentation says to; the
 # marked entry is added by the product's own installer rather than by this script.
-session_home="$run_root/home"
-mkdir -p "$session_home/.config"
 # The customisation this session runs, from the index the fetcher wrote.
 starship_root="$(/usr/bin/env python3 -c '
 import json, sys
@@ -420,8 +423,7 @@ else
   fail "the marked entry is not in the startup file the session will read"
 fi
 
-if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
-    "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
+if "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
     --json >"$artifacts/fence-create.json" 2>"$run_root/create.err"; then
   display="$(read_json "$artifacts/fence-create.json" display_number)"
   mode="$(read_json "$artifacts/fence-create.json" shell_mode)"
@@ -461,8 +463,7 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
   second="$second_identity"
   if [ -n "$second" ] && [ "$second" != "$first_identity" ] && [ -x "$packages/zsh/$second/bin/zsh" ]; then
     printf '%s' "$second" > "$packages/zsh/current"
-    if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$packages/zsh/$second/bin/zsh" \
-        "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
+    if "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
         --json >"$artifacts/fence-create-2.json" 2>&1; then
       second_display="$(read_json "$artifacts/fence-create-2.json" display_number)"
       HOME="$session_home" "$kr" status "$second_display" --json >"$artifacts/fence-status-2.json" 2>&1 || true
