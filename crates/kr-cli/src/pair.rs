@@ -4,8 +4,8 @@
 //!
 //! Every effect here is one of the host's pairing methods over this user's own local socket, and
 //! issuing an invitation, approving a device and establishing the host's clock each need a fresh
-//! owner confirmation naming exactly that action. The command asks the host for the confirmation's challenge first, and the
-//! host's answer says who can confirm it:
+//! owner confirmation naming exactly that action. The command asks the host for the confirmation's
+//! challenge first, and the host's answer says who can confirm it:
 //!
 //! * **A host with an owner.** An owner device confirms, in its own ceremony. The command says so
 //!   and asks for the effect again every second until the host spends that confirmation, or until
@@ -542,16 +542,16 @@ async fn guard(build_id: &BuildId) -> Result<()> {
         Membership::Inside(session_id) => Err(refused(
             ErrorCode::PermissionDenied,
             shown!(
-                "this process is inside session {}; what a host with no owner confirms is confirmed at a \
-                 terminal outside every session",
+                "this process is inside session {}; what a host with no owner confirms is \
+                 confirmed at a terminal outside every session",
                 session_id
             ),
         )),
         Membership::Unknown(why) => Err(refused(
             ErrorCode::PermissionDenied,
             shown!(
-                "whether this process is inside a KalaReach session cannot be established ({}); what a \
-                 host with no owner confirms is confirmed only where it can",
+                "whether this process is inside a KalaReach session cannot be established ({}); \
+                 what a host with no owner confirms is confirmed only where it can",
                 why
             ),
         )),
