@@ -100,16 +100,16 @@ fn a_side_effect_from_before_a_client_arrived_never_reaches_it() {
     );
 }
 
-/// KR-REQ-08.83 and KR-REQ-27.06: a terminal an earlier application ran in holds the session's screen
-/// after its restoration and through the output that follows, whatever that application left in
-/// it, and whether or not the terminal acts on a soft reset.
+/// KR-REQ-08.83 and KR-REQ-27.06: a terminal an earlier application ran in holds the session's
+/// screen after its restoration and through the output that follows, whatever that application
+/// left in it, and whether or not the terminal acts on a soft reset.
 ///
 /// The terminal is in origin mode inside a scroll region, has DEC line drawing in both character
 /// sets, a pen and insert mode, holds a saved cursor in each buffer, and ignores the soft reset, as
-/// Alacritty, Ghostty, tmux and GNU screen do. It starts on either buffer. A restoration that relied on the soft reset to put
-/// any of that right would draw into it. A soft reset the application sends is not forwarded to
-/// such a terminal: the session tells it to begin again, which is why the corpus that has the
-/// application send one is run too.
+/// Alacritty, Ghostty, tmux and GNU screen do. It starts on either buffer. A restoration that
+/// relied on the soft reset to put any of that right would draw into it. A soft reset the
+/// application sends is not forwarded to such a terminal: the session tells it to begin again,
+/// which is why the corpus that has the application send one is run too.
 #[test]
 fn a_terminal_an_earlier_application_left_in_a_state_holds_the_screen_after_its_restoration() {
     for beforehand in [
