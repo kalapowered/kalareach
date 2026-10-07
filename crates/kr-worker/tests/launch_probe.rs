@@ -205,9 +205,9 @@ fn written_pid(directory: &Path, file: &str) -> Option<u32> {
 /// started, and records no mode. Neither the program nor its child is left running.
 ///
 /// The deadline has to pass after the program has started what it starts, and how soon it does that
-/// is the machine's to say. So the probe is given a longer deadline, up to `GENEROUS`, each time the
-/// program is found not to have started it yet, and what is decided is the state of the processes
-/// once a probe that the program was running in has been ended.
+/// is the machine's to say. So the probe is given a longer deadline, up to `GENEROUS`, each time
+/// the program is found not to have started it yet, and what is decided is the state of the
+/// processes once a probe that the program was running in has been ended.
 #[test]
 fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_started() {
     let mut deadline = if cfg!(windows) {
