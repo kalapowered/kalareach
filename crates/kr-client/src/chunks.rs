@@ -133,6 +133,18 @@ impl ChunkLane {
         self.transfer_id
     }
 
+    /// Takes this lane's reading of time out of the runtime's hands and puts it `by` after the
+    /// moment the lane was opened, for this crate's own tests: it stands there until this is
+    /// called again, and a window the lane holds falls due, or runs out, by that reading, without
+    /// the test waiting for it. Windows the lane receives from then on are stamped with it.
+    #[cfg(feature = "testing")]
+    pub fn hold_clock_at(&self, by: Duration) {
+        let Carrier::Local(carrier) = &self.carrier;
+        let by_ms = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        carrier.clock.ahead_ms.store(by_ms, Ordering::Release);
+        carrier.clock.held.store(true, Ordering::Release);
+    }
+
     /// Sends one chunk of an upload and returns what the host accepted.
     ///
     /// The chunk is an `upload.chunk` mutation of its own: a fresh action identifier, the lane's
@@ -247,6 +259,83 @@ impl ChunkLane {
 /// caller abandoned before its answer came.
 const ANSWER_DEPTH: usize = 8;
 
+/// Where a lane reads time from: the runtime's clock. A test of this crate's can take one lane's
+/// reading out of the runtime's hands (`ChunkLane::hold_clock_at`): from then on it stands where
+/// the test puts it, so that a window falls due, or runs out, by the lane's own reading when the
+/// test says and not when the machine gets there. Every other lane reads the runtime's clock.
+#[derive(Clone)]
+struct LaneClock {
+    #[cfg(feature = "testing")]
+    opened: tokio::time::Instant,
+    #[cfg(feature = "testing")]
+    held: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "testing")]
+    ahead_ms: Arc<AtomicU64>,
+}
+
+impl LaneClock {
+    /// The reading of a lane opened at `opened`, the moment its first window is stamped with too.
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "the shipped form holds nothing of `opened`"
+        )
+    )]
+    fn new(opened: tokio::time::Instant) -> Self {
+        #[cfg(not(feature = "testing"))]
+        let _ = opened;
+        Self {
+            #[cfg(feature = "testing")]
+            opened,
+            #[cfg(feature = "testing")]
+            held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "testing")]
+            ahead_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn now(&self) -> tokio::time::Instant {
+        if self.held.load(Ordering::Acquire) {
+            self.opened + Duration::from_millis(self.ahead_ms.load(Ordering::Acquire))
+        } else {
+            tokio::time::Instant::now()
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this lane's own reading"
+    )]
+    fn now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    /// The moment on the runtime's timer at which the window that runs out at `expiry`, by this
+    /// lane's reading, has run out. That is `expiry` itself, an absolute moment of the runtime's
+    /// clock, except where a test holds the lane's reading: then it is the time that reading says
+    /// is left, from now.
+    #[cfg(feature = "testing")]
+    fn timer_deadline(&self, expiry: tokio::time::Instant) -> tokio::time::Instant {
+        if self.held.load(Ordering::Acquire) {
+            tokio::time::Instant::now() + expiry.saturating_duration_since(self.now())
+        } else {
+            expiry
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this lane's own reading"
+    )]
+    const fn timer_deadline(&self, expiry: tokio::time::Instant) -> tokio::time::Instant {
+        expiry
+    }
+}
+
 /// A window the host issued on a lane's connection, and when the lane received it.
 #[derive(Clone)]
 struct Issued {
@@ -255,10 +344,10 @@ struct Issued {
 }
 
 impl Issued {
-    fn now(window: ActionWindow) -> Self {
+    fn at(window: ActionWindow, clock: &LaneClock) -> Self {
         Self {
             window,
-            received_at: tokio::time::Instant::now(),
+            received_at: clock.now(),
         }
     }
 
@@ -295,6 +384,8 @@ struct LocalCarrier {
     /// against.
     issued: Arc<AtomicU64>,
     reader: tokio::task::JoinHandle<()>,
+    /// Where this lane reads time from, which the reader reads too.
+    clock: LaneClock,
     /// Set once the connection has failed. Nothing is sent on it again: a frame read or written in
     /// part leaves nothing a later call could trust.
     ended: bool,
@@ -363,15 +454,29 @@ impl LocalCarrier {
                  environment's controller",
             ));
         }
-        let (renewals, window) = watch::channel(Issued::now(acknowledgement.action_window));
+        // One reading for both: the lane's clock stands at it when a test holds the clock, and the
+        // first window was received at it.
+        let opened = tokio::time::Instant::now();
+        let clock = LaneClock::new(opened);
+        let (renewals, window) = watch::channel(Issued {
+            window: acknowledgement.action_window,
+            received_at: opened,
+        });
         let (answering, answers) = mpsc::channel(ANSWER_DEPTH);
         let issued = Arc::new(AtomicU64::new(0));
         Ok(Self {
             writer,
             window,
             answers,
-            reader: tokio::spawn(read_lane(reader, renewals, answering, Arc::clone(&issued))),
+            reader: tokio::spawn(read_lane(
+                reader,
+                renewals,
+                answering,
+                Arc::clone(&issued),
+                clock.clone(),
+            )),
             issued,
+            clock,
             ended: false,
         })
     }
@@ -416,12 +521,15 @@ impl LocalCarrier {
                 return Err(ClientError::NoActionWindow);
             }
             let validity = issued.validity();
-            if issued.received_at.elapsed() < validity / 2 {
+            let now = self.clock.now();
+            if now.saturating_duration_since(issued.received_at) < validity / 2 {
                 return Ok(issued.window);
             }
             // The renewal is due. The reader delivers it as soon as it arrives.
             let expiry = issued.received_at + validity;
-            match tokio::time::timeout_at(expiry, self.window.changed()).await {
+            match tokio::time::timeout_at(self.clock.timer_deadline(expiry), self.window.changed())
+                .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(self.stopped()),
                 Err(_) => {
@@ -519,6 +627,7 @@ async fn read_lane(
     renewals: watch::Sender<Issued>,
     answering: mpsc::Sender<Result<ControlFrame>>,
     issued: Arc<AtomicU64>,
+    clock: LaneClock,
 ) {
     loop {
         let frame = match reader.read_message::<ControlFrame>().await {
@@ -530,7 +639,7 @@ async fn read_lane(
         };
         let answered = match &frame {
             ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
-                renewals.send_replace(Issued::now(window.clone()));
+                renewals.send_replace(Issued::at(window.clone(), &clock));
                 continue;
             }
             ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {
