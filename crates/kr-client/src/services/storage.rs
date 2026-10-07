@@ -48,10 +48,11 @@
 //! service shares `CONFLICT`. With the reason `retention_changed`, it is a change decided against a
 //! revision the record has left: nothing was changed, and the refusal carries the retention as it
 //! stands, which is [`RetentionAnswer::Stale`], for the caller to show and decide again against. A
-//! change sent again after its answer was lost meets it too, and learns what the first one made. A
-//! conflict that does not carry those members as the contract states them stays the error the
-//! service named, a view to refresh: it still says nothing was changed, so it is never an unknown
-//! outcome.
+//! change sent again after its answer was lost meets it too, when the first one moved the record
+//! on, and the retention it carries is what the first one left unless another change has landed
+//! since. A conflict that does not carry those members as the contract states them stays the error
+//! the service named, a view to refresh: it still says nothing was changed, so it is never an
+//! unknown outcome.
 //!
 //! # What is never rendered
 //!
@@ -437,7 +438,12 @@ impl<'de> Deserialize<'de> for StoragePrincipal {
     }
 }
 
-/// The retention the service publishes and applies.
+/// The retention rules the service publishes.
+///
+/// The number of daily snapshots is the producer's decision, which the service records and reports,
+/// because it cannot know which objects a generation names. The service itself removes a deleted
+/// object's ciphertext once its tombstone days end. The provider's recovery window is a published
+/// upper bound, not something the service applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct RetentionPolicy {
     /// Daily snapshots kept for an archive.
@@ -466,7 +472,7 @@ pub struct StorageStatus {
     pub backup: BackupState,
     /// The revision the next retention change names.
     pub retention_revision: u64,
-    /// The retention the service applies.
+    /// The retention recorded for the principal.
     pub retention: RetentionPolicy,
     /// Objects readable now.
     pub stored: StorageUsage,
@@ -521,23 +527,23 @@ pub struct StorageLimits {
 /// What a retention change answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSet {
-    /// Whether the change was made, or asked for what was already so.
+    /// Whether the change was made: false when it asked for what was already so.
     pub changed: bool,
     /// Whether backup storage is on now.
     pub backup: BackupState,
-    /// The retention the service applies now.
+    /// The retention recorded now.
     pub retention: RetentionPolicy,
     /// The revision the record is at now, which the next change names.
     pub revision: u64,
 }
 
 /// One principal's retention as it stands: whether backup storage is on, the retention the service
-/// applies, and the revision the next change names.
+/// has recorded for it, and the revision the next change names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionState {
     /// Whether backup storage is on.
     pub backup: BackupState,
-    /// The retention the service applies.
+    /// The retention recorded.
     pub retention: RetentionPolicy,
     /// The revision the record is at, which the next change names.
     pub revision: u64,
@@ -553,8 +559,8 @@ pub enum RetentionAnswer {
     ///
     /// A caller shows `current` and decides again against it: the same change naming its revision
     /// is made unless the retention changes again. A change sent again after its answer was lost is
-    /// answered this way too, and `current` is then what that change left, unless another has
-    /// landed since.
+    /// answered this way too when the first one moved the record on, and `current` is then what
+    /// that change left, unless another has landed since.
     Stale {
         /// The retention as it stands.
         current: RetentionState,
@@ -688,7 +694,7 @@ pub struct ObjectDeleted {
     pub purge_after: String,
     /// The bytes still charged until then.
     pub retained_bytes: u64,
-    /// The retention the service applies.
+    /// The retention rules as the service publishes them.
     pub retention: RetentionPolicy,
 }
 
