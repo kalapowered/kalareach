@@ -1763,8 +1763,8 @@ jobs:
 
       # Everything the script below builds before it measures: the release profile of the
       # workspace, and the measurement suite and the input benchmark with their test dependencies.
-      # Built here, so the machine can then be let settle and the script's own builds find nothing
-      # to do: a figure taken while a build is still winding down is a figure about the build.
+      # Built here so that the script has as little left to build as it can: a figure taken while a
+      # build is still winding down is a figure about the build.
       - name: Build what the measurements run
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 60
@@ -1772,29 +1772,19 @@ jobs:
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
-      # Until the load average over the last minute is under one and a half, or ten minutes have
-      # passed; the script records the load at the edges of every measurement either way.
-      - name: Let the machine settle
-        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 12
-        run: |
-          for _ in $(seq 1 60); do
-            if sysctl -n vm.loadavg | awk '{ exit !($2 < 1.5) }'; then
-              break
-            fi
-            sleep 10
-          done
-          echo "load average: $(sysctl -n vm.loadavg)"
-
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under and asserted
       # against its bound. This runner has three processors and 7 GiB, short of section 27's
       # reference host, so the idle processor figure is recorded here with each missing condition
       # named and is asserted by the macos-reference job; the idle memory bound and the other
-      # figures are asserted here.
+      # figures are asserted here. Section 27 measures an idle host, so the script starts each
+      # measurement only once the one-minute load average is under the bound named here, waiting
+      # at most five minutes for it, and fails without a figure when it does not fall.
       - name: Performance measurements
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 45
+        env:
+          KR_PERF_SETTLE_LOAD: "1.5"
         run: bash scripts/performance.sh
 
       # The figures and whatever else the steps above wrote to the artefact directory, kept whether
@@ -1876,31 +1866,23 @@ jobs:
         with:
           name: macos-reference
 
-      # Everything the script below builds before it measures, so the machine can then be let
-      # settle and the script's own builds find nothing to do.
+      # Everything the script below builds before it measures, so that the script has as little
+      # left to build as it can.
       - name: Build what the measurements run
         timeout-minutes: 120
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
-      # Until the load average over the last minute is under one and a half, or ten minutes have
-      # passed; the script records the load at the edges of every measurement either way.
-      - name: Let the machine settle
-        timeout-minutes: 12
-        run: |
-          for _ in $(seq 1 60); do
-            if sysctl -n vm.loadavg | awk '{ exit !($2 < 1.5) }'; then
-              break
-            fi
-            sleep 10
-          done
-          echo "load average: $(sysctl -n vm.loadavg)"
-
       # The idle processor figure is asserted here because this host reports no shortfall against
-      # the reference host; a shortfall the host reported would be recorded and named instead.
+      # the reference host; a shortfall the host reported would be recorded and named instead. The
+      # script starts each measurement only once the one-minute load average is under the bound
+      # named here, waiting at most five minutes for it, and fails without a figure when it does
+      # not fall.
       - name: Performance measurements
         timeout-minutes: 45
+        env:
+          KR_PERF_SETTLE_LOAD: "1.5"
         run: bash scripts/performance.sh
 
       - name: Keep the test evidence
