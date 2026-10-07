@@ -393,6 +393,13 @@ a soft reset leaves the buffer, and the fifth is what it leaves saved:
   a saved cursor back, rendition and character sets included, and nothing but a sequence that moves
   the screen can.
 
+  A wrap pending at the reset needs no rule of its own. Every soft reset advances the projection, so
+  each direct attachment is told to begin again and is drawn from the canonical screen, and the
+  reset itself never reaches its terminal. The canonical screen keeps the pending wrap through the
+  reset, as xterm's does, and a redraw cannot leave a wrap pending, so an attachment drawn while the
+  wrap is still pending is shown a projection. Otherwise the redraw leaves the attachment on the
+  stream, unless the screen holds something else a redraw cannot carry, such as a soft-wrapped row.
+
 A full reset is not among these behaviours, because the engine makes it match xterm. The library
 keeps whatever was saved across a full reset. A program that restores a cursor afterwards would land
 where it saved the cursor before the reset, while a terminal that follows xterm puts it at home. So
