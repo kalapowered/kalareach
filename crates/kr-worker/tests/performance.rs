@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_controller::service::{Controller, ControllerSetup};
+#[cfg(not(windows))]
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -59,6 +60,10 @@ const ATTACH_BOUND: Duration = Duration::from_millis(500);
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker.
+    /// Declared after the tree, so it is removed once the tree has ended what was started.
+    #[cfg(windows)]
+    _task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
     controller: Arc<Controller>,
@@ -82,6 +87,22 @@ async fn host() -> Host {
         &worker,
         &["--version"],
     );
+    // On Windows the daemon runs inside `cargo test`'s job, which kills its members when it closes
+    // and forbids breakaway, so each worker is started through the environment's scheduled task,
+    // whose starter creates it outside that job. Elsewhere a detached process of the daemon's own.
+    #[cfg(windows)]
+    let task = kr_controller::supervision::windows::testing::TestTask::register(
+        &environment,
+        &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+            .unwrap_or_else(|missing| panic!("{missing}")),
+    )
+    .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
+    #[cfg(windows)]
+    let platform_supervisor: Box<dyn kr_controller::supervision::WorkerSupervisor> =
+        Box::new(task.supervisor(&environment));
+    #[cfg(not(windows))]
+    let platform_supervisor: Box<dyn kr_controller::supervision::WorkerSupervisor> =
+        Box::new(DetachedSupervisor::new());
     let secrets = environment.secrets_dir();
     let controller = Controller::start(ControllerSetup {
         paths: environment.clone(),
@@ -95,7 +116,7 @@ async fn host() -> Host {
         }),
         secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: temp.supervisor(Box::new(DetachedSupervisor::new())),
+        supervisor: temp.supervisor(platform_supervisor),
         worker_program: worker.clone(),
         build_id: build(),
         release: "0".to_owned(),
@@ -112,6 +133,8 @@ async fn host() -> Host {
     tokio::spawn(Arc::clone(&controller).serve_clients(clients));
     Host {
         temp,
+        #[cfg(windows)]
+        _task: task,
         worker,
         environment_id,
         controller,

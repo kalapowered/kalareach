@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use kr_controller::desktop::power::{self, Demand, Inhibitor};
 use kr_controller::service::{Controller, ControllerSetup};
+#[cfg(not(windows))]
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -81,6 +82,10 @@ fn power_document(setting: SleepInhibitionSetting) -> String {
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker.
+    /// Declared after the tree, so it is removed once the tree has ended what was started.
+    #[cfg(windows)]
+    task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -102,8 +107,17 @@ impl Host {
             &worker,
             &["--version"],
         );
+        #[cfg(windows)]
+        let task = kr_controller::supervision::windows::testing::TestTask::register(
+            &temp.environment(),
+            &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+                .unwrap_or_else(|missing| panic!("{missing}")),
+        )
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
         Self {
             temp,
+            #[cfg(windows)]
+            task,
             worker,
             environment_id,
         }
@@ -111,6 +125,19 @@ impl Host {
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
         self.temp.environment()
+    }
+
+    /// The supervisor this host's daemon starts workers through.
+    ///
+    /// On Windows, the environment's scheduled task, whose starter creates each worker: this
+    /// daemon runs inside `cargo test`'s job, which kills its members when it closes and forbids
+    /// breakaway, so a worker it created itself would die with the test or never start.
+    /// Elsewhere, a detached process of the daemon's own.
+    fn platform_supervisor(&self) -> Box<dyn kr_controller::supervision::WorkerSupervisor> {
+        #[cfg(windows)]
+        return Box::new(self.task.supervisor(&self.paths()));
+        #[cfg(not(windows))]
+        Box::new(DetachedSupervisor::new())
     }
 
     async fn start(&self) -> RunningDaemon {
@@ -138,7 +165,7 @@ impl Host {
                 // this machine would queue behind.
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: self.temp.supervisor(Box::new(DetachedSupervisor::new())),
+                supervisor: self.temp.supervisor(self.platform_supervisor()),
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
@@ -1658,14 +1685,20 @@ fn a_capability_record_per_desktop_says_what_produced_it_and_refuses_a_container
             "{name} claims evidence nothing produced: {record:?}"
         );
         if record.evidence_source == CapabilityEvidenceSource::PlatformQuery {
+            // Windows runs every one of a user's processes in that user's own interactive session,
+            // so for the headless profile its query says nothing is established, not that the
+            // desktop cannot be reached.
+            let says_nothing_is_established =
+                cfg!(windows) && record.state == CapabilityState::NotTested;
             assert!(
-                matches!(
-                    record.state,
-                    CapabilityState::PermissionRequired
-                        | CapabilityState::MissingInstallation
-                        | CapabilityState::TemporarilyUnavailable
-                        | CapabilityState::Incompatible
-                ),
+                says_nothing_is_established
+                    || matches!(
+                        record.state,
+                        CapabilityState::PermissionRequired
+                            | CapabilityState::MissingInstallation
+                            | CapabilityState::TemporarilyUnavailable
+                            | CapabilityState::Incompatible
+                    ),
                 "a platform query can only refuse: {record:?}"
             );
         }
