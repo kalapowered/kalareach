@@ -69,9 +69,12 @@ host records a device's prompt before it sends it. It records a local caller's o
 has said it holds no receipt for the action. The worker serves a prompt that names a draft only to
 the host, so no route to the session's agent leaves a draft unrecorded. A worker already running at
 the update serves such a prompt on its own socket unseen, so the sweep keeps what any session the
-host then knew names, as it keeps what was submitted, while that session is retained. An attachment
-that none of those sessions names stays on the seven-day window. The host cannot tell whether such
-a prompt sent it, and keeping all of them would keep the files of every such draft indefinitely. A
+host then knew names, as it keeps what was submitted, while that session is retained. Once none of
+those sessions can run a worker, the host puts what each names under its retention and stops
+reading them. An attachment that none of them names stays on the seven-day window. The host cannot
+tell whether such a prompt sent it, and keeping all of them would keep the files of every such
+draft indefinitely. A local prompt for a session that has closed is refused as `SESSION_CLOSED` from
+its closure record, including one whose session closed while the prompt waited to reach the worker. A
 prompt containing only prompt text, and therefore having no draft name, may be served to the worker on its
 own socket. A draft is sent to one session, and an attachment belongs to one. The
 attachments the draft holds, and any it gets later, can only be held by the session it was sent to.
