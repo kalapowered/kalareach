@@ -49,13 +49,3 @@ export interface LaunchSurface {
   readonly buffer_revision: string
   readonly profiles: readonly LaunchProfile[]
 }
-
-/** The six agent profiles the specification names, in the order it names them. */
-export const INSTALLED_PROFILE_IDS = [
-  'codex',
-  'claude-code',
-  'opencode',
-  'gemini',
-  'kimi',
-  'qoder'
-] as const

@@ -122,15 +122,6 @@ export function readableBytes(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
 }
 
-/**
- * The accounts an ordinary person needs to use this product.
- *
- * None. Section 26 says so and this is where the interface says it: the official applications and
- * the free gateway need no Cloudflare, Stripe, Firebase or Apple developer account, and setup
- * asks for none of them.
- */
-export const ACCOUNTS_REQUIRED: readonly string[] = []
-
 /** The sentence setup ends on. */
 export const NO_ACCOUNT_NEEDED =
   'Setup asked you for no account. KalaReach works with no Cloudflare, Stripe, Firebase or Apple ' +

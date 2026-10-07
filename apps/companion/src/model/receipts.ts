@@ -93,11 +93,6 @@ export function queued(
   return { localId, actionId: null, label, text, state: 'queued', createdAtMs, error: null }
 }
 
-/** Whether an outcome is one the person can do nothing more about. */
-export function isTerminal(state: InputState): boolean {
-  return state === 'applied' || state === 'refused' || state === 'rejected'
-}
-
 /** Whether an outcome means the submission did not happen and its text should come back. */
 export function wasRefused(state: InputState): boolean {
   return state === 'refused' || state === 'rejected'

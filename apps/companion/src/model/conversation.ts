@@ -178,14 +178,6 @@ export function nodesAbove<T extends Identified>(state: ConversationState<T>): n
   return Math.max(0, state.windowStart - WINDOW_OVERSCAN)
 }
 
-/** How many nodes are below it. */
-export function nodesBelow<T extends Identified>(state: ConversationState<T>): number {
-  return Math.max(
-    0,
-    state.nodes.length - (state.windowStart + WINDOW_SIZE + WINDOW_OVERSCAN)
-  )
-}
-
 /** Puts the window at the live end, where a following view keeps it. */
 function follow<T extends Identified>(state: ConversationState<T>): ConversationState<T> {
   if (!state.following) return state
