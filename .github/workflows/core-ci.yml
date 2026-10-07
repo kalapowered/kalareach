@@ -428,8 +428,21 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
   windows:
-    name: windows
+    name: ${{ matrix.name }}
     runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      # Two runners, one definition, as the macos job has. They set up the same way and the daemon,
+      # the worker and the forwarder are built on both, which the suites find beside them; then the
+      # steps divide in the order they are written. `first` compiles the whole workspace and its
+      # tests and runs the steps down to the forwarder's tests; `second` runs the steps after them,
+      # the ARM64 compile and the documentation. A step that names neither is both's.
+      matrix:
+        include:
+          - name: windows
+            part: first
+          - name: windows-second
+            part: second
     env:
       # What this job does *not* set is RUSTFLAGS. The Windows link needs two arguments about the
       # vendored C library, and they are in `.cargo/config.toml` so that every Windows build gets
@@ -452,7 +465,7 @@ jobs:
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: windows
+          name: ${{ matrix.name }}
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its
@@ -469,6 +482,7 @@ jobs:
       # Everything the workspace compiles for this target, including the test targets: a test that
       # only builds on Unix is a Windows failure, and this is where it is caught.
       - name: Compile the workspace and its tests
+        if: ${{ matrix.part == 'first' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # What has been qualified on this platform, and only that: the terminal engine, the
@@ -523,10 +537,11 @@ jobs:
       # the first owner at a pseudo-console outside every session, and refuse it with no console,
       # inside a session, and where session membership cannot be established.
       - name: Test the terminal engine, the repository boundary, the attach client and pairing
+        if: ${{ matrix.part == 'first' }}
         run: cargo test --locked -p kr-term -p kr-project -p kr-cli
 
       - name: Test the worker's library
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-worker --lib
 
       # The protocol crate's own tests. Among them the configuration document's validation, which
@@ -534,14 +549,14 @@ jobs:
       # writer of that document holds, which a second writer meets as a sharing violation here and
       # waits for.
       - name: Test the protocol's library
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-protocol --lib
 
       # The binder makes every binding from the admissions the worker holds; the channels, the
       # connectors and the attention source run over packages whose native bridge names an
       # absolute forwarder path, which on this platform carries a drive.
       - name: Test the binder, the channels, the connectors and the attention source
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-worker --test binder --test channels --test connectors --test attention_source
 
       # The control daemon's own tests that this platform qualifies, one filter to a step: the
@@ -553,23 +568,23 @@ jobs:
       # and 4 of 12 runs of those two groups did not finish. The cause is not established.
       # Quoted: a plain YAML scalar cannot end in a colon, and the filters do.
       - name: Test the configuration lock
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: "cargo test --locked -p kr-controller --lib config::"
 
       - name: Test the bridge store's records
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: "cargo test --locked -p kr-controller --lib bridge::store::"
 
       - name: Test the host environment a session takes
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: "cargo test --locked -p kr-controller --lib a_create_that_launches_nothing::"
 
       - name: Test the attention inbox's transport
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: "cargo test --locked -p kr-controller --lib attention::"
 
       - name: Test the decision a device reads
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: "cargo test --locked -p kr-controller --lib a_share_that_names_a_current_decision::"
 
       # The daemon's attention inbox, its dispatch barrier, the configuration it applies and the
@@ -578,7 +593,7 @@ jobs:
       # the daemon refuses a claim and lets go of the connection, one run in ten does not see the
       # connection end on this platform and waits out the case's bound.
       - name: Test the daemon's attention, barrier, configuration and diagnostics
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host -- --skip the_startup_exchange_binds_a_worker_to_its_own_reservation
 
       # The forwarder, all of it. Its own library: the registration it reads, the named pipe it connects
@@ -598,7 +613,7 @@ jobs:
       # suites that place a program of their own take turns, because the system reads a fresh executable
       # before it runs, and that read delays every other start while it lasts.
       - name: Test the forwarder
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-hook
 
       # The broker's endpoint on this platform and what it rests on. A launch binds a named pipe
@@ -610,18 +625,18 @@ jobs:
       # access-control lists, from the opened object. The transport, broker, gateway and listener
       # suites beside it run over that same endpoint.
       - name: Test the launch endpoint, the registration and the credential
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test windows_endpoint
 
       - name: Test the listener, the transport and the broker over the launch endpoint
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test listener --test transport --test broker --test gateway
 
       # The agent mutations through the real dispatch path, over what a launch records and a
       # launched agent's transport carries: a refusal is a rejection with a receipt, and an upstream
       # slow to answer does not hold the session's lock.
       - name: Test the agent mutations through the dispatch path
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test agent_service
 
       # What a process the worker starts holds of the worker's own handles. A launch's agent holds
@@ -629,14 +644,14 @@ jobs:
       # desktop reading, the time reading) take one lock, so none starts in the window in which a
       # launch's pipe ends are inheritable and holds one open after the agent has let go.
       - name: Test which handles a started process holds
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test windows_inheritance
 
       # What the worker reads of an installed package: its connector, its command integration, its
       # launch probe and its bridge, each from the verified manifest, with an installation's grants
       # and an absolute forwarder where an installation names one.
       - name: Test the connector the worker reads from an installed package
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test connectors
 
       # A vendor's own sandbox under the session's job. A sandbox that nests a job of its own, limited
@@ -646,7 +661,7 @@ jobs:
       # nothing; the profile the configuration selected for that agent starts it in a job of its own,
       # ended by the closure and by a worker that dies, and its coverage never reads complete.
       - name: Test a vendor's own sandbox under the session's job
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test windows_vendor
 
       # What a launch reads of its application's mode. The declared diagnostic is run in the launch's own
@@ -654,14 +669,14 @@ jobs:
       # much, never finishes or cannot start records no mode and is ended with everything it started. A
       # mode the package refuses in a service session is a named launch failure where the worker is in one.
       - name: Test what a launch reads of its application's mode
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test launch_probe
 
       # The backends an integrated invocation is given before it runs, on this platform: a launch's
       # endpoint and credential exist before the answer, a bypass creates nothing, and each session
       # has a root of its own. The launcher against them is run by the forwarder's suite, above.
       - name: Test the command backends
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test command_backends
 
       # What a package writes where it runs the forwarder, and the host replaces with the installed
@@ -669,27 +684,27 @@ jobs:
       # shell line, for paths that hold spaces, quotes, backslashes and non-ASCII text, and refused
       # anywhere but at the start of a command.
       - name: Test the forwarder's placeholder
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-plugin-sdk --lib forwarder
 
       # What a typed command is looked up by on this platform: the name in lower case without a
       # trailing .exe or .com, a path with either separator as the bypass, and the vector the shell
       # runs keeping what was typed.
       - name: Test the command a typed name is looked up by
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --lib host::command
 
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.
       - name: Test the doctor's reading of the platform's command backends
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib catalogue::integrations
 
       # What the doctor reads of each package's launch probe: the application's own word for the mode it
       # runs in, read by running the declared diagnostic against the executable the daemon's search path
       # names, and nothing run for a package whose installation does not hold the capability.
       - name: Test the doctor's reading of the launch probes
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib catalogue::launch_probes
 
       # The settings-sync store's locks on this platform. It takes an exclusive lock on the store
@@ -697,21 +712,21 @@ jobs:
       # is the operating system's lock and not a compiled-in one. The suite proves that by starting
       # a second process, so it is the file locking of this platform that answers.
       - name: Test the settings-sync store
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --test sync
 
       # The session job object and, beside it, a worker hosted on its own named pipe: each worker's
       # journal and pipe are its own, the pipe's list is its owner's, and a local caller on it is
       # served as that owner and held to the worker's own session.
       - name: Drive a pseudo-console, PowerShell and the session job object
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test windows
 
       # Where the worker places a helper that an agent it launched started: by the job the agent
       # was started in, since a Windows process keeps naming a parent that has exited, and that job
       # is let go of with the last instance that names the agent.
       - name: Place a launched agent's helper by the job it was started in
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test question_bindings
 
       # The local endpoint on this platform and what it rests on. A worker's endpoint is a named
@@ -723,7 +738,7 @@ jobs:
       # nanoseconds, so two processes started within one second are two identities, and a process
       # this account may only ask when it started is identified without its liveness being guessed.
       - name: Test the local endpoint, the descriptors and the process identity
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --test windows
 
       # The crate's own tests, among them the environment identity's list and the profile it is
@@ -736,7 +751,7 @@ jobs:
       # contact skill's installation compares a replacement with: files made by icacls, cipher and
       # descriptors of their own, each case beside one that reads equal or passes.
       - name: Test the local IPC library
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --lib
 
       # The one directory flush every local store makes a changed name durable with: through a
@@ -744,7 +759,7 @@ jobs:
       # handle opened from that one. Its tests hold the directory open without shared writing, so a
       # flush that did nothing would pass where these fail.
       - name: Test the shared directory flush
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-flush
 
       # The contact skill installed and removed on this platform: the installer's own tests, the
@@ -752,20 +767,20 @@ jobs:
       # it carries an entry set on it or is encrypted, replaced with the same access where its
       # directory made it, and refused at the replacement where it was moved in from elsewhere.
       - name: Test the contact skill's installer
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib agent_tools
 
       # The same through the daemon: a daemon process of its own installs, reports and removes the
       # skill at both scopes by its removal record, and a refused change leaves no dispatch marker.
       - name: Install and remove the contact skill through the daemon
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test agent_tools --test contact_skill
 
       # The directory secret store a test run or `--secret-store file` names flushes each name it
       # creates, replaces or removes, a directory made for a secret's scope among them, and reports
       # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it.
       - name: Test the directory secret store and the libsodium boundary
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-crypto
 
       # The machine group record on this platform. A step renames a new record over the old one,
@@ -773,7 +788,7 @@ jobs:
       # without sharing its deletion; the rename is tried again for a bounded time, and a holder
       # that outlasts it leaves the old record and the refusal reported.
       - name: Test the machine group record
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib machine
 
       # The plugin catalogue's package store on this platform: a package staged in a directory of
@@ -782,25 +797,25 @@ jobs:
       # link. A directory the store holds open cannot be renamed here, so the store holds none of
       # the directories it renames.
       - name: Test the plugin catalogue's package store
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-plugin-catalogue
 
       # The catalogue and plugin groups through the daemon, over that store: repositories added,
       # synchronised, pinned and removed, and packages installed, enabled, pinned and removed.
       - name: Install plugins through the daemon's catalogue
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test catalogue
 
       # What the originating agent may do with a question on this platform's identities: a caller
       # token works only for the helper it was issued to.
       - name: Test what a question's caller token reaches
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test questions_answer
 
       # A controller's authority at a worker's own pipe, and the local command line on it, which
       # the pipe admits as its owner and the worker still holds to its own session.
       - name: Test controller and local authority at a worker's pipe
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test authority
 
       # A worker of the previous release keeps running across an upgrade and states its start in
@@ -808,21 +823,21 @@ jobs:
       # still running is recorded at the creation time Windows records, and one that has gone is
       # marked ended. The test process stands in for such a worker.
       - name: Settle the registry's records of a previous release's workers
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib registry
 
       # One daemon holds an environment at a time. Here the lock is an open of its file with no
       # sharing, so a second daemon's open meets a sharing violation, which is the environment held;
       # a refused access is a failure that names the lock file.
       - name: Hold the environment's singleton lock
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib singleton
 
       # A Windows worker must be independent of the daemon's kill-on-close job, so the start asks to
       # break away from that job only when the daemon's own job would kill it on close. This checks
       # that decision for the four job contexts the product can be started in.
       - name: Decide a worker's breakaway from the daemon's job
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job
 
       # The environment's scheduled task: the definition the setup step registers, read back as the
@@ -830,7 +845,7 @@ jobs:
       # real one. This runner's account is signed in to the console, so the task logs on as the
       # interactive session the setup step registers.
       - name: Register, read back and run the environment's scheduled task
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib supervision::windows
 
       # A launch handed to the environment's task: its starter creates the process outside this
@@ -838,7 +853,7 @@ jobs:
       # another program or a launch the starter cannot create, nothing is started; a start claim
       # that has lapsed is taken and starts nothing.
       - name: Start through the environment's scheduled task
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test task_supervisor
 
       # kr new through the environment's scheduled task, as the standalone start runs it here: three
@@ -848,7 +863,7 @@ jobs:
       # and the switch is set on this step alone; each case removes the keys its daemon kept. The
       # case that needs an account signed in nowhere belongs to the Windows test machine.
       - name: Start the control daemon through the environment's scheduled task
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start
@@ -857,7 +872,7 @@ jobs:
       # the previous release wrote on it with its start in whole seconds, which the next owner
       # reads and replaces.
       - name: Test the attention store
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-attention
 
       # Every local store flushes the directory it changes a name in through the one shared flush,
@@ -867,14 +882,14 @@ jobs:
       # the offline-answer store, the settings-sync store and its membership file, and the
       # recovery-bundle record.
       - name: Test the client's stores and their directory flush
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --lib
 
       # The rule a rendering follows, read from the sources as this platform names their files: a
       # file is named by its path's components, so the files the rule allows are the same files here
       # as on a platform whose separator is `/`.
       - name: Hold the client and the command line to the rendering rule
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --test shown_rule
 
       # The root editor's own transport on this platform. The bridge endpoint is a named pipe
@@ -883,21 +898,21 @@ jobs:
       # all. The suite starts PowerShell 7 on the module files in the checkout and holds the
       # worker's half of the handshake, so it needs no installed editor and no console.
       - name: The PowerShell bridge client over a named pipe
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --test pwsh_windows
 
       # The reference bridge against a real endpoint on this platform. The published Windows
       # address carries the pipe prefix and the endpoint layer supplies it again, so a client that
       # passes the address through unchanged asks for a name no listener holds.
       - name: The reference bridge over a real endpoint
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         # Quoted: a plain YAML scalar cannot end in a colon, and the filter does.
         run: "cargo test --locked -p kr-shell-integration --lib host::scripted::"
 
       # The repository boundary refuses every operation on this platform and names what it cannot
       # hold. Run again on its own so a pass or a failure names this system.
       - name: Repository boundary
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: |
           [System.Environment]::OSVersion.VersionString
           git --version
@@ -911,7 +926,7 @@ jobs:
       # Windows host whose boundary runs a repository tool, which no host does yet. `--nocapture`
       # prints that nothing ran rather than hiding it.
       - name: Test what an apply carries across
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-changeset --test apply -- --nocapture
 
       # The handle-based authority itself: the no-escape policy against the fixture's own tree, and
@@ -919,7 +934,7 @@ jobs:
       # account it belongs to. `--nocapture` prints every case the runner could not build the
       # objects for, so a prerequisite it lacks is visible rather than counted as a pass.
       - name: Test filesystem authority and access-control lists
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-transfer --lib --test authority -- --nocapture
 
       # A collection key belongs in the operating system's own credential store, and on this system
@@ -929,7 +944,7 @@ jobs:
       # credentials, so it runs here with --ignored and the switch is set here and on no other
       # step. What the test writes is named for the run and taken away before the test finishes.
       - name: A collection key is kept in this runner's credential store
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
@@ -941,7 +956,7 @@ jobs:
       # program is a POSIX script that turns off echo, traps the interrupt signal and reads a line at
       # a time, and its store-side halves run in the tests below it.
       - name: Test the persistence suite
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test persistence
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
@@ -949,7 +964,7 @@ jobs:
       # in that job, and one started by a daemon inside nested jobs outlives them. The shipping
       # daemon's own start, which asks to break away, is refused here with its named failure.
       - name: The real-worker host tests under cargo, through the environment's task
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test host
 
       # The real-worker host tests again, run from the built executable directly rather than through
@@ -958,7 +973,7 @@ jobs:
       # runner's own job does not kill on close, so no breakaway is asked for. The three tests held
       # back on this platform are ignored here too.
       - name: The real-worker host tests, from the built executable, as the shipping daemon starts a worker
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         env:
           KR_HOST_TEST_SUPERVISOR: detached
         run: |
@@ -978,6 +993,7 @@ jobs:
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.
       - name: Compile for ARM64
+        if: ${{ matrix.part == 'second' }}
         run: |
           rustup target add aarch64-pc-windows-msvc
           cargo check --locked -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project --target aarch64-pc-windows-msvc
@@ -989,7 +1005,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-evidence-windows
+          name: test-evidence-${{ matrix.name }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -997,7 +1013,7 @@ jobs:
       # only Windows compiles is read by this build and no other. The crates are that step's. It
       # comes last because a step that fails here stops every later step that has no condition.
       - name: Documentation without warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'second' }}
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: >-
