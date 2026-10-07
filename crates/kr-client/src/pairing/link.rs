@@ -646,8 +646,16 @@ mod tests {
         pool.binds.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// How long a test watches for something that must not happen while a close is held.
-    const WATCHING: std::time::Duration = std::time::Duration::from_millis(300);
+    /// Polls `future` once, which runs it as far as its first wait, and says whether it had
+    /// finished by then. The future is kept, so the caller can go on with it.
+    async fn finished_when_first_polled<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> bool {
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(future.as_mut().poll(context).is_ready())
+        })
+        .await
+    }
 
     /// A caller that stops waiting while an endpoint on a shared relay is being closed leaves the
     /// pool whole: every endpoint that did not share the relay is still recorded, and a connection
@@ -700,21 +708,23 @@ mod tests {
             !stop_at_first_wait(pool.endpoint(&replacing)).await,
             "the replacement waits for the endpoint on the shared relay to close"
         );
-        let asking = tokio::spawn({
-            let (pool, again) = (Arc::clone(&pool), again.clone());
-            async move { pool.endpoint(&again).await }
-        });
-        tokio::time::sleep(WATCHING).await;
+        // The request runs as far as its first wait, and a pool that did not wait for the close
+        // would have counted its bind by then.
+        let mut asking = std::pin::pin!(pool.endpoint(&again));
+        assert!(!finished_when_first_polled(asking.as_mut()).await);
+        assert!(
+            pool.endpoints.try_lock().is_err(),
+            "the request is in the pool, waiting for the close"
+        );
         assert_eq!(
             binds(&pool),
             2,
             "nothing is bound on the relay while the endpoint on it is closing"
         );
-        assert!(!asking.is_finished());
         assert!(!closing.is_closed());
 
         gate.send_replace(true);
-        asking.await.expect("the request ran").expect("an endpoint");
+        asking.await.expect("an endpoint");
         assert!(
             closing.is_closed(),
             "the endpoint on the relay finished closing before another was bound on it"
@@ -755,11 +765,12 @@ mod tests {
         );
         let first = pool.endpoint(&relayed).await.expect("an endpoint");
         assert!(!stop_at_first_wait(pool.close()).await);
-        let asking = tokio::spawn({
-            let pool = Arc::clone(&pool);
-            async move { pool.endpoint(&again).await }
-        });
-        tokio::time::sleep(WATCHING).await;
+        let mut asking = std::pin::pin!(pool.endpoint(&again));
+        assert!(!finished_when_first_polled(asking.as_mut()).await);
+        assert!(
+            pool.endpoints.try_lock().is_err(),
+            "the request is in the pool, waiting for the close"
+        );
         assert_eq!(
             binds(&pool),
             1,
@@ -768,7 +779,7 @@ mod tests {
         assert!(!first.is_closed());
 
         gate.send_replace(true);
-        asking.await.expect("the request ran").expect("an endpoint");
+        asking.await.expect("an endpoint");
         assert!(
             first.is_closed(),
             "the relay is used again only once the old endpoint has finished closing"
