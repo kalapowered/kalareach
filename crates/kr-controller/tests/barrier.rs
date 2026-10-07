@@ -1750,7 +1750,7 @@ struct Hosted {
     environment_id: EnvironmentId,
     session_id: SessionId,
     runtime: Arc<SessionRuntime>,
-    _service: Arc<WorkerService>,
+    service: Arc<WorkerService>,
 }
 
 /// Starts a daemon, creates a session through it, and performs the worker's side of the
@@ -1974,7 +1974,7 @@ async fn hosted_worker() -> Hosted {
         environment_id,
         session_id,
         runtime,
-        _service: service,
+        service,
     }
 }
 
@@ -2425,6 +2425,57 @@ async fn a_retry_the_worker_answers_with_a_receipt_reaches_the_caller_as_one() {
     );
 }
 
+/// Accepts `count` intents from `device` that the worker never dispatches, more than one
+/// acknowledgement carries when `count` is, so that a fence that takes them back reports them in
+/// pages.
+fn seed_undispatched_intents(hosted: &Hosted, device: &ActorId, count: usize) {
+    let mut session = hosted.runtime.session();
+    let journal = session.journal_mut().expect("a journal");
+    for index in 0..count {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        let mut submission = submission(1, device);
+        submission.action_id = ActionId::new(Uuid::from_bytes(bytes));
+        submission.payload_digest =
+            Digest256::from_bytes([u8::try_from(index % 251).unwrap_or(0); 32]);
+        journal.accept(&submission).expect("an admitted intent");
+    }
+}
+
+/// The worker's dispatch boundary, held on a thread of its own until the test lets it go: what an
+/// announcement meets while a mutation, a generation another link presents or a maintenance pass
+/// is inside it.
+struct HeldBoundary {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HeldBoundary {
+    async fn take(service: &Arc<WorkerService>) -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = std::sync::mpsc::channel::<()>();
+        let service = Arc::clone(service);
+        let task = tokio::task::spawn_blocking(move || {
+            let _boundary = service.hold_the_dispatch_boundary();
+            held.send(()).expect("the test is waiting");
+            // Held until the test lets it go, or until the test ends without doing so.
+            let _ = wait.recv();
+        });
+        confirmed.recv().expect("the boundary is held");
+        Self {
+            release: Some(release),
+            task: Some(task),
+        }
+    }
+
+    async fn release(mut self) {
+        drop(self.release.take());
+        if let Some(task) = self.task.take() {
+            task.await.expect("the holding thread finishes");
+        }
+    }
+}
+
 /// KR-REQ-09.13: a fence whose evidence does not fit one acknowledgement is delivered in pages,
 /// and the revocation's report names every action once the daemon has collected them all.
 ///
@@ -2438,19 +2489,7 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
     let device = actor("device:phone");
     // More intents than one acknowledgement carries, so the answer has to come in pages.
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    {
-        let mut session = hosted.runtime.session();
-        let journal = session.journal_mut().expect("a journal");
-        for index in 0..affected {
-            let mut bytes = [0_u8; 16];
-            bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-            let mut submission = submission(1, &device);
-            submission.action_id = ActionId::new(Uuid::from_bytes(bytes));
-            submission.payload_digest =
-                Digest256::from_bytes([u8::try_from(index % 251).unwrap_or(0); 32]);
-            journal.accept(&submission).expect("an admitted intent");
-        }
-    }
+    seed_undispatched_intents(&hosted, &device, affected);
 
     let first = hosted
         .controller
@@ -2484,6 +2523,91 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
             .all(|named| named.actor_id == device),
         "each one is named under the actor whose intent it was"
     );
+}
+
+/// KR-REQ-09.13: a page of fence evidence that the worker refuses because its dispatch boundary
+/// is held is asked for again, so the revocation's report names every action its fence took back
+/// without another announcement.
+///
+/// The announcement is stopped once the worker has acknowledged and before the daemon asks for the
+/// pages that follow, and the worker's boundary is taken there: the first page is met with a
+/// refusal, which the worker counts. The boundary is let go once it has been refused, and the
+/// report has to be whole when the announcement returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_asked_for_again() {
+    let hosted = hosted_worker().await;
+    let device = actor("device:phone");
+    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    seed_undispatched_intents(&hosted, &device, affected);
+
+    // The first announcement may itself be refused by whatever else is inside the boundary at
+    // that moment, which leaves the worker pending and never reaches the stop: it is announced
+    // again until an acknowledgement does.
+    let revoke = {
+        let controller = Arc::clone(&hosted.controller);
+        move || {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.revoke_authority().await })
+        }
+    };
+    let announce = {
+        let controller = Arc::clone(&hosted.controller);
+        move || {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.announce_authority_revision().await })
+        }
+    };
+    let (mut arrived, mut go) = hosted.controller.stop_after_an_acknowledgement_for_tests();
+    let mut announcing = revoke();
+    let mut attempts = 0;
+    loop {
+        tokio::select! {
+            reached = &mut arrived => {
+                reached.expect("the announcement reached the stop");
+                break;
+            }
+            finished = &mut announcing => {
+                finished
+                    .expect("the announcing task finishes")
+                    .expect("the revocation is announced");
+                attempts += 1;
+                assert!(attempts < 50, "no announcement was acknowledged");
+                (arrived, go) = hosted.controller.stop_after_an_acknowledgement_for_tests();
+                announcing = announce();
+            }
+        }
+    }
+
+    let refused = hosted.service.refusals_for_the_boundary();
+    let boundary = HeldBoundary::take(&hosted.service).await;
+    go.send(())
+        .expect("the announcement is waiting at the stop");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.service.refused_for_the_boundary_beyond(refused),
+    )
+    .await
+    .expect("the first page is refused while the boundary is held");
+    boundary.release().await;
+
+    let barrier = tokio::time::timeout(Duration::from_secs(60), announcing)
+        .await
+        .expect("the announcement returns")
+        .expect("the announcing task finishes")
+        .expect("the revocation is announced");
+    assert!(barrier.holds(), "{barrier:?}");
+    let reported = barrier
+        .workers
+        .iter()
+        .find(|worker| worker.session_id == hosted.session_id)
+        .expect("this worker is in the report");
+    assert_eq!(
+        reported.rejected_actions.len(),
+        affected,
+        "every intent the fence took back is named by the announcement that was refused a page"
+    );
+    assert_eq!(reported.names_pending.get(), 0);
+    assert_eq!(reported.omitted_actions.get(), 0);
 }
 
 /// Writes one mutation to this daemon and returns what it answered.
