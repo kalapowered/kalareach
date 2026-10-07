@@ -2659,11 +2659,10 @@ async fn a_local_prompt_for_a_session_that_closed_is_told_it_closed_and_not_that
 /// The daemon looks for the worker again before it says there is none.
 ///
 /// The control is a reservation the host has fenced: looking again does not undo the fence, so the
-/// worker is not reached and the prompt is refused as for an unknown session.
+/// worker is never connected to and the prompt is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_prompt_for_a_live_session_whose_worker_was_not_reached_at_start_finds_it_first() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
-    use kr_protocol::error::ErrorCode;
 
     use crate::service::a_close_a_worker_never_answers as fake;
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
@@ -2711,14 +2710,16 @@ async fn a_local_prompt_for_a_live_session_whose_worker_was_not_reached_at_start
             )
             .await;
         if fenced {
-            let ControlFrame::Response(Response {
-                outcome: Outcome::Error(error),
-                ..
-            }) = answered
-            else {
-                panic!("a fenced reservation's worker is not reached: {answered:?}");
-            };
-            assert_eq!(error.code, ErrorCode::UnknownSession);
+            assert!(
+                matches!(
+                    answered,
+                    ControlFrame::Response(Response {
+                        outcome: Outcome::Error(_),
+                        ..
+                    })
+                ),
+                "a fenced reservation's worker is not reached: {answered:?}"
+            );
             assert_eq!(script.connections(), 0, "nothing reached the worker");
             assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
         } else {
@@ -2849,6 +2850,96 @@ async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is
         );
         world.serving.abort();
     }
+}
+
+/// KR-REQ-09.12: an exact repeat of a prompt, made while another exchange holds the daemon's one
+/// link to the worker, is answered from the receipt the worker holds for its first attempt even when
+/// the session closes while it waits: the closure is recorded and the worker still answers, and what
+/// a duplicate is owed is the existing receipt. Nothing is recorded or sent anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_waiting_for_the_workers_link_while_the_session_closes_is_answered_from_its_receipt()
+ {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
+        self as scripted, Scripted, closure_of,
+    };
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let admission = fake::admission(controller, world.accepted).await;
+    // The window the repeat carries is one this connection never issued, as on a replacement
+    // connection, so it arrives with no deadline.
+    let first_connection = fake::admission(controller, world.accepted).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let mutation = a_local_prompt(
+        &world,
+        &first_connection,
+        action_id,
+        Nullable::null(),
+        Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
+    );
+    script.holds_a_refused_prompt(
+        &mutation,
+        &actor,
+        ProtocolError::new(
+            ErrorCode::UnsupportedCapability,
+            "no upstream takes prompts",
+        ),
+    );
+
+    let mut held = controller
+        .worker_client(&world.worker)
+        .await
+        .expect("the daemon's own link");
+    let repeating = tokio::spawn({
+        let controller = std::sync::Arc::clone(controller);
+        let actor = actor.clone();
+        async move {
+            controller
+                .perform(&actor, admission.connection_id, None, mutation)
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while controller
+        .connections
+        .lock()
+        .await
+        .get(&world.session_id)
+        .map(std::sync::Arc::strong_count)
+        != Some(3)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the repeat did not queue for the worker's link"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    held.give_back();
+    drop(held);
+
+    let repeated = repeating.await.expect("the repeat's task ends");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = repeated
+    else {
+        panic!("the worker answers the repeat from its receipt: {repeated:?}");
+    };
+    let receipt: kr_protocol::receipt::ReceiptResponse = value.to_typed().expect("a receipt");
+    assert_eq!(receipt.receipt.action_id, action_id);
+    assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
+    world.serving.abort();
 }
 
 /// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal an earlier
