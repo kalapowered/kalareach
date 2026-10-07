@@ -2920,7 +2920,9 @@ async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is
 /// KR-REQ-09.12: an exact repeat of a prompt, made while another exchange holds the daemon's one
 /// link to the worker, is answered from the receipt the worker holds for its first attempt even when
 /// the session closes while it waits: the closure is recorded and the worker still answers, and what
-/// a duplicate is owed is the existing receipt. Nothing is recorded or sent anew.
+/// a duplicate is owed is the existing receipt. Nothing is recorded or sent anew, whether the repeat
+/// carries the window of the connection it is made on or one this connection never issued, and
+/// whether it carries its text or names a draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_waiting_for_the_workers_link_while_the_session_closes_is_answered_from_its_receipt()
  {
@@ -2932,79 +2934,103 @@ async fn a_repeat_waiting_for_the_workers_link_while_the_session_closes_is_answe
         self as scripted, Scripted, closure_of,
     };
 
-    let script = Scripted::new();
-    script.accepts_prompts(true);
-    let world = scripted::scripted(&script).await;
-    let controller = &world.controller;
-    let admission = fake::admission(controller, world.accepted).await;
-    // The window the repeat carries is one this connection never issued, as on a replacement
-    // connection, so it arrives with no deadline.
-    let first_connection = fake::admission(controller, world.accepted).await;
-    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-    let action_id = ActionId::new(kr_ipc::new_uuid());
-    let mutation = a_local_prompt(
-        &world,
-        &first_connection,
-        action_id,
-        Nullable::null(),
-        Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
-    );
-    script.holds_a_refused_prompt(
-        &mutation,
-        &actor,
-        ProtocolError::new(
-            ErrorCode::UnsupportedCapability,
-            "no upstream takes prompts",
-        ),
-    );
-
-    let mut held = controller
-        .worker_client(&world.worker)
-        .await
-        .expect("the daemon's own link");
-    let repeating = tokio::spawn({
-        let controller = std::sync::Arc::clone(controller);
-        let actor = actor.clone();
-        async move {
-            controller
-                .perform(&actor, admission.connection_id, None, mutation)
-                .await
-        }
-    });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    while controller
-        .connections
-        .lock()
-        .await
-        .get(&world.session_id)
-        .map(std::sync::Arc::strong_count)
-        != Some(3)
+    for (own_window, names_a_draft) in [(true, false), (false, false), (true, true), (false, true)]
     {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the repeat did not queue for the worker's link"
+        let script = Scripted::new();
+        script.accepts_prompts(true);
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let admission = fake::admission(controller, world.accepted).await;
+        // The window a repeat from a replacement connection carries is one this connection never
+        // issued, so it arrives with no deadline.
+        let other_connection = fake::admission(controller, world.accepted).await;
+        let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let draft_id =
+            a_draft_holding_an_attachment(controller, world.environment_id, &actor, "repeat.bin");
+        let (draft, text) = if names_a_draft {
+            (Nullable::some(draft_id), Nullable::null())
+        } else {
+            (
+                Nullable::null(),
+                Nullable::some(kr_protocol::agent::PromptText::new("run the tests").expect("text")),
+            )
+        };
+        let mutation = a_local_prompt(
+            &world,
+            if own_window {
+                &admission
+            } else {
+                &other_connection
+            },
+            action_id,
+            draft,
+            text,
         );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    controller
-        .retire(&closure_of(world.session_id))
-        .await
-        .expect("the closure is recorded");
-    held.give_back();
-    drop(held);
+        script.holds_a_refused_prompt(
+            &mutation,
+            &actor,
+            ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                "no upstream takes prompts",
+            ),
+        );
 
-    let repeated = repeating.await.expect("the repeat's task ends");
-    let ControlFrame::Response(Response {
-        outcome: Outcome::Ok(value),
-        ..
-    }) = repeated
-    else {
-        panic!("the worker answers the repeat from its receipt: {repeated:?}");
-    };
-    let receipt: kr_protocol::receipt::ReceiptResponse = value.to_typed().expect("a receipt");
-    assert_eq!(receipt.receipt.action_id, action_id);
-    assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
-    world.serving.abort();
+        let mut held = controller
+            .worker_client(&world.worker)
+            .await
+            .expect("the daemon's own link");
+        let repeating = tokio::spawn({
+            let controller = std::sync::Arc::clone(controller);
+            let actor = actor.clone();
+            async move {
+                controller
+                    .perform(&actor, admission.connection_id, None, mutation)
+                    .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while controller
+            .connections
+            .lock()
+            .await
+            .get(&world.session_id)
+            .map(std::sync::Arc::strong_count)
+            != Some(3)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the repeat did not queue for the worker's link"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        controller
+            .retire(&closure_of(world.session_id))
+            .await
+            .expect("the closure is recorded");
+        held.give_back();
+        drop(held);
+
+        let repeated = repeating.await.expect("the repeat's task ends");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) = repeated
+        else {
+            panic!(
+                "the worker answers the repeat from its receipt (own window {own_window}, draft \
+                 {names_a_draft}): {repeated:?}"
+            );
+        };
+        let receipt: kr_protocol::receipt::ReceiptResponse = value.to_typed().expect("a receipt");
+        assert_eq!(receipt.receipt.action_id, action_id);
+        assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
+        assert!(
+            !is_submitted(controller, &actor, draft_id),
+            "nothing is recorded for a session that is gone"
+        );
+        world.serving.abort();
+    }
 }
 
 /// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal an earlier
