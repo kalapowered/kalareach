@@ -47,7 +47,9 @@ pub struct Attachment {
     /// It starts true, because an attachment that has been given nothing has lost nothing. Every
     /// restoration rendered for it sets it again, and one that could not carry the state the
     /// application will address keeps the attachment on a projection instead, where the host paints
-    /// the canonical screen rather than trusting the terminal to already match it.
+    /// the canonical screen rather than trusting the terminal to already match it. The host asks
+    /// again whenever the session's output goes quiet, so a screen that has become one a
+    /// restoration can carry gives the attachment the stream back.
     pub restoration_continues: bool,
     /// Whether this attachment is waiting for a parser-ground boundary before it may forward.
     ///
@@ -133,7 +135,8 @@ impl Attachment {
     ///   it. A restoration that could not carry the state the application is about to address (a
     ///   pending wrap, a saved cursor of the other buffer, the virtual title stack) leaves that
     ///   terminal disagreeing with the canonical grid, and the next byte lands in the wrong place.
-    ///   Such an attachment keeps a projection, where the host paints the screen.
+    ///   Such an attachment keeps a projection, where the host paints the screen, until the
+    ///   session's screen is one a restoration can carry.
     /// * **Where the parser stands.** Forwarding may only *begin* at a parser-ground boundary, so
     ///   an attachment waiting for one is held in a projection until it arrives. This is the one
     ///   condition that is about a moment rather than about the attachment.
@@ -627,11 +630,31 @@ impl AttachmentTable {
             .collect()
     }
 
+    /// Returns every terminal attachment whose only reason for a projection is the screen it was
+    /// last given: each condition before it holds, so a screen that could be carried would put it
+    /// back on the stream.
+    #[must_use]
+    pub fn held_by_restoration(&self) -> Vec<AttachmentId> {
+        self.attachments
+            .values()
+            .filter(|attachment| {
+                attachment.mode == AttachMode::Terminal
+                    && attachment.dimensions.is_some_and(|own| {
+                        attachment.kept_off_the_stream(own, self.dimensions, self.carryable)
+                            == Some(PresentationReason::RestorationIncomplete)
+                    })
+            })
+            .map(|attachment| attachment.id)
+            .collect()
+    }
+
     /// Records whether the screen an attachment was just given continues the raw stream.
     ///
     /// Every restoration rendered for an attachment passes through here, because the answer is a
     /// property of that screen rather than of the session: the same grid restores completely for
-    /// one terminal and not for another the moment a pending wrap or a saved cursor appears.
+    /// one terminal and not for another the moment a pending wrap or a saved cursor appears. So
+    /// does the host's own check of whether a restoration drawn now would carry everything, for an
+    /// attachment a screen it could not carry is keeping on a projection.
     pub fn note_restoration(&mut self, id: AttachmentId, continues: bool) {
         let Some(ordinal) = self.by_id.get(&id) else {
             return;
