@@ -24,15 +24,17 @@ use super::workers::WORKER_EXCHANGE;
 /// next announcement continues from where this one stopped.
 const MAX_EVIDENCE_PAGES: usize = 64;
 
-/// How many times one announcement asks again for a page of evidence that a worker refused because
-/// its dispatch boundary was held, in all the pages it collects.
+/// How many times an announcement asks one worker again for a page of evidence that it refused
+/// because its dispatch boundary was held, in all the pages it collects from that worker.
 ///
 /// A worker takes the boundary without waiting and refuses an announcement while a mutation, a
 /// generation another link presents or a maintenance pass is inside it, which is a matter of
 /// moments. The pause before the first of these is [`PAGE_RETRY_PAUSE`] and it doubles up to
 /// [`PAGE_RETRY_LONGEST_PAUSE`], so the retries together wait about five seconds at most, which is
 /// one worker exchange. A worker still busy after that leaves the rest of its names to the next
-/// announcement, and the report says how many are outstanding.
+/// announcement, and the report says how many are outstanding. The bound is each worker's own, and
+/// the pages are asked for once every worker has been asked for its acknowledgement, so a busy
+/// worker holds up the pages of the workers after it and never their acknowledgements.
 const MAX_PAGE_RETRIES: u32 = 10;
 
 /// The pause before the first retry of a refused page.
@@ -310,6 +312,12 @@ impl Controller {
     /// pending, and this reports which, along with every action whose dispatch transition had
     /// already won the serial race and may therefore have executed.
     ///
+    /// Every worker is asked for its acknowledgement first. The pages of evidence an
+    /// acknowledgement leaves are asked for once all of them have been, one worker after another
+    /// ([`Self::collect_owed_evidence`]), so a worker that keeps refusing its pages holds up the
+    /// pages of the workers after it and the report, and never another worker's acknowledgement,
+    /// which is what the barrier holds on and what renews that worker's lease.
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written.
@@ -338,6 +346,10 @@ impl Controller {
                 .collect()
         };
         let mut attempted: Vec<SessionId> = Vec::new();
+        // The workers that acknowledged, with the binding each acknowledged under: the pages of
+        // evidence that follow an acknowledgement are asked for once every worker has been asked
+        // for its own.
+        let mut acknowledged: Vec<(SessionId, WorkerBinding)> = Vec::new();
         for worker in workers {
             let session_id = worker.descriptor.session_id;
             attempted.push(session_id);
@@ -412,12 +424,13 @@ impl Controller {
                         }
                         // The evidence travels a page at a time, because one acknowledgement is
                         // one control frame. The barrier holds on the first page, which is the
-                        // acknowledgement itself; what these further exchanges complete is the
-                        // naming section 9 requires, and each one is bounded like the first.
+                        // acknowledgement itself; what the further exchanges complete is the
+                        // naming section 9 requires. They wait until every worker has been asked,
+                        // because a worker that keeps refusing its pages is asked again for
+                        // seconds, and the workers after it have an acknowledgement to give.
                         #[cfg(feature = "testing")]
                         self.after_an_acknowledgement.wait().await;
-                        self.collect_owed_evidence(session_id, binding, revision)
-                            .await;
+                        acknowledged.push((session_id, binding));
                     }
                 }
                 // A worker that is confirmed gone answers the question a different way: it can no
@@ -438,6 +451,10 @@ impl Controller {
                 continue;
             }
             self.reconcile(*session_id).await?;
+        }
+        for (session_id, binding) in acknowledged {
+            self.collect_owed_evidence(session_id, binding, revision)
+                .await;
         }
         // The report is taken inside one section of the registry, which is also where a closure is
         // recorded and the barrier is told of it. The workers it covers are those that were
