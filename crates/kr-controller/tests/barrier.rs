@@ -3003,8 +3003,11 @@ async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
 /// follows a page asked one worker for its page before it had asked the other for its
 /// acknowledgement. What is decided is the order of what the daemon asks and not what a worker
 /// answers, so it holds whatever refuses, times out or is slow at the moment: that only changes how
-/// many announcements it takes to collect every name. Each announcement made until they are all
-/// collected is checked, and at least one of them has to have asked for pages.
+/// many announcements it takes. Each announcement is checked, and the announcements go on until
+/// every name is collected and one of them has asked every worker for both its acknowledgement and a
+/// page. A daemon that asked for a worker's pages as soon as that worker had acknowledged would put
+/// one worker's page before the other's acknowledgement in that announcement, so the case cannot
+/// end without meeting the order it is there to refuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_asks_for_any_page() {
     let daemon = hosted_daemon().await;
@@ -3019,7 +3022,7 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    let mut asked_for_pages = false;
+    let mut asked_everyone_both = false;
     let mut announcements = 0;
     let barrier = loop {
         assert!(
@@ -3028,12 +3031,14 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
         );
         let before = daemon.controller.announcements_sent_for_tests().len();
         let announced = if announcements == 0 {
-            daemon.controller.revoke_authority().await
+            tokio::time::timeout_at(deadline, daemon.controller.revoke_authority()).await
         } else {
-            daemon.controller.announce_authority_revision().await
+            tokio::time::timeout_at(deadline, daemon.controller.announce_authority_revision()).await
         };
         announcements += 1;
-        let barrier = announced.expect("the revocation is announced");
+        let barrier = announced
+            .expect("the names were not all collected within three minutes of announcements")
+            .expect("the revocation is announced");
         let sent = daemon.controller.announcements_sent_for_tests()[before..].to_vec();
         let mut paged = false;
         for announcement in &sent {
@@ -3047,19 +3052,25 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
                 );
             }
         }
-        asked_for_pages |= paged;
+        // An announcement that asked every worker for both its acknowledgement and a page. A daemon
+        // that collected a worker's pages as soon as it had acknowledged would have asked the first
+        // worker for its page before it asked the second for its acknowledgement, whichever worker
+        // answers in time.
+        asked_everyone_both |= hosts.iter().all(|hosted| {
+            let own = sent
+                .iter()
+                .filter(|each| each.session_id == hosted.session_id);
+            own.clone().any(|each| each.evidence_from == 0)
+                && own.clone().any(|each| each.evidence_from > 0)
+        });
         let collected = hosts.iter().all(|hosted| {
             let reported = worker_report(&barrier, hosted.session_id);
             reported.names_pending.get() == 0 && reported.rejected_actions.len() == affected
         });
-        if barrier.holds() && collected {
+        if barrier.holds() && collected && asked_everyone_both {
             break barrier;
         }
     };
-    assert!(
-        asked_for_pages,
-        "no announcement asked for a page of evidence"
-    );
     for hosted in &hosts {
         assert_eq!(
             worker_report(&barrier, hosted.session_id)
