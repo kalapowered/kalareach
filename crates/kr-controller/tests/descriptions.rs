@@ -2278,6 +2278,12 @@ async fn a_summary_asked_for_is_written_by_the_model_and_served_beside_the_chang
             .is_none_or(|words| !words.contains("changes:"))),
         "and never among them"
     );
+    // A summary is read as soon as it is written. The figures are what the host published at the
+    // end of the turn that wrote it, so they count it a moment later and are waited for.
+    until("the summary is counted", || {
+        environment.figures().jobs.summarised >= 1
+    })
+    .await;
     let counts = environment.figures().jobs;
     assert_eq!(counts.summarised, 1);
     assert_eq!(
@@ -2332,6 +2338,10 @@ async fn a_summary_asked_for_is_written_by_the_model_and_served_beside_the_chang
     let summary = refreshed.summary.0.expect("a summary");
     assert_eq!(summary.from_cursor.get(), 0, "never the tail alone");
     assert!(summary.text.starts_with("8 changes:"), "{}", summary.text);
+    until("the refreshed summary is counted", || {
+        environment.figures().jobs.summarised >= 2
+    })
+    .await;
     assert_eq!(environment.figures().jobs.summarised, 2);
     assert_eq!(environment.summaries_held(), 2, "both are kept");
 
