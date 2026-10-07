@@ -2190,19 +2190,30 @@ impl Session {
         let column = self.engine.resolve_column(column, dimensions);
         let moved =
             before_window.is_none_or(|window| window.anchor != anchor || window.column != column);
-        if (moved || before_dimensions != Some(dimensions))
-            && self.content_scope(attachment_id) != crate::render::Scope::LiveScreen
-        {
-            // What the last screen could not carry says nothing about the one this window is drawn
-            // next, so it is forgotten with the window: a terminal that is the session's size
-            // again, or back on the live screen, is handed the stream if its other conditions hold,
-            // and the screen it is then drawn decides afresh. A caller shown the live screen alone
-            // keeps it, because no screen it is drawn can carry everything.
-            self.attachments.note_restoration(attachment_id, true);
-        }
-        let (presentation, presentation_reason) =
+        let (mut presentation, mut presentation_reason) =
             self.attachments
                 .viewport(attachment_id, dimensions, anchor, column)?;
+        let scope = self.content_scope(attachment_id);
+        if (moved || before_dimensions != Some(dimensions))
+            && presentation_reason
+                == Some(kr_protocol::attachment::PresentationReason::RestorationIncomplete)
+            && scope != crate::render::Scope::LiveScreen
+        {
+            // What the last screen could not carry says nothing about the one this window is drawn
+            // next. A terminal that is the session's size again, or back on the live screen, has
+            // only that left to keep it off the stream, so the answer is asked of the screen the
+            // session holds now and the report says what it found. A caller shown the live screen
+            // alone is left out, because no screen it is drawn can carry everything.
+            let keyboard = self.attachments.keyboard_control(attachment_id);
+            let carried = self
+                .engine
+                .carried_by_restoration(dimensions, keyboard, scope);
+            self.attachments
+                .note_restoration(attachment_id, carried.continues_the_stream());
+            (presentation, presentation_reason) =
+                self.attachments
+                    .viewport(attachment_id, dimensions, anchor, column)?;
+        }
         let window_revision = self
             .attachments
             .window(attachment_id, dimensions)
@@ -3108,8 +3119,9 @@ impl Session {
     /// The question is asked once per output cursor, and terminals that would be drawn the same
     /// restoration share one answer. A quiet moment at the cursor last asked about follows a read
     /// that ended inside a sequence, or the end of the stream, and no terminal can begin
-    /// forwarding there. A change that the output does not make, such as a terminal's window
-    /// changing, is answered where it is made.
+    /// forwarding there. A terminal's own report of a new window asks the question where it is
+    /// made. A change of the session's size does not yet, so a terminal that it leaves held waits
+    /// for the next output.
     fn reconsider_incomplete_restorations(&mut self) {
         let cursor = self.engine.output_cursor();
         if std::mem::replace(&mut self.reconsidered_at, cursor) == cursor {
