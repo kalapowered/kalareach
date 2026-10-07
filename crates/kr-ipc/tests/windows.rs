@@ -506,6 +506,72 @@ async fn the_listener_names_the_process_at_the_other_end_of_the_pipe() {
     );
 }
 
+/// A connection the listener closes is seen to end by its caller, whatever another connection
+/// closed before it left unread.
+///
+/// Closing the accepting end of a pipe with bytes the caller has not read can lose them, so the
+/// close waits until the caller has read them or has gone. A caller that is sent something and
+/// never reads it is one such wait, and it must not be the wait of any other connection: the
+/// daemon closes connections of many callers, one of which can be a client that stopped reading.
+/// Here one caller is sent bytes and never reads them, its connection is closed, and then a
+/// second caller reads what it was sent and is closed; the second has to see its connection end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread() {
+    use kr_ipc::endpoint::Connection;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let host = TempHost::create();
+    let endpoint = host
+        .environment()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+
+    // The caller that never reads: sent something, and its connection closed with that unread.
+    let silent = Connection::connect(&endpoint)
+        .await
+        .expect("the first caller connects");
+    let (mut silent_end, _) = tokio::time::timeout(PATIENCE, listener.accept())
+        .await
+        .expect("the first caller was accepted in time")
+        .expect("the listener accepts it");
+    silent_end
+        .write_all(b"never read")
+        .await
+        .expect("the first caller is sent bytes");
+    drop(silent_end);
+
+    // The caller that reads: sent something, reads it, and its connection is closed.
+    let mut reading = Connection::connect(&endpoint)
+        .await
+        .expect("the second caller connects");
+    let (mut reading_end, _) = tokio::time::timeout(PATIENCE, listener.accept())
+        .await
+        .expect("the second caller was accepted in time")
+        .expect("the listener accepts it");
+    reading_end
+        .write_all(b"read")
+        .await
+        .expect("the second caller is sent bytes");
+    let mut sent = [0_u8; 4];
+    tokio::time::timeout(PATIENCE, reading.read_exact(&mut sent))
+        .await
+        .expect("the second caller reads in time")
+        .expect("the second caller reads what it was sent");
+    assert_eq!(&sent, b"read");
+    drop(reading_end);
+
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(PATIENCE, reading.read_to_end(&mut rest)).await;
+    assert!(
+        ended.is_ok(),
+        "the second caller's connection was never seen to end while the first caller left its \
+         bytes unread"
+    );
+    assert!(rest.is_empty(), "nothing more was sent: {rest:?}");
+    drop(silent);
+}
+
 /// KR-REQ-11.52: what binds a caller to its own process and start time is the operating system's
 /// record of that process. The start identity this host reads for a process is the creation time
 /// the operating system gives for it, in hundreds of nanoseconds since 1970, read here through
