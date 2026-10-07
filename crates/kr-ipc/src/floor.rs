@@ -19,11 +19,23 @@
 //! deadline, and otherwise raises `owed` for the daemon to write: an answer never rests on a
 //! reading that a restart, a reboot or a lost file could take away.
 //!
+//! # The owner's establishment
+//!
+//! The owner can establish the host's clock: say that the reading it shows is right. The daemon
+//! records that, and every worker that distrusts its own clock has to learn of it, because the
+//! owner's one action is meant to end distrust everywhere. Two more words carry it
+//! ([`SharedFloor::establish`], [`SharedFloor::established`]): the wall reading the owner
+//! established and the machine's continuous reading taken with it, so a worker can ask whether its
+//! own wall clock still agrees with them. Each word holds the establishment's count beside its
+//! reading, and a reader takes the pair only when both counts match, so the two words need no
+//! lock: a reader that meets one half of an establishment still being published finds no
+//! establishment yet and looks again later.
+//!
 //! # The file
 //!
 //! One file of [`FLOOR_FILE_LEN`] bytes in the environment's owner-only runtime directory: a
 //! header naming the format, the environment, the boot and the floor's own identity, then the
-//! three words at aligned offsets. A process checks the file before it maps it, as a reader checks
+//! five words at aligned offsets. A process checks the file before it maps it, as a reader checks
 //! a descriptor: not a symbolic link, the user's own file, not readable or writable by anybody
 //! else, exactly the right length, and a header naming this environment and this boot. A file that
 //! fails a check is no floor, and nothing is mapped from it.
@@ -67,6 +79,18 @@ const FLOOR_AT: usize = 64;
 const OWED_AT: usize = 72;
 /// The highest floor the control daemon has written down.
 const RECORDED_AT: usize = 80;
+/// The wall reading of the owner's latest establishment of the clock in this boot, beside that
+/// establishment's count.
+const ESTABLISHED_WALL_AT: usize = 88;
+/// The continuous reading taken with it, beside the same count.
+const ESTABLISHED_BOOT_AT: usize = 96;
+/// How many low bits of an establishment word hold its reading. The rest hold the count. 44 bits
+/// of milliseconds reach the year 2527 for a wall reading and 557 years for a boot.
+const READING_BITS: u32 = 44;
+/// The bits of an establishment word that hold its reading.
+const READING_MASK: u64 = (1 << READING_BITS) - 1;
+/// The largest count an establishment word holds.
+const COUNT_MASK: u64 = (1 << (u64::BITS - READING_BITS)) - 1;
 
 /// The identity of one floor: sixteen random bytes its creating daemon drew.
 ///
@@ -166,6 +190,18 @@ impl core::fmt::Display for Unusable {
     }
 }
 
+/// The owner's establishment of the host's clock, as the floor holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Establishment {
+    /// Which establishment this is in this boot, from one. A reader that has acted on a count
+    /// acts on a larger one only.
+    pub count: u64,
+    /// The wall reading the owner established, in UTC milliseconds.
+    pub wall_ms: u64,
+    /// The machine's continuous reading taken with it, in milliseconds since this boot.
+    pub boot_ms: u64,
+}
+
 /// Which file a process opened, so a later check can ask whether the name still names it.
 ///
 /// The device and inode on Unix; the volume serial number and file index on Windows.
@@ -175,17 +211,17 @@ struct FileIdentity {
     index: u64,
 }
 
-/// The host's clock floor: the word, `owed` and `recorded`.
+/// The host's clock floor: the word, `owed`, `recorded` and the owner's latest establishment.
 ///
 /// Either a mapping of the environment's floor file, which every process of the environment
-/// shares, or three words of this process's own, for a caller with no runtime directory (a unit
+/// shares, or five words of this process's own, for a caller with no runtime directory (a unit
 /// test of something that decides from a floor). Both answer the same way.
 pub struct SharedFloor {
     words: Words,
 }
 
 enum Words {
-    Local(Box<[AtomicU64; 3]>),
+    Local(Box<[AtomicU64; 5]>),
     Mapped(Mapped),
 }
 
@@ -220,6 +256,8 @@ impl SharedFloor {
                 AtomicU64::new(floor_ms),
                 AtomicU64::new(0),
                 AtomicU64::new(floor_ms),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
             ])),
         }
     }
@@ -367,6 +405,40 @@ impl SharedFloor {
     #[must_use]
     pub fn recorded(&self) -> u64 {
         self.word(RECORDED_AT).load(Ordering::SeqCst)
+    }
+
+    /// Publishes that the owner established the host's clock, at the wall reading `wall_ms` and
+    /// the machine's continuous reading `boot_ms` taken with it.
+    ///
+    /// Only the control daemon calls this, one establishment at a time, after the record of the
+    /// establishment is written. A reading past what 44 bits hold is stored as the largest value
+    /// they hold, which no worker's clock then agrees with.
+    pub fn establish(&self, wall_ms: u64, boot_ms: u64) {
+        let count = (self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> READING_BITS)
+            % COUNT_MASK
+            + 1;
+        let held = |reading: u64| (count << READING_BITS) | reading.min(READING_MASK);
+        self.word(ESTABLISHED_WALL_AT)
+            .store(held(wall_ms), Ordering::SeqCst);
+        self.word(ESTABLISHED_BOOT_AT)
+            .store(held(boot_ms), Ordering::SeqCst);
+    }
+
+    /// The owner's latest establishment of the host's clock in this boot, once there has been one
+    /// and both of its words are published.
+    #[must_use]
+    pub fn established(&self) -> Option<Establishment> {
+        let wall = self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst);
+        let boot = self.word(ESTABLISHED_BOOT_AT).load(Ordering::SeqCst);
+        let count = wall >> READING_BITS;
+        if count == 0 || boot >> READING_BITS != count {
+            return None;
+        }
+        Some(Establishment {
+            count,
+            wall_ms: wall & READING_MASK,
+            boot_ms: boot & READING_MASK,
+        })
     }
 
     /// Whether the floor's pathname still names the file this process maps.
@@ -792,6 +864,80 @@ mod tests {
         floor.owe(3_000);
         assert_eq!(floor.owed(), 3_000);
         assert!(floor.named(), "a floor with no file has no name to lose");
+        assert_eq!(floor.established(), None);
+        floor.establish(1_700_000_000_000, 90_000);
+        assert_eq!(
+            floor.established(),
+            Some(Establishment {
+                count: 1,
+                wall_ms: 1_700_000_000_000,
+                boot_ms: 90_000,
+            })
+        );
+    }
+
+    #[test]
+    fn an_establishment_one_mapping_publishes_is_the_one_another_reads() {
+        let root = directory("established");
+        let path = root.join("utc-floor");
+        let environment_id = environment();
+        let boot = BootEpoch::new(9);
+        let daemon = SharedFloor::create(&path, environment_id, boot, 0).expect("created");
+        let worker = SharedFloor::open(&path, environment_id, boot).expect("opened");
+        assert_eq!(worker.established(), None, "no owner has established yet");
+
+        daemon.establish(1_700_000_000_000, 5_000);
+        assert_eq!(
+            worker.established(),
+            Some(Establishment {
+                count: 1,
+                wall_ms: 1_700_000_000_000,
+                boot_ms: 5_000,
+            })
+        );
+        // A later one is a later count, whatever it reads: an owner who establishes a clock that
+        // stands earlier than the last one is still a new establishment.
+        daemon.establish(1_600_000_000_000, 9_000);
+        assert_eq!(
+            worker.established(),
+            Some(Establishment {
+                count: 2,
+                wall_ms: 1_600_000_000_000,
+                boot_ms: 9_000,
+            })
+        );
+        drop((daemon, worker));
+        std::fs::remove_dir_all(&root).expect("removed");
+    }
+
+    #[test]
+    fn half_of_an_establishment_is_no_establishment() {
+        let floor = SharedFloor::in_process(0);
+        floor.establish(1_700_000_000_000, 5_000);
+        // The daemon stops between the two words of the next one: the wall word carries count two
+        // and the boot word still carries count one.
+        let next = (2_u64 << READING_BITS) | 1_800_000_000_000;
+        floor
+            .word(ESTABLISHED_WALL_AT)
+            .store(next, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            floor.established(),
+            None,
+            "a reader that meets the first word alone takes neither"
+        );
+        floor.word(ESTABLISHED_BOOT_AT).store(
+            (2_u64 << READING_BITS) | 6_000,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert_eq!(
+            floor.established(),
+            Some(Establishment {
+                count: 2,
+                wall_ms: 1_800_000_000_000,
+                boot_ms: 6_000,
+            }),
+            "the second word completes it"
+        );
     }
 
     #[test]
