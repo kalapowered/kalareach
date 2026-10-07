@@ -1201,16 +1201,24 @@ negotiation of the buffer that is not showing, the virtual title stack, soft-wra
 right-hand side of a row wider than the window, and a pending wrap, whether the cursor's or a saved
 cursor's, that the window shows. `Session::restoration_losses` is the count.
 
+A restoration begins with a soft reset wherever the terminal is. It then enters the alternate
+buffer, resets there, returns to the primary buffer and resets again. xterm saves a fresh cursor
+only in the buffer that is showing, and the terminal can be showing either one when the restoration
+begins, so a single reset would leave behind a cursor that an earlier application saved in the
+other buffer. The restoration also closes any hyperlink the stream left open, which a reset does
+not do, and hides the cursor after every reset, because a reset makes it show and the cursor's own
+operation at the end decides whether it shows again. Each reset follows a carriage return and a
+plain rendition, because xterm's reset saves a fresh cursor that keeps a pending wrap and leaves
+faint, crossed-out and doubly underlined set.
+
 To paint the buffer that is not showing, the restoration enters it through mode 1049 (clearing it)
 and leaves it (retaining what was painted) before installing anything, since leaving restores the
 cursor and may turn off line-feed/new-line mode on some terminals, undoing anything that was put in.
-When the primary buffer is showing, the other buffer is painted immediately after the soft reset,
-and the reset is repeated to forget the cursor that entering saved. Each reset follows a carriage
-return and a plain rendition, because xterm's reset saves a fresh cursor that keeps a pending wrap
-and leaves faint, crossed-out and doubly underlined set. When the alternate buffer is showing, the
-primary buffer is painted between leaving and re-entering the alternate buffer. The second entry to
-the alternate buffer saves a plain cursor (the default pen and shape, no link, at home). Mode 47 is
-not one the profile tracks, and a restoration never asks a terminal for it. A saved cursor the
+When the primary buffer is showing, the other buffer is painted immediately after those resets, and
+a reset is repeated to forget the cursor that entering saved. When the alternate buffer is showing,
+the primary buffer is painted between leaving and re-entering the alternate buffer. The second entry
+to the alternate buffer saves a plain cursor (the default pen and shape, no link, at home). Mode 47
+is not one the profile tracks, and a restoration never asks a terminal for it. A saved cursor the
 session holds for the buffer that is showing is installed afterwards, except for a pending wrap it
 holds, which is counted as not carried. The one it holds for the other buffer is counted as not
 carried.
