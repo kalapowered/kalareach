@@ -35,6 +35,8 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
 
+pub use super::clock_trust::{CLOCK_TOLERANCE_MS, ClockTrust};
+
 /// The durable records a connection reads and writes, and the boundaries they move behind.
 ///
 /// One handle, because a connection needs all three and none of them belongs to it: the directory
@@ -50,175 +52,6 @@ pub struct HostRecords {
     /// Whether this host may decide an expiry from its own wall clock.
     pub clock: Arc<ClockTrust>,
 }
-
-/// Whether this host may decide an expiry from its own wall clock, and the transitions of that.
-///
-/// Four things move together: sampling the clock, moving the mark, setting or clearing the
-/// decision, and writing it down. Each of them reads what the others wrote, so they share one
-/// boundary: without it an observation taken before an owner established the clock could land
-/// after it, and a decision cleared between an observation and its write would be lost.
-pub struct ClockTrust {
-    /// Held for the whole of every transition below.
-    ///
-    /// `true` once this host has found its clock going backwards, cleared only by an owner's
-    /// approval. The durable record is what a later run reads; this is what holds the decision
-    /// while a write is failing.
-    distrusted: std::sync::Mutex<bool>,
-    /// The wall clock this decision is about: the daemon's own.
-    wall: crate::service::WallClock,
-    /// The host's clock floor, which every reading taken here is published in before anything is
-    /// decided from it.
-    floor: Arc<crate::grants::policy::UtcFloor>,
-}
-
-impl std::fmt::Debug for ClockTrust {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ClockTrust")
-            .field("distrusted", &self.distrusted)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for ClockTrust {
-    /// A decision about the machine's own wall clock, over a floor of this process's own.
-    fn default() -> Self {
-        Self::new(
-            crate::service::WallClock::system(),
-            Arc::new(crate::grants::policy::UtcFloor::default()),
-        )
-    }
-}
-
-impl ClockTrust {
-    /// A decision about `wall`, trusted until a step back says otherwise, publishing every reading
-    /// in `floor`.
-    #[must_use]
-    pub fn new(
-        wall: crate::service::WallClock,
-        floor: Arc<crate::grants::policy::UtcFloor>,
-    ) -> Self {
-        Self {
-            distrusted: std::sync::Mutex::new(false),
-            wall,
-            floor,
-        }
-    }
-
-    /// Publishes a reading in the host's floor and returns the moment to decide from: the floor as
-    /// the reading left it.
-    ///
-    /// The raw sample stays where rollback is detected, in the device store's mark: the floor only
-    /// moves forward, so it cannot show that the wall clock went back.
-    fn published(&self, observed: ObservedUtc) -> ObservedUtc {
-        ObservedUtc {
-            now: TimestampMs::new(self.floor.observe(observed.now.get())),
-            behind_ms: observed.behind_ms,
-        }
-    }
-
-    fn wall_now(&self) -> TimestampMs {
-        TimestampMs::new(self.wall.now_ms())
-    }
-
-    /// Samples the wall clock and says whether this host may decide against what it read.
-    ///
-    /// One operation, because the two halves are one decision: the clock is read, a rollback
-    /// becomes distrust, and the answer says whether the reading may be used. Anything that read
-    /// the clock and then asked separately could be answered about a clock an owner established in
-    /// between, and would then measure a grant from the reading it took before that.
-    ///
-    /// The clock is read *inside* the boundary too, so a caller that paused before it got here
-    /// cannot contribute a stale reading.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the mark or the decision cannot be read or written. A host that
-    /// cannot tell decides nothing.
-    pub fn sample(&self, devices: &DeviceDirectory) -> Result<Option<ObservedUtc>> {
-        let mut distrusted = self.held();
-        let observed = devices.utc_at_least(self.wall_now())?;
-        if observed.behind_ms > CLOCK_TOLERANCE_MS {
-            *distrusted = true;
-            // The decision is in memory before anything is written, and the write is attempted
-            // here and retried by whoever calls [`Self::settle`] until it lands.
-            let _ = devices.note_clock_untrusted(observed.now);
-        }
-        // Published whatever is decided from it: a reading any process of this host took is the
-        // floor every later decision stands on.
-        let observed = self.published(observed);
-        // A boot whose clock continuity is lost has no reading anything may be decided against
-        // until the owner establishes the clock, which is a clock this host does not trust.
-        if *distrusted || devices.clock_untrusted()? || self.floor.continuity_lost() {
-            return Ok(None);
-        }
-        Ok(Some(observed))
-    }
-
-    /// Records the moment this host is at, for a caller that needs the reading rather than a
-    /// decision from it.
-    ///
-    /// A tombstone is written at the moment it was observed, and a rollback observed while doing
-    /// it is the same fact as one observed anywhere else: it becomes distrust here too.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the mark cannot be read or written.
-    pub fn observe(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
-        let mut distrusted = self.held();
-        let observed = devices.utc_at_least(self.wall_now())?;
-        if observed.behind_ms > CLOCK_TOLERANCE_MS {
-            *distrusted = true;
-            let _ = devices.note_clock_untrusted(observed.now);
-        }
-        Ok(self.published(observed).now)
-    }
-
-    /// Writes down a decision this host is holding, until the write lands.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the record cannot be read or written.
-    pub fn settle(&self, devices: &DeviceDirectory) -> Result<()> {
-        let distrusted = self.held();
-        if *distrusted && !devices.clock_untrusted()? {
-            devices.note_clock_untrusted(self.wall_now())?;
-        }
-        Ok(())
-    }
-
-    /// Establishes the clock again, at the moment an owner authenticated, and returns that moment.
-    ///
-    /// The mark moves to that moment and the decision is cleared, in one transition: an
-    /// observation taken against the old mark cannot land after it, because it would have to take
-    /// this boundary to be recorded at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the record cannot be written. The decision stands if it cannot.
-    pub fn establish(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
-        let mut distrusted = self.held();
-        // Read inside the boundary, like every other reading of this clock: the moment the owner
-        // established is the moment this host is at now, not one sampled before it got here.
-        let established = self.wall_now();
-        devices.trust_clock(established)?;
-        *distrusted = false;
-        Ok(established)
-    }
-
-    fn held(&self) -> std::sync::MutexGuard<'_, bool> {
-        self.distrusted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// How far behind its own recorded mark this host's wall clock may be and still decide an expiry.
-///
-/// A small step is ordinary: a clock corrected by a time service, or two reads either side of a
-/// write. A larger one says the wall clock is not currently a clock this host can measure a grant
-/// against, and section 9 does not let it guess in the device's favour.
-pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
 
 /// Expiry records this host owes its own directory.
 ///
@@ -293,8 +126,59 @@ impl PendingExpiry {
 pub struct ObservedUtc {
     /// The moment to decide against: the wall clock, or the recorded mark when that is later.
     pub now: TimestampMs,
-    /// How far the wall clock is behind the mark. Zero when it is not behind it.
+    /// How far the wall clock is behind what this host holds of it: the mark, or the anchor
+    /// projected by the continuous clock when that is later. Zero when it is not behind it.
     pub behind_ms: u64,
+}
+
+/// Everything the device store holds of this host's wall clock ([`ClockTrust`] owns the decision).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockRecord {
+    /// The highest moment this host has recorded: the mark a step back is measured against.
+    pub observed_ms: Option<u64>,
+    /// When this host found its wall clock going backwards, until an owner establishes it again.
+    pub untrusted_at_ms: Option<u64>,
+    /// Where the wall clock stood on the boot clock, as the mark is projected forward from it.
+    pub anchor: Option<StoredClockAnchor>,
+    /// When the owner established the clock, until the clock is next distrusted.
+    pub confirmed_at_ms: Option<u64>,
+    /// When a hold on every forgetting was set, until an owner establishes the clock again.
+    pub forgetting_hold_at_ms: Option<u64>,
+    /// When the platform's time service was found unqualified with no owner confirmation, until
+    /// an owner establishes the clock again.
+    pub evidence_hold_at_ms: Option<u64>,
+}
+
+/// Where this host's wall clock stood at one reading of the boot clock.
+///
+/// The reading of the boot clock is bound to its boot, as a grant deadline is: within the boot it
+/// says how long has passed since, and in another boot it says nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredClockAnchor {
+    /// The wall clock, in UTC milliseconds.
+    pub wall_ms: u64,
+    /// The boot clock at that moment, in milliseconds since the boot began.
+    pub boot_ms: u64,
+    /// The boot the reading of the boot clock belongs to.
+    pub boot_value: Vec<u8>,
+}
+
+/// The two holds on forgetting that survive a restart and are lifted only by an owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockHold {
+    /// Every forgetting is withheld, attention's included.
+    Forgetting,
+    /// Attention's forgetting and quiet hours are withheld.
+    Evidence,
+}
+
+impl ClockHold {
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Forgetting => "forgetting_hold_at_ms",
+            Self::Evidence => "evidence_hold_at_ms",
+        }
+    }
 }
 
 /// How much of the bounded offline validity this host has measured as spent since one
@@ -596,7 +480,19 @@ impl DeviceDirectory {
         ] {
             self.add_column("network_devices", column)?;
         }
-        self.add_column("network_clock", "untrusted_at_ms INTEGER")?;
+        // The one record of this host's wall clock ([`ClockTrust`]): the decision, the anchor the
+        // mark is projected from, what the owner confirmed and the two holds.
+        for column in [
+            "untrusted_at_ms INTEGER",
+            "anchor_wall_ms INTEGER",
+            "anchor_boot_ms INTEGER",
+            "anchor_boot_value BLOB",
+            "confirmed_at_ms INTEGER",
+            "forgetting_hold_at_ms INTEGER",
+            "evidence_hold_at_ms INTEGER",
+        ] {
+            self.add_column("network_clock", column)?;
+        }
         self.rebuild_actions()?;
         Ok(())
     }
@@ -1225,13 +1121,75 @@ impl DeviceDirectory {
         Ok(())
     }
 
+    /// Returns everything this host recorded of its wall clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be read.
+    pub fn clock_record(&self) -> Result<ClockRecord> {
+        type Row = (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let row: Option<Row> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT observed_ms, untrusted_at_ms, anchor_wall_ms, anchor_boot_ms,
+                            anchor_boot_value, confirmed_at_ms, forgetting_hold_at_ms,
+                            evidence_hold_at_ms
+                     FROM network_clock WHERE id = 0",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+        })?;
+        let read = |value: i64| u64::try_from(value).unwrap_or_default();
+        let Some((observed, untrusted, wall, boot_ms, boot_value, confirmed, forgetting, evidence)) =
+            row
+        else {
+            return Ok(ClockRecord::default());
+        };
+        Ok(ClockRecord {
+            observed_ms: Some(read(observed)),
+            untrusted_at_ms: untrusted.map(read),
+            anchor: match (wall, boot_ms, boot_value) {
+                (Some(wall), Some(boot_ms), Some(boot_value)) => Some(StoredClockAnchor {
+                    wall_ms: read(wall),
+                    boot_ms: read(boot_ms),
+                    boot_value,
+                }),
+                _ => None,
+            },
+            confirmed_at_ms: confirmed.map(read),
+            forgetting_hold_at_ms: forgetting.map(read),
+            evidence_hold_at_ms: evidence.map(read),
+        })
+    }
+
     /// Records that this host's wall clock could not be trusted to decide an expiry.
     ///
     /// It is durable because the decision has to outlive the connection that found it and the run
     /// that was serving it: a clock that went backwards once, and then reads plausibly again,
-    /// would otherwise let the next connection decide a grant's life against it. What clears it is
-    /// [`Self::trust_clock`], and only a clock that has caught up with everything this host has
-    /// already recorded reaches that.
+    /// would otherwise let the next connection decide a grant's life against it. The owner's
+    /// confirmation of the clock goes with it: the owner said what the time was, not that the
+    /// clock would keep it. What clears it is [`Self::establish_clock`].
     ///
     /// # Errors
     ///
@@ -1242,49 +1200,90 @@ impl DeviceDirectory {
                 "INSERT INTO network_clock (id, observed_ms, untrusted_at_ms)
                  VALUES (0, ?1, ?1)
                  ON CONFLICT (id) DO UPDATE
-                     SET untrusted_at_ms = COALESCE(untrusted_at_ms, ?1)",
+                     SET untrusted_at_ms = COALESCE(untrusted_at_ms, ?1), confirmed_at_ms = NULL",
                 params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
             )
         })?;
         Ok(())
     }
 
-    /// Returns whether this host has recorded its wall clock as untrustworthy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the row cannot be read.
-    pub fn clock_untrusted(&self) -> Result<bool> {
-        let recorded: Option<Option<i64>> = self.with(|connection| {
-            connection
-                .query_row(
-                    "SELECT untrusted_at_ms FROM network_clock WHERE id = 0",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-        })?;
-        Ok(recorded.flatten().is_some())
-    }
-
-    /// Clears the record above, and marks the moment the clock was established at.
-    ///
-    /// The mark moves with it, to `now_ms`. It has to: the mark is what a rollback is measured
-    /// against, and a host whose clock had been running *ahead* would otherwise be told it had
-    /// gone backwards by the very correction the owner just authenticated. What does not move is
-    /// anything already decided - the expiry tombstones, and the deadlines this boot holds - so a
-    /// grant this host has already found to be over stays over.
+    /// Records one of the two holds on forgetting, which only [`Self::establish_clock`] lifts.
     ///
     /// # Errors
     ///
     /// Returns an error when the row cannot be written.
-    pub fn trust_clock(&self, now_ms: TimestampMs) -> Result<()> {
+    pub fn note_clock_hold(&self, hold: ClockHold, now_ms: TimestampMs) -> Result<()> {
+        let column = hold.column();
         self.with(|connection| {
             connection.execute(
-                "INSERT INTO network_clock (id, observed_ms, untrusted_at_ms)
-                 VALUES (0, ?1, NULL)
-                 ON CONFLICT (id) DO UPDATE SET observed_ms = ?1, untrusted_at_ms = NULL",
+                &format!(
+                    "INSERT INTO network_clock (id, observed_ms, {column})
+                     VALUES (0, ?1, ?1)
+                     ON CONFLICT (id) DO UPDATE SET {column} = COALESCE({column}, ?1)"
+                ),
                 params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Records where the wall clock stood at `boot_ms` on the boot clock of `boot`: the anchor the
+    /// next run in this boot projects forward, and the next run in another boot starts from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_clock_anchor(
+        &self,
+        wall_ms: u64,
+        boot: &BootIdentity,
+        boot_ms: u64,
+    ) -> Result<()> {
+        let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_clock
+                     (id, observed_ms, anchor_wall_ms, anchor_boot_ms, anchor_boot_value)
+                 VALUES (0, ?1, ?1, ?2, ?3)
+                 ON CONFLICT (id) DO UPDATE
+                     SET anchor_wall_ms = ?1, anchor_boot_ms = ?2, anchor_boot_value = ?3",
+                params![stored(wall_ms), stored(boot_ms), boot.value.as_slice()],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Clears the decision, both holds, and marks the moment the owner established the clock at.
+    ///
+    /// One statement, so the owner's establishing is all or nothing. The mark and the anchor move
+    /// with it, to `now_ms`. They have to: they are what a rollback is measured against, and a
+    /// host whose clock had been running *ahead* would otherwise be told it had gone backwards by
+    /// the very correction the owner just authenticated. What does not move is anything already
+    /// decided - the expiry tombstones, and the deadlines this boot holds - so a grant this host
+    /// has already found to be over stays over.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn establish_clock(
+        &self,
+        now_ms: TimestampMs,
+        boot: &BootIdentity,
+        boot_ms: u64,
+    ) -> Result<()> {
+        let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_clock
+                     (id, observed_ms, untrusted_at_ms, anchor_wall_ms, anchor_boot_ms,
+                      anchor_boot_value, confirmed_at_ms, forgetting_hold_at_ms,
+                      evidence_hold_at_ms)
+                 VALUES (0, ?1, NULL, ?1, ?2, ?3, ?1, NULL, NULL)
+                 ON CONFLICT (id) DO UPDATE
+                     SET observed_ms = ?1, untrusted_at_ms = NULL, anchor_wall_ms = ?1,
+                         anchor_boot_ms = ?2, anchor_boot_value = ?3, confirmed_at_ms = ?1,
+                         forgetting_hold_at_ms = NULL, evidence_hold_at_ms = NULL",
+                params![stored(now_ms.get()), stored(boot_ms), boot.value.as_slice()],
             )
         })?;
         Ok(())
@@ -1690,64 +1689,6 @@ mod tests {
     use kr_protocol::ids::AuthorityRevision;
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Nullable};
-
-    /// Every reading the clock decision takes is published in the host's floor before anything is
-    /// decided from it, and the moment decided from is the floor's value, whichever process raised
-    /// it. The raw sample still decides a rollback: the floor only moves forward.
-    #[test]
-    fn a_sample_is_published_and_decided_from_the_floor() {
-        let devices = DeviceDirectory::in_memory().expect("a directory");
-        let wall = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
-        let floor = Arc::new(crate::grants::policy::UtcFloor::at(0));
-        let trust = ClockTrust::new(
-            {
-                let wall = Arc::clone(&wall);
-                crate::service::WallClock::from_fn(move || {
-                    wall.load(std::sync::atomic::Ordering::SeqCst)
-                })
-            },
-            Arc::clone(&floor),
-        );
-        let sampled = trust
-            .sample(&devices)
-            .expect("readable")
-            .expect("a trusted clock");
-        assert_eq!(sampled.now.get(), 1_000_000);
-        assert_eq!(floor.get(), 1_000_000, "the sample is in the floor");
-
-        // Another process of the host publishes a later reading: it is the moment decided from.
-        floor.observe(1_010_000);
-        let sampled = trust
-            .sample(&devices)
-            .expect("readable")
-            .expect("a trusted clock");
-        assert_eq!(sampled.now.get(), 1_010_000);
-        assert_eq!(
-            trust.observe(&devices).expect("readable").get(),
-            1_010_000,
-            "a reading taken for a record is the floor's value too"
-        );
-
-        // The control: a step back past the tolerance still distrusts the clock, although the
-        // floor stands above the sample.
-        wall.store(1_000_000 - 60_000, std::sync::atomic::Ordering::SeqCst);
-        assert!(trust.sample(&devices).expect("readable").is_none());
-        assert_eq!(floor.get(), 1_010_000);
-    }
-
-    /// While this boot's clock continuity is lost there is no reading anything may be decided
-    /// against, whatever the wall clock says, until the owner establishes the clock.
-    #[test]
-    fn a_lost_clock_continuity_is_a_clock_this_host_does_not_trust() {
-        let devices = DeviceDirectory::in_memory().expect("a directory");
-        let floor = Arc::new(crate::grants::policy::UtcFloor::at(0));
-        let trust = ClockTrust::new(crate::service::WallClock::system(), Arc::clone(&floor));
-        assert!(trust.sample(&devices).expect("readable").is_some());
-        floor.lose_continuity();
-        assert!(trust.sample(&devices).expect("readable").is_none());
-        floor.establish_continuity();
-        assert!(trust.sample(&devices).expect("readable").is_some());
-    }
 
     fn record(byte: u8) -> DeviceRecord {
         DeviceRecord {

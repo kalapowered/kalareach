@@ -147,6 +147,13 @@ impl GrantLifetimes {
         wall: crate::service::WallClock,
         floor: Arc<UtcFloor>,
     ) -> Self {
+        let clock_trust = Arc::new(ClockTrust::new(
+            wall.clone(),
+            Arc::clone(&floor),
+            Arc::clone(&clock),
+            Arc::clone(&shared_clock),
+            boot_identity.clone(),
+        ));
         Self {
             devices,
             clock,
@@ -156,7 +163,7 @@ impl GrantLifetimes {
             anchoring: Mutex::new(()),
             pending_expiry: Arc::new(PendingExpiry::default()),
             pending_stored: Mutex::new(BTreeMap::new()),
-            clock_trust: Arc::new(ClockTrust::new(wall.clone(), Arc::clone(&floor))),
+            clock_trust,
             wall,
             floor,
             offline_anchor: Mutex::new(None),
@@ -509,8 +516,9 @@ impl GrantLifetimes {
     /// Forgetting is a decision about the clock like any expiry, and the one check every
     /// collection of this host passes before it lets go of anything the wall clock says is old.
     /// The clock is sampled through the boundary every expiry decision goes through
-    /// ([`ClockTrust::sample`]), which answers no while the wall clock has gone backwards and an
-    /// owner has not established it again, and while this boot's clock continuity is lost. The
+    /// ([`ClockTrust::sample_for_forgetting`]), which answers no while the wall clock has gone
+    /// backwards and an owner has not established it again, while a hold on forgetting stands, and
+    /// while this boot's clock continuity is lost. The
     /// floor must also be answerable at `reading_ms`: nothing is owed its record, and what is
     /// written down covers the reading the retention is counted from. A record that cannot be
     /// shown to have outlived its retention is kept, because forgetting it lets the same action
@@ -518,7 +526,7 @@ impl GrantLifetimes {
     #[must_use]
     pub fn may_forget_at(&self, reading_ms: u64) -> bool {
         self.clock_trust
-            .sample(&self.devices)
+            .sample_for_forgetting(&self.devices)
             .ok()
             .flatten()
             .is_some()
