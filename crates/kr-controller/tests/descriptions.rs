@@ -352,7 +352,13 @@ impl Worker {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the typed input was not echoed in time"
+                "the typed input was not echoed in time: {:?} was wanted {count} times and the \
+                 retained output carries it {} times: {}",
+                String::from_utf8_lossy(marker),
+                seen.windows(marker.len())
+                    .filter(|window| *window == marker)
+                    .count(),
+                String::from_utf8_lossy(&seen).escape_debug()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
