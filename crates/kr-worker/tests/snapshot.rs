@@ -2275,6 +2275,78 @@ async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_scre
     .await;
 }
 
+/// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any
+/// other. The canonical screen returns to the primary buffer, the terminal that was being handed
+/// the stream never reads the reset, and the screen it is drawn instead puts it on that buffer and
+/// leaves it on the stream. Mode 1047 enters the alternate buffer without saving a cursor, and the
+/// application homes the cursor there, so no wrapped line or saved cursor is in question: nothing
+/// but the reset is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_soft_reset_from_the_alternate_buffer_leaves_a_direct_terminal_on_the_stream() {
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abc'; read -r _; printf '\\033[?1047h\\033[Halt'; \
+         read -r _; printf '\\033[!p'; read -r _; printf 'after'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abc").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "a terminal of the session's own size on a settled stream is handed the stream"
+    );
+
+    // The application enters the alternate buffer, and the terminal is drawn it.
+    typist.release(&host).await;
+    let events = collect_until_resync(
+        &mut attached.client,
+        "the switch to the alternate buffer to tell the terminal to begin again",
+    )
+    .await;
+    resubscribe(&host, &mut attached, resync_of(&events).cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "the alternate buffer, drawn with nothing saved in the other one, leaves it on the stream"
+    );
+
+    // The soft reset returns the canonical screen to the primary buffer. The terminal is told to
+    // begin again, and the screen it is drawn leaves it on the stream.
+    typist.release(&host).await;
+    let events = collect_until_resync(
+        &mut attached.client,
+        "the soft reset to tell the terminal to begin again",
+    )
+    .await;
+    assert_eq!(
+        resync_of(&events).reason,
+        kr_protocol::recovery::ResyncReason::ProjectionReset
+    );
+    resubscribe(&host, &mut attached, resync_of(&events).cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "the screen drawn after the reset carries everything the application addresses"
+    );
+
+    // And what the application writes next reaches it as the stream.
+    typist.release(&host).await;
+    collect_output_until(
+        &mut attached.client,
+        "the application's next output",
+        |seen| carries(&joined(seen), b"after"),
+    )
+    .await;
+}
+
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {

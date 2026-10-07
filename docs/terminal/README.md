@@ -377,8 +377,10 @@ a soft reset leaves the buffer, and the fifth is what it leaves saved:
   described under `wide.wide-character-two-cells-from-the-edge` in the section on physical
   terminals.
 - **A soft reset keeps a terminal on its current buffer.** The library returns to the primary
-  buffer, so a direct attachment moves to projection when a soft reset arrives while the alternate
-  buffer is showing.
+  buffer, so an application that goes on drawing after a soft reset from the alternate buffer draws
+  on the primary buffer, where xterm would draw on the alternate one. A direct terminal is not left
+  on the other buffer: it is redrawn from the canonical screen, as described below, and that puts
+  it on the primary buffer.
 - **A soft reset clears the saved cursor of both buffers.** xterm saves a fresh cursor in the buffer
   that is showing, at home and with whatever wrap was pending, and keeps the other buffer's. The
   product follows the library. In xterm and here alike, a restore in the buffer the reset leaves
@@ -387,18 +389,23 @@ a soft reset leaves the buffer, and the fifth is what it leaves saved:
   character goes to the second row; here it goes to the first. The faint, crossed-out and doubly
   underlined states stay set in xterm, whose reset leaves them and whose save keeps them; the
   library clears the whole pen. A cursor a program saved in the other buffer before the reset, and
-  has not saved again since, comes back there in xterm; here a restore goes home. The cursor a
-  program restores on leaving the alternate buffer after a soft reset differs too, but that case has
-  already moved a direct attachment to projection. Putting these right would need the engine to put
-  a saved cursor back, rendition and character sets included, and nothing but a sequence that moves
-  the screen can.
+  has not saved again since, comes back there in xterm; here a restore goes home. Entering the
+  alternate buffer through mode 1049 is such a save, so the usual case is a program that leaves the
+  alternate buffer after a soft reset. Putting these right would need the engine to put a saved
+  cursor back, rendition and character sets included, and nothing but a sequence that moves the
+  screen can.
 
-  A wrap pending at the reset needs no rule of its own. Every soft reset advances the projection, so
-  each direct attachment is told to begin again and is drawn from the canonical screen, and the
-  reset itself never reaches its terminal. The canonical screen keeps the pending wrap through the
-  reset, as xterm's does, and a redraw cannot leave a wrap pending, so an attachment drawn while the
-  wrap is still pending is shown a projection. Otherwise the redraw leaves the attachment on the
-  stream, unless the screen holds something else a redraw cannot carry, such as a soft-wrapped row.
+A soft reset needs no rule of its own for a direct terminal. Every soft reset advances the
+projection, so each direct attachment is told to begin again and is drawn from the canonical
+screen, and the reset itself never reaches its terminal. Whichever buffer the reset came from, the
+terminal then shows the buffer the canonical screen shows. The only soft reset it reads is the
+restoration's own. That one follows a carriage return and a plain rendition, so what xterm's reset
+saves has no wrap pending and none of the faint, crossed-out or doubly underlined states is left
+set. The canonical screen keeps a pending wrap through the reset, as xterm's does, and a redraw
+cannot leave a wrap pending, so an attachment drawn while the wrap is still pending is shown a
+projection, as it is for a soft-wrapped row or any other state a redraw cannot carry. It is handed
+the stream again once the session's output goes quiet on a screen a redraw can carry. Otherwise the
+redraw leaves the attachment on the stream.
 
 A full reset is not among these behaviours, because the engine makes it match xterm. The library
 keeps whatever was saved across a full reset. A program that restores a cursor afterwards would land
