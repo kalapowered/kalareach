@@ -370,11 +370,14 @@ struct TimeState {
     /// has since come to doubt. A contract with nothing recorded starts at nought, because its
     /// doubt is the platform's and the owner's confirmation in force answers that.
     followed: u64,
-    /// Whether this contract began with nothing recorded and has not yet looked at the floor.
+    /// Whether this contract began with nothing recorded and has met nothing it could doubt since.
     ///
     /// A contract in this state takes the confirmation in force, whether the owner made it in this
-    /// boot or the daemon states it again from its record. One that has looked, or that restored a
-    /// record, takes only an action of the owner made after.
+    /// boot or the daemon states it again from its record. It stops at its first look at a
+    /// confirmation, and at a rollback its own detector finds: a restatement adds nothing to what
+    /// the worker found, so it clears neither. A look that finds nothing, or half of a
+    /// publication, leaves it in force. A contract that restored a record never has it, and takes
+    /// only an action of the owner made after.
     adopting: bool,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
@@ -875,7 +878,7 @@ impl TimeContract {
             state.trust = WallClockTrust::Unresolved;
             state.critical = state.critical.saturating_add(1);
         }
-        self.follow_the_owner(&mut state, &reading);
+        self.follow_the_owner(&mut state, &reading, found.rolled_back);
         let trust = state.trust;
         drop(state);
 
@@ -1256,15 +1259,24 @@ impl TimeContract {
     ///
     /// The daemon also states its record's confirmation again, marked as a restatement, for a
     /// worker that begins in a new boot and for a publication it did not complete. A restatement
-    /// is not an action of the owner, so only a contract that began with nothing recorded and is
-    /// making its first look takes it. One that is running, or that restored a record, spends it
-    /// without following it: a restatement over a withdrawal whose distrust the daemon lost
-    /// clears nothing a worker found.
-    fn follow_the_owner(&self, state: &mut TimeState, reading: &TimeAdapterReading) {
-        let adopting = std::mem::take(&mut state.adopting);
+    /// is not an action of the owner, so only a contract that began with nothing recorded, has
+    /// found no rollback and is making its first look at a confirmation takes it. One that has
+    /// looked, that found a rollback, or that restored a record, spends it without following it:
+    /// a restatement over a withdrawal whose distrust the daemon lost clears nothing a worker
+    /// found.
+    fn follow_the_owner(
+        &self,
+        state: &mut TimeState,
+        reading: &TimeAdapterReading,
+        rolled_back: bool,
+    ) {
+        if rolled_back {
+            state.adopting = false;
+        }
         let Some(established) = self.floor.as_ref().and_then(|floor| floor.established()) else {
             return;
         };
+        let adopting = std::mem::take(&mut state.adopting);
         if established.count == state.followed {
             return;
         }
