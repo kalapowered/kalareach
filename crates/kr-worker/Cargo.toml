@@ -94,6 +94,11 @@ rusqlite = { workspace = true, features = ["bundled"] }
 # removed with the test, because nothing a launched process opens may be in the workspace.
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+# A test that needs a process held while it is ending attaches a debugger to it, which holds the
+# process at the event that says it has exited.
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
+
 # The workspace forbids unsafe code, which a crate that waits on the terminal's own descriptor
 # cannot honour. This crate denies it instead and allows it in exactly two modules:
 # `pty::descriptor`, which owns that single wait, and `action::adapter::unix`, which reads the
