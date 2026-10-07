@@ -2178,11 +2178,11 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
     }
 }
 
-/// KR-REQ-08.78 and KR-REQ-08.82: a cursor saved with a wrap pending is a state no terminal is
-/// given back. No sequence sets a wrap on a cursor that is about to be saved, so a terminal drawn
-/// such a screen is shown a projection, and the same screen with the cursor saved before the last
-/// column was filled leaves it on the stream. The cursor itself has no wrap pending in either case:
-/// the save is followed by a move, so only the saved one differs.
+/// KR-REQ-08.78 and KR-REQ-08.82: a cursor saved with a wrap pending is a state the terminals
+/// measured do not give back, and the restoration sets none, so a terminal drawn such a screen is
+/// shown a projection. The same screen with the cursor saved before the last column was filled
+/// leaves it on the stream. The cursor itself has no wrap pending in either case: the save is
+/// followed by a move, so only the saved one differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saved_cursor_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_projection() {
     let narrow = Dimensions::new(4, 5);
