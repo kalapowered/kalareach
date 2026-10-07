@@ -194,6 +194,41 @@ impl ReadPause {
     }
 }
 
+/// A point on a thread that may block, where this host's own tests stop a step: it says it has
+/// arrived and waits there, on the thread, until the test lets it go. Armed once, it fires once.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct BlockingPause(
+    std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+);
+
+#[cfg(test)]
+impl BlockingPause {
+    /// Arms the pause. Returns the end that says the step has arrived, and the end that lets it go.
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here, on this thread, when the pause is armed.
+    fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
 /// A step of this daemon that its own tests can end where a crash would: the step returns an error
 /// there and does nothing after it, and what was already written is left as it was.
 #[cfg(test)]
@@ -447,6 +482,11 @@ pub struct Controller {
     /// the publication is in flight. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_worker_is_made_known: ReadPause,
+    /// Where this host's own tests stop the thread that writes a worker's descriptor, before it
+    /// writes, so that the daemon can be let go while the write is still to be made. Compiled away
+    /// in every shipped build.
+    #[cfg(test)]
+    before_a_descriptor_is_written: BlockingPause,
     /// The step this host's own tests have made stop where a crash would, if one is armed
     /// ([`StopPoint`]). Compiled away in every shipped build.
     #[cfg(test)]
@@ -978,6 +1018,10 @@ mod a_publication_that_outlives_its_request;
 /// A create whose session closed after its worker reported itself.
 #[cfg(test)]
 mod a_create_whose_session_closed;
+
+/// A descriptor write that the daemon's runtime ends the wait for.
+#[cfg(test)]
+mod a_write_that_outlives_its_daemon;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
