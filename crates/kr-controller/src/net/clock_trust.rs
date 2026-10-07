@@ -358,6 +358,7 @@ impl ClockTrust {
             state.evidence_hold = true;
             state.owed.evidence_hold = true;
         }
+        self.tell_the_workers(state, wall_ms);
         let _ = self.write_owed(state, devices, latest);
         if let Some(error) = store_error {
             return Err(error);
@@ -373,6 +374,25 @@ impl ClockTrust {
             },
             standing: self.standing(state),
         })
+    }
+
+    /// Keeps the owner's confirmation the floor shows the workers equal to what this record holds.
+    ///
+    /// A record that distrusts the clock holds none, so a confirmation standing in the floor is
+    /// withdrawn, and a worker that begins later does not take it. A record that holds the owner's
+    /// confirmation in a boot that has published nothing says so once with the reading just taken,
+    /// which is how a worker that begins in a new boot learns of a confirmation made in an earlier
+    /// one: the owner's word stands until a rollback ends it. A boot whose clock continuity is lost
+    /// has no reading to say it with.
+    fn tell_the_workers(&self, state: &State, wall_ms: u64) {
+        let words = self.floor.words();
+        if state.distrusted {
+            if words.established().is_some() {
+                words.withdraw();
+            }
+        } else if state.confirmed && !words.published() && !self.floor.continuity_lost() {
+            words.establish(wall_ms, self.boot_clock.boot_elapsed_ms());
+        }
     }
 
     fn standing(&self, state: &State) -> Standing {
@@ -1545,6 +1565,71 @@ mod tests {
         assert!(run.trust.sample(&devices).expect("readable").is_none());
         floor.establish_continuity();
         assert!(run.trust.sample(&devices).expect("readable").is_some());
+    }
+
+    /// KR-REQ-09.19: what the floor shows the workers of the owner's confirmation is what the
+    /// record holds. An establishment is published with the reading it was made at; a rollback
+    /// that distrusts the clock withdraws it; the next establishment publishes again. In a new boot
+    /// the floor starts empty, and a record that still holds the owner's confirmation says so with
+    /// the first reading taken, while a record that distrusts the clock says nothing.
+    #[test]
+    fn the_floor_shows_the_workers_the_confirmation_the_record_holds() {
+        let store = Store::new();
+        let devices = store.open();
+        let mut machine = Machine::new();
+        let floor = Arc::new(UtcFloor::at(0));
+        let run = Run::over(&machine, Arc::clone(&floor));
+        let words = || floor.words().established();
+
+        assert!(proven(&run, &devices));
+        assert!(
+            !floor.words().published(),
+            "no owner has confirmed anything"
+        );
+
+        run.trust
+            .establish(&devices)
+            .expect("the owner establishes");
+        let first = words().expect("the establishment is published");
+        assert_eq!(first.wall_ms, machine.wall());
+        assert_eq!(first.boot_ms, machine.boot_clock.boot_elapsed_ms());
+
+        machine.set_wall(machine.wall() - 60_000);
+        assert!(!proven(&run, &devices), "the step back distrusts the clock");
+        assert_eq!(words(), None, "and withdraws the confirmation");
+
+        run.trust
+            .establish(&devices)
+            .expect("the owner establishes again");
+        let second = words().expect("published again");
+        assert!(second.count > first.count + 1, "after the withdrawal");
+        assert_eq!(second.wall_ms, machine.wall());
+
+        // Another boot: an empty floor, and a record that holds the confirmation says so once.
+        drop(run);
+        machine.reboot();
+        let fresh = Arc::new(UtcFloor::at(0));
+        let run = Run::over(&machine, Arc::clone(&fresh));
+        assert_eq!(fresh.words().established(), None);
+        assert!(proven(&run, &devices));
+        let said = fresh
+            .words()
+            .established()
+            .expect("the first reading tells the workers the owner's word stands");
+        assert_eq!(said.wall_ms, machine.wall());
+
+        // A record that distrusts the clock says nothing in a new boot.
+        machine.set_wall(machine.wall() - 60_000);
+        assert!(!proven(&run, &devices));
+        drop(run);
+        machine.reboot();
+        let later = Arc::new(UtcFloor::at(0));
+        let run = Run::over(&machine, Arc::clone(&later));
+        assert!(
+            !proven(&run, &devices),
+            "the record still distrusts the clock"
+        );
+        assert!(!later.words().published());
     }
 
     /// KR-REQ-09.18: a continuous clock that runs fast against the wall clock raises no distrust.

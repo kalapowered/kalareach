@@ -19,17 +19,28 @@
 //! deadline, and otherwise raises `owed` for the daemon to write: an answer never rests on a
 //! reading that a restart, a reboot or a lost file could take away.
 //!
-//! # The owner's establishment
+//! # The owner's confirmation of the clock
 //!
 //! The owner can establish the host's clock: say that the reading it shows is right. The daemon
-//! records that, and every worker that distrusts its own clock has to learn of it, because the
-//! owner's one action is meant to end distrust everywhere. Two more words carry it
-//! ([`SharedFloor::establish`], [`SharedFloor::established`]): the wall reading the owner
-//! established and the machine's continuous reading taken with it, so a worker can ask whether its
-//! own wall clock still agrees with them. Each word holds the establishment's count beside its
-//! reading, and a reader takes the pair only when both counts match, so the two words need no
-//! lock: a reader that meets one half of an establishment still being published finds no
-//! establishment yet and looks again later.
+//! records that, and a worker that distrusts its own clock has to learn of it, because the owner's
+//! one action is meant to end that distrust where the worker maps this file. Two more words carry
+//! it ([`SharedFloor::establish`], [`SharedFloor::established`]): the wall reading the owner
+//! confirmed and the machine's continuous reading taken with it, so a worker can ask whether its
+//! own wall clock still agrees with them. The words state the confirmation in force: the daemon
+//! withdraws it ([`SharedFloor::withdraw`]) when its own record distrusts the clock, so a worker
+//! that begins later does not take a confirmation the daemon no longer holds.
+//!
+//! Each word holds a count of publications beside its reading, and a reader takes the pair only
+//! when both counts match, so the two words need no lock: a reader that meets one half of a
+//! publication still being made finds no confirmation yet and looks again later. The limits are
+//! the words': a reading of zero, or one that 44 bits cannot hold, is published as a withdrawal,
+//! and the count of 20 bits repeats after 1,048,575 publications in one boot, which a reader that
+//! looks less often than that could take for no change.
+//!
+//! The words carry the owner's action only as far as the account boundary. Any process of the
+//! account that maps the file can write them, as it can raise the floor, and one forged write
+//! would make every worker whose own clock agrees trust it. Nothing here defends against code that
+//! runs under the same account.
 //!
 //! # The file
 //!
@@ -410,28 +421,47 @@ impl SharedFloor {
     /// Publishes that the owner established the host's clock, at the wall reading `wall_ms` and
     /// the machine's continuous reading `boot_ms` taken with it.
     ///
-    /// Only the control daemon calls this, one establishment at a time, after the record of the
-    /// establishment is written. A reading past what 44 bits hold is stored as the largest value
-    /// they hold, which no worker's clock then agrees with.
+    /// Only the control daemon calls this, one publication at a time. A reading that cannot be
+    /// stated (zero, or past what the word holds) is published as a withdrawal.
     pub fn establish(&self, wall_ms: u64, boot_ms: u64) {
+        if wall_ms == 0 || wall_ms > READING_MASK || boot_ms > READING_MASK {
+            self.withdraw();
+        } else {
+            self.publish(wall_ms, boot_ms);
+        }
+    }
+
+    /// Publishes that no confirmation of the owner's stands: the daemon's own record distrusts the
+    /// clock. A worker that has already followed an earlier one is not affected.
+    pub fn withdraw(&self) {
+        self.publish(0, 0);
+    }
+
+    fn publish(&self, wall_ms: u64, boot_ms: u64) {
         let count = (self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> READING_BITS)
             % COUNT_MASK
             + 1;
-        let held = |reading: u64| (count << READING_BITS) | reading.min(READING_MASK);
+        let held = |reading: u64| (count << READING_BITS) | reading;
         self.word(ESTABLISHED_WALL_AT)
             .store(held(wall_ms), Ordering::SeqCst);
         self.word(ESTABLISHED_BOOT_AT)
             .store(held(boot_ms), Ordering::SeqCst);
     }
 
-    /// The owner's latest establishment of the host's clock in this boot, once there has been one
-    /// and both of its words are published.
+    /// Whether anything, an establishment or a withdrawal, has been published in this boot.
+    #[must_use]
+    pub fn published(&self) -> bool {
+        self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> READING_BITS != 0
+    }
+
+    /// The owner's confirmation of the host's clock in force in this boot, when there is one and
+    /// both of its words are published.
     #[must_use]
     pub fn established(&self) -> Option<Establishment> {
         let wall = self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst);
         let boot = self.word(ESTABLISHED_BOOT_AT).load(Ordering::SeqCst);
         let count = wall >> READING_BITS;
-        if count == 0 || boot >> READING_BITS != count {
+        if count == 0 || boot >> READING_BITS != count || wall & READING_MASK == 0 {
             return None;
         }
         Some(Establishment {
@@ -865,6 +895,7 @@ mod tests {
         assert_eq!(floor.owed(), 3_000);
         assert!(floor.named(), "a floor with no file has no name to lose");
         assert_eq!(floor.established(), None);
+        assert!(!floor.published());
         floor.establish(1_700_000_000_000, 90_000);
         assert_eq!(
             floor.established(),
@@ -906,6 +937,17 @@ mod tests {
                 boot_ms: 9_000,
             })
         );
+        // A withdrawal leaves none in force, and is a publication of its own.
+        assert!(worker.published());
+        daemon.withdraw();
+        assert_eq!(worker.established(), None);
+        daemon.establish(1_600_000_000_001, 9_001);
+        assert_eq!(worker.established().map(|held| held.count), Some(4));
+        // What the words cannot state is a withdrawal, not a reading nobody can agree with.
+        daemon.establish(0, 9_002);
+        assert_eq!(worker.established(), None);
+        daemon.establish(1_600_000_000_002, READING_MASK + 1);
+        assert_eq!(worker.established(), None);
         drop((daemon, worker));
         std::fs::remove_dir_all(&root).expect("removed");
     }
