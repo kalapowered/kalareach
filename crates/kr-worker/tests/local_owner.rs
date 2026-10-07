@@ -203,6 +203,24 @@ fn served_the_stream(attached: &SessionAttachResult) {
     );
 }
 
+/// Asserts that the terminal an attachment was admitted as is not served the stream, because the
+/// screen a caller shown the live screen alone is drawn can never carry everything, so the screen
+/// it is drawn arrives as rows.
+#[track_caller]
+fn served_the_canonical_screen(attached: &SessionAttachResult) {
+    assert_eq!(
+        (
+            attached.attachment.presentation.as_ref().copied(),
+            attached.attachment.presentation_reason
+        ),
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(kr_protocol::attachment::PresentationReason::RestorationIncomplete)
+        ),
+        "a caller shown the live screen alone is not served the stream: {attached:?}"
+    );
+}
+
 /// Asserts that an intent was taken back before it was dispatched.
 #[track_caller]
 fn cancelled(receipt: &Receipt) {
@@ -560,9 +578,15 @@ impl Wired {
 
     /// Attaches a terminal for `actor` over `daemon`, subscribes it, and returns the screen it is
     /// drawn.
-    async fn drawn_for(&self, daemon: &mut LocalClient, actor: &ActorEnvelope) -> Vec<u8> {
-        // Whether the screen arrives as bytes or as rows is the scope's to decide, and what the
-        // callers of this are about is what the screen holds, so neither form is asserted here.
+    ///
+    /// `narrowed` says whether the caller is shown the live screen alone, which decides whether its
+    /// screen arrives as rows (and its attach says so) or as the stream's bytes.
+    async fn drawn_for(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+        narrowed: bool,
+    ) -> Vec<u8> {
         let attached = self
             .attach_for(
                 daemon,
@@ -571,6 +595,11 @@ impl Wired {
                 &[AttachmentCapability::ObserveTerminal],
             )
             .await;
+        if narrowed {
+            served_the_canonical_screen(&attached);
+        } else {
+            served_the_stream(&attached);
+        }
         let request_id = next_request();
         let frame = forwarded_read(
             actor,
@@ -1244,7 +1273,9 @@ async fn a_local_caller_under_a_grant_is_drawn_the_live_screen_alone() {
     common::produced(&wired.runtime, SCREEN_DRAWN).await;
 
     let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
-    let drawn = wired.drawn_for(&mut proxy, &local_under_a_grant(1)).await;
+    let drawn = wired
+        .drawn_for(&mut proxy, &local_under_a_grant(1), true)
+        .await;
     assert!(
         !carries(&drawn, BEHIND),
         "a caller under a grant is drawn nothing of the buffer that is not showing: {}",
@@ -1274,7 +1305,9 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
 
     // The same owner as the daemon forwards it. Another socket, the same caller.
     let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
-    let drawn = wired.drawn_for(&mut proxy, &the_owner_forwarded()).await;
+    let drawn = wired
+        .drawn_for(&mut proxy, &the_owner_forwarded(), false)
+        .await;
     assert!(
         carries(&drawn, BEHIND),
         "the owner the daemon forwards is drawn the buffer that is not showing too: {}",
@@ -1283,7 +1316,7 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
 
     // A paired device is drawn the screen that is showing, and nothing behind it.
     let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
-    let drawn = wired.drawn_for(&mut phone, &device(1)).await;
+    let drawn = wired.drawn_for(&mut phone, &device(1), true).await;
     assert!(
         !carries(&drawn, BEHIND),
         "a device is drawn nothing of the buffer that is not showing: {}",
