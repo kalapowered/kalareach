@@ -421,7 +421,6 @@ jobs:
         run: df -h /
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
@@ -465,7 +464,17 @@ jobs:
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: ${{ matrix.name }}
+          name: windows
+
+      # The ARM64 compile's output apart from the x86-64 build's, which the other leg saves: the leg
+      # that compiles for ARM64 saves this one, so the x86-64 output is not saved twice.
+      - name: Restore the ARM64 build output
+        id: arm64-cache
+        if: ${{ matrix.part == 'second' }}
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: windows-arm64
+          paths: target/aarch64-pc-windows-msvc
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its
@@ -1028,11 +1037,19 @@ jobs:
           -p kr-voice -p kr-worker
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
+        if: ${{ success() && matrix.part == 'first' }}
         uses: ./.github/actions/cargo-cache-save
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+
+      - name: Save the ARM64 build output
+        if: ${{ success() && matrix.part == 'second' }}
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.arm64-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.arm64-cache.outputs.cache-hit }}
+          paths: target/aarch64-pc-windows-msvc
 
   shell-packages:
     name: shell-packages
@@ -1608,7 +1625,7 @@ jobs:
       # step and deleted after it: internal rather than removable, and another filesystem from
       # /private/tmp.
       - name: The cases that need another filesystem
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ success() && matrix.part == 'tests' }}
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -1798,7 +1815,7 @@ jobs:
         run: df -h /System/Volumes/Data
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ success() && matrix.part == 'tests' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
@@ -1806,7 +1823,7 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
       - name: Save the release build output
-        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        if: ${{ success() && matrix.part == 'demonstrations' }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
@@ -1896,7 +1913,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save the cargo cache
-        if: ${{ !cancelled() }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
