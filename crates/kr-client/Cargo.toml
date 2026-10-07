@@ -65,8 +65,12 @@ default = ["terminal"]
 # painter and the width model it measures runs with are not behind it: they build for every
 # platform, Apple's mobile systems included, where the terminal library does not build.
 terminal = ["dep:kr-term"]
+# Seams this crate's own tests act through, compiled in for them and in no shipped build.
+testing = []
 
 [dev-dependencies]
+# This crate's own tests, with the seams above compiled in.
+kr-client = { path = ".", default-features = false, features = ["testing"] }
 iroh = { workspace = true, features = ["test-utils"] }
 # A disposable owner-only host tree, so a local endpoint in a test lives on the internal disk and
 # disappears with the test.
