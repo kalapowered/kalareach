@@ -196,7 +196,8 @@ fn profile_fixture_is_current() {
 }
 
 /// The terminal reference lists as many behaviours that constrain direct mode as the library
-/// record names, and says how many in words.
+/// record names. It does not say how many there are: the record is what the reference holds itself
+/// to, and it makes no claim to be every behaviour that constrains direct mode.
 #[test]
 fn the_reference_lists_as_many_direct_mode_constraints_as_the_library_record_names() {
     let path = fixtures_dir()
@@ -226,25 +227,6 @@ fn the_reference_lists_as_many_direct_mode_constraints_as_the_library_record_nam
     assert_eq!(
         bullets, constraints,
         "the reference lists {bullets} behaviours and the library record names {constraints}"
-    );
-    let words = [
-        "no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-    ];
-    let count = words
-        .get(constraints)
-        .unwrap_or_else(|| panic!("name {constraints} in words in this test"));
-    let introduction = section
-        .iter()
-        .take_while(|line| !line.starts_with("- "))
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    assert!(
-        introduction
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|word| word == *count),
-        "the introduction does not say that there are {count}: {introduction:?}"
     );
 }
 
