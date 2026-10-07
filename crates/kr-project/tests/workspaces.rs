@@ -800,12 +800,13 @@ fn a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers() 
     );
 }
 
-/// Creates a linked worktree of `project` named `name` in `parent`.
-fn worktree_workspace(
+/// Creates an isolated workspace of `project` named `name` in `parent`.
+fn isolated_workspace(
     fixture: &Fixture,
     project: ProjectRepositoryId,
     parent: &std::path::Path,
     name: &str,
+    isolation: IsolationMechanism,
     seed: u8,
 ) -> kr_protocol::ids::WorkspaceId {
     fixture
@@ -816,7 +817,7 @@ fn worktree_workspace(
                 project_repository_id: project,
                 label: name.to_owned(),
                 kind: WorkspaceKind::Isolated,
-                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                isolation: Nullable(Some(isolation)),
                 policy: InclusionPolicy::base_only(),
                 base_revision: Nullable(None),
                 base_change_set_id: Nullable(None),
@@ -862,7 +863,14 @@ fn a_directory_that_took_a_workspace_trees_place_is_not_read_as_the_workspace() 
     let mut fixture = Fixture::create();
     let started = watching_git(&mut fixture);
     let project = adopted_with_changes(&fixture, "replaced-source");
-    let workspace_id = worktree_workspace(&fixture, project, fixture.work(), "replaced-tree", 80);
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "replaced-tree",
+        IsolationMechanism::GitWorktree,
+        80,
+    );
     let tree = fixture.work().join("replaced-tree");
     let named = std::fs::canonicalize(fixture.work())
         .expect("the directory resolves")
@@ -934,7 +942,14 @@ fn a_repository_around_a_workspace_tree_is_not_read_when_the_tree_loses_its_own(
     let started = watching_git(&mut fixture);
     let around = ordinary_repository(fixture.work(), "around");
     let project = adopted_with_changes(&fixture, "enclosed-source");
-    let workspace_id = worktree_workspace(&fixture, project, &around, "inside", 89);
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "inside",
+        IsolationMechanism::GitWorktree,
+        89,
+    );
     let tree = around.join("inside");
     write(&tree, "mine.txt", "this workspace's own work\n");
     let named = std::fs::canonicalize(&tree).expect("the tree resolves");
@@ -966,6 +981,67 @@ fn a_repository_around_a_workspace_tree_is_not_read_when_the_tree_loses_its_own(
     assert!(
         !git_started_in(&started, &outer),
         "no Git invocation started in the repository around the tree"
+    );
+}
+
+/// An independent clone that lost its own repository is not read as the repository around it, not
+/// even when that repository's configuration names the clone's tree as its working tree: Git then
+/// reports the recorded tree as the top level, and nothing else decides the repository's Git
+/// directory for an independent clone, so the search for the repository has to stop above the
+/// tree, and no `git status` starts.
+#[cfg(unix)]
+#[test]
+fn a_repository_around_an_independent_clone_that_names_its_tree_is_not_read_as_the_clone() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let around = ordinary_repository(fixture.work(), "around-clone");
+    let project = adopted_with_changes(&fixture, "clone-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "clone",
+        IsolationMechanism::IndependentClone,
+        106,
+    );
+    let tree = around.join("clone");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+
+    // The clone is read by its own repository.
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 107);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the recorded tree is counted: {held:?}"
+    );
+    assert!(
+        git_ran_in(&started, &named, "git status"),
+        "Git reads the clone's status"
+    );
+
+    // The clone loses its repository, and the repository around it names the clone's tree as its
+    // own working tree.
+    std::fs::remove_dir_all(tree.join(".git")).expect("the clone loses its repository");
+    support::git_raw(
+        &around,
+        [
+            std::ffi::OsStr::new("config"),
+            std::ffi::OsStr::new("core.worktree"),
+            named.as_os_str(),
+        ],
+    );
+    let held = measured(&fixture, workspace_id, 108);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        !git_ran_in(&started, &named, "git status"),
+        "no status was taken of the repository around the clone"
     );
 }
 
@@ -1077,7 +1153,8 @@ fn a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers() {
     );
 }
 
-/// Registers `whole/below`, a directory inside a checkout, and returns the checkout.
+/// Registers `below`, a directory inside a new checkout called `name`, and returns the checkout
+/// and the repository.
 ///
 /// Registering a directory below the top level of a repository records the top level's identity
 /// with the path of the directory below it.
@@ -1250,7 +1327,7 @@ fn a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it() 
 
 /// A repository inside the directory a repository was registered through is not read as the
 /// registered one: Git reports it as the top level, it is not the recorded tree, and its
-/// configuration is not read.
+/// configuration is not audited.
 #[cfg(unix)]
 #[test]
 fn a_repository_inside_a_registered_subdirectory_is_not_read_as_the_registered_one() {
@@ -1270,7 +1347,7 @@ fn a_repository_inside_a_registered_subdirectory_is_not_read_as_the_registered_o
     );
     assert!(
         git_ran_in(&started, &top_of(&top), "git config"),
-        "the configuration of the recorded tree is read"
+        "the configuration of the recorded tree is audited"
     );
 
     // Another repository is made where the registered directory is: Git reports it as the top level.
@@ -1284,7 +1361,7 @@ fn a_repository_inside_a_registered_subdirectory_is_not_read_as_the_registered_o
     );
     assert!(
         !git_ran_in(&started, &below, "git config"),
-        "the configuration of the repository that is not the recorded tree is not read"
+        "the configuration of the repository that is not the recorded tree is not audited"
     );
 }
 
@@ -1309,8 +1386,9 @@ fn a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it() {
             let mut fixture = Fixture::create();
             let started = watching_git(&mut fixture);
             let (top, project) = registered_through_a_subdirectory(&fixture, "mounted-whole", 92);
-            // Two workspaces of it: reading one ends it, so the control and the mounted case each
-            // have their own.
+            // Two workspaces of it, one for the control and one for the mounted case: a shared
+            // workspace whose tree holds work is read the same way each time, and the second one
+            // keeps the cases apart.
             let read = shared_workspace(&fixture, project, 93);
             let mounted = shared_workspace(&fixture, project, 94);
             let below = top.join("below");

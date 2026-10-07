@@ -110,8 +110,9 @@ fn a_staging_directory_that_is_gone_is_not_made_again_while_the_journal_names_it
     let staging = StagingArea::root_of(&host.environment()).join(&name);
     std::fs::remove_dir_all(&staging).expect("the staging directory is removed");
 
-    TransferService::open(&host.environment())
+    let refusal = TransferService::open(&host.environment())
         .expect_err("a name that holds nothing is not the recorded staging directory");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     assert!(
         std::fs::symlink_metadata(&staging).is_err(),
         "no directory was made at the name"
