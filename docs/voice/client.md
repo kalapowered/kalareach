@@ -99,22 +99,22 @@ plainly, with the statement that **unheard speech never authorises an action** (
   started or has failed.
 - `idle`: No call has been permitted, the call has ended, or its deadline has passed.
 
-What the screen shows and whether the microphone carries speech come from the same gate, so the two
-cannot disagree. The gate keeps the recent intervals in which capture was on, and answers for the
-past only: an instant later than the moment it is asked at, or older than the oldest interval it
-kept, is treated as unheard. That record is what a claim that something was said would be checked
-against (KR-ACC-014). The screen does not check a delegation against it: delegations reach the
-screen from the host, not from the provider's channel.
+On the phones, what a call displays and whether its microphone carries speech come from the same
+gate, so the two cannot disagree. The gate keeps the recent intervals in which capture was on, and
+answers for the past only: an instant later than the moment it is asked at, or older than the oldest
+interval it kept, is treated as unheard. That record is what a claim that something was said would
+be checked against (KR-ACC-014). The screen does not check a delegation against it: delegations
+reach the screen from the host, not from the provider's channel.
 
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
 
 ## Context requests and admission
 
-The client library's `VoiceContextFrame` (`crates/kr-client/src/services/voice.rs`) holds every
-context request to the managed service's bounds: an append over `VOICE_CONTEXT_BYTES` (500) is
-refused before it would be sent rather than truncated. Reading what the host selected for a call is
-a read from the host, and the screen shows it as the host's selection.
+`VoiceContextFrame::new` (`crates/kr-client/src/services/voice.rs`) refuses an append over
+`VOICE_CONTEXT_BYTES` (500) rather than truncating it. No code in the companion application builds
+a context request. Reading what the host selected for a call is a read from the host, and the
+screen shows it as the host's selection.
 
 A delegation the host admits without performing it is shown as **admission**, never as execution
 (KR-REQ-15.17), with the host's note that admission is not evidence anything ran. Host action
@@ -122,13 +122,16 @@ receipts remain the sole authority for what ran on a host.
 
 ## Local survival when the broker fails
 
-Muting the microphone, silencing the model's voice ("Stop the voice"), and hanging up the call are
-strictly local operations. They act directly on the native media pipeline and do not depend on the
-broker or the network.
+Muting the microphone, silencing the model's voice ("Stop the voice") and hanging up a call are
+local operations of the call's own native media pipeline, and they depend on neither the broker nor
+the network. The companion application's own process holds no call: its mute commands refuse with
+"this device is not holding a voice call", and its stop command asks the host and reports that
+nothing was closed locally.
 
-Whether the voice service is answering is the call's own report about its control channel. When a
-call reports the service unreachable, the screen says so, and muting the microphone, silencing the
-voice and ending the session stay available, as do the requests that go to the host.
+The call's own report about its control channel (`none`, `connected` or `unreachable`) is the only
+source of whether the voice service is answering, and this application reports `none`. When a call
+reports the service unreachable, the screen says so, and muting the microphone, silencing the voice
+and ending the session stay available, as do the requests that go to the host.
 
 ## Speech interruption vs task cancellation
 

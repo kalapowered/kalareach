@@ -8,7 +8,7 @@ use serde::Serialize;
 /// The screen reads it from the device rather than from any service, so it stays true when nothing
 /// can be reached. Section 15 ¶10 keeps local mute and closure working when the broker fails, and
 /// a screen told about its own microphone by a service would lose that at the moment it matters.
-/// This process holds no call, so it only ever reports [`NO_CALL`].
+/// This process holds no call, so it only ever reports a device holding none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct VoiceCallState {
     /// Whether this device is holding a call at all.
