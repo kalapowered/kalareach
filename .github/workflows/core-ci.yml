@@ -1625,7 +1625,7 @@ jobs:
       # step and deleted after it: internal rather than removable, and another filesystem from
       # /private/tmp.
       - name: The cases that need another filesystem
-        if: ${{ success() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 15
         run: |
           set -euo pipefail

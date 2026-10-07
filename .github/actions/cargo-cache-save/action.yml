@@ -3,8 +3,8 @@ description: >-
   Saves what `cargo-cache-restore` restores, from a run on the default branch that did not find a
   cache of exactly its dependencies. Every other run leaves the caches alone: the repository's
   caches hold ten gigabytes in all, and a cache saved from any other branch is used by that branch
-  alone and takes the room of one every branch uses. Run it as the last step of the job, without a
-  condition of its own, so that a job that failed saves nothing: a build that stopped half way
+  alone and takes the room of one every branch uses. Run it as the last step of the job, under no
+  condition but `success()`, so that a job that failed saves nothing: a build that stopped half way
   would be saved under the key of a complete one and found there by every later run.
 
 inputs:

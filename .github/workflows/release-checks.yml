@@ -82,7 +82,6 @@ jobs:
           paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-            ~/.cargo/git/db
 
       - name: Test the graph check
         run: python3 scripts/check-mobile-graph.py self-test
@@ -98,4 +97,3 @@ jobs:
           paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-            ~/.cargo/git/db

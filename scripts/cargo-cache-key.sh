@@ -6,9 +6,9 @@
 #
 # One line, `<settings>-<week>-<dependencies>`, each part sixteen hex digits or an ISO week.
 #
-# settings   The toolchain and the build settings of `.cargo/config.toml`, comments left out: a
-#            crate built with other settings is not the crate a cache holds, and an edit to a
-#            comment changes none.
+# settings   The toolchain, the build settings of `.cargo/config.toml` and the `[profile]` tables of
+#            the workspace's `Cargo.toml`, comments left out: a crate built with other settings is
+#            not the crate a cache holds, and an edit to a comment changes none.
 # week       The ISO week, so that what a cache holds is rebuilt from nothing at least weekly. A
 #            cache that is restored and saved again only grows: Cargo never removes a unit that no
 #            build asks for, and a feature a manifest turns on changes no line of Cargo.lock.
@@ -33,7 +33,10 @@ else
     digest() { shasum -a 256 | cut -c1-16; }
 fi
 
-settings="$(grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/config.toml | digest)"
+settings="$({
+    grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/config.toml
+    awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } keep && !/^[[:space:]]*(#|$)/' Cargo.toml
+} | digest)"
 week="$(date -u +%G-W%V)"
 dependencies="$(awk 'BEGIN { RS = ""; ORS = "\n\n" } /\nsource = / { print }' Cargo.lock | digest)"
 

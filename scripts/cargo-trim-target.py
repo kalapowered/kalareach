@@ -18,9 +18,10 @@ from a path relative to the workspace.
 
 Every directory below the target directory that holds `deps` is a profile's (`debug`, `release`,
 and the same inside a directory named for a target triple). In each, a unit is a name and a
-16-digit hash, and its files, its fingerprint directory and its build directories carry both.
-What cannot be told is left alone, which costs a build and never a wrong result. A file that
-cannot be removed is reported and left.
+16-digit hash, and its files, its fingerprint directory and its build directories carry both;
+the few files of a workspace package that carry no hash (a dynamic or static library, a program
+on Windows) are found by the package's name. What cannot be told is left alone, which costs a
+build and never a wrong result. A file that cannot be removed is reported and left.
 """
 import os
 import re
@@ -67,11 +68,20 @@ def trim_profile(profile):
         if name.endswith(".d") and not THIRD_PARTY.search(read(os.path.join(deps, name))):
             units.add(name[: -len(".d")])
     hashes = {unit.rsplit("-", 1)[1] for unit in units if HASH.search(unit)}
+    crates = {unit.rsplit("-", 1)[0] for unit in units}
 
     removed = 0
     for name in os.listdir(deps):
         found = HASH.search(name)
         if not found:
+            # A workspace package's dynamic and static libraries, and on Windows its programs and
+            # their debug databases, carry no hash. No third-party crate builds such a file.
+            stem = name.split(".", 1)[0]
+            if stem.startswith("lib") and stem[3:] in crates:
+                stem = stem[3:]
+            if stem in crates:
+                remove(os.path.join(deps, name))
+                removed += 1
             continue
         head = name[: found.end()]
         # A library's files are `lib<unit>.rlib` and `lib<unit>.rmeta`; its dependency file is `<unit>.d`.
