@@ -181,6 +181,10 @@ enum Ended {
 /// invitation by more than one recheck. An invitation that ended by itself, or that the pairing
 /// service let go without ending, has its locator released here; one the owner ended is released
 /// by the owner's own call.
+///
+/// A relay that runs to its end keeps its weak hold on the host until it has asked the room to
+/// release the locator, when the release is its own, so a hold that has gone says that nothing
+/// more is to be asked.
 pub async fn serve_room<H: RoomHost>(
     host: Weak<H>,
     service: Arc<dyn Rendezvous>,

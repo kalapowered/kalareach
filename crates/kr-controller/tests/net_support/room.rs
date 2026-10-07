@@ -58,7 +58,8 @@ pub struct TestRoom {
     rooms: Arc<Mutex<Rooms>>,
     /// True while the room holds back what hosts send, as a slow service does.
     held: Arc<tokio::sync::watch::Sender<bool>>,
-    /// Woken each time a host attaches to a record and each time a record is released.
+    /// Woken each time a host attaches to a record, each time a record is released and each time
+    /// the room takes a frame from a host to hold it back.
     hosting: Arc<tokio::sync::Notify>,
 }
 
@@ -78,6 +79,8 @@ struct Rooms {
     released: Vec<String>,
     release_requests: Vec<String>,
     unreachable: bool,
+    /// How many frames the room has taken from a host and held back since it last began to.
+    withheld: usize,
 }
 
 #[derive(Debug)]
@@ -107,6 +110,9 @@ impl TestRoom {
     /// A control request is not held, which is how a release could overtake frames a host sent
     /// before it if the host did not wait for the room to acknowledge them.
     pub fn hold_hosts(&self, held: bool) {
+        if held {
+            self.rooms().withheld = 0;
+        }
         self.held.send_replace(held);
     }
 
@@ -173,6 +179,63 @@ impl TestRoom {
         assert!(
             waited.is_ok(),
             "no host attached to the room of {locator} within {HOSTING_DEADLINE:?}"
+        );
+    }
+
+    /// Waits until the host attached to `locator` has handed the room a frame that the room holds
+    /// back, and waits on the room for what it sent.
+    ///
+    /// A host that has sent its last frames and waits for the room to confirm them reads whatever
+    /// the room sends it, and a host that does not wait leaves its socket. So a frame the room sends
+    /// after the one it holds is read only by a host that is still there and waiting, and this
+    /// returns once it has been read: a host that ended an invitation has nothing left to do before
+    /// it releases the locator but wait for the room, so the release has not been asked for and
+    /// cannot be until the room speaks or the host's own limit on that wait
+    /// (`rendezvous::CLOSE_ACKNOWLEDGEMENT`) runs out. The count of held frames is the room's, not
+    /// the locator's: it is for a room with one host held back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host leaves its socket or releases the locator first, and when nothing is
+    /// held back or read within [`HOSTING_DEADLINE`].
+    pub async fn until_host_waits(&self, locator: &str) {
+        const LEFT: &str = "the host left its socket without waiting for the room";
+        let waited = tokio::time::timeout(HOSTING_DEADLINE, async {
+            loop {
+                // Asked to be woken before the count is read, so a frame taken in between is not
+                // missed.
+                let changed = self.hosting.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.rooms().withheld > 0 {
+                    break;
+                }
+                changed.await;
+            }
+            let (host, probe) = {
+                let rooms = self.rooms();
+                let record = rooms.records.get(locator).expect(LEFT);
+                (
+                    record.host.clone().expect(LEFT),
+                    ServiceFrame::Attached {
+                        invitation_id: record.invitation_id,
+                        expires_at_ms: record.expires_at_ms,
+                    },
+                )
+            };
+            // A frame a host that waits ignores, sent behind everything the room has sent it. The
+            // socket holds DEPTH frames, so all of its places are free again once the host has read
+            // the probe.
+            assert!(host.send(probe).await.is_ok(), "{LEFT}");
+            tokio::select! {
+                read = host.reserve_many(DEPTH) => assert!(read.is_ok(), "{LEFT}"),
+                () = host.closed() => panic!("{LEFT}"),
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "the host of {locator} was not waiting on the room within {HOSTING_DEADLINE:?}"
         );
     }
 
@@ -262,6 +325,11 @@ impl TestRoom {
     async fn carry_host(&self, locator: &str, from_host: &mut mpsc::Receiver<ClientFrame>) {
         let mut held = self.held.subscribe();
         while let Some(frame) = from_host.recv().await {
+            let holding = *held.borrow();
+            if holding {
+                self.rooms().withheld += 1;
+                self.hosting.notify_waiters();
+            }
             if held.wait_for(|held| !*held).await.is_err() {
                 return;
             }

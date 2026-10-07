@@ -8,7 +8,8 @@
 
 mod net_support;
 
-use kr_controller::service::net::rendezvous;
+use std::sync::Arc;
+
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_protocol::confirmation::ConfirmationSubject;
@@ -36,6 +37,22 @@ fn keys() -> DeviceKeys {
 
 fn viewer() -> ProposedGrant {
     proposal(&[ActionRight::SessionView])
+}
+
+/// Waits until the room relay of the invitation this host offered since `idle` was read has
+/// ended.
+///
+/// A relay holds the pairing service weakly for as long as it runs, and it asks the room for the
+/// release, when the release is its own, before it ends. So once it has ended, what it asked the
+/// room for is all it will ask. A wait that never ends fails the test, and measures nothing.
+async fn until_relay_ended(host: &Host, idle: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while Arc::weak_count(host.network().pairing()) > idle {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the invitation's relay ends");
 }
 
 /// Issues a code invitation at this host's default origin, once `signer` has confirmed it.
@@ -421,8 +438,12 @@ async fn the_last_answer_reaches_its_candidate_before_the_locator_is_released() 
 
     host.room.hold_hosts(true);
     let room = host.room.clone();
+    let locator = code[..4].to_owned();
     let (answer, ()) = tokio::join!(last.confirm(), async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The host has sent its last answer and the close of the attempt, which the room holds
+        // back, and waits on the room for what it sent: this is when a host that released the
+        // locator without waiting would have done so.
+        room.until_host_waits(&locator).await;
         assert!(
             room.released().is_empty(),
             "the release waits for the room to confirm the last attempt closed"
@@ -504,6 +525,7 @@ async fn a_withdrawn_code_invitation_releases_its_locator() {
     let host = Host::start(&owner_keys).await;
     let environment = host.environment_id;
     let mut client = host.client().await;
+    let idle = Arc::weak_count(host.network().pairing());
     let invited = invite_code(
         environment,
         &mut client,
@@ -534,7 +556,7 @@ async fn a_withdrawn_code_invitation_releases_its_locator() {
         "the room ended the candidate with the record"
     );
     // The withdrawal took the release, and the relay leaves it to the withdrawal.
-    tokio::time::sleep(rendezvous::EXPIRY_RECHECK * 2).await;
+    until_relay_ended(&host, idle).await;
     assert_eq!(host.room.release_requests(), vec![code[..4].to_owned()]);
     host.stop().await;
 }
