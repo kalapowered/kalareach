@@ -972,8 +972,8 @@ pub use crate::windows::conpty::OutputWaiter;
 /// program that takes its command line apart itself can read it otherwise. A program built on
 /// MSYS2, such as the `sh.exe` Git for Windows installs, reads a pair of backslashes inside quotes
 /// as one backslash unless a quotation mark follows, so an argument that is quoted and holds `\\`
-/// reaches it with one where two were given. An argument that is not quoted, and one whose
-/// backslashes come before a quotation mark or before the closing quote, is read the same by both.
+/// reaches it with one where two were given. The backslashes of an argument that is not quoted, and
+/// those that come before a quotation mark or before the closing quote, are read the same by both.
 /// A script for such a shell therefore writes a backslash it needs as the octal escape `\134`.
 ///
 /// It lives here rather than beside the console it is for, so that it can be tested on a machine
