@@ -52,9 +52,9 @@
 //!   sets one, so putting a terminal back into it would mean drawing that cell through whatever
 //!   pen, character set, margin and origin the restoration has installed. The cost is one
 //!   character: the next one the application prints lands beside the last column instead of
-//!   wrapping to the next row. A saved cursor's pending wrap is lost the same way, and it is lost
-//!   on the terminals measured whatever a restoration does: they give a restored cursor no
-//!   pending wrap. The cost is the same character, the first one printed after the restore.
+//!   wrapping to the next row. A saved cursor's pending wrap is not set either, and the terminals
+//!   measured give a restored cursor no pending wrap whatever a restoration does. The cost is the
+//!   same character, the first one printed after the restore.
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
@@ -715,10 +715,9 @@ impl Writer {
             self.carried.other_saved_cursors += 1;
             return;
         };
-        // What can be installed is installed below. A wrap the cursor was saved with is not one of
-        // those things: setting it takes a character printed into the last column, drawn through
-        // the pen, sets and origin this save is putting in force, and the terminals measured give a
-        // restored cursor no wrap in any case.
+        // What can be installed is installed below. A wrap the cursor was saved with is not: this
+        // restoration sets none, and the terminals measured give a restored cursor no wrap in any
+        // case.
         if cursor.pending_wrap {
             self.carried.pending_wrap = true;
         }
@@ -778,11 +777,8 @@ impl Writer {
         self.csi(&style);
         let placed = match (self.line_of_row(cursor.row), self.column_of(cursor.col)) {
             (Some(line), Some(column)) => {
-                // A pending wrap cannot be addressed: every cursor movement clears it. What sets it
-                // is printing into the last column, so the cursor's own row is drawn again and the
-                // cursor is left where that drawing ended.
                 // A pending wrap is not reproducible here. Every cursor movement clears one, and
-                // the only thing that sets one is printing into the last column — which would have
+                // the only thing that sets one is printing into the last column, which would have
                 // to happen after the pen, the character sets, the margins and the origin were
                 // installed, and would then draw that cell through all of them. Drawing it before
                 // they are installed does not work either, because installing the margins and the
