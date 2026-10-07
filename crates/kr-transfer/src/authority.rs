@@ -3090,7 +3090,7 @@ mod tests {
 
     #[test]
     fn a_descendant_opens_and_revalidates_through_its_handle() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(root.path().join("payload.bin"), b"hello").expect("writes");
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
@@ -3111,7 +3111,7 @@ mod tests {
 
     #[test]
     fn a_handle_refuses_another_environment() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         authority
@@ -3131,8 +3131,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symbolic_link_that_leaves_the_directory_is_refused() {
-        let root = tempfile::tempdir().expect("a temporary directory");
-        let outside = tempfile::tempdir().expect("a second temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let outside = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(outside.path().join("secret"), b"not yours").expect("writes");
         std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("link"))
             .expect("links");
@@ -3152,7 +3152,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symbolic_link_that_stays_inside_the_directory_is_refused_too() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(root.path().join("payload.bin"), b"hello").expect("writes");
         std::os::unix::fs::symlink("payload.bin", root.path().join("alias")).expect("links");
         let authority =
@@ -3171,7 +3171,7 @@ mod tests {
     fn a_created_payload_file_is_owner_only_and_not_executable() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         authority.create_new(&name("payload.bin")).expect("creates");
@@ -3186,7 +3186,7 @@ mod tests {
 
     #[test]
     fn an_exclusive_create_refuses_an_existing_name() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(root.path().join("payload.bin"), b"already here").expect("writes");
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
@@ -3200,8 +3200,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exclusive_create_never_follows_a_link_to_a_file_outside() {
-        let root = tempfile::tempdir().expect("a temporary directory");
-        let outside = tempfile::tempdir().expect("a second temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let outside = kr_ipc::testing::PrivateTempDir::create();
         let target = outside.path().join("victim");
         std::fs::write(&target, b"untouched").expect("writes");
         std::os::unix::fs::symlink(&target, root.path().join("payload.bin")).expect("links");
@@ -3214,7 +3214,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_payload_file_with_a_second_name_is_refused() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(root.path().join("payload.bin"), b"hello").expect("writes");
         std::fs::hard_link(
             root.path().join("payload.bin"),
@@ -3236,7 +3236,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_named_pipe_is_not_a_regular_file_and_does_not_hold_the_open() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let path = root.path().join("payload.bin");
         let status = std::process::Command::new("mkfifo")
             .arg(&path)
@@ -3253,7 +3253,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_not_a_file() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::create_dir(root.path().join("inner")).expect("creates");
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
@@ -3265,7 +3265,7 @@ mod tests {
 
     #[test]
     fn a_reopened_scope_at_a_replaced_path_is_refused() {
-        let parent = tempfile::tempdir().expect("a temporary directory");
+        let parent = kr_ipc::testing::PrivateTempDir::create();
         let original = parent.path().join("scope");
         std::fs::create_dir(&original).expect("creates");
         let first =
@@ -3290,7 +3290,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_under_another_device_number_is_the_recorded_one_by_its_inode() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         let found = authority.identity();
@@ -3333,7 +3333,7 @@ mod tests {
     fn the_directory_above_gives_its_device_without_being_readable() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let above = tempfile::tempdir().expect("a temporary directory");
+        let above = kr_ipc::testing::PrivateTempDir::create();
         let root = above.path().join("scope");
         std::fs::create_dir(&root).expect("creates the root");
         let authority =
@@ -3383,7 +3383,7 @@ mod tests {
 
     #[test]
     fn a_subdirectory_is_created_once_and_opened_thereafter() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         // A tree is created one level at a time, each against the authority the level above
@@ -3405,7 +3405,7 @@ mod tests {
 
     #[test]
     fn a_created_directory_names_one_entry() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
 
@@ -3421,7 +3421,7 @@ mod tests {
     fn a_created_subdirectory_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         authority
@@ -3437,7 +3437,7 @@ mod tests {
 
     #[test]
     fn a_rename_between_authorities_moves_the_object_it_opened() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         let incomplete = authority
@@ -3480,7 +3480,7 @@ mod tests {
 
     #[test]
     fn removing_an_absent_name_succeeds() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         authority.remove(&name("never-there")).expect("succeeds");
@@ -3488,7 +3488,7 @@ mod tests {
 
     #[test]
     fn a_grant_path_is_built_from_the_authority_not_from_the_caller() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         let path = authority.host_path(&name("complete/payload.bin"));
@@ -3525,7 +3525,7 @@ mod tests {
     /// and takes the directory away once it is empty.
     #[test]
     fn an_empty_directory_removal_leaves_whatever_was_put_inside() {
-        let root = tempfile::tempdir().expect("a temporary directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::create_dir(root.path().join("made")).expect("a directory");
         std::fs::write(root.path().join("made/theirs"), b"theirs\n").expect("somebody's file");
         let authority =

@@ -126,7 +126,7 @@ fn every_name_in_the_fixture_is_decided_as_the_fixture_says() {
 #[test]
 fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     let fixture = fixture();
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let inside = root.path().join("authorised");
     let outside = root.path().join("outside");
     std::fs::create_dir_all(&inside).expect("creates the authorised tree");
@@ -206,7 +206,7 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
 /// KR-REQ-14.05: a component replaced with a link between two lookups is refused at the second.
 #[test]
 fn a_component_replaced_with_a_link_is_refused_at_the_next_lookup() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let inside = root.path().join("authorised");
     let outside = root.path().join("outside");
     std::fs::create_dir_all(inside.join("src")).expect("creates the authorised tree");
@@ -238,7 +238,7 @@ fn a_component_replaced_with_a_link_is_refused_at_the_next_lookup() {
 /// path afterwards, and a scope reopened at a replaced path is refused.
 #[test]
 fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let original = root.path().join("project");
     std::fs::create_dir(&original).expect("creates the tree");
     std::fs::write(original.join("notes.txt"), b"the recorded tree").expect("writes a file");
@@ -302,7 +302,7 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
 fn a_name_is_not_reported_durable_while_its_directory_cannot_be_flushed() {
     use kr_flush::NameKind;
 
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
     let name = RelativeName::parse("made").expect("a valid relative name");
@@ -360,7 +360,7 @@ fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
 #[cfg(windows)]
 #[test]
 fn a_file_held_while_it_is_published_ends_with_its_one_name() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::write(root.path().join("staged.part"), b"published").expect("stages the file");
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
@@ -410,7 +410,7 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
 #[cfg(windows)]
 #[test]
 fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let destination = root.path().join("notes.txt");
     let staged = root.path().join("staged.part");
     std::fs::write(&destination, b"what the check read").expect("the destination");
@@ -483,7 +483,7 @@ fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
 #[cfg(windows)]
 #[test]
 fn a_first_publication_never_replaces_a_file_that_took_the_name() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::create_dir_all(root.path().join("tree/objects")).expect("a staged tree");
     std::fs::write(root.path().join("tree/objects/pack"), b"staged").expect("a file in it");
     std::fs::write(root.path().join("published"), b"somebody's file").expect("the name is taken");
@@ -533,7 +533,7 @@ fn read_through(authority: &AuthorisedDirectory, name: &RelativeName) -> String 
 /// it.
 #[test]
 fn a_directory_moved_out_of_the_tree_takes_the_rest_of_the_lookup_with_it() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let inside = root.path().join("authorised");
     let outside = root.path().join("outside");
     std::fs::create_dir_all(inside.join("src")).expect("creates the authorised tree");
@@ -565,7 +565,7 @@ fn a_directory_moved_out_of_the_tree_takes_the_rest_of_the_lookup_with_it() {
 /// KR-REQ-14.05: a rename refuses two authorities that belong to different environments.
 #[test]
 fn a_rename_refuses_two_environments() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let from = root.path().join("one");
     let to = root.path().join("two");
     std::fs::create_dir_all(&from).expect("creates a tree");
@@ -597,7 +597,7 @@ fn a_rename_refuses_two_environments() {
 /// KR-REQ-14.05: a handle from one environment is never accepted by another.
 #[test]
 fn a_handle_from_one_environment_is_never_accepted_by_another() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::write(root.path().join("notes.txt"), b"inside").expect("writes a file");
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
@@ -723,7 +723,7 @@ fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), Strin
 fn a_component_swapped_under_running_lookups_never_resolves_outside() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let inside = root.path().join("authorised");
     let outside = root.path().join("outside");
     std::fs::create_dir_all(inside.join("src")).expect("creates the authorised tree");
@@ -813,7 +813,7 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
 /// no mode says, and a caller that replaces it would.
 #[test]
 fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("ordinary.txt").expect("a name");
@@ -1127,7 +1127,7 @@ fn give_an_access_control_list(
 /// after this one is the other half: a name on another mount does not resolve.
 #[test]
 fn a_name_that_resolves_within_one_mount_is_opened() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::create_dir_all(root.path().join("src/inner")).expect("creates the tree");
     std::fs::write(root.path().join("src/inner/notes.txt"), b"inside").expect("writes a file");
     let authority = AuthorisedDirectory::open_root(environment(), root.path())
@@ -1279,7 +1279,7 @@ const NOT_EXERCISED: i32 = 42;
 fn mount_race() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::create_dir_all(root.path().join("history")).expect("the tree's own directory");
     std::fs::write(root.path().join("history/main"), b"inside").expect("the tree's own file");
     std::fs::create_dir_all(root.path().join("elsewhere")).expect("the covering tree");
@@ -1384,7 +1384,7 @@ fn mount_race() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_macos_access_control_list_preserves_acl_level_flags() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("flagged.txt").expect("a name");
@@ -1526,7 +1526,7 @@ fn a_list_of_no_entries_that_carries_a_flag_is_protection_beyond_the_mode_bits()
 fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
     use std::os::unix::fs::MetadataExt as _;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("owned.txt").expect("a name");
@@ -1579,7 +1579,7 @@ fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
 #[cfg(windows)]
 #[test]
 fn a_file_says_through_its_own_handle_which_account_it_belongs_to() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("owned.txt").expect("a name");
@@ -1649,7 +1649,7 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
     /// An entry that denies.
     const DENY: u8 = 1;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
 
@@ -1805,7 +1805,7 @@ fn a_copy_is_staged_where_the_directory_grants_no_authority_over_protection() {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsHandle as _;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let restricted = root.path().join("restricted");
     std::fs::create_dir(&restricted).expect("a directory to stage in");
     let authority =
@@ -1887,7 +1887,7 @@ fn outcome_of(outcome: std::io::Result<()>) -> String {
 #[cfg(windows)]
 #[test]
 fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
 
@@ -1967,8 +1967,8 @@ fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
 fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let root = tempfile::tempdir().expect("a directory");
-    let outside = tempfile::tempdir().expect("a directory outside the authority");
+    let root = kr_ipc::testing::PrivateTempDir::create();
+    let outside = kr_ipc::testing::PrivateTempDir::create();
     std::fs::create_dir(outside.path().join("kept")).expect("a directory outside");
     std::fs::write(outside.path().join("kept/notes.txt"), b"outside\n").expect("a file outside");
     let tree = root.path().join("tree");
@@ -2021,7 +2021,7 @@ fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes(
 fn remove_tree_refuses_a_replacement_and_reports_partial() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("tree").expect("a name");
@@ -2321,7 +2321,7 @@ fn removal_answers_ok_only_once_the_directory_it_emptied_is_gone_on(root: &std::
 #[cfg(unix)]
 #[test]
 fn a_removal_answers_ok_only_once_the_directory_it_emptied_is_gone() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     removal_answers_ok_only_once_the_directory_it_emptied_is_gone_on(root.path());
 }
 
@@ -2334,7 +2334,7 @@ fn a_removal_answers_ok_only_once_the_directory_it_emptied_is_gone() {
 #[test]
 fn a_removal_is_decided_by_the_listing_on_hfs_and_fat_volumes() {
     for (filesystem, size) in [("HFS+", "8m"), ("MS-DOS", "4m")] {
-        let root = tempfile::tempdir().expect("a directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let image = root.path().join("volume.dmg");
         let volume = root.path().join("volume");
         std::fs::create_dir(&volume).expect("a mount point");
@@ -2389,7 +2389,7 @@ fn a_removal_is_decided_by_the_listing_on_hfs_and_fat_volumes() {
 fn a_removal_deeper_than_its_bound_stops_at_the_bound() {
     use kr_transfer::authority::MAX_REMOVAL_DEPTH;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let mut deepest = root.path().join("tree");
     for _ in 0..MAX_REMOVAL_DEPTH {
         deepest.push("d");
@@ -2436,7 +2436,7 @@ fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
     use kr_transfer::Privacy;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     for (name, mode, admitted) in [
@@ -2551,7 +2551,7 @@ fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
 /// The half that runs inside the mount namespace.
 #[cfg(target_os = "linux")]
 fn removal_mount() {
-    let root = tempfile::tempdir().expect("a temporary directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     std::fs::create_dir_all(root.path().join("tree/graft")).expect("the tree");
     std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
     std::fs::create_dir(root.path().join("elsewhere")).expect("another tree");
@@ -2606,7 +2606,7 @@ fn removal_mount() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let graft = root.path().join("tree/graft");
     std::fs::create_dir_all(&graft).expect("the tree");
     std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
@@ -2680,7 +2680,7 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
 fn a_removal_on_a_filesystem_that_lists_a_removed_directory_answers_by_where_it_is() {
     use kr_transfer::authority::testing::{RemovalStep, at_removal_step};
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let image = root.path().join("exfat.dmg");
     let volume = root.path().join("volume");
     std::fs::create_dir(&volume).expect("a mount point");
@@ -3313,7 +3313,7 @@ fn the_processes_serving_an_image_are_named_from_hdiutil_info() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_disk_image_that_does_not_detach_is_reported_by_name() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let nothing = root.path().join("nothing-attached");
     std::fs::create_dir(&nothing).expect("a mount point");
     let image = root.path().join("never-attached.dmg");
@@ -3335,7 +3335,7 @@ fn a_disk_image_that_does_not_detach_is_reported_by_name() {
 #[test]
 #[should_panic(expected = "did not detach")]
 fn a_guard_dropped_before_its_image_detaches_fails_with_the_report() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let nothing = root.path().join("nothing-attached");
     std::fs::create_dir(&nothing).expect("a mount point");
     drop(Attached {
@@ -3487,7 +3487,7 @@ const NO_PAUSE: std::time::Duration = std::time::Duration::ZERO;
 #[cfg(target_os = "macos")]
 #[test]
 fn a_creation_refused_for_a_moment_is_made_again_once_what_it_left_is_released() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3522,7 +3522,7 @@ fn a_creation_refused_for_a_moment_is_made_again_once_what_it_left_is_released()
 #[cfg(target_os = "macos")]
 #[test]
 fn a_detach_refused_for_a_moment_is_asked_again_before_the_creation_is() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3558,7 +3558,7 @@ fn a_detach_refused_for_a_moment_is_asked_again_before_the_creation_is() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_creation_refused_every_time_fails_after_its_bound() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3590,7 +3590,7 @@ fn a_creation_refused_every_time_fails_after_its_bound() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_creation_refused_for_any_other_reason_is_asked_once() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3623,7 +3623,7 @@ fn a_creation_that_fails_releases_what_the_last_refusal_left() {
         ("Resource busy", 1, "2 of 2 attempts"),
         ("Operation not permitted", 3, "1 of 4 attempts"),
     ] {
-        let root = tempfile::tempdir().expect("a directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let stand_in = StandIn::new(
             root.path(),
             &Behaviour {
@@ -3691,7 +3691,7 @@ fn a_refusal_whose_attachment_does_not_detach_fails_the_creation() {
             3,
         ),
     ] {
-        let root = tempfile::tempdir().expect("a directory");
+        let root = kr_ipc::testing::PrivateTempDir::create();
         let stand_in = StandIn::new(root.path(), &behaviour);
         let image = stand_in.directory.join("elsewhere.dmg");
         let why = make_image_with(
@@ -3728,7 +3728,7 @@ fn a_refusal_whose_attachment_does_not_detach_fails_the_creation() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_tool_that_cannot_list_what_is_attached_is_not_taken_to_list_nothing() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3763,7 +3763,7 @@ fn a_creation_does_not_wait_for_a_process_that_holds_the_tools_output() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let stand_in = StandIn::new(
         root.path(),
         &Behaviour {
@@ -3835,7 +3835,7 @@ fn a_creation_does_not_wait_for_a_process_that_holds_the_tools_output() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_host_that_cannot_make_an_image_still_fails() {
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let why = make_image(
         &root.path().join("not-there/elsewhere.dmg"),
         "1m",
@@ -3894,7 +3894,7 @@ fn the_devices_of_an_image_are_read_from_hdiutil_info() {
 fn a_new_directory_is_made_only_where_nothing_was() {
     use kr_transfer::Privacy;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
 
@@ -3942,7 +3942,7 @@ fn a_new_directory_that_inherited_a_list_is_kept_whenever_anything_was_put_insid
     use kr_transfer::Privacy;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let listed = root.path().join("listed");
@@ -4030,7 +4030,7 @@ fn a_directory_put_over_a_new_one_before_it_is_opened_is_never_adopted_with_anyt
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let root = tempfile::tempdir().expect("a directory");
+    let root = kr_ipc::testing::PrivateTempDir::create();
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
