@@ -382,8 +382,7 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, LogAccess, MAX_LAUNCH_FRAME,
     NamedLock, PeerProcess, Reached, StartedChild, account_sid, connect, current_session,
-    current_user_sid, disconnect_pipe, in_any_job, open_log, pipe_client_is_this_user,
-    process_facts, start_child,
+    current_user_sid, in_any_job, open_log, pipe_client_is_this_user, process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -400,9 +399,8 @@ pub use self::windows::{Job, end_process};
 mod windows {
     #![expect(
         unsafe_code,
-        reason = "the launch pipe, the end of a pipe a closing connection gives up, a process's \
-                  facts and a suspended child are kernel32 and advapi32 calls, which have no safe \
-                  interface"
+        reason = "the launch pipe, a process's facts and a suspended child are kernel32 and advapi32 \
+                  calls, which have no safe interface"
     )]
 
     use std::io;
@@ -434,7 +432,7 @@ mod windows {
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
         GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         WaitNamedPipeW,
@@ -1913,20 +1911,6 @@ mod windows {
             // `_guard` drops here, restoring this thread, before the result is unwrapped below.
         }?;
         client.same_user_as(&own)
-    }
-
-    /// Disconnects the accepting end of a pipe from its caller.
-    ///
-    /// What the caller has not read is discarded and the caller's next use of the connection fails
-    /// as a broken pipe. Anything blocked on the pipe, such as a flush that waits for the caller to
-    /// read, returns. A pipe that is already disconnected, or a handle that is not an accepting end,
-    /// is left as it is: the connection is closed after this either way.
-    pub fn disconnect_pipe(pipe: BorrowedHandle<'_>) {
-        // SAFETY: the handle is borrowed for the whole call, and the call reads nothing of this
-        // process's memory.
-        unsafe {
-            DisconnectNamedPipe(pipe.as_raw_handle());
-        }
     }
 
     /// A security descriptor parsed from its text form, freed when it goes.
