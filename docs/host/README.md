@@ -1207,16 +1207,18 @@ these but the right-hand side of a row is not handed the stream afterwards. Its 
 a projection, with the reason `restoration_incomplete`, until the session's screen is one a
 restoration can carry.
 
-A restoration begins by writing the plain state its screen is drawn under and saving that state with
+A restoration begins by writing the plain state its screen is drawn under and saving the cursor with
 `ESC 7`. The state is the cursor hidden, the plain rendition, no open link, origin mode and left and
 right margins off, the whole screen as the scroll region, ASCII designated for `G0` and `G1` with
-`G0` in use, the default cursor shape, and the cursor at home, which also ends a pending wrap. The
-restoration writes it where the terminal stands, enters the alternate buffer and writes it there,
-then returns to the primary buffer and writes it again. The terminal can be showing either buffer
-when the restoration begins, and the one it is not showing can hold a cursor an earlier application
-saved there. A restore that came before any save of the application's would go where that cursor
-was, so each buffer is left holding the state of a session that saved none. A terminal that keeps
-one saved cursor for both buffers holds the last one written.
+`G0` in use, the default cursor shape, and the cursor at home, which also ends a pending wrap.
+Autowrap and reverse video are the session's own, because kitty saves both with the cursor and a
+restore would put back what an earlier application left. The restoration writes all of it where the
+terminal stands, enters the alternate buffer and writes it there, then returns to the primary buffer
+and writes it again. The terminal can be showing either buffer when the restoration begins, and the
+one it is not showing can hold a cursor an earlier application saved there. A restore that came
+before any save of the application's would go where that cursor was, so each buffer is left holding
+the state of a session that saved none. A terminal that keeps one saved cursor for both buffers
+holds the last one written.
 
 None of this is asked of a soft reset, which a restoration never sends, because terminals do not
 agree about what one does. xterm resets origin mode, the scroll region and the character sets, and

@@ -106,33 +106,38 @@ fn a_side_effect_from_before_a_client_arrived_never_reaches_it() {
 ///
 /// The terminal is in origin mode inside a scroll region, has DEC line drawing in both character
 /// sets, a pen and insert mode, holds a saved cursor in each buffer, and ignores the soft reset, as
-/// Alacritty, Ghostty, tmux and GNU screen do. A restoration that relied on the soft reset to put
+/// Alacritty, Ghostty, tmux and GNU screen do. It starts on either buffer. A restoration that relied on the soft reset to put
 /// any of that right would draw into it. A soft reset the application sends is not forwarded to
 /// such a terminal: the session tells it to begin again, which is why the corpus that has the
 /// application send one is run too.
 #[test]
 fn a_terminal_an_earlier_application_left_in_a_state_holds_the_screen_after_its_restoration() {
-    for corpus in Corpus::all().unwrap_or_else(|error| panic!("{error}")) {
-        let outcome = run_on(&corpus, Strategy::Product, Beforehand::LeftByAnApplication)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            outcome.restorations > 0,
-            "{}: some client was handed the stream",
-            corpus.name
-        );
-        assert!(
-            outcome.failures.is_empty(),
-            "{}, {} failure(s):\n{}",
-            corpus.name,
-            outcome.failures.len(),
-            outcome
-                .failures
-                .iter()
-                .take(40)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+    for beforehand in [
+        Beforehand::LeftByAnApplication,
+        Beforehand::LeftOnTheAlternateBuffer,
+    ] {
+        for corpus in Corpus::all().unwrap_or_else(|error| panic!("{error}")) {
+            let outcome = run_on(&corpus, Strategy::Product, beforehand)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert!(
+                outcome.restorations > 0,
+                "{} from {beforehand:?}: some client was handed the stream",
+                corpus.name
+            );
+            assert!(
+                outcome.failures.is_empty(),
+                "{} from {beforehand:?}, {} failure(s):\n{}",
+                corpus.name,
+                outcome.failures.len(),
+                outcome
+                    .failures
+                    .iter()
+                    .take(40)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
     }
 }
 

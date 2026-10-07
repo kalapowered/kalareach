@@ -409,7 +409,7 @@ projection, so each direct attachment is told to begin again and is drawn from t
 and the reset itself never reaches its terminal. Whichever buffer the reset came from, the terminal
 then shows the buffer the canonical screen shows. The restoration sends no soft reset either,
 because terminals disagree about what one does (see "The terminals the host hands the stream"). It
-writes the plain state its screen is drawn under and saves that state with `ESC 7`, once where the
+writes the plain state its screen is drawn under and saves the cursor with `ESC 7`, once where the
 terminal stands, once in the alternate buffer and once in the primary buffer, with the cursor hidden
 from its first byte. A switch of buffer can bring back a link that a terminal saved with its cursor,
 so the restoration closes any link the stream left open after every switch. The canonical screen
@@ -1465,46 +1465,54 @@ is in "The terminals the host hands the stream".
 
 ### The terminals the host hands the stream
 
-A restoration asks three things of a terminal. It applies the plain state the restoration writes:
-the cursor hidden, the plain rendition, no open link, origin mode and left and right margins off,
-the whole screen as the scroll region, ASCII in `G0` and `G1` with `G0` in use, the default cursor
-shape, and the cursor at home. It saves that state with `ESC 7` and gets it back with `ESC 8`, in
-one slot for each buffer or in one slot for both. Its switch to the alternate buffer through `?1049`
-either works or does nothing. It asks nothing of a soft reset, which the eight terminals on the list
-handle in five different ways.
+A restoration asks three things of a terminal. The first is the plain state its screen is drawn
+under, which the restoration writes: the cursor hidden, the plain rendition, no open link, origin
+mode and left and right margins off, the whole screen as the scroll region, ASCII in `G0` and `G1`
+with `G0` in use, the default cursor shape, the cursor at home, and autowrap and reverse video as
+the session has them. The second is to save the cursor with `ESC 7` and give it back with `ESC 8`,
+in one slot for each buffer or in one slot for both. The save keeps the position and the rendition
+and, on most terminals, the character sets and origin mode. kitty also keeps autowrap and reverse
+video in it, which is why the plain state sets them first. The third is that the switch to the
+alternate buffer through `?1049` either works or does nothing. The restoration asks nothing of a
+soft reset, which the eight terminals on the list handle in five different ways.
 
 The table says what each terminal does, at which version, and how that was established. xterm 412,
 tmux and GNU screen were run. Each was sent the restoration's bytes after the things an earlier
 application leaves in a terminal (origin mode inside a scroll region, DEC line drawing in both
 character sets, a pen, a link, insert mode and a saved cursor in each buffer), starting on either
-buffer. What it held afterwards was read back and compared with what it held when it started clean,
-and with what it held after being sent the session's own output. The terminal library of Alacritty
-was run the same way without a window. kitty, WezTerm, foot and Ghostty were read at the release
-named, and the table gives the file and line. A name on the list is still the client's claim about
-which terminal it is, so none of this is a measurement of every build.
+buffer, and then a probe that moves the cursor, restores the saved cursor, draws a character or
+scrolls. What it held was read back: the cursor position and the mode flags in all three, the scroll
+region and rendition in xterm and tmux, and the text on the screen. That was compared with what the
+same terminal held when the same bytes reached it clean. The terminal library of Alacritty was run
+the same way without a window. xterm and the library were also compared with what they held after
+the session's own output, and held the same. kitty, WezTerm, foot and Ghostty were read at the
+release named, and the table gives the file and line. A name on the list is still the client's claim
+about which terminal it is, so none of this is a measurement of every build.
 
 | `TERM` | Version | What a soft reset (`CSI ! p`) does | Saved cursor, and `?1049` | Established by |
 | --- | --- | --- | --- | --- |
 | `xterm-256color` | xterm 412 | Resets origin mode, the scroll region, the character sets and `modifyOtherKeys`, and saves a fresh cursor in the buffer that shows | One for each buffer. `?1049h` saves in the buffer that shows, then switches and clears; `?1049l` switches and restores the primary buffer's | Run on the build box. `charproc.c` 7732-7741, 14398-14420, 14548-14562; `cursor.c` 398-421 |
-| `xterm-kitty` | kitty 0.49.2 | Resets modes (origin mode included), the scroll region, the character sets, the link and the palette, empties both buffers' keyboard stacks and drops both saved cursors | One for each buffer. `?1049h` acts only from the main buffer and `?1049l` only from the alternate one | Source. `kitty/screen.c` 209-259, 1940-1962, 2614-2626, 2706-2718; `kitty/vt-parser.c` 1432-1443 |
-| `wezterm` | WezTerm 20240203-110809-5046fc22 | Resets the pen (its link included), origin mode, both kinds of margin, the character sets, the keypad and `modifyOtherKeys`, and drops both saved cursors; leaves the keyboard stack | One for each buffer. `?1049h` acts only from the primary buffer and `?1049l` only from the alternate one | Source. `term/src/terminalstate/mod.rs` 1254-1277, 1884-1900, 2594-2637 |
+| `xterm-kitty` | kitty 0.49.2 | Resets modes (origin mode included), the scroll region, the character sets, the link and the palette, empties both buffers' keyboard stacks and drops both saved cursors | One for each buffer, which also holds autowrap, reverse video and origin mode. `?1049h` acts only from the main buffer and `?1049l` only from the alternate one | Source. `kitty/screen.c` 209-259, 1940-1962, 2037-2043, 2614-2626, 2706-2718; `kitty/vt-parser.c` 1432-1443 |
+| `wezterm` | WezTerm 20240203-110809-5046fc22 | Resets the pen (its link included), origin mode, both kinds of margin, the character sets, the keypad and `modifyOtherKeys`, drops both saved cursors and returns to the primary buffer; leaves the keyboard stack | One for each buffer. `?1049h` acts only from the primary buffer and `?1049l` only from the alternate one | Source. `term/src/terminalstate/mod.rs` 1254-1277, 1884-1900, 2594-2637 |
 | `alacritty` | Alacritty 0.17.0 (vte 0.15.0) | Ignored | One for each buffer. `?1049h` acts only from the primary buffer, saves the cursor there and clears the alternate buffer; `?1049l` swaps back | Run (the terminal library, without a window) and source. `alacritty_terminal/src/term/mod.rs` 714-738, 1619-1632, 1946-1950; `vte/src/ansi.rs` 1558-1768 |
 | `foot` | foot 1.28.0 | Resets modes, the scroll region, the character sets, the keyboard stack, `modifyOtherKeys`, the title stack and the title, and leaves the alternate buffer; leaves origin mode and both saved cursors as they were | One for each buffer, with the saved character sets shared. `?1049h` acts only from the primary buffer and `?1049l` only from the alternate one | Source. `terminal.c` 2100-2148, 3273-3295; `csi.c` 344-348, 498-533, 1862-1865 |
 | `ghostty` | Ghostty 1.3.1 | Ignored | One for each buffer. `?1049h` saves the cursor even from the alternate buffer and clears it; `?1049l` restores the primary buffer's, even from the primary buffer | Source. `src/terminal/stream.zig` 1578-1581; `src/terminal/Terminal.zig` 1089-1137, 2962-3028 |
 | `tmux-256color` | tmux 3.7c and 3.6 | Ignored | One for each pane, shared by both buffers. `?1049h` and `?1049l` save and restore the cursor and pen in fields of their own, and `?1049l` restores them even when the pane is not on the alternate screen | Run (3.7c on macOS, 3.6 on Linux). `input.c` 340-341, 833-856; `screen.c` 676-738 |
-| `screen-256color` | GNU screen 5.0.2 and 4.09.01 | Ignored | One for each window, shared by both buffers, with origin mode not saved. `?47`, `?1047` and `?1049` do nothing unless `altscreen on` is set, and it is off by default | Run (5.0.2 on macOS, 4.09.01 on Linux). `src/ansi.c` 53, 729, 1050, 1144-1171, 1447-1470; `src/process.c` 4294 |
+| `screen-256color` | GNU screen 5.0.2 and 4.09.01 | Ignored | One for each window, shared by both buffers, with origin mode not saved. `?47`, `?1047` and `?1049` do nothing unless `altscreen on` is set, and it is off by default | Run (5.0.2 on macOS, 4.09.01 on Linux). `src/ansi.c` 53, 729, 845-1076 (no arm for the `!` intermediate), 1144-1171, 1447-1470; `src/process.c` 4294 |
 
-Lines are those of the tag named in the version column, and the xterm lines are those of the 412 source.
+Lines are those of the first version named in the version column, and the xterm lines are those of the 412 source.
 
 The restoration writes its state itself because the terminals do not agree on the soft reset.
 Alacritty, Ghostty, tmux and GNU screen ignore it, and a restoration that left origin mode, the
 scroll region, the character sets or the saved cursors to it drew into whatever an earlier
-application had left there. foot leaves origin mode and its saved cursors as they were. kitty, foot,
-WezTerm and xterm change state that belongs to the person's other programs, namely the keyboard
-stack, the title stack or the `modifyOtherKeys` level, which a restoration has no business changing.
-On every terminal that was run, what the restoration leaves is the same whatever the terminal held
-before it: the screen, the cursor, origin mode, the scroll region, the pen and the cursor that `ESC
-8` brings back.
+application had left there. foot leaves origin mode and its saved cursors as they were. kitty and
+foot empty the keyboard stack and foot also empties the title stack, and xterm, foot and WezTerm
+reset the `modifyOtherKeys` level. Those belong to the person's other programs, and a restoration
+has no business changing them. On every terminal that was run, what the restoration leaves is the
+same whatever the terminal held before it, as far as the probes read it back. State the profile does
+not track stays as an earlier application left it: WezTerm's bidirectional mode and the character
+protection of xterm and Ghostty are two, and a soft reset would clear them and the person's own
+state with them.
 
 Two terminals do not keep the other buffer as xterm does. GNU screen switches buffers only when its
 `altscreen` setting is on, and the default is off. tmux throws away what is drawn in the alternate
