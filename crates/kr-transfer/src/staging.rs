@@ -139,9 +139,10 @@ impl StagingArea {
     /// Opens the staging directory, and the three areas beneath it, creating whatever is missing.
     ///
     /// `recorded` is the identity a store recorded for this staging directory, when it recorded
-    /// one. The directory is decided against it before anything is created inside it, so a
-    /// directory that took the place of the recorded one gets no areas made in it, and the answer
-    /// says what the record becomes ([`Settled`]) when it is the recorded one. The decision is
+    /// one. The directory is then opened and never made, and decided against it before anything
+    /// is created inside it, so a directory that took the place of the recorded one gets no areas
+    /// made in it and a name that holds nothing is refused, and the answer says what the record
+    /// becomes ([`Settled`]) when it is the recorded one. The decision is
     /// [`AuthorisedDirectory::check_recorded`]'s: the directory's inode and its filesystem decide,
     /// and a device number that is not the recorded one is taken in when the directory is on the
     /// filesystem of the directory it was created in, which a mount over it is not.
@@ -167,7 +168,14 @@ impl StagingArea {
                 "{staging_name} is not a staging directory: {escape}"
             ))
         })?;
-        let staging = create_private_staging_directory(root, &name)?;
+        // A directory the journal recorded is opened and never made: one that is gone is not
+        // replaced by a new one that could be given the recorded inode, and a first start, which
+        // has no record, makes it.
+        let staging = if recorded.is_some() {
+            open_private_staging_directory(root, &name)?
+        } else {
+            create_private_staging_directory(root, &name)?
+        };
         let settled = recorded
             .map(|recorded| staging.check_recorded(recorded))
             .transpose()
@@ -223,6 +231,20 @@ fn subdirectory(staging: &AuthorisedDirectory, name: &str) -> Result<AuthorisedD
     staging
         .create_subdirectory(&name)
         .map_err(TransferError::from)
+}
+
+/// Opens the private staging directory a journal recorded, and checks what it carries.
+///
+/// Nothing is created: a name that holds nothing is refused.
+fn open_private_staging_directory(
+    root: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Result<AuthorisedDirectory> {
+    let staging = root.subdirectory(name).map_err(TransferError::from)?;
+    staging
+        .check_privacy(Privacy::Boundary)
+        .map_err(TransferError::from)?;
+    Ok(staging)
 }
 
 /// Creates the private staging directory itself, and checks what it carries.

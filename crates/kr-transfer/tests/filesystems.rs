@@ -97,6 +97,27 @@ fn a_directory_that_took_the_staging_directorys_place_gets_nothing_made_in_it() 
     );
 }
 
+/// KR-REQ-14.10: a staging directory that is gone is not made again while the journal names it:
+/// a new directory could be given the recorded inode, and would be taken for the recorded one.
+#[cfg(unix)]
+#[test]
+fn a_staging_directory_that_is_gone_is_not_made_again_while_the_journal_names_it() {
+    let host = kr_ipc::testing::TempHost::create();
+    drop(TransferService::open(&host.environment()).expect("opens and records"));
+    let name: String = journal(&host)
+        .query_row("SELECT staging_name FROM environment", [], |row| row.get(0))
+        .expect("the journal records the staging directory");
+    let staging = StagingArea::root_of(&host.environment()).join(&name);
+    std::fs::remove_dir_all(&staging).expect("the staging directory is removed");
+
+    TransferService::open(&host.environment())
+        .expect_err("a name that holds nothing is not the recorded staging directory");
+    assert!(
+        std::fs::symlink_metadata(&staging).is_err(),
+        "no directory was made at the name"
+    );
+}
+
 /// KR-REQ-14.10: a staging directory is refused on another filesystem that gives it the numbers
 /// the recorded one had, and accepted on the filesystem it was recorded on.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
