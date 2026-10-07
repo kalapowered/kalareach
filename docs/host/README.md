@@ -1196,10 +1196,10 @@ Rendering a screen back into bytes cannot carry everything a client that holds i
 apply. What it leaves out is counted rather than assumed away: the rows of the buffer that is not
 showing, for a client shown the live screen alone; the saved cursor of the buffer that is not
 showing, and a saved cursor of the showing buffer that lies outside the window; the keyboard
-negotiation of the buffer that is not showing, and the keyboard stack the session holds; the
-virtual title stack; soft-wrap markers; the right-hand side of a row wider than the window; and a
-pending wrap, whether the cursor's or a saved cursor's, that the window shows.
-`Session::restoration_losses` is the count.
+negotiation of the buffer that is not showing, and all of it for a client that declared no terminal
+profile, together with the keyboard stack the session holds; the virtual title stack; soft-wrap
+markers; the right-hand side of a row wider than the window; and a pending wrap, whether the
+cursor's or a saved cursor's, that the window shows. `Session::restoration_losses` is the count.
 
 A restoration begins with a soft reset wherever the terminal is. It then enters the alternate
 buffer, resets there, returns to the primary buffer and resets again, and each reset is followed by
