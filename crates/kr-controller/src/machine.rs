@@ -65,6 +65,11 @@ use crate::singleton::SingletonLock;
 /// The name of the record in the environment's state directory.
 pub const RECORD_FILE: &str = "machine-group";
 
+/// The format of the record this build writes, recorded in it as `version`. A record that states
+/// none was written before the format was recorded and is read as this one; a record of a later
+/// format is refused and left as it is.
+pub const RECORD_VERSION: u32 = 1;
+
 /// The start of the name of every temporary file this store writes.
 ///
 /// A publication renames its temporary file into place, so one that is still there was left by a
@@ -119,6 +124,13 @@ impl Drop for Holding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineGroup {
+    /// The format of the record: [`RECORD_VERSION`] in every record this build writes, `0` in one
+    /// that states none.
+    ///
+    /// Remove the default, and read `0` as the refusal it then is, once no supported upgrade
+    /// starts from a record written before the format was recorded.
+    #[serde(default)]
+    pub version: u32,
     /// The environment this record belongs to.
     pub environment_id: EnvironmentId,
     /// The group the environment is in.
@@ -427,6 +439,7 @@ impl MachineStore {
             .checked_add(1)
             .ok_or_else(|| self.unreadable("the record has no revision after this one"))?;
         let record = MachineGroup {
+            version: RECORD_VERSION,
             environment_id: self.environment_id,
             machine_id,
             revision,
@@ -462,6 +475,12 @@ impl MachineStore {
                 "this is not a machine group record this build understands: {error}"
             ))
         })?;
+        if record.version > RECORD_VERSION {
+            return Err(self.unreadable(format!(
+                "this record is of format {}, and this build reads formats up to {RECORD_VERSION}",
+                record.version
+            )));
+        }
         if record.environment_id != self.environment_id {
             return Err(self.unreadable(format!(
                 "this record belongs to environment {}, not to {}",
@@ -495,6 +514,7 @@ impl MachineStore {
     /// open's own.
     fn mint(&self, now_ms: u64, deadline: Instant) -> Result<()> {
         let record = MachineGroup {
+            version: RECORD_VERSION,
             environment_id: self.environment_id,
             machine_id: new_machine_id(),
             revision: 1,
@@ -1596,6 +1616,7 @@ mod tests {
         let before = environment.reopened();
         let directory = environment.paths().state_dir().to_path_buf();
         let whole = MachineGroup {
+            version: RECORD_VERSION,
             machine_id: some_group(),
             revision: before.revision + 1,
             change: Change::Joined(Step {
@@ -2081,6 +2102,7 @@ mod tests {
         );
         let resume = Resume(resume);
         let other = MachineGroup {
+            version: RECORD_VERSION,
             environment_id: environment.host.environment_id(),
             machine_id: some_group(),
             revision: 1,
@@ -2680,6 +2702,10 @@ mod tests {
                 edited(&own, &|value| value["change"]["kind"] = json!("adopted")),
             ),
             (
+                "a later format",
+                edited(&own, &|value| value["version"] = json!(RECORD_VERSION + 1)),
+            ),
+            (
                 "revision zero",
                 edited(&own, &|value| value["revision"] = json!(0)),
             ),
@@ -2708,6 +2734,44 @@ mod tests {
                 "{what} was not kept as it was"
             );
         }
+    }
+
+    /// The record names the format it is written in, a record written before the format was named
+    /// is read, and the next step writes it back stamped.
+    #[test]
+    fn the_record_names_its_format_and_a_record_that_names_none_is_read() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let created = store.group().expect("reads the group");
+        let version_of = |environment: &Environment| -> serde_json::Value {
+            let bytes = std::fs::read(environment.record()).expect("reads the record");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON")["version"].clone()
+        };
+        assert_eq!(version_of(&environment), json!(RECORD_VERSION));
+
+        let bytes = std::fs::read(environment.record()).expect("reads the record");
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        value.as_object_mut().expect("an object").remove("version");
+        kr_ipc::paths::write_owner_only_file(
+            &environment.record(),
+            serde_json::to_vec(&value).expect("encodes").as_slice(),
+        )
+        .expect("places the record");
+        let read = store
+            .group()
+            .expect("a record that names no format is read");
+        assert_eq!(read.version, 0);
+        assert_eq!(read.machine_id, created.machine_id);
+        store
+            .join(
+                &environment.lock,
+                some_group(),
+                read.expected(),
+                &approval(),
+                2_000,
+            )
+            .expect("a step on it");
+        assert_eq!(version_of(&environment), json!(RECORD_VERSION));
     }
 
     /// Holds `directory` open with a handle that shares reading and deleting but not writing, which

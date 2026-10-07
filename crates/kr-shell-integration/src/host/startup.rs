@@ -1155,6 +1155,11 @@ pub const ENTRY_RECORD_NAME: &str = "shell-entries.json";
 /// The longest record this build reads: far more than a record of every startup file a home has.
 const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 
+/// The format of the record this build writes, recorded in it as `version`. A record that states
+/// none was written before the format was recorded and is read as this one; a record of a later
+/// format is not one this build writes, and is refused.
+const ENTRY_RECORD_VERSION: u32 = 1;
+
 /// The startup files `kr shell install` has put an entry in, for each shell.
 ///
 /// Removal works from this record and from nothing else: not from where an entry would go now,
@@ -1188,6 +1193,12 @@ pub enum RecordError {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recorded {
+    /// The format of the record; `0` for a record that states none.
+    ///
+    /// Remove the default once no supported upgrade starts from a record written before the format
+    /// was recorded.
+    #[serde(default)]
+    version: u32,
     /// Each file an entry was written to, with the shell the entry is for.
     entries: Vec<RecordedEntry>,
 }
@@ -1267,7 +1278,15 @@ impl EntryRecord {
     fn read(&self) -> Result<Recorded, RecordError> {
         match kr_ipc::paths::read_owner_only_file(&self.path, ENTRY_RECORD_LIMIT)? {
             None => Ok(Recorded::default()),
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| RecordError::NotARecord),
+            Some(bytes) => serde_json::from_slice::<Recorded>(&bytes)
+                .map_err(|_| RecordError::NotARecord)
+                .and_then(|recorded| {
+                    if recorded.version > ENTRY_RECORD_VERSION {
+                        Err(RecordError::NotARecord)
+                    } else {
+                        Ok(recorded)
+                    }
+                }),
         }
     }
 }
@@ -1329,6 +1348,7 @@ impl HeldRecord<'_> {
     fn change(&self, edit: impl FnOnce(&mut Vec<RecordedEntry>)) -> Result<(), RecordError> {
         let mut recorded = self.record.read()?;
         edit(&mut recorded.entries);
+        recorded.version = ENTRY_RECORD_VERSION;
         let bytes = serde_json::to_vec(&recorded).map_err(|_| RecordError::NotARecord)?;
         kr_ipc::paths::write_owner_only_file(&self.record.path, &bytes)?;
         Ok(())
@@ -4656,6 +4676,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The record names the format it is written in. One written before the format was named is
+    /// read and written back stamped; one of a later format is refused and left as it was.
+    #[test]
+    fn the_record_names_its_format_and_refuses_a_later_one() {
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        let zshrc = PathBuf::from("/home/someone/.zshrc");
+        let written = |record: &EntryRecord| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(record.path()).expect("the record"))
+                .expect("JSON")
+        };
+        record
+            .hold()
+            .expect("holds")
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
+        assert_eq!(written(&record)["version"], ENTRY_RECORD_VERSION);
+
+        let mut older = written(&record);
+        older.as_object_mut().expect("an object").remove("version");
+        std::fs::write(record.path(), older.to_string()).expect("rewritten");
+        assert_eq!(
+            record
+                .files(ShellKind::Zsh)
+                .expect("an unstamped record is read"),
+            vec![zshrc.clone()]
+        );
+        record
+            .hold()
+            .expect("holds")
+            .add(ShellKind::Bash, &[PathBuf::from("/home/someone/.bashrc")])
+            .expect("records");
+        assert_eq!(written(&record)["version"], ENTRY_RECORD_VERSION);
+
+        let mut later = written(&record);
+        later["version"] = serde_json::json!(ENTRY_RECORD_VERSION + 1);
+        std::fs::write(record.path(), later.to_string()).expect("rewritten");
+        assert!(
+            record.files(ShellKind::Zsh).is_err(),
+            "a record of a later format is refused"
+        );
+        assert_eq!(
+            written(&record)["version"],
+            ENTRY_RECORD_VERSION + 1,
+            "and left as it was"
+        );
     }
 
     /// The record keeps each file by its exact name for the shell it is for, keeps a file once

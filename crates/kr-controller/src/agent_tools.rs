@@ -1479,6 +1479,9 @@ struct InstallationRecord {
     pending: Vec<ChangeOperation>,
 }
 
+/// The format of the retained installation actions this build writes, recorded in each as `version`.
+const ACTION_RECORD_VERSION: u32 = 1;
+
 impl InstallationRecord {
     /// The shape this build writes, in which a recorded operation is one that happened.
     const VERSION: u32 = 1;
@@ -1503,6 +1506,14 @@ impl InstallationRecord {
 /// something to do again. An installation changes files, so it needs all three.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ActionRecord {
+    /// The format of the record: [`ACTION_RECORD_VERSION`] in every record this build writes, `0`
+    /// in one that states none, which an earlier build wrote.
+    ///
+    /// Remove the default, and the conversion of such a record's result that
+    /// [`carry_result_forward`] makes, once no supported upgrade starts from a record written before
+    /// the format was recorded.
+    #[serde(default)]
+    version: u32,
     /// The digest of the mutation this action was admitted for.
     digest: String,
     /// `dispatching` until the effect finishes, then `applied`.
@@ -1530,6 +1541,13 @@ impl Installer {
         };
         let record: ActionRecord = serde_json::from_str(&text)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if record.version > ACTION_RECORD_VERSION {
+            return Err(ControllerError::InvalidArgument(format!(
+                "the retained installation action {action_id} is of format {}, and this build \
+                 reads formats up to {ACTION_RECORD_VERSION}",
+                record.version
+            )));
+        }
         if record.digest != hex(digest.as_bytes()) {
             return Err(ControllerError::IdConflict {
                 token: action_id.to_string(),
@@ -1562,6 +1580,7 @@ impl Installer {
             actor_id,
             action_id,
             &ActionRecord {
+                version: ACTION_RECORD_VERSION,
                 digest: hex(digest.as_bytes()),
                 state: "dispatching".to_owned(),
                 result: None,
@@ -1585,6 +1604,7 @@ impl Installer {
             actor_id,
             action_id,
             &ActionRecord {
+                version: ACTION_RECORD_VERSION,
                 digest: hex(digest.as_bytes()),
                 state: "applied".to_owned(),
                 result: Some(hex(&kr_cbor::encode(result.as_value()))),
@@ -2839,6 +2859,8 @@ mod tests {
                 &actor,
                 action,
                 &ActionRecord {
+                    // As an earlier build wrote it: no format stated.
+                    version: 0,
                     digest: hex(digest.as_bytes()),
                     state: "applied".to_owned(),
                     result: Some(hex(&kr_cbor::encode(&stored))),
@@ -2854,6 +2876,36 @@ mod tests {
         let result: AgentToolsInstallResult = answer.to_typed().expect("this build can read it");
         assert!(result.already_installed);
         assert!(result.unresolved.is_empty());
+    }
+
+    /// A retained installation action names the format it is written in, and one of a later format
+    /// is refused rather than answered from.
+    #[test]
+    fn a_retained_action_names_its_format_and_a_later_one_is_refused() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+        let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+        let digest = Digest256::from_bytes([7; 32]);
+        installer
+            .mark_dispatching(&actor, action, &digest)
+            .expect("marks");
+        let path = installer.action_path(&actor, action);
+        let read = |path: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).expect("the record")).expect("JSON")
+        };
+        assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
+
+        let mut later = read(&path);
+        later["version"] = serde_json::json!(ACTION_RECORD_VERSION + 1);
+        std::fs::write(&path, later.to_string()).expect("rewritten");
+        assert!(
+            matches!(
+                installer.retained(&actor, action, &digest),
+                Err(ControllerError::InvalidArgument(_))
+            ),
+            "a record of a later format is refused"
+        );
     }
 
     /// A directory that hands out access is not a place to replace a file.

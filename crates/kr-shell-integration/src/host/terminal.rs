@@ -101,6 +101,17 @@ pub const PREFERENCE_FILE: &str = "terminal.json";
 /// The key the preference is written under.
 pub const PREFERENCE_KEY: &str = "terminal";
 
+/// The key the document's format is written under.
+pub const PREFERENCE_VERSION_KEY: &str = "version";
+
+/// The format of the document this build writes. A document that states none was written before
+/// the format was recorded and is read as this one; a document of a later format reads as no
+/// preference, like any other document this build does not recognise.
+///
+/// Remove the reading of a document that states no format once no supported upgrade starts from
+/// one written before the format was recorded.
+pub const PREFERENCE_VERSION: u64 = 1;
+
 /// The longest preference file this host reads.
 ///
 /// The document holds one identifier. A file larger than this is not one of ours, and reading it
@@ -115,6 +126,13 @@ pub const PREFERENCE_MAX_LEN: u64 = 4_096;
 #[must_use]
 pub fn parse_preference(contents: &[u8]) -> Option<String> {
     let document = serde_json::from_slice::<serde_json::Value>(contents).ok()?;
+    if let Some(version) = document.get(PREFERENCE_VERSION_KEY)
+        && version
+            .as_u64()
+            .is_none_or(|stated| stated > PREFERENCE_VERSION)
+    {
+        return None;
+    }
     let chosen = document.get(PREFERENCE_KEY)?.as_str()?.trim();
     (!chosen.is_empty()).then(|| chosen.to_owned())
 }
@@ -122,7 +140,8 @@ pub fn parse_preference(contents: &[u8]) -> Option<String> {
 /// Returns the document that records one terminal preference.
 #[must_use]
 pub fn preference_document(id: &str) -> String {
-    serde_json::json!({ PREFERENCE_KEY: id }).to_string()
+    serde_json::json!({ PREFERENCE_KEY: id, PREFERENCE_VERSION_KEY: PREFERENCE_VERSION })
+        .to_string()
 }
 
 /// Reads the terminal preference saved in an environment's state directory.
@@ -589,6 +608,25 @@ mod tests {
         assert_eq!(parse_preference(br#"{"terminal": ""}"#), None);
         assert_eq!(parse_preference(br#"{"terminal": 7}"#), None);
         assert_eq!(parse_preference(br#"{"something": "iterm2"}"#), None);
+        // The document names its format. One written before the format was named is read, and one
+        // of a later format is not.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&preference_document("iterm2"))
+                .expect("JSON")[PREFERENCE_VERSION_KEY],
+            PREFERENCE_VERSION
+        );
+        assert_eq!(
+            parse_preference(br#"{"terminal": "iterm2"}"#).as_deref(),
+            Some("iterm2")
+        );
+        assert_eq!(
+            parse_preference(br#"{"terminal": "iterm2", "version": 2}"#),
+            None
+        );
+        assert_eq!(
+            parse_preference(br#"{"terminal": "iterm2", "version": "one"}"#),
+            None
+        );
     }
 
     #[test]

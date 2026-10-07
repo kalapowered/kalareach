@@ -48,6 +48,19 @@ use crate::trust::{self, AcceptedTarget, MetadataVersions, TargetRecord};
 /// The database file, beside the repositories' directories.
 pub const DATABASE_FILE: &str = "catalogue.sqlite3";
 
+/// The format the database is written in, recorded in the file as SQLite's `user_version`.
+///
+/// It covers the tables and every value the catalogue keeps in them. A change to either raises it,
+/// and the stored-format lock (`stored-formats.lock`) fails until it has been raised.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The oldest format this build opens. A database that records none, as every one written before
+/// the version was recorded does, reads as `0` and is the format this build writes.
+///
+/// Remove the step that stamps such a database, and raise this to `1`, once no supported upgrade
+/// starts from a database written before the version was recorded.
+pub const OLDEST_SCHEMA_VERSION: i64 = 0;
+
 /// How long a writer waits for another writer's transaction before it reports the store busy.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -202,9 +215,27 @@ impl Db {
         db.connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(|source| db.failure(&source))?;
+        let recorded: i64 = db
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|source| db.failure(&source))?;
+        if !(OLDEST_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&recorded) {
+            return Err(CatalogueError::StorageUnavailable {
+                detail: format!(
+                    "{} records format {recorded}, and this build reads formats \
+                     {OLDEST_SCHEMA_VERSION} to {SCHEMA_VERSION}",
+                    db.path.display()
+                ),
+            });
+        }
         db.connection
             .execute_batch(SCHEMA)
             .map_err(|source| db.failure(&source))?;
+        if recorded != SCHEMA_VERSION {
+            db.connection
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|source| db.failure(&source))?;
+        }
         Ok(db)
     }
 
@@ -1846,4 +1877,45 @@ fn capabilities_from(text: &str) -> CatalogueResult<Vec<PluginCapability>> {
         .iter()
         .map(|name| capability_from_str(name).map_err(unreadable))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recorded(path: &Path) -> i64 {
+        Connection::open(path)
+            .expect("opens")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("reads")
+    }
+
+    /// The database records the format it is written in, a database written before one was
+    /// recorded is the same format and is stamped when it is opened, and one written in a format
+    /// this build does not read is refused and left as it is.
+    #[test]
+    fn the_database_records_its_format_and_refuses_a_later_one() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(DATABASE_FILE);
+        drop(Db::open(root.path()).expect("a new database"));
+        assert_eq!(recorded(&path), SCHEMA_VERSION);
+
+        // As every database written before the format was recorded: no format, all its tables.
+        Connection::open(&path)
+            .expect("opens")
+            .pragma_update(None, "user_version", 0)
+            .expect("writes");
+        drop(Db::open(root.path()).expect("an unstamped database opens"));
+        assert_eq!(recorded(&path), SCHEMA_VERSION);
+
+        Connection::open(&path)
+            .expect("opens")
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("writes");
+        assert!(
+            Db::open(root.path()).is_err(),
+            "a database of a later format is refused"
+        );
+        assert_eq!(recorded(&path), SCHEMA_VERSION + 1, "and is left as it was");
+    }
 }

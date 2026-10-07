@@ -33,6 +33,14 @@ pub const OBSERVATION_LIFETIME_MS: u64 = 5 * 60 * 1000;
 /// The largest enrolment file this host will read, in bytes.
 const MAX_RECORD_LEN: u64 = 1024 * 1024;
 
+/// The format of the enrolment file this build writes, recorded in it as `version`. A file that
+/// records none was written before the format was recorded and is read as this one; a file that
+/// records a later one is refused rather than read and written back without what it adds.
+///
+/// Remove the absent-version default on [`Record::version`] once no supported upgrade starts from
+/// a file written before the format was recorded.
+const RECORD_VERSION: u32 = 1;
+
 /// What was last observed about one enrolment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Observation {
@@ -76,6 +84,9 @@ struct ScopedChannel {
 /// The file this host keeps its enrolments and observations in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Record {
+    /// The format this file is written in; `0` for a file that records none.
+    #[serde(default)]
+    version: u32,
     /// The enrolments, in the order the owner approved them.
     enrolments: Vec<EnvironmentEnrolment>,
     /// The last observation of each, by environment identity.
@@ -211,6 +222,16 @@ impl Store {
             })?,
             None => Record::default(),
         };
+        if record.version > RECORD_VERSION {
+            return Err(ControllerError::supervision(format!(
+                "{} is an environment record of format {}, and this build reads formats up to {}",
+                path.display(),
+                record.version,
+                RECORD_VERSION
+            )));
+        }
+        // Whatever it recorded, it is written back in this build's format.
+        record.version = RECORD_VERSION;
         // An enrolment written by a build that did not number its records gets a number now, so
         // every approved record here can be named. The evidence beside it carries no number, which
         // is what it deserves: this host cannot tell which record answered for it.
@@ -665,6 +686,44 @@ mod tests {
             store
                 .approved(EnvironmentId::new(Uuid::from_bytes([9; 16])), 300)
                 .is_none()
+        );
+    }
+
+    /// The file records the format it is written in: one written before the format was recorded is
+    /// read and written back stamped, and one of a later format is refused and left as it was.
+    #[test]
+    fn the_enrolment_file_records_its_format_and_refuses_a_later_one() {
+        let (directory, mut store) = store();
+        let path = directory.root().join("environments.json");
+        store.enrol(enrolment(1, "ubuntu"), 100).expect("enrolled");
+        let stamped = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).expect("the file")).expect("JSON")
+        };
+        assert_eq!(stamped(&path)["version"], RECORD_VERSION);
+
+        // As a file written before the format was recorded: no `version` member.
+        let mut document = stamped(&path);
+        document
+            .as_object_mut()
+            .expect("an object")
+            .remove("version");
+        std::fs::write(&path, document.to_string()).expect("rewritten");
+        let mut store = Store::open(directory.root()).expect("an unstamped file is read");
+        assert_eq!(store.list(None, 0).len(), 1, "what it held is still held");
+        store.enrol(enrolment(2, "debian"), 200).expect("enrolled");
+        assert_eq!(stamped(&path)["version"], RECORD_VERSION);
+
+        let mut document = stamped(&path);
+        document["version"] = serde_json::json!(RECORD_VERSION + 1);
+        std::fs::write(&path, document.to_string()).expect("rewritten");
+        assert!(
+            Store::open(directory.root()).is_err(),
+            "a later format is refused"
+        );
+        assert_eq!(
+            stamped(&path)["version"],
+            RECORD_VERSION + 1,
+            "and left as it was"
         );
     }
 
