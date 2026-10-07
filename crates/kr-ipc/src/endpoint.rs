@@ -508,7 +508,6 @@ mod platform {
 mod platform {
     use std::os::windows::io::AsHandle as _;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -616,9 +615,8 @@ mod platform {
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
             let connection = Connection::Server(Accepted {
-                stream: Some(stream),
+                stream,
                 caller: Caller::Unproved,
-                written: false,
             });
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
@@ -660,13 +658,8 @@ mod platform {
     /// Only the reader drives the proof, so only the reader waits on the pipe's read readiness.
     #[derive(Debug)]
     pub(super) struct Accepted {
-        /// The accepting end, which is there until the connection is dropped and handed to the
-        /// thread that closes it ([`Drop`]).
-        stream: Option<PipeServer>,
+        stream: PipeServer,
         caller: Caller,
-        /// Whether anything has been written to the caller, which is what a close has to see
-        /// delivered.
-        written: bool,
     }
 
     /// What is known of an accepted connection's caller.
@@ -681,23 +674,9 @@ mod platform {
     }
 
     impl Accepted {
-        /// The accepting end, for as long as the connection is open.
-        fn pipe(&self) -> &PipeServer {
-            self.stream
-                .as_ref()
-                .expect("the accepting end is there until the connection is dropped")
-        }
-
-        /// The same, to read and write through.
-        fn pipe_mut(&mut self) -> &mut PipeServer {
-            self.stream
-                .as_mut()
-                .expect("the accepting end is there until the connection is dropped")
-        }
-
         /// Settles the caller from its opening bytes.
         fn settle(&mut self, opening: Vec<u8>) {
-            let PipeServer::NamedPipe(pipe) = self.pipe();
+            let PipeServer::NamedPipe(pipe) = &self.stream;
             self.caller = match crate::starter::pipe_client_is_this_user(pipe.as_handle()) {
                 Ok(true) => Caller::Admitted {
                     opening,
@@ -738,13 +717,13 @@ mod platform {
                             *delivered += take;
                             return Poll::Ready(Ok(()));
                         }
-                        return Pin::new(self.pipe_mut()).poll_read(context, buffer);
+                        return Pin::new(&mut self.stream).poll_read(context, buffer);
                     }
                     Caller::Refused(detail) => return Poll::Ready(Err(Self::refusal(detail))),
                     Caller::Unproved => {
                         let mut opening = vec![0_u8; OPENING_READ];
                         let mut read = ReadBuf::new(&mut opening);
-                        match Pin::new(self.pipe_mut()).poll_read(context, &mut read) {
+                        match Pin::new(&mut self.stream).poll_read(context, &mut read) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                             Poll::Ready(Ok(())) => {
@@ -771,128 +750,27 @@ mod platform {
             match &self.caller {
                 Caller::Refused(detail) => Poll::Ready(Err(Self::refusal(detail))),
                 Caller::Unproved | Caller::Admitted { .. } => {
-                    self.written = true;
-                    Pin::new(self.pipe_mut()).poll_write(context, bytes)
+                    Pin::new(&mut self.stream).poll_write(context, bytes)
                 }
             }
         }
     }
 
-    /// How long the close of a connection waits for its caller to read what it was sent before the
-    /// connection is cut and the rest is lost.
-    const CLOSE_WAIT: Duration = Duration::from_secs(30);
-
-    /// How many connections may wait to close at once. Past it a close does not wait: the
-    /// connection is closed with what its caller has not read lost, which is what this many callers
-    /// that read nothing come to.
-    const MAX_CLOSING: usize = 256;
-
-    /// How many connections are waiting to close now.
-    static CLOSING: AtomicUsize = AtomicUsize::new(0);
-
-    /// One of the [`MAX_CLOSING`] places a connection waits to close in, given back when it drops.
-    struct ClosingPlace;
-
-    impl ClosingPlace {
-        fn take() -> Option<Self> {
-            CLOSING
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |closing| {
-                    (closing < MAX_CLOSING).then_some(closing + 1)
-                })
-                .ok()
-                .map(|_| Self)
-        }
-    }
-
-    impl Drop for ClosingPlace {
-        fn drop(&mut self) {
-            CLOSING.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    /// An accepting end that is closed without the pipe library's flush.
-    ///
-    /// The library flushes a handle that has been written to when it closes it, on one thread that
-    /// every connection of the process shares ([`Drop for Accepted`]). Whatever drops this tells
-    /// the library there is nothing left to flush first, so no way of dropping it, a thread that
-    /// cannot be started included, ends on that thread.
-    struct Unflushed(PipeServer);
-
-    impl Drop for Unflushed {
-        fn drop(&mut self) {
-            let PipeServer::NamedPipe(pipe) = &self.0;
-            pipe.inner().assume_flushed();
-        }
-    }
-
-    impl Accepted {
-        /// Closes this end, waiting at most `wait` on a thread of its own for the caller to read
-        /// what it was sent, and returns that thread. A close that has nothing to wait for, or
-        /// cannot wait, returns no thread.
-        ///
-        /// What waits is a flush of a duplicate of the handle, which returns when the caller has
-        /// read everything, or has gone. It has no time limit of its own, so the thread that holds
-        /// the connection waits for it for `wait` and then disconnects the pipe, which discards
-        /// what is unread and lets the flush return.
-        fn close_within(&mut self, wait: Duration) -> Option<std::thread::JoinHandle<()>> {
-            let stream = self.stream.take()?;
-            let closing = Unflushed(stream);
-            if !self.written {
-                return None;
-            }
-            let PipeServer::NamedPipe(pipe) = &closing.0;
-            let duplicate = pipe.as_handle().try_clone_to_owned().ok()?;
-            let place = ClosingPlace::take()?;
-            // A thread that cannot be started drops the closure and with it the connection, which
-            // is closed without the library's flush like every other path.
-            std::thread::Builder::new()
-                .name("kr-ipc pipe close".to_owned())
-                .spawn(move || {
-                    let _place = place;
-                    let file = std::sync::Arc::new(std::fs::File::from(duplicate));
-                    let (flushed, hear) = std::sync::mpsc::channel::<()>();
-                    let flushing = std::sync::Arc::clone(&file);
-                    let flush = std::thread::Builder::new()
-                        .name("kr-ipc pipe flush".to_owned())
-                        .spawn(move || {
-                            let _ = flushing.sync_all();
-                            let _ = flushed.send(());
-                        });
-                    if flush.is_ok()
-                        && hear.recv_timeout(wait)
-                            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    {
-                        crate::starter::disconnect_pipe(file.as_handle());
-                        // The flush returns once the pipe is cut. Whether it does is not waited
-                        // for past `wait` again: the connection is closed either way.
-                        let _ = hear.recv_timeout(wait);
-                    }
-                    drop(closing);
-                })
-                .ok()
-        }
-    }
-
     /// Closes the accepting end of a connection without making any other connection wait for it.
     ///
-    /// A pipe's server end closed with bytes the caller has not read can lose them, so a close
-    /// first waits until the caller has read them or has gone. The pipe library does that by
-    /// flushing the handle, on one thread that every connection of the process shares, one handle
-    /// at a time, so a caller that is slow to read, or never reads, holds up every close queued
-    /// behind its own: those connections stay open, their callers never see them end, and whatever
-    /// waits for that waits for ever.
+    /// The pipe library closes a stream that has been written to by flushing it first, on one
+    /// thread that every connection of the process shares, one handle at a time. The flush waits
+    /// until the caller has read what was written, so a caller that never reads held that thread,
+    /// and every connection closed after it stayed open: its caller never saw it end, and whatever
+    /// waited for that waited for ever.
     ///
-    /// A connection that has written something is closed by a thread of its own instead, after a
-    /// flush of a duplicate of the handle, which returns when the caller has read everything or
-    /// has gone, and the library is told there is nothing left to flush, so nothing is ever handed
-    /// to the shared thread. A caller that reads nothing costs one thread, and one for its flush,
-    /// for at most [`CLOSE_WAIT`], after which the connection is cut and the rest lost, and no
-    /// other connection anything. At most [`MAX_CLOSING`] connections wait at once; one that
-    /// closes past that loses what its caller has not read.
+    /// The library is told there is nothing to flush, so a close never reaches that thread. The
+    /// operating system keeps what was written for the caller to read after the close, a write
+    /// still going out included, and the caller then sees the connection end.
     impl Drop for Accepted {
         fn drop(&mut self) {
-            // The thread is not waited for: that is the point of it.
-            drop(self.close_within(CLOSE_WAIT));
+            let PipeServer::NamedPipe(pipe) = &self.stream;
+            pipe.inner().assume_flushed();
         }
     }
 
@@ -949,7 +827,7 @@ mod platform {
                 // to; a caller of another account never gets a byte through to be acted on.
                 Self::Server(accepted) => {
                     let credentials = accepted
-                        .pipe()
+                        .stream
                         .peer_creds()
                         .map_err(|source| IpcError::PeerUnknown { source })?;
                     Ok(PeerIdentity {
@@ -1001,7 +879,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_flush(context),
-                Self::Server(accepted) => Pin::new(accepted.pipe_mut()).poll_flush(context),
+                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_flush(context),
             }
         }
 
@@ -1011,77 +889,8 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_shutdown(context),
-                Self::Server(accepted) => Pin::new(accepted.pipe_mut()).poll_shutdown(context),
+                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_shutdown(context),
             }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use std::io::Read as _;
-        use std::time::Duration;
-
-        use kr_protocol::session::DisplayNumber;
-        use tokio::io::AsyncWriteExt as _;
-
-        use super::{Connection, Listener};
-        use crate::testing::TempHost;
-
-        /// How long the case is given to see the close end: a watchdog, never a claim.
-        const PATIENCE: Duration = Duration::from_secs(60);
-
-        /// A close that waits for a caller to read does not wait for ever.
-        ///
-        /// The wait is a flush that returns only when the caller has read what it was sent or has
-        /// gone, so a caller that does neither would hold the connection, and the threads that
-        /// wait on it, for ever. Here the caller is sent bytes and reads nothing; the close ends
-        /// all the same, once its wait is over, and the caller finds the connection cut with what
-        /// it was sent discarded.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_caller_that_reads_nothing_is_cut_off_when_the_wait_for_it_ends() {
-            let host = TempHost::create();
-            let endpoint = host
-                .environment()
-                .worker_endpoint(DisplayNumber::new(1))
-                .expect("an endpoint");
-            let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-            let caller = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!(r"\\.\pipe\{}", endpoint.as_text()))
-                .expect("the caller opens the pipe");
-            let (mut connection, _) = tokio::time::timeout(PATIENCE, listener.accept())
-                .await
-                .expect("the caller was accepted in time")
-                .expect("the listener accepts it");
-            connection
-                .write_all(b"never read")
-                .await
-                .expect("the caller is sent bytes");
-            let crate::endpoint::Connection(Connection::Server(mut accepted)) = connection else {
-                panic!("the listener accepted a connection that is not an accepting end");
-            };
-
-            let closing = accepted
-                .close_within(Duration::from_millis(200))
-                .expect("the close waits on a thread of its own");
-            tokio::time::timeout(
-                PATIENCE,
-                tokio::task::spawn_blocking(move || closing.join()),
-            )
-            .await
-            .expect("the close ended although the caller reads nothing")
-            .expect("the wait for the close ran")
-            .expect("the close did not panic");
-
-            // The platform says the connection ended, as an end or as an error; what it never says
-            // is what the caller was sent.
-            let mut read = [0_u8; 16];
-            let found = (&caller).read(&mut read);
-            assert!(
-                !matches!(found, Ok(length) if length > 0),
-                "the caller was cut off with what it was sent discarded, got {found:?}"
-            );
         }
     }
 }
