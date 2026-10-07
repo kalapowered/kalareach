@@ -132,8 +132,8 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("voice_grant", Some(Method::VoiceGrant)),
     ("voice_delegate", Some(Method::VoiceDelegate)),
     ("voice_context", Some(Method::VoiceContext)),
-    // The two local silences and the call's own state. They reach the call this device is holding
-    // and no service at all, which is what keeps them working when the broker does not.
+    // The two local silences and the call's own state. They reach no service at all, which is what
+    // keeps them working when the broker does not.
     ("voice_set_muted", None),
     ("voice_call_state", None),
     // The application's own boundary.
@@ -890,135 +890,13 @@ read_command!(
     kr_protocol::voice::VoicePrepareParams => kr_protocol::voice::VoicePrepareResult
 );
 
-/// Starts a voice session on this device's own media.
+/// Refuses to start a voice session from this application.
 ///
-/// The offer is this application's, not the page's. Section 15 ¶2 puts capture, playback and the
-/// media path in native code, so the page names what it wants a call to reach and this asks the
-/// native call for the offer that opens it. A device that cannot negotiate a connection refuses
-/// here, before anything is submitted: the broker creates a metered provider session the moment a
-/// start reaches it, and a session created for a device that can carry no audio is one a person
-/// pays for and cannot use.
-///
-/// The answer is applied to the same call the offer came from, so the connection a person ends up
-/// holding is the one the service answered.
-///
-/// `prepared` and `expected_rate_version` are the preparation and the version of the managed rate
-/// the page showed the person, as the host answered them. Both are passed on untouched: the page is
-/// where the person saw them, and a start that named anything else would accept a scope or terms
-/// nobody was shown.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[tauri::command]
-pub async fn voice_start(
-    state: State<'_, AppState>,
-    subject: Subject,
-    session_ids: Vec<String>,
-    duration_seconds: u32,
-    reasoning_budget_minor: Option<String>,
-    prepared: kr_protocol::scalars::Digest256,
-    expected_rate_version: Option<String>,
-) -> Result<VoiceStarted> {
-    // What the page sent is parsed before anything else is asked, so a start that is not a start's
-    // shape is refused as that, whatever this device is doing.
-    let mut sessions = Vec::with_capacity(session_ids.len());
-    for value in &session_ids {
-        sessions.push(
-            value
-                .parse::<kr_protocol::ids::SessionId>()
-                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
-        );
-    }
-    let reasoning_budget_minor = match reasoning_budget_minor {
-        None => kr_protocol::scalars::Nullable::null(),
-        Some(value) => kr_protocol::scalars::Nullable::some(kr_protocol::scalars::U64::new(
-            value
-                .parse::<u64>()
-                .map_err(|_| CommandError::invalid("that is not an amount in minor units"))?,
-        )),
-    };
-
-    // One call at a time. A second offer would leave the first call's media running with nothing
-    // holding it, and this device has one microphone.
-    if crate::audio::holding_a_call() {
-        return Err(CommandError::refused(
-            "this device is already holding a voice call",
-        ));
-    }
-
-    let call = crate::audio::DesktopVoiceCall::new()?;
-    let offer_sdp = call.offer().await?;
-
-    let params = kr_protocol::voice::VoiceStartParams {
-        session_ids: sessions.into_iter().collect(),
-        offer_sdp,
-        duration_seconds,
-        reasoning_budget_minor,
-        prepared,
-        expected_rate_version: kr_protocol::scalars::Nullable(expected_rate_version),
-    };
-    let target = subject.target(state.environment_id()?)?;
-    let session = state.session()?;
-    let answer = session
-        .mutate(
-            Method::VoiceStart,
-            target,
-            None,
-            &NoPreconditions {},
-            &params,
-            MUTATION_TTL,
-        )
-        .await;
-    let answer = match answer {
-        Ok(value) => value,
-        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => {
-            return Ok(VoiceStarted {
-                receipt: None,
-                value: None,
-                action_id: Some(action_id.to_string()),
-            });
-        }
-        Err(error) => return Err(CommandError::from(error)),
-    };
-
-    let started = match &answer {
-        kr_client::Settled::Receipt(receipt) => {
-            return Ok(VoiceStarted {
-                action_id: Some(receipt.action_id.to_string()),
-                receipt: Some((**receipt).clone()),
-                value: None,
-            });
-        }
-        kr_client::Settled::Result(value) => value
-            .to_typed::<kr_protocol::voice::VoiceStartResult>()
-            .map_err(|error| {
-                CommandError::local_failure(format!("that start could not be read: {error}"))
-            })?,
-    };
-
-    // Only a started call has an answer to apply. The other two outcomes are answers in their own
-    // right: nothing was created, so there is nothing to hold.
-    if let kr_protocol::voice::VoiceStartOutcome::Started { session } = &started.outcome {
-        call.accept(&session.answer_sdp).await?;
-        // The microphone opens for this answer's voice session, until this answer's deadline, and
-        // for nothing else.
-        call.permit(
-            &session.voice_session_id.to_string(),
-            session.closes_at_ms.get(),
-        )?;
-        crate::audio::hold_call(call)?;
-    }
-    Ok(VoiceStarted {
-        receipt: None,
-        value: Some(started),
-        action_id: None,
-    })
-}
-
-/// Refuses to start a voice session from a phone build.
-///
-/// A phone's call is the native application's own, and this process opens none. The start is
-/// refused before anything is submitted, as the desktop refuses one it cannot negotiate, so no
-/// metered session is created for a call this process could not carry.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// A call's media is native code's: section 15 ¶2 puts capture, playback and the connection in the
+/// phone applications' own WebRTC and audio, and this process negotiates no connection, so it has
+/// no offer to give. A start is refused before anything is submitted, because the broker creates a
+/// metered provider session the moment a start reaches it, and a session created for a device that
+/// can carry no audio is one a person pays for and cannot use.
 #[tauri::command]
 pub async fn voice_start(
     state: State<'_, AppState>,
@@ -1059,10 +937,11 @@ pub struct VoiceStarted {
     pub action_id: Option<String>,
 }
 
-/// Ends the call this device is holding and revokes the voice session's grant.
+/// Revokes the voice session's grant on the host.
 ///
-/// The local call closes first. Section 15 ¶10 keeps local mute and transport closure working when
-/// the broker fails, and a closure that waited for a service to answer before silencing a
+/// A call's media is native code's and this process holds none, so there is no local call to close
+/// first, and the answer says so. Section 15 ¶10 keeps local mute and transport closure working
+/// when the broker fails, and a closure that waited for a service to answer before silencing a
 /// microphone would fail at exactly the moment a person most wants it to work. What the host said
 /// is reported beside the local closure rather than in place of it, so nothing here can report a
 /// grant as revoked because a microphone stopped.
@@ -1114,7 +993,7 @@ pub async fn voice_stop(
 /// What ending a call did, locally and on the host.
 #[derive(Debug, Serialize)]
 pub struct VoiceClosure {
-    /// Whether this device's own call was closed. True whenever one was running.
+    /// Whether a call of this process's own was closed. It holds none, so this is false.
     pub closed_locally: bool,
     /// What the host answered, when it could be told.
     pub settled: Option<Settled>,
@@ -1136,24 +1015,17 @@ pub enum VoiceMute {
     Playback,
 }
 
-/// Silences the microphone or the speaker on this device.
+/// Refuses to silence the microphone or the speaker: this process holds no call to act on.
 ///
-/// Local and immediate: it acts on the call this device is holding and contacts nothing. That is
-/// what KR-REQ-15.17 asks for, and it is why this is not a mutation.
+/// Local and immediate, and it contacts nothing, which is why this is not a mutation.
 #[tauri::command]
 pub fn voice_set_muted(what: VoiceMute, muted: bool) -> Result<crate::audio::VoiceCallState> {
-    crate::audio::set_muted(what_is_muted(what), muted)
+    let _ = (what, muted);
+    crate::audio::set_muted()
 }
 
-/// Maps the page's word to the call's own.
-const fn what_is_muted(what: VoiceMute) -> crate::audio::Silence {
-    match what {
-        VoiceMute::Microphone => crate::audio::Silence::Microphone,
-        VoiceMute::Playback => crate::audio::Silence::Playback,
-    }
-}
-
-/// What the call this device is holding is doing.
+/// What a call on this device is doing. This process holds none, so it reports a device holding no
+/// call.
 #[tauri::command]
 pub fn voice_call_state() -> Result<crate::audio::VoiceCallState> {
     crate::audio::call_state()
@@ -1879,17 +1751,6 @@ mod tests {
         })
     }
 
-    /// This process holds at most one voice call, in the one holder every voice command reads, so
-    /// a test that holds a call, or calls a command that starts or stops one, takes turns with it.
-    static CALL_HOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Takes this test's turn with the call holder, whatever a failed test left the lock in.
-    fn turn_with_the_call_holder() -> std::sync::MutexGuard<'static, ()> {
-        CALL_HOLDER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     #[test]
     fn every_named_command_is_unique() {
         let mut seen = BTreeSet::new();
@@ -1970,10 +1831,10 @@ mod tests {
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",
                 "setup_open_settings",
-                // Voice's own two. Both act on the call this device is holding and contact
-                // nothing: section 15 paragraph 10 keeps local mute and transport closure working
-                // when the broker fails, and a silence that had to be granted by a service is one
-                // that would fail at exactly the moment a person needs it.
+                // Voice's own two. Both contact nothing: section 15 paragraph 10 keeps local mute
+                // and transport closure working when the broker fails, and a silence that had to
+                // be granted by a service is one that would fail at exactly the moment a person
+                // needs it.
                 "voice_call_state",
                 "voice_set_muted",
                 // The account's five. Each reaches the account service or this device's secure
@@ -2153,20 +2014,16 @@ mod tests {
     /// that performs a method refuses a parameter map that is not that method's shape with
     /// `INVALID_ARGUMENT`, which it can answer only by parsing before it asks for a host. The two
     /// reads that take nothing from the page go straight to that question, and the upload, which
-    /// takes a path rather than a map, refuses one that nobody dropped. A voice start and a voice
-    /// stop take their values one by one rather than as a map, and refuse values that are not what
-    /// they claim to be in the same way; a phone build refuses every start before reading it. The
-    /// stop closes the call this device is holding before it parses anything, on purpose: section
-    /// 15 keeps a local stop available whatever else fails, and that closure contacts nothing.
+    /// takes a path rather than a map, refuses one that nobody dropped. A voice stop takes its
+    /// values one by one rather than as a map, and refuses values that are not what they claim to
+    /// be in the same way; a voice start refuses every request before reading it, because this
+    /// application opens no call.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
             decode(serde_json::json!({ "session_id": "the one I was looking at" }));
         let error = refusal.expect_err("that is not a session identifier");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
-
-        // The voice stop below closes whatever call this process holds.
-        let _turn = turn_with_the_call_holder();
 
         // Every command in the table that performs a method. A command added to the table and not
         // here is not found below, which fails this test rather than leaving it unchecked.
@@ -2223,9 +2080,9 @@ mod tests {
             voice_context,
         ]);
         // One body for every command: each reads the arguments it takes and nothing else. The
-        // voice start and stop read theirs one by one. The identifiers they parse themselves are
-        // not identifiers, and the values the invoke layer types are of their types, so the
-        // refusal is the command's own rather than the invoke layer's.
+        // voice stop reads its own one by one, and the voice start none. The identifier the stop
+        // parses itself is not an identifier, and the values the invoke layer types are of their
+        // types, so the refusal is the command's own rather than the invoke layer's.
         let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
             .expect("a digest");
         let foreign = serde_json::json!({
@@ -2245,9 +2102,7 @@ mod tests {
             let expected = match *command {
                 "host_info" | "environment_list" | "description_setup" => "HOST_NOT_CONFIGURED",
                 "attachment_upload" => "PERMISSION_DENIED",
-                // A phone opens no call in this process, so a phone build refuses every start
-                // before it reads one.
-                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                // This application opens no call, so it refuses every start before it reads one.
                 "voice_start" => "RESOURCE_UNAVAILABLE",
                 _ => "INVALID_ARGUMENT",
             };
@@ -2257,66 +2112,6 @@ mod tests {
                 "{command} answers a shape its method does not take"
             );
         }
-    }
-
-    /// KR-REQ-10.01: a voice start parses what the page sent before it asks whether this device is
-    /// holding a call. With a call held, a start whose session list or budget is not what it claims
-    /// to be is refused with `INVALID_ARGUMENT` rather than as a second call, and the same start in
-    /// its right shape is refused for the running call, which the refusals leave running.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn a_voice_start_parses_what_the_page_sent_before_it_asks_whether_a_call_is_held() {
-        /// Stops the call this test holds, however the test ends.
-        struct Held;
-        impl Drop for Held {
-            fn drop(&mut self) {
-                crate::audio::stop_active_call();
-            }
-        }
-
-        let _turn = turn_with_the_call_holder();
-        let (_app, window) = page_with(tauri::generate_handler![voice_start]);
-        let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
-            .expect("a digest");
-        let start = |session_ids: serde_json::Value, budget: serde_json::Value| {
-            serde_json::json!({
-                "subject": {},
-                "sessionIds": session_ids,
-                "durationSeconds": 60,
-                "reasoningBudgetMinor": budget,
-                "prepared": prepared,
-            })
-        };
-
-        crate::audio::hold_call(crate::audio::DesktopVoiceCall::new().expect("a call"))
-            .expect("this device holds the call");
-        let _held = Held;
-
-        let not_a_session = start(
-            serde_json::json!(["the session I was looking at"]),
-            serde_json::Value::Null,
-        );
-        assert_eq!(
-            refusal_of(&window, "voice_start", not_a_session).as_deref(),
-            Some("INVALID_ARGUMENT"),
-            "a session list that names no session is refused as that, not as a second call"
-        );
-        let not_an_amount = start(serde_json::json!([]), serde_json::json!("a lot"));
-        assert_eq!(
-            refusal_of(&window, "voice_start", not_an_amount).as_deref(),
-            Some("INVALID_ARGUMENT"),
-            "a budget that is not an amount is refused as that, not as a second call"
-        );
-        let well_formed = start(serde_json::json!([]), serde_json::Value::Null);
-        assert_eq!(
-            refusal_of(&window, "voice_start", well_formed).as_deref(),
-            Some("PERMISSION_DENIED"),
-            "a start in its right shape is refused for the call this device is holding"
-        );
-        assert!(
-            crate::audio::holding_a_call(),
-            "and the refused starts left that call running"
-        );
     }
 
     /// KR-REQ-13.16: a file the page hands over as bytes is read from the call's raw body with its

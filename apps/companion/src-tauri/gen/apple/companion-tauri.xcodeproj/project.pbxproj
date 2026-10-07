@@ -134,17 +134,14 @@
 		183BCF063CD995ED3E3B4C00 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		184AE003AADAF4CB87E713A1 /* owner.rs */ = {isa = PBXFileReference; path = owner.rs; sourceTree = "<group>"; };
 		207FF0D862E72EB40619126B /* ProbeSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeSurface.swift; sourceTree = "<group>"; };
-		20D78A09D280B9BA8932D5A2 /* buffer.rs */ = {isa = PBXFileReference; path = buffer.rs; sourceTree = "<group>"; };
 		21EFF08FF9DFE8027EAA8B8F /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		233EDCC125C890EB364292DC /* state.rs */ = {isa = PBXFileReference; path = state.rs; sourceTree = "<group>"; };
-		286BC5287B5926CF34F943B6 /* device.rs */ = {isa = PBXFileReference; path = device.rs; sourceTree = "<group>"; };
 		2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		2AAB471DF8105A26C4D3BA86 /* KalaReachUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KalaReachUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2C4D68F5B5A1CA28AA156354 /* LaunchHook.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LaunchHook.m; sourceTree = "<group>"; };
 		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
 		2F98D29B580DC36783990AB6 /* carrier.rs */ = {isa = PBXFileReference; path = carrier.rs; sourceTree = "<group>"; };
 		3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickerTests.swift; sourceTree = "<group>"; };
-		3059F574B246BBF7D8FD5B78 /* call.rs */ = {isa = PBXFileReference; path = call.rs; sourceTree = "<group>"; };
 		3121E24E1630B06FCF24ECAF /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		343C7C2C560F586215BF9C3F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		3CC3E46F612EC707E33F9F70 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -169,7 +166,6 @@
 		69D5CF4D29D34D99D53D6F1F /* remote.rs */ = {isa = PBXFileReference; path = remote.rs; sourceTree = "<group>"; };
 		6A195DBBD19A2188DF699148 /* DeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceProbe.swift; sourceTree = "<group>"; };
 		706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecisionTests.swift; sourceTree = "<group>"; };
-		78C823D47F18DFFD2735CD80 /* codec.rs */ = {isa = PBXFileReference; path = codec.rs; sourceTree = "<group>"; };
 		7A6B16292DE3C43BE1E61AFB /* VoiceCaptureStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCaptureStateTests.swift; sourceTree = "<group>"; };
 		7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewDecision.swift; sourceTree = "<group>"; };
 		7DC8E81F37E0ED10CC6B9FBC /* identity.rs */ = {isa = PBXFileReference; path = identity.rs; sourceTree = "<group>"; };
@@ -212,8 +208,6 @@
 		C3579CCF6F90E0C62DBEB619 /* LifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifecycleTests.swift; sourceTree = "<group>"; };
 		C64D4F0C05D1651BEE197024 /* target.rs */ = {isa = PBXFileReference; path = target.rs; sourceTree = "<group>"; };
 		C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
-		C9AA8800445515E8B9F94D02 /* gate.rs */ = {isa = PBXFileReference; path = gate.rs; sourceTree = "<group>"; };
-		CCDE8F6B0D2B775A6D9FFA85 /* control.rs */ = {isa = PBXFileReference; path = control.rs; sourceTree = "<group>"; };
 		D2F94BCB7283BE2B071B831A /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D5BA8B3F99FC67438FEBDEFB /* FirebaseConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirebaseConfiguration.swift; sourceTree = "<group>"; };
 		D607C597A5761B168642D0EB /* VoiceCall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCall.swift; sourceTree = "<group>"; };
@@ -367,12 +361,6 @@
 		5A7F67E2DD8917AEC7F1B309 /* audio */ = {
 			isa = PBXGroup;
 			children = (
-				20D78A09D280B9BA8932D5A2 /* buffer.rs */,
-				3059F574B246BBF7D8FD5B78 /* call.rs */,
-				78C823D47F18DFFD2735CD80 /* codec.rs */,
-				CCDE8F6B0D2B775A6D9FFA85 /* control.rs */,
-				286BC5287B5926CF34F943B6 /* device.rs */,
-				C9AA8800445515E8B9F94D02 /* gate.rs */,
 				14EA6778E306DFA8DC4625F9 /* mod.rs */,
 				5383232BB4B2C41130FF6993 /* state.rs */,
 			);
