@@ -63,13 +63,14 @@ fn actor(name: &str) -> ActorId {
 /// the announcement while anything else holds it: the generation another of the daemon's links
 /// presents, a mutation and a maintenance pass each hold it for a moment. A refused announcement
 /// leaves that worker `pending`, which section 9 makes the answer and not a failure, and the fence
-/// stays owed, so a status read or a start announces again. A refused page of the evidence that
-/// follows an acknowledgement is another matter: the barrier holds and the fence is settled, so
-/// only a proxy that opens, a remote dispatch or a later barrier asks for the rest, and nothing
-/// schedules one for the revocation itself. A test that needs the whole of a report therefore
-/// announces again until `settled` accepts it, and never reads the first answer as the last. One
-/// deadline bounds the whole wait: it is checked before each announcement, and each announcement
-/// is cut off at it.
+/// stays owed, so a status read or a start announces again. A page of the evidence that follows
+/// an acknowledgement is refused for the same reason, and the daemon asks for it again itself,
+/// after a pause that grows and within a bound; a worker that is still busy after the bound leaves
+/// the rest of its names to the next announcement, and the barrier holds and the fence is settled
+/// by then, so only a proxy that opens, a remote dispatch or a later barrier makes one. A test
+/// that needs the whole of a report therefore announces again until `settled` accepts it, and
+/// never reads the first answer as the last. One deadline bounds the whole wait: it is checked
+/// before each announcement, and each announcement is cut off at it.
 async fn announced_until(
     controller: &Controller,
     first: kr_protocol::action::RevocationBarrier,
@@ -2546,10 +2547,12 @@ impl HeldBoundary {
 /// KR-REQ-09.13: a fence whose evidence does not fit one acknowledgement is delivered in pages,
 /// and the revocation's report names every action once the daemon has collected them all.
 ///
-/// A page the worker refuses because its dispatch boundary is held is asked for again only by a
-/// later announcement, and nothing schedules one for the revocation: that is the open part of the
-/// naming row, and this case announces again itself ([`announced_until`]) so that it decides what
-/// the pages carry and not when the daemon next announces.
+/// A page the worker refuses because its dispatch boundary is held is asked for again by the
+/// daemon itself (`a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_asked_for_again`
+/// holds the boundary there to show it). This case still announces again itself
+/// ([`announced_until`]), because its first announcement can be refused whole, which leaves the
+/// worker pending, and so that it decides what the pages carry and not when the daemon next
+/// announces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
     let hosted = hosted_worker().await;
