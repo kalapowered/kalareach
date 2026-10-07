@@ -46,6 +46,31 @@ use common::{
 };
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
+/// Whether `bytes` carry a bell: a BEL that is not inside a string. A BEL that ends an
+/// operating-system command, as one does a window title, is that command's terminator and not a
+/// bell, and a Windows pseudo-console ends the title it writes that way.
+fn has_a_bell(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == 0x07 {
+            return true;
+        }
+        if bytes[at] == 0x1b && bytes.get(at + 1) == Some(&b']') {
+            at += 2;
+            while at < bytes.len()
+                && bytes[at] != 0x07
+                && !(bytes[at] == 0x1b && bytes.get(at + 1) == Some(&b'\\'))
+            {
+                at += 1;
+            }
+            at += if bytes.get(at) == Some(&0x07) { 1 } else { 2 };
+        } else {
+            at += 1;
+        }
+    }
+    false
+}
+
 /// Bytes shown as their escaped text, which a failure message prints under `{:?}` as it is and not
 /// as the structure that escapes it.
 struct Shown(String);
@@ -435,7 +460,7 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console answers the terminal's queries itself, so the query this case waits for never reaches the output and the host's answer is never asked for"
 )]
 async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
     // The shell asks the terminal what it is. A host that forwarded the question would have the
@@ -494,7 +519,7 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console writes no line ending after a clipboard sequence, which is what this case waits for"
 )]
 async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     // A bell, a clipboard write and some text, all before anybody attaches. What the attachment
@@ -597,10 +622,6 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
 /// KR-REQ-08.06, KR-REQ-08.38: a side effect reaches the one attachment holding the input lease,
 /// under the host's policy, and no other terminal watching the same output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
-)]
 async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     // The bell, a clipboard write and a line of text in one write. The bell and the clipboard
     // write are side effects and have one destination; the text is output and reaches every
@@ -629,12 +650,12 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     let rang = collect_until(&mut holder, b"kr-after.").await;
     let watched = collect_until(&mut watcher, b"kr-after.").await;
     assert!(
-        rang.contains(&0x07),
+        has_a_bell(&rang),
         "the bell reaches the attachment holding the input lease: {:?}",
         Shown::of(&rang)
     );
     assert!(
-        !watched.contains(&0x07),
+        !has_a_bell(&watched),
         "and reaches nobody else, because a side effect has one destination: {:?}",
         Shown::of(&watched)
     );
@@ -707,7 +728,7 @@ const SPLIT_CLIPBOARD_WRITE: &str = "stty -echo -echonl || exit 1; printf '\\033
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console holds back an unfinished sequence, so the first half of the clipboard write this case waits for never reaches the output"
 )]
 async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole() {
     let host = host(SPLIT_CLIPBOARD_WRITE).await;
@@ -731,7 +752,7 @@ async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console holds back an unfinished sequence, so the first half of the clipboard write this case waits for never reaches the output"
 )]
 async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches_it() {
     let host = host(SPLIT_CLIPBOARD_WRITE).await;
@@ -762,10 +783,6 @@ async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches
 /// KR-REQ-08.38, KR-REQ-08.06: with nobody holding the input lease a side effect has no
 /// destination, so it is recorded as a durable host event and reaches no attached terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
-)]
 async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_terminal() {
     // Two terminals watch and neither takes the keys, so nobody can release the application by
     // typing. It waits for a file this test creates once both are watching, on the internal disk
@@ -789,7 +806,7 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
     let second_saw = collect_until(&mut second, b"kr-rang.").await;
     for (who, saw) in [("first", &first_saw), ("second", &second_saw)] {
         assert!(
-            !saw.contains(&0x07) && !carries(saw, b"]52;"),
+            !has_a_bell(saw) && !carries(saw, b"]52;"),
             "the {who} watcher is sent neither side effect: {:?}",
             Shown::of(saw)
         );
@@ -825,7 +842,7 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console answers the terminal's queries itself, so the query this case waits for never reaches the output"
 )]
 async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     // The application turns bracketed paste on, asks its question only when this test says so,
@@ -884,7 +901,7 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console answers the terminal's queries itself, so the query this case waits for never reaches the output"
 )]
 async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
@@ -1056,7 +1073,7 @@ async fn flooded_application() -> Flooded {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console answers the terminal's queries itself, so a flood of them never reaches the host to be degraded"
 )]
 async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_typed_line_is_taken_whole() {
     let Flooded {
@@ -1168,7 +1185,7 @@ async fn a_flooded_application_answers_the_line_typed_to_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console answers the terminal's queries itself, so the host's answer this case waits for is never sent"
 )]
 async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer() {
     // The application asks once, when this test opens the gate, and then shows everything it is
@@ -1274,7 +1291,7 @@ async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console answers the terminal's queries and takes the clipboard and notification sequences itself, so they never reach the output this case reads"
+    ignore = "a Windows pseudo-console decodes the bytes itself and writes valid text, so the malformed bytes this case sends never reach the host"
 )]
 async fn malformed_output_moves_a_direct_terminal_to_projection_with_replacement_characters() {
     // A surrogate, which is never valid UTF-8, between two runs of good text, written only once
