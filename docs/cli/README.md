@@ -1779,11 +1779,16 @@ The reason is the first of these that holds, in this order:
 | `size_mismatch` | its size is not the session's |
 | `history_window` | its window is above the live screen |
 | `stream_not_carryable` | the session's output is no longer something a terminal can be handed as it is |
-| `restoration_incomplete` | the screen it was last given could not carry everything the application addresses, such as a pending wrap, until the session's screen is one a restoration can carry |
+| `restoration_incomplete` | the screen it was last given could not carry everything the application addresses, such as a pending wrap |
 | `awaiting_parser_boundary` | forwarding waits for the session's output to reach the end of a sequence |
 
 The first three last as long as the attachment stays as it is, the window until the person
 returns to the live screen, and the others pass by themselves.
+
+An attachment kept off the stream by `restoration_incomplete` is handed it again when the session's
+output goes quiet on a screen a restoration can carry, for example once the line that wrapped has
+been cleared. A client that is shown the live screen alone never has such a screen, because the
+rows of the other buffer are always left out, so its reason stays.
 
 A closed session carries its record instead of a null: whose it is, how it closed, the owned
 processes the closure terminated and anything that survived it.
