@@ -911,9 +911,16 @@ impl AttentionModule {
     /// The platform's time service is asked at each reading, and whether it qualifies is what the
     /// decision takes from it. Without the decision attached the wall clock is read as unproven.
     fn reading(&self) -> HostReading {
+        self.reading_and_debt().0
+    }
+
+    /// As [`Self::reading`], and whether the host owes its record a write that the reading found
+    /// or had left. A forgetting is not made while a write is owed: what the host knows of its
+    /// clock is ahead of its record.
+    fn reading_and_debt(&self) -> (HostReading, bool) {
         let qualified = self.adapter.read().is_qualified();
         let Some(watched) = self.clock.get().and_then(|clock| clock.watch(qualified)) else {
-            return unproven_reading(self.boot);
+            return (unproven_reading(self.boot), false);
         };
         // The host owes its record a write: the first reading that finds so wakes the maintenance
         // loop, which may be in a wait it began while nothing was owed, and it comes back soon
@@ -925,11 +932,14 @@ impl AttentionModule {
         } else {
             self.clock_owed.store(false, Ordering::Relaxed);
         }
-        HostReading::new(
-            self.boot,
-            kr_ipc::clock::boot_elapsed_ms(),
-            watched.wall_ms,
-            watched.proven,
+        (
+            HostReading::new(
+                self.boot,
+                kr_ipc::clock::boot_elapsed_ms(),
+                watched.wall_ms,
+                watched.proven,
+            ),
+            watched.owed,
         )
     }
 
@@ -2805,9 +2815,10 @@ impl AttentionModule {
     }
 
     /// Runs the store's timers once, and lets go of the action records that have outlived their
-    /// retention when that is due: `forgotten_at` is the wall reading the last such pass was made
-    /// at. Returns the reading the pass decided under and the one to pass on next, or `None` when
-    /// the pool was shut down before the pass ran.
+    /// retention when that is due: `forgotten_at` is the wall reading the last cutoff was counted
+    /// from, and a pass is due an hour after it or whenever the clock reads before it. Returns the
+    /// reading the pass decided under and the marker to pass on next, or `None` when the pool was
+    /// shut down before the pass ran.
     pub(crate) async fn tick_and_forget(
         self: &Arc<Self>,
         forgotten_at: u64,
@@ -2841,8 +2852,8 @@ impl AttentionModule {
                     // with the store held and the store is held to the delete: no record can be
                     // stamped after a correction between the two, and the cutoff is counted from
                     // the earlier of the two readings, never later than the clock stands now.
-                    let held = module.reading();
-                    if held.wall_proven {
+                    let (held, owed) = module.reading_and_debt();
+                    if held.wall_proven && !owed {
                         let counted = asked.min(held.wall_ms.get());
                         // The schedule moves to the reading the cutoff was counted from, and
                         // only once the records are gone.
@@ -5818,12 +5829,62 @@ pub(crate) mod tests {
             "the schedule moves to the reading the cutoff was counted from, not to the late one"
         );
 
-        // The pass after that is due although the clock reads far behind the late reading.
+        // The marker the pass returned is what the next pass is given, and it forgets what has
+        // since outlived its retention.
         clock.set_wall(CLOCK_START + 31 * 86_400_000);
         module.tick_and_forget(marker).await.expect("the pass runs");
-        assert!(
-            recorded_actions(&temp).is_empty(),
-            "the next pass is not waited for until the clock catches up with a reading taken back"
+        assert!(recorded_actions(&temp).is_empty());
+    }
+
+    /// KR-REQ-09.14, KR-REQ-09.18: a forgetting is not made while the host owes its record a write
+    /// that the final reading found. The host answers that the store may forget and the pass stops
+    /// before it takes the store; the owner then establishes the clock back at the corrected
+    /// moment, a record is stamped, the store refuses the anchor's write and the clock steps a
+    /// month forward. The final reading owes its anchor, though it is proven and its cutoff would
+    /// reach the record stamped after the correction: nothing is forgotten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_final_reading_that_leaves_a_write_owed_forgets_nothing() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        clock.set_wall(CLOCK_START + 100 * 86_400_000);
+        assert!(module.reading().wall_proven);
+        record_action(&temp, "old", 1);
+
+        let (arrived, go) = module.after_the_clock_answer.arm();
+        let pass = tokio::spawn({
+            let module = Arc::clone(&module);
+            async move { module.tick_and_forget(0).await }
+        });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("joins")
+            .expect("the pass reached the clock question");
+
+        clock.set_wall(CLOCK_START);
+        clock
+            .trust
+            .establish(&clock.devices)
+            .expect("the owner establishes");
+        record_action(&temp, "new", CLOCK_START);
+        clock
+            .devices
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER refuse_the_anchor BEFORE UPDATE OF anchor_wall_ms
+                     ON network_clock BEGIN SELECT RAISE(ABORT, 'the store is full'); END;",
+                )
+            })
+            .expect("the store takes a trigger");
+        clock.set_wall(CLOCK_START + 31 * 86_400_000);
+        go.send(()).expect("the pass goes on");
+        pass.await.expect("the pass ends").expect("the pass runs");
+
+        assert_eq!(
+            recorded_actions(&temp),
+            vec!["new".to_owned(), "old".to_owned()],
+            "nothing is forgotten while the host owes its record the step"
         );
     }
 
