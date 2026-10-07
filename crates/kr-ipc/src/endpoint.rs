@@ -615,8 +615,9 @@ mod platform {
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
             let connection = Connection::Server(Accepted {
-                stream,
+                stream: Some(stream),
                 caller: Caller::Unproved,
+                written: false,
             });
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
@@ -658,8 +659,13 @@ mod platform {
     /// Only the reader drives the proof, so only the reader waits on the pipe's read readiness.
     #[derive(Debug)]
     pub(super) struct Accepted {
-        stream: PipeServer,
+        /// The accepting end, which is there until the connection is dropped and handed to the
+        /// thread that closes it ([`Drop`]).
+        stream: Option<PipeServer>,
         caller: Caller,
+        /// Whether anything has been written to the caller, which is what a close has to see
+        /// delivered.
+        written: bool,
     }
 
     /// What is known of an accepted connection's caller.
@@ -674,9 +680,23 @@ mod platform {
     }
 
     impl Accepted {
+        /// The accepting end, for as long as the connection is open.
+        fn pipe(&self) -> &PipeServer {
+            self.stream
+                .as_ref()
+                .expect("the accepting end is there until the connection is dropped")
+        }
+
+        /// The same, to read and write through.
+        fn pipe_mut(&mut self) -> &mut PipeServer {
+            self.stream
+                .as_mut()
+                .expect("the accepting end is there until the connection is dropped")
+        }
+
         /// Settles the caller from its opening bytes.
         fn settle(&mut self, opening: Vec<u8>) {
-            let PipeServer::NamedPipe(pipe) = &self.stream;
+            let PipeServer::NamedPipe(pipe) = self.pipe();
             self.caller = match crate::starter::pipe_client_is_this_user(pipe.as_handle()) {
                 Ok(true) => Caller::Admitted {
                     opening,
@@ -717,13 +737,13 @@ mod platform {
                             *delivered += take;
                             return Poll::Ready(Ok(()));
                         }
-                        return Pin::new(&mut self.stream).poll_read(context, buffer);
+                        return Pin::new(self.pipe_mut()).poll_read(context, buffer);
                     }
                     Caller::Refused(detail) => return Poll::Ready(Err(Self::refusal(detail))),
                     Caller::Unproved => {
                         let mut opening = vec![0_u8; OPENING_READ];
                         let mut read = ReadBuf::new(&mut opening);
-                        match Pin::new(&mut self.stream).poll_read(context, &mut read) {
+                        match Pin::new(self.pipe_mut()).poll_read(context, &mut read) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                             Poll::Ready(Ok(())) => {
@@ -750,9 +770,49 @@ mod platform {
             match &self.caller {
                 Caller::Refused(detail) => Poll::Ready(Err(Self::refusal(detail))),
                 Caller::Unproved | Caller::Admitted { .. } => {
-                    Pin::new(&mut self.stream).poll_write(context, bytes)
+                    self.written = true;
+                    Pin::new(self.pipe_mut()).poll_write(context, bytes)
                 }
             }
+        }
+    }
+
+    /// Closes the accepting end of a connection without making any other connection wait for it.
+    ///
+    /// A pipe's server end closed with bytes the caller has not read can lose them, so closing it
+    /// first flushes it, which waits until the caller has read everything or has gone. The pipe
+    /// library does that on one thread that every connection of the process shares, one handle at
+    /// a time, so a caller that is slow to read, or never reads, holds up every close queued behind
+    /// its own: those connections stay open, their callers never see them end, and whatever waits
+    /// for that waits for ever. A close that has something to deliver is given a thread of its own
+    /// instead, which flushes over a duplicate of the handle and only then lets the library close
+    /// the pipe, so everything the library is handed has already been read by its caller and its
+    /// flush returns at once. A caller that never reads keeps its own connection open, as it would
+    /// by holding it, and nothing else.
+    impl Drop for Accepted {
+        fn drop(&mut self) {
+            let Some(stream) = self.stream.take() else {
+                return;
+            };
+            if !self.written {
+                return;
+            }
+            let PipeServer::NamedPipe(pipe) = &stream;
+            let Ok(duplicate) = pipe.as_handle().try_clone_to_owned() else {
+                // The library's own close is what is left, and it delivers.
+                return;
+            };
+            let file = std::fs::File::from(duplicate);
+            // A thread that cannot be started leaves the closure, and the library's close with it,
+            // to this thread.
+            let _ = std::thread::Builder::new()
+                .name("kr-ipc pipe flush".to_owned())
+                .spawn(move || {
+                    // A flush of a pipe's handle waits for the caller to read what was written.
+                    let _ = file.sync_all();
+                    drop(file);
+                    drop(stream);
+                });
         }
     }
 
@@ -809,7 +869,7 @@ mod platform {
                 // to; a caller of another account never gets a byte through to be acted on.
                 Self::Server(accepted) => {
                     let credentials = accepted
-                        .stream
+                        .pipe()
                         .peer_creds()
                         .map_err(|source| IpcError::PeerUnknown { source })?;
                     Ok(PeerIdentity {
@@ -861,7 +921,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_flush(context),
-                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_flush(context),
+                Self::Server(accepted) => Pin::new(accepted.pipe_mut()).poll_flush(context),
             }
         }
 
@@ -871,7 +931,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_shutdown(context),
-                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_shutdown(context),
+                Self::Server(accepted) => Pin::new(accepted.pipe_mut()).poll_shutdown(context),
             }
         }
     }
