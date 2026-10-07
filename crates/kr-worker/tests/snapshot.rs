@@ -2180,9 +2180,9 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
 
 /// KR-REQ-08.78 and KR-REQ-08.82: a cursor saved with a wrap pending is a state the terminals
 /// measured do not give back, and the restoration sets none, so a terminal drawn such a screen is
-/// shown a projection. The same screen with the cursor saved before the last column was filled
-/// leaves it on the stream. The cursor itself has no wrap pending in either case: the save is
-/// followed by a move, so only the saved one differs.
+/// shown a projection. A screen whose cursor was saved before the last column was written leaves
+/// it on the stream. The cursor itself has no wrap pending in either case: the save is followed by
+/// a move, so only the saved one differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saved_cursor_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_projection() {
     let narrow = Dimensions::new(4, 5);
@@ -2273,6 +2273,56 @@ async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_scre
         |seen| carries(&joined(seen), b"after"),
     )
     .await;
+}
+
+/// KR-REQ-08.78 and KR-REQ-08.82: what a terminal was last given says nothing once its window
+/// changes, because the next screen is drawn for the window it has then. A terminal kept on a
+/// projection by a line the application wrapped, whose window shrinks and then returns to the
+/// session's size after the application has cleared the screen, is handed the stream when it
+/// returns, with no output from the application to prompt it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_screen_can_be_carried() {
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abcdef'; read -r _; \
+         printf '\\033[H\\033[2J'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abcdef").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::RestorationIncomplete)
+        ),
+        "the line the application wrapped cannot be drawn as one"
+    );
+
+    // The window shrinks, so its size is the reason now, and the application clears the screen
+    // while that is so: nothing keeps the terminal off the stream but its own size.
+    let smaller = report_viewport(&host, &mut attached, Dimensions::new(3, 5), None).await;
+    assert_eq!(
+        smaller.presentation_reason.0,
+        Some(PresentationReason::SizeMismatch)
+    );
+    typist.release(&host).await;
+    produced(&host.runtime, b"\x1b[2J").await;
+
+    // The window is the session's size again. The screen the session holds can be carried, so the
+    // report says the terminal is handed the stream, without the application writing anything.
+    let returned = report_viewport(&host, &mut attached, narrow, None).await;
+    assert_eq!(
+        (returned.presentation, returned.presentation_reason.0),
+        (TerminalPresentationMode::Direct, None)
+    );
 }
 
 /// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any
