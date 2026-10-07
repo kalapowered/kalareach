@@ -1133,6 +1133,33 @@ fn grant_full(path: &Path, account: &str) {
 /// The security identifier of the Everyone group, which no descriptor's list may name.
 const EVERYONE: &str = "S-1-1-0";
 
+/// KR-REQ-05.03: a descriptor that is being retired is read as no descriptor.
+///
+/// A file deleted while another handle on it is open stays under its name until that handle is
+/// closed, and nothing can open it meanwhile: the operating system refuses with "access is
+/// denied", the answer it gives for a list that refuses the account. It is not that. The name is
+/// retired, and a reader that meets it, such as a client listing sessions while the daemon closes
+/// one, has to find no descriptor, never a failure to read one.
+#[test]
+fn a_descriptor_whose_removal_is_pending_is_read_as_no_descriptor() {
+    let host = TempHost::create();
+    let environment = host.environment();
+    let published = descriptor(&host, 6, "retiring");
+    kr_ipc::descriptor::publish(&environment, &published).expect("publishes the descriptor");
+    // A reader that is part way through the file when the daemon retires it.
+    let reading = std::fs::File::open(environment.descriptor_file(published.session_id))
+        .expect("a reader holds the descriptor open");
+
+    kr_ipc::descriptor::retire(&environment, published.session_id).expect("retires it");
+    let read = kr_ipc::descriptor::read(&environment, published.session_id);
+
+    assert!(
+        matches!(read, Ok(None)),
+        "a descriptor whose removal is pending is no descriptor: {read:?}"
+    );
+    drop(reading);
+}
+
 /// KR-REQ-05.03: a descriptor whose access-control list grants an account this host does not trust
 /// is refused, rather than read and acted on. The public key inside a descriptor decides which
 /// worker a client trusts, so a file any account could have written is not one to read a key from.
