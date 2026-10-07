@@ -562,6 +562,48 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 9 has an owner perform "an explicit authenticated retrust action" when this host's
+    // clock cannot be trusted again from evidence, and section 23 names no method that performs
+    // it. This build adds the one effect that spends the owner's confirmation of the clock. It is
+    // served on the local socket and to a paired device whose grant manages this host, it asks for
+    // host management, it always needs a fresh owner confirmation, and it is de-duplicated by
+    // actor and action.
+    let clock = [("host.clock.establish", EffectClass::Write)];
+    for (name, effect) in clock {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::OwnerConfirmation,
+            "{name} spends an owner confirmation"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is never reachable from a session, a plugin or an unpaired peer"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::Always,
+            "{name} always needs a fresh owner confirmation"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ActionWindow,
+            "{name} is a first admission under an action window"
+        );
+        assert_eq!(
+            entry.idempotency,
+            IdempotencyBehaviour::ActionDeduplicated,
+            "{name} is de-duplicated by actor and action"
+        );
+    }
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -677,6 +719,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + policy.len()
             + voice.len()
             + owner.len()
+            + clock.len()
             + inspection.len(),
         "the registry holds the required methods and the named additions"
     );
@@ -1041,6 +1084,7 @@ fn host_management_methods_require_the_host_manage_right() {
         "machine.join",
         "machine.merge",
         "machine.split",
+        "host.clock.establish",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(
@@ -1062,6 +1106,7 @@ fn owner_confirmation_covers_the_sensitive_operations() {
         "catalogue.add",
         "plugin.grant",
         "owner.confirmation.complete",
+        "host.clock.establish",
     ] {
         assert_eq!(
             lookup(name).expect("listed").confirmation,

@@ -238,7 +238,8 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
 
         Method::OwnerConfirmationRequest
         | Method::OwnerConfirmationPending
-        | Method::OwnerConfirmationComplete => at(PAIRING, "Owner confirmation"),
+        | Method::OwnerConfirmationComplete
+        | Method::HostClockEstablish => at(PAIRING, "Owner confirmation"),
 
         Method::EventsSubscribe
         | Method::EventsSnapshot

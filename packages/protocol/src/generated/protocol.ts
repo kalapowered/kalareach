@@ -2127,6 +2127,8 @@ export interface KalaReachProtocol {
   hello_reply?: HelloReply
   history_page_params?: HistoryPageParams
   history_page_result?: HistoryPageResult
+  host_clock_establish_params?: HostClockEstablishParams
+  host_clock_establish_result?: HostClockEstablishResult
   host_doctor_result?: HostDoctorResult
   host_info_result?: HostInfoResult
   host_selection?: HostSelection
@@ -14623,6 +14625,22 @@ export interface HistoryPageResult {
   oldest_retained_cursor: string
 }
 /**
+ * The parameters of `host.clock.establish`.
+ *
+ * There are none: what the owner confirmed is the digest of [`CLOCK_PURPOSE`], and the effect is
+ * the one the host takes when it trusts its own clock again.
+ */
+export interface HostClockEstablishParams {}
+/**
+ * The result of `host.clock.establish`.
+ */
+export interface HostClockEstablishResult {
+  /**
+   * The owner confirmation this establishment spent, which the host's acceptance record names.
+   */
+  confirmation_id: string
+}
+/**
  * The result of `host.doctor`.
  */
 export interface HostDoctorResult {
@@ -15962,6 +15980,7 @@ export interface MethodEntry {
     | 'owner.confirmation.request'
     | 'owner.confirmation.pending'
     | 'owner.confirmation.complete'
+    | 'host.clock.establish'
     | 'events.subscribe'
     | 'events.snapshot'
     | 'history.page'
@@ -16404,9 +16423,9 @@ export interface OwnerConfirmationCompleteParams {
    * The key a bootstrap proof is signed with.
    *
    * Present only for the `local_bootstrap_terminal` channel, which a host accepts only while it
-   * has no owner, only from local IPC and only for establishing its first owner. The key proves
-   * possession and nothing else: the evidence is the local caller at an interactive terminal
-   * outside a KalaReach session.
+   * has no owner, only from local IPC and only for establishing its first owner or its clock.
+   * The key proves possession and nothing else: the evidence is the local caller at an
+   * interactive terminal outside a KalaReach session.
    */
   bootstrap_signer: AuthorisationKey | null
   proof: OwnerConfirmationProof1
@@ -24521,6 +24540,7 @@ export interface ServiceRequestPayload {
     | 'owner.confirmation.request'
     | 'owner.confirmation.pending'
     | 'owner.confirmation.complete'
+    | 'host.clock.establish'
     | 'events.subscribe'
     | 'events.snapshot'
     | 'history.page'

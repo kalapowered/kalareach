@@ -251,6 +251,7 @@ links to its document.
 | `owner.confirmation.request` | write | `local_ipc`, `paired_device` | Start a confirmation ceremony bound to one single-use action digest. | [Pairing: Owner confirmation](../pairing/README.md) |
 | `owner.confirmation.pending` | read | `local_ipc`, `paired_device` | The confirmation challenges an owner can still answer, each with the exact action it approves, so a separately paired owner device can approve what the local owner asked. | [Pairing: Owner confirmation](../pairing/README.md) |
 | `owner.confirmation.complete` | write | `local_ipc`, `paired_device` | Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof. | [Pairing: Owner confirmation](../pairing/README.md) |
+| `host.clock.establish` | write | `local_ipc`, `paired_device` | Trust this host's wall clock again, on an owner confirmation that names exactly that: it ends the host-wide distrust of the clock, the holds that follow from it and a lost clock continuity, in one step, and never revives an object that already expired. | [Pairing: Owner confirmation](../pairing/README.md) |
 
 ## State recovery
 

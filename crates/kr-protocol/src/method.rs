@@ -1277,6 +1277,15 @@ methods! {
     doc: "Complete the ceremony with a protected user-verification context. A click that desktop \
           automation can synthesise is not that proof.";
 
+    HostClockEstablish = "host.clock.establish", OwnerConfirmation,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: Always, idempotency: ACTION,
+    doc: "Trust this host's wall clock again, on an owner confirmation that names exactly that: \
+          it ends the host-wide distrust of the clock, the holds that follow from it and a lost \
+          clock continuity, in one step, and never revives an object that already expired.";
+
     // ----- State recovery -------------------------------------------------------------------
     EventsSubscribe = "events.subscribe", StateRecovery,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],

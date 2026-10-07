@@ -19,8 +19,8 @@
 //!   exact expectation matches, so no method takes a confirmation reference a caller could point
 //!   at another action's approval.
 //! * **The channel is inside the signature.** A session, plugin or contact-tool channel is never a
-//!   confirmation, and the interactive controlling terminal is the initial bootstrap and nothing
-//!   more.
+//!   confirmation, and the interactive controlling terminal is the initial bootstrap: while a host
+//!   has no owner it confirms the first owner and the host's clock, and nothing else.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -545,9 +545,9 @@ pub struct OwnerConfirmationCompleteParams {
     /// The key a bootstrap proof is signed with.
     ///
     /// Present only for the `local_bootstrap_terminal` channel, which a host accepts only while it
-    /// has no owner, only from local IPC and only for establishing its first owner. The key proves
-    /// possession and nothing else: the evidence is the local caller at an interactive terminal
-    /// outside a KalaReach session.
+    /// has no owner, only from local IPC and only for establishing its first owner or its clock.
+    /// The key proves possession and nothing else: the evidence is the local caller at an
+    /// interactive terminal outside a KalaReach session.
     pub bootstrap_signer: Nullable<AuthorisationKey>,
 }
 
@@ -561,6 +561,22 @@ pub struct OwnerConfirmationCompleteResult {
     pub channel: ConfirmationChannel,
     /// When the host recorded the answer, in UTC milliseconds.
     pub answered_at_ms: TimestampMs,
+}
+
+/// The parameters of `host.clock.establish`.
+///
+/// There are none: what the owner confirmed is the digest of [`CLOCK_PURPOSE`], and the effect is
+/// the one the host takes when it trusts its own clock again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostClockEstablishParams {}
+
+/// The result of `host.clock.establish`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostClockEstablishResult {
+    /// The owner confirmation this establishment spent, which the host's acceptance record names.
+    pub confirmation_id: ConfirmationId,
 }
 
 #[cfg(test)]
@@ -942,6 +958,28 @@ mod tests {
             *root_key_ids = vec!["k1".to_owned(), "k1".to_owned()];
         }
         assert_eq!(CatalogueTrustPlan::of_display(&repeated), None);
+    }
+
+    /// The digest an owner confirms to establish a host's clock is the one every owner device
+    /// recomputes, so its bytes are fixed here: a change to the purpose, to its encoding or to the
+    /// hash would leave an owner device approving a digest the host never asks for.
+    #[test]
+    fn the_clock_confirmation_digest_is_fixed() {
+        let encoded = kr_cbor::to_canonical_vec(&CLOCK_PURPOSE).expect("encodes");
+        assert_eq!(
+            encoded,
+            [
+                0x6f, 0x6b, 0x72, 0x2d, 0x68, 0x6f, 0x73, 0x74, 0x2d, 0x63, 0x6c, 0x6f, 0x63, 0x6b,
+                0x2f, 0x31,
+            ]
+        );
+        let digest = kr_cbor::sha256(&encoded);
+        let expected: [u8; 32] = [
+            0xc8, 0xe5, 0x87, 0xc2, 0xc5, 0x01, 0x4f, 0xf1, 0x45, 0x48, 0x57, 0xdd, 0xab, 0x5a,
+            0xb8, 0x11, 0xed, 0xb9, 0xf2, 0x43, 0xb3, 0xd5, 0x9c, 0xa6, 0xd0, 0x6a, 0x6f, 0xf2,
+            0x05, 0x97, 0x75, 0x56,
+        ];
+        assert_eq!(digest, expected);
     }
 
     #[test]
