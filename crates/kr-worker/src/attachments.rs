@@ -630,9 +630,9 @@ impl AttachmentTable {
             .collect()
     }
 
-    /// Returns every terminal attachment whose only reason for a projection is the screen it was
-    /// last given: each condition before it holds, so a screen that could be carried would put it
-    /// back on the stream.
+    /// Returns every terminal attachment whose first reason for a projection is the screen it was
+    /// last given: each condition before it holds, so a screen that could be carried would end
+    /// that reason, and the conditions after it are asked of it then.
     #[must_use]
     pub fn held_by_restoration(&self) -> Vec<AttachmentId> {
         self.attachments

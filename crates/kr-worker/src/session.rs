@@ -392,6 +392,9 @@ pub struct Session {
     held_input_bytes: usize,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
+    /// The output cursor at which terminals kept on a projection by their screen were last asked
+    /// whether a screen drawn now would carry everything.
+    reconsidered_at: u64,
     /// How much of the screen each attachment's caller may be shown.
     ///
     /// Section 10's live-screen exception is the currently visible screen and never the buffer
@@ -720,6 +723,7 @@ impl Session {
             interrupt_failed: None,
             held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
+            reconsidered_at: 0,
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3090,20 +3094,43 @@ impl Session {
     /// favours is served the stream again through the change `deliver` makes for every
     /// attachment that moves between the two, which draws it a screen of its own at a boundary.
     /// Nothing is drawn for anybody here, so nothing is counted among what renderings left out.
+    ///
+    /// The question is asked once per screen, because it is a question about the screen: a quiet
+    /// moment at an output cursor already asked about has nothing new to find, and the join that
+    /// put an attachment on a projection asked it of the screen it was then. Terminals that would
+    /// be drawn the same restoration share one answer.
     fn reconsider_incomplete_restorations(&mut self) {
+        let cursor = self.engine.output_cursor();
+        if std::mem::replace(&mut self.reconsidered_at, cursor) == cursor {
+            return;
+        }
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
+        let mut answers = Vec::new();
         for attachment_id in self.attachments.held_by_restoration() {
             let Ok(dimensions) = self.attachment_dimensions(attachment_id) else {
                 continue;
             };
             let keyboard = self.attachments.keyboard_control(attachment_id);
             let scope = self.content_scope(attachment_id);
-            let carried = self
-                .engine
-                .carried_by_restoration(dimensions, keyboard, scope);
-            self.attachments
-                .note_restoration(attachment_id, carried.continues_the_stream());
+            if scope == crate::render::Scope::LiveScreen {
+                // The other buffer's rows are always left out of what a caller shown the live
+                // screen alone is drawn, so such a terminal never has a screen to be handed the
+                // stream from.
+                continue;
+            }
+            let key = (dimensions, keyboard, scope);
+            let continues = match answers.iter().find(|(asked, _)| *asked == key) {
+                Some((_, continues)) => *continues,
+                None => {
+                    let carried = self
+                        .engine
+                        .carried_by_restoration(dimensions, keyboard, scope);
+                    answers.push((key, carried.continues_the_stream()));
+                    carried.continues_the_stream()
+                }
+            };
+            self.attachments.note_restoration(attachment_id, continues);
         }
     }
 
