@@ -2726,8 +2726,8 @@ async fn a_resize_that_frees_a_held_terminal_mid_sequence_leaves_it_waiting_for_
     let narrow = Dimensions::new(8, 5);
     let wide = Dimensions::new(12, 5);
     let host = host_with(
-        "stty -echo -echonl || exit 1; printf 'abcdefghij'; read -r _; printf '\\033[1'; read -r _; \
-         printf 'm'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'abcdefghij'; read -r _; \
+         printf '\\033[1'; read -r _; printf 'm'; read -r _",
         narrow,
         None,
         1024 * 1024,
