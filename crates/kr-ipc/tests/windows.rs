@@ -527,10 +527,13 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
 
-    // The caller that never reads: sent something, and its connection closed with that unread.
-    let silent = Connection::connect(&endpoint)
-        .await
-        .expect("the first caller connects");
+    // The caller that never reads: sent something, and its connection closed with that unread. It
+    // opens the pipe as a plain file, which reads nothing until it is asked to.
+    let silent = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(local_name(&endpoint))
+        .expect("the first caller opens the pipe");
     let (mut silent_end, _) = tokio::time::timeout(PATIENCE, listener.accept())
         .await
         .expect("the first caller was accepted in time")
