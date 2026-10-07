@@ -46,6 +46,22 @@ use common::{
 };
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
+/// Bytes shown as their escaped text, which a failure message prints under `{:?}` as it is and not
+/// as the structure that escapes it.
+struct Shown(String);
+
+impl Shown {
+    fn of(bytes: &[u8]) -> Self {
+        Self(String::from_utf8_lossy(bytes).escape_debug().to_string())
+    }
+}
+
+impl std::fmt::Debug for Shown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 const CANONICAL: (u64, u64) = (80, 24);
 
 struct Host {
@@ -397,13 +413,13 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8]) -> Vec<u8> {
                  {:?}",
                 started.elapsed(),
                 String::from_utf8_lossy(marker),
-                String::from_utf8_lossy(&seen).escape_debug()
+                Shown::of(&seen)
             ),
             Err(_) => panic!(
                 "waited {:?} for {:?} to reach this terminal: {:?}",
                 started.elapsed(),
                 String::from_utf8_lossy(marker),
-                String::from_utf8_lossy(&seen).escape_debug()
+                Shown::of(&seen)
             ),
         }
     }
@@ -609,22 +625,22 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     assert!(
         rang.contains(&0x07),
         "the bell reaches the attachment holding the input lease: {:?}",
-        String::from_utf8_lossy(&rang).escape_debug()
+        Shown::of(&rang)
     );
     assert!(
         !watched.contains(&0x07),
         "and reaches nobody else, because a side effect has one destination: {:?}",
-        String::from_utf8_lossy(&watched).escape_debug()
+        Shown::of(&watched)
     );
     assert!(
         carries(&rang, b"]52;c;c2VjcmV0"),
         "the clipboard write reaches the lease holder, under the default policy: {:?}",
-        String::from_utf8_lossy(&rang).escape_debug()
+        Shown::of(&rang)
     );
     assert!(
         !carries(&watched, b"]52;") && !carries(&watched, b"c2VjcmV0"),
         "and the secret reaches no other terminal: {:?}",
-        String::from_utf8_lossy(&watched).escape_debug()
+        Shown::of(&watched)
     );
 }
 
@@ -659,12 +675,12 @@ async fn collect_until_told_to_begin_again(client: &mut LocalClient) -> Vec<u8> 
                 "waited {:?} for this terminal to be told to begin again and the connection ended \
                  ({error}): {:?}",
                 started.elapsed(),
-                String::from_utf8_lossy(&seen).escape_debug()
+                Shown::of(&seen)
             ),
             Err(_) => panic!(
                 "waited {:?} for this terminal to be told to begin again: {:?}",
                 started.elapsed(),
-                String::from_utf8_lossy(&seen).escape_debug()
+                Shown::of(&seen)
             ),
         }
     }
@@ -699,7 +715,7 @@ async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole()
     assert!(
         carries(&bytes, CLIPBOARD_WRITE),
         "the clipboard write reaches the terminal holding the lease whole: {}",
-        String::from_utf8_lossy(&bytes).escape_debug()
+        Shown::of(&bytes)
     );
 }
 
@@ -725,7 +741,7 @@ async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches
     assert!(
         carries(&before_the_marker, CLIPBOARD_WRITE),
         "the clipboard write reached the terminal before it was told to begin again: {}",
-        String::from_utf8_lossy(&before_the_marker).escape_debug()
+        Shown::of(&before_the_marker)
     );
     // And once, not again with the screen it installs.
     subscribe_over(&mut holder, &host, keys.attachment()).await;
@@ -733,7 +749,7 @@ async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches
     assert!(
         !carries(&installed, b"]52;"),
         "the screen it installs carries no clipboard write: {}",
-        String::from_utf8_lossy(&installed).escape_debug()
+        Shown::of(&installed)
     );
 }
 
@@ -769,7 +785,7 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
         assert!(
             !saw.contains(&0x07) && !carries(saw, b"]52;"),
             "the {who} watcher is sent neither side effect: {:?}",
-            String::from_utf8_lossy(saw).escape_debug()
+            Shown::of(saw)
         );
     }
 
@@ -844,7 +860,7 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     assert!(
         carries(&seen, b"^[[200~kr-pasted-text^[[201~^[[?62;22c"),
         "the paste reaches the application whole, and the answer after it: {}",
-        String::from_utf8_lossy(&seen).escape_debug()
+        Shown::of(&seen)
     );
     let session = host.runtime.session();
     assert_eq!(
@@ -897,7 +913,7 @@ async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     assert!(
         carries(&seen, b"^[[200~kr-pasted-^[[201~^[[?62;22c"),
         "the host closed the paste before it delivered the answer: {}",
-        String::from_utf8_lossy(&seen).escape_debug()
+        Shown::of(&seen)
     );
     let _ = std::fs::remove_dir_all(&gates);
 }
@@ -1078,7 +1094,7 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_typed_line_is_t
     assert!(
         !carries(&seen, b"\x1b[c"),
         "no question is forwarded to the attached terminal: {}",
-        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+        Shown::of(&seen[seen.len().saturating_sub(256)..])
     );
 }
 
@@ -1124,18 +1140,18 @@ async fn a_flooded_application_answers_the_line_typed_to_it() {
         )
         .await,
         "waited {LIVENESS_DEADLINE:?} for the application's last line to reach this terminal: {}",
-        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+        Shown::of(&seen[seen.len().saturating_sub(256)..])
     );
     let written = retained(&host.runtime);
     assert!(
         carries(&written, b"kr-typed:kr-end"),
         "what the person typed reached the application whole; it wrote {}",
-        String::from_utf8_lossy(&written[written.len().saturating_sub(256)..]).escape_debug()
+        Shown::of(&written[written.len().saturating_sub(256)..])
     );
     assert!(
         !carries(&seen, b"\x1b[c"),
         "no question is forwarded to the attached terminal: {}",
-        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+        Shown::of(&seen[seen.len().saturating_sub(256)..])
     );
 }
 
@@ -1169,7 +1185,7 @@ async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer
     assert!(
         !carries(&answered, b"\x1b[c"),
         "the question never reached the attached terminal: {}",
-        String::from_utf8_lossy(&answered).escape_debug()
+        Shown::of(&answered)
     );
 
     // The connection goes, and the attachment with it.
@@ -1225,24 +1241,24 @@ async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer
         !carries(&seen, b"\x1b[c"),
         "the question is not replayed to a reconnecting terminal, whose own terminal would answer \
          it: {}",
-        String::from_utf8_lossy(&seen).escape_debug()
+        Shown::of(&seen)
     );
     assert!(
         !carries(&seen, b"\x1b[?62;22c"),
         "and neither is the answer: {}",
-        String::from_utf8_lossy(&seen).escape_debug()
+        Shown::of(&seen)
     );
     let written = retained(&host.runtime);
     assert_eq!(
         carried_times(&written, b"^[[?62;22c"),
         1,
         "the application was answered once, and not again when the terminal came back: {}",
-        String::from_utf8_lossy(&written).escape_debug()
+        Shown::of(&written)
     );
     assert!(
         carries(&written, b"^[[?62;22ckr-back."),
         "what was typed after the reconnection follows the one answer directly: {}",
-        String::from_utf8_lossy(&written).escape_debug()
+        Shown::of(&written)
     );
     let _ = std::fs::remove_dir_all(&gates);
 }
@@ -1284,7 +1300,7 @@ async fn malformed_output_moves_a_direct_terminal_to_projection_with_replacement
             panic!(
                 "waited {:?} to be told the screen no longer continues; sent {:?}",
                 started.elapsed(),
-                String::from_utf8_lossy(&sent).escape_debug()
+                Shown::of(&sent)
             );
         };
         let ControlFrame::Notification(notification) = frame else {
@@ -1315,8 +1331,8 @@ async fn malformed_output_moves_a_direct_terminal_to_projection_with_replacement
     assert!(
         !carries(&sent, b"\xed\xa0\x80") && !carries(&bytes, b"\xed\xa0\x80"),
         "the malformed bytes never reach the terminal: {:?} then {:?}",
-        String::from_utf8_lossy(&sent).escape_debug(),
-        String::from_utf8_lossy(&bytes).escape_debug()
+        Shown::of(&sent),
+        Shown::of(&bytes)
     );
     let drawn: Vec<String> = rows
         .iter()
