@@ -128,6 +128,8 @@ pub struct OperationUpdate<'a> {
 pub struct WorkspaceUpdate<'a> {
     /// The working tree's filesystem identity, once there is one.
     pub identity: Option<RecordedIdentity>,
+    /// The filesystem identity of an independent clone's own Git directory, once there is one.
+    pub git_dir: Option<RecordedIdentity>,
     /// The retention policy a removal was requested under.
     pub retention: Option<RetentionPolicy>,
     /// When it was removed.
@@ -174,6 +176,11 @@ pub struct WorkspaceRow {
     pub base_change_set_id: Option<ChangeSetId>,
     /// The stable filesystem identity of its working tree.
     pub identity: Option<RecordedIdentity>,
+    /// The stable filesystem identity of an independent clone's own Git directory, which is the
+    /// repository the clone is. Absent on any other workspace, which shares its project's
+    /// repository, and on a clone an earlier build recorded: its first successful open records the
+    /// directory it finds.
+    pub git_dir: Option<RecordedIdentity>,
     /// The path its working tree is at.
     pub display_path: String,
     /// The private sibling an independent clone was staged in, while one existed.
@@ -584,7 +591,10 @@ impl Store {
                      location_id           BLOB,
                      relative_path         TEXT,
                      tree_fs               BLOB,
-                     staging_fs            BLOB
+                     staging_fs            BLOB,
+                     git_dir_device        INTEGER,
+                     git_dir_file_id       INTEGER,
+                     git_dir_fs            BLOB
                  );
                  CREATE TABLE IF NOT EXISTS workspace_progress (
                      workspace_id BLOB NOT NULL,
@@ -1222,9 +1232,7 @@ impl Store {
                 identity,
                 retention,
                 removed_at_ms,
-                staging_name: None,
-                staging_identity: None,
-                detail: None,
+                ..WorkspaceUpdate::default()
             },
         )
     }
@@ -1242,6 +1250,7 @@ impl Store {
     ) -> Result<()> {
         let WorkspaceUpdate {
             identity,
+            git_dir,
             retention,
             removed_at_ms,
             staging_name,
@@ -1263,7 +1272,10 @@ impl Store {
                         staging_file_id = COALESCE(?9, staging_file_id),
                         detail = COALESCE(?10, detail),
                         tree_fs = COALESCE(?11, tree_fs),
-                        staging_fs = COALESCE(?12, staging_fs)
+                        staging_fs = COALESCE(?12, staging_fs),
+                        git_dir_device = COALESCE(?13, git_dir_device),
+                        git_dir_file_id = COALESCE(?14, git_dir_file_id),
+                        git_dir_fs = COALESCE(?15, git_dir_fs)
                   WHERE workspace_id = ?1",
                 params![
                     id.get().as_bytes().to_vec(),
@@ -1278,6 +1290,9 @@ impl Store {
                     detail.map(crate::git::redact),
                     identity.and_then(|identity| identity.filesystem),
                     staging_identity.and_then(|identity| identity.filesystem),
+                    git_dir.map(|identity| i64_of(identity.object.device)),
+                    git_dir.map(|identity| i64_of(identity.object.file_id)),
+                    git_dir.and_then(|identity| identity.filesystem),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -2785,6 +2800,16 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("workspaces", "staging_fs", "BLOB"),
         ("operations", "staging_fs", "BLOB"),
         ("operations", "staged_fs", "BLOB"),
+        // An independent clone's own Git directory. A clone an earlier build recorded has none:
+        // its first successful open records the directory it finds
+        // (`crate::identity::GitDirOutcome::Found`, written by `record_workspace_git_dir`), and
+        // every open after that decides the directory by the record. Remove these entries, with
+        // that arm of the outcome and `record_workspace_git_dir`, once no supported upgrade starts
+        // from a store written before an independent clone's Git directory was recorded; a clone
+        // whose record is still missing by then is refused, and made again.
+        ("workspaces", "git_dir_device", "INTEGER"),
+        ("workspaces", "git_dir_file_id", "INTEGER"),
+        ("workspaces", "git_dir_fs", "BLOB"),
     ];
     for (table, column, kind) in ADDED {
         let present: i64 = transaction
@@ -2808,7 +2833,8 @@ const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environmen
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
      display_path, staging_name, detail, retention, created_at_ms, removed_at_ms, \
-     staging_device, staging_file_id, location_id, relative_path, tree_fs, staging_fs";
+     staging_device, staging_file_id, location_id, relative_path, tree_fs, staging_fs, \
+     git_dir_device, git_dir_file_id, git_dir_fs";
 
 fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
     let remote = row.remote.as_ref();
@@ -3146,6 +3172,80 @@ pub(crate) fn settle_workspace_tree(
     )
 }
 
+/// Replaces what a workspace's record carries for its independent clone's own Git directory by
+/// what the directory is now, only while the row still carries what it replaces.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn settle_workspace_git_dir(
+    connection: &Connection,
+    id: WorkspaceId,
+    was: RecordedIdentity,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET git_dir_device = ?3, git_dir_fs = ?5
+              WHERE workspace_id = ?1 AND git_dir_device = ?2 AND git_dir_file_id = ?6
+                AND git_dir_fs IS ?4",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(was.object.device),
+                i64_of(now.object.device),
+                was.filesystem,
+                now.filesystem,
+                i64_of(was.object.file_id),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || held_workspace_git_dir(connection, id) == Some(now),
+        "the workspace's record of its Git directory",
+    )
+}
+
+/// Records the Git directory of an independent clone whose row holds none, and only while it holds
+/// none: a clone an earlier build recorded takes the directory it was found with the first time it
+/// is opened, and a row that already holds one is never replaced here.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+pub(crate) fn record_workspace_git_dir(
+    connection: &Connection,
+    id: WorkspaceId,
+    now: RecordedIdentity,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET git_dir_device = ?2, git_dir_file_id = ?3, git_dir_fs = ?4
+              WHERE workspace_id = ?1 AND git_dir_device IS NULL AND git_dir_file_id IS NULL",
+            params![
+                id.get().as_bytes().to_vec(),
+                i64_of(now.object.device),
+                i64_of(now.object.file_id),
+                now.filesystem,
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    replaced(
+        changed,
+        || held_workspace_git_dir(connection, id) == Some(now),
+        "the workspace's record of its Git directory",
+    )
+}
+
+/// Reads the Git directory a workspace's record holds, for a write that matched no row.
+fn held_workspace_git_dir(connection: &Connection, id: WorkspaceId) -> Option<RecordedIdentity> {
+    stored_identity(
+        connection,
+        "SELECT git_dir_device, git_dir_file_id, git_dir_fs FROM workspaces WHERE workspace_id = ?1",
+        id.get().as_bytes().to_vec(),
+    )
+}
+
 /// Replaces what a repository's record carries for its Git common directory by what the directory
 /// is now, only while the row still carries what it replaces.
 ///
@@ -3365,9 +3465,10 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                                      binary_files, generated_artefacts, state, base_revision,
                                      base_change_set_id, tree_device, tree_file_id, display_path,
                                      staging_name, detail, retention, created_at_ms, removed_at_ms,
-                                     location_id, relative_path, tree_fs)
+                                     location_id, relative_path, tree_fs, git_dir_device,
+                                     git_dir_file_id, git_dir_fs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 row.workspace_id.get().as_bytes().to_vec(),
                 row.project_repository_id.get().as_bytes().to_vec(),
@@ -3399,6 +3500,9 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                     .as_ref()
                     .map(|named| named.relative_path.clone()),
                 row.identity.and_then(|id| id.filesystem),
+                row.git_dir.map(|id| i64_of(id.object.device)),
+                row.git_dir.map(|id| i64_of(id.object.file_id)),
+                row.git_dir.and_then(|id| id.filesystem),
             ],
         )
         .map_err(ProjectError::store)?;
@@ -3445,6 +3549,7 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
             .and_then(uuid_of)
             .map(ChangeSetId::new),
         identity: recorded_identity(device, file_id, row.get(26)?),
+        git_dir: recorded_identity(row.get(28)?, row.get(29)?, row.get(30)?),
         display_path: row.get(16)?,
         staging_name: row.get(17)?,
         staging_identity: recorded_identity(staging_device, staging_file_id, row.get(27)?),
@@ -3753,6 +3858,7 @@ mod tests {
             base_revision: "a".repeat(40),
             base_change_set_id: None,
             identity: None,
+            git_dir: None,
             display_path: "/tmp/held".to_owned(),
             staging_name: None,
             staging_identity: None,
@@ -3957,6 +4063,7 @@ mod tests {
             base_revision: "a".repeat(40),
             base_change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([12; 16]))),
             identity: None,
+            git_dir: None,
             display_path: "/tmp/review".to_owned(),
             staging_name: None,
             staging_identity: None,
@@ -4096,6 +4203,7 @@ mod tests {
             base_revision: "a".repeat(40),
             base_change_set_id: None,
             identity: None,
+            git_dir: None,
             display_path: "/tmp/review".to_owned(),
             staging_name: None,
             staging_identity: None,
@@ -4207,6 +4315,7 @@ mod tests {
             base_revision: "a".repeat(40),
             base_change_set_id: None,
             identity: None,
+            git_dir: None,
             display_path: "/tmp/reserved".to_owned(),
             staging_name: None,
             staging_identity: None,
@@ -4754,6 +4863,7 @@ mod tests {
             base_revision: "a".repeat(40),
             base_change_set_id: None,
             identity: None,
+            git_dir: None,
             display_path: "/tmp/held".to_owned(),
             staging_name: None,
             staging_identity: None,

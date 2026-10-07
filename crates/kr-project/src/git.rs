@@ -2446,6 +2446,10 @@ impl ConfigurationAudit {
     /// The invocation itself executes nothing: `git config --list` reads files. It runs under the
     /// same profile, so the only configuration it can see is the repository's own.
     ///
+    /// `ceiling` is where Git's search for the repository stops, when the repository lies inside
+    /// the directory it is read from: a directory that lost its own repository finds none instead
+    /// of the one around it.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::GitFailed`] when the configuration cannot be read.
@@ -2454,6 +2458,7 @@ impl ConfigurationAudit {
         directory: &Path,
         expected: Option<ObjectIdentity>,
         admission: Option<&ReadAdmission>,
+        ceiling: Option<&Path>,
     ) -> Result<Self> {
         let arguments: [&OsStr; 3] = [
             OsStr::new("config"),
@@ -2462,6 +2467,7 @@ impl ConfigurationAudit {
         ];
         let mut request = GitRequest::read(directory, &arguments).admitted(admission.cloned());
         request.expected = expected;
+        request.ceiling = ceiling;
         let output = profile.run(&request)?;
         output.require_success()?;
         // The listing is classified from its bytes. Git accepts a configuration subsection that is

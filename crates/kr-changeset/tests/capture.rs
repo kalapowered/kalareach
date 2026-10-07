@@ -2456,19 +2456,50 @@ fn an_independent_clone_workspace_can_be_captured() {
 
     // The repository behind the clone is replaced with another one inside the same working tree.
     // It satisfies the rule that makes a clone independent, and it is not the repository this host
-    // read the first time, which is what decides.
+    // recorded for the clone when it made it, which is what decides.
     let clone = fixture.work().join("clone-tree");
+    let resolved = fixture
+        .service()
+        .resolve(created.workspace_id)
+        .expect("the workspace resolves");
     std::fs::rename(clone.join(".git"), clone.join(".git-was")).expect("the clone's own data");
     let substitute = ordinary_repository(fixture.work(), "substitute");
     std::fs::rename(substitute.join(".git"), clone.join(".git")).expect("another repository");
     let refusal = fixture
         .service()
-        .open_repository(
-            &fixture
-                .service()
-                .resolve(created.workspace_id)
-                .expect("the workspace resolves"),
+        .open_repository(&resolved)
+        .expect_err("a repository this host did not record for the clone is refused");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+
+    // A clone recorded before its Git directory was is held to the repository the first capture
+    // found behind it: the project service takes the directory it finds the first time it opens
+    // the clone, and this service's own record of the first capture still refuses another.
+    let forget_the_git_directory = || {
+        rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
         )
+        .expect("the project journal opens")
+        .execute(
+            "UPDATE workspaces SET git_dir_device = NULL, git_dir_file_id = NULL, git_dir_fs = NULL
+              WHERE workspace_id = ?1",
+            rusqlite::params![created.workspace_id.get().as_bytes().to_vec()],
+        )
+        .expect("the record is made as an earlier build made it");
+    };
+    std::fs::rename(clone.join(".git"), clone.join(".git-substitute")).expect("put aside");
+    std::fs::rename(clone.join(".git-was"), clone.join(".git")).expect("the clone's own data");
+    forget_the_git_directory();
+    fixture
+        .service()
+        .open_repository(&resolved)
+        .expect("the clone is the repository this host first found behind it");
+    forget_the_git_directory();
+    std::fs::rename(clone.join(".git"), clone.join(".git-was")).expect("the clone's own data");
+    std::fs::rename(clone.join(".git-substitute"), clone.join(".git")).expect("another repository");
+    let refusal = fixture
+        .service()
+        .open_repository(&resolved)
         .expect_err("a repository this host has not seen before is refused");
     assert!(
         refusal.to_string().contains("independent clone"),

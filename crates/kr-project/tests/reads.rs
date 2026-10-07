@@ -666,7 +666,7 @@ mod linux {
         // The audit, as a repository reached for a caller bounded by a grant takes it: the
         // include is not read when the listing is made, so the audit is refused rather than
         // produced from it.
-        let refusal = ConfigurationAudit::take(profile, &path, None, bounded().as_ref())
+        let refusal = ConfigurationAudit::take(profile, &path, None, bounded().as_ref(), None)
             .expect_err("an audit that cannot read an include is not an audit of it");
         assert!(
             !refusal.to_string().contains("included-from-outside"),
@@ -701,7 +701,7 @@ mod linux {
             granted.stderr
         );
         // And the owner's audit of the same repository is taken as it always was.
-        ConfigurationAudit::take(profile, &path, None, None)
+        ConfigurationAudit::take(profile, &path, None, None, None)
             .expect("the owner's audit reads the include");
     }
 

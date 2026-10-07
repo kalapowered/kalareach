@@ -2560,6 +2560,143 @@ fn a_directory_that_is_not_the_bound_repository_is_not_read_through_its_source()
     );
 }
 
+/// A repository whose Git directory is not the one a source location's record names is refused
+/// before its configuration is read, whatever the tree around it is: nothing of it is audited.
+#[cfg(unix)]
+#[test]
+fn a_bound_repository_whose_git_directory_was_replaced_is_refused_before_it_is_audited() {
+    let mut fixture = Fixture::create();
+    let started = support::watching_git(&mut fixture);
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 180);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        181,
+    );
+    let project = adopt(&fixture, &sources, "repo", 182);
+    attach(fixture.service(), &owner, project, source, 183).expect("the repository is bound");
+    let named = std::fs::canonicalize(&sources)
+        .expect("the directory resolves")
+        .join("repo");
+
+    // The bound repository's configuration is audited when it is read.
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "control"),
+        true,
+        184,
+    )
+    .expect("the bound repository is the registered one");
+    assert!(
+        support::git_ran_in(&started, &named, "git config"),
+        "the configuration of the bound repository is read"
+    );
+
+    // Its Git directory is replaced by a copy, which is another object with the same contents.
+    support::replace_by_a_copy(&sources.join("repo/.git"));
+    let refusal = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "copy"),
+        true,
+        185,
+    )
+    .expect_err("another Git directory is not the repository's");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        !support::git_ran_in(&started, &named, "git config"),
+        "the configuration of the repository that took the Git directory's place was not read"
+    );
+}
+
+/// An independent clone made through a location is held to its own Git directory, which was
+/// recorded when it was made: a directory that took the place of its `.git` is another
+/// repository, and no Git invocation starts in the clone.
+#[cfg(unix)]
+#[test]
+fn a_clone_made_through_a_location_whose_git_directory_was_replaced_is_not_read() {
+    let mut fixture = Fixture::create();
+    let started = support::watching_git(&mut fixture);
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 190);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        191,
+    );
+    let project = adopt(&fixture, &sources, "repo", 192);
+    attach(fixture.service(), &owner, project, source, 193).expect("the repository is bound");
+    let made = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "feature"),
+        false,
+        194,
+    )
+    .expect("the workspace is made through a location")
+    .workspace
+    .0
+    .expect("a workspace, not a preview");
+    let named = std::fs::canonicalize(&workspaces)
+        .expect("the directory resolves")
+        .join("feature");
+    let measured = |seed: u8| {
+        fixture
+            .service()
+            .workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id: made.workspace_id,
+                    retention: RetentionPolicy::KeepEverything,
+                    through_location_id: Nullable(Some(made_in)),
+                },
+                Some(&action("workspace.remove", seed)),
+            )
+            .expect("the removal is answered")
+            .retained
+    };
+    std::fs::write(
+        workspaces.join("feature/mine.txt"),
+        b"this workspace's own work\n",
+    )
+    .expect("work in the clone");
+    let _ = support::git_started_in(&started, &named);
+    let held = measured(195);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the clone is counted: {held:?}"
+    );
+    assert!(
+        support::git_started_in(&started, &named),
+        "Git is started in the clone"
+    );
+
+    support::replace_by_a_copy(&workspaces.join("feature/.git"));
+    let held = measured(196);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the clone: {held:?}"
+    );
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in a clone whose repository is not the recorded one"
+    );
+}
+
 /// The owner removes a workspace through its location, and the staging directory its row recorded,
 /// when the filesystem is numbered differently since the row was written: each is still the object
 /// the row recorded. A tree that is another object is not removed under any number, and the

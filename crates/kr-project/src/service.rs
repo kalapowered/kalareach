@@ -45,7 +45,9 @@ use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
 use crate::git::ReadAdmission;
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
-use crate::identity::{OpenedRepository, Revised, wire_identity};
+use crate::identity::{
+    Decided, GitDirOutcome, GitDirectory, OpenedRepository, RecordedTree, Revised, wire_identity,
+};
 use crate::operation::{
     Cleanup, Destination, Reconciliation, STAGED_TREE, STAGING_PREFIX, StagedWitness,
     StagingSibling, publish, reconcile, remove_staging_directory, stage_clone, stage_init,
@@ -1172,13 +1174,16 @@ impl ProjectService {
             // A registered repository is the object its record names, decided before anything of
             // it is read.
             Some((project, expected)) => {
-                let (opened, _) = self.open_through_deciding(
+                let (opened, decided) = self.open_through_deciding(
                     &held,
                     &relative,
                     admission,
-                    is_recorded_tree(expected.work_tree),
+                    Some(RecordedTree {
+                        tree: expected.work_tree,
+                        git_dir: GitDirectory::Named(expected.git_dir),
+                    }),
                 )?;
-                self.settle_project(project, opened.require_identity(expected)?)?;
+                self.settle_project(project, decided.revision(expected))?;
                 opened
             }
             None => self.open_through(&held, &relative, admission)?,
@@ -1203,34 +1208,39 @@ impl ProjectService {
         admission: Option<ReadAdmission>,
     ) -> Result<OpenedRepository> {
         Ok(self
-            .open_through_deciding(location, relative, admission, |_| Ok(()))?
+            .open_through_deciding(location, relative, admission, None)?
             .0)
     }
 
-    /// Opens a repository through a location like [`Self::open_through`], after `decide` has
-    /// accepted the working tree's directory and before anything of the repository is read or Git
-    /// is asked anything.
-    fn open_through_deciding<T>(
+    /// Opens a repository through a location like [`Self::open_through`], deciding it against
+    /// `recorded` when a record names it: the working tree's directory before anything of the
+    /// repository is read or Git is asked anything, and its Git directory before its
+    /// configuration is audited.
+    fn open_through_deciding(
         &self,
         location: &HeldLocation,
         relative: &RelativeName,
         admission: Option<ReadAdmission>,
-        decide: impl FnOnce(&kr_transfer::AuthorisedDirectory) -> Result<T>,
-    ) -> Result<(OpenedRepository, T)> {
+        recorded: Option<RecordedTree>,
+    ) -> Result<(OpenedRepository, Decided)> {
         let shown = location.handle().host_path(relative).display().to_string();
         if let Some(admission) = admission.as_ref() {
             admission.admit()?;
         }
         let work_tree = location.handle().subdirectory(relative)?;
-        let decided = decide(&work_tree)?;
+        let tree = match recorded {
+            Some(recorded) => crate::identity::decide_tree_before_git(&work_tree, recorded.tree)?,
+            None => Settled::AsRecorded,
+        };
         let found = crate::discovery::discover(work_tree, &shown)?;
-        let opened = OpenedRepository::discovered(
+        let (opened, git_dir) = OpenedRepository::discovered(
             &self.profile,
             found,
             (location.handle().try_clone()?, relative.clone()),
             admission,
+            recorded.map(|recorded| recorded.git_dir),
         )?;
-        Ok((opened, decided))
+        Ok((opened, Decided { tree, git_dir }))
     }
 
     /// Opens the repository at a destination: through its location when it has one, and as it
@@ -1570,14 +1580,16 @@ impl ProjectService {
     }
 
     /// Opens the repository one workspace's working tree belongs to, and requires the objects there
-    /// to be the ones the journal recorded: the workspace's own tree and, for a workspace that
-    /// shares its project's repository, the repository's Git directory.
+    /// to be the ones the journal recorded: the workspace's own tree and the repository's Git
+    /// directory. A workspace that shares its project's repository is held to the project's Git
+    /// directory, and an independent clone, which is its own repository made inside its tree, to
+    /// its own.
     ///
     /// Each is decided by the rule every recorded directory is decided by: it is the recorded one
     /// by its inode on the recorded filesystem, under whatever device number that filesystem has
-    /// now, and what the record is to become is written here. An independent clone is its own
-    /// repository, so only its tree is held to a record. The tree is decided before Git is asked
-    /// anything in it.
+    /// now, and what the record is to become is written here. The tree is decided before Git is
+    /// asked anything in it, and the Git directory before the repository's configuration is
+    /// audited.
     ///
     /// # Errors
     ///
@@ -1598,8 +1610,9 @@ impl ProjectService {
     ///
     /// The directory at the recorded place is decided before Git is asked anything in it, so a
     /// directory that took the tree's place, or a filesystem mounted over it, is refused without a
-    /// Git invocation having run there. The shared decision ([`Self::settle_workspace_records`])
-    /// then covers the repository the workspace shares with its project.
+    /// Git invocation having run there. The repository's Git directory is decided before its
+    /// configuration is audited ([`Self::settle_workspace_records`] writes what both decisions
+    /// make of the records).
     fn open_recorded_workspace(
         &self,
         row: &WorkspaceRow,
@@ -1621,47 +1634,42 @@ impl ProjectService {
             .ok_or_else(|| ProjectError::UnknownProject {
                 project: row.project_repository_id.to_string().into(),
             })?;
-        let (opened, settled_tree) = match &reach.through {
-            Some((held, name)) => self.open_through_deciding(
-                held,
-                name,
-                reach.admission.clone(),
-                is_recorded_tree(tree),
-            )?,
-            None => {
-                let (opened, settled) = OpenedRepository::open_recorded_tree(
-                    &self.profile,
-                    self.environment_id,
-                    Path::new(&row.display_path),
-                    tree,
-                    // An independent clone is its own repository, made inside its tree.
-                    row.isolation == Some(IsolationMechanism::IndependentClone),
-                )?;
-                (opened, settled)
-            }
+        let recorded = RecordedTree {
+            tree,
+            git_dir: if is_independent_clone(row) {
+                // Its own repository, made inside its tree.
+                GitDirectory::InsideTree {
+                    recorded: row.git_dir,
+                }
+            } else {
+                GitDirectory::Named(project.identity.git_dir)
+            },
         };
-        self.settle_workspace_records(row, &project, &opened, settled_tree)?;
+        let (opened, decided) = match &reach.through {
+            Some((held, name)) => {
+                self.open_through_deciding(held, name, reach.admission.clone(), Some(recorded))?
+            }
+            None => OpenedRepository::open_recorded_tree(
+                &self.profile,
+                self.environment_id,
+                Path::new(&row.display_path),
+                recorded,
+            )?,
+        };
+        self.settle_workspace_records(row, &project, decided)?;
         Ok(opened)
     }
 
-    /// Decides that the repository a workspace's tree belongs to is the one its project recorded,
-    /// and writes what the tree's record and the project's record become.
-    ///
-    /// An independent clone is its own repository, so only its tree is held to a record. Both
-    /// decisions are made before either write.
+    /// Writes what the tree's record and the Git directory's record become, once both were
+    /// decided: the project's record of its Git directory for a workspace that shares it, and the
+    /// workspace's own for an independent clone.
     fn settle_workspace_records(
         &self,
         row: &WorkspaceRow,
         project: &ProjectRow,
-        opened: &OpenedRepository,
-        settled_tree: Settled,
+        decided: Decided,
     ) -> Result<()> {
-        let settled_git_dir = if row.isolation == Some(IsolationMechanism::IndependentClone) {
-            Settled::AsRecorded
-        } else {
-            opened.require_git_dir(project.identity.git_dir)?
-        };
-        if let Some((was, now)) = settled_tree.revision() {
+        if let Some((was, now)) = decided.tree.revision() {
             crate::store::settle_workspace_tree(
                 self.writable()?.connection(),
                 row.workspace_id,
@@ -1669,13 +1677,35 @@ impl ProjectService {
                 now,
             )?;
         }
-        if let Some((was, now)) = settled_git_dir.revision() {
-            crate::store::settle_project_git_dir(
+        match decided.git_dir {
+            GitDirOutcome::Undecided => {}
+            GitDirOutcome::Settled(settled) => {
+                if let Some((was, now)) = settled.revision() {
+                    if is_independent_clone(row) {
+                        crate::store::settle_workspace_git_dir(
+                            self.writable()?.connection(),
+                            row.workspace_id,
+                            was,
+                            now,
+                        )?;
+                    } else {
+                        crate::store::settle_project_git_dir(
+                            self.writable()?.connection(),
+                            project.project_repository_id,
+                            was,
+                            now,
+                        )?;
+                    }
+                }
+            }
+            // A clone an earlier build recorded holds no Git directory: this is the one record it
+            // gets, from the directory it was found with, and it is held to it from here on. The
+            // arm goes with the migration it serves (see `add_missing_columns`).
+            GitDirOutcome::Found(now) => crate::store::record_workspace_git_dir(
                 self.writable()?.connection(),
-                project.project_repository_id,
-                was,
+                row.workspace_id,
                 now,
-            )?;
+            )?,
         }
         Ok(())
     }
@@ -2548,6 +2578,7 @@ impl ProjectService {
             base_revision: base_revision.clone(),
             base_change_set_id: params.base_change_set_id.0,
             identity: None,
+            git_dir: None,
             display_path: display_path.clone(),
             staging_name: None,
             staging_identity: None,
@@ -2760,14 +2791,18 @@ impl ProjectService {
                             // The object that will be published is recorded *before* the rename,
                             // so a crash in the interval leaves a tree whose ownership this host
                             // can still establish: the identity a rename preserves is the one
-                            // already on the row.
+                            // already on the row. So is the clone's own Git directory, which is
+                            // the repository the clone is: every later open decides it by this
+                            // record.
                             let staged = staging.staged_witness()?;
-                            self.writable()?.set_workspace_state(
+                            self.writable()?.set_workspace(
                                 row.workspace_id,
                                 WorkspaceState::Materialising,
-                                Some(staged.identity),
-                                None,
-                                None,
+                                &WorkspaceUpdate {
+                                    identity: Some(staged.identity),
+                                    git_dir: Some(staging.staged_git_dir()?),
+                                    ..WorkspaceUpdate::default()
+                                },
                             )?;
                             publish(&staging, destination, staged)?;
                             Ok(())
@@ -3261,15 +3296,18 @@ impl ProjectService {
         };
         let source = self.locations().admit(bound.location_id, &wanted)?;
         reach.push((Arc::clone(&source), wanted));
-        let (opened, _) = self.open_through_deciding(
+        let (opened, decided) = self.open_through_deciding(
             &source,
             &RelativeName::parse(&bound.relative_path)?,
             admission_for(self.locations(), reach.clone()),
-            is_recorded_tree(project.identity.work_tree),
+            Some(RecordedTree {
+                tree: project.identity.work_tree,
+                git_dir: GitDirectory::Named(project.identity.git_dir),
+            }),
         )?;
         self.settle_project(
             project.project_repository_id,
-            opened.require_identity(project.identity)?,
+            decided.revision(project.identity),
         )?;
         Ok(opened)
     }
@@ -4009,17 +4047,9 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
     )
 }
 
-/// Returns what decides, before anything of a repository reached through a location is read and
-/// before Git is asked anything, that the working tree found at its place is the one a record
-/// names.
-fn is_recorded_tree(
-    tree: RecordedIdentity,
-) -> impl FnOnce(&kr_transfer::AuthorisedDirectory) -> Result<Settled> {
-    move |work_tree| {
-        work_tree.check_recorded(tree).map_err(|refusal| {
-            crate::identity::not_the_recorded_tree(tree, work_tree.display_path(), &refusal)
-        })
-    }
+/// Returns whether a workspace is an independent clone: its own repository, made inside its tree.
+const fn is_independent_clone(row: &WorkspaceRow) -> bool {
+    matches!(row.isolation, Some(IsolationMechanism::IndependentClone))
 }
 
 /// How a removal reaches a workspace's tree.

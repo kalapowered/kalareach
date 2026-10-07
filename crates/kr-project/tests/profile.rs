@@ -570,8 +570,9 @@ fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
     // repository's own file the same way.
     let fixture = Fixture::create();
     let planted = planted_repository(fixture.work(), "read-back", false);
-    let audit = ConfigurationAudit::take(fixture.service().profile(), &planted.path, None, None)
-        .expect("the configuration is read");
+    let audit =
+        ConfigurationAudit::take(fixture.service().profile(), &planted.path, None, None, None)
+            .expect("the configuration is read");
     assert!(
         audit
             .drivers

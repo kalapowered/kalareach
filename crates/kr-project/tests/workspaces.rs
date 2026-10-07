@@ -1099,6 +1099,262 @@ fn a_repository_around_an_independent_clone_that_names_its_tree_is_not_read_as_t
     );
 }
 
+/// An independent clone that loses its own repository after it was opened is not read as the
+/// repository around it by any later request, and not only by the first Git call of the open.
+///
+/// The repository around the clone here holds the clone's own configuration, so a read of it passes
+/// for a read of the clone: the check of the configuration a write is about to run under is the
+/// request that would take it for the clone's.
+#[cfg(unix)]
+#[test]
+fn a_clone_that_loses_its_repository_after_it_is_opened_is_not_read_as_the_repository_around_it() {
+    let fixture = Fixture::create();
+    let around = ordinary_repository(fixture.work(), "around-opened");
+    let project = adopted_with_changes(&fixture, "opened-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "clone",
+        IsolationMechanism::IndependentClone,
+        112,
+    );
+    let tree = around.join("clone");
+    let opened = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect("the clone opens through its own repository");
+    let profile = fixture.service().profile();
+    opened
+        .recheck(profile)
+        .expect("the clone's configuration is as it was when it was opened");
+
+    // The repository around the clone takes the clone's configuration, and the clone loses its own
+    // repository.
+    std::fs::copy(tree.join(".git/config"), around.join(".git/config"))
+        .expect("the repository around the clone is given the clone's configuration");
+    std::fs::remove_dir_all(tree.join(".git")).expect("the clone loses its repository");
+
+    assert!(
+        opened.recheck(profile).is_err(),
+        "the configuration read for the clone is not the repository around it"
+    );
+}
+
+/// Every request an opened independent clone builds stops Git's search for a repository above the
+/// clone's tree, so that whichever request is the first to look finds none instead of the
+/// repository around it.
+#[cfg(unix)]
+#[test]
+fn every_request_against_an_independent_clone_stops_the_search_above_its_tree() {
+    let fixture = Fixture::create();
+    let around = ordinary_repository(fixture.work(), "around-requests");
+    let project = adopted_with_changes(&fixture, "requests-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "clone",
+        IsolationMechanism::IndependentClone,
+        123,
+    );
+    let opened = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect("the clone opens");
+    let above = std::fs::canonicalize(&around).expect("the directory resolves");
+    let arguments = [std::ffi::OsStr::new("status")];
+    assert_eq!(opened.read(&arguments).ceiling, Some(above.as_path()));
+    assert_eq!(opened.write(&arguments).ceiling, Some(above.as_path()));
+}
+
+/// A tree that lost its own repository is not audited as the repository around it, even when that
+/// repository's configuration names the tree as its working tree and so passes for it: the Git
+/// directory it reports is not the recorded one, and nothing of it is read before it is refused.
+#[cfg(unix)]
+#[test]
+fn a_repository_around_a_projects_tree_is_refused_before_its_configuration_is_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let around = ordinary_repository(fixture.work(), "around-project");
+    let tree = ordinary_repository(&around, "inner");
+    write(&tree, "mine.txt", "work in the project's own tree\n");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), &around, "inner"),
+                label: "inner".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 113)),
+        )
+        .expect("the repository inside another is adopted")
+        .project
+        .project_repository_id;
+    let workspace_id = shared_workspace(&fixture, project, 114);
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+
+    // The project's own repository is audited when its tree is read.
+    let held = measured(&fixture, workspace_id, 115);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the tree is counted: {held:?}"
+    );
+    assert!(
+        git_ran_in(&started, &named, "git config"),
+        "the configuration of the recorded repository is read"
+    );
+
+    // The tree loses its repository, and the repository around it names the tree as its own working
+    // tree, so Git reports the tree as the top level.
+    std::fs::remove_dir_all(tree.join(".git")).expect("the tree loses its repository");
+    support::git_raw(
+        &around,
+        [
+            std::ffi::OsStr::new("config"),
+            std::ffi::OsStr::new("core.worktree"),
+            named.as_os_str(),
+        ],
+    );
+    let held = measured(&fixture, workspace_id, 116);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        !git_ran_in(&started, &named, "git config"),
+        "the configuration of the repository around the tree was not read"
+    );
+}
+
+/// An independent clone's own repository is decided by what was recorded when the clone was made,
+/// as its tree is: a directory that took the place of its `.git` is another repository, and no
+/// Git invocation starts in the clone.
+#[cfg(unix)]
+#[test]
+fn an_independent_clone_whose_git_directory_was_replaced_is_not_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "replaced-git-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "replaced-git",
+        IsolationMechanism::IndependentClone,
+        117,
+    );
+    let tree = fixture.work().join("replaced-git");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 118);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the clone is counted: {held:?}"
+    );
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the clone"
+    );
+
+    support::replace_by_a_copy(&tree.join(".git"));
+    let held = measured(&fixture, workspace_id, 119);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the clone: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &named),
+        "no Git invocation started in a clone whose repository is not the recorded one"
+    );
+}
+
+/// A clone recorded before its repository was takes the repository it has the first time it is
+/// opened, and is held to that one from then on.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_independent_clone_recorded_without_its_git_directory_is_held_to_the_one_it_is_found_with() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "unrecorded-git-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "unrecorded-git",
+        IsolationMechanism::IndependentClone,
+        120,
+    );
+    let tree = fixture.work().join("unrecorded-git");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let id = workspace_id.get().as_bytes().to_vec();
+    let recorded = || -> (Option<i64>, Option<i64>) {
+        journal
+            .query_row(
+                "SELECT git_dir_device, git_dir_file_id FROM workspaces WHERE workspace_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the record reads")
+    };
+
+    // The record a build wrote before Git directories were recorded holds none.
+    journal
+        .execute(
+            "UPDATE workspaces SET git_dir_device = NULL, git_dir_file_id = NULL, git_dir_fs = NULL
+              WHERE workspace_id = ?1",
+            rusqlite::params![id],
+        )
+        .expect("the record is made as an earlier build made it");
+    assert_eq!(recorded(), (None, None));
+
+    // The first read takes the repository the clone has, and reads it.
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 121);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the clone is counted: {held:?}"
+    );
+    let (device, inode) = numbers_of(&tree.join(".git"));
+    assert_eq!(
+        recorded(),
+        (Some(device), Some(inode)),
+        "the record names the repository the clone was found with"
+    );
+
+    // And from then on a directory that took its place is refused.
+    support::replace_by_a_copy(&tree.join(".git"));
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 122);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the clone: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &named),
+        "no Git invocation started in the clone once its repository was replaced"
+    );
+}
+
 /// A workspace tree on another filesystem that gives the directory at its path the numbers the
 /// recorded one had is not read as the workspace, and no Git invocation starts in it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2309,6 +2565,7 @@ fn a_workspace_row_holds_every_field_a_replacement_needs() {
         base_revision: "a".repeat(40),
         base_change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([4; 16]))),
         identity: Some(kr_transfer::RecordedIdentity::from_parts(1, 2, None)),
+        git_dir: None,
         display_path: "/tmp/review".to_owned(),
         staging_name: None,
         staging_identity: None,

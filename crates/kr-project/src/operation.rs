@@ -468,6 +468,25 @@ impl StagingSibling {
         staged_in(self.reach()?)
     }
 
+    /// Returns the filesystem identity of the staged repository's own Git directory, the `.git`
+    /// inside the staged tree, as the journal records it.
+    ///
+    /// Read before the publication with the staged tree's own identity: the rename that publishes
+    /// the tree keeps the directory inside it, so what a later open finds at the tree's `.git` is
+    /// this object or something that took its place. Read by a descent from the sibling's handle,
+    /// which is a read through the destination's location, so the location is asked first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when the staged repository holds no `.git` directory,
+    /// or the location's refusal.
+    pub fn staged_git_dir(&self) -> Result<RecordedIdentity> {
+        let tree = staged_tree_in(self.reach()?)?;
+        Ok(tree
+            .subdirectory(&RelativeName::parse(".git")?)?
+            .recorded()?)
+    }
+
     /// Returns the sibling's own object, read through its handle, for the invocations that have to
     /// run in this directory and no other.
     #[must_use]

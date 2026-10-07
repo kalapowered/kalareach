@@ -330,6 +330,24 @@ where
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Replaces a directory by a copy of it, which is another object with the same contents.
+///
+/// # Panics
+///
+/// Panics when the directory cannot be moved or copied.
+#[cfg(unix)]
+pub fn replace_by_a_copy(directory: &std::path::Path) {
+    let original = directory.with_extension("original");
+    std::fs::rename(directory, &original).expect("the directory is moved aside");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(&original)
+        .arg(directory)
+        .status()
+        .expect("cp runs");
+    assert!(copied.success(), "the directory is copied into its place");
+}
+
 /// Builds an ordinary repository with one commit.
 ///
 /// # Panics
