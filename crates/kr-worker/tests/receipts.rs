@@ -3877,6 +3877,228 @@ async fn a_clock_that_cannot_be_proved_stops_collection_and_not_the_session() {
     assert_eq!(state.trust, kr_protocol::action::WallClockTrust::Unresolved);
 }
 
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.17, 09.18: a worker that runs for weeks on a continuous clock nothing corrects
+// ---------------------------------------------------------------------------------------------
+
+const AN_HOUR: std::time::Duration = std::time::Duration::from_secs(3_600);
+const THIRTY_DAYS: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+
+/// A machine whose wall clock its time service keeps and whose continuous clock nothing keeps, so
+/// the continuous clock runs a few parts per million fast against it.
+///
+/// macOS and Windows count continuous time from an oscillator the time service never corrects. A
+/// real clock cannot be made fast, so the three clocks the worker's contract reads are driven by
+/// hand, and everything else about the worker is real: its session, its journal and its restart.
+struct DriftingMachine {
+    continuous: kr_ipc::clock::ManualSharedClock,
+    active: kr_worker::action::time::ManualActiveClock,
+    wall: kr_worker::action::time::ManualWallClock,
+    ppm: u64,
+}
+
+impl DriftingMachine {
+    fn fast_by(ppm: u64) -> Self {
+        Self {
+            continuous: kr_ipc::clock::ManualSharedClock::new(),
+            active: kr_worker::action::time::ManualActiveClock::new(),
+            wall: kr_worker::action::time::ManualWallClock::new(1_700_000_000_000),
+            ppm,
+        }
+    }
+
+    fn sources(&self) -> kr_worker::action::time::TimeSources {
+        let synchronised = classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            UnixTimex {
+                time_state: kr_worker::action::adapter::unix_model::TIME_OK,
+                status: kr_worker::action::adapter::unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500,
+            },
+            TimestampMs::new(1_700_000_000_000),
+        );
+        kr_worker::action::time::TimeSources {
+            continuous: Arc::new(self.continuous.clone()),
+            active: Arc::new(self.active.clone()),
+            wall: Arc::new(self.wall.clone()),
+            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(
+                synchronised,
+            )),
+            floor: None,
+        }
+    }
+
+    /// The machine runs awake for `duration`: the wall clock counts it, the other two count it
+    /// fast.
+    fn runs(&self, duration: std::time::Duration) {
+        let millis = u64::try_from(duration.as_millis()).expect("a duration in milliseconds");
+        let counted = std::time::Duration::from_millis(millis + millis * self.ppm / 1_000_000);
+        self.continuous.advance(counted);
+        self.active.advance(counted);
+        self.wall.advance(duration);
+    }
+
+    /// The wall clock is stepped back by `by`, and nothing else moves.
+    fn steps_back(&self, by: std::time::Duration) {
+        use kr_worker::action::time::WallClock as _;
+        let by = u64::try_from(by.as_millis()).expect("a duration in milliseconds");
+        self.wall.set(self.wall.now_ms().get() - by);
+    }
+}
+
+/// A journal that holds one record past the retention period, for a worker to collect or not.
+fn a_journal_with_a_record_past_retention() -> (
+    kr_ipc::testing::TempHost,
+    kr_ipc::paths::EnvironmentPaths,
+    SessionId,
+) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let path = environment.journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
+    record_from_an_earlier_run(&path, 70);
+    (temp, environment, session_id)
+}
+
+/// Starts a worker on `session_id`'s journal that reads `machine`'s clocks.
+fn a_worker_on(
+    machine: &DriftingMachine,
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> Session {
+    Session::open(SessionConfig {
+        time: machine.sources(),
+        ..session_config(environment, session_id)
+    })
+    .expect("opens")
+}
+
+/// Thirty days pass, and the worker looks at its clocks every hour, as its maintenance does
+/// (every minute in a live host).
+fn thirty_days_looking_every_hour(session: &mut Session, machine: &DriftingMachine) {
+    for _ in 0..(THIRTY_DAYS.as_secs() / AN_HOUR.as_secs()) {
+        machine.runs(AN_HOUR);
+        session.observe_time();
+    }
+}
+
+/// KR-REQ-09.17: a continuous clock that runs 50 parts per million fast, which the time service
+/// never corrects, costs a worker that runs for weeks no trust in its wall clock, so it goes on
+/// collecting what retention covers.
+#[test]
+fn a_continuous_clock_running_fast_costs_a_worker_that_runs_for_weeks_no_trust() {
+    // Looking every hour, and not looking until the end: the worst case for a clock that drifts,
+    // because nothing renews the point the drift is measured from.
+    for every_hour in [true, false] {
+        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(50);
+        let mut session = a_worker_on(&machine, &environment, session_id);
+        if every_hour {
+            thirty_days_looking_every_hour(&mut session, &machine);
+        } else {
+            machine.runs(THIRTY_DAYS);
+        }
+        session.observe_time();
+        assert_eq!(
+            session.time().trust(),
+            WallClockTrust::Trusted,
+            "a healthy clock, looked at every hour: {every_hour}"
+        );
+        assert_eq!(
+            session.collect_expired(),
+            1,
+            "a worker that trusts its clock collects, looked at every hour: {every_hour}"
+        );
+    }
+}
+
+/// KR-REQ-09.18: a rollback beyond what the rate allowance forgives still stops a worker
+/// collecting, at the end of the same thirty days. Collecting on a clock that went back is how a
+/// rollback deletes what had not expired.
+#[test]
+fn a_rollback_beyond_the_allowance_still_stops_a_worker_collecting() {
+    // How far the wall clock goes back: past five seconds for a worker that looked an hour ago,
+    // and past five seconds and the allowance's thirty days (about four and a half minutes) for
+    // one that had not looked since the start.
+    for (every_hour, rollback) in [
+        (true, std::time::Duration::from_secs(10)),
+        (false, std::time::Duration::from_secs(6 * 60)),
+    ] {
+        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(50);
+        let mut session = a_worker_on(&machine, &environment, session_id);
+        if every_hour {
+            thirty_days_looking_every_hour(&mut session, &machine);
+        } else {
+            machine.runs(THIRTY_DAYS);
+        }
+        machine.steps_back(rollback);
+        session.observe_time();
+        assert_eq!(
+            session.time().trust(),
+            WallClockTrust::Unresolved,
+            "a rollback of {rollback:?}, looked at every hour: {every_hour}"
+        );
+        assert_eq!(session.collect_expired(), 0);
+        assert_eq!(
+            session.journal().expect("a journal").len().expect("reads"),
+            1,
+            "what retention covers is kept while the clock cannot be proved"
+        );
+    }
+}
+
+/// KR-REQ-09.17, 09.18: a worker that restarts after thirty days keeps neither a false distrust of
+/// a healthy clock nor a rollback it missed: the one it saw before it stopped, and the one the
+/// clock made while it was down.
+#[test]
+fn a_restarted_worker_keeps_neither_a_false_distrust_nor_a_missed_rollback() {
+    let ten_seconds = std::time::Duration::from_secs(10);
+
+    // A healthy clock stays trusted across the restart, and the restarted worker collects.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(50);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    thirty_days_looking_every_hour(&mut session, &machine);
+    drop(session);
+    machine.runs(AN_HOUR);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert_eq!(session.collect_expired(), 1);
+
+    // A rollback the worker saw is still one after it restarts.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(50);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    thirty_days_looking_every_hour(&mut session, &machine);
+    machine.steps_back(ten_seconds);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    drop(session);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    assert_eq!(session.collect_expired(), 0);
+
+    // A rollback the clock made while the worker was down is found when it comes back.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(50);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    thirty_days_looking_every_hour(&mut session, &machine);
+    drop(session);
+    machine.runs(AN_HOUR);
+    machine.steps_back(ten_seconds);
+    let mut session = a_worker_on(&machine, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    assert_eq!(session.collect_expired(), 0);
+    assert_eq!(
+        session.journal().expect("a journal").len().expect("reads"),
+        1
+    );
+}
+
 /// KR-REQ-09.12, 09.13: a fence report bigger than one acknowledgement is delivered a page at a
 /// time from the journal, every page encodes inside one control frame, and the pages together name
 /// every affected action however many there are.
