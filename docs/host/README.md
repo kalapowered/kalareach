@@ -4379,7 +4379,9 @@ and rebuilds its directory from the registry rows and the published descriptors,
 of process names. Each worker is verified by a fresh challenge. A descriptor that fails is
 quarantined and never spawned from. A descriptor whose reservation this host fenced is quarantined
 without a challenge: the fence says the worker is not to be reached again, and recovery leaves such
-a worker alone for the same reason. No worker is killed because the daemon restarted.
+a worker alone for the same reason. No worker is killed because the daemon restarted. A worker that
+did not answer at start is looked for again when a request names its session. A read, a device's link
+and a local caller's prompt each do so before they say the session is unknown.
 
 A worker accepts its current generation again only after a fresh challenge, which fences that
 generation's previous connection; it refuses a lower generation and requires a strictly higher one
