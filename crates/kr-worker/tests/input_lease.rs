@@ -1060,13 +1060,14 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
 // KR-REQ-08.64, KR-PERF-002: bracketed-paste framing per lease.
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-08.64: a plain Escape is not held when the mode is off and no paste is open.
-#[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
-)]
-async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
+/// A session whose application has turned no bracketed paste on, with the input lease held, and the
+/// epoch it is held at.
+async fn with_no_paste_mode_on() -> (
+    kr_ipc::testing::TempHost,
+    Arc<SessionRuntime>,
+    kr_protocol::ids::AttachmentId,
+    u64,
+) {
     let host = kr_ipc::testing::TempHost::create();
     // No bracketed paste, so an Escape is an Escape.
     let config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
@@ -1086,6 +1087,13 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
         .expect("starts"),
     );
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    (host, runtime, id, epoch)
+}
+
+/// KR-REQ-08.64: a plain Escape is not held when the mode is off and no paste is open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_escape_is_not_held_when_the_mode_is_off_and_no_paste_is_open() {
+    let (_host, runtime, id, epoch) = with_no_paste_mode_on().await;
 
     let accepted = {
         let mut session = runtime.session();
@@ -1098,6 +1106,23 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
         "nothing is held: the mode is off and no paste is open"
     );
     assert_eq!(accepted.forwarded_bytes, 1);
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.64: and the Escape reaches the application at once.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the application is not sent it at once"
+)]
+async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
+    let (_host, runtime, id, epoch) = with_no_paste_mode_on().await;
+
+    runtime
+        .session()
+        .write_input(id, epoch, 0, b"\x1b", None, std::time::Instant::now())
+        .expect("accepted");
     runtime.flush_input();
     let seen = retained_within(&runtime, b"kr-ready.\x1b", LIVENESS_DEADLINE).await;
     assert!(
