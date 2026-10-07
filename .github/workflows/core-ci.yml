@@ -1105,13 +1105,14 @@ jobs:
 
       # Everything a person needs to rebuild the same package from the same upstream release: the
       # patch set, the sources the patches bring with them, the startup entry, the manifest that
-      # pins and describes them, the licence, and the identity the run produced.
+      # pins and describes them, the scripts that place the archives and build the packages, the
+      # licence, and the identity the run produced.
       - name: Collect the published patch sets and identities
         run: |
-          # The same layout the build script and the document expect, so the archive can be
-          # unpacked and built without moving anything.
+          # The same layout the scripts and the document expect, so the archive can be unpacked and
+          # built without moving anything.
           mkdir -p /tmp/kr-shell-packages/scripts /tmp/kr-shell-packages/docs/shell-integration
-          cp scripts/build-shells.sh /tmp/kr-shell-packages/scripts/
+          cp scripts/place-shell-sources.sh scripts/build-shells.sh /tmp/kr-shell-packages/scripts/
           cp docs/shell-integration/packages.md /tmp/kr-shell-packages/docs/shell-integration/
           cp LICENSE /tmp/kr-shell-packages/
           for shell in zsh bash fish; do
