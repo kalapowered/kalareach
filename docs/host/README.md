@@ -1202,7 +1202,10 @@ showing, and a saved cursor of the showing buffer that lies outside the window; 
 negotiation of the buffer that is not showing, and all of it for a client that declared no terminal
 profile, together with the keyboard stack the session holds; the virtual title stack; soft-wrap
 markers; the right-hand side of a row wider than the window; and a pending wrap, whether the
-cursor's or a saved cursor's, that the window shows. `Session::restoration_losses` is the count.
+cursor's or a saved cursor's, that the window shows. A terminal given a screen that left out any of
+these but the right-hand side of a row is not handed the stream afterwards. Its attachment is shown
+a projection, with the reason `restoration_incomplete`, until the session's screen is one a
+restoration can carry.
 
 A restoration begins by writing the plain state its screen is drawn under and saving that state with
 `ESC 7`. The state is the cursor hidden, the plain rendition, no open link, origin mode and left and
