@@ -25,6 +25,7 @@ worker directly for what a session owns.
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
 | `kr host install` | — | Put a first release into this user's store of releases and make it current |
 | `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
+| `kr host rollback [--to <release>]` | — | Go back to an older release this host keeps: its control daemons are handed over as an update hands them over, and every live session keeps the release it started from |
 | `kr host versions` | — | The releases this host keeps, and which one is current |
 | `kr host machine [join/merge/split/plan/finish/undo]` | — | Show the machine group an environment records for itself, take one owner-approved step that changes it, or keep a merge over several environments as a plan |
 | `kr host clock --establish` | — | Trust this host's clock again, as its owner |
@@ -1705,12 +1706,15 @@ update brings its registry forward before it classes it, and says so. An environ
 longer present, such as one whose container has been removed, is named by its recorded roots and
 skipped. See `docs/host/updates.md` for details.
 
+`kr host rollback [--to <release>]` goes back to an older release which is still available in the store. If no release is specified, then the release that the host was running before the last release switch is used. The rollback process hands each control daemon over in the same way as for an update. However, it does not move an existing session. Instead, it exits with status 9 if there is an existing session which will not be compatible with the control daemons in the rolled-back release. Prior to rolling back, it checks the stores listed in the rolled-back release to ensure that they are at a version that can be read by the rolled-back release. If not, the command exits with status 1, names the stores that cannot be read and makes no changes. For the rules, see `docs/host/updates.md`.
+
 With `--json`, `kr host update` returns JSON with the keys `source`, `target`, `checked_only`
 (whether it only checked), `restarted` (the environments whose daemons it started again), `carried`
 (the registries it brought forward, each a map with the keys `environment`, `from` and `to`, where
 `from` is the schema the registry was at and `to` the schema the migration brought it to), `not_reached` (the
 recorded environments it could not reach, each a map with the keys `runtime_root`, `state_root` and
-`reason`) and `removed` (the releases it removed). `kr host versions` returns one object per
+`reason`) and `removed` (the releases it removed) and `rolled_back` (whether it went back to an older release, which is what
+`kr host rollback` returns). `kr host versions` returns one object per
 release, with the keys `release`, `sequence`, and whether it is `current`, `previous`, `staged` or
 `held` by a running program. `docs/host/updates.md` has the store, how a release is checked, the
 handover and what happens when an update stops part way.

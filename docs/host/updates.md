@@ -3,7 +3,8 @@
 A host installed with `kr host install` keeps each release it runs in a directory of its own and
 never changes one in place. An update adds the new release beside the old one, makes it current in
 one step, and replaces the control daemons. It never replaces a worker: a session keeps running the
-release it started from, with that release's shell package and module tree, until it closes.
+release it started from, with that release's shell package and module tree, until it closes. Going
+back to an older release is a switch of the same kind (see "Rolling back").
 
 ## The store
 
@@ -133,8 +134,10 @@ Only the current release's `kr` updates the host. An update, in order:
    does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
    and those already told are waited for to have gone, up to thirty seconds from the last telling,
    before anything is started again. Once every daemon has stopped, it holds every environment's
-   lock, brings forward any registry that records an earlier schema (see "Environments whose daemon
-   did not run"), and reads every environment's registry as it is. A log that a daemon ended by a
+   lock, reads every store the new release lists and refuses the switch, naming each, when one is at
+   a version the new release does not read (see "Rolling back"), brings forward any registry that
+   records an earlier schema (see "Environments whose daemon did not run"), and reads every
+   environment's registry as it is. A log that a daemon ended by a
    signal left beside the registry is taken into its file first, as the daemon's own stop would
    have; a registry that is a link, or is not a regular file, is refused before anything is opened,
    and the run then starts again what it stopped and exits with 1. A worker at a level the new
@@ -167,7 +170,8 @@ A release archive is `kalareach-<target>-<release>.tar.gz`: one top directory ho
 Framework's signed envelope: its release name and sequence, its commit, the target and the oldest
 operating system it runs on, the protocol package version its programs were built from, the public
 protocol majors it accepts, the compatibility levels its control daemon speaks to a worker at, its
-shell packages, and every file with its length, SHA-256 digest and whether it is a program.
+shell packages, the stores its programs read with the versions of each it reads (see "Stored
+formats"), and every file with its length, SHA-256 digest and whether it is a program.
 
 A release is taken in only whole and checked:
 
@@ -315,8 +319,86 @@ start leaves the update recorded, and the run exits with 1:
 kr: an update an earlier run left part way is not settled yet: a control daemon it stopped did not start again, and the next kr host update starts it before anything else: the control daemon of environment 7c9e… (process 4242) is still running and does not answer; stop it with `kill 4242` and run kr host update again
 ```
 
+## Rolling back
+
+```sh
+kr host rollback                                # to the release this host was on before its last switch
+kr host rollback --to 0.1.0+aaaaaaaaaaaa        # to another release the store keeps
+```
+
+Like `kr host update`, `kr host rollback` switches to a different release by surveying the workers of all live sessions and handing each control daemon over to the target release's. Like `kr host update`, `kr host rollback` records what it has done, so that a run which stopped part way is settled by the next run. Like `kr host update`, `kr host rollback` does not affect any live session. The session's worker, the session shell, and all its agents continue to run the release they were started in, and that release remains in the release store as long as anything holds it.
+
+`kr host rollback` can be run only using the `kr` binary of the current release. The target release, specified by `--to` or implied by the release that was current before the last release switch, must be present in the release store (`kr host versions` lists the releases that are present), and must be an older release. (To switch to a newer release, use `kr host update --archive`.) The target release's manifest is read from the release store. Since it was already checked when the target release was accepted into the release store, it need not be checked again against the update channel's root, which may have changed since. If the target release is not specified and there is no release to roll back to, `kr host rollback` exits with exit code 2 and tells the user which release to specify.
+
+If a live session's worker runs at a compatibility level that the target release's control daemon does not speak, `kr host rollback` waits: it stops nothing, exits with exit code 9 and names the session.
+
+```text
+kr: the rollback to 0.1.0+aaaaaaaaaaaa waits: session 7 runs kr-worker/0.2.0+bbbbbbbbbbbb with protocol 0.48.0, which the control daemon of 0.1.0+aaaaaaaaaaaa does not speak; run kr host rollback again once that has changed
+```
+
+### What the older release has to be able to read
+
+Rolling back is safe only when all stores on disk are in a format that the target release can read (see "Stored formats"). After stopping all control daemons and locking all environments, but before anything is brought forward, `kr host rollback` opens each store specified by the target release's manifest, at the path specified by the target release's manifest. If the store has a version outside the range of versions that the target release reads for that store, `kr host rollback` does not switch to the target release, does not change anything, starts again each daemon it stopped, and exits with exit code 1, telling the user the incompatible stores, including their environments, their versions, and the range of versions that the target release reads for them:
+
+```text
+kr: the switch to 0.1.0+aaaaaaaaaaaa was not made, and nothing was changed, because it cannot read the stores as they are: registry of environment 7c9e… at …/registry.sqlite records schema version 7, and 0.1.0+aaaaaaaaaaaa reads versions 1 to 6
+```
+
+`kr host update` performs this same check before it switches to a new release. In performing this check, `kr host update` and `kr host rollback` follow these rules:
+
+- If a store doesn't exist, or if a store exists but is not specified by the target release's manifest, its version is not checked, since the target release will never open it.
+- If a JSON record specifies no version, its version is assumed to be the version specified by the target release's manifest for that case, which is 0 unless the manifest says otherwise.
+- A database that records no version or several, a record that is not JSON, a version that is not a whole number, and a file that is not a regular file are refused by name. A version that cannot be read cannot be shown to be in range.
+- The configuration document is an exception to the above, since every release loads a configuration document that it cannot read as defaults, so it has no version to refuse a switch for. The configuration document is sought where the environment's state and the account's home each put it.
+- A registry that is behind the version the running `kr` reads is brought forward by the update itself before the target release meets it, so the check uses the version that the running `kr` reads and the refusal says so. Nothing is brought forward before the check.
+- If a store is specified by the target release's manifest with a scope or a recording that the running `kr` doesn't know about, its name is included in the list of stores that the target release cannot read.
+
+### What is kept, and what does not go back
+
+The release that a rollback leaves becomes the previous release and stays in the store. The store keeps the current release, the previous one, one staged for a later update, and any release a running program holds. A session started under the newer release keeps that release in the store, and `kr host versions` shows it as held.
+
+Trust will not be rolled back. A release carries the channel root it was built with. If this root was rotated and a signing key retired, that key will remain retired. The host stores the newest root of any release it has switched to. When running `kr host update`, the new release is checked against the newer of the root stored by the host and the one that the current release carries. After rolling back to a release with the first root, archives signed with the retired key will be refused.
+
+To move forward again, an archive of a newer release must be given to `kr host update --archive`. An archive of the release that was just rolled back from may be given as with any other release, except that its copy in the store cannot be replaced while a session of that release is live, and the update then waits, exiting 9.
+
+The control daemon of the older release will be started with the arguments the newer release's daemon ran with. If this fails the rollback will still be recorded, and the next run of `kr host update` or `kr host rollback` will try to start the daemon again. The daemon can be started by hand with arguments it does accept. A service definition that `kr host startup` wrote names the daemon through `current`, so it follows the switch.
+
+`kr host update --check` does not read the stores. A release without a store in its manifest cannot be rolled back to. Stores listed in the older release's manifest but not present on the host are not checked, and neither is an environment that cannot be reached. The registry stores session create requests, closure records and the configuration it accepted, and most changes to those raise the version of the registry, so a rollback across such a release is refused. On Windows `kr host rollback` says what `kr host update` says: that the host keeps no store of releases.
+
+## Stored formats
+
+All of the records that get written to a database or JSON file on disk under a state root are stores, and every store has a format version. The version stands for the format of all of the tables in that store, and all of the values kept in those tables (for the registry, that includes the create request recorded for a session, the record made when a session closes, and the configuration document an environment accepted). The version is recorded within each store, as the one row of a table, as SQLite's own `user_version`, or as a member of the record. A release which changes the tables of a store, or any of the values kept in it, raises the version and carries the step that takes an earlier store forward. These steps only run forward, and each commits whole. A release reads the versions from the lowest it brings forward up to the one it writes, and refuses a store which has a version above that. Two stores are the exception: every release loads the configuration document and the terminal preference as empty when it cannot read them.
+
+The registry's file is opened for writing by four different parts of the system: the registry, the grant store, the device store, and the pairing tables. Each of these four parts, when it opens the file, creates and migrates its own tables. The file has a single version number, and a change to the tables or kept values of any of these four parts raises it, with a step in the registry's chain that is empty when the writer's own open does the work. A migration opens the other three before it writes the version, whether it is a daemon starting or an update carrying the file forward. A file that records a version therefore has all four writers at the shape that version stands for.
+
+Records written before their version was recorded state none. The release that records the version reads such a record as version 0 and writes it back with the version. The catalogue's database had no version, so it is read as 0 and has its `user_version` set to 1 the next time it is opened.
+
+### What a release says about its stores
+
+A release's manifest lists each store its programs read. For each store it gives the version which will be written and the lowest version from which that release brings the store forward:
+
+```json
+{ "store": "registry", "scope": "environment", "path": "registry.sqlite",
+  "recording": { "kind": "sqlite_table", "table": "schema_version" },
+  "version": 7, "migrates_from": 1 }
+```
+
+The scope says where the path starts: `install` for the store of releases, `state_root`, `environment` for an environment's state directory, or `configuration` for the configuration document wherever the environment keeps it. A path that ends in `/*.json` means every record of that kind in a directory. If a release is offered which does not list any stores, then the release will be refused by the host.
+
+For a given store (identified by the name, scope, and path), the store must be maintained for as long as the data is maintained (so the name, scope, path, and recording method all must be stable for as long as the store is maintained). A release that moves a store lists a new one, and the old file stays, at a version above what earlier releases read. The addition of a scope or a recording method at a later date should have the first release which includes it also not include it in the stores, so that older releases will not reject the switch to that release.
+
+### The lock
+
+`stored-formats.lock`, at the root of the repository, maps each store to its manifest entry, to a digest of what its version stands for, and to the names of the types it keeps. The digest includes the definitions of the store's database as a running daemon creates them, the schema for each kept type which the protocol generates (excluding the prose of the type and its name), the source of each kept type that belongs to one crate, the words the code matches stored text against by hand, and the names the store owns.
+
+The update suite starts a daemon, runs a session and compares the code with the lock. A digest that moved while the version stood still fails the check, and the message says to raise the version and write the lock. The lock is written by an ignored test, `write_the_lock`, which refuses that same change, a version that went down, and a store moved to another place. It is not possible to write the lock in response to a change in the code without raising the version first.
+
+The lock also names everything else under the state root, along with the reason it has no version: locks, markers, logs, directories containing content, leftovers from crashes, records the client keeps on its own device, and the per-session journals, which keep the archive's own rule. After a daemon has run, every entry of the state root and of each environment's directory must be a store or be named in the lock, and a database found anywhere which is neither fails the check.
+
+The check does not look at the lock itself (so a change to the lock should be reviewed against the lock on the main branch), does not check that all of the types kept in a store are declared, or that the types nested inside one of those types are listed, and does not check differences in the encoding of the types (for example, a UUID or a 64-bit number is written differently in JSON and in CBOR).
+
 ## Windows
 
 A Windows host keeps no store: a directory link there cannot be replaced in one step by a user who
 does not administer the machine. Its installer replaces the release, and `kr host install`,
-`kr host update` and `kr host versions` say so.
+`kr host update`, `kr host rollback` and `kr host versions` say so.
