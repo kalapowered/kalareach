@@ -563,7 +563,8 @@ impl ClockTrust {
     /// after the trust and continuity rows: whatever must be written with the establishment
     /// (the spending of the owner's confirmation, the action's record) goes there, and what it
     /// refuses rolls the establishment back with it. Memory changes only after the commit: the
-    /// clock state here and the floor's continuity flag.
+    /// clock state here, the floor's continuity flag and the establishment the floor publishes to
+    /// every worker.
     ///
     /// `during` runs under this state's lock, which cannot be taken twice. It must not call
     /// [`Self::sample`], [`Self::observe`], [`Self::watch`] or anything that reads a grant's
@@ -609,6 +610,9 @@ impl ClockTrust {
             owed: Owed::default(),
         };
         self.floor.establish_continuity();
+        // And in the floor every worker maps, so a worker that distrusts its own clock can follow
+        // the owner.
+        self.floor.words().establish(established.get(), boot_ms);
         Ok(established)
     }
 

@@ -120,10 +120,10 @@ pub fn transferred_deadline(destination_now: u64, remaining: Duration) -> Option
 /// continuous clock (`mach_continuous_time`, `QueryInterruptTime`), so the two differ by the
 /// oscillator's error: 20 ppm is about 1.7 seconds a day. A projection that credits every
 /// continuous millisecond counts that error as a rollback once it passes the five-second
-/// tolerance, about three days at 20 ppm, and a healthy host then distrusts its own clock: the
-/// daemon's record until its owner establishes the clock again, a worker's contract until its
-/// session ends. So a projection credits a millisecond less per 10,000 ([`credited`]): a
-/// continuous clock up to this fast raises no distrust, and one faster than that still does.
+/// tolerance, about three days at 20 ppm, and a healthy host then distrusts its own clock until
+/// its owner establishes it again. So a projection credits a millisecond less per 10,000
+/// ([`credited`]): a continuous clock up to this fast raises no distrust, and one faster than that
+/// still does.
 ///
 /// Both of the host's time records project this way, the daemon's clock record and each worker's
 /// time contract, and this is the one statement of the rule and of its cost. A wall clock that

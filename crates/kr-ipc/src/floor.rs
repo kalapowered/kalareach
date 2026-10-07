@@ -193,8 +193,8 @@ impl core::fmt::Display for Unusable {
 /// The owner's establishment of the host's clock, as the floor holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Establishment {
-    /// Which establishment this is in this boot, from one. A reader that has acted on a count
-    /// acts on a larger one only.
+    /// Which establishment this is in this boot, from one. A reader acts on a count it has not
+    /// acted on before.
     pub count: u64,
     /// The wall reading the owner established, in UTC milliseconds.
     pub wall_ms: u64,
