@@ -2178,6 +2178,46 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
     }
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.82: a cursor saved with a wrap pending is a state no terminal is
+/// given back. No sequence sets a wrap on a cursor that is about to be saved, so a terminal drawn
+/// such a screen is shown a projection, and the same screen with the cursor saved before the last
+/// column was filled leaves it on the stream. The cursor itself has no wrap pending in either case:
+/// the save is followed by a move, so only the saved one differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_cursor_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_projection() {
+    let narrow = Dimensions::new(4, 5);
+    for (printed, expected) in [
+        (
+            "abcd",
+            (
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::RestorationIncomplete),
+            ),
+        ),
+        ("abc", (Some(TerminalPresentationMode::Direct), None)),
+    ] {
+        // `ESC 7` saves the cursor and `CSI 3;1 H` moves it on, so the screen is settled when the
+        // move has been written.
+        let host = host_with(
+            &format!("stty -echo -echonl || exit 1; printf '{printed}\\0337\\033[3;1H'; read -r _"),
+            narrow,
+            None,
+            1024 * 1024,
+        )
+        .await;
+        produced(&host.runtime, b"\x1b[3;1H").await;
+        let attached = attach(&host, narrow, Some("xterm-256color")).await;
+        let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        assert_eq!(
+            reported(&host, &mut reader, attached.attachment_id).await,
+            expected,
+            "the screen drawn after {printed:?} and a save decides how the terminal is served"
+        );
+    }
+}
+
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {

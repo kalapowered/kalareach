@@ -47,7 +47,9 @@
 //!   sets one, so putting a terminal back into it would mean drawing that cell through whatever
 //!   pen, character set, margin and origin the restoration has installed. The cost is one
 //!   character: the next one the application prints lands beside the last column instead of
-//!   wrapping to the next row.
+//!   wrapping to the next row. A saved cursor's pending wrap is lost the same way, and it is lost
+//!   on the terminals measured whatever a restoration does: they give a restored cursor no
+//!   pending wrap. The cost is the same character, the first one printed after the restore.
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
@@ -78,7 +80,7 @@ pub struct Carried {
     pub other_keyboard: bool,
     /// Keyboard-stack entries the session holds, which this restoration does not install.
     pub keyboard_stack: usize,
-    /// A pending wrap this restoration could not reproduce.
+    /// A pending wrap this restoration could not reproduce, on the cursor or on a saved cursor.
     pub pending_wrap: bool,
 }
 
@@ -697,6 +699,13 @@ impl Writer {
             self.carried.other_saved_cursors += 1;
             return;
         };
+        // What can be installed is installed below. A wrap the cursor was saved with is not one of
+        // those things: setting it takes a character printed into the last column, drawn through
+        // the pen, sets and origin this save is putting in force, and the terminals measured give a
+        // restored cursor no wrap in any case.
+        if cursor.pending_wrap {
+            self.carried.pending_wrap = true;
+        }
         let restore_pen = self.pen.unwrap_or_default();
         let restore_link = self.link.clone();
         self.csi(if cursor.origin_mode { b"?6h" } else { b"?6l" });

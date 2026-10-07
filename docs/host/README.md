@@ -1208,8 +1208,9 @@ and the reset is repeated to forget the cursor that entering saved. When the alt
 showing, the primary buffer is painted between leaving and re-entering the alternate buffer. The
 second entry to the alternate buffer saves a plain cursor (the default pen and shape, no link, at
 home). Mode 47 is not one the profile tracks, and a restoration never asks a terminal for it. A
-saved cursor the session holds for the buffer that is showing is installed afterwards. The one it
-holds for the other buffer is counted as not carried.
+saved cursor the session holds for the buffer that is showing is installed afterwards, except for a
+pending wrap it holds, which is counted as not carried. The one it holds for the other buffer is
+counted as not carried.
 
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
