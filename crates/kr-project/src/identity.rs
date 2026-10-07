@@ -849,9 +849,9 @@ pub(crate) fn not_the_recorded_tree(
 ) -> ProjectError {
     ProjectError::IdentityChanged {
         detail: format!(
-            "this record names the working tree {tree}, and {} is a directory that is neither \
-             that tree nor inside it: a recorded identity is the object rather than the path, so \
-             a record of one never covers another object. Nothing is run there ({})",
+            "this record names the working tree {tree}, and {} is not that tree: a recorded \
+             identity is the object rather than the path, so a record of one never covers another \
+             object ({})",
             crate::git::redact(&shown.display().to_string()),
             crate::git::redact(&refusal.to_string())
         )
