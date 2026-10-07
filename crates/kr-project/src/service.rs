@@ -1157,7 +1157,7 @@ impl ProjectService {
                     .ok_or_else(|| ProjectError::UnknownProject {
                         project: project_repository_id.to_string().into(),
                     })?;
-                let Some(bound) = project.source else {
+                let Some(bound) = project.source.clone() else {
                     return Err(ProjectError::PermissionDenied {
                         detail: format!(
                             "repository {project_repository_id} is bound to no source location, \
@@ -1169,7 +1169,11 @@ impl ProjectService {
                 (
                     bound.location_id,
                     RelativeName::parse(&bound.relative_path)?,
-                    Some((project.project_repository_id, project.identity)),
+                    Some((
+                        project.project_repository_id,
+                        project_tree(&project),
+                        project.identity,
+                    )),
                 )
             }
         };
@@ -1183,16 +1187,9 @@ impl ProjectService {
         let opened = match expected {
             // A registered repository is the object its record names, decided before anything of
             // it is read.
-            Some((project, expected)) => {
-                let (opened, decided) = self.open_through_deciding(
-                    &held,
-                    &relative,
-                    admission,
-                    Some(RecordedTree {
-                        tree: expected.work_tree,
-                        git_dir: GitDirectory::Named(expected.git_dir),
-                    }),
-                )?;
+            Some((project, recorded, expected)) => {
+                let (opened, decided) =
+                    self.open_through_deciding(&held, &relative, admission, Some(recorded))?;
                 self.settle_project(project, decided.revision(expected))?;
                 opened
             }
@@ -1654,6 +1651,25 @@ impl ProjectService {
         self.open_recorded_workspace(&row, &TreeReach::by_path())
     }
 
+    /// Opens a project's repository at the path its record names, as the tree and the Git
+    /// directory the record names, and writes what the record becomes.
+    ///
+    /// The tree is decided before Git is asked anything in it, and the Git directory before the
+    /// repository's configuration is audited ([`project_tree`] says how each is decided).
+    fn open_recorded_project(&self, project: &ProjectRow) -> Result<OpenedRepository> {
+        let (opened, decided) = OpenedRepository::open_recorded_tree(
+            &self.profile,
+            self.environment_id,
+            Path::new(&project.display_path),
+            project_tree(project),
+        )?;
+        self.settle_project(
+            project.project_repository_id,
+            decided.revision(project.identity),
+        )?;
+        Ok(opened)
+    }
+
     /// Opens the repository one workspace's working tree belongs to, reached the way `reach` says,
     /// as the tree the row recorded, and writes what the records become.
     ///
@@ -1685,13 +1701,17 @@ impl ProjectService {
             })?;
         let recorded = RecordedTree {
             tree,
-            git_dir: if is_independent_clone(row) {
+            git_dir: match row.isolation {
                 // Its own repository, made inside its tree.
-                GitDirectory::InsideTree {
+                Some(IsolationMechanism::IndependentClone) => GitDirectory::InsideTree {
                     recorded: row.git_dir,
+                },
+                // A linked worktree this host made at its path, in the project's repository.
+                Some(IsolationMechanism::GitWorktree) => {
+                    GitDirectory::AtTree(project.identity.git_dir)
                 }
-            } else {
-                GitDirectory::Named(project.identity.git_dir)
+                // The project's own tree, decided as the project is.
+                None => project_tree(&project).git_dir,
             },
         };
         let (opened, decided) = match &reach.through {
@@ -2527,16 +2547,7 @@ impl ProjectService {
             None if performed.grant().is_some() => {
                 self.open_through_source(&project, admitting, &mut reach)?
             }
-            None => {
-                let (opened, renumbered) = OpenedRepository::open_recorded(
-                    &self.profile,
-                    self.environment_id,
-                    Path::new(&project.display_path),
-                    project.identity,
-                )?;
-                self.settle_project(project.project_repository_id, renumbered)?;
-                opened
-            }
+            None => self.open_recorded_project(&project)?,
         };
         let admission = admission_for(self.locations(), reach);
         let (head_revision, head_reference) = repository.head(&self.profile)?;
@@ -3360,10 +3371,7 @@ impl ProjectService {
             &source,
             &RelativeName::parse(&bound.relative_path)?,
             admission_for(self.locations(), reach.clone()),
-            Some(RecordedTree {
-                tree: project.identity.work_tree,
-                git_dir: GitDirectory::Named(project.identity.git_dir),
-            }),
+            Some(project_tree(project)),
         )?;
         self.settle_project(
             project.project_repository_id,
@@ -3626,15 +3634,7 @@ impl ProjectService {
             // it leaves a record naming a path that is gone, which `git worktree list` reports
             // and a later prune clears; running Git under an unaudited configuration would be
             // worse than that.
-            let top = PathBuf::from(&project.display_path);
-            if let Ok((opened, renumbered)) = OpenedRepository::open_recorded(
-                &self.profile,
-                self.environment_id,
-                &top,
-                project.identity,
-            ) && self
-                .settle_project(project.project_repository_id, renumbered)
-                .is_ok()
+            if let Ok(opened) = self.open_recorded_project(&project)
                 && opened.recheck(&self.profile).is_ok()
             {
                 let arguments: [&OsStr; 2] = [OsStr::new("worktree"), OsStr::new("prune")];
@@ -4105,6 +4105,25 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
         || name.to_owned(),
         |parent| parent.join(name).display().to_string(),
     )
+}
+
+/// Returns what a project's record says of the repository at its path, which every open of the
+/// project decides before Git is asked anything there.
+///
+/// A project this host initialised or cloned was published at its path, so the directory there is
+/// its tree and nothing below it, and its own `.git` leads to its repository. A project the owner
+/// adopted may have been adopted through a directory below its top level, and keeps its Git
+/// directory wherever its configuration puts it: the record cannot say that its path is the top
+/// level, so the directory at the path may lie inside the recorded tree.
+fn project_tree(project: &ProjectRow) -> RecordedTree {
+    let git_dir = project.identity.git_dir;
+    RecordedTree {
+        tree: project.identity.work_tree,
+        git_dir: match project.origin {
+            ProjectOrigin::Initialised | ProjectOrigin::Cloned => GitDirectory::AtTree(git_dir),
+            ProjectOrigin::Adopted => GitDirectory::Named(git_dir),
+        },
+    }
 }
 
 /// Returns whether a workspace is an independent clone: its own repository, made inside its tree.

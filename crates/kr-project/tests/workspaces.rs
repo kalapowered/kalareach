@@ -27,7 +27,7 @@ use kr_protocol::project::{
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use support::{
-    Fixture, action, actor, destination, git_ran_in, git_started_in, include_everything,
+    Fixture, action, actor, destination, git_ran_in, git_raw, git_started_in, include_everything,
     ordinary_repository, watching_git, write, write_bytes,
 };
 
@@ -1593,6 +1593,217 @@ fn a_destination_replaced_after_an_independent_clone_was_published_gets_no_work(
 #[test]
 fn a_destination_replaced_after_a_worktree_was_added_gets_no_work() {
     made_into_a_replaced_destination(IsolationMechanism::GitWorktree, "replaced-worktree", 131);
+}
+
+/// Initialises a project at `name` in `parent`, which this host publishes there, and commits once
+/// so that a workspace of it has a revision to start from.
+#[cfg(unix)]
+fn published_project(
+    fixture: &Fixture,
+    parent: &std::path::Path,
+    name: &str,
+    seed: u8,
+) -> ProjectRepositoryId {
+    let project = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &kr_protocol::project::ProjectInitParams {
+                destination: destination(fixture.environment_id(), parent, name),
+                label: name.to_owned(),
+                initial_branch: Nullable(None),
+            },
+            Some(&action("project.init", seed)),
+        )
+        .expect("the project is initialised")
+        .project
+        .project_repository_id;
+    git_raw(
+        &parent.join(name),
+        ["commit", "--allow-empty", "-m", "the first commit"],
+    );
+    project
+}
+
+/// Moves the directory at `path` aside, makes another repository inside it, and makes `path` a
+/// link to that repository: a path that leads to a directory inside what was there. Returns the
+/// directory it leads to.
+#[cfg(unix)]
+fn made_a_link_into_what_was_there(path: &std::path::Path) -> std::path::PathBuf {
+    let moved = path.with_extension("moved");
+    std::fs::rename(path, &moved).expect("the directory moves aside");
+    let elsewhere = ordinary_repository(&moved, "inside");
+    std::os::unix::fs::symlink(&elsewhere, path).expect("the path leads to the directory");
+    std::fs::canonicalize(&elsewhere).expect("the directory resolves")
+}
+
+/// A linked worktree's workspace is decided as exactly its tree: a path that leads to a directory
+/// inside the tree is not the workspace, and no Git invocation starts there.
+#[cfg(unix)]
+#[test]
+fn a_directory_inside_a_linked_worktree_is_not_read_as_the_workspace() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "worktree-inside-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "worktree-inside",
+        IsolationMechanism::GitWorktree,
+        132,
+    );
+    let tree = fixture.work().join("worktree-inside");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 133);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the worktree is counted: {held:?}"
+    );
+
+    let inside = made_a_link_into_what_was_there(&tree);
+    let held = measured(&fixture, workspace_id, 134);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the worktree: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &inside),
+        "no Git invocation started in a directory inside the worktree"
+    );
+}
+
+/// A request against an opened linked worktree does not take the repository around the worktree
+/// for the worktree's: the worktree lost the file that makes Git take it for a repository, and
+/// Git's search would go on above the tree.
+#[cfg(unix)]
+#[test]
+fn a_request_against_an_opened_linked_worktree_does_not_search_above_its_tree() {
+    let fixture = Fixture::create();
+    let around = ordinary_repository(fixture.work(), "around-worktree");
+    let project = adopted_with_changes(&fixture, "worktree-requests-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        &around,
+        "worktree",
+        IsolationMechanism::GitWorktree,
+        135,
+    );
+    let tree = around.join("worktree");
+    let opened = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect("the worktree opens");
+    let profile = fixture.service().profile();
+    let arguments = [
+        std::ffi::OsStr::new("rev-parse"),
+        std::ffi::OsStr::new("--show-toplevel"),
+    ];
+    let toplevel = profile
+        .run_checked(&opened.read(&arguments))
+        .expect("the worktree is a repository's working tree");
+    assert_eq!(
+        std::fs::canonicalize(toplevel.trim()).expect("the top level resolves"),
+        std::fs::canonicalize(&tree).expect("the tree resolves")
+    );
+
+    std::fs::remove_file(tree.join(".git")).expect("the worktree loses its repository");
+    assert!(
+        profile.run_checked(&opened.read(&arguments)).is_err(),
+        "a read finds no repository for the worktree instead of the one around it"
+    );
+    assert!(
+        opened.recheck(profile).is_err(),
+        "so does the check of the configuration a write is about to run under"
+    );
+}
+
+/// A project this host published is decided as exactly its tree: a path that leads to a directory
+/// inside it is not the project, and no Git invocation starts there.
+#[cfg(unix)]
+#[test]
+fn a_directory_inside_a_published_project_is_not_read_as_the_project() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = published_project(&fixture, fixture.work(), "published-inside", 136);
+    let tree = fixture.work().join("published-inside");
+    let named = std::fs::canonicalize(&tree).expect("the project resolves");
+    let _ = git_started_in(&started, &named);
+    shared_workspace(&fixture, project, 137);
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the published project"
+    );
+
+    let inside = made_a_link_into_what_was_there(&tree);
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "preview".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: true,
+            },
+            Some(&action("workspace.create", 138)),
+        )
+        .expect_err("a directory inside the project is not the project");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        !git_started_in(&started, &inside),
+        "no Git invocation started in a directory inside the published project"
+    );
+}
+
+/// A request against an opened published project does not take the repository around the project
+/// for the project's: the project's own repository is no longer one, and Git's search would go on
+/// above the tree.
+#[cfg(unix)]
+#[test]
+fn a_request_against_an_opened_published_project_does_not_search_above_its_tree() {
+    let fixture = Fixture::create();
+    let around = ordinary_repository(fixture.work(), "around-published");
+    let project = published_project(&fixture, &around, "published", 139);
+    let workspace_id = shared_workspace(&fixture, project, 140);
+    let tree = around.join("published");
+    let opened = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect("the project opens");
+    let profile = fixture.service().profile();
+    let arguments = [
+        std::ffi::OsStr::new("rev-parse"),
+        std::ffi::OsStr::new("--show-toplevel"),
+    ];
+    let toplevel = profile
+        .run_checked(&opened.read(&arguments))
+        .expect("the project is its own repository");
+    assert_eq!(
+        std::fs::canonicalize(toplevel.trim()).expect("the top level resolves"),
+        std::fs::canonicalize(&tree).expect("the tree resolves")
+    );
+
+    std::fs::remove_file(tree.join(".git/HEAD")).expect("the project's repository is not one");
+    assert!(
+        profile.run_checked(&opened.read(&arguments)).is_err(),
+        "a read finds no repository for the project instead of the one around it"
+    );
+    assert!(
+        opened.recheck(profile).is_err(),
+        "so does the check of the configuration a write is about to run under"
+    );
 }
 
 /// A workspace tree on another filesystem that gives the directory at its path the numbers the

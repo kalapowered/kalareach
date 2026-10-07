@@ -19,8 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kr_project::RecordedRepository;
 use kr_project::git::{Cancellation, GitRequest};
-use kr_project::identity::OpenedRepository;
+use kr_project::identity::{GitDirectory, OpenedRepository, RecordedTree};
 use kr_project::operation::STAGING_PREFIX;
 use kr_project::store::Performed;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -431,6 +432,25 @@ fn a_transport_this_host_does_not_use_is_refused_by_name() {
     );
 }
 
+/// Opens the directory at `path` as the repository a record of an adopted project names: a record
+/// that says nothing of where the repository's own directory is.
+fn open_recorded(
+    fixture: &Fixture,
+    path: &Path,
+    recorded: RecordedRepository,
+) -> kr_project::Result<OpenedRepository> {
+    OpenedRepository::open_recorded_tree(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        path,
+        RecordedTree {
+            tree: recorded.work_tree,
+            git_dir: GitDirectory::Named(recorded.git_dir),
+        },
+    )
+    .map(|(opened, _)| opened)
+}
+
 #[test]
 fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_not() {
     // Section 14 paragraph 5: identity is the stable filesystem identity, so a rename does not
@@ -461,24 +481,14 @@ fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_n
     // A rename of the checkout. The object is the same, so the recorded identity still names it.
     let moved = fixture.work().join("moved");
     std::fs::rename(&first, &moved).expect("the checkout is renamed");
-    OpenedRepository::open_recorded(
-        fixture.service().profile(),
-        fixture.environment_id(),
-        &moved,
-        recorded,
-    )
-    .expect("a rename of the checkout keeps the identity that was recorded");
+    open_recorded(&fixture, &moved, recorded)
+        .expect("a rename of the checkout keeps the identity that was recorded");
 
     // A different repository at the old path is a different object, so nothing is served from the
     // record: the grant did not extend to whatever now holds the name.
     ordinary_repository(fixture.work(), "first");
-    let refusal = OpenedRepository::open_recorded(
-        fixture.service().profile(),
-        fixture.environment_id(),
-        &first,
-        recorded,
-    )
-    .expect_err("a replacement at the recorded path is refused");
+    let refusal = open_recorded(&fixture, &first, recorded)
+        .expect_err("a replacement at the recorded path is refused");
     assert_eq!(refusal.code(), ErrorCode::SourceChanged);
     assert!(
         refusal
@@ -543,13 +553,8 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
     // The working tree is a different object, so a record made against the first does not cover
     // the second: adding a worktree extends no grant.
     assert_ne!(worktree.identity().work_tree, recorded.work_tree.object);
-    let refusal = OpenedRepository::open_recorded(
-        fixture.service().profile(),
-        fixture.environment_id(),
-        &added,
-        recorded,
-    )
-    .expect_err("a record of one working tree does not cover another");
+    let refusal = open_recorded(&fixture, &added, recorded)
+        .expect_err("a record of one working tree does not cover another");
     assert_eq!(refusal.code(), ErrorCode::SourceChanged);
     assert!(
         refusal

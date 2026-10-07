@@ -97,8 +97,17 @@ pub struct RecordedTree {
 #[derive(Clone, Copy, Debug)]
 pub enum GitDirectory {
     /// A record names it, and the repository keeps it wherever its configuration puts it: a
-    /// checkout whose configuration sets `core.worktree` keeps it above its tree.
+    /// checkout whose configuration sets `core.worktree` keeps it above its tree. A repository the
+    /// owner registered may have been registered through a directory below its top level, so the
+    /// directory at the recorded path is the tree or lies inside it, and Git's search for the
+    /// repository is not stopped above the tree.
     Named(RecordedIdentity),
+    /// A record names it, and this host made the tree at the record's path: a linked worktree, or
+    /// a repository it published. The tree's own `.git`, a directory or a file that names the
+    /// repository's Git directory, is how Git finds the repository, so the directory at the path
+    /// is the tree itself, never a directory inside it, and Git's search for the repository is
+    /// stopped above the tree. Unlike [`Self::InsideTree`] it asks nothing of what the `.git` is.
+    AtTree(RecordedIdentity),
     /// The repository was made inside its tree, an independent clone or a repository this host
     /// staged: its Git directory is the tree's own `.git`, a directory and never a file or a link
     /// to another repository, and no other repository is its repository, so Git's search for one
@@ -155,9 +164,10 @@ impl Decided {
 }
 
 impl GitDirectory {
-    /// Returns whether Git's search for the repository stops above the tree.
-    const fn inside_tree(self) -> bool {
-        matches!(self, Self::InsideTree { .. })
+    /// Returns whether Git's search for the repository stops above the tree: the repository is
+    /// found from the tree's own `.git` and nowhere else.
+    const fn stops_above_tree(self) -> bool {
+        matches!(self, Self::AtTree(_) | Self::InsideTree { .. })
     }
 
     /// Refuses, before Git is asked anything, a tree whose own `.git` is not a directory, and one
@@ -187,6 +197,7 @@ impl GitDirectory {
     ) -> Result<GitDirOutcome> {
         match self {
             Self::Named(recorded)
+            | Self::AtTree(recorded)
             | Self::InsideTree {
                 recorded: Some(recorded),
             } => git_dir
@@ -277,11 +288,12 @@ impl OpenedRepository {
     ///
     /// The directory is opened and decided first, and Git starts in that object: a directory that
     /// took the place of the recorded tree, or a filesystem mounted over it, is refused before Git
-    /// is asked anything. For a repository registered through a directory below its top level the
-    /// directory at the path may lie inside the recorded tree (`require_within`); for one made
-    /// inside its tree ([`GitDirectory::InsideTree`]) it is the tree itself, and the tree's own
-    /// `.git` must be a directory, and the recorded one where a record names it, before Git
-    /// starts. Git then
+    /// is asked anything. For a repository the owner registered, possibly through a directory
+    /// below its top level, the directory at the path may lie inside the recorded tree
+    /// ([`GitDirectory::Named`], `require_within`); for a tree this host made
+    /// ([`GitDirectory::AtTree`], [`GitDirectory::InsideTree`]) it is the tree itself, and for a
+    /// repository made inside its tree the tree's own `.git` must also be a directory, and the
+    /// recorded one where a record names it, before Git starts. Git then
     /// reports the top level of the repository it finds, and that top level is decided before its
     /// configuration is audited: a repository whose top level is not the recorded tree, found
     /// inside or around it, is refused unaudited. Its Git directory is decided the same way
@@ -289,10 +301,10 @@ impl OpenedRepository {
     /// its working tree, and so reports the recorded tree as its top level, is refused before its
     /// configuration is read.
     ///
-    /// For a repository made inside its tree Git's search is stopped at the directory above the
-    /// tree, and that ceiling stays on the opened repository for every request made against it,
-    /// so a tree that lost its own `.git` finds no repository rather than the one around it. Any
-    /// other repository can keep its Git directory anywhere (a checkout whose configuration sets
+    /// For a tree this host made Git's search is stopped at the directory above the tree, and that
+    /// ceiling stays on the opened repository for every request made against it, so a tree that
+    /// lost its own `.git` finds no repository rather than the one around it. A repository the
+    /// owner registered can keep its Git directory anywhere (a checkout whose configuration sets
     /// `core.worktree` keeps it above the tree), so the search is not stopped. It is not stopped
     /// either where the platform cannot say where the tree is, or where the path of the directory
     /// above it holds the character Git separates its ceilings by; the Git directory decision
@@ -301,7 +313,7 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the directory is not the recorded tree (nor
-    /// inside it, for a repository that was not made inside its tree), when the top level Git
+    /// inside it, for a repository the owner registered), when the top level Git
     /// reports is not the recorded tree, when the Git directory is not the recorded one, or what
     /// [`Self::open`] returns.
     pub fn open_recorded_tree(
@@ -326,13 +338,13 @@ impl OpenedRepository {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
         let ceiling = match recorded {
             Some(recorded) => {
-                // A repository made inside its tree is at the tree's own place and nowhere below
-                // it, so the directory at its path is the tree itself. A directory inside the
-                // tree is what Git would start in when a link at the path names one, and a
-                // repository found there is not the one the record is for. Any other repository
-                // may have been registered through a directory below its top level.
+                // A tree this host made is at its own place and nowhere below it, so the
+                // directory at its path is the tree itself. A directory inside the tree is what
+                // Git would start in when a link at the path names one, and a repository found
+                // there is not the one the record is for. A repository the owner registered may
+                // have been registered through a directory below its top level.
                 let within = match recorded.git_dir {
-                    GitDirectory::InsideTree { .. } => {
+                    GitDirectory::InsideTree { .. } | GitDirectory::AtTree(_) => {
                         decide_tree_before_git(&work_tree, recorded.tree)?;
                         work_tree.try_clone()?
                     }
@@ -341,7 +353,7 @@ impl OpenedRepository {
                 recorded.git_dir.decide_before_git(&within)?;
                 recorded
                     .git_dir
-                    .inside_tree()
+                    .stops_above_tree()
                     .then(|| ceiling_above(&within))
                     .flatten()
             }
@@ -537,35 +549,6 @@ impl OpenedRepository {
     #[must_use]
     pub const fn admission(&self) -> Option<&ReadAdmission> {
         self.admission.as_ref()
-    }
-
-    /// Opens a working tree and requires it to be the object a record named, and says whether the
-    /// record is to be replaced by what the repository is now.
-    ///
-    /// The tree is decided before Git is asked anything there, and the repository's Git directory
-    /// once Git has said where it is and before its configuration is audited
-    /// ([`Self::open_recorded_tree`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectError::IdentityChanged`] when either identity differs from the record's,
-    /// or whatever [`Self::open`] returns.
-    pub fn open_recorded(
-        profile: &RestrictedProfile,
-        environment_id: EnvironmentId,
-        path: &Path,
-        expected: RecordedRepository,
-    ) -> Result<(Self, Option<Revised>)> {
-        let (opened, decided) = Self::open_recorded_tree(
-            profile,
-            environment_id,
-            path,
-            RecordedTree {
-                tree: expected.work_tree,
-                git_dir: GitDirectory::Named(expected.git_dir),
-            },
-        )?;
-        Ok((opened, decided.revision(expected)))
     }
 
     /// Returns both identities as the journal records them.
