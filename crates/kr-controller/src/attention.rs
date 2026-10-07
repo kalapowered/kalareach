@@ -128,15 +128,13 @@ const MAX_RELINK: Duration = Duration::from_secs(30);
 /// How often the store is looked at when no timer is due sooner.
 const MAINTENANCE: Duration = Duration::from_secs(60);
 
-/// How soon the maintenance loop writes again what the time contract must keep, when the last
-/// save could not write it.
+/// How soon the maintenance loop reads the host's clock again while the host owes its record
+/// something decided about it.
 ///
-/// A save is made by a reading, and a reading never waits for the file: on Windows another program
-/// can hold it for a moment, and a reading runs in a request, some under the store's lock. So a
-/// refused save stays unwritten until the next reading, and without a request the next is the
-/// loop's own: the first refused save wakes the loop, and while anything is unsaved it comes back
-/// this soon.
-const SAVE_RETRY: Duration = Duration::from_secs(5);
+/// A reading writes what is owed before it answers, and without a request the next reading is the
+/// loop's own: the first reading that finds a write owed wakes the loop, and while the host owes
+/// anything it comes back this soon.
+const CLOCK_WRITE_RETRY: Duration = Duration::from_secs(5);
 
 /// How long the record of an action is kept, after which a repeat is a new request.
 const ACTION_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -589,6 +587,22 @@ impl Pause {
     }
 }
 
+/// What the attention store asks of the host about its wall clock.
+///
+/// The host's one decision about the clock answers it, so the store withholds quiet hours and
+/// forgets action records on the same clock every other collection of the host forgets on: a
+/// rollback any of them finds is found for all, and one owner's retrust frees all.
+pub(crate) trait HostClock: Send + Sync {
+    /// One reading of the wall clock, and whether it proves what the store uses it for.
+    /// `platform_qualified` is whether the platform's time service qualified at this reading.
+    /// `None` when the host cannot answer, which the store reads as unproven.
+    fn watch(&self, platform_qualified: bool) -> Option<crate::service::net::clock_trust::Watched>;
+
+    /// Whether the host lets a record whose retention is counted from `reading_ms` be forgotten:
+    /// the one check every collection passes.
+    fn may_forget_at(&self, reading_ms: u64) -> bool;
+}
+
 /// The environment's attention store, as the daemon holds it.
 pub struct AttentionModule {
     /// Each session's privacy fence, and the lock every release of session text is made under:
@@ -597,16 +611,18 @@ pub struct AttentionModule {
     /// only for the holders admitted before it.
     release: tokio::sync::RwLock<BTreeMap<SessionId, SessionFence>>,
     store: std::sync::Mutex<Attention>,
-    /// The host time contract the store's readings come from, observed at each reading and kept
-    /// beside the store so a restart keeps what it knew about the wall clock.
-    time: kr_worker::action::time::TimeContract,
-    time_file: std::path::PathBuf,
-    /// Held from reading what the time contract must keep to recording it as kept, so one save
-    /// never replaces a newer one with an older state.
-    time_saving: std::sync::Mutex<()>,
-    /// Set by a save that could not write and cleared by one that did, so only the first failure
-    /// wakes the maintenance loop.
-    save_failing: AtomicBool,
+    /// The host's one decision about its wall clock, which every reading of the store goes
+    /// through, once the daemon has attached it. Until it has, the store reads the wall clock as
+    /// unproven and forgets nothing.
+    clock: std::sync::OnceLock<Arc<dyn HostClock>>,
+    /// The platform's time service, read at each reading: whether it qualifies is evidence the
+    /// host's decision takes from here.
+    adapter: Arc<dyn kr_worker::action::adapter::TimeAdapter>,
+    /// This host's boot, as the store tells one boot's readings from another's.
+    boot: kr_attention::time::BootMark,
+    /// Set by a reading that found a write owed to the host's record and cleared by one that did
+    /// not, so only the first wakes the maintenance loop.
+    clock_owed: AtomicBool,
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
@@ -628,14 +644,10 @@ pub struct AttentionModule {
     /// before it takes the store. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_store: Pause,
-    /// Where this module's own tests stop a save of the time contract as it begins, before it
-    /// waits for its turn.
+    /// Where this module's own tests stop a forgetting pass once the host has answered that it may
+    /// forget, before the pass takes the store.
     #[cfg(test)]
-    save_entry: Pause,
-    /// Where this module's own tests stop a save of the time contract, between reading what it
-    /// keeps and writing it.
-    #[cfg(test)]
-    in_save: Pause,
+    after_the_clock_answer: Pause,
     /// Where this host's own tests stop a pass that decides announcements once it holds the
     /// privacy state's read side, before it decides. Compiled away in every shipped build.
     #[cfg(any(test, feature = "testing"))]
@@ -687,27 +699,18 @@ impl AttentionModule {
     ) -> Result<Self> {
         Self::open_over(
             paths,
-            boot_identity,
-            kr_worker::action::time::TimeSources::system(),
+            &boot_identity,
+            Arc::new(kr_worker::action::adapter::PlatformTimeAdapter::new()),
         )
     }
 
-    /// Opens the store as [`Self::open`] does, reading time from the clocks given.
+    /// Opens the store as [`Self::open`] does, reading the platform's time service from `adapter`.
     fn open_over(
         paths: &kr_ipc::paths::EnvironmentPaths,
-        boot_identity: kr_protocol::identity::BootIdentity,
-        sources: kr_worker::action::time::TimeSources,
+        boot_identity: &kr_protocol::identity::BootIdentity,
+        adapter: Arc<dyn kr_worker::action::adapter::TimeAdapter>,
     ) -> Result<Self> {
-        let time_file = paths.state_dir().join("attention-time.cbor");
-        let recorded = std::fs::read(&time_file).ok().and_then(|bytes| {
-            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
-                &bytes,
-                &kr_cbor::Limits::DEFAULT,
-            )
-            .ok()
-        });
-        let time =
-            kr_worker::action::time::TimeContract::restore(boot_identity, "", sources, recorded);
+        let boot = boot_mark(boot_identity);
         let identity = kr_ipc::identity::current_process_start_identity().map_err(|error| {
             ControllerError::RegistryUnavailable {
                 detail: format!("this daemon's process cannot be identified: {error}"),
@@ -722,19 +725,19 @@ impl AttentionModule {
         })?;
         let store = Attention::open(
             directory.join("attention.sqlite3"),
-            reading(&time),
+            unproven_reading(boot),
             &claimant,
         )
         .map_err(|error| ControllerError::RegistryUnavailable {
             detail: format!("the attention store cannot be opened: {error}"),
         })?;
-        let module = Self {
+        Ok(Self {
             release: tokio::sync::RwLock::new(BTreeMap::new()),
             store: std::sync::Mutex::new(store),
-            time,
-            time_file,
-            time_saving: std::sync::Mutex::new(()),
-            save_failing: AtomicBool::new(false),
+            clock: std::sync::OnceLock::new(),
+            adapter,
+            boot,
+            clock_owed: AtomicBool::new(false),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
             automation_pass: std::sync::Mutex::new(()),
@@ -745,18 +748,14 @@ impl AttentionModule {
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
             #[cfg(test)]
-            save_entry: Pause::default(),
-            #[cfg(test)]
-            in_save: Pause::default(),
+            after_the_clock_answer: Pause::default(),
             #[cfg(any(test, feature = "testing"))]
             after_privacy_read: Pause::default(),
             #[cfg(test)]
             after_page: Pause::default(),
             #[cfg(test)]
             decided_on: std::sync::Mutex::new(Vec::new()),
-        };
-        module.keep_time();
-        Ok(module)
+        })
     }
 
     /// Returns true when this module serves the method.
@@ -900,50 +899,37 @@ impl AttentionModule {
 
     /// Returns what the host's clocks read now, in the form the store takes.
     ///
-    /// The time contract is observed first, so a rollback of the wall clock is noticed before a
-    /// reading is taken from it, and what it learned is written down.
+    /// The wall clock is read through the host's one decision about it, which notices a rollback
+    /// before a reading is taken from the clock and says whether the reading is proven: the same
+    /// answer every other part of the host that lets go of a record by the wall clock is given.
+    /// The platform's time service is asked at each reading, and whether it qualifies is what the
+    /// decision takes from it. Without the decision attached the wall clock is read as unproven.
     fn reading(&self) -> HostReading {
-        self.time.observe();
-        self.keep_time();
-        reading(&self.time)
+        let qualified = self.adapter.read().is_qualified();
+        let Some(watched) = self.clock.get().and_then(|clock| clock.watch(qualified)) else {
+            return unproven_reading(self.boot);
+        };
+        // The host owes its record a write: the first reading that finds so wakes the maintenance
+        // loop, which may be in a wait it began while nothing was owed, and it comes back soon
+        // after for as long as anything is.
+        if watched.owed {
+            if !self.clock_owed.swap(true, Ordering::Relaxed) {
+                self.wake.notify_one();
+            }
+        } else {
+            self.clock_owed.store(false, Ordering::Relaxed);
+        }
+        HostReading::new(
+            self.boot,
+            kr_ipc::clock::boot_elapsed_ms(),
+            watched.wall_ms,
+            watched.proven,
+        )
     }
 
-    /// Writes down what the time contract has to keep across a restart, when it has something new.
-    ///
-    /// One save at a time, from reading the state to recording it as kept: two saves that crossed
-    /// could write an older state over a newer one and still record the newer as kept. The rename
-    /// is made once and never waited for: on Windows another program can hold the file for a
-    /// moment, and this runs inside readings, some under the store's lock. A refused save leaves
-    /// the state unsaved and wakes the maintenance loop, whose own reading writes it again within
-    /// [`SAVE_RETRY`] unless another reading does first.
-    fn keep_time(&self) {
-        #[cfg(test)]
-        self.save_entry.wait();
-        let _saving = self
-            .time_saving
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.time.unsaved() {
-            return;
-        }
-        let (state, generation) = self.time.durable_state();
-        #[cfg(test)]
-        self.in_save.wait();
-        let Ok(bytes) = kr_cbor::to_canonical_vec(&state) else {
-            return;
-        };
-        let partial = self.time_file.with_extension("cbor.partial");
-        if std::fs::write(&partial, bytes).is_ok()
-            && std::fs::rename(&partial, &self.time_file).is_ok()
-        {
-            self.time.note_saved(generation);
-            self.save_failing.store(false, Ordering::Relaxed);
-        } else if !self.save_failing.swap(true, Ordering::Relaxed) {
-            // The first save that could not write wakes the maintenance loop, which may be in a
-            // wait it began while nothing was unsaved; it then comes back within SAVE_RETRY. A
-            // save that goes on failing wakes nothing more, so it never keeps its loop spinning.
-            self.wake.notify_one();
-        }
+    /// Attaches the host's decision about its wall clock, once the daemon exists.
+    pub(crate) fn attach_clock(&self, clock: Arc<dyn HostClock>) {
+        let _ = self.clock.set(clock);
     }
 
     fn store(&self) -> Answer<std::sync::MutexGuard<'_, Attention>> {
@@ -2796,8 +2782,8 @@ impl AttentionModule {
                 if !held.origins().unfinished.is_empty() {
                     wait = wait.min(CLOSURE_RETRY);
                 }
-                if held.time.unsaved() {
-                    wait = wait.min(SAVE_RETRY);
+                if held.clock_owed.load(Ordering::Relaxed) {
+                    wait = wait.min(CLOCK_WRITE_RETRY);
                 }
                 // The signal is taken before the module is let go of, so a change that wakes it
                 // cannot fall between the look above and the wait; the module itself is not held
@@ -2820,20 +2806,39 @@ impl AttentionModule {
     ) -> Option<(HostReading, u64)> {
         self.deciding_on_the_blocking_pool(move |module, reading| {
             let mut forgot = forgotten_at;
+            // Expired records are let go of only on a wall clock this host can prove, so a
+            // rollback cannot make a live record look expired. The host is asked about the
+            // reading this pass decided under, before the store is taken and never under it, and
+            // only when a forgetting is due and the reading itself is proven.
+            let asked = reading.wall_ms.get();
+            let due = asked.saturating_sub(forgot) > FORGET_EVERY_MS;
+            let permitted = due
+                && reading.wall_proven
+                && module
+                    .clock
+                    .get()
+                    .is_some_and(|clock| clock.may_forget_at(asked));
+            #[cfg(test)]
+            module.after_the_clock_answer.wait();
             if let Ok(mut store) = module.store() {
                 // Read with the store held: a closure and a replacement take the store before
                 // they take a certificate away, so this tick never decides on one they took.
                 let certified = module.certificates();
                 let _ = store.tick(reading, &|origin| certified.at(origin));
-                // Expired records are let go of only on a wall clock this host can prove, so a
-                // rollback cannot make a live record look expired.
-                if module.time.may_collect_expired()
-                    && reading.wall_ms.get().saturating_sub(forgot) > FORGET_EVERY_MS
-                {
-                    forgot = reading.wall_ms.get();
-                    let _ = store.forget_actions_before(
-                        reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
-                    );
+                if permitted {
+                    // The records go by a predicate over every row, so the final reading is taken
+                    // with the store held and the store is held to the delete: no record can be
+                    // stamped after a correction between the two, and the cutoff is counted from
+                    // the earlier of the two readings, never later than the clock stands now.
+                    let held = module.reading();
+                    if held.wall_proven {
+                        forgot = asked;
+                        let _ = store.forget_actions_before(
+                            asked
+                                .min(held.wall_ms.get())
+                                .saturating_sub(ACTION_RETENTION_MS),
+                        );
+                    }
                 }
             }
             (reading, forgot)
@@ -3358,17 +3363,22 @@ const fn complete(cursor: u64, head: u64, last: Option<u64>) -> bool {
 
 // ----- Helpers ---------------------------------------------------------------------------------
 
-/// Returns the host's clocks now, in the form the store takes.
-fn reading(time: &kr_worker::action::time::TimeContract) -> HostReading {
-    let identity = time.boot_identity();
+/// Reduces a boot identity to what the store compares one boot's readings by.
+fn boot_mark(identity: &kr_protocol::identity::BootIdentity) -> kr_attention::time::BootMark {
     let mut bytes = format!("{:?}", identity.source).into_bytes();
     bytes.push(b'|');
     bytes.extend_from_slice(identity.value.as_slice());
+    kr_attention::time::BootMark::of(&bytes)
+}
+
+/// Returns the host's clocks now with the wall clock unproven: what the store reads before the
+/// daemon has attached the host's decision about it, and when that decision cannot be read.
+fn unproven_reading(boot: kr_attention::time::BootMark) -> HostReading {
     HostReading::new(
-        kr_attention::time::BootMark::of(&bytes),
+        boot,
         kr_ipc::clock::boot_elapsed_ms(),
         kr_ipc::now_ms().get(),
-        time.trust() == kr_protocol::action::WallClockTrust::Trusted,
+        false,
     )
 }
 
@@ -5492,297 +5502,298 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the store's time contract must keep is written beside the store, one save at a time,
-    /// and a store opened again reads it back.
-    ///
-    /// Two saves are made to cross. The first is stopped between reading what it keeps and writing
-    /// it; the wall clock is then set back, and a second save begins with the rollback to keep
-    /// while the first holds the saves' turn. The rollback is what is written last and what a
-    /// restart reads: had the first written after it, a restart would trust the clock again.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
-        use kr_worker::action::adapter::{
-            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
+    /// What the platform's time service says, as a test states it.
+    fn platform_reading(qualified: bool) -> kr_protocol::action::TimeAdapterReading {
+        use kr_worker::action::adapter::{UnixTimex, classify_unix, unix_model};
+        let (time_state, status, maxerror_us) = if qualified {
+            (unix_model::TIME_OK, unix_model::STA_PLL, 62_192)
+        } else {
+            (
+                unix_model::TIME_ERROR,
+                unix_model::STA_PLL | unix_model::STA_UNSYNC,
+                16_000_000,
+            )
         };
-        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
-
-        const WALL: u64 = 1_700_000_000_000;
-        let temp = kr_ipc::testing::TempHost::create();
-        let continuous = kr_ipc::clock::ManualSharedClock::new();
-        continuous.advance(Duration::from_secs(3_600));
-        let active = ManualActiveClock::new();
-        active.advance(Duration::from_secs(3_600));
-        let wall = ManualWallClock::new(WALL);
-        let adapter = RecordedTimeAdapter::new(classify_unix(
+        classify_unix(
             "macos",
             "ntp_adjtime(2)",
             UnixTimex {
-                time_state: unix_model::TIME_OK,
-                status: unix_model::STA_PLL,
-                maxerror_us: 62_192,
+                time_state,
+                status,
+                maxerror_us,
                 esterror_us: 500_000,
             },
-            TimestampMs::new(WALL),
-        ));
-        let sources = || TimeSources {
-            continuous: Arc::new(continuous.clone()),
-            active: Arc::new(active.clone()),
-            wall: Arc::new(wall.clone()),
-            adapter: Arc::new(adapter.clone()),
-            floor: None,
-        };
-        let written = |module: &AttentionModule| {
-            let bytes = std::fs::read(&module.time_file).expect("the record is written");
-            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
-                &bytes,
-                &kr_cbor::Limits::DEFAULT,
+            TimestampMs::new(CLOCK_START),
+        )
+    }
+
+    /// The platform's time service, as a test states it.
+    fn platform(qualified: bool) -> kr_worker::action::adapter::RecordedTimeAdapter {
+        kr_worker::action::adapter::RecordedTimeAdapter::new(platform_reading(qualified))
+    }
+
+    /// Where the test host's wall clock starts.
+    const CLOCK_START: u64 = 1_700_000_000_000;
+
+    /// The host's one decision about its wall clock, over a real device store and a wall clock the
+    /// test moves by hand. The floor's own record is the daemon's, and is tested with it.
+    struct TestClock {
+        trust: crate::service::net::clock_trust::ClockTrust,
+        devices: crate::service::net::devices::DeviceDirectory,
+        wall: Arc<AtomicU64>,
+    }
+
+    impl TestClock {
+        fn new() -> Arc<Self> {
+            let wall = Arc::new(AtomicU64::new(CLOCK_START));
+            let reading = Arc::clone(&wall);
+            Arc::new(Self {
+                trust: crate::service::net::clock_trust::ClockTrust::new(
+                    crate::service::WallClock::from_fn(move || reading.load(Ordering::SeqCst)),
+                    Arc::new(crate::grants::policy::UtcFloor::at(0)),
+                    Arc::new(kr_transport::clock::ManualClock::new()),
+                    Arc::new(kr_ipc::clock::ManualSharedClock::new()),
+                    kr_ipc::identity::boot_identity().expect("a boot identity"),
+                ),
+                devices: crate::service::net::devices::DeviceDirectory::in_memory()
+                    .expect("a device store"),
+                wall,
+            })
+        }
+
+        fn set_wall(&self, ms: u64) {
+            self.wall.store(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl HostClock for TestClock {
+        fn watch(
+            &self,
+            platform_qualified: bool,
+        ) -> Option<crate::service::net::clock_trust::Watched> {
+            self.trust.watch(&self.devices, platform_qualified).ok()
+        }
+
+        fn may_forget_at(&self, _reading_ms: u64) -> bool {
+            self.trust
+                .sample_for_forgetting(&self.devices)
+                .ok()
+                .flatten()
+                .is_some()
+        }
+    }
+
+    /// A module over `adapter`, with `clock` attached when it is given.
+    fn module_on(
+        temp: &kr_ipc::testing::TempHost,
+        adapter: &kr_worker::action::adapter::RecordedTimeAdapter,
+        clock: Option<&Arc<TestClock>>,
+    ) -> Arc<AttentionModule> {
+        let module = Arc::new(
+            AttentionModule::open_over(
+                &temp.environment(),
+                &kr_ipc::identity::boot_identity().expect("a boot identity"),
+                Arc::new(adapter.clone()),
             )
-            .expect("what was written reads back")
+            .expect("the store opens"),
+        );
+        if let Some(clock) = clock {
+            module.attach_clock(Arc::clone(clock) as Arc<dyn HostClock>);
+        }
+        module
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the store's readings of the wall clock come from the host's one decision about
+    /// it. Detached, the wall clock is read as unproven. Attached, a reading carries the host's
+    /// wall clock and says it is proven only when the host proves it: the platform's time service
+    /// qualifies or the owner has confirmed the clock, nothing is held, and no rollback was found.
+    #[test]
+    fn a_reading_is_proven_when_the_host_proves_the_clock() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let detached = module_on(&temp, &adapter, None);
+        assert!(
+            !detached.reading().wall_proven,
+            "detached it proves nothing"
+        );
+        drop(detached);
+
+        let module = module_on(&temp, &adapter, Some(&clock));
+        let reading = module.reading();
+        assert!(reading.wall_proven);
+        assert_eq!(
+            reading.wall_ms.get(),
+            CLOCK_START,
+            "on the host's wall clock"
+        );
+
+        // The platform's service stops qualifying while the owner has not confirmed the clock: a
+        // hold, which the service qualifying again does not lift.
+        adapter.set(platform_reading(false));
+        assert!(!module.reading().wall_proven);
+        adapter.set(platform_reading(true));
+        assert!(!module.reading().wall_proven);
+        clock
             .trust
-        };
-        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
-        let first = Arc::new(
-            AttentionModule::open_over(&temp.environment(), boot.clone(), sources())
-                .expect("the store opens"),
-        );
-        let _ = first.reading();
-        assert_eq!(
-            first.time.trust(),
-            kr_protocol::action::WallClockTrust::Trusted
-        );
-
-        // A step of a day forward is worth keeping; its save is stopped once it has read it.
-        let (arrived, release) = first.in_save.arm();
-        wall.advance(Duration::from_secs(86_400));
-        let stepping = {
-            let first = Arc::clone(&first);
-            std::thread::spawn(move || {
-                let _ = first.reading();
-            })
-        };
-        arrived
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the first save has read what it keeps");
-
-        // The clock is set back while that save is stopped, and a second reading observes the
-        // rollback and begins its own save.
-        let (entered, enter) = first.save_entry.arm();
-        wall.set(WALL);
-        let rolling_back = {
-            let first = Arc::clone(&first);
-            std::thread::spawn(move || {
-                let _ = first.reading();
-            })
-        };
-        entered
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the second save has begun");
-        assert_eq!(
-            first.time.trust(),
-            kr_protocol::action::WallClockTrust::Unresolved,
-            "the rollback was observed before its save began"
-        );
-        assert!(first.time.unsaved());
-        // The stopped save holds the saves' turn from its reading to its writing, so the second
-        // cannot write in between, whenever it runs.
+            .establish(&clock.devices)
+            .expect("the owner establishes");
+        adapter.set(platform_reading(false));
         assert!(
-            first.time_saving.try_lock().is_err(),
-            "the first save holds the turn while it is stopped"
+            module.reading().wall_proven,
+            "the owner's confirmation stands where the platform has none to give"
         );
-        enter.send(()).expect("the second save goes on");
-        release.send(()).expect("the first save is let go");
-        stepping.join().expect("the first save finishes");
-        rolling_back.join().expect("the second save finishes");
 
-        assert_eq!(
-            first.time.trust(),
-            kr_protocol::action::WallClockTrust::Unresolved
-        );
-        assert_eq!(
-            written(&first),
-            kr_protocol::action::WallClockTrust::Unresolved,
-            "the rollback is what was written last"
-        );
-        assert!(
-            !first.time.unsaved(),
-            "nothing it must keep is left unwritten"
-        );
-        drop(first);
-        let again = AttentionModule::open_over(&temp.environment(), boot, sources())
-            .expect("the store opens again");
-        assert_eq!(
-            again.time.trust(),
-            kr_protocol::action::WallClockTrust::Unresolved,
-            "a restart keeps the rollback"
-        );
+        clock.set_wall(CLOCK_START - 60_000);
+        assert!(!module.reading().wall_proven, "a rollback proves nothing");
     }
 
-    /// On Windows what the time contract must keep is not waited for by the reading whose save
-    /// found the file held: while another program holds it without sharing its deletion, as a
-    /// scanner holds a file it has just seen written, the reading returns at once with the save
-    /// refused, and the maintenance loop writes it again once that program lets go, with no other
-    /// request to prompt it.
-    #[cfg(windows)]
+    /// KR-REQ-09.18: a decision the host owes its record is written by the maintenance loop's own
+    /// reading, with no request to prompt it. A rollback is found and its write is refused; the
+    /// reading that found it wakes the loop, which may be in the long wait it began while nothing
+    /// was owed, and the loop reads again soon after for as long as the record is owed, so once the
+    /// store takes the write it is made.
     #[tokio::test(flavor = "multi_thread")]
-    async fn what_a_held_save_left_unwritten_is_written_again_without_another_request() {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        use kr_worker::action::adapter::{
-            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
-        };
-        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
-
-        /// Reading and writing are shared; deleting is not.
-        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
-        const WALL: u64 = 1_700_000_000_000;
+    async fn the_maintenance_loop_writes_what_the_host_owes_with_no_other_request() {
         let temp = kr_ipc::testing::TempHost::create();
-        let continuous = kr_ipc::clock::ManualSharedClock::new();
-        continuous.advance(Duration::from_secs(3_600));
-        let active = ManualActiveClock::new();
-        active.advance(Duration::from_secs(3_600));
-        let wall = ManualWallClock::new(WALL);
-        let adapter = RecordedTimeAdapter::new(classify_unix(
-            "macos",
-            "ntp_adjtime(2)",
-            UnixTimex {
-                time_state: unix_model::TIME_OK,
-                status: unix_model::STA_PLL,
-                maxerror_us: 62_192,
-                esterror_us: 500_000,
-            },
-            TimestampMs::new(WALL),
-        ));
-        let module = Arc::new(
-            AttentionModule::open_over(
-                &temp.environment(),
-                kr_ipc::identity::boot_identity().expect("a boot identity"),
-                TimeSources {
-                    continuous: Arc::new(continuous.clone()),
-                    active: Arc::new(active.clone()),
-                    wall: Arc::new(wall.clone()),
-                    adapter: Arc::new(adapter),
-                    floor: None,
-                },
-            )
-            .expect("the store opens"),
-        );
-        let _ = module.reading();
-        assert!(!module.time.unsaved(), "what it keeps is written");
-        let kept = std::fs::read(&module.time_file).expect("the record");
-
-        let holding = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ_WRITE)
-            .open(&module.time_file)
-            .expect("the record is held");
-        // A step of a day forward is worth keeping.
-        wall.advance(Duration::from_secs(86_400));
-        let started = std::time::Instant::now();
-        let _ = module.reading();
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the reading does not wait for the file"
-        );
-        assert!(
-            module.time.unsaved(),
-            "its save was refused while the record was held"
-        );
-
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        assert!(module.reading().wall_proven);
         module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(holding);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while module.time.unsaved() && tokio::time::Instant::now() < deadline {
+
+        clock
+            .devices
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER refuse_the_decision BEFORE UPDATE OF untrusted_at_ms
+                     ON network_clock BEGIN SELECT RAISE(ABORT, 'the store is full'); END;",
+                )
+            })
+            .expect("the store takes a trigger");
+        clock.set_wall(CLOCK_START - 60_000);
+        assert!(!module.reading().wall_proven);
+        assert!(clock.trust.owes_a_write(), "the decision is owed");
+        clock
+            .devices
+            .with(|connection| connection.execute_batch("DROP TRIGGER refuse_the_decision;"))
+            .expect("the trigger goes");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while clock.trust.owes_a_write() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(
-            !module.time.unsaved(),
-            "the loop wrote it again with no request to prompt it"
-        );
-        assert_ne!(std::fs::read(&module.time_file).expect("the record"), kept);
-    }
-
-    /// On Windows a save a request makes while the maintenance loop is already in its long wait,
-    /// and that another program's hold refuses, wakes the loop: once the program lets go, the loop
-    /// writes what the time contract must keep with no other request, rather than at the end of
-    /// the wait it began while nothing was unsaved.
-    #[cfg(windows)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_save_refused_while_the_loop_waits_wakes_it_to_write_again() {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        use kr_worker::action::adapter::{
-            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
-        };
-        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
-
-        /// Reading and writing are shared; deleting is not.
-        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
-        const WALL: u64 = 1_700_000_000_000;
-        let temp = kr_ipc::testing::TempHost::create();
-        let continuous = kr_ipc::clock::ManualSharedClock::new();
-        continuous.advance(Duration::from_secs(3_600));
-        let active = ManualActiveClock::new();
-        active.advance(Duration::from_secs(3_600));
-        let wall = ManualWallClock::new(WALL);
-        let adapter = RecordedTimeAdapter::new(classify_unix(
-            "macos",
-            "ntp_adjtime(2)",
-            UnixTimex {
-                time_state: unix_model::TIME_OK,
-                status: unix_model::STA_PLL,
-                maxerror_us: 62_192,
-                esterror_us: 500_000,
-            },
-            TimestampMs::new(WALL),
-        ));
-        let module = Arc::new(
-            AttentionModule::open_over(
-                &temp.environment(),
-                kr_ipc::identity::boot_identity().expect("a boot identity"),
-                TimeSources {
-                    continuous: Arc::new(continuous.clone()),
-                    active: Arc::new(active.clone()),
-                    wall: Arc::new(wall.clone()),
-                    adapter: Arc::new(adapter),
-                    floor: None,
-                },
-            )
-            .expect("the store opens"),
-        );
-        let _ = module.reading();
-        assert!(!module.time.unsaved(), "what it keeps is written");
-        let kept = std::fs::read(&module.time_file).expect("the record");
-
-        // The loop's first reading is seen, and let go; with nothing unsaved it then begins its
-        // long wait.
-        let (entered, go) = module.save_entry.arm();
-        module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
-        entered
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the loop takes its first reading");
-        go.send(()).expect("and goes on");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let holding = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ_WRITE)
-            .open(&module.time_file)
-            .expect("the record is held");
-        // A step of a day forward is worth keeping; a request's reading tries to save it.
-        wall.advance(Duration::from_secs(86_400));
-        let _ = module.reading();
-        assert!(module.time.unsaved(), "its save was refused");
-        drop(holding);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while module.time.unsaved() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            !module.time.unsaved(),
+            !clock.trust.owes_a_write(),
             "the loop was woken and wrote it with no other request"
         );
-        assert_ne!(std::fs::read(&module.time_file).expect("the record"), kept);
+        assert!(
+            clock
+                .devices
+                .clock_record()
+                .expect("the record")
+                .untrusted_at_ms
+                .is_some()
+        );
+    }
+
+    /// Puts an action record stamped at `recorded_at_ms` into the store of the module over `temp`.
+    fn record_action(temp: &kr_ipc::testing::TempHost, id: &str, recorded_at_ms: u64) {
+        let store =
+            rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
+                .expect("opens the attention store");
+        store
+            .busy_timeout(Duration::from_secs(10))
+            .expect("waits for the module's own use");
+        store
+            .execute(
+                "INSERT INTO attention_actions
+                     (actor, action_id, method, digest, answer, recorded_at_ms)
+                 VALUES ('a', ?1, 'attention.acknowledge', x'00', x'00', ?2)",
+                rusqlite::params![id, i64::try_from(recorded_at_ms).expect("a time")],
+            )
+            .expect("the attention store takes a record");
+    }
+
+    fn recorded_actions(temp: &kr_ipc::testing::TempHost) -> Vec<String> {
+        let store =
+            rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
+                .expect("opens the attention store");
+        let mut statement = store
+            .prepare("SELECT action_id FROM attention_actions ORDER BY action_id")
+            .expect("prepares");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("reads")
+            .collect::<std::result::Result<_, _>>()
+            .expect("the rows")
+    }
+
+    /// KR-REQ-09.14, KR-REQ-09.18: a reading from before the owner corrected a wrong clock never reaches a record
+    /// stamped after the correction. The wall clock reads a late moment, the host answers that the
+    /// store may forget, and the pass stops before it takes the store. The wall clock is corrected
+    /// back by a hundred days and the owner establishes it; a record is stamped at the corrected
+    /// moment. The pass counts its cutoff from the earlier of its two readings, so the record
+    /// stamped after the correction is kept while the old one is forgotten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reading_from_before_a_correction_forgets_nothing_stamped_after_it() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        let late = CLOCK_START + 100 * 86_400_000;
+        clock.set_wall(late);
+        assert!(module.reading().wall_proven, "a step forward is accepted");
+        record_action(&temp, "old", 1);
+
+        let (arrived, go) = module.after_the_clock_answer.arm();
+        let pass = tokio::spawn({
+            let module = Arc::clone(&module);
+            async move { module.tick_and_forget(0).await }
+        });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("joins")
+            .expect("the pass reached the clock question");
+
+        clock.set_wall(CLOCK_START);
+        clock
+            .trust
+            .establish(&clock.devices)
+            .expect("the owner establishes");
+        record_action(&temp, "new", CLOCK_START);
+        go.send(()).expect("the pass goes on");
+        pass.await.expect("the pass ends").expect("the pass runs");
+
+        assert_eq!(
+            recorded_actions(&temp),
+            vec!["new".to_owned()],
+            "the record stamped after the correction is kept, and the old one is forgotten"
+        );
+    }
+
+    /// Nothing is forgotten while the host holds the clock against its own reading: a pass on a
+    /// clock that went backwards keeps every record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_on_a_clock_that_went_backwards_forgets_nothing() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        assert!(module.reading().wall_proven);
+        record_action(&temp, "old", 1);
+        clock.set_wall(CLOCK_START - 60_000);
+        assert!(!module.reading().wall_proven);
+        clock.set_wall(CLOCK_START + 100 * 86_400_000);
+
+        module.tick_and_forget(0).await.expect("the pass runs");
+        assert_eq!(recorded_actions(&temp), vec!["old".to_owned()]);
+        clock
+            .trust
+            .establish(&clock.devices)
+            .expect("the owner establishes");
+        module.tick_and_forget(0).await.expect("the pass runs");
+        assert!(recorded_actions(&temp).is_empty());
     }
 
     /// A request's bound covers the wait for the connection's writer as well as the answer, so a

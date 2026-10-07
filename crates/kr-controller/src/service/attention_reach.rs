@@ -127,6 +127,31 @@ impl Controller {
     }
 }
 
+/// How the attention store asks this daemon about its wall clock: through the one decision the
+/// host holds about it, and the check every forgetting passes.
+pub(super) struct AttentionClock(pub(super) std::sync::Weak<Controller>);
+
+impl crate::attention::HostClock for AttentionClock {
+    fn watch(&self, platform_qualified: bool) -> Option<super::net::clock_trust::Watched> {
+        let owner = self.0.upgrade()?;
+        owner
+            .lifetimes()
+            .clock_trust()
+            .watch(owner.devices(), platform_qualified)
+            .ok()
+    }
+
+    fn may_forget_at(&self, reading_ms: u64) -> bool {
+        let Some(owner) = self.0.upgrade() else {
+            return false;
+        };
+        // The host's own reading is settled first: the floor is raised to it and written down, so
+        // the check covers the reading the retention is counted from.
+        owner.settled_now_ms();
+        owner.lifetimes().may_forget_at(reading_ms)
+    }
+}
+
 /// How the attention store reaches this daemon's workers and its closed sessions.
 struct AttentionReach(std::sync::Weak<Controller>);
 
