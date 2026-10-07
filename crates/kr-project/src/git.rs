@@ -1967,12 +1967,14 @@ impl RestrictedProfile {
     }
 }
 
-/// The separator between two entries of `PATH` on this platform.
+/// The separator between two entries of `PATH` on this platform, and of the list of directories
+/// Git's search for a repository stops at.
 #[cfg(windows)]
-const PATH_SEPARATOR: &str = ";";
-/// The separator between two entries of `PATH` on this platform.
+pub(crate) const PATH_SEPARATOR: &str = ";";
+/// The separator between two entries of `PATH` on this platform, and of the list of directories
+/// Git's search for a repository stops at.
 #[cfg(not(windows))]
-const PATH_SEPARATOR: &str = ":";
+pub(crate) const PATH_SEPARATOR: &str = ":";
 
 /// The Git executable's file name on this platform.
 #[cfg(windows)]

@@ -137,20 +137,23 @@ impl OpenedRepository {
     /// that tree before Git is asked anything there.
     ///
     /// The directory is opened and decided by `require_within` first, and Git starts in that
-    /// object. The top level Git reports is decided as well, before its configuration is audited
-    /// or anything else is run in it, so a directory that took the place of the recorded tree, or
-    /// a filesystem mounted over it, or a repository Git found around or inside it, is refused
-    /// without the repository being audited.
+    /// object: a directory that took the place of the recorded tree, or a filesystem mounted over
+    /// it, is refused before Git is asked anything. Git then reports the top level of the
+    /// repository it finds, and that top level is decided before its configuration is audited:
+    /// a repository whose top level is not the recorded tree, found inside or around it, is
+    /// refused unaudited.
     ///
-    /// `inside_tree` says the repository is one this host made inside its tree, an independent
-    /// clone, whose Git directory no record decides. Git's search for the repository is then
-    /// stopped at the directory above the tree, so a tree that lost its own `.git` finds no
-    /// repository rather than the one around it, whatever that repository's configuration says.
-    /// Any other repository can keep its Git directory anywhere (a checkout whose configuration
-    /// sets `core.worktree` keeps it above the tree), so the search is not stopped, and the
-    /// caller decides the Git directory once Git has said where it is. The search is not stopped
-    /// either where the platform cannot say where the tree is, or where the directory above it
-    /// holds the character Git separates its ceilings by.
+    /// A repository around the tree whose configuration names the tree as its working tree
+    /// reports the recorded tree as its top level, and passes that decision. `inside_tree` says
+    /// the repository is one this host made inside its tree, an independent clone, whose Git
+    /// directory no record decides: Git's search is then stopped at the directory above the
+    /// tree, so a tree that lost its own `.git` finds no repository rather than the one around
+    /// it. Any other repository can keep its Git directory anywhere (a checkout whose
+    /// configuration sets `core.worktree` keeps it above the tree), so the search is not
+    /// stopped, and the caller decides the Git directory once Git has said where it is, which
+    /// refuses a repository that is not the recorded one, after the audit. The search is not
+    /// stopped either where the platform cannot say where the tree is, or where the path of the
+    /// directory above it holds the character Git separates its ceilings by.
     ///
     /// # Errors
     ///
@@ -865,15 +868,8 @@ fn require_within(
 /// directory's path holds the character Git separates its ceilings by, which would split it.
 fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
     let above = path_of(tree).ok()?.parent()?.to_path_buf();
-    (!above.to_string_lossy().contains(CEILING_SEPARATOR)).then_some(above)
+    (!above.to_string_lossy().contains(crate::git::PATH_SEPARATOR)).then_some(above)
 }
-
-/// The character `GIT_CEILING_DIRECTORIES` separates its directories by.
-#[cfg(unix)]
-const CEILING_SEPARATOR: char = ':';
-/// The character `GIT_CEILING_DIRECTORIES` separates its directories by.
-#[cfg(windows)]
-const CEILING_SEPARATOR: char = ';';
 
 /// Returns the refusal for a directory that is not the working tree a record names.
 pub(crate) fn not_the_recorded_tree(
