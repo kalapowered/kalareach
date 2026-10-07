@@ -153,8 +153,18 @@ impl DurableClientBudgetStore {
             .truncate(false)
             .open(&path)
             .map_err(|error| io_error("open", &path, &error))?;
-        file.lock()
-            .map_err(|error| io_error("lock", &path, &error))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                tests::found_held();
+                file.lock()
+                    .map_err(|error| io_error("lock", &path, &error))?;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(io_error("lock", &path, &error));
+            }
+        }
         Ok(file)
     }
 
@@ -737,6 +747,19 @@ mod tests {
         assert_eq!(allowed, MAX_CLIENT_ATTEMPTS);
     }
 
+    /// Said by the budget's own lock, in a child of the two-process test, once it has found the
+    /// lock held by another process: the child's name goes into the shared directory as the lock
+    /// is about to make it wait. It is where the test learns that both children are waiting.
+    pub(super) fn found_held() {
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            std::fs::write(
+                PathBuf::from(directory).join(format!("ready-{}", std::process::id())),
+                b"",
+            )
+            .expect("ready");
+        }
+    }
+
     /// Run by the two-process test in a child process of its own: opens the shared budget, with
     /// its key in the shared directory store, charges the code five times and prints how many
     /// were allowed.
@@ -752,23 +775,6 @@ mod tests {
                 .expect("the shared secrets")
                 .store,
         );
-        // Said once this child has found the budget's lock held by another process, which is
-        // where it then waits.
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(directory.join("budget").join(LOCK))
-            .expect("the budget's lock");
-        match lock.try_lock() {
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Ok(()) => panic!("the budget's lock was free while the parent held it"),
-            Err(std::fs::TryLockError::Error(error)) => {
-                panic!("the lock could not be tried: {error}")
-            }
-        }
-        drop(lock);
-        std::fs::write(directory.join(format!("ready-{}", std::process::id())), b"")
-            .expect("ready");
         let allowed = charge(
             &open(&directory, &secrets),
             &TestClock::new(),
@@ -917,8 +923,11 @@ mod tests {
                     .expect("a child process"),
             );
         }
-        // Both children say they found the lock held; neither gets it while it is held, and
-        // nothing is written meanwhile.
+        // Both children's budgets say, from their own lock call, that they found the lock held
+        // and are about to wait for it; neither gets it while it is held, and nothing is written
+        // meanwhile. A child that waits has no sign of it that every platform gives, so what
+        // follows gives one that does not wait a moment to show it: it can only miss a lock that
+        // lets a second process in, and cannot fail because of a slow machine.
         let started = std::time::Instant::now();
         loop {
             let ready = std::fs::read_dir(&scratch.0)
