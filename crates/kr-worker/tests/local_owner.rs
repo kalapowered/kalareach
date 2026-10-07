@@ -216,10 +216,12 @@ fn cancelled(receipt: &Receipt) {
 
 /// Writes a subscription and returns the screen it is drawn.
 ///
-/// That is everything the subscription is sent up to and including [`SHOWN`]. The screen a
-/// subscription joins on paints the buffer that is not showing before the one that is, so any of
-/// [`BEHIND`] this caller is drawn has arrived by the time [`SHOWN`] has, and the wait ends on
-/// something the application printed rather than on a length of time.
+/// That is everything the subscription is sent up to and including [`SHOWN`]: the bytes of a
+/// terminal that is served the stream, and the text of the rows of a terminal that is served the
+/// canonical screen as state, which is how a caller shown the live screen alone is drawn from its
+/// attach. The screen a subscription joins on paints the buffer that is not showing before the
+/// one that is, so any of [`BEHIND`] this caller is drawn has arrived by the time [`SHOWN`] has,
+/// and the wait ends on something the application printed rather than on a length of time.
 async fn drawn(client: &mut LocalClient, frame: ControlFrame, request_id: RequestId) -> Vec<u8> {
     within("the subscription", client.writer().write_message(&frame))
         .await
@@ -245,6 +247,17 @@ async fn drawn(client: &mut LocalClient, frame: ControlFrame, request_id: Reques
                     .to_typed()
                     .expect("an output event decodes");
                 seen.extend_from_slice(event.bytes.as_slice());
+            }
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.projection.rows" =>
+            {
+                let page: kr_protocol::projection::ProjectionRowPage =
+                    notification.payload.to_typed().expect("a row page decodes");
+                for row in &page.rows {
+                    for run in &row.runs {
+                        seen.extend_from_slice(run.text.as_bytes());
+                    }
+                }
             }
             // Anything else this connection is sent is not the screen.
             Ok(Ok(_)) => {}
@@ -548,6 +561,8 @@ impl Wired {
     /// Attaches a terminal for `actor` over `daemon`, subscribes it, and returns the screen it is
     /// drawn.
     async fn drawn_for(&self, daemon: &mut LocalClient, actor: &ActorEnvelope) -> Vec<u8> {
+        // Whether the screen arrives as bytes or as rows is the scope's to decide, and what the
+        // callers of this are about is what the screen holds, so neither form is asserted here.
         let attached = self
             .attach_for(
                 daemon,
@@ -556,7 +571,6 @@ impl Wired {
                 &[AttachmentCapability::ObserveTerminal],
             )
             .await;
-        served_the_stream(&attached);
         let request_id = next_request();
         let frame = forwarded_read(
             actor,
