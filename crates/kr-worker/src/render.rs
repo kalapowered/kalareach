@@ -54,10 +54,11 @@
 //!   shows that the terminals keep a wrap through the pen and character sets that would follow
 //!   such a print. The cost is that the next character the application prints overwrites the
 //!   last column instead of going to the next row, and the characters after it land one cell to
-//!   the left of where the grid puts them until the line ends or the cursor is placed. A saved
-//!   cursor's pending wrap is not set either, and the terminals measured give a restored cursor
-//!   no pending wrap whatever a restoration does. The cost is the same, from the first character
-//!   printed after the restore.
+//!   the left of where the grid puts them until the cursor is placed. A carriage return that
+//!   comes while the terminal's own wrap is pending leaves the terminal a row above the grid. A
+//!   saved cursor's pending wrap is not set either, and the terminals measured give a restored
+//!   cursor no pending wrap whatever a restoration does. The cost is the same, from the first
+//!   character printed after the restore.
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};

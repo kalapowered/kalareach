@@ -2337,6 +2337,63 @@ async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_scree
     );
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.82: a window report says how the terminal is served from the
+/// screen the session holds when it is made, whatever the terminal was last given. A terminal on
+/// the stream is drawn a line the application wraps without its being drawn anything again, so
+/// when it looks above the live page and comes back, the report says the wrapped line keeps it
+/// off the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_holds() {
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; i=0; while [ $i -lt 12 ]; do printf 'l%s\\r\\n' $i; \
+         i=$((i+1)); done; read -r _; printf 'abcdef'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"l11\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "a terminal of the session's own size on a settled stream is handed the stream"
+    );
+
+    // The application wraps a line. The terminal is on the stream, so it is drawn it as bytes and
+    // nothing asks what the screen could carry.
+    typist.release(&host).await;
+    produced(&host.runtime, b"abcdef").await;
+    let above = report_viewport(
+        &host,
+        &mut attached,
+        narrow,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(2),
+        )),
+    )
+    .await;
+    assert_eq!(
+        above.presentation_reason.0,
+        Some(PresentationReason::HistoryWindow)
+    );
+
+    // Back on the live screen, the screen it will be drawn has the wrapped line on it.
+    let back = report_viewport(&host, &mut attached, narrow, None).await;
+    assert_eq!(
+        (back.presentation, back.presentation_reason.0),
+        (
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::RestorationIncomplete)
+        )
+    );
+}
+
 /// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any
 /// other. The canonical screen returns to the primary buffer, the terminal that was being handed
 /// the stream never reads the reset, and the screen it is drawn instead puts it on that buffer and
