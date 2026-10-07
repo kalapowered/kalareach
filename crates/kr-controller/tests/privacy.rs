@@ -371,7 +371,9 @@ impl Worker {
     /// A Windows pseudo-console draws what the shell prints again, in sequences of its own, so the
     /// bytes the worker reads are not the bytes the shell wrote and cannot be counted against
     /// them. What can be waited for is output arriving after `since`, which the worker counts as it
-    /// appends it to its history, whether it keeps it or not.
+    /// appends it to its history, whether it keeps it or not. That is some of what the shell
+    /// printed, and not all of it: a case that turns privacy mode off afterwards cannot take the
+    /// rest as read, and says by the cursor what it relies on.
     #[cfg(windows)]
     async fn has_read_all_that_was_said(&self, since: u64) {
         until("the worker reading output that arrived", || {
@@ -383,6 +385,16 @@ impl Worker {
     /// The worker's output cursor: how many bytes of output it has read.
     fn output_cursor(&self) -> u64 {
         self.runtime.session().output_cursor()
+    }
+
+    /// The cursor the output the session retains starts at, after any range it gave up.
+    fn retained_from(&self) -> u64 {
+        self.runtime
+            .session()
+            .history_page(0, 1024 * 1024)
+            .expect("the history reads")
+            .from_cursor
+            .get()
     }
 
     /// The action target of this session.
@@ -1251,8 +1263,10 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     assert!(!report.kept.is_empty(), "what is kept is named");
 
     // While it is on, the session says something that is never kept. It falls silent before
-    // privacy mode is turned off, and the worker has read everything it wrote by then, so all it
-    // said is read while privacy mode is still on.
+    // privacy mode is turned off. Where the terminal passes the shell's bytes as they are, the
+    // worker has read everything the shell wrote by then, so all it said is read while privacy
+    // mode is still on. Where it does not, the worker has read some of it, and what comes back
+    // when privacy mode is turned off is told by the cursor below.
     let private_from = worker.output_cursor();
     worker.mark("while private");
     until("the shell printing it", || {
@@ -1264,6 +1278,7 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     assert_eq!(worker.retained(), 0);
 
     // Turning it off: the next generation, recorded, and the worker told.
+    let turned_off_from = worker.output_cursor();
     let report = environment
         .set(false)
         .await
@@ -1290,6 +1305,14 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     .await;
     let history = worker.history();
     assert!(!history.contains("before"), "{history}");
+    // Nothing the worker read while privacy mode was on comes back: what it retains starts where
+    // its cursor stood when privacy mode was turned off, or after it.
+    assert!(
+        worker.retained_from() >= turned_off_from,
+        "the retained output starts at {}, before the {turned_off_from} the worker had read",
+        worker.retained_from()
+    );
+    #[cfg(unix)]
     assert!(!history.contains("while private"), "{history}");
     environment
         .status_until("the worker's answer for the new generation", |report| {
