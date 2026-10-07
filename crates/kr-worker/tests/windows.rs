@@ -828,6 +828,29 @@ fn a_process_that_is_already_ending_is_not_a_failure_to_end() {
     child.kill().expect("and so is one that has finished");
 }
 
+/// The root shell a session's closure ends is ended by the same rule. A shell that is ending when
+/// the closure ends it, because it was asked to stop and is going, is not a failure of the closure,
+/// which has the processes it owns still to end.
+#[test]
+fn a_root_shell_that_is_already_ending_is_not_a_failure_to_force_stop() {
+    let (pty, _reader, mut shell) = powershell_in_a_console("Start-Sleep -Seconds 600");
+    let process = u32::try_from(shell.identity().pid.get()).expect("an identifier");
+    let mut debugger = held_end::Debugger::attach(process);
+    shell.force_stop().expect("a running shell is stopped");
+    debugger.hold_the_end();
+    assert!(
+        shell.try_wait().expect("its state is read").is_none(),
+        "the shell is ending and has not finished"
+    );
+
+    let stopped_again = shell.force_stop();
+
+    drop(debugger);
+    shell.wait().expect("the shell finishes and is collected");
+    drop(pty);
+    stopped_again.expect("a shell that is ending is stopped again without a failure");
+}
+
 /// A backend this test launched as a launch does: held by a session's job and by a job of its own,
 /// which the broker keeps with the end of the backend's input it writes, so stopping it is stopping
 /// that job.
