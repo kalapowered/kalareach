@@ -69,7 +69,9 @@ host records a device's prompt before it sends it. It records a local caller's o
 has said it holds no receipt for the action. The worker serves a prompt that names a draft only to
 the host, so no route to the session's agent leaves a draft unrecorded. A worker already running at
 the update serves such a prompt on its own socket unseen, so the sweep keeps what any session the
-host then knew names, as it keeps what was submitted, while that session is retained. A prompt
+host then knew names, as it keeps what was submitted, while that session is retained. An attachment
+that no session names, one held only by a draft that names none included, stays on the seven-day
+window, because the host cannot tell which session such a prompt went to. A prompt
 containing only prompt text, and therefore having no draft name, may be served to the worker on its
 own socket. A draft is sent to one session, and an attachment belongs to one. The
 attachments the draft holds, and any it gets later, can only be held by the session it was sent to.
