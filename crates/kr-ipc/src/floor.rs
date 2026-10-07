@@ -30,12 +30,16 @@
 //! withdraws it ([`SharedFloor::withdraw`]) when its own record distrusts the clock, so a worker
 //! that begins later does not take a confirmation the daemon no longer holds.
 //!
-//! Each word holds a count of publications beside its reading, and a reader takes the pair only
-//! when both counts match, so the two words need no lock: a reader that meets one half of a
-//! publication still being made finds no confirmation yet and looks again later. The limits are
-//! the words': a reading of zero, or one that 44 bits cannot hold, is published as a withdrawal,
-//! and the count of 20 bits repeats after 1,048,575 publications in one boot, which a reader that
-//! looks less often than that could take for no change.
+//! Each word holds a count of publications and a mark beside its reading, and a reader takes the
+//! pair only when both match, so the two words need no lock: a reader that meets one half of a
+//! publication still being made finds no confirmation yet and looks again later. The mark says the
+//! daemon states its record again, with the reading it has just taken ([`SharedFloor::restate`]),
+//! rather than records an action of the owner: that is how a worker that begins in a new boot
+//! learns of a confirmation made in an earlier one, and how a publication the daemon did not
+//! complete is made good, and a worker that is running does not take it for a new action. The
+//! limits are the words': a reading of zero, or one that 44 bits cannot hold, is published as a
+//! withdrawal or not stated, and the count of 19 bits repeats after 524,287 publications in one
+//! boot, which a reader that looks less often than that could take for no change.
 //!
 //! The words carry the owner's action only as far as the account boundary. Any process of the
 //! account that maps the file can write them, as it can raise the floor, and one forged write
@@ -95,13 +99,20 @@ const RECORDED_AT: usize = 80;
 const ESTABLISHED_WALL_AT: usize = 88;
 /// The continuous reading taken with it, beside the same count.
 const ESTABLISHED_BOOT_AT: usize = 96;
-/// How many low bits of an establishment word hold its reading. The rest hold the count. 44 bits
-/// of milliseconds reach the year 2527 for a wall reading and 557 years for a boot.
+/// How many low bits of an establishment word hold its reading. The rest hold the publication's
+/// count and whether it states the daemon's record again. 44 bits of milliseconds reach the year
+/// 2527 for a wall reading and 557 years for a boot.
 const READING_BITS: u32 = 44;
 /// The bits of an establishment word that hold its reading.
 const READING_MASK: u64 = (1 << READING_BITS) - 1;
+/// The bit of an establishment word, above its reading, that says the publication states the
+/// daemon's record again rather than records the owner's action.
+const RESTATED: u64 = 1 << READING_BITS;
+/// How many bits of an establishment word, above its reading and the restatement, hold the
+/// publication's count.
+const COUNT_BITS: u32 = u64::BITS - READING_BITS - 1;
 /// The largest count an establishment word holds.
-const COUNT_MASK: u64 = (1 << (u64::BITS - READING_BITS)) - 1;
+const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
 
 /// The identity of one floor: sixteen random bytes its creating daemon drew.
 ///
@@ -201,12 +212,16 @@ impl core::fmt::Display for Unusable {
     }
 }
 
-/// The owner's establishment of the host's clock, as the floor holds it.
+/// The owner's confirmation of the host's clock, as the floor holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Establishment {
-    /// Which establishment this is in this boot, from one. A reader acts on a count it has not
+    /// Which publication this is in this boot, from one. A reader acts on a count it has not
     /// acted on before.
     pub count: u64,
+    /// Whether the daemon states its record again, with the reading it has just taken, rather
+    /// than records an action of the owner: a worker that is running does not take it for a new
+    /// action, and one that begins takes it for what the record holds.
+    pub restated: bool,
     /// The wall reading the owner established, in UTC milliseconds.
     pub wall_ms: u64,
     /// The machine's continuous reading taken with it, in milliseconds since this boot.
@@ -424,34 +439,62 @@ impl SharedFloor {
     /// Only the control daemon calls this, one publication at a time. A reading that cannot be
     /// stated (zero, or past what the word holds) is published as a withdrawal.
     pub fn establish(&self, wall_ms: u64, boot_ms: u64) {
-        if wall_ms == 0 || wall_ms > READING_MASK || boot_ms > READING_MASK {
-            self.withdraw();
+        if Self::can_state(wall_ms, boot_ms) {
+            self.publish(wall_ms, boot_ms, 0);
         } else {
-            self.publish(wall_ms, boot_ms);
+            self.withdraw();
         }
+    }
+
+    /// States again that the daemon's record holds the owner's confirmation, with the reading the
+    /// daemon has just taken, and says whether it could: a reading the words cannot hold is not
+    /// stated.
+    ///
+    /// For a worker that begins after the owner's action, in this boot or an earlier one, and for
+    /// a publication that did not complete. A worker that is running does not take it for a new
+    /// action of the owner ([`Establishment::restated`]).
+    pub fn restate(&self, wall_ms: u64, boot_ms: u64) -> bool {
+        let stated = Self::can_state(wall_ms, boot_ms);
+        if stated {
+            self.publish(wall_ms, boot_ms, RESTATED);
+        }
+        stated
     }
 
     /// Publishes that no confirmation of the owner's stands: the daemon's own record distrusts the
     /// clock. A worker that has already followed an earlier one is not affected.
     pub fn withdraw(&self) {
-        self.publish(0, 0);
+        self.publish(0, 0, 0);
     }
 
-    fn publish(&self, wall_ms: u64, boot_ms: u64) {
-        let count = (self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> READING_BITS)
+    /// Stops a publication of `wall_ms` between its two stores, as a daemon that stopped there
+    /// would have left it, for a test of what the host does about one.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn leave_half_published(&self, wall_ms: u64) {
+        let count = ((self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> (READING_BITS + 1))
+            & COUNT_MASK)
             % COUNT_MASK
             + 1;
-        let held = |reading: u64| (count << READING_BITS) | reading;
+        self.word(ESTABLISHED_WALL_AT).store(
+            (count << (READING_BITS + 1)) | wall_ms.min(READING_MASK),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn can_state(wall_ms: u64, boot_ms: u64) -> bool {
+        wall_ms != 0 && wall_ms <= READING_MASK && boot_ms <= READING_MASK
+    }
+
+    fn publish(&self, wall_ms: u64, boot_ms: u64, restated: u64) {
+        let count = ((self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> (READING_BITS + 1))
+            & COUNT_MASK)
+            % COUNT_MASK
+            + 1;
+        let held = |reading: u64| (count << (READING_BITS + 1)) | restated | reading;
         self.word(ESTABLISHED_WALL_AT)
             .store(held(wall_ms), Ordering::SeqCst);
         self.word(ESTABLISHED_BOOT_AT)
             .store(held(boot_ms), Ordering::SeqCst);
-    }
-
-    /// Whether anything, an establishment or a withdrawal, has been published in this boot.
-    #[must_use]
-    pub fn published(&self) -> bool {
-        self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst) >> READING_BITS != 0
     }
 
     /// The owner's confirmation of the host's clock in force in this boot, when there is one and
@@ -460,12 +503,14 @@ impl SharedFloor {
     pub fn established(&self) -> Option<Establishment> {
         let wall = self.word(ESTABLISHED_WALL_AT).load(Ordering::SeqCst);
         let boot = self.word(ESTABLISHED_BOOT_AT).load(Ordering::SeqCst);
-        let count = wall >> READING_BITS;
-        if count == 0 || boot >> READING_BITS != count || wall & READING_MASK == 0 {
+        let tag = |word: u64| word >> READING_BITS;
+        let count = wall >> (READING_BITS + 1);
+        if count == 0 || tag(boot) != tag(wall) || wall & READING_MASK == 0 {
             return None;
         }
         Some(Establishment {
             count,
+            restated: wall & RESTATED != 0,
             wall_ms: wall & READING_MASK,
             boot_ms: boot & READING_MASK,
         })
@@ -895,12 +940,12 @@ mod tests {
         assert_eq!(floor.owed(), 3_000);
         assert!(floor.named(), "a floor with no file has no name to lose");
         assert_eq!(floor.established(), None);
-        assert!(!floor.published());
         floor.establish(1_700_000_000_000, 90_000);
         assert_eq!(
             floor.established(),
             Some(Establishment {
                 count: 1,
+                restated: false,
                 wall_ms: 1_700_000_000_000,
                 boot_ms: 90_000,
             })
@@ -922,6 +967,7 @@ mod tests {
             worker.established(),
             Some(Establishment {
                 count: 1,
+                restated: false,
                 wall_ms: 1_700_000_000_000,
                 boot_ms: 5_000,
             })
@@ -933,19 +979,36 @@ mod tests {
             worker.established(),
             Some(Establishment {
                 count: 2,
+                restated: false,
                 wall_ms: 1_600_000_000_000,
                 boot_ms: 9_000,
             })
         );
         // A withdrawal leaves none in force, and is a publication of its own.
-        assert!(worker.published());
         daemon.withdraw();
         assert_eq!(worker.established(), None);
-        daemon.establish(1_600_000_000_001, 9_001);
-        assert_eq!(worker.established().map(|held| held.count), Some(4));
-        // What the words cannot state is a withdrawal, not a reading nobody can agree with.
+        // A restatement is a publication of its own, marked as one.
+        assert!(daemon.restate(1_600_000_000_001, 9_001));
+        assert_eq!(
+            worker.established(),
+            Some(Establishment {
+                count: 4,
+                restated: true,
+                wall_ms: 1_600_000_000_001,
+                boot_ms: 9_001,
+            })
+        );
+        // What the words cannot state is a withdrawal when it is an establishment, and nothing
+        // when it is a restatement: the daemon's decision is not reshaped by the words' size.
         daemon.establish(0, 9_002);
         assert_eq!(worker.established(), None);
+        assert!(daemon.restate(1_600_000_000_003, 9_003));
+        assert!(!daemon.restate(1_600_000_000_004, READING_MASK + 1));
+        assert_eq!(
+            worker.established().map(|held| held.wall_ms),
+            Some(1_600_000_000_003),
+            "a restatement that cannot be stated leaves what stands"
+        );
         daemon.establish(1_600_000_000_002, READING_MASK + 1);
         assert_eq!(worker.established(), None);
         drop((daemon, worker));
@@ -958,7 +1021,7 @@ mod tests {
         floor.establish(1_700_000_000_000, 5_000);
         // The daemon stops between the two words of the next one: the wall word carries count two
         // and the boot word still carries count one.
-        let next = (2_u64 << READING_BITS) | 1_800_000_000_000;
+        let next = (2_u64 << (READING_BITS + 1)) | 1_800_000_000_000;
         floor
             .word(ESTABLISHED_WALL_AT)
             .store(next, std::sync::atomic::Ordering::SeqCst);
@@ -968,13 +1031,14 @@ mod tests {
             "a reader that meets the first word alone takes neither"
         );
         floor.word(ESTABLISHED_BOOT_AT).store(
-            (2_u64 << READING_BITS) | 6_000,
+            (2_u64 << (READING_BITS + 1)) | 6_000,
             std::sync::atomic::Ordering::SeqCst,
         );
         assert_eq!(
             floor.established(),
             Some(Establishment {
                 count: 2,
+                restated: false,
                 wall_ms: 1_800_000_000_000,
                 boot_ms: 6_000,
             }),

@@ -385,12 +385,19 @@ impl ClockTrust {
     ///
     /// A record that distrusts the clock holds none, so a confirmation standing in the floor is
     /// withdrawn, and a worker that begins later does not take it. A record that holds the owner's
-    /// confirmation while the floor shows none says so with the reading just taken: that is how a
-    /// worker that begins in a new boot learns of a confirmation made in an earlier one, since the
-    /// owner's word stands until a rollback ends it, and how a publication that did not complete
-    /// (a daemon that stopped after the commit and before its stores, or between them) is made
-    /// good at the next reading. A boot whose clock continuity is lost has no reading to say it
-    /// with.
+    /// confirmation while the floor shows none in force says so with the reading just taken, as a
+    /// restatement ([`kr_ipc::floor::SharedFloor::restate`]): that is how a worker that begins in
+    /// a new boot learns of a confirmation made in an earlier one, since the owner's word stands
+    /// until a rollback ends it, and how a publication the daemon did not complete (it stopped
+    /// after the commit and before its stores, or between them) is made good at the next reading.
+    /// A boot whose clock continuity is lost has no reading to say it with.
+    ///
+    /// A restatement is not an action of the owner: a worker that is running, or that restored a
+    /// record, does not take it for one. That matters most when the floor shows a withdrawal
+    /// because the record, in memory, found a rollback whose write was lost when the daemon
+    /// stopped: the record then reads as confirmed again, and states it again over the withdrawal,
+    /// and no worker that found the rollback is cleared by it. A worker that begins after takes
+    /// what the record holds, as the daemon does.
     fn tell_the_workers(&self, state: &State, wall_ms: u64, boot_ms: u64) {
         let words = self.floor.words();
         if state.distrusted {
@@ -399,7 +406,7 @@ impl ClockTrust {
             }
         } else if state.confirmed && words.established().is_none() && !self.floor.continuity_lost()
         {
-            words.establish(wall_ms, boot_ms);
+            let _ = words.restate(wall_ms, boot_ms);
         }
     }
 
@@ -1590,15 +1597,16 @@ mod tests {
         let words = || floor.words().established();
 
         assert!(proven(&run, &devices));
-        assert!(
-            !floor.words().published(),
-            "no owner has confirmed anything"
-        );
+        assert_eq!(words(), None, "no owner has confirmed anything");
 
         run.trust
             .establish(&devices)
             .expect("the owner establishes");
         let first = words().expect("the establishment is published");
+        assert!(
+            !first.restated,
+            "an action of the owner is not a restatement"
+        );
         assert_eq!(first.wall_ms, machine.wall());
         assert_eq!(first.boot_ms, machine.boot_clock.boot_elapsed_ms());
 
@@ -1625,6 +1633,7 @@ mod tests {
             .established()
             .expect("the first reading tells the workers the owner's word stands");
         assert_eq!(said.wall_ms, machine.wall());
+        assert!(said.restated, "and says it as a restatement");
 
         // A record that distrusts the clock says nothing in a new boot.
         machine.set_wall(machine.wall() - 60_000);
@@ -1637,14 +1646,15 @@ mod tests {
             !proven(&run, &devices),
             "the record still distrusts the clock"
         );
-        assert!(!later.words().published());
+        assert_eq!(later.words().established(), None);
     }
 
-    /// KR-REQ-09.19: a publication the daemon did not complete is made good at its next reading.
-    /// The owner's confirmation is in the record, and the floor shows the workers a withdrawal (a
-    /// distrust the record has since ended) or half of a publication, or nothing: the next reading
-    /// states the confirmation in force. A boot whose clock continuity is lost states nothing, and
-    /// states it once the owner has established the clock.
+    /// KR-REQ-09.19: a publication the daemon did not complete is made good at its next reading,
+    /// as a restatement. The owner's confirmation is in the record, and the floor shows the
+    /// workers a withdrawal (a distrust the record has since ended) or half of a publication: the
+    /// next reading states the confirmation in force. A boot whose clock continuity is lost
+    /// states nothing, and states it once the owner has established the clock. A reading the words
+    /// cannot hold is not stated, and not stated again at every reading after it.
     #[test]
     fn a_publication_that_did_not_complete_is_made_good_at_the_next_reading() {
         let store = Store::new();
@@ -1662,13 +1672,23 @@ mod tests {
         // a withdrawal: the floor shows the withdrawal and the record the confirmation.
         floor.words().withdraw();
         assert_eq!(floor.words().established(), None);
-        assert!(floor.words().published());
         assert!(proven(&run, &devices));
-        assert_eq!(
-            floor.words().established().map(|held| held.wall_ms),
-            Some(machine.wall()),
-            "the next reading says what the record holds"
-        );
+        let stated = floor
+            .words()
+            .established()
+            .expect("the next reading says it");
+        assert_eq!(stated.wall_ms, machine.wall(), "what the record holds");
+        assert!(stated.restated);
+
+        // Or between the two stores of a publication.
+        floor.words().leave_half_published(machine.wall() + 1);
+        assert_eq!(floor.words().established(), None);
+        assert!(proven(&run, &devices));
+        let stated = floor
+            .words()
+            .established()
+            .expect("the next reading says it");
+        assert_eq!(stated.wall_ms, machine.wall());
 
         // A boot whose continuity is lost has no reading to say it with, until the owner has
         // established the clock.
@@ -1677,7 +1697,6 @@ mod tests {
         let run = Run::over(&machine, Arc::clone(&lost));
         let _ = run.trust.sample(&devices);
         assert_eq!(lost.words().established(), None);
-        assert!(!lost.words().published());
         lost.establish_continuity();
         assert!(proven(&run, &devices));
         assert!(lost.words().established().is_some());
@@ -1689,8 +1708,9 @@ mod tests {
     /// read, lets a minute pass on the boot clock first and moves itself on half a minute only, as
     /// a reading that paused between its samples while the wall clock was slowed would find: the
     /// boot reading shown is the one taken before the pause, so a worker that begins later
-    /// projects the wall reading from where it was taken and finds its own clock a half minute
-    /// short, as it is.
+    /// projects the wall reading from where it was taken and finds its own clock a minute short of
+    /// it: the half minute the wall clock lost against the boot clock, and the half minute it ran
+    /// during the pause.
     #[test]
     fn the_pair_shown_to_the_workers_is_taken_boot_clock_first() {
         let store = Store::new();
