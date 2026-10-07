@@ -1303,17 +1303,22 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
         worker.history().contains("after")
     })
     .await;
-    let history = worker.history();
-    assert!(!history.contains("before"), "{history}");
-    // Nothing the worker read while privacy mode was on comes back: what it retains starts where
-    // its cursor stood when privacy mode was turned off, or after it.
+    // No output below the cursor the worker had reached when privacy mode was turned off is
+    // retained: what it retains starts there, or after it. The text of what was said before and
+    // while privacy mode was on is checked where the console passes the shell's bytes as they are;
+    // where it redraws them, a chunk of that text can arrive after retention starts again, and is
+    // then new output.
     assert!(
         worker.retained_from() >= turned_off_from,
-        "the retained output starts at {}, before the {turned_off_from} the worker had read",
+        "the retained output starts at {}, before the {turned_off_from} the worker had reached",
         worker.retained_from()
     );
     #[cfg(unix)]
-    assert!(!history.contains("while private"), "{history}");
+    {
+        let history = worker.history();
+        assert!(!history.contains("before"), "{history}");
+        assert!(!history.contains("while private"), "{history}");
+    }
     environment
         .status_until("the worker's answer for the new generation", |report| {
             report.completion == PrivacyCompletion::Complete
