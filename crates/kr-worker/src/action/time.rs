@@ -1218,19 +1218,25 @@ impl TimeContract {
     }
 
     /// Follows the owner's confirmation of the host's clock, once, unless this worker's own clock
-    /// shows it behind.
+    /// shows a rollback the owner did not see.
     ///
     /// The owner's one action is meant to end the distrust of the host's clock where the worker
     /// maps the host's clock floor, where the daemon publishes the wall reading the owner
     /// confirmed and the machine's continuous reading taken with it, and withdraws it again when
     /// its own record distrusts the clock. What the owner said is what the time was then, so the
     /// worker's own wall clock has to read that carried forward by the continuous time since, or
-    /// later: it may be behind it by no more than the rollback tolerance and the rate allowance. A
-    /// wall clock stepped back since is a rollback the owner did not see, and the confirmation is
-    /// spent all the same, because one a worker met and could not follow is not one it follows when
-    /// the clock next reads right: the owner has said nothing about the clock in between. Only the
-    /// next confirmation ends that distrust. A step forward is not held against it, as it is not
-    /// held against a worker that never distrusted its clock: forward steps expire conservatively.
+    /// later: it may be behind it by no more than the rollback tolerance and the rate allowance.
+    /// A reading the worker took after the confirmation outranks it in the same way: a wall clock
+    /// that has fallen behind the worker's own mark, when that mark was raised after the owner
+    /// spoke, is a rollback the owner did not see, and an older confirmation does not clear what
+    /// the worker found after it.
+    ///
+    /// A wall clock behind either is a rollback since, and the confirmation is spent all the same,
+    /// because one a worker met and could not follow is not one it follows when the clock next
+    /// reads right: the owner has said nothing about the clock in between. A worker that still
+    /// trusted its clock distrusts it then, as the daemon's record would. Only the next
+    /// confirmation ends that distrust. A step forward is not held against it, as it is not held
+    /// against a worker that never distrusted its clock: forward steps expire conservatively.
     ///
     /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
     /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
@@ -1253,7 +1259,18 @@ impl TimeContract {
         let expected = established.wall_ms.saturating_add(elapsed);
         let slack = MAX_WALL_CLOCK_ROLLBACK_MS
             .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
-        if wall_ms.saturating_add(slack) < expected {
+        let behind_the_confirmation = wall_ms.saturating_add(slack) < expected;
+        let behind_a_later_mark = state.high_water.is_some_and(|mark| {
+            mark.continuous_ms >= established.boot_ms
+                && mark.projected(continuous_ms).saturating_sub(wall_ms)
+                    > MAX_WALL_CLOCK_ROLLBACK_MS
+        });
+        if behind_the_confirmation || behind_a_later_mark {
+            if state.trust == WallClockTrust::Trusted {
+                state.trust = WallClockTrust::Unresolved;
+                state.owner_confirmed = false;
+                state.critical = state.critical.saturating_add(1);
+            }
             return;
         }
         self.trust_again(state, continuous_ms, wall_ms, reading.clone(), true);

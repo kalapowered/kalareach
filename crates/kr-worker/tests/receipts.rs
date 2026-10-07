@@ -4404,6 +4404,72 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
     );
 }
 
+/// KR-REQ-09.18, KR-REQ-09.19: an older confirmation does not clear a rollback the worker found
+/// after it. The owner establishes the clock; the wall clock then runs ten minutes ahead, which a
+/// worker that begins afterwards samples; before its first look the wall clock goes back a minute.
+/// The worker finds that rollback against its own mark, and the confirmation (which reads earlier
+/// than the clock does now, so the clock is not behind it) does not end it. The control is the
+/// same worker looking only at the confirmation's own clock, which follows it.
+#[test]
+fn an_older_confirmation_does_not_clear_a_rollback_the_worker_found_after_it() {
+    let ten_minutes = std::time::Duration::from_secs(600);
+    let a_minute = std::time::Duration::from_secs(60);
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    machine.owner_establishes(&floor);
+    machine.runs(ten_minutes);
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "a time service that vouches for the clock starts the worker trusted"
+    );
+    machine.steps_back(a_minute);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the rollback it found is not cleared by a confirmation older than the reading it took"
+    );
+    assert_eq!(session.collect_expired(), 0);
+
+    // The control: a worker whose clock only rose and has not fallen follows the confirmation.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    machine.time_service_stops();
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    machine.owner_establishes(&floor);
+    machine.runs(ten_minutes);
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: a worker that still trusts its clock distrusts it when the clock is
+/// behind what the owner confirmed. The wall clock steps forward ten minutes, which the worker's
+/// own mark has not seen; the owner confirms that reading; the wall clock then goes back a minute.
+/// The worker's own mark finds no rollback, and the confirmation shows one, as the daemon's record
+/// would: the worker distrusts its clock, and collects nothing.
+#[test]
+fn a_trusted_worker_distrusts_a_clock_stepped_back_behind_the_owners_confirmation() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    machine.wall.advance(std::time::Duration::from_secs(600));
+    machine.owner_establishes(&floor);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the owner confirmed a reading this clock is now a minute behind"
+    );
+    assert_eq!(session.collect_expired(), 0);
+}
+
 /// The mark a worker's journal holds for its contract, in UTC milliseconds.
 fn recorded_mark(journal: &std::path::Path) -> u64 {
     let row: Vec<u8> = rusqlite::Connection::open(journal)

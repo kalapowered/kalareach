@@ -436,6 +436,13 @@ async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
     // after that has nothing to follow.
     wall.store(wall.load(Ordering::SeqCst) - 60_000, Ordering::SeqCst);
     assert!(!super::an_owner_establishes_the_clock::proven(&controller));
+    // The wall clock reads right again, so the worker's own clock agrees with the withdrawn
+    // confirmation: what keeps it from following is the withdrawal and nothing else.
+    wall.store(
+        established.wall_ms
+            + (kr_ipc::clock::SystemSharedClock.boot_elapsed_ms() - established.boot_ms),
+        Ordering::SeqCst,
+    );
     let late = worker_on(vouching_for_nothing);
     late.observe();
     assert_eq!(
