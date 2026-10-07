@@ -50,11 +50,15 @@ pub fn carries(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Returns how many times `haystack` carries `needle`, as a terminal reads the bytes.
 ///
-/// A line the application ends with a line feed arrives as a carriage return and a line feed, and a
-/// pseudo-terminal under load can carry that carriage return twice: a retained line has ended
-/// `all written\r\r\n`. A terminal takes the second return for the first again, so a run of
-/// carriage returns before a line feed counts as one, in the marker as in the output, and a marker
-/// finds its line whichever way the line arrived.
+/// A line the application ends with a line feed arrives as a carriage return and a line feed, and
+/// macOS's pseudo-terminal can carry that carriage return twice: a retained line has ended
+/// `all written\r\r\n`. Its output translation queues the return, finds no room left for the
+/// line feed in the terminal's 1,024-byte output queue, and translates the line feed again when
+/// the write goes on (`ttyoutput` and `ttwrite` in XNU's `bsd/kern/tty.c`), which happens when a
+/// reader that falls behind leaves the queue one byte short as a line feed arrives. The worker
+/// keeps the bytes it reads as they come. A terminal takes the second return for the first
+/// again, so a run of carriage returns before a line feed counts as one, in the marker as in the
+/// output, and a marker finds its line whichever way the line arrived.
 pub fn carried_times(haystack: &[u8], needle: &[u8]) -> usize {
     let needle = returns_before_line_feeds_as_one(needle);
     returns_before_line_feeds_as_one(haystack)
