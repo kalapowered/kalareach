@@ -29,11 +29,10 @@
 //! * **A worker crash closes the session.** The closure is recorded and nothing is rebuilt from
 //!   terminal history. Taking ownership removes the worker's published endpoint and descriptor.
 //!   What this module does *not* do is stop what the session still owned:
-//!   [`ArchiveService::fence_owned`] terminates no process and reports no cleanup boundary,
-//!   because this build records none a later daemon could act on. The closure's coverage says so,
-//!   and section 7's cleaning half - terminate or fence the remaining owned processes by cgroup
-//!   or Job identity before the session identity is released - is open, so KR-REQ-07.66 and 24.25
-//!   are open with it.
+//!   [`ArchiveService::fence_owned`] terminates no process. The closure's coverage says so, and
+//!   section 7's cleaning half - terminate or fence the remaining owned processes by cgroup or Job
+//!   identity before the session identity is released - is open, so KR-REQ-07.66 and 24.25 are
+//!   open with it.
 //!
 //! Retention reaches a closed session as well. A session with no worker has no maintenance tick,
 //! so [`ArchiveService::collect`] applies the bounds that belong to it under recovery ownership:
@@ -212,20 +211,6 @@ impl Archive {
     }
 }
 
-/// The boundary a crashed session's remaining processes are cleaned by.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CleanupBoundary {
-    /// The transient unit or Job the supervisor started this worker in.
-    ///
-    /// This is the boundary section 7 names, and it is the only one that cannot name something
-    /// else: it is derived from the reservation rather than from a process identifier the kernel
-    /// may since have reused. This build records none with a worker, so
-    /// [`ArchiveService::fence_owned`] never reports one.
-    SupervisedUnit(String),
-    /// No boundary this host can work from.
-    None,
-}
-
 /// What recovering a crashed session's journal resolved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
@@ -268,17 +253,15 @@ pub struct Collected {
 pub struct Fenced {
     /// The session.
     pub session_id: SessionId,
-    /// The boundary this pass was able to enumerate.
-    pub boundary: CleanupBoundary,
     /// The processes this pass terminated.
     ///
     /// Always empty in this build: nothing is terminated on the strength of an identifier the
-    /// kernel may have reused, and no boundary is recorded to stop.
+    /// kernel may have reused, and this pass stops no unit or Job.
     pub stopped: Vec<ProcessStartIdentity>,
     /// How many recorded processes had already ended.
     pub already_gone: u64,
-    /// How many things this host could not account for. A fence in this build counts one: the
-    /// cleanup boundary itself, which it has none of.
+    /// How many things this host could not account for. A fence in this build counts one: what
+    /// the unit or Job the worker ran in still holds, which this pass does not look at.
     pub unaccounted: u64,
     /// Resources known to survive, which are the user's rather than this host's.
     pub surviving: Vec<kr_protocol::session::SurvivingResource>,
@@ -508,9 +491,9 @@ impl ArchiveService {
     /// Section 7: after a worker crash the controller fences its endpoints, uses the cgroup or
     /// Job or the recorded identities for cleanup, and records any incomplete coverage. The
     /// endpoint is fenced by [`Self::take_ownership`]. This is the second half. It terminates no
-    /// process and names no [`CleanupBoundary`]: it counts the recorded processes the kernel
-    /// confirms have ended, carries the closure's surviving resources through, counts the
-    /// boundary itself as one thing it cannot account for, and reports incomplete coverage.
+    /// process: it counts the recorded processes the kernel confirms have ended, carries the
+    /// closure's surviving resources through, counts what the unit or Job the worker ran in still
+    /// holds as one thing it cannot account for, and reports incomplete coverage.
     ///
     /// **Nothing is inferred from a dead identifier.** A worker's descendants join the group it
     /// led, and after the worker has gone the kernel is free to give its number to an unrelated
@@ -521,13 +504,11 @@ impl ArchiveService {
     ///
     /// What would work is the boundary the platform itself keeps: the transient unit or Job the
     /// supervisor started this worker in, which is named from the reservation and cannot name
-    /// anything else. This host records no such boundary with a worker, so there is none for this
-    /// to stop, and the coverage it returns is incomplete.
+    /// anything else. This pass does not stop it, so the coverage it returns is incomplete.
     #[must_use]
     pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
         Fenced {
             session_id: ownership.session_id,
-            boundary: CleanupBoundary::None,
             stopped: Vec::new(),
             // What the session recorded as already stopped, confirmed against the kernel rather
             // than taken on trust: the identifier may since have been reused.
@@ -541,12 +522,12 @@ impl ArchiveService {
                     )
                 })
                 .count() as u64,
-            // The boundary itself: this host has none to work from, and that is one thing it
-            // cannot account for.
+            // What the worker's unit or Job still holds: this pass does not look, and that is one
+            // thing it cannot account for.
             unaccounted: 1,
             surviving: closure.surviving.clone(),
             // Section 7 forbids claiming that every application a worker may have started was
-            // discovered, and a host with no boundary to clean by is further from that than most.
+            // discovered, and a pass that stops no unit or Job is further from that than most.
             coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
         }
     }
@@ -560,7 +541,6 @@ impl ArchiveService {
     pub const fn nothing_fenced(session_id: SessionId) -> Fenced {
         Fenced {
             session_id,
-            boundary: CleanupBoundary::None,
             stopped: Vec::new(),
             already_gone: 0,
             unaccounted: 1,
