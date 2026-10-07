@@ -4014,17 +4014,9 @@ fn is_recorded_tree(
     tree: RecordedIdentity,
 ) -> impl FnOnce(&kr_transfer::AuthorisedDirectory) -> Result<Settled> {
     move |work_tree| {
-        work_tree
-            .check_recorded(tree)
-            .map_err(|refusal| ProjectError::IdentityChanged {
-                detail: format!(
-                    "this record names the working tree {tree}, and {} holds another directory, \
-                     so nothing is read there: {}",
-                    crate::git::redact(&work_tree.display_path().display().to_string()),
-                    crate::git::redact(&refusal.to_string())
-                )
-                .into(),
-            })
+        work_tree.check_recorded(tree).map_err(|refusal| {
+            crate::identity::not_the_recorded_tree(tree, work_tree.display_path(), &refusal)
+        })
     }
 }
 

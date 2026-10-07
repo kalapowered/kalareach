@@ -800,10 +800,11 @@ fn a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers() 
     );
 }
 
-/// Creates a linked worktree of `project` named `name` in the fixture's directory.
+/// Creates a linked worktree of `project` named `name` in `parent`.
 fn worktree_workspace(
     fixture: &Fixture,
     project: ProjectRepositoryId,
+    parent: &std::path::Path,
     name: &str,
     seed: u8,
 ) -> kr_protocol::ids::WorkspaceId {
@@ -819,11 +820,7 @@ fn worktree_workspace(
                 policy: InclusionPolicy::base_only(),
                 base_revision: Nullable(None),
                 base_change_set_id: Nullable(None),
-                destination: Nullable(Some(destination(
-                    fixture.environment_id(),
-                    fixture.work(),
-                    name,
-                ))),
+                destination: Nullable(Some(destination(fixture.environment_id(), parent, name))),
                 preview_only: false,
             },
             Some(&action("workspace.create", seed)),
@@ -865,7 +862,7 @@ fn a_directory_that_took_a_workspace_trees_place_is_not_read_as_the_workspace() 
     let mut fixture = Fixture::create();
     let started = watching_git(&mut fixture);
     let project = adopted_with_changes(&fixture, "replaced-source");
-    let workspace_id = worktree_workspace(&fixture, project, "replaced-tree", 80);
+    let workspace_id = worktree_workspace(&fixture, project, fixture.work(), "replaced-tree", 80);
     let tree = fixture.work().join("replaced-tree");
     let named = std::fs::canonicalize(fixture.work())
         .expect("the directory resolves")
@@ -924,6 +921,51 @@ fn a_directory_that_took_a_workspace_trees_place_is_not_read_as_the_workspace() 
     assert!(
         other.join("theirs.txt").is_file(),
         "what is there is left as it is"
+    );
+}
+
+/// A workspace tree that lost the file that names its repository is not read as another
+/// repository: Git looks upward for one, finds the repository the tree is inside, and nothing of
+/// that repository is read, because it is not the directory the record names.
+#[cfg(unix)]
+#[test]
+fn a_repository_around_a_workspace_tree_is_not_read_when_the_tree_loses_its_own() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let around = ordinary_repository(fixture.work(), "around");
+    let project = adopted_with_changes(&fixture, "enclosed-source");
+    let workspace_id = worktree_workspace(&fixture, project, &around, "inside", 89);
+    let tree = around.join("inside");
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let named = std::fs::canonicalize(&tree).expect("the tree resolves");
+    let outer = std::fs::canonicalize(&around).expect("the repository resolves");
+
+    // The tree is read where it is, by its own repository.
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 90);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the recorded tree is counted: {held:?}"
+    );
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the recorded tree"
+    );
+
+    // The file that names its repository is gone, so the repository Git finds for the tree is the
+    // one around it.
+    std::fs::remove_file(tree.join(".git")).expect("the tree loses its repository");
+    let held = measured(&fixture, workspace_id, 91);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &outer),
+        "no Git invocation started in the repository around the tree"
     );
 }
 

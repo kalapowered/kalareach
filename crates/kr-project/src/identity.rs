@@ -130,44 +130,59 @@ impl OpenedRepository {
         environment_id: EnvironmentId,
         path: &Path,
     ) -> Result<Self> {
-        Self::open_deciding(profile, environment_id, path, |_| Ok(()))
+        Self::open_deciding(profile, environment_id, path, |_| Ok(()), |_| Ok(()))
     }
 
     /// Opens a working tree that a record names, and decides that the directory at its path is
     /// that tree before Git is asked anything there.
     ///
-    /// The directory is opened and decided by `require_within` first. Git then starts in that
-    /// object and nowhere else, and the repository it reports is decided once more
-    /// ([`Self::require_tree`]), so a directory that took the place of the recorded tree, or a
-    /// filesystem mounted over it, is refused without a Git invocation having run in it.
+    /// The directory is opened and decided by `require_within` first, and Git starts in that
+    /// object. Git looks upward for the repository a directory belongs to, so the top level it
+    /// reports can be another directory than the one decided (a tree that lost its own `.git`
+    /// belongs to the repository around it): that top level is decided as well, before its
+    /// configuration is read or anything else is run in it. A directory that took the place of
+    /// the recorded tree, or a filesystem mounted over it, is refused without Git having been
+    /// started in it.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the directory is neither the recorded tree
-    /// nor inside it, or what [`Self::open`] returns.
+    /// nor inside it, or when the top level Git reports is not the recorded tree, or what
+    /// [`Self::open`] returns.
     pub fn open_recorded_tree(
         profile: &RestrictedProfile,
         environment_id: EnvironmentId,
         path: &Path,
         tree: RecordedIdentity,
     ) -> Result<(Self, Settled)> {
-        let opened = Self::open_deciding(profile, environment_id, path, |named| {
-            require_within(named, tree)
-        })?;
+        let opened = Self::open_deciding(
+            profile,
+            environment_id,
+            path,
+            |named| require_within(named, tree),
+            |top| {
+                top.check_recorded(tree)
+                    .map(|_| ())
+                    .map_err(|refusal| not_the_recorded_tree(tree, top.display_path(), &refusal))
+            },
+        )?;
         let settled = opened.require_tree(tree)?;
         Ok((opened, settled))
     }
 
-    /// Opens a working tree like [`Self::open`], after `decide` has accepted the directory at the
-    /// path and before Git is asked anything. Git starts in the directory `decide` saw.
+    /// Opens a working tree like [`Self::open`], with two decisions made before anything else is
+    /// done: `named` accepts the directory at the path before Git is asked anything, and `top`
+    /// accepts the top level Git reports before its configuration is read. Git starts in the
+    /// directory `named` saw.
     fn open_deciding(
         profile: &RestrictedProfile,
         environment_id: EnvironmentId,
         path: &Path,
-        decide: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
+        named: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
+        top: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
     ) -> Result<Self> {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
-        decide(&work_tree)?;
+        named(&work_tree)?;
         // `--git-common-dir` rather than `--git-dir`: a linked worktree's own Git directory lives
         // inside the main one, and what identifies the repository is the object every worktree of
         // it shares.
@@ -209,6 +224,9 @@ impl OpenedRepository {
                 .into(),
             });
         }
+        // The top level is opened and decided before anything is read in the repository Git found.
+        let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
+        top(&tree)?;
         // The Git directory is opened as an object of its own, because for a linked worktree it
         // lies outside the working tree this call named. Both directories are opened here, where
         // Git has just said where they are, and kept: every later question about this
@@ -220,7 +238,6 @@ impl OpenedRepository {
         } else {
             AuthorisedDirectory::open_root(environment_id, &own_dir_path)?
         };
-        let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
         let identity = RepositoryIdentity {
             git_dir: git_dir.identity(),
             work_tree: tree.identity(),
@@ -791,36 +808,55 @@ impl OpenedRepository {
 /// A record names the top level of a working tree, and a repository that was registered through a
 /// directory below its top level keeps that directory's path, so the directory at a recorded path
 /// is the recorded tree itself or lies beneath it. A directory that is not the recorded tree is
-/// followed upward by its own handle for as long as it stays on one filesystem; finding the
-/// recorded tree on the way says the path is inside it. A filesystem mounted over the path ends the
-/// climb at its own root, and so does the root of the filesystem, and either refuses.
+/// followed upward by its own handle for as long as it stays on one mount; finding the recorded
+/// tree on the way says the path is inside it. The mount is what the platform names it by (on
+/// Linux its own identifier, which tells a bind mount from the tree it was made from, and
+/// elsewhere the device). Another filesystem mounted over the path ends the climb at its own
+/// root, and so does the root of the filesystem, and either refuses. Where a platform does not
+/// open a directory's parent from its handle, only the recorded tree itself is accepted.
 fn require_within(named: &AuthorisedDirectory, tree: RecordedIdentity) -> Result<()> {
     let refusal = match named.check_recorded(tree) {
         Ok(_) => return Ok(()),
         Err(refusal) => refusal,
     };
-    let device = named.identity().device;
-    let mut here = named.try_clone()?;
-    while let Ok(above) = here.parent() {
-        if above.identity() == here.identity() || above.identity().device != device {
-            break;
+    let mount_of = |directory: &AuthorisedDirectory| {
+        directory
+            .try_clone()
+            .and_then(AuthorisedDirectory::confined_to_one_mount)
+            .ok()
+            .and_then(|held| held.mount())
+    };
+    if let Some(mount) = mount_of(named) {
+        let mut here = named.try_clone()?;
+        while let Ok(above) = here.parent() {
+            if above.identity() == here.identity() || mount_of(&above) != Some(mount) {
+                break;
+            }
+            if above.check_recorded(tree).is_ok() {
+                return Ok(());
+            }
+            here = above;
         }
-        if above.check_recorded(tree).is_ok() {
-            return Ok(());
-        }
-        here = above;
     }
-    Err(ProjectError::IdentityChanged {
+    Err(not_the_recorded_tree(tree, named.display_path(), &refusal))
+}
+
+/// Returns the refusal for a directory that is not the working tree a record names.
+pub(crate) fn not_the_recorded_tree(
+    tree: RecordedIdentity,
+    shown: &Path,
+    refusal: &kr_transfer::Escape,
+) -> ProjectError {
+    ProjectError::IdentityChanged {
         detail: format!(
             "this record names the working tree {tree}, and {} is a directory that is neither \
-             that tree nor inside it; a recorded identity is the object rather than the path, and \
-             a linked worktree is its own object and a record of one never covers another, so \
-             nothing is run there: {}",
-            crate::git::redact(&named.display_path().display().to_string()),
+             that tree nor inside it: a recorded identity is the object rather than the path, so \
+             a record of one never covers another object. Nothing is run there ({})",
+            crate::git::redact(&shown.display().to_string()),
             crate::git::redact(&refusal.to_string())
         )
         .into(),
-    })
+    }
 }
 
 /// Returns the path the operating system gives for an open directory now, taken from its handle.
