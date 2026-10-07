@@ -6,17 +6,18 @@
 //! before the program starts. The package states the integration here, in its manifest, so what a
 //! host adds is the bytes the package hash names: the host reads it only from the verified
 //! manifest, never from anything that describes the installation. Asking for it is the
-//! `command_integration.launch` capability, which the owner confirms on every release, and the
-//! grant shows [`CommandIntegration::statement`], which lists the command, every flag and every
-//! variable exactly.
+//! `command_integration.launch` capability, which the owner confirms on every release. The plan an
+//! installation or a grant is confirmed against holds the capability names and the exact package
+//! hash, which covers the declaration, and not [`CommandIntegration::statement`], which lists the
+//! command, every flag and every variable exactly, so no confirmation shows it.
 //!
 //! What a declaration may say is closed:
 //!
 //! * The command is a bare name, the executable name of one of the package's own match rules.
 //! * The flags are whole argument elements, added in the order declared, each one line of text
-//!   with nothing in it that a person reading the grant could not see. A flag may hold the
+//!   with nothing in it that a person reading the declaration could not see. A flag may hold the
 //!   forwarder's placeholder (see [`crate::forwarder`]), which the host replaces with the installed
-//!   forwarder's path, and the grant says so.
+//!   forwarder's path, and the statement says so.
 //! * A variable is one of [`PERMITTED_VARIABLES`], by exact name and value. Reserved `KR_` values
 //!   come only from the worker, and a variable that loads code, changes a search path or chooses a
 //!   startup file changes what a program runs. No list of forbidden names can be complete, so this
@@ -80,8 +81,7 @@ pub struct CommandIntegration {
     pub flags: Vec<String>,
     /// The environment variables the integration sets for that invocation, in order.
     pub variables: Vec<IntegrationVariable>,
-    /// What the grant tells the person before they accept it, beside the exact list the host
-    /// renders from this declaration.
+    /// What the package says its integration does, in its own words.
     pub grant_statement: Summary,
 }
 
@@ -96,11 +96,11 @@ pub struct IntegrationVariable {
 }
 
 impl CommandIntegration {
-    /// Returns what the integration does, exactly, for the grant a person confirms.
+    /// Returns what the integration does, exactly, as text a person can read.
     ///
     /// Every flag is written as a JSON string, in the order it is added, and every variable as its
-    /// name and its value as a JSON string. Nothing is shortened: a person confirms every byte the
-    /// host adds.
+    /// name and its value as a JSON string. Nothing is shortened: every flag and every variable
+    /// the host adds is in it.
     #[must_use]
     pub fn statement(&self) -> String {
         let mut statement = format!("Runs {} in KalaReach sessions", quoted(&self.command));
@@ -253,7 +253,7 @@ fn flag_problem(flag: &str) -> Option<String> {
     }
     if let Some(character) = flag.chars().find(|c| is_forbidden_text_char(*c)) {
         return Some(format!(
-            "it carries U+{:04X}, which a person reading the grant could not see",
+            "it carries U+{:04X}, which a person reading the declaration could not see",
             u32::from(character)
         ));
     }
@@ -386,6 +386,10 @@ mod tests {
                 "{flag:?} is refused"
             );
         }
+        // The finding names the character a person could not see.
+        let hidden = integration("agent", &["--a\u{200B}"], &[]).problems(&rules);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(hidden[0].contains("U+200B"), "{hidden:?}");
         let longest = "f".repeat(MAX_FLAG_BYTES);
         assert!(
             integration("agent", &[&longest], &[])
@@ -409,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn the_forwarder_placeholder_is_allowed_where_the_host_can_replace_it_and_the_grant_says_so() {
+    fn the_forwarder_placeholder_is_allowed_where_the_host_replaces_it_and_the_statement_says_so() {
         let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"{kr_hook}","args":["qoder-cli","hook"]}]}]}}"#;
         let rules = [rule("agent", &[])];
         let placed = integration("agent", &["--settings", settings], &[]);
