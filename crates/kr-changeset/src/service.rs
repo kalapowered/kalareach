@@ -270,7 +270,12 @@ impl ChangeSetService {
         })
     }
 
-    /// Opens one workspace's repository under the project service's profile.
+    /// Opens one workspace's repository under the project service's profile, and writes nothing.
+    ///
+    /// This is the open of everything that reads, and of a preflight: a preflight that stops at a
+    /// conflict leaves this host's journals, the project service's records of the workspace
+    /// included, as they were. What the open decides about those records waits for the next open
+    /// that writes ([`Self::open_repository_recording`]).
     ///
     /// # Errors
     ///
@@ -283,6 +288,32 @@ impl ChangeSetService {
         let opened = self
             .project
             .open_workspace_repository(resolved.summary.workspace_id)?;
+        self.require_first_repository_of(resolved, opened)
+    }
+
+    /// Opens one workspace's repository like [`Self::open_repository`], and has the project
+    /// service write what the open decides about its records: for a caller that is writing anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open_repository`] returns, and whatever the write returns.
+    pub fn open_repository_recording(
+        &self,
+        resolved: &ResolvedWorkspace,
+    ) -> Result<OpenedRepository> {
+        let opened = self
+            .project
+            .open_workspace_repository_recording(resolved.summary.workspace_id)?;
+        self.require_first_repository_of(resolved, opened)
+    }
+
+    /// Requires what an independent clone's repository must be besides the one the project service
+    /// recorded, and returns the repository.
+    fn require_first_repository_of(
+        &self,
+        resolved: &ResolvedWorkspace,
+        opened: OpenedRepository,
+    ) -> Result<OpenedRepository> {
         // An independent clone is its own repository, and the project service holds the clone's
         // own Git directory to the record it made of it, so the repository it opened is the one
         // that was recorded. Two things are required of it as well. The first is what makes it
@@ -414,7 +445,7 @@ impl ChangeSetService {
             ));
         }
         let resolved = self.resolve(order.workspace_id)?;
-        let repository = self.open_repository(&resolved)?;
+        let repository = self.open_repository_recording(&resolved)?;
         // A capture writes, so this is where the first observation of an independent clone's own
         // repository is fixed. Every later open is compared against it.
         self.remember_repository(&resolved, &repository, order.admitted)?;

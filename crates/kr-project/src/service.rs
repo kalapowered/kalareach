@@ -1633,9 +1633,13 @@ impl ProjectService {
     ///
     /// Each is decided by the rule every recorded directory is decided by: it is the recorded one
     /// by its inode on the recorded filesystem, under whatever device number that filesystem has
-    /// now, and what the record is to become is written here. The tree is decided before Git is
-    /// asked anything in it, and the Git directory before the repository's configuration is
-    /// audited.
+    /// now. The tree is decided before Git is asked anything in it, and the Git directory before
+    /// the repository's configuration is audited.
+    ///
+    /// **Nothing is written.** What the decisions make of the records, a renumbered device or the
+    /// Git directory of a clone recorded before its Git directory was, is left for the next open
+    /// that writes ([`Self::open_workspace_repository_recording`]), so that a read, and a
+    /// preflight that stops at a conflict, leave this host's journal as it was.
     ///
     /// # Errors
     ///
@@ -1643,12 +1647,35 @@ impl ProjectService {
     /// and [`ProjectError::IdentityChanged`] when this host recorded no identity for the tree or
     /// when either object at the recorded path is not the one the record names.
     pub fn open_workspace_repository(&self, workspace_id: WorkspaceId) -> Result<OpenedRepository> {
-        let row = self.locked()?.workspace(workspace_id)?.ok_or_else(|| {
-            ProjectError::UnknownWorkspace {
+        let row = self.recorded_workspace(workspace_id)?;
+        Ok(self
+            .open_recorded_workspace(&row, &TreeReach::by_path())?
+            .opened)
+    }
+
+    /// Opens the repository one workspace's working tree belongs to like
+    /// [`Self::open_workspace_repository`], and then writes what the two decisions make of the
+    /// records: for a caller that is writing anyway, such as a capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open_workspace_repository`] returns, and
+    /// [`ProjectError::StoreUnavailable`] when a record cannot be written.
+    pub fn open_workspace_repository_recording(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<OpenedRepository> {
+        let row = self.recorded_workspace(workspace_id)?;
+        self.open_recorded_workspace_recording(&row, &TreeReach::by_path())
+    }
+
+    /// Returns the row the journal holds for a workspace.
+    fn recorded_workspace(&self, workspace_id: WorkspaceId) -> Result<WorkspaceRow> {
+        self.locked()?
+            .workspace(workspace_id)?
+            .ok_or_else(|| ProjectError::UnknownWorkspace {
                 workspace: workspace_id.to_string().into(),
-            }
-        })?;
-        self.open_recorded_workspace(&row, &TreeReach::by_path())
+            })
     }
 
     /// Opens a project's repository at the path its record names, as the tree and the Git
@@ -1671,7 +1698,7 @@ impl ProjectService {
     }
 
     /// Opens the repository one workspace's working tree belongs to, reached the way `reach` says,
-    /// as the tree the row recorded, and writes what the records become.
+    /// as the tree the row recorded, and says what the records become without writing it.
     ///
     /// The directory at the recorded place is decided before Git is asked anything in it, so a
     /// directory that took the tree's place, or a filesystem mounted over it, is refused without a
@@ -1682,7 +1709,7 @@ impl ProjectService {
         &self,
         row: &WorkspaceRow,
         reach: &TreeReach,
-    ) -> Result<OpenedRepository> {
+    ) -> Result<OpenedWorkspace> {
         let Some(tree) = row.identity else {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
@@ -1725,6 +1752,25 @@ impl ProjectService {
                 recorded,
             )?,
         };
+        Ok(OpenedWorkspace {
+            opened,
+            project,
+            decided,
+        })
+    }
+
+    /// Opens the repository of a workspace like [`Self::open_recorded_workspace`], and writes what
+    /// the records become.
+    fn open_recorded_workspace_recording(
+        &self,
+        row: &WorkspaceRow,
+        reach: &TreeReach,
+    ) -> Result<OpenedRepository> {
+        let OpenedWorkspace {
+            opened,
+            project,
+            decided,
+        } = self.open_recorded_workspace(row, reach)?;
         self.settle_workspace_records(row, &project, decided)?;
         Ok(opened)
     }
@@ -3167,7 +3213,7 @@ impl ProjectService {
     fn count_dirty(&self, row: &WorkspaceRow, reach: &TreeReach) -> DirtyCount {
         // A shared workspace's tree is the user's own and is never removed, so what it holds does
         // not gate anything; a read of it still says what is there.
-        let opened = self.open_recorded_workspace(row, reach);
+        let opened = self.open_recorded_workspace_recording(row, reach);
         let opened = match opened {
             Ok(opened) => opened,
             Err(error) => {
@@ -4107,12 +4153,20 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
     )
 }
 
+/// A workspace's repository as it was opened, with the project it was decided against and what its
+/// two decisions make of the records, which nothing has written yet.
+struct OpenedWorkspace {
+    opened: OpenedRepository,
+    project: ProjectRow,
+    decided: Decided,
+}
+
 /// Returns what a project's record says of the repository at its path, which every open of the
 /// project decides before Git is asked anything there.
 ///
 /// A project this host initialised or cloned was published at its path, so the directory there is
-/// its tree and nothing below it, and its own `.git` leads to its repository. A project the owner
-/// adopted may have been adopted through a directory below its top level, and keeps its Git
+/// its tree and nothing below it, and its own `.git` leads to its repository. A project the
+/// owner adopted may have been adopted through a directory below its top level, and keeps its Git
 /// directory wherever its configuration puts it: the record cannot say that its path is the top
 /// level, so the directory at the path may lie inside the recorded tree.
 fn project_tree(project: &ProjectRow) -> RecordedTree {

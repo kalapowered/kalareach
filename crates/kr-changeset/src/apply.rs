@@ -3181,7 +3181,7 @@ fn clear_staged(
     let opened = row
         .workspace_id
         .and_then(|workspace_id| service.resolve(workspace_id).ok())
-        .and_then(|resolved| service.open_repository(&resolved).ok());
+        .and_then(|resolved| service.open_repository_recording(&resolved).ok());
     let Some(repository) = opened else {
         cleanup.not_ours = staged.into_iter().map(|entry| entry.path).collect();
         recovery.staged_left += cleanup.not_ours.len() as u64;

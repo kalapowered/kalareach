@@ -1507,6 +1507,68 @@ fn an_independent_clone_recorded_without_its_git_directory_is_held_to_the_one_it
     );
 }
 
+/// Opening a workspace's repository to read it, and to answer a preflight, records nothing: a
+/// clone recorded before its Git directory was takes the directory it is found with from the next
+/// open that writes, and is read as the clone in the meantime.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn opening_a_clone_recorded_without_its_git_directory_to_read_it_records_nothing() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "read-only-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "read-only-clone",
+        IsolationMechanism::IndependentClone,
+        141,
+    );
+    let tree = fixture.work().join("read-only-clone");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let id = workspace_id.get().as_bytes().to_vec();
+    let recorded = || -> (Option<i64>, Option<i64>) {
+        journal
+            .query_row(
+                "SELECT git_dir_device, git_dir_file_id FROM workspaces WHERE workspace_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the record reads")
+    };
+    journal
+        .execute(
+            "UPDATE workspaces SET git_dir_device = NULL, git_dir_file_id = NULL, git_dir_fs = NULL
+              WHERE workspace_id = ?1",
+            rusqlite::params![id],
+        )
+        .expect("the record is made as an earlier build made it");
+
+    fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect("the clone is read as the repository found inside its tree");
+    assert_eq!(
+        recorded(),
+        (None, None),
+        "an open that reads records nothing"
+    );
+
+    fixture
+        .service()
+        .open_workspace_repository_recording(workspace_id)
+        .expect("the clone opens for a writer");
+    let (device, inode) = numbers_of(&tree.join(".git"));
+    assert_eq!(
+        recorded(),
+        (Some(device), Some(inode)),
+        "an open that writes records the directory the clone was found with"
+    );
+}
+
 /// Creates a workspace that includes everything, in a destination that another directory takes the
 /// place of once the tree is made and before anything is copied into it. The creation is refused,
 /// nothing is copied into the directory that took the place, and the workspace's record never

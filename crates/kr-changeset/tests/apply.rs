@@ -191,6 +191,64 @@ fn a_preflight_conflict_returns_draft_conflict_and_writes_nothing() {
     assert_eq!(clean.limitations.len(), 3);
 }
 
+/// KR-REQ-14.26: a preflight conflict writes nothing to this host's own journal, and that includes
+/// the project service's record of the workspace. Opening the workspace's repository to look at it
+/// does not renumber what the record carries; a capture, which writes, does.
+#[cfg(unix)]
+#[test]
+fn a_preflight_conflict_leaves_the_project_services_record_of_the_workspace_as_it_was() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "recorded");
+    write(&path, "README.md", "the version this change is against\n");
+    let workspace = fixture.workspace("recorded");
+    let record = fixture.capture(workspace, &include_everything());
+    let affected = expectations(&path, &["README.md"]);
+    write(&path, "README.md", "somebody else got here first\n");
+
+    // The record names the tree under another device number, as a filesystem that is attached
+    // again under a new one leaves it: the same tree, which a use of the record then renumbers.
+    let journal = fixture.project_journal();
+    let device_of_tree = || -> i64 {
+        journal
+            .query_row("SELECT tree_device FROM workspaces", [], |row| row.get(0))
+            .expect("the workspace's record reads")
+    };
+    let now = i64::try_from(std::fs::metadata(&path).expect("the tree is there").dev())
+        .expect("a device number");
+    assert_eq!(device_of_tree(), now, "the record starts as the tree is");
+    journal
+        .execute_batch(
+            "UPDATE workspaces SET tree_device = tree_device + 1;
+             UPDATE projects SET work_tree_device = work_tree_device + 1,
+                                 git_dir_device = git_dir_device + 1;",
+        )
+        .expect("the record is renumbered");
+    assert_eq!(device_of_tree(), now + 1);
+
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let failure = apply::apply(fixture.service(), &order).expect_err("the preflight refuses");
+    assert_eq!(failure.code(), ErrorCode::DraftConflict);
+    assert_eq!(
+        device_of_tree(),
+        now + 1,
+        "the refused preflight did not write to the project service's record"
+    );
+
+    // A capture writes, and it renumbers the record to what the tree is.
+    write(&path, "README.md", "the version this change is against\n");
+    let _ = fixture.capture(workspace, &include_everything());
+    assert_eq!(device_of_tree(), now, "a capture settles the record");
+}
+
 /// KR-REQ-14.27: an apply to a proposal records two immutable versions and writes to no working
 /// tree at all.
 #[cfg(not(windows))]

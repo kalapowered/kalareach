@@ -2472,8 +2472,8 @@ fn an_independent_clone_workspace_can_be_captured() {
     assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
 
     // A clone recorded before its Git directory was is held to the repository the first capture
-    // found behind it: the project service takes the directory it finds the first time it opens
-    // the clone, and this service's own record of the first capture still refuses another.
+    // found behind it: the project service takes the directory it finds the first time a capture
+    // opens the clone, and this service's own record of the first capture still refuses another.
     let forget_the_git_directory = || {
         rusqlite::Connection::open(
             kr_project::ProjectService::root_of(&fixture.host().environment())

@@ -100,6 +100,17 @@ impl Fixture {
         &self.host
     }
 
+    /// Opens the project journal of this host, so a test can read or rewrite what the project
+    /// service recorded.
+    #[must_use]
+    pub fn project_journal(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(
+            ProjectService::root_of(&self.host.environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the project journal opens")
+    }
+
     /// Returns the environment this host owns.
     #[must_use]
     pub fn environment_id(&self) -> kr_protocol::ids::EnvironmentId {
