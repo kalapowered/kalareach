@@ -108,8 +108,7 @@ impl core::fmt::Display for ChainRefused {
                 formatter.write_str("the head is not signed by the revision it names")
             }
             Self::HeadNotCurrent => formatter.write_str("the head is not current"),
-            Self::ClockUntrusted => formatter
-                .write_str("this host's clock went backwards and has not been established again"),
+            Self::ClockUntrusted => formatter.write_str(super::CLOCK_DISTRUSTED),
             Self::FloorUnrecorded => formatter.write_str(super::FLOOR_UNRECORDED),
         }
     }
@@ -180,9 +179,7 @@ impl LeaseRefused {
             }
             Self::TooLong => "the lease lasts longer than fifteen minutes",
             Self::AboveRoleCeiling => "the lease grants more than its role allows",
-            Self::ClockUntrusted => {
-                "this host's clock went backwards and has not been established again"
-            }
+            Self::ClockUntrusted => super::CLOCK_DISTRUSTED,
             Self::FloorUnrecorded => super::FLOOR_UNRECORDED,
             Self::NotYetValid => "the lease was issued in this host's future",
             Self::Expired => "the lease has expired",

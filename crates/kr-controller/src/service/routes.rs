@@ -304,8 +304,13 @@ impl Controller {
                 admitted,
                 accepted.map(|accepted| accepted.deadline),
             );
+            let guard = self.pairing_guard(
+                connection_id,
+                admitted,
+                accepted.map(|accepted| accepted.deadline),
+            );
             let outcome = self
-                .pairing_write(caller, method, mutation, admission)
+                .pairing_write(caller, method, mutation, admission, guard)
                 .await;
             return respond(mutation.request_id, outcome);
         }

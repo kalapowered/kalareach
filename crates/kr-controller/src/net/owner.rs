@@ -15,9 +15,9 @@
 //! * **Who may sign is the host's record.** The enrolled signers are the authorisation keys of the
 //!   live paired devices whose grant holds `host.manage`. The one exception is the initial
 //!   bootstrap: while this host has no owner, a local caller at an interactive terminal outside a
-//!   KalaReach session may establish the first one, with a proof signed by a key it presents. That
-//!   key proves possession and nothing else, and once the first owner is committed the exception is
-//!   over for good.
+//!   KalaReach session may establish the first one, or establish the host's clock, with a proof
+//!   signed by a key it presents. That key proves possession and nothing else, and once the first
+//!   owner is committed the exception is over for good.
 //!
 //! What is not a confirmation, and is refused here: a proof carried by a session, plugin or
 //! contact-tool channel; the operating-system credentials a local caller connected with; anything a
@@ -31,13 +31,15 @@ use kr_pairing::confirm::{
     verify_confirmation,
 };
 use kr_pairing::host::{OwnerApproval, OwnerContext};
+use kr_pairing::platform::PairingClock;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
-    OwnerConfirmationPendingResult, OwnerConfirmationRequestResult, PendingConfirmation,
+    CLOCK_PURPOSE, ConfirmationDisplay, HostClockEstablishResult, OwnerConfirmationCompleteParams,
+    OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
+    OwnerConfirmationRequestResult, PendingConfirmation,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, ActorId, ConfirmationId, DeviceId};
+use kr_protocol::ids::{ActionId, ActorId, BootEpoch, ConfirmationId, DeviceId};
 use kr_protocol::pairing::{
     ConfirmationChannel, DevicePublicKeys, KeyPurpose, OwnerConfirmationProof,
     OwnerConfirmationRequest, SensitiveAction,
@@ -46,7 +48,9 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId};
 
 use super::devices::{DeviceDirectory, DeviceRecord};
-use super::invitations::{ActionSubject, InvitationRows, PairingAction, another_subject};
+use super::invitations::{
+    ActionSubject, InvitationRows, PairingAction, another_subject, claim_effect, consume,
+};
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
@@ -126,9 +130,9 @@ pub struct Resolved {
     pub rights: CanonicalSet<ActionRight>,
     /// What an owner device shows the owner.
     pub display: ConfirmationDisplay,
-    /// True when this is the establishment of the host's first owner, which is the only thing the
-    /// initial bootstrap may confirm.
-    pub first_owner: bool,
+    /// True when the initial bootstrap may confirm this: the establishment of the host's first
+    /// owner and the establishment of the host's clock, which are the only things it may confirm.
+    pub bootstrap: bool,
 }
 
 /// One outstanding challenge, as this host holds it beside the ledger.
@@ -137,7 +141,7 @@ struct Entry {
     order: u64,
     request: OwnerConfirmationRequest,
     display: ConfirmationDisplay,
-    first_owner: bool,
+    bootstrap: bool,
     answer: Option<Answer>,
 }
 
@@ -159,10 +163,73 @@ pub struct Challenges {
 /// The host's owner-confirmation service.
 pub struct OwnerAuthority {
     host_device_id: DeviceId,
-    host_endpoint_id: EndpointKey,
+    /// The endpoint every challenge names as the host's: the one the host's listener serves.
+    /// Bound at start from the host's keys and rebound once by the network's registration
+    /// ([`Self::rebind_endpoint`]).
+    host_endpoint_id: Mutex<EndpointKey>,
     clock: HostPairingClock,
     rows: InvitationRows,
     state: Mutex<Challenges>,
+    /// Where this host's own tests stop the establishment of the clock: after it has chosen the
+    /// confirmation it spends and before it takes the clock, and inside its commit.
+    #[cfg(test)]
+    pub(crate) pauses: EstablishPauses,
+}
+
+/// A point this host's own tests stop a blocking step at: the step says it has arrived and waits
+/// there until the test lets it go. Armed once, it fires once.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SyncPause(
+    Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+);
+
+#[cfg(test)]
+impl SyncPause {
+    /// Arms the pause. Returns the end that says the step has arrived, and the end that lets it
+    /// go.
+    pub(crate) fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = tokio::sync::oneshot::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here, blocking this thread, when the pause is armed.
+    fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.blocking_recv();
+        }
+    }
+}
+
+/// The two places the establishment of the clock can be stopped at in a test.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct EstablishPauses {
+    /// After the confirmation is chosen, before the clock is taken.
+    pub(crate) before_the_transaction: SyncPause,
+    /// Inside the commit's guard, after every row is written and checked, before the commit.
+    pub(crate) inside_the_commit: SyncPause,
 }
 
 impl std::fmt::Debug for OwnerAuthority {
@@ -220,7 +287,7 @@ impl OwnerAuthority {
     ) -> Self {
         Self {
             host_device_id,
-            host_endpoint_id,
+            host_endpoint_id: Mutex::new(host_endpoint_id),
             clock,
             rows,
             state: Mutex::new(Challenges {
@@ -228,6 +295,8 @@ impl OwnerAuthority {
                 entries: BTreeMap::new(),
                 issued: 0,
             }),
+            #[cfg(test)]
+            pauses: EstablishPauses::default(),
         }
     }
 
@@ -243,9 +312,46 @@ impl OwnerAuthority {
         })
     }
 
+    /// Returns the endpoint a challenge names as the host's.
+    fn endpoint(&self) -> EndpointKey {
+        *self
+            .host_endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Binds the endpoint a challenge names to the one the network's listener serves.
+    ///
+    /// The authority is built at start from the host's keys, before the network is registered, and
+    /// the listener's identity is loaded from the network's own key store, which can differ from
+    /// it on a host with a recorded file fallback. Registration calls this once, before the
+    /// listener accepts anything; a production daemon registers inside its start, before any
+    /// client is served, so no challenge has named the earlier endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while any challenge is outstanding: one issued for the earlier endpoint
+    /// would name a host that no device pinned.
+    pub fn rebind_endpoint(&self, endpoint: EndpointKey) -> Result<()> {
+        let mut state = self.state();
+        self.sweep(&mut state);
+        if !state.entries.is_empty() {
+            return Err(ControllerError::NotConfigured(
+                "this host's owner confirmations name the endpoint it started with, and some are \
+                 outstanding"
+                    .to_owned(),
+            ));
+        }
+        *self
+            .host_endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = endpoint;
+        Ok(())
+    }
+
     /// Returns the expectation an effect of `action` over `digest` builds, for this host.
     #[must_use]
-    pub const fn expectation<'a>(
+    pub fn expectation<'a>(
         &self,
         action: SensitiveAction,
         digest: Digest256,
@@ -256,7 +362,7 @@ impl OwnerAuthority {
             action,
             action_digest: digest,
             host_device_id: self.host_device_id,
-            host_endpoint_id: self.host_endpoint_id,
+            host_endpoint_id: self.endpoint(),
             destination_keys: destination,
             destination_rights: rights,
         }
@@ -315,7 +421,7 @@ impl OwnerAuthority {
             resolved.destination,
             resolved.rights.iter().copied().collect(),
             self.host_device_id,
-            self.host_endpoint_id,
+            self.endpoint(),
         )
         .map_err(refusal)?;
         // The admission is asked inside the transaction that records the request, after every wait
@@ -335,7 +441,7 @@ impl OwnerAuthority {
                 initial_bootstrap,
             });
         }
-        self.issue(&mut state, &request, resolved.display, resolved.first_owner);
+        self.issue(&mut state, &request, resolved.display, resolved.bootstrap);
         Ok(OwnerConfirmationRequestResult {
             request,
             initial_bootstrap,
@@ -348,7 +454,7 @@ impl OwnerAuthority {
         state: &mut Challenges,
         request: &OwnerConfirmationRequest,
         display: ConfirmationDisplay,
-        first_owner: bool,
+        bootstrap: bool,
     ) {
         state.ledger.issue(request, &self.clock);
         state.issued += 1;
@@ -359,7 +465,7 @@ impl OwnerAuthority {
                 order,
                 request: request.clone(),
                 display,
-                first_owner,
+                bootstrap,
                 answer: None,
             },
         );
@@ -372,8 +478,8 @@ impl OwnerAuthority {
     /// and listed by `owner.confirmation.pending` with what it approves, so an owner device reads
     /// exactly what it is asked to sign. The service keeps its own action identity, so no pairing
     /// action is recorded for it. A host with no owner device refuses it, because nothing on the
-    /// host could answer it: the terminal bootstrap establishes the first owner and confirms
-    /// nothing else.
+    /// host could answer it: the terminal bootstrap establishes the first owner and the host's
+    /// clock, and confirms nothing else.
     ///
     /// # Errors
     ///
@@ -392,7 +498,7 @@ impl OwnerAuthority {
             resolved.destination,
             resolved.rights.iter().copied().collect(),
             self.host_device_id,
-            self.host_endpoint_id,
+            self.endpoint(),
         )
         .map_err(refusal)?;
         let mut state = self.state();
@@ -780,9 +886,21 @@ impl OwnerAuthority {
         expectation: &ConfirmationExpectation<'_>,
         shows: &dyn Fn(&ConfirmationDisplay) -> bool,
     ) -> Result<(Spendable, MutexGuard<'_, Challenges>)> {
-        let enrolment = self.enrolment()?;
         let mut state = self.state();
-        self.sweep(&mut state);
+        let spendable = self.select(&mut state, expectation, shows)?;
+        Ok((spendable, state))
+    }
+
+    /// Selects the oldest answered challenge that equals `expectation` and was shown as `shows`
+    /// accepts, from the challenges the caller holds.
+    fn select(
+        &self,
+        state: &mut Challenges,
+        expectation: &ConfirmationExpectation<'_>,
+        shows: &dyn Fn(&ConfirmationDisplay) -> bool,
+    ) -> Result<Spendable> {
+        let enrolment = self.enrolment()?;
+        self.sweep(state);
         let mut candidates: Vec<&Entry> = state
             .entries
             .values()
@@ -826,13 +944,180 @@ impl OwnerAuthority {
                      host no longer holds; confirm again",
                 )
             })?;
-        let spendable = Spendable {
+        Ok(Spendable {
             request,
             proof: answer.proof,
             signer: answer.signer,
             enrolment,
+        })
+    }
+
+    /// Issues the challenge for establishing this host's clock again.
+    ///
+    /// Every host can be asked, networked or not: the terminal bootstrap confirms it on a host with
+    /// no owner, and an owner device confirms it on one that has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::request`] returns.
+    pub fn request_clock(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+        admission: &dyn Fn() -> Result<()>,
+    ) -> Result<OwnerConfirmationRequestResult> {
+        self.request(
+            caller,
+            Resolved {
+                action: SensitiveAction::ChangeHostAuthority,
+                digest: clock_digest()?,
+                destination: None,
+                rights: CanonicalSet::new(),
+                display: ConfirmationDisplay::EstablishClock,
+                bootstrap: true,
+            },
+            action,
+            admission,
+        )
+    }
+
+    /// Returns what a `host.clock.establish` that already established the clock is answered with,
+    /// when its action did.
+    ///
+    /// # Errors
+    ///
+    /// The inner result is `ID_CONFLICT` when the identifier was used with another payload, for
+    /// this method or any other pairing method, and a registry error when the record cannot be
+    /// read.
+    #[must_use]
+    pub fn established(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+    ) -> Option<Result<HostClockEstablishResult>> {
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
         };
-        Ok((spendable, state))
+        Some(match subject {
+            ActionSubject::ClockEstablished(confirmation_id) => {
+                Ok(HostClockEstablishResult { confirmation_id })
+            }
+            _ => Err(another_subject()),
+        })
+    }
+
+    /// Establishes this host's clock again: spends an answered `EstablishClock` confirmation, ends
+    /// the host's distrust of its clock, its holds and a lost clock continuity, and records the
+    /// action, in one transaction.
+    ///
+    /// The challenges are held from the first read to the end, so two copies of one action meet
+    /// at the record and the second is answered with the first's result, and a confirmation is
+    /// never spent by two effects. The transaction commits under `guarded`, which holds the
+    /// connection's registration standing through the commit. Inside it the signer's standing is
+    /// read again, a terminal proof needs the host to still have no owner, the action is claimed,
+    /// and the challenge is checked, without being consumed, to be still outstanding inside its
+    /// own deadline. A failure anywhere before the commit changes nothing and leaves the same
+    /// confirmation answered. Only after the commit is the challenge consumed from the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for a caller without owner authority,
+    /// `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of the clock stands, `ID_CONFLICT`
+    /// for a reused action, and whatever the admission or the records refuse with.
+    pub fn establish_clock(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+        boot: BootEpoch,
+        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<HostClockEstablishResult> {
+        self.require_owner(caller)?;
+        let rights = CanonicalSet::new();
+        let expectation = self.expectation(
+            SensitiveAction::ChangeHostAuthority,
+            clock_digest()?,
+            None,
+            &rights,
+        );
+        let mut state = self.state();
+        if let Some(answered) = self.established(caller, action) {
+            return answered;
+        }
+        let spendable = self.select(&mut state, &expectation, &|display| {
+            matches!(display, ConfirmationDisplay::EstablishClock)
+        })?;
+        let confirmation_id = spendable.request.confirmation_id;
+        let claimed = PairingAction {
+            actor: caller.actor_id.clone(),
+            action_id: action.0,
+            digest: action.1,
+            subject: ActionSubject::ClockEstablished(confirmation_id),
+        };
+        #[cfg(test)]
+        self.pauses.before_the_transaction.wait();
+        let lifetimes = self.rows.lifetimes();
+        lifetimes.clock_trust().establish_with(
+            self.rows.directory(),
+            boot,
+            guarded,
+            |transaction, established| {
+                consume(
+                    transaction,
+                    lifetimes,
+                    &spendable.proof,
+                    "establish this host's clock",
+                    established,
+                )?;
+                claim_effect(transaction, &claimed)?;
+                self.still_covers(&state, &spendable, &expectation)?;
+                #[cfg(test)]
+                self.pauses.inside_the_commit.wait();
+                Ok(())
+            },
+        )?;
+        // Committed. The ledger forgets the challenge now, and what it answers cannot matter: the
+        // record says the confirmation was spent, and a challenge that outlives that is not
+        // spendable, because its answer is consumed in the record.
+        let _ = state.ledger.consume(&spendable.request, &self.clock);
+        state.entries.remove(confirmation_id.get().as_bytes());
+        drop(state);
+        lifetimes.settle();
+        Ok(HostClockEstablishResult { confirmation_id })
+    }
+
+    /// Checks, without consuming it, that the challenge a spend selected is still outstanding
+    /// inside its own boot and monotonic deadline, and that its proof still answers exactly the
+    /// expectation. The spend consumes it from the ledger only once its transaction has committed.
+    fn still_covers(
+        &self,
+        state: &Challenges,
+        spendable: &Spendable,
+        expectation: &ConfirmationExpectation<'_>,
+    ) -> Result<()> {
+        let id = spendable.request.confirmation_id;
+        if state.ledger.outstanding(id) != Some(&spendable.request) {
+            return Err(confirmation_required(
+                "that confirmation is not outstanding on this host any more",
+            ));
+        }
+        let covered = state.ledger.deadline(id).is_some_and(|(boot, deadline)| {
+            boot == self.clock.boot_identity() && self.clock.monotonic_ms() < deadline
+        });
+        if !covered {
+            return Err(confirmation_required(
+                "the owner's confirmation of the clock has run out",
+            ));
+        }
+        expectation.require(&spendable.request).map_err(refusal)?;
+        verify_confirmation(
+            &self.clock,
+            &spendable.request,
+            &spendable.proof,
+            &spendable.signer,
+            spendable.enrolment,
+        )
+        .map_err(refusal)
     }
 
     /// Consumes an answered challenge for an effect outside the pairing records.
@@ -891,10 +1176,10 @@ impl OwnerAuthority {
                         "the terminal bootstrap is local to this host",
                     ));
                 }
-                if !entry.first_owner {
+                if !entry.bootstrap {
                     return Err(confirmation_required(
-                        "the terminal bootstrap establishes this host's first owner and confirms \
-                         nothing else",
+                        "the terminal bootstrap establishes this host's first owner and its clock \
+                         and confirms nothing else",
                     ));
                 }
                 let signer = params.bootstrap_signer.0.ok_or_else(|| {
@@ -1038,4 +1323,11 @@ pub fn refusal(error: kr_pairing::PairingError) -> ControllerError {
         code: error.code(),
         detail: error.to_string(),
     }
+}
+
+/// Returns the digest an owner confirms to establish this host's clock again: of the purpose
+/// alone, because the effect takes no parameter, so a confirmation of it is one confirmation of
+/// one action.
+pub(super) fn clock_digest() -> Result<Digest256> {
+    kr_pairing::confirm::action_digest(&CLOCK_PURPOSE).map_err(refusal)
 }

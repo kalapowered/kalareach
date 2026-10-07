@@ -437,6 +437,9 @@ pub struct Controller {
     devices: Arc<net::devices::DeviceDirectory>,
     /// Every grant's lifetime on this host, measured on this daemon's clocks.
     lifetimes: Arc<net::lifetimes::GrantLifetimes>,
+    /// The owner confirmations this host asks for, has answered and has spent, whether or not it
+    /// is on a network.
+    owner: Arc<net::owner::OwnerAuthority>,
     /// What is true of this host rather than of one grant: the revision in force, the organisation
     /// leases it holds and the optional bounded offline-validity policy its owner chose.
     ///
@@ -580,6 +583,12 @@ impl Controller {
     /// Every grant's lifetime on this host.
     pub(crate) const fn lifetimes(&self) -> &Arc<net::lifetimes::GrantLifetimes> {
         &self.lifetimes
+    }
+
+    /// The owner confirmations this host asks for, has answered and has spent.
+    #[must_use]
+    pub const fn owner_authority(&self) -> &Arc<net::owner::OwnerAuthority> {
+        &self.owner
     }
 
     /// The host's clock floor: the one reading of UTC every process of this environment decides
@@ -897,6 +906,15 @@ mod a_sweep_on_a_clock_in_doubt;
 /// Every collection that lets go of a record by the wall clock, on the one host time contract.
 #[cfg(test)]
 mod one_clock_for_every_collection;
+
+/// The owner's route to establish the host's clock, through the local door of a daemon with no
+/// network.
+#[cfg(test)]
+mod an_owner_establishes_the_clock;
+
+/// The establishment of the host's clock, asked again where it commits.
+#[cfg(test)]
+mod the_clock_effect_at_its_commit;
 
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]

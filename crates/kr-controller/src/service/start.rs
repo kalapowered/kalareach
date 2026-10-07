@@ -537,6 +537,17 @@ impl Controller {
             .map_err(ControllerError::registry)?;
         let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
         let device_keys = net::host_device_keys(&*secret_store, setup.environment_id)?;
+        // The owner authority is the host's, not the network's: the clock is established through
+        // it on a host that never joins one. It keeps the challenges owners answer and the records
+        // of what they answered, so the tables it writes exist from the first start, and the
+        // network's registration binds the endpoint its listener serves to it.
+        net::invitations::prepare(&devices)?;
+        let owner = Arc::new(net::owner::OwnerAuthority::new(
+            kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
+            *device_keys.transport.public(),
+            net::pairing::HostPairingClock::new(&setup.boot_identity),
+            net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
+        ));
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
         let delivery = Arc::new(crate::push::DeliveryModule::open(
@@ -685,6 +696,7 @@ impl Controller {
             delivery_runtime,
             devices,
             lifetimes,
+            owner,
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             utc_floor,

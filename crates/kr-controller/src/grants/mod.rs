@@ -279,6 +279,11 @@ pub const CLOCK_CONTINUITY_LOST: &str = "this host lost the record of the clock 
      in this boot, so it cannot prove whether a time bound has passed until its owner establishes \
      the clock again with `kr host clock --establish`";
 
+/// What a caller is told when a decision that reads this host's clock is not taken because the
+/// clock went backwards and its owner has not established it again.
+pub const CLOCK_DISTRUSTED: &str = "this host's clock went backwards and its owner has not \
+     established it again with `kr host clock --establish`";
+
 /// The refusal of anything that reads this host's clock while this boot's clock continuity is
 /// lost ([`CLOCK_CONTINUITY_LOST`]).
 #[must_use]
@@ -372,6 +377,11 @@ pub fn decide(
     // says.
     // Raised here rather than by the caller. A floor a caller has to remember to advance is a
     // floor that is not there the one time it matters.
+    //
+    // Whether this boot's clock continuity is lost is read once, before the bound is: the owner
+    // can end it while a decision is being made, and a bound taken as unproven must not then pass
+    // a second reading that finds the continuity ended. Continuity is only ever lost at start.
+    let continuity_lost = policy.utc_floor().continuity_lost();
     let bound = policy.utc_floor().bound(grant.expiry, request.now_ms);
     let now_ms = policy.settled_now(request.now_ms);
     if !record.is_active() {
@@ -386,7 +396,7 @@ pub fn decide(
     // are asked about whatever the grant's own expiry is. A lapse found here is owed its record by
     // the caller, which writes the floor it stood on.
     if policy.stands_on_the_clock(grant, request.ingress) {
-        if policy.utc_floor().continuity_lost() {
+        if continuity_lost {
             return Err(Refusal::ClockUnproven);
         }
         if policy.utc_floor().is_owed() {
@@ -523,6 +533,8 @@ pub fn standing_at_dispatch(
             },
         });
     }
+    // As in [`decide`], the continuity is read once, before the bound.
+    let continuity_lost = policy.utc_floor().continuity_lost();
     let bound = policy.utc_floor().bound(grant.expiry, now_ms);
     let now_ms = policy.settled_now(now_ms);
     if !record.is_active() {
@@ -533,7 +545,7 @@ pub fn standing_at_dispatch(
     // As [`decide`]: nothing that reads the clock is decided while this boot's clock continuity is
     // lost, or while its floor is owed its record.
     if policy.stands_on_the_clock(grant, ingress) {
-        if policy.utc_floor().continuity_lost() {
+        if continuity_lost {
             return Err(Refusal::ClockUnproven);
         }
         if policy.utc_floor().is_owed() {

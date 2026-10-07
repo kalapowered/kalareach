@@ -355,9 +355,10 @@ impl GrantLifetimes {
             None => {
                 let Some(observed) = self.clock_trust.sample(&self.devices)? else {
                     return Err(ControllerError::ClockUntrusted {
-                        detail: "this host's clock went backwards and has not been established \
-                                 again, so it cannot say whether this grant has run out"
-                            .to_owned(),
+                        detail: format!(
+                            "{}, so it cannot say whether this grant has run out",
+                            crate::grants::CLOCK_DISTRUSTED
+                        ),
                     });
                 };
                 // Decided through the floor, as every time bound on this host is, and not while
@@ -612,9 +613,10 @@ impl GrantLifetimes {
         // and only an owner's approval of the clock clears it.
         let Some(observed) = self.clock_trust.sample(&self.devices)? else {
             return Err(ControllerError::ClockUntrusted {
-                detail: "this host's clock went backwards and has not been established again, so \
-                         it cannot say whether this device's grant has run out"
-                    .to_owned(),
+                detail: format!(
+                    "{}, so it cannot say whether this device's grant has run out",
+                    crate::grants::CLOCK_DISTRUSTED
+                ),
             });
         };
         let remaining = expires_at_ms.get().saturating_sub(observed.now.get());

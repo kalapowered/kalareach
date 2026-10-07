@@ -11,7 +11,8 @@ use kr_ipc::client::LocalClient;
 use kr_pairing::confirm::sign_confirmation;
 use kr_pairing::direct::{CandidateIdentity, redeem_proof};
 use kr_protocol::confirmation::{
-    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
+    ConfirmationSubject, HostClockEstablishParams, HostClockEstablishResult,
+    OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
     OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
     OwnerConfirmationRequestResult,
 };
@@ -173,6 +174,20 @@ pub async fn complete(
             proof,
             bootstrap_signer: bootstrap_signer.map_or_else(Nullable::null, Nullable::some),
         },
+    )
+    .await
+}
+
+/// Spends an answered confirmation of the clock, under a fresh action identity.
+pub async fn establish_clock(
+    environment: EnvironmentId,
+    client: &mut LocalClient,
+) -> Result<HostClockEstablishResult, ProtocolError> {
+    mutate(
+        environment,
+        client,
+        Method::HostClockEstablish,
+        &HostClockEstablishParams {},
     )
     .await
 }

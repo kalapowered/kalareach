@@ -18,7 +18,7 @@ use kr_voice::seams::VoiceAuthority as _;
 use super::a_sweep_on_a_clock_in_doubt::{aged, kept, swept};
 use super::a_voice_grant_on_the_floor::authority;
 use crate::service::Controller;
-use crate::service::net::tests::{daemon_on, manual_clocks};
+use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
 
 const DAY: u64 = 86_400_000;
 
@@ -131,7 +131,7 @@ impl<'a> Collections<'a> {
 /// the owner's one retrust frees every forgetting. A record of each kind is as old as the clock can
 /// say; the clock goes back by more than the tolerance, and then reads a plausible later moment.
 /// The transfer sweep, the voice spend and the attention store's pass each keep their record. After
-/// one `establish` each lets go of its record.
+/// the owner's one establishment each lets go of its record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -160,11 +160,7 @@ async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
         "a clock that went backwards and was not established again forgets nothing"
     );
 
-    controller
-        .lifetimes()
-        .clock_trust()
-        .establish(controller.devices())
-        .expect("the owner establishes the clock");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
     collections.pass().await;
     assert_eq!(kept(&temp), 0, "the transfer record is forgotten");
     assert_eq!(
@@ -178,7 +174,7 @@ async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
 /// KR-REQ-09.18: a step back smaller than the time between two readings is a rollback. The wall
 /// clock reads ten seconds behind where sixty seconds of continuous time put it, which a comparison
 /// against the last wall reading alone does not see. It is found by whoever asks, it withholds the
-/// transfer sweep, and one `establish` clears it.
+/// transfer sweep, and the owner's establishment clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forgetting() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -207,11 +203,7 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
     swept(&controller).await;
     assert_eq!(kept(&temp), 1, "the transfer sweep forgets nothing");
 
-    controller
-        .lifetimes()
-        .clock_trust()
-        .establish(controller.devices())
-        .expect("the owner establishes the clock");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
     assert!(trust().is_some(), "an established clock is proven again");
     swept(&controller).await;
     assert_eq!(
@@ -299,11 +291,7 @@ async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetti
         "the spend has outlived its retention and is kept"
     );
 
-    controller
-        .lifetimes()
-        .clock_trust()
-        .establish(controller.devices())
-        .expect("the owner establishes the clock");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
     swept(&controller).await;
     assert_eq!(kept(&temp), 0, "the established clock frees the sweep");
     assert!(collections.spend(), "and the voice spend");
@@ -349,15 +337,124 @@ async fn a_distrust_recorded_by_the_attention_store_is_carried_forward() {
     swept(&controller).await;
     assert_eq!(kept(&temp), 1, "the transfer sweep forgets nothing");
 
-    controller
-        .lifetimes()
-        .clock_trust()
-        .establish(controller.devices())
-        .expect("the owner establishes the clock");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
     swept(&controller).await;
     assert_eq!(
         kept(&temp),
         0,
         "the established clock has outlived the retention"
+    );
+}
+
+/// The record an earlier build's attention store kept of a clock it never trusted: one whose first
+/// reading of the platform's time service did not qualify, so nothing says whether the clock
+/// itself ever went backwards.
+const EARLIER_BUILD_THAT_NEVER_TRUSTED: &[u8] =
+    include_bytes!("../../tests/fixtures/earlier-attention-clock/never_trusted.cbor");
+
+/// KR-REQ-09.14, KR-REQ-09.19: a clock an earlier build never trusted holds every forgetting, and
+/// holds nothing else, until the owner establishes it. A daemon started over that file keeps the
+/// transfer record, the voice spend and the attention record that have outlived their retention,
+/// the host's reading of its clock being proven all the while: the file cannot say whether only the
+/// platform's time service failed. The owner's establishment frees all three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the_owner_says_so() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    std::fs::create_dir_all(environment.state_dir()).expect("the state directory");
+    std::fs::write(
+        environment.state_dir().join("attention-time.cbor"),
+        EARLIER_BUILD_THAT_NEVER_TRUSTED,
+    )
+    .expect("the earlier build's record");
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let collections = Collections::new(&temp, &controller);
+    let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+
+    assert!(collections.spend(), "a first spend");
+    collections.age_one_of_each();
+    wall.store(
+        wall.load(Ordering::SeqCst) + retention + DAY,
+        Ordering::SeqCst,
+    );
+    assert!(
+        super::an_owner_establishes_the_clock::proven(&controller),
+        "the host does not doubt its wall clock: only what forgets by it is held"
+    );
+    assert!(
+        collections.forgot_nothing().await,
+        "a clock an earlier build never trusted forgets nothing"
+    );
+
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    collections.pass().await;
+    assert_eq!(kept(&temp), 0, "the transfer record is forgotten");
+    assert_eq!(
+        collections.attention_kept(),
+        0,
+        "the attention record is forgotten"
+    );
+    assert!(collections.spend(), "the spent delegation is forgotten");
+}
+
+/// KR-REQ-09.19: the platform evidence hold withholds attention and nothing else, and only the
+/// owner lifts it. It is set when the platform's time service is found unqualified while the owner
+/// has not confirmed the clock; here it is recorded before the daemon starts. The transfer sweep is
+/// not held by it and the attention store's forgetting is, whatever the adapter reads; the owner's
+/// establishment confirms the clock, and attention forgets again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms_the_clock() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks.clone()).await;
+    stopped(controller).await;
+    rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry")
+        .execute(
+            "INSERT INTO network_clock (id, observed_ms, evidence_hold_at_ms) VALUES (0, ?1, ?1)
+             ON CONFLICT (id) DO UPDATE SET evidence_hold_at_ms = ?1",
+            [i64::try_from(wall.load(Ordering::SeqCst)).expect("a time")],
+        )
+        .expect("the evidence hold is recorded");
+    let controller = daemon_on(&temp, clocks).await;
+    let collections = Collections::new(&temp, &controller);
+    let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+    let watched = |qualified: bool| {
+        controller
+            .lifetimes()
+            .clock_trust()
+            .watch(controller.devices(), qualified)
+            .expect("the host watches its clock")
+            .proven
+    };
+
+    assert!(
+        !watched(true),
+        "a qualified reading of the platform's time service does not lift the hold"
+    );
+    collections.age_one_of_each();
+    wall.store(
+        wall.load(Ordering::SeqCst) + retention + DAY,
+        Ordering::SeqCst,
+    );
+    collections.pass().await;
+    assert_eq!(kept(&temp), 0, "the transfer sweep is not held by it");
+    assert_eq!(
+        collections.attention_kept(),
+        1,
+        "the attention store forgets nothing"
+    );
+
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    assert!(
+        watched(false),
+        "the owner's confirmation proves the clock without the platform's word"
+    );
+    collections.pass().await;
+    assert_eq!(
+        collections.attention_kept(),
+        0,
+        "the attention store forgets again"
     );
 }

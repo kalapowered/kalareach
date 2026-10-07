@@ -718,7 +718,7 @@ impl CatalogueModule {
                     destination: None,
                     rights: kr_protocol::scalars::CanonicalSet::new(),
                     display: plan.display(),
-                    first_owner: false,
+                    bootstrap: false,
                 })
             }
             ConfirmationSubject::PluginInstall(params) => {
@@ -736,7 +736,7 @@ impl CatalogueModule {
                     destination: None,
                     rights: kr_protocol::scalars::CanonicalSet::new(),
                     display: plan.display(),
-                    first_owner: false,
+                    bootstrap: false,
                 })
             }
             _ => Err(ProtocolError::new(

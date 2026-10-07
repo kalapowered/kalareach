@@ -381,21 +381,6 @@ impl Network {
         self.guard.host.revoke_device(device_id).await
     }
 
-    /// Establishes this host's clock again, on an owner confirmation answered for exactly that.
-    ///
-    /// A host whose wall clock was found to have gone backwards decides no grant's expiry from it
-    /// until this is called. Nothing else clears that, because nothing else is evidence about the
-    /// clock.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no owner confirmation naming the clock has been
-    /// answered through the owner-confirmation methods, and an error when the record cannot be
-    /// written.
-    pub async fn establish_clock(&self) -> Result<()> {
-        self.guard.host.establish_clock().await
-    }
-
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
         self.guard.shutdown().await;
@@ -653,25 +638,6 @@ impl NetworkHost {
         recorded?;
         controller.unbind_device(device_id);
         barrier
-    }
-
-    /// Establishes this host's clock again, on an owner's authority.
-    ///
-    /// Nothing a clock says about itself can do this, and neither can another decision the owner
-    /// happened to make: section 9 wants qualified time evidence or an authenticated action about
-    /// *this*. So it is its own operation, and it needs an approval this host's owner signed for
-    /// it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no owner confirmation naming the clock has been
-    /// answered, and an error when the record cannot be written.
-    async fn establish_clock(&self) -> Result<()> {
-        self.pairing.accept_clock()?;
-        let established = self.lifetimes.clock_trust().establish(&self.devices)?;
-        // The same word ends a boot's lost clock continuity, which the registry records for the
-        // boot so a restart of this daemon in it does not lose it again.
-        self.daemon()?.establish_clock_continuity(established).await
     }
 
     /// Returns the records a connection reads and writes, each of which outlives it.
@@ -1270,7 +1236,6 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     let devices = Arc::new(DeviceDirectory::open(
         controller.paths().registry_database(),
     )?);
-    invitations::prepare(&devices)?;
     // The daemon's one record of every grant's lifetime, read by the connections this host admits
     // and by the owner confirmations it spends, on the daemon's own clocks.
     let lifetimes = Arc::clone(controller.lifetimes());
@@ -1306,6 +1271,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         keys.authorisation.clone(),
         HostPairingClock::new(&controller.boot_identity),
         rows,
+        Arc::clone(controller.owner_authority()),
         setup.rendezvous.clone(),
     );
     let host = Arc::new(NetworkHost {
@@ -1345,6 +1311,8 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
             "this daemon is already on the network".to_owned(),
         ));
     }
+    // The challenges this host's owner answers name the endpoint its listener serves.
+    controller.owner_authority().rebind_endpoint(endpoint_id)?;
     // The project service's location decisions are confirmed by this host's owner devices, the
     // owner every other sensitive action here is confirmed by. There is one owner, lent once, with
     // the network that holds its devices.
@@ -2530,10 +2498,8 @@ pub(crate) mod tests {
 
         // The owner establishes the clock: the bound is decided again, and a restart in the boot
         // keeps it established.
-        controller
-            .establish_clock_continuity(TimestampMs::new(now))
-            .await
-            .expect("recorded");
+        crate::service::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller)
+            .await;
         controller
             .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
             .expect("the grant stands once the clock is established");

@@ -27,24 +27,28 @@
 //! * what is **owed** to the durable record: a decision or a step that could not be written stays
 //!   here and is written again before the next answer.
 //!
-//! [`ClockTrust::establish`] clears the decision and both holds, moves the mark and the anchor,
-//! and confirms the clock, in one transition. Nothing else does.
+//! [`ClockTrust::establish_with`] clears the decision and both holds, moves the mark and the
+//! anchor, confirms the clock and ends a lost clock continuity, in one transition. Nothing else
+//! does, and the owner's confirmation is spent in the same transaction.
 //!
 //! # Lock order
 //!
-//! The attention store, then this state, then the device directory. No policy or grant callback
-//! runs under this state.
+//! The owner challenges where an owner's confirmation is spent, the attention store where one is
+//! read, then this state, then the device directory, then a registration table held through a
+//! commit. No policy or grant callback runs under this state.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_protocol::identity::BootIdentity;
+use kr_protocol::ids::BootEpoch;
 use kr_protocol::scalars::TimestampMs;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use kr_worker::action::time::DISCONTINUITY_TOLERANCE;
 
-use super::devices::{DeviceDirectory, ObservedUtc};
+use super::devices::{DeviceDirectory, ObservedUtc, establish_clock_in};
 use crate::error::Result;
 use crate::grants::policy::UtcFloor;
+use crate::registry::end_clock_continuity;
 
 /// How far behind what this host holds of its wall clock the clock may be and still decide an
 /// expiry.
@@ -566,22 +570,46 @@ impl ClockTrust {
 
     /// Establishes the clock again, at the moment an owner authenticated, and returns that moment.
     ///
-    /// The decision and both holds are cleared, the mark and the anchor move to that moment and the
-    /// clock is confirmed, in one transition and one durable write: an observation taken against
-    /// the old mark cannot land after it, because it would have to take this boundary to be
-    /// recorded at all, and success is reported only once the record says it.
+    /// The decision and both holds are cleared, the mark and the anchor move to that moment, the
+    /// clock is confirmed and this `boot`'s lost clock continuity is ended, in one transition and
+    /// one durable transaction: an observation taken against the old mark cannot land after it,
+    /// because it would have to take this boundary to be recorded at all, and success is reported
+    /// only once the record says it.
+    ///
+    /// The transaction is one immediate transaction on the device directory's connection, and it
+    /// commits inside `guarded` ([`DeviceDirectory::guarded_transaction`]). `during` runs in it,
+    /// after the trust and continuity rows: whatever must be written with the establishment
+    /// (the spending of the owner's confirmation, the action's record) goes there, and what it
+    /// refuses rolls the establishment back with it. Memory changes only after the commit: the
+    /// clock state here and the floor's continuity flag.
+    ///
+    /// `during` runs under this state's lock, which cannot be taken twice. It must not call
+    /// [`Self::sample`], [`Self::observe`], [`Self::watch`] or anything that reads a grant's
+    /// lifetime through them, and it holds the device directory's connection, so it touches that
+    /// connection through the transaction it is given and in no other way.
     ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be written. The decision stands if it cannot.
-    pub fn establish(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
+    /// Returns an error when the record cannot be written, and whatever `guarded` and `during`
+    /// refuse with. The decision stands, and so does every other record, if it does.
+    pub(crate) fn establish_with(
+        &self,
+        devices: &DeviceDirectory,
+        boot: BootEpoch,
+        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        during: impl FnOnce(&rusqlite::Connection, TimestampMs) -> Result<()>,
+    ) -> Result<TimestampMs> {
         let mut state = self.held();
         // Read inside the boundary, like every other reading of this clock: the moment the owner
         // established is the moment this host is at now, not one sampled before it got here.
         let boot_ms = self.boot_clock.boot_elapsed_ms();
         let at = self.clock.now();
         let established = TimestampMs::new(self.wall.now_ms());
-        devices.establish_clock(established, &self.boot, boot_ms)?;
+        devices.guarded_transaction(guarded, |transaction| {
+            establish_clock_in(transaction, established, &self.boot, boot_ms)?;
+            end_clock_continuity(transaction, boot, established)?;
+            during(transaction, established)
+        })?;
         let anchor = Anchor {
             wall_ms: established.get(),
             at,
@@ -598,7 +626,19 @@ impl ClockTrust {
             evidence_hold: false,
             owed: Owed::default(),
         };
+        self.floor.establish_continuity();
         Ok(established)
+    }
+
+    /// Establishes the clock with no confirmation to spend, for a test of the record itself.
+    #[cfg(test)]
+    pub(crate) fn establish(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
+        self.establish_with(
+            devices,
+            BootEpoch::new(0),
+            &|commit| commit(),
+            |_, _| Ok(()),
+        )
     }
 }
 

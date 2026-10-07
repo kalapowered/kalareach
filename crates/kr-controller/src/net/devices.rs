@@ -582,6 +582,48 @@ impl DeviceDirectory {
         Ok(value)
     }
 
+    /// Runs `body` inside one immediate transaction on this directory's connection, and commits
+    /// it inside `guarded`.
+    ///
+    /// `guarded` is handed the commit and runs it while it holds whatever must stay true from the
+    /// last check to the commit: an effect that is admitted by a connection's registration asks
+    /// for the registration to be held standing through the commit, so that a withdrawal is
+    /// ordered wholly before the check or wholly after the commit. The connection is taken before
+    /// `guarded` takes anything of its own, the order every write to this directory's pairing
+    /// records takes. `body` runs inside `guarded`, after the check.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `guarded` and `body` return, and a registry error when the transaction cannot
+    /// begin or commit. Nothing is written unless it commits.
+    pub(crate) fn guarded_transaction<T>(
+        &self,
+        guarded: &dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transaction = Some(
+            connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(ControllerError::registry)?,
+        );
+        let mut body = Some(body);
+        let mut value = None;
+        guarded(&mut || {
+            let (Some(transaction), Some(body)) = (transaction.take(), body.take()) else {
+                return Err(ControllerError::registry(
+                    "a guarded transaction was committed twice",
+                ));
+            };
+            value = Some(body(&transaction)?);
+            transaction.commit().map_err(ControllerError::registry)
+        })?;
+        value.ok_or_else(|| ControllerError::registry("a guarded transaction did not commit"))
+    }
+
     /// Records a completed pairing.
     ///
     /// The device record and the grant are one row, written in one statement: section 10 commits
@@ -1250,42 +1292,6 @@ impl DeviceDirectory {
         Ok(())
     }
 
-    /// Clears the decision, both holds, and marks the moment the owner established the clock at.
-    ///
-    /// One statement, so the owner's establishing is all or nothing. The mark and the anchor move
-    /// with it, to `now_ms`. They have to: they are what a rollback is measured against, and a
-    /// host whose clock had been running *ahead* would otherwise be told it had gone backwards by
-    /// the very correction the owner just authenticated. What does not move is anything already
-    /// decided - the expiry tombstones, and the deadlines this boot holds - so a grant this host
-    /// has already found to be over stays over.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the row cannot be written.
-    pub fn establish_clock(
-        &self,
-        now_ms: TimestampMs,
-        boot: &BootIdentity,
-        boot_ms: u64,
-    ) -> Result<()> {
-        let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO network_clock
-                     (id, observed_ms, untrusted_at_ms, anchor_wall_ms, anchor_boot_ms,
-                      anchor_boot_value, confirmed_at_ms, forgetting_hold_at_ms,
-                      evidence_hold_at_ms)
-                 VALUES (0, ?1, NULL, ?1, ?2, ?3, ?1, NULL, NULL)
-                 ON CONFLICT (id) DO UPDATE
-                     SET observed_ms = ?1, untrusted_at_ms = NULL, anchor_wall_ms = ?1,
-                         anchor_boot_ms = ?2, anchor_boot_value = ?3, confirmed_at_ms = ?1,
-                         forgetting_hold_at_ms = NULL, evidence_hold_at_ms = NULL",
-                params![stored(now_ms.get()), stored(boot_ms), boot.value.as_slice()],
-            )
-        })?;
-        Ok(())
-    }
-
     /// Marks one device as revoked, and reports whether this call was the one that did it.
     ///
     /// Revoking twice is not an error: the second call finds the row already revoked and says so,
@@ -1401,6 +1407,45 @@ impl DeviceDirectory {
 /// reaches the pre-authorisation surface, where pairing's own rules decide, and it reaches nothing
 /// else. What matters here is that it can never be *authorised*, and the handshake asks this
 /// exactly once for that purpose.
+/// Clears the decision, both holds, and marks the moment the owner established the clock at.
+///
+/// One statement, so the owner's establishing is all or nothing. The mark and the anchor move with
+/// it, to `now_ms`. They have to: they are what a rollback is measured against, and a host whose
+/// clock had been running *ahead* would otherwise be told it had gone backwards by the very
+/// correction the owner just authenticated. What does not move is anything already decided - the
+/// expiry tombstones, and the deadlines this boot holds - so a grant this host has already found
+/// to be over stays over.
+///
+/// It is written inside the transaction that spends the owner's confirmation of the clock and ends
+/// the boot's lost clock continuity, and in no other.
+///
+/// # Errors
+///
+/// Returns an error when the row cannot be written.
+pub(crate) fn establish_clock_in(
+    connection: &Connection,
+    now_ms: TimestampMs,
+    boot: &BootIdentity,
+    boot_ms: u64,
+) -> Result<()> {
+    let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    connection
+        .execute(
+            "INSERT INTO network_clock
+                 (id, observed_ms, untrusted_at_ms, anchor_wall_ms, anchor_boot_ms,
+                  anchor_boot_value, confirmed_at_ms, forgetting_hold_at_ms,
+                  evidence_hold_at_ms)
+             VALUES (0, ?1, NULL, ?1, ?2, ?3, ?1, NULL, NULL)
+             ON CONFLICT (id) DO UPDATE
+                 SET observed_ms = ?1, untrusted_at_ms = NULL, anchor_wall_ms = ?1,
+                     anchor_boot_ms = ?2, anchor_boot_value = ?3, confirmed_at_ms = ?1,
+                     forgetting_hold_at_ms = NULL, evidence_hold_at_ms = NULL",
+            params![stored(now_ms.get()), stored(boot_ms), boot.value.as_slice()],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
 /// Writes one device row inside a transaction the caller holds.
 ///
 /// The device record and its grant are one row, written in one statement: section 10 commits them

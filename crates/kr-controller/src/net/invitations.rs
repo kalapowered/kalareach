@@ -260,6 +260,8 @@ pub enum ActionSubject {
     Confirmed(InvitationId),
     /// `pair.cancel`: the invitation it ended.
     Ended(InvitationId),
+    /// `host.clock.establish`: the confirmation it spent to establish the host's clock.
+    ClockEstablished(ConfirmationId),
 }
 
 impl ActionSubject {
@@ -272,6 +274,7 @@ impl ActionSubject {
             Self::Issued(_) => Method::PairInvite,
             Self::Confirmed(_) => Method::PairConfirm,
             Self::Ended(_) => Method::PairCancel,
+            Self::ClockEstablished(_) => Method::HostClockEstablish,
         }
     }
 
@@ -279,7 +282,9 @@ impl ActionSubject {
     fn identity(&self) -> Uuid {
         match self {
             Self::Requested(request) => request.confirmation_id.get(),
-            Self::Completed(confirmation_id) => confirmation_id.get(),
+            Self::Completed(confirmation_id) | Self::ClockEstablished(confirmation_id) => {
+                confirmation_id.get()
+            }
             Self::Issued(invitation_id)
             | Self::Confirmed(invitation_id)
             | Self::Ended(invitation_id) => invitation_id.get(),
@@ -1149,7 +1154,7 @@ fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Opti
 /// write: another payload under the identifier is `ID_CONFLICT`, and the same one means the action
 /// already has its outcome, which is what a repeat of it is answered from. Neither can reach here
 /// from one caller's own repeat, which finds the record before it acts.
-fn claim_effect(transaction: &Connection, action: &PairingAction) -> Result<()> {
+pub(super) fn claim_effect(transaction: &Connection, action: &PairingAction) -> Result<()> {
     match claim_action(transaction, action)? {
         None => Ok(()),
         Some(_) => Err(ControllerError::Refused {
@@ -1209,6 +1214,9 @@ fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result
         ("owner.confirmation.complete", None) => {
             ActionSubject::Completed(ConfirmationId::new(identity))
         }
+        ("host.clock.establish", None) => {
+            ActionSubject::ClockEstablished(ConfirmationId::new(identity))
+        }
         ("pair.invite", None) => ActionSubject::Issued(InvitationId::new(identity)),
         ("pair.confirm", None) => ActionSubject::Confirmed(InvitationId::new(identity)),
         ("pair.cancel", None) => ActionSubject::Ended(InvitationId::new(identity)),
@@ -1254,7 +1262,7 @@ pub fn another_subject() -> ControllerError {
 /// refused: one ceremony authorises one action. The signer's authority and the keys of the device
 /// the confirmation names are read in this transaction, so the record and the standing it rests on
 /// are one step.
-fn consume(
+pub(super) fn consume(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
     proof: &OwnerConfirmationProof,

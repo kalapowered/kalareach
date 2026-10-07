@@ -13,9 +13,10 @@ mod net_support;
 use kr_client::error::ClientError;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, ConfirmationSubject, DescribedAction, OwnerConfirmationCompleteParams,
-    OwnerConfirmationCompleteResult, OwnerConfirmationPendingParams,
-    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+    ConfirmationDisplay, ConfirmationSubject, DescribedAction, HostClockEstablishParams,
+    HostClockEstablishResult, OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
+    OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -168,12 +169,14 @@ async fn the_first_owner_is_established_through_local_ipc_and_ends_the_bootstrap
     host.stop().await;
 }
 
-/// KR-REQ-10.53, KR-REQ-10.05: the terminal bootstrap establishes the first owner and confirms
-/// nothing else. A session invitation, the clock and a described action each refuse a terminal
-/// proof on a host with no owner, and so does a terminal proof that does not present the key it
-/// was signed with. Without any confirmation, a host with no owner issues nothing.
+/// KR-REQ-10.53, KR-REQ-10.05, KR-REQ-09.19: the terminal bootstrap establishes the first owner and
+/// the host's clock, and confirms nothing else. A session invitation and a described action each
+/// refuse a terminal proof on a host with no owner, and so does a terminal proof that does not
+/// present the key it was signed with. Without any confirmation, a host with no owner issues
+/// nothing. The clock is the other thing the terminal confirms: the owner of a host that has paired
+/// no device establishes its clock at its own terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_bootstrap_confirms_the_first_owner_and_nothing_else() {
+async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else() {
     let host = Host::start_unowned().await;
     let environment = host.environment_id;
     let mut client = host.client().await;
@@ -182,7 +185,6 @@ async fn the_bootstrap_confirms_the_first_owner_and_nothing_else() {
 
     for subject in [
         issue_subject(InviteGrantKind::SessionInvitation, &viewer()),
-        ConfirmationSubject::EstablishClock,
         ConfirmationSubject::Described(DescribedAction {
             action: SensitiveAction::TrustRepositoryRoot,
             action_digest: Digest256::from_bytes([4; 32]),
@@ -241,6 +243,45 @@ async fn the_bootstrap_confirms_the_first_owner_and_nothing_else() {
         ),
         ErrorCode::OwnerConfirmationRequired
     );
+    assert_eq!(
+        code(calls::establish_clock(environment, &mut client).await),
+        ErrorCode::OwnerConfirmationRequired,
+        "nor of the clock"
+    );
+
+    // The clock is the other thing the terminal confirms.
+    let challenge = calls::request(
+        environment,
+        &mut client,
+        ConfirmationSubject::EstablishClock,
+    )
+    .await
+    .expect("a challenge for the clock");
+    assert!(challenge.initial_bootstrap);
+    let (proof, presented) = calls::sign(&challenge.request, &bootstrap);
+    assert_eq!(
+        calls::complete(environment, &mut client, proof, presented)
+            .await
+            .expect("the terminal answers for the clock")
+            .channel,
+        ConfirmationChannel::LocalBootstrapTerminal
+    );
+    let established = calls::establish_clock(environment, &mut client)
+        .await
+        .expect("the owner at the terminal establishes the clock");
+    assert_eq!(
+        established.confirmation_id,
+        challenge.request.confirmation_id
+    );
+    let acceptance = host
+        .network()
+        .pairing()
+        .rows()
+        .acceptance(established.confirmation_id)
+        .expect("readable")
+        .expect("the acceptance record");
+    assert_eq!(acceptance.channel, "local_bootstrap_terminal");
+    assert!(acceptance.consumed_at_ms.is_some());
     host.stop().await;
 }
 
@@ -368,7 +409,10 @@ async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
     connection.close(0u32.into(), b"paired");
 
     // The clock needs its own confirmation, once.
-    assert!(host.network().establish_clock().await.is_err());
+    assert_eq!(
+        code(calls::establish_clock(environment, &mut client).await),
+        ErrorCode::OwnerConfirmationRequired
+    );
     calls::confirm_subject(
         environment,
         &mut client,
@@ -377,12 +421,12 @@ async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
     )
     .await
     .expect("answered for the clock");
-    host.network()
-        .establish_clock()
+    calls::establish_clock(environment, &mut client)
         .await
         .expect("the clock is established");
-    assert!(
-        host.network().establish_clock().await.is_err(),
+    assert_eq!(
+        code(calls::establish_clock(environment, &mut client).await),
+        ErrorCode::OwnerConfirmationRequired,
         "spent once"
     );
 
@@ -655,6 +699,183 @@ async fn an_owner_device_approves_what_the_local_owner_asked() {
         )
         .await;
     assert_eq!(code(carried), ErrorCode::OwnerConfirmationRequired);
+    host.stop().await;
+}
+
+/// Spends a confirmation of the clock over a paired device's own connection, under `action` and
+/// the action window the request was first sent with, which is how a device presents it again.
+async fn spend_clock(
+    raw: &RawDevice,
+    window: &kr_protocol::ids::ActionWindowId,
+    action: ActionId,
+    target: &ActionTarget,
+) -> Result<HostClockEstablishResult, ProtocolError> {
+    Ok(raw
+        .mutate_in(
+            window.clone(),
+            Method::HostClockEstablish,
+            action,
+            target.clone(),
+            &HostClockEstablishParams {},
+        )
+        .await?
+        .to_typed::<HostClockEstablishResult>()
+        .expect("decodes"))
+}
+
+/// KR-REQ-09.19, KR-REQ-10.52, KR-REQ-10.53: once a host has an owner, only an owner device
+/// confirms its clock. The terminal proof is refused, and so is the effect with no confirmation; a
+/// paired device that is not an owner device can neither ask for the confirmation nor spend one; the
+/// owner device answers the local owner's challenge, which the local owner then spends once; and an
+/// owner device runs the whole of it itself over its own connection, where a retry of the effect,
+/// on that connection and on a new one, is answered from its record and not performed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let target = ActionTarget::environment(environment);
+    let mut client = host.client().await;
+    let owner_record = host.owner.clone().expect("the owner device");
+    let owner_device = host.owner_device.as_ref().expect("the owner device");
+    let raw = RawDevice::connect(&host, owner_device, &owner_record).await;
+    let ceremony = keys();
+
+    // The local owner asks, and the terminal is not who confirms it any more.
+    let challenge = calls::request(
+        environment,
+        &mut client,
+        ConfirmationSubject::EstablishClock,
+    )
+    .await
+    .expect("the local owner asks");
+    assert!(!challenge.initial_bootstrap);
+    let (proof, presented) = calls::sign(
+        &challenge.request,
+        &Signer::Bootstrap(&ceremony.authorisation),
+    );
+    assert_eq!(
+        code(calls::complete(environment, &mut client, proof, presented).await),
+        ErrorCode::OwnerConfirmationRequired
+    );
+    assert_eq!(
+        code(calls::establish_clock(environment, &mut client).await),
+        ErrorCode::OwnerConfirmationRequired,
+        "a challenge nobody answered spends nothing"
+    );
+
+    // A paired device that is not an owner device asks for nothing and spends nothing.
+    let viewer_device = Device::with_keys(keys()).await;
+    let viewer_record = pair_with(&host, &viewer_device, &owner_keys, viewer()).await;
+    let viewer_raw = RawDevice::connect(&host, &viewer_device, &viewer_record).await;
+    assert_eq!(
+        code(
+            viewer_raw
+                .mutate(
+                    Method::OwnerConfirmationRequest,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target.clone(),
+                    &OwnerConfirmationRequestParams {
+                        subject: ConfirmationSubject::EstablishClock,
+                    },
+                )
+                .await
+        ),
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        code(
+            viewer_raw
+                .mutate(
+                    Method::HostClockEstablish,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target.clone(),
+                    &HostClockEstablishParams {},
+                )
+                .await
+        ),
+        ErrorCode::PermissionDenied
+    );
+
+    // The owner device answers the local owner's challenge, and the local owner spends it once.
+    let (proof, _) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner_keys));
+    raw.mutate(
+        Method::OwnerConfirmationComplete,
+        ActionId::new(kr_ipc::new_uuid()),
+        target.clone(),
+        &OwnerConfirmationCompleteParams {
+            proof,
+            bootstrap_signer: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the owner device answers from its own connection");
+    let established = calls::establish_clock(environment, &mut client)
+        .await
+        .expect("the local owner spends the owner device's confirmation");
+    assert_eq!(
+        established.confirmation_id,
+        challenge.request.confirmation_id
+    );
+    let acceptance = host
+        .network()
+        .pairing()
+        .rows()
+        .acceptance(established.confirmation_id)
+        .expect("readable")
+        .expect("the acceptance record");
+    assert_eq!(acceptance.channel, "owner_device_presence");
+    assert_eq!(
+        code(calls::establish_clock(environment, &mut client).await),
+        ErrorCode::OwnerConfirmationRequired,
+        "spent once"
+    );
+
+    // An owner device does all of it over its own connection.
+    let asked = raw
+        .mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::EstablishClock,
+            },
+        )
+        .await
+        .expect("the owner device asks")
+        .to_typed::<OwnerConfirmationRequestResult>()
+        .expect("decodes");
+    let (proof, _) = calls::sign(&asked.request, &Signer::OwnerDevice(&owner_keys));
+    raw.mutate(
+        Method::OwnerConfirmationComplete,
+        ActionId::new(kr_ipc::new_uuid()),
+        target.clone(),
+        &OwnerConfirmationCompleteParams {
+            proof,
+            bootstrap_signer: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the owner device answers");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let window = raw.action_window_id();
+    let first = spend_clock(&raw, &window, action, &target)
+        .await
+        .expect("the owner device establishes the clock");
+    assert_eq!(first.confirmation_id, asked.request.confirmation_id);
+    assert_eq!(
+        spend_clock(&raw, &window, action, &target)
+            .await
+            .expect("answered from the record"),
+        first
+    );
+    let reconnected = RawDevice::connect(&host, owner_device, &owner_record).await;
+    assert_eq!(
+        spend_clock(&reconnected, &window, action, &target)
+            .await
+            .expect("answered from the record on a new connection"),
+        first
+    );
     host.stop().await;
 }
 
