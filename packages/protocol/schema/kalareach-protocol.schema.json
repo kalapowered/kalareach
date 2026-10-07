@@ -15594,6 +15594,25 @@
       ],
       "type": "object"
     },
+    "HostClockEstablishParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `host.clock.establish`.\n\nThere are none: what the owner confirmed is the digest of [`CLOCK_PURPOSE`], and the effect is\nthe one the host takes when it trusts its own clock again.",
+      "type": "object"
+    },
+    "HostClockEstablishResult": {
+      "additionalProperties": false,
+      "description": "The result of `host.clock.establish`.",
+      "properties": {
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId",
+          "description": "The owner confirmation this establishment spent, which the host's acceptance record names."
+        }
+      },
+      "required": [
+        "confirmation_id"
+      ],
+      "type": "object"
+    },
     "HostDoctorResult": {
       "additionalProperties": false,
       "description": "The result of `host.doctor`.",
@@ -19284,6 +19303,11 @@
           "type": "string"
         },
         {
+          "const": "host.clock.establish",
+          "description": "Trust this host's wall clock again, on an owner confirmation that names exactly that: it ends the host-wide distrust of the clock, the holds that follow from it and a lost clock continuity, in one step, and never revives an object that already expired.",
+          "type": "string"
+        },
+        {
           "const": "events.subscribe",
           "description": "Subscribe to an event stream from a cursor.",
           "type": "string"
@@ -21074,7 +21098,7 @@
               "type": "null"
             }
           ],
-          "description": "The key a bootstrap proof is signed with.\n\nPresent only for the `local_bootstrap_terminal` channel, which a host accepts only while it\nhas no owner, only from local IPC and only for establishing its first owner. The key proves\npossession and nothing else: the evidence is the local caller at an interactive terminal\noutside a KalaReach session."
+          "description": "The key a bootstrap proof is signed with.\n\nPresent only for the `local_bootstrap_terminal` channel, which a host accepts only while it\nhas no owner, only from local IPC and only for establishing its first owner or its clock.\nThe key proves possession and nothing else: the evidence is the local caller at an\ninteractive terminal outside a KalaReach session."
         },
         "proof": {
           "$ref": "#/$defs/OwnerConfirmationProof",
@@ -38376,6 +38400,12 @@
     },
     "history_page_result": {
       "$ref": "#/$defs/HistoryPageResult"
+    },
+    "host_clock_establish_params": {
+      "$ref": "#/$defs/HostClockEstablishParams"
+    },
+    "host_clock_establish_result": {
+      "$ref": "#/$defs/HostClockEstablishResult"
     },
     "host_doctor_result": {
       "$ref": "#/$defs/HostDoctorResult"

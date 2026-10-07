@@ -79,9 +79,9 @@ use crate::changeset::{
 };
 use crate::collection_keys::CollectionKeyRecord;
 use crate::confirmation::{
-    OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
-    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
-    OwnerConfirmationRequestResult,
+    HostClockEstablishParams, HostClockEstablishResult, OwnerConfirmationCompleteParams,
+    OwnerConfirmationCompleteResult, OwnerConfirmationPendingParams,
+    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
 use crate::delivery::{
     DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult, DestinationSecret,
@@ -811,6 +811,10 @@ pub fn protocol_schema() -> Value {
         "description_facts_request" => DescriptionFactsRequest,
         "description_repository" => DescriptionRepository,
         "description_setup_params" => DescriptionSetupParams,
+        // The one effect that spends an owner confirmation of the host's clock. Appended for the
+        // same reason.
+        "host_clock_establish_params" => HostClockEstablishParams,
+        "host_clock_establish_result" => HostClockEstablishResult,
     }
     properties.insert(
         "identifiers".to_owned(),
