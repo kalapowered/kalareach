@@ -39,9 +39,13 @@ working tree.
   from the record until the identity matches again.
 * A linked worktree is a new object with a new identity, so adding one creates a record rather than
   widening a grant that covers an existing one.
+* A linked worktree and a repository this host published are decided as exactly the recorded tree,
+  never a directory inside it, and Git's search for the repository stops above the tree.
+* A repository the owner adopted may have been adopted through a directory below its top level, so
+  a directory inside the recorded tree is accepted for it.
 * One rule checks every recorded directory: the inode names it, the recorded filesystem says
   where. One that reports an identity is refused when it differs; the same under another device
-  number is accepted, and the record takes the number.
+  number is accepted, and the record takes the number the next time a write opens it.
 
 Everything this host does to the filesystem itself goes through an open directory descriptor rather
 than a path: the same authority model the transfer service uses for a staging area and for a
@@ -260,7 +264,7 @@ holds.
 
 | What the running operation finds | What it does |
 | --- | --- |
-| The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim |
+| The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim, once the repository passes the bar the run that published it applies. One whose configuration names something no override removes is left where it was published, unregistered, and the operation fails |
 | The staging directory still holds it | Finishes the same publication, which is not another clone. If that rename fails, as it does when something else took the name, it moved nothing: the object is still staged, so the operation fails with the rename's refusal as its answer, and the staging directory goes through the handle the operation holds |
 | Neither holds it | Records the operation as unknown and keeps the staging path, named in the result |
 
@@ -529,6 +533,9 @@ person to look at, and the reason is on the record. A tree that is not there nee
 found absent, so a workspace whose materialisation stopped before it made one is removed. A removal
 that reaches the tree through a location takes away the staging directory the workspace recorded
 too, under the same proof.
+
+The uncommitted work a creation carries in goes into the object it recorded, never into a directory
+that took its name since: the creation is refused, and the workspace is recorded as awaiting removal.
 
 The deletion itself goes the way a staging sibling's does. The identity is checked through the open
 handle, and the tree is removed *through that same handle* and through handles the removal opens
