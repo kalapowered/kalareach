@@ -31,10 +31,15 @@
 //! buffer that is showing. Alacritty, Ghostty, tmux and GNU screen ignore it, so they keep whatever
 //! origin mode, region and character set an earlier application left. foot keeps origin mode and
 //! every saved cursor, and kitty and foot empty the keyboard stack, which belongs to the person's
-//! other programs and not to this session. So every part of the state a restoration draws under is
+//! other programs and not to this session. State the profile does not track stays as an earlier
+//! application left it. WezTerm's bidirectional mode and the character protection of xterm and
+//! Ghostty are two; a soft reset would clear them, and would clear the person's own state with
+//! them. So every part of the state a restoration draws under is
 //! written instead: the cursor hidden, the plain rendition, no open link, origin mode and left and
 //! right margins off, the whole screen as the scroll region, ASCII in `G0` and `G1` with `G0`
-//! selected, the default cursor shape, and the cursor at home. Then `DECSC` saves that state.
+//! selected, the default cursor shape, and the cursor at home, with autowrap and reverse video as
+//! the session has them, because kitty saves both with a cursor. Then `DECSC` saves the cursor,
+//! which keeps the position, the rendition, the character sets and origin mode on most terminals.
 //!
 //! The terminal can be showing either buffer when a restoration begins, and the buffer it is not
 //! showing can hold a cursor an earlier application saved there. A restore that comes before any
@@ -227,6 +232,22 @@ pub fn render(
             _ => None,
         })
         .collect();
+    // Two modes some terminals save with a cursor, so each save has to find the session's values.
+    for (mode, held) in [
+        (AUTOWRAP_MODE, &mut writer.autowrap),
+        (REVERSE_VIDEO_MODE, &mut writer.reverse_video),
+    ] {
+        if let Some(enabled) = operations.iter().find_map(|operation| match operation {
+            RestoreOp::SetMode { entry }
+                if entry.kind == kr_term::modes::ModeKind::Dec && entry.mode == mode =>
+            {
+                Some(entry.enabled)
+            }
+            _ => None,
+        }) {
+            *held = enabled;
+        }
+    }
     for operation in operations {
         writer.apply(operation);
     }
@@ -244,6 +265,12 @@ const CURSOR_SAVE_MODE: u16 = 1048;
 
 /// DEC private mode 25, whether the cursor shows.
 const CURSOR_VISIBLE_MODE: u16 = 25;
+
+/// DEC private mode 7, autowrap.
+const AUTOWRAP_MODE: u16 = 7;
+
+/// DEC private mode 5, reverse video.
+const REVERSE_VIDEO_MODE: u16 = 5;
 /// The string terminator this writer uses, which every profile in the repertoire accepts.
 const ST: &[u8] = b"\x1b\\";
 
@@ -280,6 +307,10 @@ struct Writer {
     margins: Option<Margins>,
     /// Whether the snapshot had origin mode set, held back for the same reason.
     origin_mode: bool,
+    /// Whether the session has autowrap on, which the plain state writes before every save.
+    autowrap: bool,
+    /// Whether the session has reverse video on, which the plain state writes before every save.
+    reverse_video: bool,
     carried: Carried,
 }
 
@@ -298,6 +329,8 @@ impl Writer {
             inactive: Vec::new(),
             margins: None,
             origin_mode: false,
+            autowrap: true,
+            reverse_video: false,
             keyboard,
             carried: Carried::default(),
         }
@@ -442,18 +475,19 @@ impl Writer {
     /// home with the cursor hidden.
     ///
     /// Every part of that state is written. None of it is left to a terminal's soft reset, which
-    /// terminals disagree about: xterm resets origin mode, the scroll region, the character sets
-    /// and the saved cursor of the buffer that shows; Alacritty, Ghostty, tmux and GNU screen
-    /// ignore it; foot leaves origin mode and every saved cursor as they were; kitty and foot also
-    /// empty the keyboard stack, and foot the title stack, which are the person's own and not the
-    /// session's to take. A restoration that depended on the reset would draw into origin mode, a
-    /// region or a character set an earlier application left behind on the first group of
-    /// terminals, and would change the keyboard on the second.
+    /// terminals disagree about. xterm resets origin mode, the scroll region, the character sets
+    /// and the saved cursor of the buffer that shows. Alacritty, Ghostty, tmux and GNU screen
+    /// ignore it, so a restoration that depended on it would draw into origin mode, a region or a
+    /// character set an earlier application left behind. foot leaves origin mode and every saved
+    /// cursor as they were. kitty and foot also empty the keyboard stack, and foot the title
+    /// stack, which are the person's own and not the session's to take.
     ///
     /// The cursor is hidden first, so nobody watches it travel. The rendition and the link are the
     /// plain ones, origin mode and left and right margins are off, the scroll region is the whole
     /// screen, `G0` and `G1` are ASCII with `G0` in use, and the cursor shape is the default.
-    /// The cursor then goes home, which also ends a pending wrap.
+    /// Autowrap and reverse video are the session's own, because kitty saves both with the cursor
+    /// and a restore of that cursor would put back the values an earlier application left. The
+    /// cursor then goes home, which also ends a pending wrap.
     fn plain_state(&mut self) {
         self.csi(b"?25l");
         self.csi(b"0m");
@@ -462,17 +496,21 @@ impl Writer {
         self.csi(b"?6l");
         self.csi(b"?69l");
         self.csi(b"r");
+        self.csi(if self.autowrap { b"?7h" } else { b"?7l" });
+        self.csi(if self.reverse_video { b"?5h" } else { b"?5l" });
         self.out.extend_from_slice(b"\x1b(B\x1b)B\x0f");
         self.csi(b"0 q");
         self.csi(b"H");
     }
 
-    /// Puts the terminal in the plain state and saves it, in the buffer that is showing.
+    /// Puts the terminal in the plain state and saves the cursor, in the buffer that is showing.
     ///
     /// What `DECSC` saves is what a `DECRC` with no save of the application's in between puts
-    /// back, and a session that has saved no cursor puts back the plain state at home. Saving it
-    /// is also what makes a terminal that keeps a saved cursor through everything else, or ignores
-    /// the soft reset, hold the session's cursor and not an earlier application's.
+    /// back, and a session that has saved no cursor puts back the plain state at home. That is the
+    /// position, the rendition, the character sets and origin mode on most terminals, and the
+    /// shape on a few. It is not the scroll region, the margin mode or whether the cursor shows.
+    /// Saving it is also what makes a terminal that keeps a saved cursor through everything else,
+    /// or ignores the soft reset, hold the session's cursor and not an earlier application's.
     fn save_plain_state(&mut self) {
         self.plain_state();
         self.out.push(ESC);
@@ -502,11 +540,10 @@ impl Writer {
     ///
     /// A switch changes the terminal under the writer. Entering saves the cursor and leaving
     /// restores it, and the cursor a terminal saves can hold the pen and the hyperlink the
-    /// application left in force: a soft reset does not always close a link, and some terminals
-    /// give back at the switch a link the saved cursor held, in the buffer the writer did not
-    /// reset. So the pen is unknown after a switch, as it is at the start, and the link is closed
-    /// again rather than assumed closed: a link this writer did not open would otherwise attach to
-    /// the next cells drawn.
+    /// application left in force: some terminals give back at the switch a link the saved cursor
+    /// held, in the buffer the writer did not write the plain state in. So the pen is unknown after
+    /// a switch, as it is at the start, and the link is closed again rather than assumed closed: a
+    /// link this writer did not open would otherwise attach to the next cells drawn.
     fn switch_buffer(&mut self, alternate: bool) {
         self.csi(if alternate { b"?1049h" } else { b"?1049l" });
         self.pen = None;
@@ -638,8 +675,8 @@ impl Writer {
 
     /// Writes the character-set designations and the shift state.
     ///
-    /// Rows are painted before this runs, under whatever the terminal already had; the profile's
-    /// reset leaves that as ASCII with the shift-out set inactive, which is what canonical text is.
+    /// Rows are painted before this runs, under the plain state the restoration wrote, which is
+    /// ASCII in both sets with the shift-out inactive, which is what canonical text is.
     fn charsets(&mut self, charsets: &Charsets) {
         self.designations(&Designations {
             g0: charsets.g0.clone(),
@@ -1548,8 +1585,8 @@ mod tests {
     }
 
     /// Every erase in a restoration is made with the plain rendition: the last rendition sequence
-    /// before it is the plain one, or a soft reset came after it. The restoration here has a
-    /// reversed run in each buffer and ends a row on one, so every erase follows one.
+    /// before it is the plain one. The restoration here has a reversed run in each buffer and ends
+    /// a row on one, so every erase follows one.
     #[test]
     fn every_erase_a_restoration_makes_is_made_with_the_plain_rendition() {
         let mut reversed = row(0, 0, "bar");
@@ -1829,13 +1866,13 @@ mod tests {
 
     /// What a restoration writes to put a terminal in the plain state, in the order it writes it:
     /// the cursor hidden, the plain rendition, no link, no origin mode, no left and right margins,
-    /// the whole screen as the region, ASCII in both sets with the first in use, the default
-    /// shape, and home.
+    /// the whole screen as the region, autowrap on and reverse video off (a session that has not
+    /// changed them), ASCII in both sets with the first in use, the default shape, and home.
     fn plain() -> Vec<u8> {
         [
             &b"\x1b[?25l\x1b[0m"[..],
             b"\x1b]8;;\x1b\\",
-            b"\x1b[?6l\x1b[?69l\x1b[r",
+            b"\x1b[?6l\x1b[?69l\x1b[r\x1b[?7h\x1b[?5l",
             b"\x1b(B\x1b)B\x0f",
             b"\x1b[0 q\x1b[H",
         ]
