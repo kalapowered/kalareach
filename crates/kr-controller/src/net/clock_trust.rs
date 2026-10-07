@@ -1653,8 +1653,7 @@ mod tests {
     /// as a restatement. The owner's confirmation is in the record, and the floor shows the
     /// workers a withdrawal (a distrust the record has since ended) or half of a publication: the
     /// next reading states the confirmation in force. A boot whose clock continuity is lost
-    /// states nothing, and states it once the owner has established the clock. A reading the words
-    /// cannot hold is not stated, and not stated again at every reading after it.
+    /// states nothing, and states it once the owner has established the clock.
     #[test]
     fn a_publication_that_did_not_complete_is_made_good_at_the_next_reading() {
         let store = Store::new();

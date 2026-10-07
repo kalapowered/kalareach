@@ -4412,12 +4412,13 @@ fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
 }
 
 /// KR-REQ-09.18, KR-REQ-09.19: an older confirmation does not clear a rollback the worker found
-/// after it. The owner establishes the clock; the wall clock then steps forward ten minutes, and a
-/// worker that begins afterwards takes that reading for its mark; before its first look the wall
-/// clock goes back a minute. The worker finds that rollback against its own mark, which was raised
-/// after the owner spoke, and the confirmation (the clock is not behind it, only behind the
-/// worker's mark) does not end it. The control is the same sequence without the step back, which
-/// follows the confirmation.
+/// after it. The owner establishes the clock; a second passes and the wall clock steps forward ten
+/// minutes, and a worker that begins afterwards takes that reading for its mark, which is later
+/// than the owner's word by the second; before its first look the wall clock goes back a minute.
+/// The worker finds that rollback against its own mark, and the confirmation (the clock is not
+/// behind it, only behind the worker's mark) does not end it. The control is the same sequence
+/// without the step back, which follows the confirmation and is trusted because the owner
+/// confirmed it.
 #[test]
 fn an_older_confirmation_does_not_clear_a_rollback_the_worker_found_after_it() {
     use kr_worker::action::time::WallClock as _;
@@ -4427,6 +4428,10 @@ fn an_older_confirmation_does_not_clear_a_rollback_the_worker_found_after_it() {
         let machine = DriftingMachine::fast_by(0);
         let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
         machine.owner_establishes(&floor);
+        machine
+            .continuous
+            .advance(std::time::Duration::from_secs(1));
+        machine.active.advance(std::time::Duration::from_secs(1));
         machine.wall.advance(std::time::Duration::from_secs(600));
         let wall = Arc::new(WallThatMovesAfterItsNextReading {
             inner: machine.wall.clone(),
@@ -4451,16 +4456,19 @@ fn an_older_confirmation_does_not_clear_a_rollback_the_worker_found_after_it() {
             ..session_config(&environment, session_id)
         })
         .expect("opens");
-        session.time().trust()
+        (
+            session.time().trust(),
+            session.time().durable_state().0.owner_confirmed,
+        )
     };
     assert_eq!(
         began_after(true),
-        WallClockTrust::Unresolved,
+        (WallClockTrust::Unresolved, false),
         "the rollback it found after the owner spoke is not cleared by what the owner said"
     );
     assert_eq!(
         began_after(false),
-        WallClockTrust::Trusted,
+        (WallClockTrust::Trusted, true),
         "the control: a clock that only rose follows the confirmation"
     );
 }
@@ -4506,10 +4514,100 @@ fn a_restatement_is_followed_by_a_worker_that_begins_and_by_no_other() {
     beginning.observe_time();
     assert_eq!(beginning.time().trust(), WallClockTrust::Trusted);
 
-    // And the owner's own action ends the distrust of the other two.
+    // And the owner's own action ends the distrust of the one that restored its record.
     machine.owner_establishes(&floor);
     restored.observe_time();
     assert_eq!(restored.time().trust(), WallClockTrust::Trusted);
+}
+
+/// KR-REQ-09.19: a worker that begins before the daemon states its record still takes the
+/// restatement. Its first look finds nothing, and so does a look between the two stores of the
+/// publication; neither ends what it can take. The restatement it meets next is the daemon's
+/// record, and the worker, whose time service vouches for nothing, trusts its clock because of it.
+#[test]
+fn a_worker_that_looked_before_the_daemon_stated_its_record_takes_the_restatement() {
+    use kr_worker::action::time::WallClock as _;
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    machine.time_service_stops();
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    session.observe_time();
+    machine.runs(AN_HOUR);
+    floor.leave_half_published(machine.wall.now_ms().get());
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+
+    machine.runs(AN_HOUR);
+    machine.daemon_restates(&floor);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "the restatement is the first confirmation it meets"
+    );
+    assert!(session.time().durable_state().0.owner_confirmed);
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: a restatement does not clear a rollback the worker finds at its
+/// first look. The worker begins and samples a clock; the clock goes back a minute before its
+/// first look; the daemon, which did not see the peak, states its record at the lower reading,
+/// later than the worker's mark. The worker finds the rollback against its mark, which ends what it
+/// can take, and spends the restatement. The control is the same without the step back: the worker
+/// takes the restatement.
+#[test]
+fn a_restatement_does_not_clear_a_rollback_found_at_the_first_look() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let began = |steps_back: bool| {
+        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(0);
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let wall = Arc::new(WallThatMovesAfterItsNextReading {
+            inner: machine.wall.clone(),
+            after: std::sync::Mutex::new(None),
+        });
+        let (inner, continuous, stated) = (
+            machine.wall.clone(),
+            machine.continuous.clone(),
+            Arc::clone(&floor),
+        );
+        *wall
+            .after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            continuous.advance(std::time::Duration::from_secs(1));
+            if steps_back {
+                inner.set(inner.now_ms().get() - 60_000);
+            }
+            assert!(stated.restate(inner.now_ms().get(), continuous.boot_elapsed_ms()));
+        }));
+        let session = Session::open(SessionConfig {
+            time: kr_worker::action::time::TimeSources {
+                wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+                ..machine.sources_on(&floor)
+            },
+            ..session_config(&environment, session_id)
+        })
+        .expect("opens");
+        (
+            session.time().trust(),
+            session.time().durable_state().0.owner_confirmed,
+        )
+    };
+    assert_eq!(
+        began(true),
+        (WallClockTrust::Unresolved, false),
+        "the rollback it found at its first look is not cleared by a restatement"
+    );
+    assert_eq!(
+        began(false),
+        (WallClockTrust::Trusted, true),
+        "the control: without the rollback it takes the restatement"
+    );
 }
 
 /// KR-REQ-09.18, KR-REQ-09.19: a worker that still trusts its clock distrusts it when the clock is
