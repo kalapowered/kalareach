@@ -175,8 +175,8 @@ mod platform {
     use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
     use windows_sys::Win32::Foundation::{
-        ERROR_OPERATION_ABORTED, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        ERROR_OPERATION_ABORTED, HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
@@ -249,7 +249,8 @@ mod platform {
             self.process.as_raw_handle()
         }
 
-        /// Ends the process, which a process that has ended already is not a failure of.
+        /// Ends the process, which a process that has ended already, or is ending, is not a
+        /// failure of.
         ///
         /// # Errors
         ///
@@ -261,9 +262,11 @@ mod platform {
                 return Ok(());
             }
             let failure = std::io::Error::last_os_error();
-            // A process that has ended already refuses to be ended again, which is the outcome
-            // that was wanted.
-            match self.try_wait() {
+            // A process that has ended already refuses to be ended again, and so does one that
+            // is ending, whether it was ended or ended itself: it is not signalled until its last
+            // thread has gone, but it has its exit status from the moment it begins to end. Either
+            // is the outcome that was wanted. A process that is running has none.
+            match self.exit_status() {
                 Ok(Some(_)) => Ok(()),
                 _ => Err(failure),
             }
@@ -309,6 +312,19 @@ mod platform {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(std::process::ExitStatus::from_raw(code))
+        }
+
+        /// Says how the process ended, where it has ended or is ending, without waiting.
+        ///
+        /// A process has an exit status from the moment it begins to end, before it is signalled
+        /// and can be waited for. While it runs, the system reports a status of its own, which a
+        /// process may also end with, so a process that is signalled is ended whatever it
+        /// reports.
+        fn exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            // SAFETY: as for the wait.
+            let waited = unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 0) };
+            let status = self.status()?;
+            Ok((waited == WAIT_OBJECT_0 || status.code() != Some(STILL_ACTIVE)).then_some(status))
         }
     }
 
