@@ -165,24 +165,6 @@ pub struct StoredClockAnchor {
     pub boot_value: Vec<u8>,
 }
 
-/// The two holds on forgetting that survive a restart and are lifted only by an owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClockHold {
-    /// Every forgetting is withheld, attention's included.
-    Forgetting,
-    /// Attention's forgetting and quiet hours are withheld.
-    Evidence,
-}
-
-impl ClockHold {
-    const fn column(self) -> &'static str {
-        match self {
-            Self::Forgetting => "forgetting_hold_at_ms",
-            Self::Evidence => "evidence_hold_at_ms",
-        }
-    }
-}
-
 /// How much of the bounded offline validity this host has measured as spent since one
 /// synchronisation.
 ///
@@ -1222,20 +1204,20 @@ impl DeviceDirectory {
         Ok(())
     }
 
-    /// Records one of the two holds on forgetting, which only [`Self::establish_clock`] lifts.
+    /// Records that the platform's time service was found unqualified while the owner had not
+    /// confirmed the clock: the hold on attention's forgetting and quiet hours, which only
+    /// [`Self::establish_clock`] lifts.
     ///
     /// # Errors
     ///
     /// Returns an error when the row cannot be written.
-    pub fn note_clock_hold(&self, hold: ClockHold, now_ms: TimestampMs) -> Result<()> {
-        let column = hold.column();
+    pub fn note_evidence_hold(&self, now_ms: TimestampMs) -> Result<()> {
         self.with(|connection| {
             connection.execute(
-                &format!(
-                    "INSERT INTO network_clock (id, observed_ms, {column})
-                     VALUES (0, ?1, ?1)
-                     ON CONFLICT (id) DO UPDATE SET {column} = COALESCE({column}, ?1)"
-                ),
+                "INSERT INTO network_clock (id, observed_ms, evidence_hold_at_ms)
+                 VALUES (0, ?1, ?1)
+                 ON CONFLICT (id) DO UPDATE
+                     SET evidence_hold_at_ms = COALESCE(evidence_hold_at_ms, ?1)",
                 params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
             )
         })?;

@@ -6,9 +6,12 @@
 //! every reader ([`super::clock_trust::ClockTrust`]), so a daemon started over an earlier file takes
 //! the file in once, and removes it.
 //!
-//! Remove this module, its declaration in `net/mod.rs`, its call at start and the record's
-//! `attention_time_retired` column once no installation can be upgraded in place from a build that
-//! wrote the file.
+//! Remove this module once no supported upgrade starts from a build that wrote the file, together
+//! with: its declaration and the `pub(crate) use` in `net/mod.rs`, its call at start, the
+//! `attention_time_retired` column (the `add_column` entry in `net/devices.rs` and
+//! `ClockRecord::attention_time_retired`), the fixtures under
+//! `tests/fixtures/earlier-attention-clock/` and the daemon test
+//! `a_distrust_recorded_by_the_attention_store_is_carried_forward`.
 
 use std::path::Path;
 

@@ -42,7 +42,7 @@ use kr_protocol::scalars::TimestampMs;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use kr_worker::action::time::DISCONTINUITY_TOLERANCE;
 
-use super::devices::{ClockHold, DeviceDirectory, ObservedUtc};
+use super::devices::{DeviceDirectory, ObservedUtc};
 use crate::error::Result;
 use crate::grants::policy::UtcFloor;
 
@@ -58,7 +58,9 @@ pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
 /// truth.
 ///
 /// A step is written down when the wall clock exceeds the anchor projected from what was last
-/// written by more than this, so time passing is not mistaken for a correction and costs no write.
+/// written by more than this, so time passing is not mistaken for a correction. The projection
+/// credits a little less than the time that passes ([`RATE_ALLOWANCE_PPM`]), so a clock that keeps
+/// pace is written about every 42 minutes.
 fn unwritten_step_ms() -> u64 {
     u64::try_from(DISCONTINUITY_TOLERANCE.as_millis()).unwrap_or(u64::MAX)
 }
@@ -89,9 +91,10 @@ impl Anchor {
 /// A projection that credits every continuous millisecond would count that error as a rollback
 /// once it passed the tolerance, after days on a host that runs for weeks, and only an owner's
 /// retrust or a reboot would clear it. So the projection credits a millisecond less per 10,000 and
-/// a continuous clock up to this fast raises no distrust. The cost is stated once, here: a
-/// rollback gains slack of this rate times the time since the anchor was last raised, about 60
-/// seconds per week of uptime, which is small against the 30 days a record is kept.
+/// a continuous clock up to this fast raises no distrust; one faster than that still does. The
+/// cost is stated once, here: a rollback gains slack of this rate times the time since the anchor
+/// was last raised, 6 ms for each minute, about 60 seconds for a host nobody read for a week. That
+/// is small against the 30 days a record is kept.
 const RATE_ALLOWANCE_PPM: u64 = 100;
 
 /// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
@@ -105,13 +108,12 @@ fn credited(elapsed_ms: u64) -> u64 {
 struct Owed {
     distrust: bool,
     anchor: bool,
-    forgetting_hold: bool,
     evidence_hold: bool,
 }
 
 impl Owed {
     const fn any(self) -> bool {
-        self.distrust || self.anchor || self.forgetting_hold || self.evidence_hold
+        self.distrust || self.anchor || self.evidence_hold
     }
 }
 
@@ -408,14 +410,8 @@ impl ClockTrust {
                 Err(error) => outcome = outcome.and(Err(error)),
             }
         }
-        if state.owed.forgetting_hold {
-            match devices.note_clock_hold(ClockHold::Forgetting, stamp) {
-                Ok(()) => state.owed.forgetting_hold = false,
-                Err(error) => outcome = outcome.and(Err(error)),
-            }
-        }
         if state.owed.evidence_hold {
-            match devices.note_clock_hold(ClockHold::Evidence, stamp) {
+            match devices.note_evidence_hold(stamp) {
                 Ok(()) => state.owed.evidence_hold = false,
                 Err(error) => outcome = outcome.and(Err(error)),
             }
@@ -532,7 +528,6 @@ impl ClockTrust {
             proven: !standing.distrusted
                 && !standing.forgetting_hold
                 && !standing.evidence_hold
-                && !standing.anchor_owed
                 && (platform_qualified || standing.confirmed),
             owed: standing.owed,
         })
@@ -910,6 +905,88 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.17, KR-REQ-09.18: a restored anchor is held to a tolerance reduced by the step the
+    /// host does not write, until the host has read the clock past it. A step smaller than 250 ms
+    /// is not written, so an anchor read back may be that far behind the truth and a rollback
+    /// measured against it would look that much smaller. After a restart in the same boot a wall
+    /// clock 4.9 s behind where the minute put it is found, which the full 5 s would forgive; once
+    /// the host has read a step past the restored anchor the full tolerance applies again.
+    #[test]
+    fn a_restored_anchor_is_held_to_a_tolerance_reduced_by_the_step_the_host_does_not_write() {
+        let store = Store::new();
+        let machine = Machine::new();
+        let first = Run::on(&machine);
+        assert!(proven(&first, &store.open()));
+        machine.pass(MINUTE);
+        machine.set_wall(machine.wall() - 4_900);
+        let restarted = Run::on(&machine);
+        assert!(
+            !proven(&restarted, &store.open()),
+            "4.9 s behind is a rollback against a restored anchor"
+        );
+
+        let store = Store::new();
+        let machine = Machine::new();
+        let first = Run::on(&machine);
+        assert!(proven(&first, &store.open()));
+        machine.pass(MINUTE);
+        let restarted = Run::on(&machine);
+        assert!(proven(&restarted, &store.open()));
+        // A reading a step beyond the restored anchor ends the allowance: the anchor is now the
+        // host's own, and the full tolerance applies. The wall clock runs a second ahead of the
+        // continuous clock, as a correction forward does.
+        restarted.pass(Duration::from_secs(1));
+        machine.set_wall(machine.wall() + 1_000);
+        assert!(proven(&restarted, &store.open()));
+        machine.set_wall(machine.wall() - 4_900);
+        assert!(
+            proven(&restarted, &store.open()),
+            "4.9 s behind is within the tolerance once the host has read past the restored anchor"
+        );
+    }
+
+    /// KR-REQ-09.19: an evidence hold whose write failed stays in memory, withholds attention while
+    /// it is owed, is written by the next reading, and survives a restart: the platform qualifying
+    /// again lifts nothing.
+    #[test]
+    fn an_evidence_hold_that_could_not_be_written_is_written_by_the_next_reading() {
+        let store = Store::new();
+        let machine = Machine::new();
+        let run = Run::on(&machine);
+        let devices = store.open();
+        // The record's row exists once a reading has made its mark, so the hold is an update.
+        assert!(proven(&run, &devices));
+
+        refuse_writes_of(&devices, "evidence_hold_at_ms");
+        let watched = run.trust.watch(&devices, false).expect("watches");
+        assert!(!watched.proven && watched.owed);
+        let watched = run.trust.watch(&devices, true).expect("watches");
+        assert!(
+            !watched.proven && watched.owed,
+            "the platform qualifying again does not lift it while it is owed"
+        );
+        assert!(
+            devices
+                .clock_record()
+                .expect("the record")
+                .evidence_hold_at_ms
+                .is_none()
+        );
+
+        allow_writes_of(&devices, "evidence_hold_at_ms");
+        let watched = run.trust.watch(&devices, true).expect("watches");
+        assert!(!watched.proven && !watched.owed, "written by the reading");
+        let restarted = Run::on(&machine);
+        assert!(
+            !restarted
+                .trust
+                .watch(&store.open(), true)
+                .expect("watches")
+                .proven,
+            "and it survives a restart"
+        );
+    }
+
     /// KR-REQ-09.17, KR-REQ-09.18: the restored anchor is never short of the time that passed
     /// between the two readings the restart makes. The host reads its continuous clock and then the
     /// boot clock; ten seconds pass right after the second reading, a descheduled thread's pause, and
@@ -973,10 +1050,11 @@ mod tests {
     }
 
     /// KR-REQ-09.17: a restart in another boot keeps the wall reading and starts the continuous
-    /// side from now. The boot clock restarted, so what it reads says nothing of how long ago the
-    /// anchor was written, and the anchor is not carried forward by it: the new boot is an hour
-    /// old when the host starts in it, and a clock that kept going is trusted. A wall clock behind
-    /// the reading kept is still found.
+    /// side from now. The boot clock restarted, so the anchor is not carried forward by it: the
+    /// reading it gives is the age of a boot that began after the anchor was written, a lower
+    /// bound that holds only while the boot identity can be relied on, and the anchor claims no
+    /// more than the wall reading it recorded. A clock past that reading is trusted in the new
+    /// boot; one behind the mark kept is found, by the mark.
     #[test]
     fn a_restart_in_a_new_boot_keeps_the_wall_reading_and_not_the_boot_clock() {
         let store = Store::new();
@@ -1054,10 +1132,11 @@ mod tests {
         );
     }
 
-    /// KR-REQ-09.18: a step whose write failed stays owed, withholds what depends on the record
-    /// while it is, and is written again by the next reading, which is not itself a step: a
-    /// restart does not forget the peak. A grant is decided meanwhile, as the record is no part of
-    /// what it measures against.
+    /// KR-REQ-09.18: a step whose write failed stays owed, withholds every forgetting while it is,
+    /// and is written again by the next reading, which is not itself a step: a restart does not
+    /// forget the peak. A grant and attention's quiet hours are decided meanwhile, as the record is
+    /// no part of what they measure against; what a restart would lose is what a delete cannot
+    /// take back.
     #[test]
     fn a_step_that_could_not_be_written_is_written_before_the_next_answer() {
         let store = Store::new();
@@ -1071,7 +1150,10 @@ mod tests {
         machine.set_wall(peak);
         let watched = run.trust.watch(&devices, true).expect("watches");
         assert!(watched.owed, "the step is owed");
-        assert!(!watched.proven, "and what depends on the record waits");
+        assert!(
+            watched.proven,
+            "quiet hours are decided from the clock now, which the record does not bear on"
+        );
         assert!(run.trust.owes_a_write());
         assert!(
             run.trust
@@ -1502,9 +1584,11 @@ mod tests {
     }
 
     /// KR-REQ-09.17, KR-REQ-09.18: a restart in the same boot keeps neither a false distrust nor a
-    /// missed rollback. After thirty days on a fast continuous clock the host goes down for a day
-    /// on a boot clock that is just as fast, and starts again: it trusts the clock. Another day, and
-    /// a wall clock corrected six minutes back while it was down: it does not.
+    /// missed rollback. After thirty days on a fast continuous clock the host goes down for two
+    /// days on a boot clock that is just as fast (8.6 s more than the wall clock, beyond even the
+    /// restored tolerance, so only the credit given to the restored anchor keeps it trusted), and
+    /// starts again: it trusts the clock. Two more days, and a wall clock corrected six minutes
+    /// back while it was down: it does not.
     #[test]
     fn a_restart_after_thirty_days_on_a_fast_clock_keeps_neither_a_false_distrust_nor_a_missed_rollback()
      {
@@ -1516,11 +1600,11 @@ mod tests {
             assert!(proven(&run, &store.open()));
         }
 
-        machine.pass_fast(DAY, FIFTY_PPM);
+        machine.pass_fast(2 * DAY, FIFTY_PPM);
         let restarted = Run::on(&machine);
         assert!(
             proven(&restarted, &store.open()),
-            "a day on a fast clock is no rollback after a restart"
+            "two days on a fast clock are no rollback after a restart"
         );
         assert!(
             restarted
@@ -1530,7 +1614,7 @@ mod tests {
                 .proven
         );
 
-        machine.pass_fast(DAY, FIFTY_PPM);
+        machine.pass_fast(2 * DAY, FIFTY_PPM);
         machine.set_wall(machine.wall() - 360_000);
         let corrected = Run::on(&machine);
         assert!(
