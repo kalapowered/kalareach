@@ -4387,6 +4387,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "kr-cbor",
+ "kr-client",
  "kr-crypto",
  "kr-flush",
  "kr-ipc",

@@ -22,6 +22,7 @@ use kr_client::services::account::{
     AccountHttp, AccountService, AccountToken, AccountTokenSource, Client, IssuedGrant,
     ManagedAccountService, RefreshToken, SignedInAccount,
 };
+use kr_client::services::http::{HttpDeadlines, ResponseLimits};
 use kr_crypto::store::SecretStore;
 use kr_protocol::service::GatewayOrigin;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -52,8 +53,20 @@ fn open_store(directory: &Path) -> Arc<dyn SecretStore> {
 }
 
 fn account(directory: &Path, origin: &str, clock: fn() -> u64, shared: bool) -> SignedInAccount {
-    let http = HttpService::new(GatewayOrigin::new(origin).expect("a loopback origin"))
-        .expect("a transport");
+    // The token service holds a refresh until the other process is at the lock, which can take as
+    // long as a loaded machine takes to start it, so no deadline of the client's ends the wait
+    // before the service's own bound does.
+    let patient = HttpDeadlines {
+        connect: Duration::from_secs(60),
+        read: Duration::from_secs(60),
+        total: Duration::from_secs(60),
+    };
+    let http = HttpService::with(
+        GatewayOrigin::new(origin).expect("a loopback origin"),
+        patient,
+        ResponseLimits::default(),
+    )
+    .expect("a transport");
     let service = ManagedAccountService::at_origin(
         origin,
         Arc::new(http) as Arc<dyn AccountHttp>,
@@ -82,6 +95,39 @@ fn wait_for(path: &Path) {
     panic!("{} never appeared", path.display());
 }
 
+/// Tells the token service that this process found the shared lock held by another and is about
+/// to wait for it.
+///
+/// The account says so itself, from the product's own lock path, when its attempt to take the lock
+/// without waiting finds it held; the token service holds the first refresh until it has been
+/// told, so the second process's change to the grant is certain to come after the first
+/// process's, which is the order the lock exists to give. A process that never finds the lock held
+/// never tells it.
+fn announce_the_wait(origin: &str) {
+    let address = origin
+        .strip_prefix("http://")
+        .expect("a loopback origin over plain HTTP");
+    let mut stream = std::net::TcpStream::connect(address).expect("the token service");
+    std::io::Write::write_all(
+        &mut stream,
+        format!(
+            "POST /at-lock HTTP/1.1\r\nhost: {address}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .expect("the announcement");
+    let mut answer = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut answer).expect("the answer");
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+}
+
+/// The account of a process that tells the token service when it waits for the shared lock.
+fn account_that_announces(directory: &Path, origin: &str) -> SignedInAccount {
+    let announced = origin.to_owned();
+    account(directory, origin, children_clock, true)
+        .on_shared_lock_wait(Arc::new(move || announce_the_wait(&announced)))
+}
+
 /// The children's entry. It does nothing in an ordinary run of this binary.
 #[test]
 fn child_process() {
@@ -102,6 +148,14 @@ fn child_process() {
                 Ok(token) => println!("result ok {}", token.expose()),
                 Err(error) => println!("result err {}", error.code().as_str()),
             },
+            "refresh-behind-another" => {
+                wait_for(&directory.join("refresh-started"));
+                let account = account_that_announces(&directory, &origin);
+                match account.token("openid").await {
+                    Ok(token) => println!("result ok {}", token.expose()),
+                    Err(error) => println!("result err {}", error.code().as_str()),
+                }
+            }
             "refresh-then-again" => {
                 match account.token("openid").await {
                     Ok(token) => println!("result ok {}", token.expose()),
@@ -115,6 +169,7 @@ fn child_process() {
             }
             "sign-out" => {
                 wait_for(&directory.join("refresh-started"));
+                let account = account_that_announces(&directory, &origin);
                 let out = account.sign_out().await.expect("a sign-out");
                 println!("signout {} {}", out.was_signed_in, out.service_told);
                 std::fs::write(directory.join("signed-out"), b"").expect("a marker");
@@ -133,13 +188,18 @@ struct Family {
     replays: usize,
     revoked: Vec<String>,
     waiting: usize,
+    /// How many processes have said they are waiting for the shared lock another holds.
+    at_lock: usize,
+    /// Whether a presentation gave up waiting for that.
+    gave_up: bool,
 }
 
 /// How the stub answers the first presentation of a live token.
 #[derive(Clone, Copy)]
 enum Pace {
-    /// After a pause long enough for another process to act meanwhile.
-    Pause,
+    /// Once another process has said it found the shared lock held and is about to wait for it, so
+    /// that process's change to the grant comes after this one's.
+    UntilAtLock,
     /// Once a second request has arrived, so two presentations are certain to overlap.
     Together,
 }
@@ -195,6 +255,10 @@ async fn stub(directory: PathBuf, pace: Pace) -> (String, Arc<Mutex<Family>>) {
                         .revoked
                         .push(fields.get("token").cloned().unwrap_or_default());
                     (200, serde_json::json!({}))
+                } else if head.starts_with("post /at-lock ") {
+                    family.lock().expect("the family").at_lock += 1;
+                    arrived.notify_waiters();
+                    (200, serde_json::json!({}))
                 } else if head.starts_with("post /auth/oauth2/token ") {
                     let presented = fields.get("refresh_token").cloned().unwrap_or_default();
                     let live = {
@@ -206,7 +270,24 @@ async fn stub(directory: PathBuf, pace: Pace) -> (String, Arc<Mutex<Family>>) {
                     std::fs::write(directory.join("refresh-started"), b"").expect("a marker");
                     if live {
                         match pace {
-                            Pace::Pause => tokio::time::sleep(Duration::from_millis(1500)).await,
+                            Pace::UntilAtLock => {
+                                let deadline =
+                                    tokio::time::Instant::now() + Duration::from_secs(20);
+                                while family.lock().expect("the family").at_lock < 1 {
+                                    // Asked for before the condition is read, so that an
+                                    // announcement between the two is not missed.
+                                    let announced = arrived.notified();
+                                    tokio::pin!(announced);
+                                    announced.as_mut().enable();
+                                    if family.lock().expect("the family").at_lock >= 1 {
+                                        break;
+                                    }
+                                    if tokio::time::timeout_at(deadline, announced).await.is_err() {
+                                        family.lock().expect("the family").gave_up = true;
+                                        break;
+                                    }
+                                }
+                            }
                             Pace::Together => {
                                 let deadline =
                                     tokio::time::Instant::now() + Duration::from_secs(20);
@@ -345,15 +426,22 @@ async fn children(directory: &Path, origin: &str, roles: &[&str], shared: bool) 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_processes_refreshing_at_once_cause_one_refresh() {
     let directory = tempfile::tempdir().expect("a directory on the internal disk");
-    let (origin, family) = stub(directory.path().to_path_buf(), Pace::Pause).await;
+    let (origin, family) = stub(directory.path().to_path_buf(), Pace::UntilAtLock).await;
     seed(directory.path(), &origin).await;
-    let lines = children(directory.path(), &origin, &["refresh", "refresh"], true).await;
+    let lines = children(
+        directory.path(),
+        &origin,
+        &["refresh", "refresh-behind-another"],
+        true,
+    )
+    .await;
     assert_eq!(
         lines,
         ["result ok rotated-1-access", "result ok rotated-1-access"],
         "{lines:?}"
     );
     let held = family.lock().expect("the family");
+    assert!(!held.gave_up, "the second process never reached the lock");
     assert_eq!(held.rotations, 1);
     assert_eq!(held.replays, 0);
 }
@@ -363,7 +451,7 @@ async fn two_processes_refreshing_at_once_cause_one_refresh() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sign_out_in_one_process_during_a_refresh_in_another_revokes_the_rotated_token() {
     let directory = tempfile::tempdir().expect("a directory on the internal disk");
-    let (origin, family) = stub(directory.path().to_path_buf(), Pace::Pause).await;
+    let (origin, family) = stub(directory.path().to_path_buf(), Pace::UntilAtLock).await;
     seed(directory.path(), &origin).await;
     let lines = children(
         directory.path(),
@@ -382,6 +470,7 @@ async fn a_sign_out_in_one_process_during_a_refresh_in_another_revokes_the_rotat
         "{lines:?}"
     );
     let held = family.lock().expect("the family");
+    assert!(!held.gave_up, "the sign-out never reached the lock");
     assert_eq!(held.revoked, ["rotated-1"]);
     assert_eq!(held.replays, 0);
 }

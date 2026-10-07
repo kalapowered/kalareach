@@ -1853,6 +1853,11 @@ pub struct SignedInAccount {
     client: Client,
     lock: tokio::sync::Mutex<()>,
     shared_lock: Option<PathBuf>,
+    /// Told whenever this account finds the shared lock held by another process and is about to
+    /// wait for it, which this crate's own tests act through. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    lock_wait_notice: Option<Arc<dyn Fn() + Send + Sync>>,
     clock_ms: fn() -> u64,
     ended: AtomicBool,
     status: tokio::sync::watch::Sender<AccountStatus>,
@@ -1913,6 +1918,8 @@ impl SignedInAccount {
             client,
             lock: tokio::sync::Mutex::new(()),
             shared_lock: None,
+            #[cfg(feature = "testing")]
+            lock_wait_notice: None,
             clock_ms: system_milliseconds,
             ended: AtomicBool::new(false),
             status,
@@ -1924,6 +1931,16 @@ impl SignedInAccount {
     #[must_use]
     pub fn with_shared_lock(mut self, path: PathBuf) -> Self {
         self.shared_lock = Some(path);
+        self
+    }
+
+    /// Calls `notice` whenever this account finds the shared lock held by another process, as it
+    /// is about to wait for it, for this crate's own tests: they release what the other process
+    /// holds once a process is certain to be waiting for it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn on_shared_lock_wait(mut self, notice: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.lock_wait_notice = Some(notice);
         self
     }
 
@@ -1980,6 +1997,8 @@ impl SignedInAccount {
             None => None,
             Some(path) => {
                 let path = path.clone();
+                #[cfg(feature = "testing")]
+                let waiting = self.lock_wait_notice.clone();
                 let taken =
                     tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
                         let mut options = std::fs::OpenOptions::new();
@@ -1990,7 +2009,17 @@ impl SignedInAccount {
                             options.mode(0o600);
                         }
                         let file = options.open(&path)?;
-                        file.lock()?;
+                        match file.try_lock() {
+                            Ok(()) => {}
+                            Err(std::fs::TryLockError::WouldBlock) => {
+                                #[cfg(feature = "testing")]
+                                if let Some(notice) = &waiting {
+                                    notice();
+                                }
+                                file.lock()?;
+                            }
+                            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                        }
                         Ok(file)
                     })
                     .await
