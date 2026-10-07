@@ -1277,7 +1277,7 @@ impl Environment {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "the typed input is not echoed into the output on a Windows pseudo-console, which this case waits to see"
+    ignore = "this case waits for the typed text to appear twice in the retained output, as the terminal's echo and the program's answer, and a Windows pseudo-console draws the screen itself, so it sometimes carries the text once"
 )]
 async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job() {
     let mut environment = Environment::start(Setup::new()).await;
@@ -1360,7 +1360,7 @@ async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "the typed input is not echoed into the output the case waits on, on a Windows pseudo-console, or not every time"
+    ignore = "this case waits for the typed text to appear twice in the retained output, as the terminal's echo and the program's answer, and a Windows pseudo-console draws the screen itself, so it sometimes carries the text once"
 )]
 async fn with_a_job_stopped_in_the_process_input_queries_and_resize_still_answer() {
     let mut environment = Environment::start(Setup {
@@ -1601,7 +1601,7 @@ async fn privacy_mode_removes_the_description_and_describes_nothing_captured_whi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "the typed input is not echoed into the output the case waits on, on a Windows pseudo-console, or not every time"
+    ignore = "this case waits for the typed text to appear twice in the retained output, as the terminal's echo and the program's answer, and a Windows pseudo-console draws the screen itself, so it sometimes carries the text once"
 )]
 async fn a_process_that_ends_inside_a_job_is_restarted_and_the_session_keeps_its_title() {
     let mut environment = Environment::start(Setup {
