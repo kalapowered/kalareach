@@ -288,8 +288,19 @@ impl MachineStore {
     ///
     /// Returns a storage failure when the record is missing, damaged or another environment's.
     pub fn group(&self) -> Result<MachineGroup> {
-        self.read()?
+        self.read_by_name()?
             .ok_or_else(|| self.unreadable("the record is missing"))
+    }
+
+    /// Reads the record by its name, as a reader that holds nothing does.
+    fn read_by_name(&self) -> Result<Option<MachineGroup>> {
+        // A test makes the name resolve to nothing here, as Windows can answer for an instant
+        // while a rename replaces it.
+        #[cfg(test)]
+        if seam::resolves_nothing(&self.record) {
+            return Ok(None);
+        }
+        self.read()
     }
 
     /// Moves this environment into the group the owner named.
@@ -743,6 +754,27 @@ mod seam {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((record.to_path_buf(), told));
+    }
+
+    /// Records whose name resolves to nothing for the next read that holds nothing.
+    static UNRESOLVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Makes the name of `record` resolve to nothing for the next read that holds nothing, once.
+    pub(super) fn resolve_nothing_once(record: &Path) {
+        UNRESOLVED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(record.to_path_buf());
+    }
+
+    /// Whether the name of `record` resolves to nothing for this read, which a test asked for once.
+    pub(super) fn resolves_nothing(record: &Path) -> bool {
+        let mut unresolved = UNRESOLVED.lock().unwrap_or_else(PoisonError::into_inner);
+        unresolved
+            .iter()
+            .position(|path| path == record)
+            .map(|index| unresolved.remove(index))
+            .is_some()
     }
 
     /// Records whose holder a test lets go once, just after the deadline of a call waiting for the
@@ -1485,24 +1517,22 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.07: a reader running beside real publications never finds the record's name
-    /// missing or holding part of a record. The held checkpoints above prove each point of one
-    /// publication; this reads while 64 run freely, from before the first one starts.
+    /// KR-REQ-03.07: a reader running beside real publications never finds the record missing or
+    /// holding part of a record. The held checkpoints above prove each point of one publication;
+    /// this reads while 64 run freely, from before the first one starts.
     #[test]
     fn a_reader_always_finds_a_whole_record_while_steps_publish() {
         let environment = Environment::create();
         let store = environment.open();
-        let record = environment.record();
         let done = AtomicBool::new(false);
         let (reading, started) = mpsc::channel();
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
                 let mut reads = 0_u64;
                 loop {
-                    let bytes = std::fs::read(&record)
-                        .map_err(|error| format!("the record's name held no file: {error}"))?;
-                    serde_json::from_slice::<MachineGroup>(&bytes)
-                        .map_err(|error| format!("the record's name held part of one: {error}"))?;
+                    store.group().map_err(|error| {
+                        format!("the reader did not find a whole record: {error}")
+                    })?;
                     reads += 1;
                     if reads == 1 {
                         let _ = reading.send(());
@@ -1650,6 +1680,76 @@ mod tests {
                 .join()
                 .expect("the opener ran")
                 .expect("the opener read the record");
+            assert_eq!(written.machine_id, into);
+            assert_eq!(read, written);
+        });
+    }
+
+    /// KR-REQ-03.07: a read whose first look at the record's name finds nothing is not told the
+    /// record is missing while a step of this process is replacing it. Windows can answer so for an
+    /// instant while a rename replaces a name, so the reader waits for the step, which holds the
+    /// writer lock until the new record has its name, and reads again. The step is held just before
+    /// its rename; the reader says when it has come to the lock and that it found the lock held.
+    #[test]
+    fn a_read_that_finds_no_record_waits_for_the_step_replacing_it() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let before = store.group().expect("reads the group");
+        let (arrived, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        seam::register(
+            &environment.record(),
+            Boundary::Flushed,
+            Interruption::Pause {
+                arrived,
+                resume: resumed,
+            },
+        );
+        let resume = Resume(resume);
+        let into = some_group();
+        let environment = &environment;
+        std::thread::scope(|scope| {
+            let step = scope.spawn(|| {
+                store.join(
+                    &environment.lock,
+                    into,
+                    before.expected(),
+                    &approval(),
+                    2_000,
+                )
+            });
+            arrival
+                .recv_timeout(WAIT)
+                .expect("the step reached its publication");
+            // Asked only now, so that the lookup which finds nothing is the reader's.
+            seam::resolve_nothing_once(&environment.record());
+            let (told, locking) = mpsc::channel();
+            seam::watch_lock(&environment.record(), told);
+            let reader = scope.spawn(|| store.group());
+            let holder = locking.recv_timeout(WAIT).unwrap_or_else(|_| {
+                panic!(
+                    "the reader did not come to the writer lock; it {}",
+                    if reader.is_finished() {
+                        "answered without waiting for the step"
+                    } else {
+                        "is still reading"
+                    }
+                )
+            });
+            assert_eq!(
+                holder,
+                Some(step.thread().id()),
+                "the reader did not find the writer lock held by the step that was publishing"
+            );
+            drop(resume);
+            let written = step
+                .join()
+                .expect("the step ran")
+                .expect("the step published its record");
+            let read = reader
+                .join()
+                .expect("the reader ran")
+                .expect("the reader found the record");
             assert_eq!(written.machine_id, into);
             assert_eq!(read, written);
         });
