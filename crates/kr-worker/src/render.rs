@@ -102,7 +102,8 @@ pub struct Carried {
     pub clipped_rows: usize,
     /// Soft-wrap markers, which a byte stream cannot set on a row it has drawn itself.
     pub soft_wraps: usize,
-    /// The keyboard negotiation of the buffer that is not showing.
+    /// Keyboard negotiation this restoration does not install: that of the buffer that is not
+    /// showing, and, for a terminal nobody was allowed to ask about its keyboard, that of both.
     pub other_keyboard: bool,
     /// Keyboard-stack entries the session holds, which this restoration does not install.
     pub keyboard_stack: usize,
@@ -562,7 +563,11 @@ impl Writer {
             // in an encoding their shell does not expect is the failure they cannot work around.
             // What the session holds is counted as something this restoration did not carry, which
             // is what keeps such an attachment on a projection.
-            if keyboard.modify_other_keys != 0 || kitty.flags.is_some() {
+            if keyboard.modify_other_keys != 0
+                || kitty.flags.is_some()
+                || other.flags.is_some()
+                || !other.stack.is_empty()
+            {
                 self.carried.other_keyboard = true;
             }
             self.carried.keyboard_stack += kitty.stack.len();
@@ -2337,6 +2342,32 @@ mod tests {
             Scope::WholeScreen,
         );
         assert_eq!(installed.bytes, b"\x1b[>4;2m\x1b[=5;1u".to_vec());
+    }
+
+    #[test]
+    fn a_terminal_that_was_asked_nothing_is_told_of_a_negotiation_only_the_other_buffer_holds() {
+        // Nothing is installed for such a terminal in either buffer, so what the buffer that is
+        // not showing holds is as much a loss as what the one that is showing holds.
+        let withheld = render(
+            &[RestoreOp::SetKeyboard {
+                keyboard: KeyboardSnapshot {
+                    modify_other_keys: 0,
+                    primary: KittyKeyboard {
+                        flags: None,
+                        stack: Vec::new(),
+                    },
+                    alternate: KittyKeyboard {
+                        flags: Some(1),
+                        stack: Vec::new(),
+                    },
+                },
+            }],
+            viewport(24, 80),
+            Keyboard::Withhold,
+            Scope::WholeScreen,
+        );
+        assert!(withheld.bytes.is_empty());
+        assert!(withheld.carried.other_keyboard);
     }
 
     #[test]
