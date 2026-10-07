@@ -771,8 +771,8 @@ mod windows {
         GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
     };
     use windows_sys::Win32::Foundation::{
-        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, UNICODE_STRING,
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
+        STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -812,8 +812,8 @@ mod windows {
     /// reparse-point option opens a link itself rather than following it, so the caller refuses one
     /// by its attributes rather than being sent wherever it points.
     ///
-    /// `None` is a name that is not there, which a caller reads as no descriptor rather than a
-    /// failure.
+    /// `None` is a name that is not there, or whose removal is pending, which a caller reads as no
+    /// descriptor rather than a failure.
     ///
     /// [`openat`]: https://man7.org/linux/man-pages/man2/openat.2.html
     ///
@@ -883,7 +883,13 @@ mod windows {
                 std::fs::File::from_raw_handle(handle.cast())
             }));
         }
-        if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        // A name whose removal is pending is retired: it stays under its name until the last
+        // handle on it is closed, nothing can open it meanwhile, and the Win32 code for that is the
+        // one a refusing access list gets, so it is told apart here and not after the mapping.
+        if status == STATUS_OBJECT_NAME_NOT_FOUND
+            || status == STATUS_OBJECT_PATH_NOT_FOUND
+            || status == STATUS_DELETE_PENDING
+        {
             return Ok(None);
         }
         // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
