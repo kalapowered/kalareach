@@ -968,6 +968,14 @@ pub use crate::windows::conpty::OutputWaiter;
 /// before the closing quote as `2n`, and a run anywhere else exactly as it is. A path is mostly
 /// backslashes, so a version of this that dropped them would start the wrong program or none.
 ///
+/// That is the reading of the Microsoft C runtime, which almost every Windows program uses, and a
+/// program that takes its command line apart itself can read it otherwise. A program built on
+/// MSYS2, such as the `sh.exe` Git for Windows installs, reads a pair of backslashes inside quotes
+/// as one backslash unless a quotation mark follows, so an argument that is quoted and holds `\\`
+/// reaches it with one where two were given. An argument that is not quoted, and one whose
+/// backslashes come before a quotation mark or before the closing quote, is read the same by both.
+/// A script for such a shell therefore writes a backslash it needs as the octal escape `\134`.
+///
 /// It lives here rather than beside the console it is for, so that it can be tested on a machine
 /// that cannot run Windows: the rule is a string rule and has nothing of the platform in it. The
 /// control daemon's Windows supervisor quotes the command its scheduled task runs with it too, so
