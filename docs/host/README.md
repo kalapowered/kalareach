@@ -65,8 +65,9 @@ holds that group enabled as an owner, as an elevated administrator's token does 
 owner it was given: a shell of Git for Windows gives its processes the user as default owner, and
 a tree or a pipe an elevated process made is still that administrator's own. An account that
 already holds the machine that way is not something these checks keep out, and a token filtered
-down to what a standard user holds trusts no pipe that group owns. The state and runtime
-directories are checked by the same rule. A name another account created first while the host was
+down to what a standard user holds trusts no pipe that group owns. An entry for an identifier
+that no account on the machine holds, such as a copied image carries, is refused like any other
+account. The state and runtime directories are checked by the same rule. A name another account created first while the host was
 not listening is refused rather than served or trusted, and the host does not start on a name
 another account holds.
 
