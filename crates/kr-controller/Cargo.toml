@@ -88,7 +88,8 @@ rustix = { workspace = true, features = ["fs", "process"] }
 exacl.workspace = true
 
 [dev-dependencies]
-# The tests act exactly when a held rename was refused, through the retry's own seam.
+# The tests act exactly when a held rename was refused, through the retry's own seam, and make the
+# flush of a directory fail after a rename.
 kr-flush = { workspace = true, features = ["testing"] }
 # This crate's own tests, with the pause above compiled in.
 kr-controller = { path = ".", features = ["testing"] }

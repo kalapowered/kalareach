@@ -65,7 +65,7 @@ fn assert_closed(answer: &SessionCreateResult, world: &Served) {
     );
     assert!(
         !answer.deduplicated,
-        "it is the first answer to this create"
+        "an answer made for the create itself is not a replay of it"
     );
 }
 
