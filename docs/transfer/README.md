@@ -741,9 +741,10 @@ because the caller should wait rather than change its request.
 
 ## What a caller builds on
 
-The Rust API is `kr_transfer`. A host opens `TransferService::open(&environment_paths)`, calls
-`recover()` before serving anything, and drives the methods above; the control daemon does exactly
-that in `crates/kr-controller/src/transfer.rs`. A client that wants a file on disk uses
+The Rust API is `kr_transfer`. A host opens `TransferService::with_clock(&environment_paths, clock)`
+with a clock it can vouch for, calls `recover()` before serving anything, and drives the methods
+above; the control daemon does exactly that in `crates/kr-controller/src/transfer.rs`, with its own
+wall clock. A client that wants a file on disk uses
 `DownloadWriter`, which never holds more than one chunk in memory. A caller that needs a readable
 source registers it with `register_scope` and addresses files beneath it by relative name.
 

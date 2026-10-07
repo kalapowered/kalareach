@@ -19,6 +19,8 @@ use kr_ipc::testing::volumes;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::transfer::{DownloadBeginParams, DownloadSource};
+#[cfg(unix)]
+use kr_transfer::SystemClock;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use kr_transfer::{AuthorisedDirectory, Escape};
 use kr_transfer::{ManualClock, RecordedIdentity, Settled, StagingArea, Store, TransferService};
@@ -68,7 +70,10 @@ fn a_directory_that_took_the_staging_directorys_place_gets_nothing_made_in_it() 
     use std::os::unix::fs::DirBuilderExt as _;
 
     let host = kr_ipc::testing::TempHost::create();
-    drop(TransferService::open(&host.environment()).expect("opens and records"));
+    drop(
+        TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
+            .expect("opens and records"),
+    );
     let name: String = journal(&host)
         .query_row("SELECT staging_name FROM environment", [], |row| row.get(0))
         .expect("the journal records the staging directory");
@@ -81,7 +86,7 @@ fn a_directory_that_took_the_staging_directorys_place_gets_nothing_made_in_it() 
         .create(&staging)
         .expect("another directory at the name");
 
-    let refusal = TransferService::open(&host.environment())
+    let refusal = TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
         .expect_err("another directory is not the recorded staging directory");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     assert_eq!(
@@ -103,14 +108,17 @@ fn a_directory_that_took_the_staging_directorys_place_gets_nothing_made_in_it() 
 #[test]
 fn a_staging_directory_that_is_gone_is_not_made_again_while_the_journal_names_it() {
     let host = kr_ipc::testing::TempHost::create();
-    drop(TransferService::open(&host.environment()).expect("opens and records"));
+    drop(
+        TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
+            .expect("opens and records"),
+    );
     let name: String = journal(&host)
         .query_row("SELECT staging_name FROM environment", [], |row| row.get(0))
         .expect("the journal records the staging directory");
     let staging = StagingArea::root_of(&host.environment()).join(&name);
     std::fs::remove_dir_all(&staging).expect("the staging directory is removed");
 
-    let refusal = TransferService::open(&host.environment())
+    let refusal = TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
         .expect_err("a name that holds nothing is not the recorded staging directory");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     assert!(
@@ -140,9 +148,12 @@ fn a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers() {
             // The service records its staging directory on the first filesystem, and accepts it
             // there again.
             let host = kr_ipc::testing::TempHost::create_in(first.at());
-            drop(TransferService::open(&host.environment()).expect("opens and records"));
             drop(
-                TransferService::open(&host.environment())
+                TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
+                    .expect("opens and records"),
+            );
+            drop(
+                TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
                     .expect("the recorded filesystem accepts its own directory again"),
             );
             let kept = scratch.path().join("kept");
@@ -173,7 +184,7 @@ fn a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers() {
                 )
                 .expect("rewrites the numbers");
 
-            let refusal = TransferService::open(&host.environment())
+            let refusal = TransferService::with_clock(&host.environment(), Arc::new(SystemClock))
                 .expect_err("another filesystem is not the one the directory was recorded on");
             assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
             second.detach();
