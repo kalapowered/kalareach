@@ -1334,6 +1334,10 @@ async fn links_to_one_target_with_different_identifiers_reach_a_client_as_differ
 /// A cursor saved while the locking shift selected the shift-out set is sent with that shift, which
 /// is not the shift the session is in now: a restore puts the one back that was saved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_saved_cursor_reaches_a_client_with_the_shift_it_was_saved_under() {
     let host = host(
         "stty -echo -echonl || exit 1; \
@@ -2204,6 +2208,10 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
 /// it on the stream. The cursor itself has no wrap pending in either case: the save is followed by
 /// a move, so only the saved one differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_saved_cursor_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_projection() {
     let narrow = Dimensions::new(4, 5);
     for (printed, expected) in [
@@ -2302,6 +2310,10 @@ async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_scre
 /// when it returns after the application has cleared the screen, with no output from the
 /// application to prompt it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_screen_can_be_carried() {
     let narrow = Dimensions::new(4, 5);
     let smaller = Dimensions::new(3, 5);
@@ -2363,6 +2375,10 @@ async fn a_terminal_back_at_the_session_size_is_handed_the_stream_when_its_scree
 /// when it looks above the live page and comes back, the report says the wrapped line keeps it
 /// off the stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_holds() {
     let narrow = Dimensions::new(4, 5);
     let host = host_with(
@@ -2420,6 +2436,10 @@ async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_h
 /// reports now, and the line the application wrapped after that reached it as bytes: the report
 /// says it is still on the stream, and no resynchronisation follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console draws the screen itself, so the output the session retains is its rendering and not the sequences the application wrote"
+)]
 async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_drawn() {
     let tall = Dimensions::new(4, 5);
     let short = Dimensions::new(4, 3);
