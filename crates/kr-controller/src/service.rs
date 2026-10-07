@@ -1019,7 +1019,7 @@ mod a_publication_that_outlives_its_request;
 #[cfg(test)]
 mod a_create_whose_session_closed;
 
-/// A descriptor write that the daemon's runtime ends the wait for.
+/// A descriptor write that the task waiting for it stops waiting for.
 #[cfg(test)]
 mod a_write_that_outlives_its_daemon;
 
