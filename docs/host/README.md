@@ -1402,11 +1402,15 @@ drive it, which the runner can do. The two bridge steps need neither a console n
 editor: a named pipe has no terminal behind it, and the PowerShell suite loads the module files
 from the checkout and drives the handshake against a real endpoint.
 
-The worker's other integration suites are compiled here and not run. They drive a session the way a
-Unix pseudo-terminal behaves, and on Windows a number of them fail on that difference rather than
-on the code they are checking; running them and calling the result a Windows failure would say
-something nobody has established. One test in the worker's service is skipped here for its own
-stated reason, which `cargo test` prints.
+The worker's integration suites that the runner does not run are compiled and not run. They drive a
+session the way a Unix pseudo-terminal behaves, and on Windows a number of them fail on that
+difference rather than on the code they are checking. Each of the suites that the runner does run
+leaves out the cases that need a Unix terminal, a Unix shell package or Git: they are ignored on
+Windows, and running `cargo test` shows why. A Windows pseudo-console draws the screen itself, so
+what a session retains is the console's rendering and not the sequences the application wrote,
+which is what the terminal cases read. Cases that need Git are ignored because this platform runs
+no Git. Finally, one test in the worker's service is skipped on this platform for its own stated
+reason, which `cargo test` prints.
 
 What the runner cannot do is the release matrix. It has no interactive logon, no window manager, no
 IME and no physical keyboard, so nothing about Windows Terminal, a real desktop session, IME
@@ -1445,11 +1449,13 @@ Every command in that list needs the developer environment for the target loaded
 The runner runs the worker's suites one at a time (its library, and the `windows`,
 `windows_endpoint`, `listener`, `transport`, `broker`, `gateway`, `agent_service`,
 `windows_inheritance`, `command_backends`, `windows_vendor`, `launch_probe`, `question_bindings`,
-`questions_answer`, `authority`, `persistence`, `host`, `binder`, `channels`, `connectors` and
+`questions_answer`, `authority`, `persistence`, `snapshot`, `terminal`, `session`, `local_owner`,
+`input_lease`, `fence`, `desktop`, `performance`, `host`, `binder`, `channels`, `connectors` and
 `attention_source` suites) and does not run `cargo test -p kr-worker` with every suite, because the
 worker's other integration suites are the ones described above as compiled and not run. It also
-runs the protocol's library and a named set of the control daemon's cases and suites, in steps of
-the workflow.
+runs the protocol's library and a named set of the control daemon's cases and suites, among them
+its `project`, `network_project`, `shell`, `privacy` and `descriptions` suites, in steps of the
+workflow.
 Nothing has to be set for the link: `.cargo/config.toml` carries what the MSVC targets need, which
 is to leave the static C runtime out of the image and to stop the linker reporting the vendored C
 library's missing debug database once per object file. Setting `RUSTFLAGS` in the environment
