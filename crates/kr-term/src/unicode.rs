@@ -114,10 +114,8 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          since, which xterm gives back there. A soft reset needs no rule of its own for a direct \
          terminal: every soft reset redraws each direct attachment from the canonical screen, an \
          attachment redrawn with a wrap pending is shown a projection, and it is handed the \
-         stream again once the screen can be carried. The only soft resets a terminal reads are \
-         the restoration's own, which follow a carriage return and a plain rendition, so xterm's \
-         reset has no wrap to keep and no faint, crossed-out or doubly underlined state to leave \
-         set.",
+         stream again once the screen can be carried. A restoration sends no soft reset of \
+         its own.",
         "ESC 8 restores a pending wrap. The library saves the wrap with the cursor and puts it \
          back, as xterm does, where Terminal.app and iTerm2 restore the position and not the \
          wrap, so the next character lands on the last column and not on the row below. A \

@@ -208,6 +208,13 @@ impl Attachment {
 /// outside it is projected. `TERM=dumb` and `TERM=vt100` are outside it because they do not
 /// implement that entry at all.
 ///
+/// One thing has been established terminal by terminal: what a restoration asks of the terminal it
+/// draws. xterm, tmux and GNU screen were run headless, and kitty, WezTerm, Alacritty, foot and
+/// Ghostty were read at a pinned release; the terminal reference lists what each does with the
+/// sequences a restoration writes. They treat a soft reset in five different ways, so a restoration
+/// sends none and writes the state it draws under instead. A terminal joins this list only with
+/// that established for it.
+///
 /// A name reaching here is the client's own report of what it probed, which is a claim rather than
 /// a measurement: `TERM` names a terminfo entry, not a build or a configuration of it.
 pub const QUALIFIED_TERMINALS: &[&str] = &[

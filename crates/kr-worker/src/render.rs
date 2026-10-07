@@ -26,30 +26,33 @@
 //! line-feed/new-line mode and shift-out off on some terminals. So the switches come before
 //! anything that would be undone, and what they leave saved is what the session has saved.
 //!
-//! xterm keeps one saved cursor for each buffer. Its soft reset saves a fresh one in the buffer
-//! that is showing and leaves the other alone, and `?1049h` saves one in the buffer that is showing
-//! when it comes. A terminal can be showing either buffer when a restoration begins, and the one it
-//! is not showing can hold a cursor an earlier application saved there, so a restoration begins by
-//! resetting the terminal in each buffer, which leaves both fresh whichever it started in. Each
-//! reset is followed by a move home, so a terminal that ignores the reset still saves the plain
-//! state at the next switch. A reset makes the cursor show, so the cursor is hidden again after
-//! every reset and is shown, or left hidden, only by the cursor's own operation at the end: nobody
-//! watches it travel across the repaint.
+//! A restoration never sends a soft reset, because terminals disagree about what one does. xterm
+//! resets origin mode, the scroll region and the character sets, and saves a fresh cursor in the
+//! buffer that is showing. Alacritty, Ghostty, tmux and GNU screen ignore it, so they keep whatever
+//! origin mode, region and character set an earlier application left. foot keeps origin mode and
+//! every saved cursor, and kitty and foot empty the keyboard stack, which belongs to the person's
+//! other programs and not to this session. So every part of the state a restoration draws under is
+//! written instead: the cursor hidden, the plain rendition, no open link, origin mode and left and
+//! right margins off, the whole screen as the scroll region, ASCII in `G0` and `G1` with `G0`
+//! selected, the default cursor shape, and the cursor at home. Then `DECSC` saves that state.
 //!
-//! A soft reset does not always close a hyperlink, and a switch can give back a link the terminal
-//! saved with its cursor, so the hyperlink is closed after every switch, and the pen is taken as
-//! unknown after one. The stream the terminal was handed can have left a link open, and one the
-//! writer did not open would otherwise attach to the first cells it draws.
+//! The terminal can be showing either buffer when a restoration begins, and the buffer it is not
+//! showing can hold a cursor an earlier application saved there. A restore that comes before any
+//! save of the application's would go where that cursor was. So the plain state is saved where the
+//! terminal stands, in the alternate buffer and then in the primary one, which leaves both saved
+//! cursors plain whichever it started in. The cursor is hidden at the start of each visit and is
+//! shown, or left hidden, only by the cursor's own operation at the end: nobody watches it travel
+//! across the repaint.
+//!
+//! A switch can give back a link the terminal saved with its cursor, so the hyperlink is closed
+//! after every switch, and the pen is taken as unknown after one. The stream the terminal was
+//! handed can have left a link open, and one the writer did not open would otherwise attach to the
+//! first cells it draws.
 //!
 //! When the primary buffer is the one that is showing, the other buffer is painted right after
-//! those resets, and the reset is repeated: the repeat forgets the cursor that entering the other
-//! buffer saved, as a session that never saved one has none. When the alternate buffer is showing,
-//! the switch back into it saves the plain state.
-//!
-//! Each soft reset comes after a carriage return and a plain rendition. They are the only soft
-//! resets a direct terminal reads, and xterm's saves a fresh cursor that keeps a wrap the terminal
-//! had pending and leaves faint, crossed-out and doubly underlined set; the return and the plain
-//! rendition leave it nothing to keep.
+//! those saves, and the plain state is saved again: entering the other buffer saved a cursor, which
+//! a session that never saved one has no counterpart of. When the alternate buffer is showing, the
+//! switch back into it saves the plain state.
 //!
 //! What a byte stream still cannot carry is named here rather than approximated, and every one of
 //! them is counted in [`Restoration::carried`] rather than left for a caller to discover:
@@ -316,18 +319,19 @@ impl Writer {
 
     fn apply(&mut self, operation: &RestoreOp) {
         match operation {
-            // A soft reset puts the terminal into a state this restoration then describes
-            // completely. It is not a hard reset: that would clear the scrollback the person can
-            // still scroll back through, and reset a palette the next operation sets anyway.
+            // The plain state is written, never asked of the terminal's reset. A hard reset would
+            // clear the scrollback the person can still scroll back through, a soft reset would
+            // take the keyboard stack of some terminals with it, and the operations that follow
+            // describe everything else completely.
             RestoreOp::ResetProjection { .. } => {
-                self.reset_both_buffers();
+                self.save_plain_state_in_both_buffers();
                 if self.selected == ActiveBuffer::Primary {
-                    // The other buffer is painted from here, in the terminal the reset has just
-                    // put in order, and the reset is repeated: it forgets the cursor that going
-                    // into the other buffer saved, which the session has no counterpart of.
+                    // The other buffer is painted from here, in the plain state, and that state is
+                    // saved again: going into the other buffer saved a cursor, which the session
+                    // has no counterpart of.
                     if !self.inactive.is_empty() {
                         self.paint_inactive_buffer();
-                        self.soft_reset();
+                        self.save_plain_state();
                     }
                 }
                 self.erase(b"2J");
@@ -430,51 +434,63 @@ impl Writer {
         }
     }
 
-    /// Writes a soft reset with nothing in front of it for xterm's reset to keep, and then hides
-    /// the cursor.
+    /// Puts the terminal in the plain state a restoration draws under, and leaves the cursor at
+    /// home with the cursor hidden.
     ///
-    /// A restoration's resets are the only ones a direct terminal reads, because the application's
-    /// own make every direct terminal begin again rather than reaching it. xterm's reset saves a
-    /// fresh cursor at home that keeps any wrap the terminal had pending, and it leaves faint,
-    /// crossed-out and doubly underlined set. A return clears the wrap and a plain rendition
-    /// clears the three, both before the reset, so what the reset saves and the pen it leaves are
-    /// what this writer says they are.
+    /// Every part of that state is written. None of it is left to a terminal's soft reset, which
+    /// terminals disagree about: xterm resets origin mode, the scroll region, the character sets
+    /// and the saved cursor of the buffer that shows; Alacritty, Ghostty, tmux and GNU screen
+    /// ignore it; foot leaves origin mode and every saved cursor as they were; kitty and foot also
+    /// empty the keyboard stack, and foot the title stack, which are the person's own and not the
+    /// session's to take. A restoration that depended on the reset would draw into origin mode, a
+    /// region or a character set an earlier application left behind on the first group of
+    /// terminals, and would change the keyboard on the second.
     ///
-    /// The reset also makes the cursor show. The cursor's own operation decides whether it does,
-    /// and it comes last, so the cursor is hidden again at once and stays hidden while rows are
-    /// drawn.
-    fn soft_reset(&mut self) {
-        self.out.push(b'\r');
-        self.csi(b"0m");
-        self.csi(b"!p");
+    /// The cursor is hidden first, so nobody watches it travel. The rendition and the link are the
+    /// plain ones, origin mode and left and right margins are off, the scroll region is the whole
+    /// screen, `G0` and `G1` are ASCII with `G0` in use, and the cursor shape is the default.
+    /// The cursor then goes home, which also ends a pending wrap.
+    fn plain_state(&mut self) {
         self.csi(b"?25l");
+        self.csi(b"0m");
         self.pen = Some(Rendition::default());
+        self.close_link();
+        self.csi(b"?6l");
+        self.csi(b"?69l");
+        self.csi(b"r");
+        self.out.extend_from_slice(b"\x1b(B\x1b)B\x0f");
+        self.csi(b"0 q");
+        self.csi(b"H");
     }
 
-    /// Puts both buffers' saved cursors in a state this writer knows.
+    /// Puts the terminal in the plain state and saves it, in the buffer that is showing.
     ///
-    /// xterm's soft reset saves a fresh cursor only in the buffer that is showing, and `?1049h`
-    /// saves one in the buffer that is showing when it comes, whichever that is. The terminal
-    /// shows either buffer when a restoration begins, and the buffer it is not showing can hold
-    /// a cursor an earlier application saved there, which the session knows nothing of: a restore
-    /// that comes before any save of the application's would go where that cursor was. So the
-    /// terminal is reset where it stands, in the alternate buffer and then in the primary one,
-    /// which leaves both slots fresh and the terminal in the primary buffer whichever it started
-    /// in. The cursor saved on the way into the alternate buffer is the first thing the primary
-    /// buffer's reset forgets.
+    /// What `DECSC` saves is what a `DECRC` with no save of the application's in between puts
+    /// back, and a session that has saved no cursor puts back the plain state at home. Saving it
+    /// is also what makes a terminal that keeps a saved cursor through everything else, or ignores
+    /// the soft reset, hold the session's cursor and not an earlier application's.
+    fn save_plain_state(&mut self) {
+        self.plain_state();
+        self.out.push(ESC);
+        self.out.push(b'7');
+    }
+
+    /// Saves the plain state in both buffers' saved cursors, and leaves the primary buffer showing.
     ///
-    /// Each reset is followed by a move home. A terminal that ignores the reset has nothing else
-    /// to make what the next switch saves the plain state, and the switch saves the position it
-    /// finds.
-    fn reset_both_buffers(&mut self) {
-        self.soft_reset();
-        self.csi(b"H");
+    /// The terminal can be showing either buffer when a restoration begins, and the one it is not
+    /// showing can hold a cursor an earlier application saved there, which the session knows
+    /// nothing of: a restore that comes before any save of the application's would go where that
+    /// cursor was. So the state is saved where the terminal stands, in the alternate buffer and
+    /// then in the primary one, which leaves both saved cursors plain whichever buffer it started
+    /// in. A terminal that keeps one saved cursor for both buffers holds the last of them, and a
+    /// terminal that has no alternate buffer, or does not switch to it, holds the same state three
+    /// times.
+    fn save_plain_state_in_both_buffers(&mut self) {
+        self.save_plain_state();
         self.switch_buffer(true);
-        self.soft_reset();
-        self.csi(b"H");
+        self.save_plain_state();
         self.switch_buffer(false);
-        self.soft_reset();
-        self.csi(b"H");
+        self.save_plain_state();
     }
 
     /// Writes one switch between the buffers, and forgets what this writer knew of the pen and the
@@ -1572,7 +1588,6 @@ mod tests {
             let sequence = &bytes[at..=end];
             match bytes[end] {
                 b'm' => plain = sequence == b"\x1b[0m",
-                b'p' if sequence == b"\x1b[!p" => plain = true,
                 b'K' | b'J' => {
                     erases += 1;
                     assert!(
@@ -1807,21 +1822,44 @@ mod tests {
         );
     }
 
-    /// A direct terminal reads no soft reset but the restoration's own, so what xterm's reset
-    /// leaves is what the restoration has to take away before it: the reset saves a fresh cursor
-    /// that keeps a wrap the terminal had pending, and it leaves faint, crossed-out and doubly
-    /// underlined set. A return clears the wrap and a plain rendition clears the three, so every
-    /// reset has both in front of it, whichever buffer is showing.
+    /// What a restoration writes to put a terminal in the plain state, in the order it writes it:
+    /// the cursor hidden, the plain rendition, no link, no origin mode, no left and right margins,
+    /// the whole screen as the region, ASCII in both sets with the first in use, the default
+    /// shape, and home.
+    fn plain() -> Vec<u8> {
+        [
+            &b"\x1b[?25l\x1b[0m"[..],
+            b"\x1b]8;;\x1b\\",
+            b"\x1b[?6l\x1b[?69l\x1b[r",
+            b"\x1b(B\x1b)B\x0f",
+            b"\x1b[0 q\x1b[H",
+        ]
+        .concat()
+    }
+
+    /// A terminal can start in any state an earlier application left, and terminals disagree about
+    /// what a soft reset puts right, so none is sent. What the restoration draws under is written
+    /// instead and saved with `DECSC`, in the buffer the terminal shows and in the other one, and
+    /// the terminal is left showing the primary buffer, whichever it started in. Each switch of
+    /// buffer is followed by the link being closed again, because a switch can give one back.
     #[test]
-    fn every_soft_reset_a_restoration_makes_comes_after_a_return_and_a_plain_rendition() {
+    fn a_restoration_begins_by_saving_the_plain_state_in_each_buffer() {
+        let expected = [
+            &plain()[..],
+            b"\x1b7",
+            b"\x1b[?1049h\x1b]8;;\x1b\\",
+            &plain()[..],
+            b"\x1b7",
+            b"\x1b[?1049l\x1b]8;;\x1b\\",
+            &plain()[..],
+            b"\x1b7",
+        ]
+        .concat();
         for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
             let rendered = render(
                 &[
                     RestoreOp::ResetProjection { generation: 1 },
                     RestoreOp::SelectBuffer { buffer: active },
-                    RestoreOp::PaintInactiveRow {
-                        row: row(0, 0, "other"),
-                    },
                     RestoreOp::PaintRow {
                         row: row(0, 0, "showing"),
                     },
@@ -1830,31 +1868,23 @@ mod tests {
                 Keyboard::Install,
                 Scope::WholeScreen,
             );
-            let resets: Vec<usize> = rendered
-                .bytes
-                .windows(4)
-                .enumerate()
-                .filter(|(_, window)| *window == b"\x1b[!p")
-                .map(|(at, _)| at)
-                .collect();
             assert!(
-                !resets.is_empty(),
-                "{active:?} draws a screen after a reset"
+                rendered.bytes.starts_with(&expected),
+                "{active:?}: {:?}",
+                String::from_utf8_lossy(&rendered.bytes)
             );
-            for at in resets {
-                assert!(
-                    rendered.bytes[..at].ends_with(b"\r\x1b[0m"),
-                    "a reset at byte {at} with {active:?} showing follows neither: {:?}",
-                    String::from_utf8_lossy(&rendered.bytes[at.saturating_sub(12)..at + 4])
-                );
-            }
+            assert!(
+                !rendered.bytes.windows(4).any(|window| window == b"\x1b[!p"),
+                "{active:?}: no soft reset is sent"
+            );
         }
     }
 
     #[test]
-    fn a_cursor_saved_going_into_the_other_buffer_is_forgotten_when_the_primary_buffer_shows() {
-        // The session has no saved cursor, so the terminal must not be left holding one: the soft
-        // reset forgets what entering the other buffer saved, and it comes after the last such entry.
+    fn a_cursor_saved_going_into_the_other_buffer_is_replaced_when_the_primary_buffer_shows() {
+        // The session has no saved cursor, so the terminal must not be left holding the one that
+        // entering the other buffer saved: the plain state is saved again, after the last such
+        // entry and before the screen that shows is drawn.
         let operations = vec![
             RestoreOp::ResetProjection { generation: 1 },
             RestoreOp::SelectBuffer {
@@ -1880,15 +1910,16 @@ mod tests {
             .map(|(at, _, _)| at)
             .max()
             .expect("the other buffer is entered");
-        let last_reset = text.rfind("\x1b[!p").expect("a soft reset");
-        assert!(last_entry < last_reset, "{text:?}");
+        let last_save = text.rfind("\x1b7").expect("a save of the cursor");
+        assert!(last_entry < last_save, "{text:?}");
+        assert!(text.find("other").expect("painted") < last_save, "{text:?}");
         assert!(
-            text.find("other").expect("painted") < last_reset,
+            text.find("showing").expect("painted") > last_save,
             "{text:?}"
         );
         assert!(
-            text.find("showing").expect("painted") > last_reset,
-            "{text:?}"
+            text[..last_save].ends_with("\x1b[H"),
+            "the save is made at home: {text:?}"
         );
     }
 

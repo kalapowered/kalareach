@@ -47,11 +47,24 @@ pub struct Performed {
     pub replies: usize,
 }
 
+/// What an earlier application leaves in a terminal it was running in: a saved cursor in each
+/// buffer, a scroll region with origin mode on, DEC line drawing in both character sets with the
+/// second in use, a pen and insert mode. Each part is one a restoration is drawn over if it does
+/// not put it right.
+const LEFT_BEHIND: &[u8] = b"\x1b[3;3H\x1b7\x1b[?47h\x1b[2;2H\x1b7\x1b[?47l\
+    \x1b[2;3r\x1b[?6h\x1b(0\x1b)0\x0e\x1b[1;31;44m\x1b[4h";
+
+/// The soft reset, which some terminals ignore.
+const SOFT_RESET: &[u8] = b"\x1b[!p";
+
 /// A terminal of the xterm family, modelled on the profile's engine.
 pub struct Terminal {
     engine: Engine,
     /// The start of a mode-47 switch the last feed ended inside, held until the rest arrives.
     held: Vec<u8>,
+    /// Whether a soft reset sent to it does nothing, as it does in Alacritty, Ghostty, tmux and
+    /// GNU screen.
+    ignores_soft_reset: bool,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -94,7 +107,27 @@ impl Terminal {
         Ok(Self {
             engine,
             held: Vec::new(),
+            ignores_soft_reset: false,
         })
+    }
+
+    /// A terminal of `columns` by `rows` that an earlier application has been running in, and that
+    /// ignores the soft reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the engine refused about the size, or about what was left in it.
+    pub fn left_by_an_application(columns: u16, rows: u16) -> Result<Self, String> {
+        let mut terminal = Self::new(columns, rows)?;
+        let performed = terminal.feed(LEFT_BEHIND);
+        if !performed.refused.is_empty() {
+            return Err(format!(
+                "what an application leaves behind was refused: {:?}",
+                performed.refused
+            ));
+        }
+        terminal.ignores_soft_reset = true;
+        Ok(terminal)
     }
 
     /// Sends the terminal `bytes`, and says what it did.
@@ -134,6 +167,13 @@ impl Terminal {
     }
 
     fn send(&mut self, bytes: &[u8], performed: &mut Performed) {
+        let kept;
+        let bytes = if self.ignores_soft_reset {
+            kept = without_soft_resets(bytes);
+            &kept[..]
+        } else {
+            bytes
+        };
         if bytes.is_empty() {
             return;
         }
@@ -281,6 +321,21 @@ impl Terminal {
     pub fn view(&mut self) -> Result<View, String> {
         View::of_engine(&mut self.engine, 0)
     }
+}
+
+/// `bytes` without the soft resets in them.
+fn without_soft_resets(bytes: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(SOFT_RESET) {
+            at += SOFT_RESET.len();
+        } else {
+            kept.push(bytes[at]);
+            at += 1;
+        }
+    }
+    kept
 }
 
 /// The sequence that designates the character set the library names `name` into G0 (`(`) or G1
