@@ -1000,6 +1000,10 @@ fn reaching(actions: &[ActionRight]) -> kr_protocol::pairing::ProposedGrant {
 /// output still arriving kept. A result of the generation before that comes back afterwards is
 /// recorded as a copy elsewhere, never as this host's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[cfg_attr(
+    windows,
+    ignore = "the worker's output cursor is compared with the bytes the shell wrote, and a Windows pseudo-console draws the output again"
+)]
 async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_subsystem_through_its_steps()
  {
     let environment = Environment::start().await;
@@ -1127,6 +1131,10 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
 /// as retained, not erased. Turning it off records the next generation, retention starts again
 /// from that point, and nothing omitted while it was on comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[cfg_attr(
+    windows,
+    ignore = "the worker's output cursor is compared with the bytes the shell wrote, and a Windows pseudo-console draws the output again"
+)]
 async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_is_listed() {
     let environment = Environment::start().await;
     let worker = &environment.worker;

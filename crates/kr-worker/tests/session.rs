@@ -219,7 +219,17 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let record = closure_record(&runtime, "the closure finishes").await;
     assert_eq!(record.session_id, session_id);
     assert_eq!(record.reason, ClosureReason::CloseRequested);
-    assert_eq!(record.terminated.len(), 1);
+    // A job object holds every process the shell started, and a process here does not replace
+    // itself by `exec` as a Unix process does, so the closure can name more than one.
+    if cfg!(windows) {
+        assert!(
+            !record.terminated.is_empty(),
+            "the closure names what it stopped: {:?}",
+            record.terminated
+        );
+    } else {
+        assert_eq!(record.terminated.len(), 1);
+    }
     assert_eq!(runtime.state(), SessionState::Closed);
     assert_eq!(runtime.session().summary().state, SessionState::Closed);
     let _ = record.ownership_coverage;
@@ -988,12 +998,20 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Unix terminal stops taking input while the application is not reading, which holds the paste this case takes over; a Windows pseudo-console takes it at once"
+)]
 async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() {
     // The end of the paste arrives in a frame of its own, behind the body.
     takeover_mid_paste(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Unix terminal stops taking input while the application is not reading, which holds the paste this case takes over; a Windows pseudo-console takes it at once"
+)]
 async fn a_takeover_closes_a_paste_whose_end_was_in_the_half_that_never_arrived() {
     // One frame carries the whole paste, start to end. The framer reads it as a paste that opened
     // and closed, so nothing about the batch's *final* framing says a terminator is needed; what
@@ -1333,6 +1351,10 @@ async fn a_geometry_the_session_budget_cannot_admit_is_refused_before_anything_m
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "this case counts every byte sent against those received and discarded, and a Windows pseudo-console adds sequences of its own to what it sends"
+)]
 async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
     // The receipt is a promise about what reached the application, so it has to be exact in both
     // directions: a byte counted as discarded must not arrive afterwards, and a byte that arrived
@@ -1835,10 +1857,20 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
     // as well: a subscriber that hears nothing for long enough stops listening, and the session
     // this test wants is one that is running something rather than one that has gone quiet.
     let host = kr_ipc::testing::TempHost::create();
+    // The process a record names is the operating system's own identifier. Where the shell's `$!`
+    // is a number of its own runtime's, which is so on Windows, the job's own identifier is read
+    // from the runtime's table of processes.
+    let job_identifier = if cfg!(windows) {
+        "$(cat /proc/$!/winpid)"
+    } else {
+        "$!"
+    };
     let config = configuration(
         &host,
-        "sleep 4 & printf 'kr-job %s\\n' \"$!\"; sleep 2; printf 'kr-waiting\\n'; wait; \
-         printf 'kr-reaped\\n'; exec cat",
+        &format!(
+            "sleep 4 & printf 'kr-job %s\\n' \"{job_identifier}\"; sleep 2; \
+             printf 'kr-waiting\\n'; wait; printf 'kr-reaped\\n'; exec cat"
+        ),
     );
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
@@ -1941,10 +1973,16 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
         !root.forced,
         "a shell that had already left was not forced to: {root:?}"
     );
+    // A terminal process group never claims complete coverage; a job object holds every process
+    // the shell started, so on this platform the boundary does.
     assert_eq!(
         record.ownership_coverage,
-        OwnershipCoverage::Incomplete,
-        "the boundary is a terminal process group, which never claims complete coverage"
+        if cfg!(windows) {
+            OwnershipCoverage::Complete
+        } else {
+            OwnershipCoverage::Incomplete
+        },
+        "the boundary is a terminal process group on a Unix host and a job object on Windows"
     );
     assert!(
         record.surviving.is_empty(),
