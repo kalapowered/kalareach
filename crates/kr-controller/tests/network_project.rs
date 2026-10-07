@@ -233,6 +233,10 @@ fn workspace_params(
 /// the other five are the next test. Each read is asked on both doors for the same subject and the
 /// two answers compared, because the answer must not depend on which door asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -434,6 +438,10 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
 /// that matters most here — the owner's own creation and removal still work while the device's are
 /// refused, which is the posture this product has always had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffected() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -611,6 +619,10 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
 /// can see afterwards says the same thing from the other side: no repository, no working copy and
 /// no directory appeared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_is_refused_all_five_repository_methods() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -778,6 +790,10 @@ async fn a_device_is_refused_all_five_repository_methods() {
 
 /// KR-REQ-23.42 and KR-REQ-23.43: A device with a grant for another environment or session sees narrowed lists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -910,6 +926,10 @@ async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
 /// A grant that covers the environment reads one working copy, and sees only the sessions its own
 /// selector admits bound to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_read_of_one_working_copy_carries_only_the_sessions_the_grant_admits() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -1000,6 +1020,10 @@ async fn a_read_of_one_working_copy_carries_only_the_sessions_the_grant_admits()
 
 /// KR-REQ-23.42 and KR-REQ-23.43: A device with an admitted environment but unadmitted session sees the workspace but narrowed bound sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_with_admitted_environment_and_unadmitted_session_sees_narrowed_bound_sessions() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -1137,6 +1161,10 @@ async fn a_device_without_session_view_is_refused_project_and_workspace_lists() 
 /// creation and the removal of a working copy. A grant that carries neither still reads, because
 /// the reads require no right of their own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_reaches_only_the_project_methods_its_grant_carries() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -1416,6 +1444,10 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
 /// entries. A cancellation of an operation another actor owns has no effect to observe either
 /// way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_performed_again() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -1529,6 +1561,10 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
 /// created between the two submissions for the reason the test above gives: it makes the record
 /// and another execution say different things.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_without_session_view_still_recovers_its_own_project_outcome() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -1928,6 +1964,10 @@ async fn read_and_materialise(
 /// `changeset.read` lists carry the form a device is shown. The control is the owner's own answer
 /// over its own socket, which names the directory it wrote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_host_path() {
     let mut recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
@@ -2029,6 +2069,10 @@ async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_ho
 /// Each case is one grant against the same two recorded versions, asked for the diff and for the
 /// materialisation, beside a control: the same request under a grant that reaches the version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     use kr_protocol::grant::{EnvironmentSelector, SessionSelector};
 
@@ -2203,6 +2247,10 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
 /// that names no number, which would be the second, is refused. The control is the grant over any
 /// session, which reads the latest and is told it is the second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
     use kr_protocol::grant::SessionSelector;
 
@@ -2288,6 +2336,10 @@ async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
 /// nothing about which working copies exist. The control is the same host serving a recorded
 /// version, which runs no Git.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
     let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
@@ -2398,6 +2450,10 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
 /// effect is the change-set module's own hold, which this door hands the connection's admission to
 /// and which `tests/changeset.rs` withdraws authority inside, through the owner's door.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_materialisation_asked_for_by_a_device_whose_authority_has_gone_is_not_performed() {
     let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
@@ -2474,6 +2530,10 @@ async fn a_materialisation_asked_for_by_a_device_whose_authority_has_gone_is_not
 /// under a revision that did not exist when the connection was authorised, and nothing the device
 /// then asks is performed. A connection authorised after the withdrawal is served, as the control.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_connection_authorised_before_authority_was_withdrawn_is_not_served_after_it() {
     let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
