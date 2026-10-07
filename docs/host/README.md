@@ -1405,12 +1405,15 @@ from the checkout and drives the handshake against a real endpoint.
 The worker's integration suites that the runner does not run are compiled and not run. They drive a
 session the way a Unix pseudo-terminal behaves, and on Windows a number of them fail on that
 difference rather than on the code they are checking. Each of the suites that the runner does run
-leaves out the cases that need a Unix terminal, a Unix shell package or Git: they are ignored on
-Windows, and running `cargo test` shows why. A Windows pseudo-console draws the screen itself, so
-what a session retains is the console's rendering and not the sequences the application wrote,
-which is what the terminal cases read. Cases that need Git are ignored because this platform runs
-no Git. Finally, one test in the worker's service is skipped on this platform for its own stated
-reason, which `cargo test` prints.
+leaves out the cases that need a Unix terminal, a Unix shell package or Git: those cases are
+ignored on Windows, and running `cargo test` prints the reason beside each one. A Windows
+pseudo-console draws the screen itself, so what a session retains is the console's rendering and
+not the sequences the application wrote. It also answers the terminal's queries itself, holds back
+an unfinished sequence and a lone Escape, and adds sequences of its own to what it sends, so the
+cases that read the application's output, the terminal's echo or its input behaviour are ignored
+for that. This platform runs no Git, so a case that needs a repository operation is ignored for
+that. One test in the worker's service is skipped on this platform for its own stated reason, which
+`cargo test` prints.
 
 What the runner cannot do is the release matrix. It has no interactive logon, no window manager, no
 IME and no physical keyboard, so nothing about Windows Terminal, a real desktop session, IME
