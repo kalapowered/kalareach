@@ -1,10 +1,11 @@
 name: Restore the cargo cache
 description: >-
   Restores the registry and the build output of the third-party crates that a run on the default
-  branch saved for this entry. A run on another branch that finds no cache of exactly its
-  dependencies takes the newest one of the same settings, so that only the crates that changed
-  are built again; a run on the default branch builds from nothing instead, which is what keeps
-  a cache from growing. The `cargo-cache-save` action saves one.
+  branch saved for this entry. A run that finds no cache of exactly its dependencies takes the
+  newest one of the same settings, so that only the crates that changed are built again. A run on
+  the default branch takes one of the same week only, so that what a cache holds is built again
+  from nothing every week: a cache that is restored and saved again only grows. The
+  `cargo-cache-save` action saves one.
 
 inputs:
   name:
@@ -36,6 +37,8 @@ runs:
         part="$(bash scripts/cargo-cache-key.sh)"
         echo "part=$part" >> "$GITHUB_OUTPUT"
         echo "settings=${part%%-*}" >> "$GITHUB_OUTPUT"
+        week="${part#*-}"
+        echo "week=${part%%-*}-${week%-*}" >> "$GITHUB_OUTPUT"
 
     - name: Restore
       id: restore
@@ -43,4 +46,4 @@ runs:
       with:
         path: ${{ inputs.paths }}
         key: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.part }}
-        restore-keys: ${{ github.ref != 'refs/heads/main' && format('cargo-v1-{0}-{1}-{2}-{3}-', inputs.name, runner.os, runner.arch, steps.key.outputs.settings) || '' }}
+        restore-keys: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && steps.key.outputs.week || steps.key.outputs.settings }}-
