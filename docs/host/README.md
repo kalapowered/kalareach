@@ -2151,14 +2151,14 @@ device it became and reads its own pairing.
 
 **The first owner.** A host starts with no owner. The first owner is established through local IPC
 under the logged-in account, by pairing the owner's first device with a personal owner grant: while
-the host has no owner, and only for that pairing, an owner confirmation may arrive on the
-`local_bootstrap_terminal` channel, signed with a key the local caller presents. That key proves
-possession and nothing else. The command line only answers such a challenge at an interactive
-controlling terminal outside a KalaReach session, which protects against an agent starting the
-ceremony by accident; it is not isolation from other code running under the same account. The
-commit that pairs the first owner device writes the owner record in the same transaction, and from
-then on the terminal channel is refused for good, even if every owner device is later revoked:
-revoking authority must never turn into a weaker way to confirm.
+the host has no owner, and only for that pairing and for establishing the host's clock, an owner
+confirmation may arrive on the `local_bootstrap_terminal` channel, signed with a key the local
+caller presents. That key proves possession and nothing else. The command line only answers such a
+challenge at an interactive controlling terminal outside a KalaReach session, which protects against
+an agent starting the ceremony by accident; it is not isolation from other code running under the
+same account. The commit that pairs the first owner device writes the owner record in the same
+transaction, and from then on the terminal channel is refused for good, even if every owner device
+is later revoked: revoking authority must never turn into a weaker way to confirm.
 
 **Owner confirmations.** Six actions need a fresh confirmation bound to the exact action. A caller
 asks with `owner.confirmation.request`, naming a subject; the host fills in the action, the digest,
@@ -2180,13 +2180,13 @@ Session, plugin and contact-tool channels are refused. Confirmations live for tw
 monotonic clock and end with the daemon.
 
 **One action identifier, one answer.** The five pairing mutations, `owner.confirmation.request`,
-`owner.confirmation.complete`, `pair.invite`, `pair.confirm` and `pair.cancel`, keep one record of
-the actions they answered, keyed by the verified caller and the action identifier, with the digest
-of the whole mutation and what it acted on. Each mutation writes its record in the transaction that
-writes its effect; an answer that changes nothing, such as a withdrawal of an invitation that had
-already ended, writes it before it is given. A repeat is answered from that record and only for the
-same payload: the identifier reused with another payload is `ID_CONFLICT`, whichever of the five
-methods it was first spent on, and nothing is done under it.
+`owner.confirmation.complete`, `pair.invite`, `pair.confirm` and `pair.cancel`, and
+`host.clock.establish` keep one record of the actions they answered, keyed by the verified caller
+and the action identifier, with the digest of the whole mutation and what it acted on. Each mutation
+writes its record in the transaction that writes its effect; an answer that changes nothing, such as
+a withdrawal of an invitation that had already ended, writes it before it is given. A repeat is
+answered from that record and only for the same payload: the identifier reused with another payload
+is `ID_CONFLICT`, whichever of these methods it was first spent on, and nothing is done under it.
 
 **Authority when an answer is spent.** An owner device's grant is in force under the same time
 contract the network admits devices under: a deadline anchored on the continuous clock, a wall
@@ -3833,6 +3833,8 @@ share. It projects its anchor on the continuous clock less 100 parts per million
 clock up to that fast never raises distrust. A rollback gains slack of the same rate times the time
 since the anchor was last raised: 6 ms for each minute, about a minute for a host nobody read for a
 week.
+
+The owner can end this with the single action `host.clock.establish`. If the daemon can spend this action with a confirmation from the owner on that very action, it will remove the distrust and both holds, move the mark and anchor to the time of the owner's confirmation, record the end of lost clock continuity for this boot, and record the action itself; all in one transaction. This transaction commits while the registration of the connection it came in on is held standing. If any part of that fails, nothing changes, and the same confirmation can be spent again. The daemon serves this action on a host that is not on a network. When the host has no owner, the confirmation can come from the person at the host's own terminal. When the host has an owner, only a ceremony on one of the owner's devices can confirm the action. If the action is done again, either on the same connection or a new one, the daemon will answer it from the record and will not establish it a second time. Expiration tombstones are not disturbed, nor deadlines from this boot, so a grant the host found over stays over.
 
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object

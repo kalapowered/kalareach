@@ -230,8 +230,9 @@ together: a channel beside an unsigned signature would be the signer's unauthent
 how the confirmation was obtained.
 
 A session, plugin or contact-tool channel is refused outright. The interactive controlling terminal
-is the initial local bootstrap exception and nothing more: afterwards a host with no
-user-presence-capable signer and no separately paired owner refuses rather than downgrading.
+is the initial local bootstrap exception: while a host has no owner it confirms the first owner and
+the host's clock, and nothing more. Afterwards a host with no user-presence-capable signer and no
+separately paired owner refuses rather than downgrading.
 
 The challenge is consumed exactly once, which is part of the host's acceptance record. Verification
 comes first and consumption second, so rubbish cannot burn an owner's outstanding challenge and a

@@ -27,6 +27,7 @@ worker directly for what a session owns.
 | `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
 | `kr host versions` | — | The releases this host keeps, and which one is current |
 | `kr host machine [join/merge/split/plan/finish/undo]` | — | Show the machine group an environment records for itself, take one owner-approved step that changes it, or keep a merge over several environments as a plan |
+| `kr host clock --establish` | — | Trust this host's clock again, as its owner |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -1264,8 +1265,9 @@ it: `kr pair invite --owner` asks them to type `pair` to issue the invitation, a
 confirm` asks them to type the verification value the new device shows. Both are read from the
 controlling terminal itself, not from standard input. `kr` then confirms on the host's
 `local_bootstrap_terminal` channel with a key it makes for that one confirmation. The host accepts
-that channel only while it has no owner and only for this pairing, so the pairing that commits
-closes it for good; a host with no owner refuses to issue anything else first.
+that channel only while it has no owner, and only for this pairing and for establishing its clock
+(`kr host clock --establish`). The pairing that commits closes it for good, and a host with no owner
+refuses to issue anything else first.
 
 The first owner is confirmed only at an interactive terminal outside every KalaReach session.
 Standard input and output must be terminals, the controlling terminal must open, neither
@@ -1283,6 +1285,14 @@ and cannot establish it otherwise. So in a window opened after a session started
 
 This guard exists so that an agent running in a session cannot start the ceremony by accident. It
 is not isolation from other code running under the same account, which can do anything `kr` does.
+
+## `kr host clock`
+
+`kr host clock --establish` trusts a host's clock again by spending an owner's confirmation of that action. A host that finds its wall clock going backwards stops forgetting records by it and stops deciding expiring grants against it, and only its owner ends that. The command will show the time that the host sees and ask for the owner to confirm this specific action, similar to the owner confirmation required by `kr pair`.
+
+If the host does not have an owner, the confirmation happens on the host's own terminal. The `kr` program will show the time, ask the user to type `clock`, and then use a newly-generated key to answer a challenge from the host on the `local_bootstrap_terminal` channel. In this case, the program will ensure that standard input and standard output are terminals, that the controlling terminal can be opened, and that the program is not running in a KalaReach session, as it does when taking a host's first owner. Otherwise, `kr` will wait for the confirmation to happen on one of the owner's devices, as it does for `kr pair invite`. If that host is not on the network, the command will refuse at once, because no owner device can reach it.
+
+This command spends a confirmation once, and it ends the distrust of the clock, the holds that follow from it and a lost clock continuity together or not at all, but it will not cause an object that has already expired to become unexpired. Because an owner's device will refuse to answer a challenge whose expiration time has already passed according to the device's clock, an owner will not be able to confirm a host whose clock is more than two minutes behind the clocks on the owner's devices. With the `--json` option, the command prints the ID of the confirmation that was spent.
 
 ## `kr project`
 
