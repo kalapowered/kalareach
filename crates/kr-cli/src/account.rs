@@ -278,12 +278,12 @@ mod tests {
             .join("\n")
     }
 
-    /// A disposable runtime root on the internal disk, never on the workspace volume.
-    fn runtime_root() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("kr-account-")
-            .tempdir_in(std::env::temp_dir())
-            .expect("a runtime root on the internal disk")
+    /// A disposable runtime root on the internal disk, never on the workspace volume, of the kind
+    /// the host makes its own: the token written into it is read back under the host's owner-only
+    /// check, which refuses a directory that inherits another account's entry from the temporary
+    /// directory above it.
+    fn runtime_root() -> kr_ipc::testing::PrivateTempDir {
+        kr_ipc::testing::PrivateTempDir::create()
     }
 
     fn document(scopes: &str) -> String {
