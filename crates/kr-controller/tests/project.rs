@@ -21,6 +21,7 @@ use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -63,7 +64,7 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     /// Where the repositories live. Shared, so it outlives a daemon a test replaces.
-    work: Arc<tempfile::TempDir>,
+    work: Arc<PrivateTempDir>,
 }
 
 impl Host {
@@ -71,7 +72,7 @@ impl Host {
     ///
     /// Returns the environment and the working directory, so a replacement daemon opens the same
     /// state and finds the same repositories.
-    async fn stop(self) -> (kr_ipc::testing::TempHost, Arc<tempfile::TempDir>) {
+    async fn stop(self) -> (kr_ipc::testing::TempHost, Arc<PrivateTempDir>) {
         self.clients.abort();
         let _ = self.clients.await;
         drop(self.controller);
@@ -100,12 +101,12 @@ fn build() -> BuildId {
 async fn host() -> Host {
     host_on(
         kr_ipc::testing::TempHost::create(),
-        Arc::new(tempfile::TempDir::new().expect("a working directory on the internal disk")),
+        Arc::new(PrivateTempDir::create()),
     )
     .await
 }
 
-async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) -> Host {
+async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<PrivateTempDir>) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     // A replacement daemon on the same environment has to wait for the one it replaces to release
@@ -947,7 +948,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         &["--version"],
     );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
-    let work = tempfile::TempDir::new().expect("a working directory on the internal disk");
+    let work = PrivateTempDir::create();
     let journal =
         kr_project::ProjectService::root_of(&environment).join(kr_project::store::STORE_FILE_NAME);
 
@@ -1350,7 +1351,7 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint, log: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services_transaction() {
     let temp = kr_ipc::testing::TempHost::create();
-    let work = tempfile::TempDir::new().expect("a working directory on the internal disk");
+    let work = PrivateTempDir::create();
     let checkout = repository(work.path(), "adopted");
     let module = kr_controller::project::ProjectModule::open(&temp.environment())
         .await
@@ -1448,7 +1449,7 @@ struct Owned {
 }
 
 impl Owned {
-    async fn stop(self) -> (kr_ipc::testing::TempHost, Arc<tempfile::TempDir>) {
+    async fn stop(self) -> (kr_ipc::testing::TempHost, Arc<PrivateTempDir>) {
         self.network.shutdown().await;
         self.host.stop().await
     }
@@ -1462,7 +1463,7 @@ fn owner_keys() -> kr_crypto::keys::DeviceKeys {
 async fn owned(owner: &kr_crypto::keys::DeviceKeys) -> Owned {
     owned_on(
         kr_ipc::testing::TempHost::create(),
-        Arc::new(tempfile::TempDir::new().expect("a working directory on the internal disk")),
+        Arc::new(PrivateTempDir::create()),
         owner,
     )
     .await
@@ -1472,7 +1473,7 @@ async fn owned(owner: &kr_crypto::keys::DeviceKeys) -> Owned {
 /// already has an owner, as a replacement daemon on the same tree does.
 async fn owned_on(
     temp: kr_ipc::testing::TempHost,
-    work: Arc<tempfile::TempDir>,
+    work: Arc<PrivateTempDir>,
     owner: &kr_crypto::keys::DeviceKeys,
 ) -> Owned {
     let (host, network) = networked_on(temp, work).await;
@@ -1512,7 +1513,7 @@ async fn owned_on(
 /// host's owner devices.
 async fn networked_on(
     temp: kr_ipc::testing::TempHost,
-    work: Arc<tempfile::TempDir>,
+    work: Arc<PrivateTempDir>,
 ) -> (Host, kr_controller::service::net::Network) {
     use kr_controller::service::net::{self, NetworkSetup, config::NetworkSettings};
 
@@ -1868,7 +1869,7 @@ async fn a_host_with_no_enrolled_owner_authorises_no_location() {
 async fn a_host_with_no_owner_device_authorises_no_location() {
     let (host, network) = networked_on(
         kr_ipc::testing::TempHost::create(),
-        Arc::new(tempfile::TempDir::new().expect("a working directory on the internal disk")),
+        Arc::new(PrivateTempDir::create()),
     )
     .await;
     let mut control = client(&host).await;
