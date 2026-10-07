@@ -218,8 +218,8 @@ export function tauriPort(): HostPort {
     },
 
     // Voice. The reads, the stop and the delegation each reach one method. Native code refuses the
-    // start, because it opens no call. The last two reach no service at all, which is what keeps
-    // mute and closure working when the broker is the thing that has stopped answering.
+    // start, because it opens no call. The last two reach no service at all: this process holds no
+    // call, so the silence is refused and the state is a device holding none.
     voicePrepare: (params) => read('voice_prepare', params),
     voiceStart: (request, subject) =>
       call('voice_start', {

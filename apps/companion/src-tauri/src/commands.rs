@@ -1,9 +1,9 @@
 //! Every command the WebView may call, and nothing else.
 //!
-//! Each command names one [`Method`] in its own body, and parses the page's parameters into that
-//! method's own Rust type before anything is sent. The page supplies values; it never supplies a
-//! method, a path or a command line, and a value it supplies that is not the shape the method
-//! takes is refused here rather than on the wire.
+//! Each command that performs a method names one [`Method`] in its own body, and parses the page's
+//! parameters into that method's own Rust type before anything is sent. The page supplies values;
+//! it never supplies a method, a path or a command line, and a value it supplies that is not the
+//! shape the method takes is refused here rather than on the wire.
 //!
 //! That parse is not a formality. The protocol's canonical encoding is KR-CBOR-1, where an
 //! identifier is a byte string and a counter is an unsigned integer, while the same values in the
@@ -125,15 +125,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // The owner's confirmations of this computer's hosts.
     ("owner_confirmations", None),
     ("owner_confirmation_review", None),
-    // Voice.
+    // Voice. The start names its method for the table, and this process refuses it before sending.
     ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
     ("voice_stop", Some(Method::VoiceStop)),
     ("voice_grant", Some(Method::VoiceGrant)),
     ("voice_delegate", Some(Method::VoiceDelegate)),
     ("voice_context", Some(Method::VoiceContext)),
-    // The two local silences and the call's own state. They reach no service at all, which is what
-    // keeps them working when the broker does not.
+    // The two local silences and the call's own state. They reach no service at all. This process
+    // holds no call, so the silences are refused and the state is a device holding none.
     ("voice_set_muted", None),
     ("voice_call_state", None),
     // The application's own boundary.
@@ -892,11 +892,11 @@ read_command!(
 
 /// Refuses to start a voice session from this application.
 ///
-/// A call's media is native code's: section 15 ¶2 puts capture, playback and the connection in the
-/// phone applications' own WebRTC and audio, and this process negotiates no connection, so it has
-/// no offer to give. A start is refused before anything is submitted, because the broker creates a
-/// metered provider session the moment a start reaches it, and a session created for a device that
-/// can carry no audio is one a person pays for and cannot use.
+/// Section 15 ¶2 puts capture, playback and the connection in native WebRTC and platform audio,
+/// and this process holds neither, so it has no offer to give. The phone applications' Swift and
+/// Kotlin calls are their own. A start is refused before anything is submitted, because the broker
+/// creates a metered provider session the moment a start reaches it, and a session created for a
+/// device that can carry no audio is one a person pays for and cannot use.
 #[tauri::command]
 pub async fn voice_start(
     state: State<'_, AppState>,
@@ -937,10 +937,10 @@ pub struct VoiceStarted {
     pub action_id: Option<String>,
 }
 
-/// Revokes the voice session's grant on the host.
+/// Asks the host to revoke the voice session's grant.
 ///
-/// A call's media is native code's and this process holds none, so there is no local call to close
-/// first, and the answer says so. Section 15 ¶10 keeps local mute and transport closure working
+/// This process holds no call, so there is no local call to close first, and the answer says so.
+/// Section 15 ¶10 keeps local mute and transport closure working
 /// when the broker fails, and a closure that waited for a service to answer before silencing a
 /// microphone would fail at exactly the moment a person most wants it to work. What the host said
 /// is reported beside the local closure rather than in place of it, so nothing here can report a
@@ -2080,9 +2080,10 @@ mod tests {
             voice_context,
         ]);
         // One body for every command: each reads the arguments it takes and nothing else. The
-        // voice stop reads its own one by one, and the voice start none. The identifier the stop
-        // parses itself is not an identifier, and the values the invoke layer types are of their
-        // types, so the refusal is the command's own rather than the invoke layer's.
+        // voice stop reads its own one by one, and the voice start reads none after the invoke
+        // layer has typed them. The identifier the stop parses itself is not an identifier, and the
+        // values the invoke layer types are of their types, so the refusal is the command's own
+        // rather than the invoke layer's.
         let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
             .expect("a digest");
         let foreign = serde_json::json!({

@@ -23,7 +23,7 @@ commands every other screen uses, and it draws only what an answer carried.
 | The sessions' names | `session.list` |
 | The model, the disclosure, the rate and the call limits | `voice.prepare`, in the managed service's words |
 | The voice session, the model, the call and when it closes | `voice.start` |
-| The microphone and the speaker | the call this device is holding |
+| The microphone and the speaker | the device's own report of its call, never a service's |
 | A delegation's state and its words | `voice.delegate` |
 | What the host selected for the call | `voice.context`, a read from the host |
 
@@ -68,10 +68,11 @@ screen reads the preparation again and shows it.
 ## What the person holds during a call
 
 The call screen puts the capture state first, because that is what decides whether anything spoken
-counted. Muting the microphone, silencing the voice and ending the session act on this device and
-are never withheld for an unreachable service. Ending a call closes this device's own call first
-and tells the host after, and the screen says which of the two happened rather than reporting a
-revoked grant it has no answer for.
+counted. Muting the microphone and silencing the voice are local controls that contact no service,
+and ending the session never waits for one: the device's own call closes first and the host is told
+after, and the screen says which of the two happened rather than reporting a revoked grant it has no
+answer for. The application's own process holds no call, so there its mute commands refuse and its
+stop command tells the host and reports that nothing was closed locally.
 
 Cancelling what the agent is doing is a separate control, under its own heading, with its own
 confirmation. It needs the turn the agent is on, named by the host; no host answer names one to
