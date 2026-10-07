@@ -149,7 +149,7 @@ fn a_machine_that_does_not_settle_is_not_measured() {
         run.started
     );
     assert!(
-        run.printed.contains("did not settle") && run.printed.contains("3.29"),
+        run.printed.contains("did not settle") && run.printed.contains("still 3.29"),
         "the run says the machine did not settle, and at what load:\n{}",
         run.printed
     );

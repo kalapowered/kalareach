@@ -80,7 +80,7 @@ load_average() {
 
 # Waits, when a bound was named, until the one-minute load is under it: at most sixty waits, ten
 # seconds apart. Says what it found, and fails when the load never fell or could not be read as a
-# number, which a host that writes its decimal separator as a comma, for one, would not allow.
+# number, which is what a host that gives no reading at all leaves.
 number='^[0-9]+([.][0-9]+)?$'
 settle() {
   local name="$1" waits=0 load _
