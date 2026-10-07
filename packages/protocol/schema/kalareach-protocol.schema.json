@@ -31684,7 +31684,7 @@
     },
     "ServiceRequestSignature": {
       "additionalProperties": false,
-      "description": "One signed service request.\n\nIt authenticates a request; it authorises nothing by itself. What the caller may do with the\nmethod it names is the service's decision, made from the installation record and the records\nthat method reads.",
+      "description": "One signed service request.\n\nIt authenticates a request; it authorises nothing by itself. What the caller may do with the\nmethod it names is the service's decision, made from the records that method reads.",
       "properties": {
         "payload": {
           "$ref": "#/$defs/ServiceRequestPayload",

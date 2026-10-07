@@ -302,8 +302,7 @@ impl ServiceRequestPayload {
 /// One signed service request.
 ///
 /// It authenticates a request; it authorises nothing by itself. What the caller may do with the
-/// method it names is the service's decision, made from the installation record and the records
-/// that method reads.
+/// method it names is the service's decision, made from the records that method reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceRequestSignature {
