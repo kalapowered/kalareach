@@ -2718,6 +2718,100 @@ async fn a_local_prompt_for_a_session_that_closed_is_told_it_closed_and_not_that
     assert_eq!(code_of(unknown), ErrorCode::UnknownSession);
 }
 
+/// KR-REQ-09.12: a prompt a caller at this machine makes to a session the registry lists as live,
+/// whose worker the daemon had not reached when it started, is put to that worker, as a device's
+/// attach to the session and a read of it are, and is not refused as for a session nobody holds.
+/// The daemon looks for the worker again before it says there is none.
+///
+/// The control is a reservation the host has fenced: looking again does not undo the fence, so the
+/// worker is not reached and the prompt is refused as for an unknown session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_prompt_for_a_live_session_whose_worker_was_not_reached_at_start_finds_it_first() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for fenced in [false, true] {
+        let script = Scripted::new();
+        script.accepts_prompts(true);
+        let world = scripted::recorded_unreached(&script).await;
+        let controller = &world.controller;
+        if fenced {
+            let mut registry = controller.registry.lock().await;
+            let reservation = registry
+                .reservation_for_session(world.session_id)
+                .expect("the registry answers")
+                .expect("the create's reservation");
+            registry
+                .fence(reservation.reservation_id)
+                .expect("fences the reservation");
+        }
+        assert!(
+            controller
+                .directory
+                .lock()
+                .await
+                .get(world.session_id)
+                .is_none(),
+            "the daemon has not reached the worker"
+        );
+        let admission = fake::admission(controller, world.accepted).await;
+        let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let answered = controller
+            .perform(
+                &actor,
+                admission.connection_id,
+                None,
+                a_local_prompt(
+                    &world,
+                    &admission,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Nullable::null(),
+                    Nullable::some(
+                        kr_protocol::agent::PromptText::new("run the tests").expect("text"),
+                    ),
+                ),
+            )
+            .await;
+        if fenced {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) = answered
+            else {
+                panic!("a fenced reservation's worker is not reached: {answered:?}");
+            };
+            assert_eq!(error.code, ErrorCode::UnknownSession);
+            assert_eq!(script.connections(), 0, "nothing reached the worker");
+            assert!(prompts_the_worker_was_asked_to_take(&script).is_empty());
+        } else {
+            assert!(
+                matches!(
+                    answered,
+                    ControlFrame::Response(Response {
+                        outcome: Outcome::Ok(_),
+                        ..
+                    })
+                ),
+                "{answered:?}"
+            );
+            assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 1);
+            assert!(
+                controller
+                    .directory
+                    .lock()
+                    .await
+                    .get(world.session_id)
+                    .is_some(),
+                "the worker the prompt reached is in the directory"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal it notes
 /// every session the host knows, because each was started by a daemon of an earlier build whose
 /// worker may take a draft prompt this host is not told of, and a daemon that starts again over the
