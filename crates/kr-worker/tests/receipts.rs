@@ -3894,20 +3894,13 @@ struct DriftingMachine {
     continuous: kr_ipc::clock::ManualSharedClock,
     active: kr_worker::action::time::ManualActiveClock,
     wall: kr_worker::action::time::ManualWallClock,
+    /// What the platform's time service says, which a test can change.
+    adapter: kr_worker::action::adapter::RecordedTimeAdapter,
     ppm: u64,
 }
 
 impl DriftingMachine {
     fn fast_by(ppm: u64) -> Self {
-        Self {
-            continuous: kr_ipc::clock::ManualSharedClock::new(),
-            active: kr_worker::action::time::ManualActiveClock::new(),
-            wall: kr_worker::action::time::ManualWallClock::new(1_700_000_000_000),
-            ppm,
-        }
-    }
-
-    fn sources(&self) -> kr_worker::action::time::TimeSources {
         let synchronised = classify_unix(
             "macos",
             "ntp_adjtime(2)",
@@ -3919,15 +3912,32 @@ impl DriftingMachine {
             },
             TimestampMs::new(1_700_000_000_000),
         );
+        Self {
+            continuous: kr_ipc::clock::ManualSharedClock::new(),
+            active: kr_worker::action::time::ManualActiveClock::new(),
+            wall: kr_worker::action::time::ManualWallClock::new(1_700_000_000_000),
+            adapter: kr_worker::action::adapter::RecordedTimeAdapter::new(synchronised),
+            ppm,
+        }
+    }
+
+    fn sources(&self) -> kr_worker::action::time::TimeSources {
         kr_worker::action::time::TimeSources {
             continuous: Arc::new(self.continuous.clone()),
             active: Arc::new(self.active.clone()),
             wall: Arc::new(self.wall.clone()),
-            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(
-                synchronised,
-            )),
+            adapter: Arc::new(self.adapter.clone()),
             floor: None,
         }
+    }
+
+    /// The platform's time service stops keeping the clock: it reports nothing it can vouch for.
+    fn time_service_stops(&self) {
+        self.adapter.set(kr_worker::action::adapter::unavailable(
+            "macos",
+            "ntp_adjtime(2)",
+            TimestampMs::new(1_700_000_000_000),
+        ));
     }
 
     /// The clocks as [`Self::sources`] gives them, with the host's clock floor mapped.
@@ -4169,6 +4179,38 @@ fn the_owners_establishment_of_the_host_clock_ends_a_workers_distrust() {
     drop(session);
     let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+}
+
+/// KR-REQ-09.19: a worker that followed the owner's establishment is trusting its clock because
+/// the owner confirmed it, so the platform's time service later saying nothing it can vouch for
+/// does not take that back, as it does not for the daemon. Without an establishment it does: the
+/// same worker, with the same service failure, distrusts its clock.
+#[test]
+fn a_worker_that_followed_the_owner_keeps_a_clock_its_time_service_stops_keeping() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    machine.time_service_stops();
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "the owner confirmed this clock"
+    );
+
+    // The control: with no establishment, the same failure of the time service is a distrust.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.time_service_stops();
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
 }
 
 /// KR-REQ-09.19: a worker follows an establishment only when its own clock agrees with it, and
