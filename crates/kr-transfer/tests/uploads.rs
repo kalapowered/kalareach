@@ -2654,6 +2654,109 @@ fn settling_the_noted_sessions_puts_what_each_names_under_its_retention_and_forg
     );
 }
 
+/// KR-REQ-14.11: settling reads what each attachment is named by before it gives any attachment a
+/// session, so the result does not depend on the order the rows come in. Two drafts that name no
+/// session share one attachment: the first holds it beside an attachment that belongs to the noted
+/// session, the second holds it beside another that belongs to none. Only the first pair is named by
+/// the session; giving the shared attachment the session as it is settled must not name the other.
+#[test]
+fn settling_does_not_name_an_attachment_by_one_the_settling_has_just_named() {
+    let harness = Harness::create();
+    let noted = SessionId::new(Uuid::from_bytes([38; 16]));
+    let publish = |name: &str, for_session: Option<SessionId>| {
+        let bytes = pattern(32);
+        let begun = harness
+            .begin_for(
+                &bytes,
+                "application/octet-stream",
+                name,
+                Nullable(for_session),
+            )
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle
+    };
+    let draft = || {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    application_instance_id: Nullable::null(),
+                    text: "look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let bind = |draft: &kr_protocol::transfer::DraftRecord,
+                handle: &kr_protocol::transfer::AttachmentHandle| {
+        let revision = harness
+            .service
+            .draft(&harness.actor, draft.draft_id)
+            .expect("reads the draft")
+            .revision;
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(handle),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+    };
+
+    // Published in the order they are read: the shared one before the one only the second draft
+    // holds it beside.
+    let named = publish("named.bin", Some(noted));
+    let shared = publish("shared.bin", None);
+    let beside = publish("beside.bin", None);
+    let (first, second) = (draft(), draft());
+    bind(&first, &named);
+    bind(&first, &shared);
+    bind(&second, &shared);
+    bind(&second, &beside);
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([noted]))
+        .expect("notes the session");
+
+    assert_eq!(
+        harness
+            .service
+            .settle_unseen_prompt_sessions()
+            .expect("settles the noting"),
+        2,
+        "the attachment that belongs to the session, and the one held beside it"
+    );
+    let submitted = |handle: &kr_protocol::transfer::AttachmentHandle| {
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .expect("reads the handle")
+            .submitted
+    };
+    assert!(submitted(&named) && submitted(&shared));
+    assert!(
+        !submitted(&beside),
+        "held beside an attachment that named no session when the settling read it"
+    );
+}
+
 /// KR-REQ-14.11: a journal in which an earlier build noted sessions, in its own two tables and at the
 /// schema version it wrote, is read where it stands: the noted sessions are held, what one names is
 /// kept for its retention, and settling moves what each names under its retention and leaves a
