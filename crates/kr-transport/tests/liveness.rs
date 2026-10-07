@@ -136,10 +136,11 @@ async fn an_idle_connection_is_kept_alive_and_a_silent_one_ends_after_thirty_sec
     };
 
     let silent_leg = async {
-        // The connection settles first. Its host is then stopped just after a datagram from it is
-        // seen to arrive, so the time of the last datagram is always one that was observed: that
-        // one, or a later one still in flight when the host stopped.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // The connection is open. Its host is stopped just after a datagram from it is seen to
+        // arrive, so the time of the last datagram is always one that was observed: that one, or a
+        // later one still in flight when the host stopped. Where in the connection's life that is
+        // does not matter: the thirty seconds run from the last datagram that reached the client,
+        // whichever one it was.
         let settled = Instant::now();
         let mut received = silent.stats().udp_rx.datagrams;
         let mut received_at = loop {
