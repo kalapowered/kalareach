@@ -54,6 +54,10 @@ pub struct Performed {
 const LEFT_BEHIND: &[u8] = b"\x1b[3;3H\x1b7\x1b[?47h\x1b[2;2H\x1b7\x1b[?47l\
     \x1b[2;3r\x1b[?6h\x1b(0\x1b)0\x0e\x1b[1;31;44m\x1b[4h";
 
+/// What an application does on the way into its full-screen view, which leaves the terminal
+/// showing the alternate buffer with a cursor saved in the primary one.
+const LEFT_ON_THE_ALTERNATE_BUFFER: &[u8] = b"\x1b[?1049h\x1b[3;3H";
+
 /// The soft reset, which some terminals ignore.
 const SOFT_RESET: &[u8] = b"\x1b[!p";
 
@@ -112,12 +116,17 @@ impl Terminal {
     }
 
     /// A terminal of `columns` by `rows` that an earlier application has been running in, and that
-    /// ignores the soft reset.
+    /// ignores the soft reset. With `on_the_alternate_buffer` the application left it showing the
+    /// alternate buffer, with its cursor somewhere in the middle.
     ///
     /// # Errors
     ///
     /// Returns what the engine refused about the size, or about what was left in it.
-    pub fn left_by_an_application(columns: u16, rows: u16) -> Result<Self, String> {
+    pub fn left_by_an_application(
+        columns: u16,
+        rows: u16,
+        on_the_alternate_buffer: bool,
+    ) -> Result<Self, String> {
         let mut terminal = Self::new(columns, rows)?;
         let performed = terminal.feed(LEFT_BEHIND);
         if !performed.refused.is_empty() {
@@ -125,6 +134,15 @@ impl Terminal {
                 "what an application leaves behind was refused: {:?}",
                 performed.refused
             ));
+        }
+        if on_the_alternate_buffer {
+            let performed = terminal.feed(LEFT_ON_THE_ALTERNATE_BUFFER);
+            if !performed.refused.is_empty() {
+                return Err(format!(
+                    "what an application leaves on the alternate buffer was refused: {:?}",
+                    performed.refused
+                ));
+            }
         }
         terminal.ignores_soft_reset = true;
         Ok(terminal)

@@ -454,12 +454,12 @@ fn a_restoration_writes_the_plain_state_in_every_buffer_it_visits() {
     }
 }
 
-/// A restoration changes no keyboard state of a terminal beyond what its brief names, and no title
-/// stack: a soft reset is how kitty and foot would empty a keyboard stack, foot would empty its
-/// title stack and WezTerm would reset `modifyOtherKeys`, and the stacks are the person's own.
-/// A terminal nobody asked about its keyboard has no sequence about it written at all; one that
-/// was asked has the flags in force and the `modifyOtherKeys` level installed, and never a push
-/// or a pop.
+/// A restoration changes no keyboard state of a terminal beyond what its `Keyboard` argument allows,
+/// and no title stack: a soft reset is how kitty and foot would empty a keyboard stack, foot would
+/// empty its title stack, and xterm, foot and WezTerm would reset `modifyOtherKeys`, and the stacks
+/// are the person's own. A terminal nobody asked about its keyboard has no sequence about it
+/// written at all; one that was asked has the flags in force and the `modifyOtherKeys` level
+/// installed, and never a push or a pop.
 #[test]
 fn a_restoration_leaves_the_keyboard_and_title_stacks_the_terminal_holds_alone() {
     let stream = b"shell\r\n\x1b[>4;2m\x1b[>1u\x1b[>5u\x1b]2;title\x07\x1b[22;0t";
@@ -493,6 +493,60 @@ fn a_restoration_leaves_the_keyboard_and_title_stacks_the_terminal_holds_alone()
                     );
                 }
             }
+        }
+    }
+}
+
+/// Some terminals save autowrap and reverse video with a cursor, and put them back when the cursor
+/// is restored. Every save a restoration makes, by `ESC 7` and by the entry into the alternate
+/// buffer, finds the session's own values, so a restore of a cursor the session never saved cannot
+/// bring back what an earlier application left in the terminal.
+#[test]
+fn every_cursor_a_restoration_saves_holds_the_sessions_autowrap_and_reverse_video() {
+    for (name, stream, autowrap, reverse) in [
+        ("the defaults", &b"one\r\ntwo"[..], true, false),
+        ("autowrap off", b"one\x1b[?7l\r\ntwo", false, false),
+        ("reverse video on", b"one\x1b[?5h\r\ntwo", true, true),
+        (
+            "both",
+            b"one\x1b[?7l\x1b[?5h\x1b[?1047h\x1b[Hfull screen",
+            false,
+            true,
+        ),
+    ] {
+        for scope in SCOPES {
+            let written = items(&restoration_after(stream, scope));
+            let (mut wrapping, mut reversed) = (None, None);
+            let mut saves = 0;
+            for item in &written {
+                match item {
+                    Item::Csi(sequence) if sequence == "?7h" || sequence == "?7l" => {
+                        wrapping = Some(sequence == "?7h");
+                    }
+                    Item::Csi(sequence) if sequence == "?5h" || sequence == "?5l" => {
+                        reversed = Some(sequence == "?5h");
+                    }
+                    Item::Esc(sequence) if sequence == "7" => {
+                        saves += 1;
+                        assert_eq!(
+                            (wrapping, reversed),
+                            (Some(autowrap), Some(reverse)),
+                            "{name} in {scope:?}: a cursor is saved with other autowrap or reverse \
+                             video than the session has"
+                        );
+                    }
+                    Item::Csi(sequence) if sequence == "?1049h" => {
+                        assert_eq!(
+                            (wrapping, reversed),
+                            (Some(autowrap), Some(reverse)),
+                            "{name} in {scope:?}: the alternate buffer is entered with other \
+                             autowrap or reverse video than the session has"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saves >= 3, "{name} in {scope:?}: {saves} saves");
         }
     }
 }

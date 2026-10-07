@@ -98,6 +98,9 @@ pub enum Beforehand {
     /// [`Terminal::left_by_an_application`]), and it ignores the soft reset as Alacritty, Ghostty,
     /// tmux and GNU screen do. The session's own output sends none to it.
     LeftByAnApplication,
+    /// The same, with the application's full-screen view showing: the terminal is on the alternate
+    /// buffer when the restoration begins.
+    LeftOnTheAlternateBuffer,
 }
 
 /// Which property a failure is of.
@@ -783,7 +786,10 @@ impl Stage {
                 Form::Direct => Some(match self.beforehand {
                     Beforehand::Fresh => Terminal::new(columns, rows)?,
                     Beforehand::LeftByAnApplication => {
-                        Terminal::left_by_an_application(columns, rows)?
+                        Terminal::left_by_an_application(columns, rows, false)?
+                    }
+                    Beforehand::LeftOnTheAlternateBuffer => {
+                        Terminal::left_by_an_application(columns, rows, true)?
                     }
                 }),
                 Form::Projected => None,
