@@ -511,12 +511,15 @@ async fn the_listener_names_the_process_at_the_other_end_of_the_pipe() {
 ///
 /// Closing the accepting end of a pipe with bytes the caller has not read can lose them, so the
 /// close waits until the caller has read them or has gone. A caller that is sent something and
-/// never reads it is one such wait, and it must not be the wait of any other connection: the
+/// does not read it is one such wait, and it must not be the wait of any other connection: the
 /// daemon closes connections of many callers, one of which can be a client that stopped reading.
-/// Here one caller is sent bytes and never reads them, its connection is closed, and then a
-/// second caller reads what it was sent and is closed; the second has to see its connection end.
+/// Here one caller is sent bytes and does not read them, its connection is closed, and then a
+/// second caller reads what it was sent and is closed; the second has to see its connection end,
+/// and the first, reading at last, gets every byte it was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread() {
+    use std::io::Read as _;
+
     use kr_ipc::endpoint::Connection;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -527,8 +530,8 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
 
-    // The caller that never reads: sent something, and its connection closed with that unread. It
-    // opens the pipe as a plain file, which reads nothing until it is asked to.
+    // The caller that does not read until the end: sent something, and its connection closed with
+    // that unread. It opens the pipe as a plain file, which reads nothing until it is asked to.
     let silent = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -580,6 +583,14 @@ async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread()
         "the second caller's connection ended with {ended:?}"
     );
     assert!(rest.is_empty(), "nothing more was sent: {rest:?}");
+
+    // Closing did not lose what the first caller was sent: its connection waited for it to read,
+    // and it reads every byte, late as it is.
+    let mut late = [0_u8; 10];
+    (&silent)
+        .read_exact(&mut late)
+        .expect("the first caller still reads what it was sent after its connection was closed");
+    assert_eq!(&late, b"never read");
     drop(silent);
 }
 
