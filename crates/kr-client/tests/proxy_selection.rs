@@ -31,14 +31,14 @@ const WATCHDOG: Duration = Duration::from_secs(20);
 /// A gateway on loopback that is never meant to be reached, and says whether it was.
 struct Gateway {
     origin: String,
-    listener: TcpListener,
+    listener: std::net::TcpListener,
 }
 
 impl Gateway {
-    async fn start() -> Self {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .await
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("a loopback port");
+        listener.set_nonblocking(true).expect("a listener to ask");
         let port = listener.local_addr().expect("an address").port();
         Self {
             origin: format!("http://127.0.0.1:{port}"),
@@ -47,13 +47,14 @@ impl Gateway {
     }
 
     /// Asserts that nothing connected to the gateway itself.
-    async fn heard_nothing(&self) {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), self.listener.accept())
-                .await
-                .is_err(),
-            "the request reached the gateway without the proxy"
-        );
+    ///
+    /// It is asked once the request has ended. A connection the client opened for it is complete by
+    /// then and waits to be accepted, so nothing is left to arrive.
+    fn heard_nothing(&self) {
+        match self.listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            heard => panic!("the request reached the gateway without the proxy: {heard:?}"),
+        }
     }
 
     fn client(&self, proxy: &ProxyUrl) -> HttpService {
@@ -71,7 +72,7 @@ impl Gateway {
 /// nothing reaches the gateway around it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_client_goes_through_the_proxy_its_caller_names() {
-    let gateway = Gateway::start().await;
+    let gateway = Gateway::start();
     let proxy = ConnectProxy::refusing(502).await;
     let service = gateway.client(&proxy.url.parse().expect("a proxy address"));
     let address = format!("{}/api/probe", gateway.origin);
@@ -79,7 +80,7 @@ async fn a_service_client_goes_through_the_proxy_its_caller_names() {
         .await
         .expect("the request ends");
     assert_eq!(proxy.asked(), vec![format!("POST {address} HTTP/1.1")]);
-    gateway.heard_nothing().await;
+    gateway.heard_nothing();
 }
 
 /// Where the child finds the server its parent started.
@@ -202,7 +203,7 @@ async fn no_proxy_variable_moves_a_client_this_product_builds() {
 /// nothing: the client does not go around the proxy it was given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_client_does_not_go_around_a_proxy_that_cannot_be_reached() {
-    let gateway = Gateway::start().await;
+    let gateway = Gateway::start();
     // An address nothing answers at: a port this test freed could be handed to another test before
     // the request is sent, and that test's server would answer as a proxy.
     let service = gateway.client(
@@ -222,5 +223,5 @@ async fn a_service_client_does_not_go_around_a_proxy_that_cannot_be_reached() {
         ErrorCode::UpstreamUnavailable,
         "nothing was sent: {error}"
     );
-    gateway.heard_nothing().await;
+    gateway.heard_nothing();
 }
