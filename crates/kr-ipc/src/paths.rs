@@ -657,16 +657,40 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
     check_owner_only(path, &metadata)
 }
 
+/// Creates one owner-only directory that was not there, and says whether it did.
+///
+/// [`create_private_directory`] takes a directory that is already there once it has checked it. A
+/// caller that removes what it made has to know that it made it, and a second caller that picks the
+/// same name must not end up holding the first one's directory, so this returns `false` for a name
+/// that was taken and leaves what is there alone.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created, or when the one created is not
+/// owner-only.
+#[cfg(feature = "testing")]
+pub(crate) fn create_new_private_directory(path: &Path) -> Result<bool> {
+    if !build_owner_only_directory(path)? {
+        return Ok(false);
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| IpcError::io("inspect", path, error))?;
+    check_owner_only(path, &metadata)?;
+    Ok(true)
+}
+
+/// Creates the directory with owner-only permissions. Returns `false` when something was already
+/// at `path`, which is left as it is.
 #[cfg(unix)]
-fn build_owner_only_directory(path: &Path) -> Result<()> {
+fn build_owner_only_directory(path: &Path) -> Result<bool> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     match std::fs::DirBuilder::new()
         .mode(OWNER_ONLY_DIRECTORY_MODE)
         .create(path)
     {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(error) => Err(IpcError::io("create", path, error)),
     }
 }
@@ -675,9 +699,10 @@ fn build_owner_only_directory(path: &Path) -> Result<()> {
 ///
 /// The list is protected, so nothing above it in the user profile is inherited into it, and it
 /// carries an inherit-only entry for the object's owner, so a file or a directory created beneath
-/// it is owner-only without a second call per object.
+/// it is owner-only without a second call per object. Returns `false` when something was already
+/// at `path`, which is left as it is.
 #[cfg(windows)]
-fn build_owner_only_directory(path: &Path) -> Result<()> {
+fn build_owner_only_directory(path: &Path) -> Result<bool> {
     windows::create_owner_only_directory(path)
 }
 
@@ -1008,23 +1033,26 @@ mod windows {
         Policy(String),
     }
 
-    /// Creates a directory whose access-control list names its owner and nothing else.
+    /// Creates a directory whose access-control list names its owner and nothing else, and says
+    /// whether it did.
     ///
-    /// An existing directory is left alone: the caller checks the list it already carries.
+    /// An existing directory is left alone, and `false` returned: the caller checks the list it
+    /// already carries.
     ///
     /// # Errors
     ///
     /// Returns an error when the list cannot be built or the directory cannot be created.
-    pub(super) fn create_owner_only_directory(path: &Path) -> Result<()> {
+    pub(super) fn create_owner_only_directory(path: &Path) -> Result<bool> {
         create_directory_with_list(path, OWNER_ONLY_DESCRIPTOR)
     }
 
-    /// Creates a directory with one explicit access-control list, written as SDDL.
+    /// Creates a directory with one explicit access-control list, written as SDDL, and says
+    /// whether it did. An existing directory is left alone, and `false` returned.
     ///
     /// # Errors
     ///
     /// Returns an error when the list cannot be built or the directory cannot be created.
-    pub(crate) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
+    pub(crate) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<bool> {
         let wide_path = wide(path.as_os_str());
         let wide_descriptor = wide_str(descriptor);
         let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1059,11 +1087,11 @@ mod windows {
             LocalFree(built.cast());
         }
         match failure {
-            None => Ok(()),
+            None => Ok(true),
             // An existing staging directory is the ordinary case on every start after the first. Its
             // list is checked by the caller rather than replaced here.
             Some(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS.cast_signed()) => {
-                Ok(())
+                Ok(false)
             }
             Some(error) => Err(IpcError::io("create", path, error)),
         }
