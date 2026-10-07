@@ -56,7 +56,24 @@ impl<'a> Collections<'a> {
     }
 
     /// Puts one record of each kind into its store, as old as a clock can say.
+    ///
+    /// The daemon sweeps once as it starts and the attention store forgets on its first pass, so
+    /// the records are put in only once the clock is in doubt: a pass that ran at any moment from
+    /// then on finds a clock it cannot prove.
     fn age_one_of_each(&self) {
+        self.age_the_transfer_record();
+        let attention = self.attention_store();
+        attention
+            .execute(
+                "INSERT INTO attention_actions (actor, action_id, method, digest, answer, \
+                 recorded_at_ms) VALUES ('a', '1', 'attention.acknowledge', x'00', x'00', 1)",
+                [],
+            )
+            .expect("the attention store takes a record");
+    }
+
+    /// Puts one de-duplication record into the transfer store, as old as a clock can say.
+    fn age_the_transfer_record(&self) {
         self.controller
             .transfer()
             .service()
@@ -69,14 +86,6 @@ impl<'a> Collections<'a> {
             )
             .expect("the service records an action");
         aged(self.temp);
-        let attention = self.attention_store();
-        attention
-            .execute(
-                "INSERT INTO attention_actions (actor, action_id, method, digest, answer, \
-                 recorded_at_ms) VALUES ('a', '1', 'attention.acknowledge', x'00', x'00', 1)",
-                [],
-            )
-            .expect("the attention store takes a record");
     }
 
     fn attention_store(&self) -> rusqlite::Connection {
@@ -141,9 +150,9 @@ async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
 
     assert!(trust().is_some(), "the clock is proven where it starts");
     assert!(collections.spend(), "a first spend");
-    collections.age_one_of_each();
     wall.store(start - 60_000, Ordering::SeqCst);
     assert!(trust().is_none(), "the step back is found");
+    collections.age_one_of_each();
     wall.store(start + retention + DAY, Ordering::SeqCst);
 
     assert!(
@@ -187,13 +196,13 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
     };
 
     assert!(trust().is_some(), "the clock is proven where it starts");
-    collections.age_one_of_each();
     continuous.advance(Duration::from_secs(60));
     wall.store(start + 50_000, Ordering::SeqCst);
     assert!(
         trust().is_none(),
         "the wall clock lags the continuous clock by more than the tolerance"
     );
+    collections.age_one_of_each();
     wall.store(start + retention + DAY, Ordering::SeqCst);
     swept(&controller).await;
     assert_eq!(kept(&temp), 1, "the transfer sweep forgets nothing");
@@ -210,6 +219,52 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
         0,
         "the established clock has outlived the retention"
     );
+}
+
+/// KR-REQ-09.14, KR-REQ-09.18: a continuous clock that runs fast against the wall clock withholds
+/// no forgetting, and a rollback larger than the allowance still withholds all of them. The
+/// continuous clock runs fifty parts per million fast for thirty days and an hour, read every hour
+/// as the host's decisions read it: the host never doubts its clock, so a spent delegation and a
+/// de-duplication record that outlived their retention are forgotten. A wall clock six minutes
+/// behind where it stood then withholds the transfer sweep and the voice spend again. (The
+/// attention store also needs the platform's time service or the owner's confirmation, which a
+/// test on a host with no qualified time service cannot assume.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetting() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let collections = Collections::new(&temp, &controller);
+    let trust = || {
+        controller
+            .lifetimes()
+            .clock_trust()
+            .sample(controller.devices())
+            .expect("the host samples its clock")
+    };
+
+    assert!(trust().is_some(), "the clock is proven where it starts");
+    assert!(collections.spend(), "a first spend");
+    for hour in 0..30 * 24 + 1 {
+        continuous.advance(Duration::from_millis(3_600_000 + 180));
+        wall.fetch_add(3_600_000, Ordering::SeqCst);
+        assert!(trust().is_some(), "hour {hour}: the clock is still proven");
+    }
+    collections.age_the_transfer_record();
+    swept(&controller).await;
+    assert_eq!(
+        kept(&temp),
+        0,
+        "the sweep forgets what outlived its retention"
+    );
+    assert!(collections.spend(), "the spent delegation is forgotten");
+
+    wall.fetch_sub(360_000, Ordering::SeqCst);
+    assert!(trust().is_none(), "six minutes back is a rollback");
+    collections.age_the_transfer_record();
+    swept(&controller).await;
+    assert_eq!(kept(&temp), 1, "the transfer sweep forgets nothing");
+    assert!(!collections.spend(), "the voice spend forgets nothing");
 }
 
 /// The record an earlier build's attention store kept of its clock, as that build wrote it: a

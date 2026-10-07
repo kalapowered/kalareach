@@ -3828,6 +3828,10 @@ those would give a deadline back indefinitely. The same proven reading is what a
 compared against, with the platform's own uncertainty bound added to it, so an object expires when
 it cannot still be valid rather than when a forgiving clock says so.
 
+The daemon's record of the wall clock projects its anchor on the continuous clock less 100 parts
+per million, so a fast continuous clock never raises distrust. A rollback may go unseen for about a
+minute per week of uptime.
+
 The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
 Without them a restarted host would start trusting a clock it had marked unresolved, and an object
 it had already expired could revive; `TimeContract::durable_state` and `TimeContract::restore` are
