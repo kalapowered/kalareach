@@ -46,6 +46,7 @@ pub mod clock_trust;
 pub mod config;
 pub mod devices;
 pub mod dispatch;
+mod earlier_attention_clock;
 pub mod invitations;
 pub mod lifetimes;
 pub mod methods;
@@ -76,6 +77,7 @@ use crate::service::{AdmittedConnection, Controller, LeaseDenied};
 use config::NetworkSettings;
 use devices::{DeviceDirectory, DeviceRecord};
 use dispatch::RemoteConnection;
+pub(crate) use earlier_attention_clock::adopt_earlier_attention_clock;
 use pairing::{HostPairingClock, PairingHost};
 use proxy::{RELAY_DEPTH, RelayBudget, Relayed, WorkerProxy};
 

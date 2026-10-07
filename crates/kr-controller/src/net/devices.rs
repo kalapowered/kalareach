@@ -147,6 +147,8 @@ pub struct ClockRecord {
     /// When the platform's time service was found unqualified with no owner confirmation, until
     /// an owner establishes the clock again.
     pub evidence_hold_at_ms: Option<u64>,
+    /// Whether an earlier build's attention record of the clock has been taken in.
+    pub attention_time_retired: bool,
 }
 
 /// Where this host's wall clock stood at one reading of the boot clock.
@@ -490,6 +492,7 @@ impl DeviceDirectory {
             "confirmed_at_ms INTEGER",
             "forgetting_hold_at_ms INTEGER",
             "evidence_hold_at_ms INTEGER",
+            "attention_time_retired INTEGER",
         ] {
             self.add_column("network_clock", column)?;
         }
@@ -1136,13 +1139,14 @@ impl DeviceDirectory {
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<i64>,
         );
         let row: Option<Row> = self.with(|connection| {
             connection
                 .query_row(
                     "SELECT observed_ms, untrusted_at_ms, anchor_wall_ms, anchor_boot_ms,
                             anchor_boot_value, confirmed_at_ms, forgetting_hold_at_ms,
-                            evidence_hold_at_ms
+                            evidence_hold_at_ms, attention_time_retired
                      FROM network_clock WHERE id = 0",
                     [],
                     |row| {
@@ -1155,14 +1159,24 @@ impl DeviceDirectory {
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
                         ))
                     },
                 )
                 .optional()
         })?;
         let read = |value: i64| u64::try_from(value).unwrap_or_default();
-        let Some((observed, untrusted, wall, boot_ms, boot_value, confirmed, forgetting, evidence)) =
-            row
+        let Some((
+            observed,
+            untrusted,
+            wall,
+            boot_ms,
+            boot_value,
+            confirmed,
+            forgetting,
+            evidence,
+            retired,
+        )) = row
         else {
             return Ok(ClockRecord::default());
         };
@@ -1180,6 +1194,7 @@ impl DeviceDirectory {
             confirmed_at_ms: confirmed.map(read),
             forgetting_hold_at_ms: forgetting.map(read),
             evidence_hold_at_ms: evidence.map(read),
+            attention_time_retired: retired.is_some_and(|retired| retired != 0),
         })
     }
 

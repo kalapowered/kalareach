@@ -3853,8 +3853,9 @@ before the record of it is written. Every one of those answers is nought or less
 never more: a reminder that comes late is still a reminder, and one raised seconds after a request
 because somebody corrected a clock is an interruption nobody earned. The wall clock keeps the two
 jobs it can do: deciding quiet hours, and saying when something happened for a person reading the
-record. The store keeps the host time contract's own record beside it, so a daemon that restarts
-still knows whether the wall clock was ever rolled back.
+record. The store keeps no clock record of its own: it reads the wall clock through the host's one
+record of it, so a rollback found anywhere in the host is found here, and one owner retrust clears
+it everywhere.
 
 ### A session that ends
 

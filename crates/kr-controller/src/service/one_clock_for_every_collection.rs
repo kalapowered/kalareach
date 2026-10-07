@@ -118,7 +118,7 @@ impl<'a> Collections<'a> {
     }
 }
 
-/// KR-REQ-09.07, KR-REQ-09.14: a wall clock that went backwards withholds every forgetting, and
+/// KR-REQ-09.14, KR-REQ-09.18, KR-REQ-09.19: a wall clock that went backwards withholds every forgetting, and
 /// the owner's one retrust frees every forgetting. A record of each kind is as old as the clock can
 /// say; the clock goes back by more than the tolerance, and then reads a plausible later moment.
 /// The transfer sweep, the voice spend and the attention store's pass each keep their record. After
@@ -166,7 +166,7 @@ async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
     assert!(collections.spend(), "the spent delegation is forgotten");
 }
 
-/// KR-REQ-09.07: a step back smaller than the time between two readings is a rollback. The wall
+/// KR-REQ-09.18: a step back smaller than the time between two readings is a rollback. The wall
 /// clock reads ten seconds behind where sixty seconds of continuous time put it, which a comparison
 /// against the last wall reading alone does not see. It is found by whoever asks, it withholds the
 /// transfer sweep, and one `establish` clears it.
@@ -212,46 +212,12 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
     );
 }
 
-/// The record an earlier build's attention store kept of its clock, written the way that build
-/// wrote it: by a time contract that has seen the wall clock go back by a minute.
-fn earlier_build_after_a_rollback() -> Vec<u8> {
-    use kr_worker::action::adapter::{RecordedTimeAdapter, UnixTimex, classify_unix, unix_model};
-    use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeContract, TimeSources};
+/// The record an earlier build's attention store kept of its clock, as that build wrote it: a
+/// store that was trusted and then found the wall clock going backwards.
+const EARLIER_BUILD_AFTER_A_ROLLBACK: &[u8] =
+    include_bytes!("../../tests/fixtures/earlier-attention-clock/rolled_back.cbor");
 
-    let now = kr_ipc::now_ms().get();
-    let adapter = RecordedTimeAdapter::new(classify_unix(
-        "macos",
-        "ntp_adjtime(2)",
-        UnixTimex {
-            time_state: unix_model::TIME_OK,
-            status: unix_model::STA_PLL,
-            maxerror_us: 62_192,
-            esterror_us: 500_000,
-        },
-        kr_protocol::scalars::TimestampMs::new(now),
-    ));
-    let continuous = kr_ipc::clock::ManualSharedClock::new();
-    let wall = ManualWallClock::new(now);
-    let contract = TimeContract::restore(
-        kr_ipc::identity::boot_identity().expect("a boot identity"),
-        "",
-        TimeSources {
-            continuous: Arc::new(continuous),
-            active: Arc::new(ManualActiveClock::new()),
-            wall: Arc::new(wall.clone()),
-            adapter: Arc::new(adapter),
-            floor: None,
-        },
-        None,
-    );
-    contract.observe();
-    wall.set(now - 60_000);
-    contract.observe();
-    let (state, _) = contract.durable_state();
-    kr_cbor::to_canonical_vec(&state).expect("the state encodes")
-}
-
-/// KR-REQ-09.07: a distrust the attention store recorded before the host held one record of the
+/// KR-REQ-09.18: a distrust the attention store recorded before the host held one record of the
 /// clock is not lost by the change. A daemon started over the earlier file distrusts its clock,
 /// withholds the transfer sweep and ends only when the owner establishes the clock again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -259,11 +225,8 @@ async fn a_distrust_recorded_by_the_attention_store_is_carried_forward() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     std::fs::create_dir_all(environment.state_dir()).expect("the state directory");
-    std::fs::write(
-        environment.state_dir().join("attention-time.cbor"),
-        earlier_build_after_a_rollback(),
-    )
-    .expect("the earlier build's record");
+    let file = environment.state_dir().join("attention-time.cbor");
+    std::fs::write(&file, EARLIER_BUILD_AFTER_A_ROLLBACK).expect("the earlier build's record");
     let (_continuous, wall, clocks) = manual_clocks();
     let controller = daemon_on(&temp, clocks).await;
     let collections = Collections::new(&temp, &controller);
@@ -280,6 +243,7 @@ async fn a_distrust_recorded_by_the_attention_store_is_carried_forward() {
         trust().is_none(),
         "the clock the earlier build had found going backwards is not trusted"
     );
+    assert!(!file.exists(), "the earlier file is taken in and removed");
     collections.age_one_of_each();
     wall.store(
         wall.load(Ordering::SeqCst) + retention + DAY,

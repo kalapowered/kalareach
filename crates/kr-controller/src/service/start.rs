@@ -457,6 +457,15 @@ impl Controller {
         // clock, and never less than this host's reading of UTC says.
         let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
             Arc::new(kr_ipc::clock::SystemSharedClock);
+        // What an earlier build's attention store recorded of the wall clock is taken into this
+        // host's one record of it before anything reads that record.
+        net::adopt_earlier_attention_clock(
+            &devices,
+            setup.paths.state_dir(),
+            &setup.boot_identity,
+            &*shared_clock,
+            wall.now_ms(),
+        )?;
         // One record of every grant's lifetime, on this daemon's clocks. The network's connections
         // and the owner confirmations they spend ask it, and so does everything else here that
         // decides a grant's time, so no two parts of the host can disagree about one grant.
@@ -707,6 +716,12 @@ impl Controller {
             machine,
             lock,
         });
+        // The attention store reads the wall clock through the host's one decision about it.
+        controller
+            .attention
+            .attach_clock(Arc::new(super::attention_reach::AttentionClock(
+                Arc::downgrade(&controller),
+            )));
         // A step that wrote the machine group record and ended before its receipt has its answer
         // kept from the record before anything is served, so no later step can take it away. A
         // record that cannot be settled now does not stop the daemon: every step and every retry
