@@ -2394,6 +2394,82 @@ async fn a_terminal_back_from_history_is_told_what_the_screen_it_will_be_drawn_h
     );
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.82: a window report from a terminal that is on the stream never
+/// takes it off the stream for what the screen holds. The terminal here panned a taller session
+/// by a line before the session took its size, so a window it stored differs from the one it
+/// reports now, and the line the application wrapped after that reached it as bytes: the report
+/// says it is still on the stream, and no resynchronisation follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_from_a_terminal_on_the_stream_leaves_it_there_whatever_it_was_drawn() {
+    let tall = Dimensions::new(4, 5);
+    let short = Dimensions::new(4, 3);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'x'; read -r _; printf 'abcdef'; read -r _",
+        tall,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"x").await;
+    let mut typist = typist(&host).await;
+    let mut owner = attach_claiming(&host, tall, None).await;
+    let mut terminal = attach(&host, short, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    // A window shorter than the session can start at a line below the first, and the host keeps it.
+    report_viewport(
+        &host,
+        &mut terminal,
+        short,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(2),
+        )),
+    )
+    .await;
+
+    // The session takes the terminal's size, and the terminal is drawn the screen as bytes.
+    let resized: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: short,
+                expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(resized.geometry.dimensions, short);
+    let events = collect_until_resync(
+        &mut terminal.client,
+        "the resize to tell the terminal to begin again",
+    )
+    .await;
+    resubscribe(&host, &mut terminal, resync_of(&events).cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, terminal.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "the screen is carried, so the terminal is on the stream"
+    );
+
+    // The application wraps a line, which reaches the terminal as bytes.
+    typist.release(&host).await;
+    produced(&host.runtime, b"abcdef").await;
+    let report = report_viewport(&host, &mut terminal, short, None).await;
+    assert_eq!(
+        (report.presentation, report.presentation_reason.0),
+        (TerminalPresentationMode::Direct, None),
+        "a terminal on the stream is not taken off it by a report"
+    );
+}
+
 /// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any
 /// other. The canonical screen returns to the primary buffer, the terminal that was being handed
 /// the stream never reads the reset, and the screen it is drawn instead puts it on that buffer and
