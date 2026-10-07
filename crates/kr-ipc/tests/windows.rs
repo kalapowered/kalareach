@@ -509,13 +509,13 @@ async fn the_listener_names_the_process_at_the_other_end_of_the_pipe() {
 /// A connection the listener closes is seen to end by its caller, whatever another connection
 /// closed before it left unread.
 ///
-/// Closing the accepting end of a pipe with bytes the caller has not read can lose them, so the
-/// close waits until the caller has read them or has gone. A caller that is sent something and
-/// does not read it is one such wait, and it must not be the wait of any other connection: the
-/// daemon closes connections of many callers, one of which can be a client that stopped reading.
-/// Here one caller is sent bytes and does not read them, its connection is closed, and then a
-/// second caller reads what it was sent and is closed; the second has to see its connection end,
-/// and the first, reading at last, gets every byte it was sent.
+/// The pipe library flushes a stream that has been written to when it closes it, on one thread
+/// that every connection of the process shares, and the flush waits until the caller has read what
+/// was written. A caller that is sent something and does not read it held that thread, and every
+/// connection closed after its own stayed open. Here one caller is sent bytes and does not read
+/// them until the end, its connection is closed, and then a second caller reads what it was sent
+/// and is closed; the second has to see its connection end, and the first, reading at last, gets
+/// every byte it was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_connection_is_seen_to_end_while_another_closed_one_is_unread() {
     use kr_ipc::endpoint::Connection;
