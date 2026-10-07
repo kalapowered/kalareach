@@ -552,11 +552,9 @@ jobs:
 
       # The control daemon's own tests that this platform qualifies, one filter to a step: the
       # configuration lock, the bridge store's records, the host environment a session takes, the
-      # attention inbox's transport and the decision a device reads. Not the cases of
-      # `service::a_read_that_meets_a_worker_on_its_way_out` and `service::net::dispatch::tests`
-      # that replace a daemon while a scripted worker goes: on the Windows test machine one of them
-      # takes about 30 s alone and the group 56 s together, and 3 of 10 runs of the whole library
-      # and 4 of 12 runs of those two groups did not finish. The cause is not established.
+      # attention inbox's transport, the decision a device reads, and the cases that replace a
+      # daemon while a scripted worker goes (`service::a_read_that_meets_a_worker_on_its_way_out`
+      # and `service::net::dispatch::tests`).
       # Quoted: a plain YAML scalar cannot end in a colon, and the filters do.
       - name: Test the configuration lock
         if: ${{ !cancelled() }}
@@ -578,14 +576,20 @@ jobs:
         if: ${{ !cancelled() }}
         run: "cargo test --locked -p kr-controller --lib a_share_that_names_a_current_decision::"
 
+      - name: Test a read that meets a worker on its way out
+        if: ${{ !cancelled() }}
+        run: "cargo test --locked -p kr-controller --lib service::a_read_that_meets_a_worker_on_its_way_out::"
+
+      - name: Test the dispatch that replaces a daemon while a worker goes
+        if: ${{ !cancelled() }}
+        run: "cargo test --locked -p kr-controller --lib service::net::dispatch::tests::"
+
       # The daemon's attention inbox, its dispatch barrier, the configuration it applies and the
       # diagnostics it answers to a device, each with a daemon and a worker of its own whose root
-      # shell is the POSIX shell Git for Windows installs. Not the startup exchange's case: after
-      # the daemon refuses a claim and lets go of the connection, one run in ten does not see the
-      # connection end on this platform and waits out the case's bound.
+      # shell is the POSIX shell Git for Windows installs.
       - name: Test the daemon's attention, barrier, configuration and diagnostics
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host -- --skip the_startup_exchange_binds_a_worker_to_its_own_reservation
+        run: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host
 
       # The forwarder, all of it. Its own library: the registration it reads, the named pipe it connects
       # to, and the credential file it presents only when that file's own access list is its owner's.
