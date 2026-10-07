@@ -173,6 +173,12 @@ impl Fixture {
         self.service.interpose(interposition);
     }
 
+    /// Runs something when a destination holds a repository the service published and nothing of
+    /// it has been read yet.
+    pub fn after_publication(&mut self, act: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.service.after_publication(act);
+    }
+
     /// Runs something immediately before a reconciliation reads or removes anything beneath its
     /// location.
     pub fn before_reconciling(&mut self, act: std::sync::Arc<dyn Fn() + Send + Sync>) {

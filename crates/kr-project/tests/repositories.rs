@@ -2038,6 +2038,176 @@ fn an_unbound_owner_operation_is_unchanged() {
     }
 }
 
+/// Makes the fixture list every Git invocation, and run `act` each time a destination holds a
+/// published repository that nothing has read yet. It is given how many times that has happened
+/// and the list, which it may take.
+fn on_publication(
+    fixture: &mut Fixture,
+    act: impl Fn(usize, &support::Started) + Send + Sync + 'static,
+) -> support::Started {
+    let started = support::watching_git(fixture);
+    let list = Arc::clone(&started);
+    let times = std::sync::atomic::AtomicUsize::new(0);
+    fixture.after_publication(Arc::new(move || {
+        let nth = times.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        act(nth, &list);
+    }));
+    started
+}
+
+/// Puts another repository where `published` is, and the published one beside it.
+#[cfg(unix)]
+fn another_repository_takes_the_place_of(published: &Path, other: &Path) {
+    std::fs::rename(published, published.with_extension("published"))
+        .expect("the published repository moves away");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(other)
+        .arg(published)
+        .status()
+        .expect("cp runs");
+    assert!(copied.success(), "another repository takes the name");
+}
+
+/// What took the place of a repository a moment after it was published is not read as the
+/// published one: the object at the destination is decided by the identity staged for it before
+/// Git is asked anything there, and nothing of what is there is audited.
+#[cfg(unix)]
+#[test]
+fn a_repository_that_takes_a_published_destinations_place_is_not_read_as_the_published_one() {
+    let mut fixture = Fixture::create();
+    let other = ordinary_repository(fixture.work(), "other");
+    let published = fixture.work().join("fresh");
+    let named = std::fs::canonicalize(fixture.work())
+        .expect("the directory resolves")
+        .join("fresh");
+    let started = on_publication(&mut fixture, move |_, list| {
+        // Nothing has read the destination yet: what is listed from here on is what the host does
+        // with whatever is there.
+        list.lock().expect("the list is held").clear();
+        another_repository_takes_the_place_of(&published, &other);
+    });
+    let refusal = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "fresh"),
+                label: "fresh".to_owned(),
+                initial_branch: Nullable(Some("main".to_owned())),
+            },
+            Some(&action("project.init", 90)),
+        )
+        .expect_err("another repository at the destination is not the one that was published");
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in what took the name: {refusal}"
+    );
+}
+
+/// And so it does for a repository published beneath a location: what took the name after the
+/// publication is not read as the published one.
+#[cfg(unix)]
+#[test]
+fn a_repository_that_takes_a_published_places_beneath_a_location_is_not_read_as_the_published_one()
+{
+    let mut fixture = Fixture::create();
+    let owner = support::TestOwner::default();
+    let other = ordinary_repository(fixture.work(), "other");
+    let parent = fixture.work().join("places");
+    let location = support::authorise_location(
+        fixture.service(),
+        &owner,
+        &parent,
+        LocationPurpose::Destination,
+        92,
+    );
+    let published = parent.join("fresh");
+    let named = std::fs::canonicalize(&parent)
+        .expect("the directory resolves")
+        .join("fresh");
+    let started = on_publication(&mut fixture, move |_, list| {
+        list.lock().expect("the list is held").clear();
+        another_repository_takes_the_place_of(&published, &other);
+    });
+    let refusal = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: kr_protocol::project::DestinationRequest {
+                    environment_id: fixture.environment_id(),
+                    parent: kr_protocol::project::DestinationParent::Location {
+                        location_id: location,
+                    },
+                    name: "fresh".to_owned(),
+                },
+                label: "fresh".to_owned(),
+                initial_branch: Nullable(Some("main".to_owned())),
+            },
+            Some(&action("project.init", 93)),
+        )
+        .expect_err("another repository at the destination is not the one that was published");
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in what took the name: {refusal}"
+    );
+}
+
+/// The same holds when an interrupted publication is finished: the first open of the destination
+/// fails for another reason, the host finishes the publication it reconciled, and what took the
+/// name in between is not read as the published repository either.
+#[cfg(unix)]
+#[test]
+fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read_as_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut fixture = Fixture::create();
+    let other = ordinary_repository(fixture.work(), "other");
+    let published = fixture.work().join("fresh");
+    let named = std::fs::canonicalize(fixture.work())
+        .expect("the directory resolves")
+        .join("fresh");
+    let git_directory = published.join(".git");
+    let started = on_publication(&mut fixture, {
+        let git_directory = git_directory.clone();
+        move |nth, list| {
+            if nth == 1 {
+                // The first open finds a repository it cannot read, which fails the operation
+                // after the rename landed, and the host reconciles it.
+                std::fs::set_permissions(&git_directory, std::fs::Permissions::from_mode(0o000))
+                    .expect("the repository cannot be read");
+            } else if nth == 2 {
+                std::fs::set_permissions(&git_directory, std::fs::Permissions::from_mode(0o755))
+                    .expect("the repository can be read again");
+                list.lock().expect("the list is held").clear();
+                another_repository_takes_the_place_of(&published, &other);
+            }
+        }
+    });
+    let refusal = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "fresh"),
+                label: "fresh".to_owned(),
+                initial_branch: Nullable(Some("main".to_owned())),
+            },
+            Some(&action("project.init", 91)),
+        )
+        .expect_err("another repository at the destination is not the one that was published");
+    // Whatever the outcome, the directory is left as a test may remove it.
+    let _ = std::fs::set_permissions(
+        fixture.work().join("fresh/.git"),
+        std::fs::Permissions::from_mode(0o755),
+    );
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in what took the name: {refusal}"
+    );
+}
+
 #[test]
 fn a_publication_that_meets_a_taken_name_fails_and_takes_its_staging_away() {
     // The rename that publishes a staged repository replaces nothing. Something takes the

@@ -39,7 +39,7 @@ use kr_protocol::project::{
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
 };
 use kr_protocol::scalars::{Nullable, U64, Uuid};
-use kr_transfer::{Clock, ObjectIdentity, RecordedIdentity, RelativeName, Settled, SystemClock};
+use kr_transfer::{Clock, RecordedIdentity, RelativeName, Settled, SystemClock};
 
 use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
@@ -167,6 +167,10 @@ pub struct ProjectService {
     /// location.
     #[cfg(feature = "git-fixtures")]
     reconciling: Option<Hook>,
+    /// What a test runs when a destination holds a published repository and nothing of it has
+    /// been read yet.
+    #[cfg(feature = "git-fixtures")]
+    publication: Option<Hook>,
 }
 
 /// Something a test runs at one point of the service's own work.
@@ -222,6 +226,8 @@ impl ProjectService {
             running: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "git-fixtures")]
             reconciling: None,
+            #[cfg(feature = "git-fixtures")]
+            publication: None,
         })
     }
 
@@ -244,6 +250,17 @@ impl ProjectService {
     #[cfg(feature = "git-fixtures")]
     pub fn before_reconciling(&mut self, act: Arc<dyn Fn() + Send + Sync>) {
         self.reconciling = Some(Hook(act));
+    }
+
+    /// Runs something at the moment a destination holds a repository this service published and
+    /// nothing of it has been read: after the rename that publishes it, and again when an
+    /// interrupted publication is finished, in each case before the destination is opened.
+    ///
+    /// Compiled with the fixtures, so that a test can act in a window where no Git child runs for
+    /// an interposition to act beside. Nothing in the service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn after_publication(&mut self, act: Arc<dyn Fn() + Send + Sync>) {
+        self.publication = Some(Hook(act));
     }
 
     /// Returns the directory, under the environment's state directory, that this service owns.
@@ -852,8 +869,8 @@ impl ProjectService {
             Err(error) => return Err(error),
         };
         match reconciled {
-            Reconciliation::Published(identity) => {
-                self.finish_publication(row, destination, identity, staging)?;
+            Reconciliation::Published(_) => {
+                self.finish_publication(row, destination, staged, staging)?;
                 Ok(ResolvedStep::Completed)
             }
             Reconciliation::Staged(_) => {
@@ -863,8 +880,8 @@ impl ProjectService {
                     return Ok(ResolvedStep::Unresolved(None));
                 };
                 match publish(&sibling, destination, staged) {
-                    Ok(identity) => {
-                        self.finish_publication(row, destination, identity, Some(sibling))?;
+                    Ok(_) => {
+                        self.finish_publication(row, destination, staged, Some(sibling))?;
                         Ok(ResolvedStep::Completed)
                     }
                     Err(error) => {
@@ -899,8 +916,8 @@ impl ProjectService {
             Err(failure) => return Err(failure),
         };
         match reconciled {
-            Reconciliation::Published(identity) => {
-                self.finish_publication(row, destination, identity, Some(sibling))?;
+            Reconciliation::Published(_) => {
+                self.finish_publication(row, destination, staged, Some(sibling))?;
                 Ok(ResolvedStep::Completed)
             }
             Reconciliation::Staged(_) => {
@@ -1019,21 +1036,11 @@ impl ProjectService {
         &self,
         row: &OperationRow,
         destination: &Destination,
-        identity: ObjectIdentity,
+        staged: StagedWitness,
         staging: Option<StagingSibling>,
     ) -> Result<()> {
         let path = destination.path();
-        let opened = self.open_at(destination, destination.admission())?;
-        if opened.identity().work_tree != identity {
-            return Err(ProjectError::OutcomeUnknown {
-                detail: format!(
-                    "{} holds {} and the staged repository was {identity}",
-                    crate::git::redact(&path.display().to_string()),
-                    opened.identity().work_tree
-                )
-                .into(),
-            });
-        }
+        let opened = self.open_published(destination, destination.admission(), staged)?;
         let project = ProjectRow {
             project_repository_id: row.project_repository_id,
             environment_id: row.environment_id,
@@ -1243,9 +1250,10 @@ impl ProjectService {
         Ok((opened, Decided { tree, git_dir }))
     }
 
-    /// Opens the repository at a destination: through its location when it has one, and as it
-    /// always was when the owner named a path.
-    fn open_at(
+    /// Opens the checkout an adoption names, at its destination: through its location when it has
+    /// one, and as it always was when the owner named a path. Nothing was staged for it, so no
+    /// record says which object it is.
+    fn open_adopted(
         &self,
         destination: &Destination,
         admission: Option<&ReadAdmission>,
@@ -1253,6 +1261,44 @@ impl ProjectService {
         match destination.location() {
             Some(held) => self.open_through(held, destination.name(), admission.cloned()),
             None => OpenedRepository::open(&self.profile, self.environment_id, &destination.path()),
+        }
+    }
+
+    /// Opens the repository an operation published at its destination, as the object that was
+    /// staged for it: the identity recorded before the rename decides the directory before Git is
+    /// asked anything there and before anything of it is audited, so another directory that took
+    /// the name after the publication is refused unread. The repository was made inside its tree,
+    /// and is found there.
+    fn open_published(
+        &self,
+        destination: &Destination,
+        admission: Option<&ReadAdmission>,
+        staged: StagedWitness,
+    ) -> Result<OpenedRepository> {
+        #[cfg(feature = "git-fixtures")]
+        if let Some(hook) = &self.publication {
+            (hook.0)();
+        }
+        let recorded = RecordedTree {
+            tree: staged.identity,
+            git_dir: GitDirectory::InsideTree { recorded: None },
+        };
+        match destination.location() {
+            Some(held) => Ok(self
+                .open_through_deciding(
+                    held,
+                    destination.name(),
+                    admission.cloned(),
+                    Some(recorded),
+                )?
+                .0),
+            None => Ok(OpenedRepository::open_recorded_tree(
+                &self.profile,
+                self.environment_id,
+                &destination.path(),
+                recorded,
+            )?
+            .0),
         }
     }
 
@@ -1971,7 +2017,7 @@ impl ProjectService {
         cancel: &Arc<Cancellation>,
         admission: Option<&ReadAdmission>,
     ) -> Result<CreationAnswer> {
-        let (identity, path, staging) = match plan {
+        let (published, path, staging) = match plan {
             CreatePlan::Adopt { .. } => {
                 // Nothing is staged: the checkout is already there and adopting it writes nothing
                 // into it, does not fetch, does not check anything out and does not touch the
@@ -1989,8 +2035,8 @@ impl ProjectService {
                         admission,
                     )
                 })?;
-                let published = publish(&staging, destination, staged)?;
-                (Some(published), destination.path(), Some(staging))
+                publish(&staging, destination, staged)?;
+                (Some(staged), destination.path(), Some(staging))
             }
             CreatePlan::Clone { remote, .. } => {
                 let staging = self.begin_staging(row, destination)?;
@@ -2002,28 +2048,22 @@ impl ProjectService {
                     stage_clone(&self.profile, staging, remote, cancel, admission)
                         .map_err(|error| unauthenticated_fetch(error, remote))
                 })?;
-                let published = publish(&staging, destination, staged)?;
-                (Some(published), destination.path(), Some(staging))
+                publish(&staging, destination, staged)?;
+                (Some(staged), destination.path(), Some(staging))
             }
         };
-        let opened = self.open_at(destination, admission)?;
+        // What was published is opened as the object that was staged, so that nothing of whatever
+        // else is at the destination is read; a checkout that is adopted was staged by nobody, and
+        // is opened as the directory the owner named.
+        let opened = match published {
+            Some(staged) => self.open_published(destination, admission, staged)?,
+            None => self.open_adopted(destination, admission)?,
+        };
         // A record in this host's registry is a promise to serve the repository, including its
         // remotes. A read of a repository whose configuration names something no override removes
         // is allowed and states the limitation; taking it into the registry is not, because the
         // host would then be serving a repository whose helpers it cannot neutralise.
         opened.audit().require_neutralised()?;
-        if let Some(identity) = identity
-            && opened.identity().work_tree != identity
-        {
-            return Err(ProjectError::OutcomeUnknown {
-                detail: format!(
-                    "{} holds {} and the staged repository was {identity}",
-                    crate::git::redact(&path.display().to_string()),
-                    opened.identity().work_tree
-                )
-                .into(),
-            });
-        }
         let project = ProjectRow {
             project_repository_id: row.project_repository_id,
             environment_id: self.environment_id,
