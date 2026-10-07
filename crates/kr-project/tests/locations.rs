@@ -2478,6 +2478,88 @@ fn a_bound_repository_recorded_under_other_device_numbers_is_cloned_from_and_wor
     assert_eq!(devices(), numbers, "so does making a workspace of it");
 }
 
+/// A directory that is not the repository a source location is bound to is not read through it: a
+/// clone by registration and a workspace made through a location are each refused, and no Git
+/// invocation starts in that directory.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_is_not_the_bound_repository_is_not_read_through_its_source() {
+    let mut fixture = Fixture::create();
+    let started = support::watching_git(&mut fixture);
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 170);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        171,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        172,
+    );
+    let project = adopt(&fixture, &sources, "repo", 173);
+    attach(fixture.service(), &owner, project, source, 174).expect("the repository is bound");
+    let named = std::fs::canonicalize(&sources)
+        .expect("the directory resolves")
+        .join("repo");
+
+    // The repository the record names is read where it is.
+    let _ = support::git_started_in(&started, &named);
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "control"),
+        true,
+        175,
+    )
+    .expect("the bound repository is the registered one");
+    assert!(
+        support::git_started_in(&started, &named),
+        "Git is started in the bound repository"
+    );
+
+    // The record names another directory than the one at the bound path.
+    journal(&fixture)
+        .execute(
+            "UPDATE projects SET work_tree_file_id = work_tree_file_id + 1
+              WHERE project_repository_id = ?1",
+            rusqlite::params![bytes(project.get())],
+        )
+        .expect("the record is rewritten");
+    let cloned = clone_into(
+        fixture.service(),
+        through(environment, into, "copy"),
+        CloneSource::Registered {
+            project_repository_id: project,
+        },
+        176,
+    )
+    .expect_err("another directory is not the registered repository");
+    assert_eq!(cloned.code(), ErrorCode::SourceChanged);
+    let worked = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        true,
+        177,
+    )
+    .expect_err("another directory is not the repository a workspace is made of");
+    assert_eq!(worked.code(), ErrorCode::SourceChanged);
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in the directory the record does not name"
+    );
+}
+
 /// The owner removes a workspace through its location, and the staging directory its row recorded,
 /// when the filesystem is numbered differently since the row was written: each is still the object
 /// the row recorded. A tree that is another object is not removed under any number, and the
@@ -2566,6 +2648,100 @@ fn owner_cleanup_finds_what_the_journal_recorded_under_another_device_number() {
     let removed = remove(156).expect("the tree and its staging directory are the recorded ones");
     assert!(removed.working_files_removed);
     support::assert_absent(&workspaces.join("feature"), "the removed workspace");
+}
+
+/// What a workspace made through a location holds is read from the directory its record names and
+/// from no other: a directory that is not the recorded tree is not counted as the workspace's, and
+/// no Git invocation starts in it.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_is_not_the_recorded_tree_is_not_read_through_its_location() {
+    let mut fixture = Fixture::create();
+    let started = support::watching_git(&mut fixture);
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 160);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        161,
+    );
+    let project = adopt(&fixture, &sources, "repo", 162);
+    attach(fixture.service(), &owner, project, source, 163).expect("the repository is bound");
+    let made = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "feature"),
+        false,
+        164,
+    )
+    .expect("the workspace is made through a location")
+    .workspace
+    .0
+    .expect("a workspace, not a preview");
+    let named = std::fs::canonicalize(&workspaces)
+        .expect("the directory resolves")
+        .join("feature");
+    let measured = |seed: u8| {
+        fixture
+            .service()
+            .workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id: made.workspace_id,
+                    retention: RetentionPolicy::KeepEverything,
+                    through_location_id: Nullable(Some(made_in)),
+                },
+                Some(&action("workspace.remove", seed)),
+            )
+            .expect("the removal is answered")
+            .retained
+    };
+
+    // The tree the record names holds uncommitted work, so the removal that keeps everything keeps
+    // it, and it is read where it is.
+    std::fs::write(
+        workspaces.join("feature/mine.txt"),
+        b"this workspace's own work\n",
+    )
+    .expect("work in the tree");
+    let _ = support::git_started_in(&started, &named);
+    let held = measured(165);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the recorded tree is counted: {held:?}"
+    );
+    assert!(
+        support::git_started_in(&started, &named),
+        "Git is started in the recorded tree"
+    );
+
+    // The record names another directory than the one at the tree's path.
+    journal(&fixture)
+        .execute(
+            "UPDATE workspaces SET tree_file_id = tree_file_id + 1 WHERE workspace_id = ?1",
+            rusqlite::params![bytes(made.workspace_id.get())],
+        )
+        .expect("the record is rewritten");
+    let held = measured(166);
+    assert!(
+        held.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        !support::git_started_in(&started, &named),
+        "no Git invocation started in the directory the record does not name"
+    );
+    assert!(
+        workspaces.join("feature/mine.txt").is_file(),
+        "nothing was removed"
+    );
 }
 
 /// The owner's cleanup of a workspace through its location does not remove the staging directory

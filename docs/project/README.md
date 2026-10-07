@@ -502,7 +502,9 @@ the change-set service's; a policy that claimed to keep what it had just deleted
 **What a workspace holds is measured, not assumed.** An empty retention table does not establish a
 clean tree: a workspace created from its base alone holds nothing, and then somebody edits a file in
 it. So every removal reads the workspace's own status first and records what it found, and
-`keep_everything` then keeps the workspace because of that as readily as because of a pin.
+`keep_everything` then keeps the workspace because of that as readily as because of a pin. The
+status is read only in the directory the workspace recorded: a directory that took its place is
+reported as one this host could not inspect.
 
 **Cleanup waits for every session and every run.** Both are recorded bindings and either refuses a
 removal while it is live, whatever policy the request carries. A run can hold a workspace between

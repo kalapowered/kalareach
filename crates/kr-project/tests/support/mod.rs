@@ -210,6 +210,26 @@ impl Fixture {
     }
 }
 
+/// Makes the fixture list every directory a Git invocation is about to start in.
+pub fn watching_git(fixture: &mut Fixture) -> std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>> {
+    let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&started);
+    fixture.interpose(kr_project::git::Interposition::new(std::sync::Arc::new(
+        move |_: &str, directory: &Path, _: &Path| {
+            seen.lock()
+                .expect("the list is held")
+                .push(directory.to_path_buf());
+        },
+    )));
+    started
+}
+
+/// Returns true when a Git invocation started in `directory`, and forgets what was listed.
+pub fn git_started_in(started: &std::sync::Mutex<Vec<PathBuf>>, directory: &Path) -> bool {
+    let started = std::mem::take(&mut *started.lock().expect("the list is held"));
+    started.iter().any(|started| started == directory)
+}
+
 /// A broker whose programs are the ones installed Git ships with.
 ///
 /// The tests that clone over a network transport need a broker, and what makes one approved is

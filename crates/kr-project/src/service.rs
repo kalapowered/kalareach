@@ -1168,10 +1168,21 @@ impl ProjectService {
         };
         let held = self.locations().admit(location_id, &wanted)?;
         let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
-        let opened = self.open_through(&held, &relative, admission)?;
-        if let Some((project, expected)) = expected {
-            self.settle_project(project, opened.require_identity(expected)?)?;
-        }
+        let opened = match expected {
+            // A registered repository is the object its record names, decided before anything of
+            // it is read.
+            Some((project, expected)) => {
+                let (opened, _) = self.open_through_deciding(
+                    &held,
+                    &relative,
+                    admission,
+                    is_recorded_tree(expected.work_tree),
+                )?;
+                self.settle_project(project, opened.require_identity(expected)?)?;
+                opened
+            }
+            None => self.open_through(&held, &relative, admission)?,
+        };
         let remote = self.brokers.validate(&RemoteSpecification {
             remote_name: "origin".to_owned(),
             transport: RemoteTransport::LocalPath,
@@ -1191,19 +1202,35 @@ impl ProjectService {
         relative: &RelativeName,
         admission: Option<ReadAdmission>,
     ) -> Result<OpenedRepository> {
+        Ok(self
+            .open_through_deciding(location, relative, admission, |_| Ok(()))?
+            .0)
+    }
+
+    /// Opens a repository through a location like [`Self::open_through`], after `decide` has
+    /// accepted the working tree's directory and before anything of the repository is read or Git
+    /// is asked anything.
+    fn open_through_deciding<T>(
+        &self,
+        location: &HeldLocation,
+        relative: &RelativeName,
+        admission: Option<ReadAdmission>,
+        decide: impl FnOnce(&kr_transfer::AuthorisedDirectory) -> Result<T>,
+    ) -> Result<(OpenedRepository, T)> {
         let shown = location.handle().host_path(relative).display().to_string();
-        let found = crate::discovery::discover_through(
-            location.handle(),
-            relative,
-            &shown,
-            admission.as_ref(),
-        )?;
-        OpenedRepository::discovered(
+        if let Some(admission) = admission.as_ref() {
+            admission.admit()?;
+        }
+        let work_tree = location.handle().subdirectory(relative)?;
+        let decided = decide(&work_tree)?;
+        let found = crate::discovery::discover(work_tree, &shown)?;
+        let opened = OpenedRepository::discovered(
             &self.profile,
             found,
             (location.handle().try_clone()?, relative.clone()),
             admission,
-        )
+        )?;
+        Ok((opened, decided))
     }
 
     /// Opens the repository at a destination: through its location when it has one, and as it
@@ -1549,7 +1576,8 @@ impl ProjectService {
     /// Each is decided by the rule every recorded directory is decided by: it is the recorded one
     /// by its inode on the recorded filesystem, under whatever device number that filesystem has
     /// now, and what the record is to become is written here. An independent clone is its own
-    /// repository, so only its tree is held to a record.
+    /// repository, so only its tree is held to a record. The tree is decided before Git is asked
+    /// anything in it.
     ///
     /// # Errors
     ///
@@ -1557,21 +1585,26 @@ impl ProjectService {
     /// and [`ProjectError::IdentityChanged`] when this host recorded no identity for the tree or
     /// when either object at the recorded path is not the one the record names.
     pub fn open_workspace_repository(&self, workspace_id: WorkspaceId) -> Result<OpenedRepository> {
-        let (row, project) = {
-            let store = self.locked()?;
-            let row =
-                store
-                    .workspace(workspace_id)?
-                    .ok_or_else(|| ProjectError::UnknownWorkspace {
-                        workspace: workspace_id.to_string().into(),
-                    })?;
-            let project = store.project(row.project_repository_id)?.ok_or_else(|| {
-                ProjectError::UnknownProject {
-                    project: row.project_repository_id.to_string().into(),
-                }
-            })?;
-            (row, project)
-        };
+        let row = self.locked()?.workspace(workspace_id)?.ok_or_else(|| {
+            ProjectError::UnknownWorkspace {
+                workspace: workspace_id.to_string().into(),
+            }
+        })?;
+        self.open_recorded_workspace(&row, &TreeReach::by_path())
+    }
+
+    /// Opens the repository one workspace's working tree belongs to, reached the way `reach` says,
+    /// as the tree the row recorded, and writes what the records become.
+    ///
+    /// The directory at the recorded place is decided before Git is asked anything in it, so a
+    /// directory that took the tree's place, or a filesystem mounted over it, is refused without a
+    /// Git invocation having run there. The shared decision ([`Self::settle_workspace_records`])
+    /// then covers the repository the workspace shares with its project.
+    fn open_recorded_workspace(
+        &self,
+        row: &WorkspaceRow,
+        reach: &TreeReach,
+    ) -> Result<OpenedRepository> {
         let Some(tree) = row.identity else {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
@@ -1582,12 +1615,45 @@ impl ProjectService {
                 .into(),
             });
         };
-        let opened = OpenedRepository::open(
-            &self.profile,
-            self.environment_id,
-            Path::new(&row.display_path),
-        )?;
-        let settled_tree = opened.require_tree(tree)?;
+        let project = self
+            .locked()?
+            .project(row.project_repository_id)?
+            .ok_or_else(|| ProjectError::UnknownProject {
+                project: row.project_repository_id.to_string().into(),
+            })?;
+        let (opened, settled_tree) = match &reach.through {
+            Some((held, name)) => self.open_through_deciding(
+                held,
+                name,
+                reach.admission.clone(),
+                is_recorded_tree(tree),
+            )?,
+            None => {
+                let (opened, settled) = OpenedRepository::open_recorded_tree(
+                    &self.profile,
+                    self.environment_id,
+                    Path::new(&row.display_path),
+                    tree,
+                )?;
+                (opened, settled)
+            }
+        };
+        self.settle_workspace_records(row, &project, &opened, settled_tree)?;
+        Ok(opened)
+    }
+
+    /// Decides that the repository a workspace's tree belongs to is the one its project recorded,
+    /// and writes what the tree's record and the project's record become.
+    ///
+    /// An independent clone is its own repository, so only its tree is held to a record. Both
+    /// decisions are made before either write.
+    fn settle_workspace_records(
+        &self,
+        row: &WorkspaceRow,
+        project: &ProjectRow,
+        opened: &OpenedRepository,
+        settled_tree: Settled,
+    ) -> Result<()> {
         let settled_git_dir = if row.isolation == Some(IsolationMechanism::IndependentClone) {
             Settled::AsRecorded
         } else {
@@ -1596,7 +1662,7 @@ impl ProjectService {
         if let Some((was, now)) = settled_tree.revision() {
             crate::store::settle_workspace_tree(
                 self.writable()?.connection(),
-                workspace_id,
+                row.workspace_id,
                 was,
                 now,
             )?;
@@ -1609,7 +1675,7 @@ impl ProjectService {
                 now,
             )?;
         }
-        Ok(opened)
+        Ok(())
     }
 
     // ----- creations ------------------------------------------------------------------------
@@ -2985,17 +3051,15 @@ impl ProjectService {
     ///
     /// Ignored files count: a build product somebody added after the creation is still work the
     /// user has not approved removing.
+    ///
+    /// Only the directory the workspace recorded is read. A directory that took its place, or a
+    /// filesystem mounted over it, is not the workspace's tree, so Git is not run there and what
+    /// it holds is not counted as the workspace's: the tree is reported as one this host could
+    /// not inspect.
     fn count_dirty(&self, row: &WorkspaceRow, reach: &TreeReach) -> DirtyCount {
         // A shared workspace's tree is the user's own and is never removed, so what it holds does
         // not gate anything; a read of it still says what is there.
-        let opened = match &reach.through {
-            Some((held, name)) => self.open_through(held, name, reach.admission.clone()),
-            None => OpenedRepository::open(
-                &self.profile,
-                self.environment_id,
-                Path::new(&row.display_path),
-            ),
-        };
+        let opened = self.open_recorded_workspace(row, reach);
         let opened = match opened {
             Ok(opened) => opened,
             Err(error) => {
@@ -3195,10 +3259,11 @@ impl ProjectService {
         };
         let source = self.locations().admit(bound.location_id, &wanted)?;
         reach.push((Arc::clone(&source), wanted));
-        let opened = self.open_through(
+        let (opened, _) = self.open_through_deciding(
             &source,
             &RelativeName::parse(&bound.relative_path)?,
             admission_for(self.locations(), reach.clone()),
+            is_recorded_tree(project.identity.work_tree),
         )?;
         self.settle_project(
             project.project_repository_id,
@@ -3942,6 +4007,27 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
     )
 }
 
+/// Returns what decides, before anything of a repository reached through a location is read and
+/// before Git is asked anything, that the working tree found at its place is the one a record
+/// names.
+fn is_recorded_tree(
+    tree: RecordedIdentity,
+) -> impl FnOnce(&kr_transfer::AuthorisedDirectory) -> Result<Settled> {
+    move |work_tree| {
+        work_tree
+            .check_recorded(tree)
+            .map_err(|refusal| ProjectError::IdentityChanged {
+                detail: format!(
+                    "this record names the working tree {tree}, and {} holds another directory, \
+                     so nothing is read there: {}",
+                    crate::git::redact(&work_tree.display_path().display().to_string()),
+                    crate::git::redact(&refusal.to_string())
+                )
+                .into(),
+            })
+    }
+}
+
 /// How a removal reaches a workspace's tree.
 struct TreeReach {
     /// The location the tree is reached through, admitted, and the tree's name beneath it: the
@@ -3953,6 +4039,14 @@ struct TreeReach {
 }
 
 impl TreeReach {
+    /// Returns the reach of a tree named by its recorded path alone, as the owner always has.
+    const fn by_path() -> Self {
+        Self {
+            through: None,
+            admission: None,
+        }
+    }
+
     /// Returns the reach of another entry of the directory the tree is in, through the same
     /// location and asking the same question.
     fn beside(&self, name: &str) -> Result<Self> {

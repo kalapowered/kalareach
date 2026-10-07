@@ -130,7 +130,44 @@ impl OpenedRepository {
         environment_id: EnvironmentId,
         path: &Path,
     ) -> Result<Self> {
+        Self::open_deciding(profile, environment_id, path, |_| Ok(()))
+    }
+
+    /// Opens a working tree that a record names, and decides that the directory at its path is
+    /// that tree before Git is asked anything there.
+    ///
+    /// The directory is opened and decided by `require_within` first. Git then starts in that
+    /// object and nowhere else, and the repository it reports is decided once more
+    /// ([`Self::require_tree`]), so a directory that took the place of the recorded tree, or a
+    /// filesystem mounted over it, is refused without a Git invocation having run in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when the directory is neither the recorded tree
+    /// nor inside it, or what [`Self::open`] returns.
+    pub fn open_recorded_tree(
+        profile: &RestrictedProfile,
+        environment_id: EnvironmentId,
+        path: &Path,
+        tree: RecordedIdentity,
+    ) -> Result<(Self, Settled)> {
+        let opened = Self::open_deciding(profile, environment_id, path, |named| {
+            require_within(named, tree)
+        })?;
+        let settled = opened.require_tree(tree)?;
+        Ok((opened, settled))
+    }
+
+    /// Opens a working tree like [`Self::open`], after `decide` has accepted the directory at the
+    /// path and before Git is asked anything. Git starts in the directory `decide` saw.
+    fn open_deciding(
+        profile: &RestrictedProfile,
+        environment_id: EnvironmentId,
+        path: &Path,
+        decide: impl FnOnce(&AuthorisedDirectory) -> Result<()>,
+    ) -> Result<Self> {
         let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
+        decide(&work_tree)?;
         // `--git-common-dir` rather than `--git-dir`: a linked worktree's own Git directory lives
         // inside the main one, and what identifies the repository is the object every worktree of
         // it shares.
@@ -147,7 +184,8 @@ impl OpenedRepository {
             OsStr::new("--show-toplevel"),
             OsStr::new("--is-inside-work-tree"),
         ];
-        let reported = profile.run_checked(&GitRequest::read(path, &arguments))?;
+        let reported = profile
+            .run_checked(&GitRequest::read(path, &arguments).expecting(work_tree.identity()))?;
         let mut lines = reported.lines();
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let own_dir_path = PathBuf::from(lines.next().unwrap_or_default());
@@ -278,6 +316,9 @@ impl OpenedRepository {
     /// Opens a working tree and requires it to be the object a record named, and says whether the
     /// record is to be replaced by what the repository is now.
     ///
+    /// The tree is decided before Git is asked anything there ([`Self::open_recorded_tree`]), and
+    /// the repository's Git directory once Git has said where it is.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when either identity differs from the record's,
@@ -288,9 +329,10 @@ impl OpenedRepository {
         path: &Path,
         expected: RecordedRepository,
     ) -> Result<(Self, Option<Revised>)> {
-        let opened = Self::open(profile, environment_id, path)?;
-        let revised = opened.require_identity(expected)?;
-        Ok((opened, revised))
+        let (opened, tree) =
+            Self::open_recorded_tree(profile, environment_id, path, expected.work_tree)?;
+        let git_dir = opened.require_git_dir(expected.git_dir)?;
+        Ok((opened, Self::revised(expected, git_dir, tree)))
     }
 
     /// Returns both identities as the journal records them.
@@ -323,17 +365,22 @@ impl OpenedRepository {
     pub fn require_identity(&self, expected: RecordedRepository) -> Result<Option<Revised>> {
         let git_dir = self.require_git_dir(expected.git_dir)?;
         let work_tree = self.require_tree(expected.work_tree)?;
-        Ok(
-            (git_dir != Settled::AsRecorded || work_tree != Settled::AsRecorded).then_some(
-                Revised {
-                    was: expected,
-                    now: RecordedRepository {
-                        git_dir: git_dir.current(expected.git_dir),
-                        work_tree: work_tree.current(expected.work_tree),
-                    },
-                },
-            ),
-        )
+        Ok(Self::revised(expected, git_dir, work_tree))
+    }
+
+    /// Returns what a record is to become, or `None` when it is as the repository is.
+    fn revised(
+        expected: RecordedRepository,
+        git_dir: Settled,
+        work_tree: Settled,
+    ) -> Option<Revised> {
+        (git_dir != Settled::AsRecorded || work_tree != Settled::AsRecorded).then_some(Revised {
+            was: expected,
+            now: RecordedRepository {
+                git_dir: git_dir.current(expected.git_dir),
+                work_tree: work_tree.current(expected.work_tree),
+            },
+        })
     }
 
     /// Refuses when this repository's Git common directory is not the directory a record named,
@@ -736,6 +783,44 @@ impl OpenedRepository {
         output.require_success()?;
         Ok(())
     }
+}
+
+/// Refuses, before Git is asked anything, when the directory found at a recorded path is neither
+/// the working tree a record names nor a directory inside it.
+///
+/// A record names the top level of a working tree, and a repository that was registered through a
+/// directory below its top level keeps that directory's path, so the directory at a recorded path
+/// is the recorded tree itself or lies beneath it. A directory that is not the recorded tree is
+/// followed upward by its own handle for as long as it stays on one filesystem; finding the
+/// recorded tree on the way says the path is inside it. A filesystem mounted over the path ends the
+/// climb at its own root, and so does the root of the filesystem, and either refuses.
+fn require_within(named: &AuthorisedDirectory, tree: RecordedIdentity) -> Result<()> {
+    let refusal = match named.check_recorded(tree) {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    let device = named.identity().device;
+    let mut here = named.try_clone()?;
+    while let Ok(above) = here.parent() {
+        if above.identity() == here.identity() || above.identity().device != device {
+            break;
+        }
+        if above.check_recorded(tree).is_ok() {
+            return Ok(());
+        }
+        here = above;
+    }
+    Err(ProjectError::IdentityChanged {
+        detail: format!(
+            "this record names the working tree {tree}, and {} is a directory that is neither \
+             that tree nor inside it; a recorded identity is the object rather than the path, and \
+             a linked worktree is its own object and a record of one never covers another, so \
+             nothing is run there: {}",
+            crate::git::redact(&named.display_path().display().to_string()),
+            crate::git::redact(&refusal.to_string())
+        )
+        .into(),
+    })
 }
 
 /// Returns the path the operating system gives for an open directory now, taken from its handle.

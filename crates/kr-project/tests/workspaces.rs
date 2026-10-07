@@ -27,8 +27,8 @@ use kr_protocol::project::{
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use support::{
-    Fixture, action, actor, destination, include_everything, ordinary_repository, write,
-    write_bytes,
+    Fixture, action, actor, destination, git_started_in, include_everything, ordinary_repository,
+    watching_git, write, write_bytes,
 };
 
 /// Builds a repository with one of each class of uncommitted work in it and adopts it.
@@ -654,8 +654,12 @@ fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
     volumes::with_volumes(
         "a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers",
         || {
-            let fixture = Fixture::create();
+            let mut fixture = Fixture::create();
+            let started = watching_git(&mut fixture);
             let project = adopted_with_changes(&fixture, "elsewhere");
+            let named = std::fs::canonicalize(fixture.work())
+                .expect("the directory resolves")
+                .join("elsewhere");
             let journal = || {
                 rusqlite::Connection::open(
                     kr_project::ProjectService::root_of(&fixture.host().environment())
@@ -681,6 +685,10 @@ fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
                 )
             };
             preview(70).expect("the repository on the filesystem it was registered on");
+            assert!(
+                git_started_in(&started, &named),
+                "Git is started in the registered repository"
+            );
 
             // Another filesystem takes the place of the directory the repository is in, with a
             // repository at the same path, and the record carries the numbers that repository has:
@@ -702,6 +710,10 @@ fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
             let refusal =
                 preview(71).expect_err("another filesystem is not the one it was registered on");
             assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+            assert!(
+                !git_started_in(&started, &named),
+                "no Git invocation started in the repository on the other filesystem"
+            );
             volume.detach();
         },
     );
@@ -785,6 +797,307 @@ fn a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers() 
             );
             volume.detach();
         },
+    );
+}
+
+/// Creates a linked worktree of `project` named `name` in the fixture's directory.
+fn worktree_workspace(
+    fixture: &Fixture,
+    project: ProjectRepositoryId,
+    name: &str,
+    seed: u8,
+) -> kr_protocol::ids::WorkspaceId {
+    fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: name.to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    name,
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", seed)),
+        )
+        .expect("the workspace is created")
+        .workspace
+        .0
+        .expect("it exists")
+        .workspace_id
+}
+
+/// Asks for a removal that keeps everything, which measures what the tree holds and removes
+/// nothing, and returns what it says was held.
+fn measured(
+    fixture: &Fixture,
+    workspace_id: kr_protocol::ids::WorkspaceId,
+    seed: u8,
+) -> Vec<kr_protocol::project::RetainedItem> {
+    fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
+            },
+            Some(&action("workspace.remove", seed)),
+        )
+        .expect("the removal is answered")
+        .retained
+}
+
+/// What a workspace holds is read from the directory its record names and from no other: a
+/// directory that took the tree's place is not read as the workspace, and no Git invocation starts
+/// in it, whether a removal measures the tree or a capture opens it.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_took_a_workspace_trees_place_is_not_read_as_the_workspace() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let project = adopted_with_changes(&fixture, "replaced-source");
+    let workspace_id = worktree_workspace(&fixture, project, "replaced-tree", 80);
+    let tree = fixture.work().join("replaced-tree");
+    let named = std::fs::canonicalize(fixture.work())
+        .expect("the directory resolves")
+        .join("replaced-tree");
+
+    // The tree the record names is read where it is, and it holds uncommitted work, so the removal
+    // that keeps everything keeps it.
+    write(&tree, "mine.txt", "this workspace's own work\n");
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 81);
+    assert!(
+        held.iter()
+            .any(|item| item.detail.contains("hold uncommitted work")),
+        "the work in the recorded tree is counted: {held:?}"
+    );
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the recorded tree"
+    );
+
+    // Another repository, with uncommitted work of its own, is where the tree was.
+    std::fs::rename(&tree, fixture.work().join("replaced-tree-moved"))
+        .expect("the tree is moved away");
+    let other = ordinary_repository(fixture.work(), "replaced-tree");
+    write(&other, "theirs.txt", "not this workspace's\n");
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 82);
+    assert!(
+        held.iter()
+            .any(|item| item.kind == RetainedKind::DirtyContent
+                && item
+                    .detail
+                    .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {held:?}"
+    );
+    assert!(
+        held.iter()
+            .all(|item| !item.detail.contains("hold uncommitted work")),
+        "what the other directory holds is not counted as the workspace's: {held:?}"
+    );
+    assert!(
+        !git_started_in(&started, &named),
+        "no Git invocation started in the directory that took the tree's place"
+    );
+
+    // A capture opens the workspace's repository through the same decision.
+    let refusal = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect_err("the directory at the recorded path is not the workspace's tree");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        !git_started_in(&started, &named),
+        "no Git invocation started in it to open the repository either"
+    );
+    assert!(
+        other.join("theirs.txt").is_file(),
+        "what is there is left as it is"
+    );
+}
+
+/// A workspace tree on another filesystem that gives the directory at its path the numbers the
+/// recorded one had is not read as the workspace, and no Git invocation starts in it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
+)]
+fn a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers() {
+    volumes::with_volumes(
+        "a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers",
+        || {
+            let mut fixture = Fixture::create();
+            let started = watching_git(&mut fixture);
+            let project = adopted_with_changes(&fixture, "mounted-source");
+            let trees = fixture.work().join("trees");
+            std::fs::create_dir(&trees).expect("where workspaces are made");
+            let workspace_id = fixture
+                .service()
+                .workspace_create(
+                    &actor(),
+                    &WorkspaceCreateParams {
+                        project_repository_id: project,
+                        label: "mounted".to_owned(),
+                        kind: WorkspaceKind::Isolated,
+                        isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                        policy: InclusionPolicy::base_only(),
+                        base_revision: Nullable(None),
+                        base_change_set_id: Nullable(None),
+                        destination: Nullable(Some(destination(
+                            fixture.environment_id(),
+                            &trees,
+                            "tree",
+                        ))),
+                        preview_only: false,
+                    },
+                    Some(&action("workspace.create", 83)),
+                )
+                .expect("the workspace is created")
+                .workspace
+                .0
+                .expect("it exists")
+                .workspace_id;
+            let named = std::fs::canonicalize(&trees)
+                .expect("the directory resolves")
+                .join("tree");
+
+            // The tree the record names is read where it is, and it holds uncommitted work, so the
+            // removal that keeps everything keeps it.
+            write(
+                &trees.join("tree"),
+                "mine.txt",
+                "this workspace's own work\n",
+            );
+            let _ = git_started_in(&started, &named);
+            let held = measured(&fixture, workspace_id, 84);
+            assert!(
+                held.iter()
+                    .any(|item| item.detail.contains("hold uncommitted work")),
+                "the work in the recorded tree is counted: {held:?}"
+            );
+            assert!(
+                git_started_in(&started, &named),
+                "Git is started in the recorded tree"
+            );
+
+            // Another filesystem takes the place of the directory the workspace is in, with a
+            // directory of its own at the tree's path that has the inode the tree had.
+            let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
+            let volume = volumes::Volume::attach(&trees, scratch.path(), "other")
+                .unwrap_or_else(|| volumes::not_attachable());
+            std::fs::create_dir(trees.join("tree")).expect("a directory at the tree's path");
+            std::fs::write(trees.join("tree/theirs.txt"), b"not this host's\n")
+                .expect("their file");
+            let (device, inode) = numbers_of(&trees.join("tree"));
+            rusqlite::Connection::open(
+                kr_project::ProjectService::root_of(&fixture.host().environment())
+                    .join(kr_project::store::STORE_FILE_NAME),
+            )
+            .expect("the journal opens")
+            .execute(
+                "UPDATE workspaces SET tree_device = ?2, tree_file_id = ?3 WHERE workspace_id = ?1",
+                rusqlite::params![workspace_id.get().as_bytes().to_vec(), device, inode],
+            )
+            .expect("the record is rewritten");
+
+            let held = measured(&fixture, workspace_id, 85);
+            assert!(
+                held.iter()
+                    .any(|item| item.kind == RetainedKind::DirtyContent
+                        && item
+                            .detail
+                            .contains("could not read what this workspace holds")),
+                "the host says it could not inspect the tree: {held:?}"
+            );
+            assert!(
+                !git_started_in(&started, &named),
+                "no Git invocation started in the directory on the other filesystem"
+            );
+            assert!(
+                trees.join("tree/theirs.txt").is_file(),
+                "what the other filesystem holds is as it was"
+            );
+            volume.detach();
+        },
+    );
+}
+
+/// A repository registered through a directory below its top level is recorded by the top level's
+/// identity, and its workspace is still read: the directory at the registered path is inside the
+/// recorded tree.
+#[cfg(unix)]
+#[test]
+fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read() {
+    let mut fixture = Fixture::create();
+    let started = watching_git(&mut fixture);
+    let top = ordinary_repository(fixture.work(), "whole");
+    write(
+        &top,
+        "below/work.txt",
+        "uncommitted, below the registered directory\n",
+    );
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), &top, "below"),
+                label: "below".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 86)),
+        )
+        .expect("a directory inside a checkout is adopted")
+        .project
+        .project_repository_id;
+    let workspace_id = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "in place".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 87)),
+        )
+        .expect("the shared workspace is created")
+        .workspace
+        .0
+        .expect("it exists")
+        .workspace_id;
+    let named = std::fs::canonicalize(&top).expect("the checkout resolves");
+
+    let _ = git_started_in(&started, &named);
+    let held = measured(&fixture, workspace_id, 88);
+    assert!(
+        held.iter()
+            .any(|item| item.kind == RetainedKind::DirtyContent
+                && item.detail.contains("hold uncommitted work")),
+        "the tree is read where it is: {held:?}"
+    );
+    assert!(
+        git_started_in(&started, &named),
+        "Git is started in the recorded tree"
     );
 }
 
