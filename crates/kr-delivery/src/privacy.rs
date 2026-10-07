@@ -177,7 +177,7 @@ mod tests {
     }
 
     fn consumer() -> String {
-        EventSource::WorkerOutbox.consumer("session-1")
+        EventSource::Attention.consumer("session-1")
     }
 
     /// The one external destination these tests send to.
@@ -264,7 +264,7 @@ mod tests {
                 .take_events(
                     &consumer(),
                     &[TakenEvent {
-                        key: EventKey::outbox(&uuid(byte)),
+                        key: EventKey::announcement(None, "an-item", u64::from(byte)),
                         source_cursor: u64::from(byte),
                         session_id: None,
                         recorded_at_ms: TimestampMs::new(1_000),
@@ -276,7 +276,7 @@ mod tests {
             journal
                 .admit(&DeliveryRecord {
                     notification_id: NotificationId::new(uuid(byte + 10)),
-                    event: EventKey::outbox(&uuid(byte)),
+                    event: EventKey::announcement(None, "an-item", u64::from(byte)),
                     destination_id: DestinationId::new("hook").expect("an identifier"),
                     state: DeliveryState::Admitted,
                     privacy_generation: 0,
@@ -430,7 +430,7 @@ mod tests {
             .take_events(
                 &consumer(),
                 &[TakenEvent {
-                    key: EventKey::outbox(&uuid(byte)),
+                    key: EventKey::announcement(None, "an-item", u64::from(byte)),
                     source_cursor: u64::from(byte),
                     session_id: None,
                     recorded_at_ms: TimestampMs::new(1_000),
@@ -443,7 +443,7 @@ mod tests {
         journal
             .admit(&DeliveryRecord {
                 notification_id,
-                event: EventKey::outbox(&uuid(byte)),
+                event: EventKey::announcement(None, "an-item", u64::from(byte)),
                 destination_id: phone.id.clone(),
                 state: DeliveryState::Admitted,
                 privacy_generation: 0,
