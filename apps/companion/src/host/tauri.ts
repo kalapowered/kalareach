@@ -307,8 +307,3 @@ export function tauriPort(): HostPort {
       })
   }
 }
-
-/** Whether this page is running inside the desktop shell. */
-export function insideDesktopShell(): boolean {
-  return '__TAURI_INTERNALS__' in window
-}
