@@ -146,10 +146,11 @@ impl Controller {
     /// remove it.
     ///
     /// The reservation the worker was started for (`held`, which the caller holds) is shared with
-    /// that task, and is given back when the publication ends as well as when the request does. A look at the reservation presents a
-    /// generation token to the worker, and one presented while the worker is being made known
-    /// fences the connections that begins to open, so a look that came after a request stopped
-    /// waiting would otherwise overlap the publication that request left running.
+    /// that task, and is given back when the last of the two lets go of it: the publication's end,
+    /// where the request stopped waiting before. A look at the reservation presents a generation
+    /// token to the worker, and one presented while the worker is being made known fences the
+    /// connections that begins to open, so a look that came after a request stopped waiting would
+    /// otherwise overlap the publication that request left running.
     ///
     /// # Errors
     ///
