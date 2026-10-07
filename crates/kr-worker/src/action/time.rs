@@ -399,10 +399,14 @@ struct HighWater {
 /// continuous millisecond counts that error as a rollback once it passes the five-second
 /// tolerance, about three days at 20 ppm, and a healthy worker then distrusts its own clock and
 /// stops collecting. So the projection credits a millisecond less per 10,000: a continuous clock up
-/// to this fast raises no distrust, and one faster than that still does. The cost, stated once
-/// here: rollback detection gains slack of this rate times the continuous time since the mark was
-/// last raised, 6 ms for each minute and about a minute after a week. A rollback inside that slack
-/// goes unseen, and a UTC deadline outlives the time it names by no more than the same slack.
+/// to this fast raises no distrust, and one faster than that still does.
+///
+/// The cost, stated once here: a wall clock that falls behind the continuous clock by no more than
+/// this rate is never read as a rollback, however long that lasts, so it can lose this rate times
+/// the elapsed time (6 ms for each minute, about a minute a week) without being seen, and a UTC
+/// deadline decided against the proven reading can outlive its time by as much. A single step back
+/// is seen when it exceeds the tolerance plus this rate times the time since the mark was last
+/// raised.
 const RATE_ALLOWANCE_PPM: u64 = 100;
 
 /// What `elapsed_ms` of continuous time credits a projection with: all of it less the rate
@@ -1980,7 +1984,8 @@ mod tests {
         assert!(!harness.contract.unsaved());
 
         // Ordinary time passing. The mark advances with it, and nothing about that is worth a
-        // durable write: a restart that read the older mark back would measure the same rollback.
+        // durable write: a restart that read the older mark back would measure the same rollback,
+        // to within the rate allowance.
         awake(&harness, Duration::from_secs(1));
         harness.contract.observe();
         assert!(
