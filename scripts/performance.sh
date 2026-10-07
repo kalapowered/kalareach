@@ -11,6 +11,12 @@
 # elsewhere the measurement records its figure and names what was missing, and says so in its
 # verdict line.
 #
+# Section 27 measures an idle host, and a machine that has just built the workspace or finished
+# another measurement is not one. A run that names a one-minute load in KR_PERF_SETTLE_LOAD has each
+# measurement wait, before it starts anything, for the load to fall under it, and takes no figure
+# on a machine whose load has not fallen within five minutes. A run that names none measures at
+# whatever load the machine has, which every figure records.
+#
 # Nothing here reaches the person's own credential store. A measurement that needs a key store
 # opens one in its own temporary directory, so the keys a run creates leave with the run, and a
 # figure is never the cost of writing to a store that has been filling up since the last one.
@@ -18,6 +24,17 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+
+# A bound that is not a load is refused before anything runs, because a typing mistake that left the
+# run unbounded would be a run that measured a busy machine and said nothing.
+settle_load=""
+if [ "${KR_PERF_SETTLE_LOAD+set}" = set ]; then
+  settle_load="$KR_PERF_SETTLE_LOAD"
+  if ! awk -v bound="$settle_load" 'BEGIN { exit !(bound ~ /^[0-9]+([.][0-9]+)?$/ && bound + 0 > 0) }'; then
+    echo "KR_PERF_SETTLE_LOAD must be a one-minute load above zero, such as 1.5, not \"$settle_load\"" >&2
+    exit 2
+  fi
+fi
 
 log="${1:-}"
 if [ -n "$log" ]; then
@@ -53,11 +70,33 @@ power_mode() {
 }
 
 load_average() {
-  if [ -r /proc/loadavg ]; then
-    cut -d' ' -f1-3 /proc/loadavg
-  else
-    sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }' || echo unknown
+  local reading
+  reading="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }')"
+  if [ -z "$reading" ] && [ -r /proc/loadavg ]; then
+    reading="$(cut -d' ' -f1-3 /proc/loadavg)"
   fi
+  echo "${reading:-unknown}"
+}
+
+# Waits, when a bound was named, until the one-minute load is under it: at most sixty looks, five
+# seconds apart. Says what it found, and fails when the load never fell or could not be read.
+settle() {
+  local name="$1" waits=0 load
+  [ -n "$settle_load" ] || return 0
+  while :; do
+    load="$(load_average | awk '{ print $1 }')"
+    if awk -v load="$load" -v bound="$settle_load" \
+      'BEGIN { exit !(load ~ /^[0-9]+([.][0-9]+)?$/ && load + 0 < bound + 0) }'; then
+      echo "  settled: the one-minute load was $load, under the $settle_load asked for, after $waits waits of five seconds"
+      return 0
+    fi
+    [ "$waits" -lt 60 ] || break
+    waits=$((waits + 1))
+    sleep 5
+  done
+  echo "  the one-minute load was still $load after five minutes, not under the $settle_load asked for"
+  echo "FAILED: $name was not measured: the machine did not settle"
+  return 1
 }
 
 echo "kalareach performance measurements"
@@ -127,6 +166,7 @@ measurement_in() {
   local target_flag="$1" target="$2" name="$3"
   echo
   echo "running $name"
+  settle "$name" || return 1
   # The load at each edge of the measurement, so a figure can be read against what else the machine
   # was doing while it was taken.
   echo "  load average entering this measurement: $(load_average)"

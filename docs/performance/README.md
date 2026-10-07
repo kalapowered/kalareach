@@ -104,6 +104,10 @@ minutes, and memory and every view's progress are read every five seconds. The s
 
 Every measurement runs in a release build, one at a time.
 
+With `KR_PERF_SETTLE_LOAD` set to a load, `scripts/performance.sh` starts each measurement only once
+the one-minute load is under it, and takes no figure if five minutes pass first. The load is waited
+out, not a host condition.
+
 | Identifier | Target | Measured by | What is measured |
 | --- | --- | --- | --- |
 | KR-PERF-001 | p95 below 5 ms, p99 below 15 ms | `crates/kr-worker/benches/input_latency.rs` (`added_input_forwarding_latency`), and again in the stress run | 1,000 single-byte writes on the session's own local socket, each timed to the byte arriving back after the application echoed it. That includes the application's read and echo and the host's whole output path, which section 27 leaves out, so the figure is an upper bound on the added latency |
