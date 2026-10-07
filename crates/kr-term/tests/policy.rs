@@ -684,34 +684,32 @@ fn a_title_keeps_everything_after_its_selector() {
     assert_eq!(engine.titles().window(), "one;two;three");
 }
 
-/// A soft reset returns the primary screen and resets the projection with it.
+/// A soft reset returns the primary screen and resets the projection with it, from either buffer.
+/// The engine reports the same for both: every terminal is drawn the screen again at the reset, so
+/// the buffer it would have stayed in is not a reason to ask for projection.
 #[test]
 fn a_soft_reset_returns_the_primary_screen() {
-    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
-    engine.feed(b"\x1b[?1049h", 0);
-    assert!(engine.grid().alternate_active());
-    assert!(engine.modes().is_set(kr_term::modes::ModeKind::Dec, 1049));
-
-    let outcome = engine.feed(b"\x1b[!p", 0);
-    assert!(
-        !engine.grid().alternate_active(),
-        "the grid is back on the primary screen"
-    );
-    assert!(
-        !engine.modes().is_set(kr_term::modes::ModeKind::Dec, 1049),
-        "and the tracked mode agrees with it"
-    );
-    assert!(outcome.projection_reset, "a client is told to start again");
-    assert!(
-        outcome.projection_required_at.is_some() && outcome.forward.is_empty(),
-        "a terminal reading it would stay on the alternate screen, so a direct attachment projects"
-    );
-
-    // From the primary screen the reset is the same in the library and in a terminal.
-    let mut shell = Engine::new(EngineConfig::default()).expect("engine");
-    let outcome = shell.feed(b"\x1b[!p", 0);
-    assert!(outcome.projection_required_at.is_none());
-    assert_eq!(outcome.forward.len(), 1, "and it is forwarded as it came");
+    for entered in [&b""[..], &b"\x1b[?1049h"[..]] {
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        engine.feed(entered, 0);
+        assert_eq!(
+            engine.grid().alternate_active(),
+            !entered.is_empty(),
+            "the reset starts from the screen that was asked for"
+        );
+        let outcome = engine.feed(b"\x1b[!p", 0);
+        assert!(
+            !engine.grid().alternate_active(),
+            "the grid is on the primary screen"
+        );
+        assert!(
+            !engine.modes().is_set(kr_term::modes::ModeKind::Dec, 1049),
+            "and the tracked mode agrees with it"
+        );
+        assert!(outcome.projection_reset, "a client is told to start again");
+        assert!(outcome.projection_required_at.is_none());
+        assert_eq!(outcome.forward.len(), 1, "and it is forwarded as it came");
+    }
 }
 
 /// A combined mode request keeps the modes that are not the backend's business.

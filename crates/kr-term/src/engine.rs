@@ -572,18 +572,6 @@ impl Engine {
             } else {
                 (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out())
             };
-            // The library returns to the primary buffer on a soft reset, and a terminal stays in
-            // the alternate one. A direct terminal reading the same bytes would be showing a
-            // different buffer from the canonical grid from here on, so the attachment projects.
-            // The buffer is asked first because it is a flag, and reading the sequence is not.
-            // A wrap pending at the reset is not a reason to ask for projection here. The reset
-            // advances the projection, which redraws every direct attachment from the canonical
-            // screen, and a redraw cannot leave a wrap pending, so an attachment redrawn with the
-            // wrap still pending is shown a projection whatever is asked of it here.
-            if decision.apply_to_grid && self.grid.alternate_active() && is_soft_reset(&event.kind)
-            {
-                disposition = DirectDisposition::RequireProjection;
-            }
             // Whether the grid performed the save or restore: a sequence it refused moved nothing.
             let mut cursor_performed = false;
             // A measurement asked for part way through a read is taken there, not at the end of
@@ -1333,7 +1321,10 @@ impl Engine {
                 }
             }
             (None, [b'!'], b'p') => {
-                // DECSTR returns the primary screen, which resets the projection with it.
+                // DECSTR returns the primary screen, which resets the projection with it. Every
+                // direct attachment is then told to begin again and is drawn the canonical screen,
+                // so the reset never reaches a terminal, and none is left in the alternate buffer
+                // that a terminal reading the reset would have stayed in.
                 self.modes.soft_reset();
                 // The reset selects the first character set again, and the cursors it clears are
                 // the ones that held a shift.
@@ -1926,20 +1917,6 @@ impl Engine {
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
     }
-}
-
-/// Whether a sequence is a soft terminal reset.
-fn is_soft_reset(kind: &EventKind) -> bool {
-    let EventKind::Csi {
-        params,
-        truncated,
-        final_byte,
-    } = kind
-    else {
-        return false;
-    };
-    let csi = crate::classify::CsiView::with_truncation(params, *final_byte, *truncated);
-    csi.private.is_none() && csi.intermediates == b"!" && csi.final_byte == b'p'
 }
 
 /// One save or restore of a cursor, naming the buffer whose saved cursor it touches (0 for the
