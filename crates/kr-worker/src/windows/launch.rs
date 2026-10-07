@@ -311,7 +311,7 @@ mod platform {
     /// whether it was ended or ended itself: it is not signalled until its last thread has gone,
     /// but it has its exit status from the moment it begins to end. Either is the outcome that was
     /// wanted. A process that is running has no status, and its refusal is a failure. Every
-    /// process this host ends is ended here, so the rule is one rule.
+    /// process the worker ends by its handle is ended here, so the rule is one rule.
     ///
     /// # Errors
     ///
