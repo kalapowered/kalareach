@@ -52,10 +52,12 @@
 //!   one. The margins and the origin home the cursor, so they are installed before the cursor is
 //!   placed, and this restoration does not print the last cell again after them. No measurement
 //!   shows that the terminals keep a wrap through the pen and character sets that would follow
-//!   such a print. The cost is one character: the next one the application prints lands beside
-//!   the last column instead of wrapping to the next row. A saved cursor's pending wrap is not
-//!   set either, and the terminals measured give a restored cursor no pending wrap whatever a
-//!   restoration does. The cost is the same character, the first one printed after the restore.
+//!   such a print. The cost is that the next character the application prints overwrites the
+//!   last column instead of going to the next row, and the characters after it land one cell to
+//!   the left of where the grid puts them until the line ends or the cursor is placed. A saved
+//!   cursor's pending wrap is not set either, and the terminals measured give a restored cursor
+//!   no pending wrap whatever a restoration does. The cost is the same, from the first character
+//!   printed after the restore.
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
@@ -783,8 +785,8 @@ impl Writer {
                 // cursor, so that print would have to come after them, through whatever pen and
                 // character sets are then in force, and no measurement shows that the terminals
                 // keep a wrap through the changes that would follow it. So it is reported rather
-                // than approximated: the next character an application prints lands one cell along
-                // instead of wrapping.
+                // than approximated: the next character an application prints overwrites the last
+                // column instead of going to the next row.
                 if cursor.pending_wrap {
                     self.carried.pending_wrap = true;
                 }
@@ -2006,7 +2008,7 @@ mod tests {
         // Every cursor movement clears a pending wrap and printing into the last column sets one.
         // The restoration installs the margins and the origin, which home the cursor, before it
         // places the cursor, and does not print the last cell again after them. It is counted
-        // instead, and the cost is that the next character lands one cell along.
+        // instead, and the cost is that the next character overwrites the last column.
         let operations = vec![
             RestoreOp::PaintRow {
                 row: row(0, 0, "abcd"),
