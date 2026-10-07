@@ -2638,8 +2638,9 @@ async fn a_local_prompt_the_worker_cannot_look_up_is_refused_and_its_draft_is_no
 
 /// KR-REQ-09.12: a prompt a caller at this machine makes to a session that has closed is answered
 /// that the session closed, from the closure the host recorded, as a paired device's read of it is,
-/// and not that the session is unknown, which is the answer for a session the host has no record of.
-/// The prompt names a draft, and nothing is recorded for a session that is gone.
+/// and not that the session is unknown, which is the answer for a session this daemon holds neither
+/// a worker nor a closure for. The prompt names a draft, and nothing is recorded for a session that
+/// is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_prompt_for_a_session_that_closed_is_told_it_closed_and_not_that_it_is_unknown() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};

@@ -74,9 +74,9 @@ impl Controller {
             )
             .await
         {
-            // Wherever the daemon finds no worker for the session, before the prompt is sent or
-            // because a closure took it while the prompt waited for its link, a session whose
-            // closure is recorded is closed, and the record is what says so.
+            // Wherever the daemon finds no worker for the session, at the look before the prompt
+            // is sent or at the check taking the link makes, a session whose closure is recorded
+            // is closed, and the record is what says so.
             Err(error @ ControllerError::UnknownSession { .. }) => {
                 Err(self.closed_or(session_id, error).await)
             }
