@@ -2218,6 +2218,63 @@ async fn a_saved_cursor_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_pro
     }
 }
 
+/// KR-REQ-08.78 and KR-REQ-08.82: a terminal kept on a projection because the screen it was drawn
+/// could not be carried is handed the stream again once the session's screen can be. One wrapped
+/// line is enough to keep it off, since a terminal has no way to be told a row wraps, and the
+/// application clearing the screen is what lets it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_kept_off_the_stream_by_its_screen_is_handed_it_when_the_screen_can_be_carried()
+{
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abcdef'; read -r _; \
+         printf '\\033[H\\033[2J'; read -r _; printf 'after'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abcdef").await;
+    let mut typist = typist(&host).await;
+    let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::RestorationIncomplete)
+        ),
+        "the line the application wrapped cannot be drawn as one"
+    );
+
+    // The application clears the screen. What the session holds can now be drawn exactly, so the
+    // terminal is told to begin again, and what it is then drawn leaves it on the stream.
+    typist.release(&host).await;
+    let events = collect_until_resync(
+        &mut attached.client,
+        "the cleared screen to tell the terminal to begin again",
+    )
+    .await;
+    let marker = resync_of(&events);
+    resubscribe(&host, &mut attached, marker.cursor.get()).await;
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "the screen it is drawn after the clear carries everything the application addresses"
+    );
+
+    // And what the application writes next reaches it as the stream.
+    typist.release(&host).await;
+    collect_output_until(
+        &mut attached.client,
+        "the application's next output",
+        |seen| carries(&joined(seen), b"after"),
+    )
+    .await;
+}
+
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {
