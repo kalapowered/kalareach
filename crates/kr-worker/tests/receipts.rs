@@ -4021,8 +4021,8 @@ fn a_continuous_clock_running_fast_costs_a_worker_that_runs_for_weeks_no_trust()
 #[test]
 fn a_rollback_beyond_the_allowance_still_stops_a_worker_collecting() {
     // How far the wall clock goes back: past five seconds for a worker that looked an hour ago,
-    // and past five seconds and the allowance's thirty days (about four and a half minutes) for
-    // one that had not looked since the start.
+    // and past five seconds and the allowance's thirty days (about four minutes and twenty
+    // seconds) for one that had not looked since the start.
     for (every_hour, rollback) in [
         (true, std::time::Duration::from_secs(10)),
         (false, std::time::Duration::from_secs(6 * 60)),
