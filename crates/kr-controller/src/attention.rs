@@ -648,6 +648,10 @@ pub struct AttentionModule {
     /// forget, before the pass takes the store.
     #[cfg(test)]
     after_the_clock_answer: Pause,
+    /// How many times the maintenance loop has gone into its wait, which a test reads to know the
+    /// loop is waiting.
+    #[cfg(test)]
+    maintenance_waits: AtomicU64,
     /// Where this host's own tests stop a pass that decides announcements once it holds the
     /// privacy state's read side, before it decides. Compiled away in every shipped build.
     #[cfg(any(test, feature = "testing"))]
@@ -749,6 +753,8 @@ impl AttentionModule {
             before_store: Pause::default(),
             #[cfg(test)]
             after_the_clock_answer: Pause::default(),
+            #[cfg(test)]
+            maintenance_waits: AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             after_privacy_read: Pause::default(),
             #[cfg(test)]
@@ -2790,6 +2796,8 @@ impl AttentionModule {
                 // across the wait, so one its owner has let go of goes.
                 let wake = Arc::clone(&held.wake);
                 let notified = wake.notified();
+                #[cfg(test)]
+                held.maintenance_waits.fetch_add(1, Ordering::SeqCst);
                 drop(held);
                 let _ = tokio::time::timeout(wait, notified).await;
             }
@@ -2811,7 +2819,10 @@ impl AttentionModule {
             // reading this pass decided under, before the store is taken and never under it, and
             // only when a forgetting is due and the reading itself is proven.
             let asked = reading.wall_ms.get();
-            let due = asked.saturating_sub(forgot) > FORGET_EVERY_MS;
+            // Due an hour after the last forgetting, and at once when the clock reads before it:
+            // a clock the owner established again after a correction is not waited for until it
+            // catches up with a reading the correction took back.
+            let due = asked < forgot || asked - forgot > FORGET_EVERY_MS;
             let permitted = due
                 && reading.wall_proven
                 && module
@@ -2832,12 +2843,15 @@ impl AttentionModule {
                     // the earlier of the two readings, never later than the clock stands now.
                     let held = module.reading();
                     if held.wall_proven {
-                        forgot = asked;
-                        let _ = store.forget_actions_before(
-                            asked
-                                .min(held.wall_ms.get())
-                                .saturating_sub(ACTION_RETENTION_MS),
-                        );
+                        let counted = asked.min(held.wall_ms.get());
+                        // The schedule moves to the reading the cutoff was counted from, and
+                        // only once the records are gone.
+                        if store
+                            .forget_actions_before(counted.saturating_sub(ACTION_RETENTION_MS))
+                            .is_ok()
+                        {
+                            forgot = counted;
+                        }
                     }
                 }
             }
@@ -5541,6 +5555,9 @@ pub(crate) mod tests {
         trust: crate::service::net::clock_trust::ClockTrust,
         devices: crate::service::net::devices::DeviceDirectory,
         wall: Arc<AtomicU64>,
+        /// Whether the host refuses every forgetting, as it does on a clock whose continuity is
+        /// lost or whose floor is owed its record.
+        refuses_forgetting: AtomicBool,
     }
 
     impl TestClock {
@@ -5558,6 +5575,7 @@ pub(crate) mod tests {
                 devices: crate::service::net::devices::DeviceDirectory::in_memory()
                     .expect("a device store"),
                 wall,
+                refuses_forgetting: AtomicBool::new(false),
             })
         }
 
@@ -5575,11 +5593,13 @@ pub(crate) mod tests {
         }
 
         fn may_forget_at(&self, _reading_ms: u64) -> bool {
-            self.trust
-                .sample_for_forgetting(&self.devices)
-                .ok()
-                .flatten()
-                .is_some()
+            !self.refuses_forgetting.load(Ordering::SeqCst)
+                && self
+                    .trust
+                    .sample_for_forgetting(&self.devices)
+                    .ok()
+                    .flatten()
+                    .is_some()
         }
     }
 
@@ -5648,19 +5668,39 @@ pub(crate) mod tests {
         assert!(!module.reading().wall_proven, "a rollback proves nothing");
     }
 
+    /// Waits for `condition`, which something else makes true, for as long as a loaded runner takes.
+    async fn until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// KR-REQ-09.18: a decision the host owes its record is written by the maintenance loop's own
-    /// reading, with no request to prompt it. A rollback is found and its write is refused; the
-    /// reading that found it wakes the loop, which may be in the long wait it began while nothing
-    /// was owed, and the loop reads again soon after for as long as the record is owed, so once the
-    /// store takes the write it is made.
+    /// reading, with no request to prompt it. The loop is in the long wait it began while nothing
+    /// was owed when a reading finds a rollback and its write is refused. That reading wakes the
+    /// loop, which reads again with the write still refused and then waits only the retry, not the
+    /// long wait; once the store takes the write again the retry makes it. Without the wake the
+    /// loop does not read again within the test's bound, and without the retry it does not write.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_maintenance_loop_writes_what_the_host_owes_with_no_other_request() {
+    async fn the_maintenance_loop_wakes_and_retries_to_write_what_the_host_owes() {
         let temp = kr_ipc::testing::TempHost::create();
         let adapter = platform(true);
         let clock = TestClock::new();
         let module = module_on(&temp, &adapter, Some(&clock));
         assert!(module.reading().wall_proven);
         module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
+        let waits = || module.maintenance_waits.load(Ordering::SeqCst);
+        let passes = || {
+            module
+                .decided_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        };
+        until("the loop is in its first wait", || waits() >= 1).await;
+        let passes_before = passes();
 
         clock
             .devices
@@ -5674,19 +5714,22 @@ pub(crate) mod tests {
         clock.set_wall(CLOCK_START - 60_000);
         assert!(!module.reading().wall_proven);
         assert!(clock.trust.owes_a_write(), "the decision is owed");
+
+        until("the woken loop reads again", || passes() > passes_before).await;
+        until("and waits for its retry", || waits() >= 2).await;
+        assert!(
+            clock.trust.owes_a_write(),
+            "the store still refused what the woken loop wrote"
+        );
         clock
             .devices
             .with(|connection| connection.execute_batch("DROP TRIGGER refuse_the_decision;"))
             .expect("the trigger goes");
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while clock.trust.owes_a_write() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            !clock.trust.owes_a_write(),
-            "the loop was woken and wrote it with no other request"
-        );
+        until("the retry writes what is owed", || {
+            !clock.trust.owes_a_write()
+        })
+        .await;
         assert!(
             clock
                 .devices
@@ -5763,13 +5806,68 @@ pub(crate) mod tests {
             .expect("the owner establishes");
         record_action(&temp, "new", CLOCK_START);
         go.send(()).expect("the pass goes on");
-        pass.await.expect("the pass ends").expect("the pass runs");
+        let (_, marker) = pass.await.expect("the pass ends").expect("the pass runs");
 
         assert_eq!(
             recorded_actions(&temp),
             vec!["new".to_owned()],
             "the record stamped after the correction is kept, and the old one is forgotten"
         );
+        assert_eq!(
+            marker, CLOCK_START,
+            "the schedule moves to the reading the cutoff was counted from, not to the late one"
+        );
+
+        // The pass after that is due although the clock reads far behind the late reading.
+        clock.set_wall(CLOCK_START + 31 * 86_400_000);
+        module.tick_and_forget(marker).await.expect("the pass runs");
+        assert!(
+            recorded_actions(&temp).is_empty(),
+            "the next pass is not waited for until the clock catches up with a reading taken back"
+        );
+    }
+
+    /// KR-REQ-09.14: a schedule that stands ahead of the clock is not waited for. The last
+    /// forgetting was counted from a reading a correction has since taken back by a hundred days;
+    /// once the owner has established the clock the next pass is due at once, not when the clock
+    /// has caught up with that reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_schedule_ahead_of_the_clock_does_not_stall_forgetting() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        assert!(module.reading().wall_proven);
+        record_action(&temp, "old", 1);
+        clock.set_wall(CLOCK_START + 100 * 86_400_000);
+        assert!(module.reading().wall_proven);
+
+        let ahead = CLOCK_START + 200 * 86_400_000;
+        module.tick_and_forget(ahead).await.expect("the pass runs");
+        assert!(recorded_actions(&temp).is_empty());
+    }
+
+    /// KR-REQ-09.14: a forgetting the host refuses is not made, whatever the store's own reading
+    /// says. The store's reading is proven and the records have outlived their retention; the host
+    /// answers that it may not forget, as it does while this boot's clock continuity is lost or
+    /// the floor is owed its record, and the records stay until it may.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forgetting_the_host_refuses_is_not_made_on_a_proven_reading() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let adapter = platform(true);
+        let clock = TestClock::new();
+        let module = module_on(&temp, &adapter, Some(&clock));
+        assert!(module.reading().wall_proven);
+        record_action(&temp, "old", 1);
+        clock.set_wall(CLOCK_START + 100 * 86_400_000);
+        assert!(module.reading().wall_proven, "the reading is proven");
+
+        clock.refuses_forgetting.store(true, Ordering::SeqCst);
+        module.tick_and_forget(0).await.expect("the pass runs");
+        assert_eq!(recorded_actions(&temp), vec!["old".to_owned()]);
+        clock.refuses_forgetting.store(false, Ordering::SeqCst);
+        module.tick_and_forget(0).await.expect("the pass runs");
+        assert!(recorded_actions(&temp).is_empty());
     }
 
     /// Nothing is forgotten while the host holds the clock against its own reading: a pass on a

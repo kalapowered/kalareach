@@ -225,14 +225,35 @@ async fn a_step_back_smaller_than_the_time_between_two_readings_withholds_forget
 /// no forgetting, and a rollback larger than the allowance still withholds all of them. The
 /// continuous clock runs fifty parts per million fast for thirty days and an hour, read every hour
 /// as the host's decisions read it: the host never doubts its clock, so a spent delegation and a
-/// de-duplication record that outlived their retention are forgotten. A wall clock six minutes
-/// behind where it stood then withholds the transfer sweep and the voice spend again. (The
+/// de-duplication record that outlived their retention are forgotten. After thirty days and an hour
+/// more, a wall clock six minutes behind where it stood withholds the transfer sweep and the voice
+/// spend, which have both outlived their retention, until the owner establishes the clock. (The
 /// attention store also needs the platform's time service or the owner's confirmation, which a
 /// test on a host with no qualified time service cannot assume.)
+///
+/// The wall clock is computed from the continuous one, so that one step of the test moves both and
+/// the daemon's own readers, which run meanwhile, never see the two apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetting() {
+    use kr_transport::clock::ContinuousClock as _;
+
     let temp = kr_ipc::testing::TempHost::create();
-    let (continuous, wall, clocks) = manual_clocks();
+    let continuous = kr_transport::clock::ManualClock::new();
+    let start = kr_ipc::now_ms().get();
+    let rolled_back = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clocks = crate::service::Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: crate::service::WallClock::from_fn({
+            let continuous = continuous.clone();
+            let rolled_back = Arc::clone(&rolled_back);
+            move || {
+                let elapsed_ms = u64::try_from(continuous.now().since_anchor().as_millis())
+                    .expect("a manual clock stays within u64");
+                // True time is 50 parts per million less than the continuous clock says.
+                start + elapsed_ms * 1_000_000 / 1_000_050 - rolled_back.load(Ordering::SeqCst)
+            }
+        }),
+    };
     let controller = daemon_on(&temp, clocks).await;
     let collections = Collections::new(&temp, &controller);
     let trust = || {
@@ -242,14 +263,16 @@ async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetti
             .sample(controller.devices())
             .expect("the host samples its clock")
     };
+    let thirty_days_and_an_hour = || {
+        for hour in 0..30 * 24 + 1 {
+            continuous.advance(Duration::from_millis(3_600_000 + 180));
+            assert!(trust().is_some(), "hour {hour}: the clock is still proven");
+        }
+    };
 
     assert!(trust().is_some(), "the clock is proven where it starts");
     assert!(collections.spend(), "a first spend");
-    for hour in 0..30 * 24 + 1 {
-        continuous.advance(Duration::from_millis(3_600_000 + 180));
-        wall.fetch_add(3_600_000, Ordering::SeqCst);
-        assert!(trust().is_some(), "hour {hour}: the clock is still proven");
-    }
+    thirty_days_and_an_hour();
     collections.age_the_transfer_record();
     swept(&controller).await;
     assert_eq!(
@@ -259,12 +282,25 @@ async fn a_continuous_clock_that_runs_fast_for_thirty_days_withholds_no_forgetti
     );
     assert!(collections.spend(), "the spent delegation is forgotten");
 
-    wall.fetch_sub(360_000, Ordering::SeqCst);
+    thirty_days_and_an_hour();
+    rolled_back.store(360_000, Ordering::SeqCst);
     assert!(trust().is_none(), "six minutes back is a rollback");
     collections.age_the_transfer_record();
     swept(&controller).await;
     assert_eq!(kept(&temp), 1, "the transfer sweep forgets nothing");
-    assert!(!collections.spend(), "the voice spend forgets nothing");
+    assert!(
+        !collections.spend(),
+        "the spend has outlived its retention and is kept"
+    );
+
+    controller
+        .lifetimes()
+        .clock_trust()
+        .establish(controller.devices())
+        .expect("the owner establishes the clock");
+    swept(&controller).await;
+    assert_eq!(kept(&temp), 0, "the established clock frees the sweep");
+    assert!(collections.spend(), "and the voice spend");
 }
 
 /// The record an earlier build's attention store kept of its clock, as that build wrote it: a
