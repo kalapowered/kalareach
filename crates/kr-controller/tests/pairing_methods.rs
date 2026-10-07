@@ -882,6 +882,94 @@ async fn once_a_host_has_an_owner_only_an_owner_device_confirms_its_clock() {
     host.stop().await;
 }
 
+/// KR-REQ-09.17, KR-REQ-09.19, KR-REQ-10.52: an owner whose own authority the host decides by its
+/// clock can still establish that clock. The owner chose a bounded offline validity for personal
+/// remote access, so every request of the owner device reads the host's clock; the host then loses
+/// the continuity of its clock readings, and until the owner establishes the clock again it decides
+/// nothing by it. The owner device's reads are refused as `CLOCK_UNTRUSTED`, which is the right
+/// answer for them; its confirmation of the clock is not, because the owner's explicit retrust is
+/// what ends that state and cannot wait for the clock it repairs. The device asks, answers and
+/// spends the confirmation itself, and its reads are served again afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_the_host_decides_by_the_clock_can_still_establish_the_clock() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let target = ActionTarget::environment(environment);
+    let owner_record = host.owner.clone().expect("the owner device");
+    let owner_device = host.owner_device.as_ref().expect("the owner device");
+    let raw = RawDevice::connect(&host, owner_device, &owner_record).await;
+    let now = kr_ipc::now_ms();
+    host.controller()
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(86_400_000),
+                last_synchronised_at_ms: Nullable::some(now),
+            }));
+        })
+        .expect("the owner's choice is recorded");
+    let list = || async {
+        raw.read(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::some(environment),
+                include_closed: false,
+            },
+        )
+        .await
+    };
+    list()
+        .await
+        .expect("the owner device reads while the host proves its clock");
+
+    host.controller().utc_floor().lose_continuity();
+    assert_eq!(
+        code(list().await),
+        ErrorCode::ClockUntrusted,
+        "nothing the host decides by its clock is served while its continuity is lost"
+    );
+
+    let asked = raw
+        .mutate(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &OwnerConfirmationRequestParams {
+                subject: ConfirmationSubject::EstablishClock,
+            },
+        )
+        .await
+        .expect("the owner device asks")
+        .to_typed::<OwnerConfirmationRequestResult>()
+        .expect("decodes");
+    let (proof, _) = calls::sign(&asked.request, &Signer::OwnerDevice(&owner_keys));
+    raw.mutate(
+        Method::OwnerConfirmationComplete,
+        ActionId::new(kr_ipc::new_uuid()),
+        target.clone(),
+        &OwnerConfirmationCompleteParams {
+            proof,
+            bootstrap_signer: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the owner device answers");
+    let established = spend_clock(
+        &raw,
+        &raw.action_window_id(),
+        ActionId::new(kr_ipc::new_uuid()),
+        &target,
+    )
+    .await
+    .expect("the owner device establishes the clock");
+    assert_eq!(established.confirmation_id, asked.request.confirmation_id);
+    assert!(!host.controller().utc_floor().continuity_lost());
+    list()
+        .await
+        .expect("the owner device reads again once the clock is established");
+    host.stop().await;
+}
+
 /// KR-REQ-23.26: the six methods are served with their transcript binding and the exact issuing
 /// owner. A paired device is the issuing owner of nothing, so it cannot confirm, cancel or read an
 /// invitation's owner view; an approval that names another transcript or key digest commits
