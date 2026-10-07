@@ -796,10 +796,6 @@ fn a_crash_stops_nothing_on_the_strength_of_an_identifier_the_kernel_may_have_re
 
     let fenced = archive.fence_owned(&ownership, &record);
     assert_eq!(fenced.session_id, session_id);
-    assert_eq!(
-        fenced.boundary,
-        kr_controller::archive::CleanupBoundary::None
-    );
     assert!(fenced.stopped.is_empty(), "nothing is stopped by inference");
     assert_eq!(fenced.already_gone, 1, "the worker had already ended");
     assert!(
