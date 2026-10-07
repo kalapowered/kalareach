@@ -352,8 +352,10 @@ mod handle {
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
+
+    use crate::windows::launch::end_process;
 
     /// The attribute that puts a new process inside a pseudo-console.
     const PSEUDOCONSOLE_ATTRIBUTE: usize = 0x0002_0016;
@@ -923,7 +925,7 @@ mod handle {
     /// that stopped the cleanup, because a reader needs the first to know what went wrong and the
     /// second to know what is still running.
     fn terminate_unstarted(process: &OwnedHandle, because: &str) -> std::io::Result<()> {
-        end(process).map_err(|failure| {
+        end_process(process).map_err(|failure| {
             std::io::Error::other(format!(
                 "a shell was created and never started, because {because}, and then could not be \
                  ended either: {failure}"
@@ -958,7 +960,7 @@ mod handle {
 
     impl portable_pty::ChildKiller for Spawned {
         fn kill(&mut self) -> std::io::Result<()> {
-            end(&self.process)
+            end_process(&self.process)
         }
 
         fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
@@ -968,7 +970,7 @@ mod handle {
 
     impl portable_pty::ChildKiller for Killer {
         fn kill(&mut self) -> std::io::Result<()> {
-            end(&self.0)
+            end_process(&self.0)
         }
 
         fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
@@ -1020,16 +1022,5 @@ mod handle {
             return Err(std::io::Error::last_os_error());
         }
         Ok(ExitStatus::with_exit_code(code))
-    }
-
-    /// Ends a process.
-    fn end(process: &OwnedHandle) -> std::io::Result<()> {
-        // SAFETY: the handle is open for the call.
-        let ended = unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) };
-        if ended == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
     }
 }
