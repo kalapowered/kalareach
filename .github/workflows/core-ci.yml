@@ -1778,11 +1778,12 @@ jobs:
       # reference host, so the idle processor figure is recorded here with each missing condition
       # named and is asserted by the macos-reference job; the idle memory bound and the other
       # figures are asserted here. Section 27 measures an idle host, so the script starts each
-      # measurement only once the one-minute load average is under the bound named here, waiting
-      # at most five minutes for it, and fails without a figure when it does not fall.
+      # measurement only once the one-minute load average is under the bound named here, half this
+      # runner's three processors, waiting at most ten minutes for it and failing without a figure
+      # when it does not fall. Four such waits fit the limit below with the measurements.
       - name: Performance measurements
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 45
+        timeout-minutes: 60
         env:
           KR_PERF_SETTLE_LOAD: "1.5"
         run: bash scripts/performance.sh
@@ -1877,12 +1878,13 @@ jobs:
       # The idle processor figure is asserted here because this host reports no shortfall against
       # the reference host; a shortfall the host reported would be recorded and named instead. The
       # script starts each measurement only once the one-minute load average is under the bound
-      # named here, waiting at most five minutes for it, and fails without a figure when it does
-      # not fall.
+      # named here, half this host's four processors, waiting at most ten minutes for it and
+      # failing without a figure when it does not fall. Four such waits fit the limit below with
+      # the measurements.
       - name: Performance measurements
-        timeout-minutes: 45
+        timeout-minutes: 60
         env:
-          KR_PERF_SETTLE_LOAD: "1.5"
+          KR_PERF_SETTLE_LOAD: "2.0"
         run: bash scripts/performance.sh
 
       - name: Keep the test evidence
