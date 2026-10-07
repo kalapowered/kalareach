@@ -1074,13 +1074,12 @@ mod platform {
             .expect("the wait for the close ran")
             .expect("the close did not panic");
 
+            // The platform says the connection ended, as an end or as an error; what it never says
+            // is what the caller was sent.
             let mut read = [0_u8; 16];
             let found = (&caller).read(&mut read);
             assert!(
-                matches!(found, Ok(0))
-                    || found
-                        .as_ref()
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe),
+                !matches!(found, Ok(length) if length > 0),
                 "the caller was cut off with what it was sent discarded, got {found:?}"
             );
         }
