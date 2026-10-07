@@ -2450,22 +2450,18 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
     let (loose, loose_draft) = (publish("loose.bin", None), draft_for(None));
     bind(&loose_draft, &loose);
 
-    assert!(
-        !harness
-            .service
-            .unseen_prompt_sessions_noted()
-            .expect("reads the journal"),
-        "nothing is noted before the host says so"
+    assert_eq!(
+        harness.service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Done,
+        "a journal this build made has nothing noted"
     );
     harness
         .service
         .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([noted]))
         .expect("notes the session");
-    assert!(
-        harness
-            .service
-            .unseen_prompt_sessions_noted()
-            .expect("reads the journal")
+    assert_eq!(
+        harness.service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Held
     );
 
     harness
@@ -2490,6 +2486,297 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
     assert_eq!(
         sweep.expired_attachments, 3,
         "the session's retention has ended"
+    );
+}
+
+/// KR-REQ-14.11: settling the noted sessions puts what each names under its retention, as a
+/// submission would, and forgets the sessions. What a session names is read by the same relations
+/// the sweep reads: an attachment that belongs to it, one held by a draft that targets it, and one
+/// held by a draft that holds another attachment that belongs to it, which takes the session where it
+/// has none. An attachment that names no noted session stays on the seven-day window. The sweep
+/// that follows needs no noted session to keep what was settled, and a second settling has nothing
+/// left to do.
+#[test]
+fn settling_the_noted_sessions_puts_what_each_names_under_its_retention_and_forgets_them() {
+    struct Retains(bool);
+    impl kr_transfer::SessionRetention for Retains {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(if self.0 {
+                sessions.clone()
+            } else {
+                std::collections::BTreeSet::new()
+            })
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
+        }
+    }
+
+    let harness = Harness::create();
+    let noted = SessionId::new(Uuid::from_bytes([35; 16]));
+    let other = SessionId::new(Uuid::from_bytes([36; 16]));
+    let publish = |name: &str, for_session: Option<SessionId>| {
+        let bytes = pattern(32);
+        let begun = harness
+            .begin_for(
+                &bytes,
+                "application/octet-stream",
+                name,
+                Nullable(for_session),
+            )
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .finish(begun.transfer_id, &bytes)
+            .expect("publishes the attachment")
+            .handle
+    };
+    let draft_for = |session: Option<SessionId>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &kr_protocol::transfer::DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable(session),
+                    application_instance_id: Nullable::null(),
+                    text: "look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let bind = |draft: &kr_protocol::transfer::DraftRecord,
+                handle: &kr_protocol::transfer::AttachmentHandle| {
+        let revision = harness
+            .service
+            .draft(&harness.actor, draft.draft_id)
+            .expect("reads the draft")
+            .revision;
+        harness
+            .service
+            .draft_add_attachment(
+                &harness.actor,
+                &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                    draft_id: draft.draft_id,
+                    expected_revision: revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: contribution(handle),
+                },
+                None,
+            )
+            .expect("binds the attachment");
+    };
+    let handle_of = |transfer_id: TransferId| {
+        harness
+            .service
+            .attachment_handle(&harness.actor, transfer_id)
+            .expect("reads the handle")
+    };
+
+    // One that belongs to the noted session; two that name no session, held by one draft, the first
+    // of which is bound to a draft for the noted session too; one that belongs to another session;
+    // and one held by a draft that names none.
+    let belonging = publish("belonging.bin", Some(noted));
+    let (shared, beside) = (publish("shared.bin", None), publish("beside.bin", None));
+    let unnamed_draft = draft_for(None);
+    bind(&unnamed_draft, &shared);
+    bind(&unnamed_draft, &beside);
+    bind(&draft_for(Some(noted)), &shared);
+    let elsewhere = publish("elsewhere.bin", Some(other));
+    let (loose, loose_draft) = (publish("loose.bin", None), draft_for(None));
+    bind(&loose_draft, &loose);
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([noted]))
+        .expect("notes the session");
+
+    assert_eq!(
+        harness
+            .service
+            .settle_unseen_prompt_sessions()
+            .expect("settles the noting"),
+        3,
+        "what the noted session names, by each relation"
+    );
+    assert!(
+        harness
+            .service
+            .unseen_prompt_sessions()
+            .expect("reads the journal")
+            .is_empty(),
+        "the session is forgotten"
+    );
+    assert_eq!(
+        harness.service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Done,
+        "and nothing is left to note, so a start does not note again"
+    );
+    for named in [&belonging, &shared, &beside] {
+        let handle = handle_of(named.transfer_id);
+        assert!(handle.submitted, "{} is submitted", named.transfer_id);
+        assert_eq!(handle.session_id, Nullable::some(noted));
+    }
+    for unnamed in [&elsewhere, &loose] {
+        assert!(!handle_of(unnamed.transfer_id).submitted);
+    }
+    assert_eq!(
+        harness
+            .service
+            .settle_unseen_prompt_sessions()
+            .expect("settles again"),
+        0
+    );
+
+    harness
+        .clock
+        .set(support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get() + 1);
+    let sweep = harness.service.sweep(&Retains(true)).expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 2,
+        "only what names no noted session expired, and the sweep read no noted session"
+    );
+    let sweep = harness
+        .service
+        .sweep(&Retains(false))
+        .expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 3,
+        "the session's retention has ended"
+    );
+}
+
+/// KR-REQ-14.11: a journal in which an earlier build noted sessions, in its own two tables and at the
+/// schema version it wrote, is read where it stands: the noted sessions are held, what one names is
+/// kept for its retention, and settling moves what each names under its retention and leaves a
+/// journal with neither table, that a start reads as having nothing to note.
+#[test]
+fn a_journal_that_an_earlier_build_noted_sessions_in_is_settled_in_place() {
+    struct Retains;
+    impl kr_transfer::SessionRetention for Retains {
+        fn retained(
+            &self,
+            sessions: &std::collections::BTreeSet<SessionId>,
+        ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
+            Ok(sessions.clone())
+        }
+
+        fn clock_is_proven(&self, _reading: kr_protocol::scalars::TimestampMs) -> bool {
+            true
+        }
+    }
+
+    let harness = Harness::create();
+    let noted = SessionId::new(Uuid::from_bytes([37; 16]));
+    let bytes = pattern(32);
+    let begun = harness
+        .begin_for(
+            &bytes,
+            "application/octet-stream",
+            "named.bin",
+            Nullable::some(noted),
+        )
+        .expect("reserves the upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends every chunk");
+    let named = harness
+        .finish(begun.transfer_id, &bytes)
+        .expect("publishes the attachment")
+        .handle;
+    let Harness {
+        host,
+        service,
+        clock,
+        actor,
+    } = harness;
+    drop(service);
+
+    // What the build that noted them wrote: its schema version, and both tables with the session.
+    let journal = || {
+        rusqlite::Connection::open(kr_transfer::StagingArea::store_path(&host.environment()))
+            .expect("opens the store")
+    };
+    journal()
+        .execute_batch(&format!(
+            "UPDATE schema_version SET version = 2;
+             CREATE TABLE unseen_prompt_sessions (
+                 session_id  BLOB PRIMARY KEY,
+                 noted_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE unseen_prompts_noted (
+                 id          INTEGER PRIMARY KEY CHECK (id = 1),
+                 noted_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO unseen_prompt_sessions VALUES (x'{}', 1);
+             INSERT INTO unseen_prompts_noted VALUES (1, 1);",
+            noted
+                .get()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+        .expect("writes the journal as the earlier build left it");
+    let service = TransferService::with_clock(&host.environment(), Arc::clone(&clock) as Arc<_>)
+        .expect("the journal is read where it stands");
+    assert_eq!(
+        service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Held
+    );
+    assert_eq!(
+        service.unseen_prompt_sessions().expect("reads the journal"),
+        std::collections::BTreeSet::from([noted])
+    );
+
+    assert_eq!(
+        service
+            .settle_unseen_prompt_sessions()
+            .expect("settles the noting"),
+        1
+    );
+    assert_eq!(
+        service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Done
+    );
+    let tables: i64 = journal()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('unseen_prompt_sessions', 'unseen_prompts_noted')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reads the journal's tables");
+    assert_eq!(tables, 0);
+    assert!(
+        service
+            .attachment_handle(&actor, named.transfer_id)
+            .expect("reads the handle")
+            .submitted
+    );
+    drop(service);
+
+    // A start that reads the journal after settling finds nothing to note.
+    let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+        .expect("the settled journal opens");
+    assert_eq!(
+        service.noting().expect("reads the journal"),
+        kr_transfer::Noting::Done
+    );
+    assert_eq!(
+        service
+            .sweep(&Retains)
+            .expect("runs a sweep")
+            .expired_attachments,
+        0
     );
 }
 

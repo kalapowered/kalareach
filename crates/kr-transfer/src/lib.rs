@@ -117,7 +117,7 @@ pub use crate::service::{
     TransferService,
 };
 pub use crate::staging::{StagingArea, StorageName};
-pub use crate::store::{Limits, Store};
+pub use crate::store::{Limits, Noting, Store};
 #[cfg(windows)]
 pub use crate::windows::{
     AclEntry, Sid, WindowsAcl, account_named, read_access_control, set_access_control,

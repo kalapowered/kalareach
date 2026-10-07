@@ -2916,13 +2916,16 @@ async fn a_local_prompt_waiting_for_the_workers_link_while_the_session_closes_is
     }
 }
 
-/// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal it notes
-/// every session the host knows, because each was started by a daemon of an earlier build whose
-/// worker may take a draft prompt this host is not told of, and a daemon that starts again over the
-/// same journal notes nothing: a session started since has a worker that refuses such a prompt.
+/// KR-REQ-14.11: the first time a daemon of this build starts over a transfer journal an earlier
+/// build wrote it notes every session the host knows, because each was started by a daemon of an
+/// earlier build whose worker may take a draft prompt this host is not told of. A daemon that starts
+/// again over the same journal notes nothing: a session started since has a worker that refuses such
+/// a prompt. A journal this build makes has no earlier session to note.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_sessions_a_daemon_knows_at_its_first_start_over_a_journal_are_noted() {
+async fn the_sessions_a_daemon_knows_at_its_first_start_over_an_earlier_builds_journal_are_noted() {
     use std::collections::BTreeSet;
+
+    use kr_transfer::Noting;
 
     use crate::service::a_close_a_worker_never_answers::Silent;
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
@@ -2937,36 +2940,197 @@ async fn the_sessions_a_daemon_knows_at_its_first_start_over_a_journal_are_noted
             .unseen_prompt_sessions()
             .expect("reads the journal")
     };
-
-    // The first start of the world found no session.
-    let script = Scripted::new();
-    let world = scripted::scripted(&script).await;
-    assert!(
+    let noting = |world: &Silent| {
         world
             .controller
             .transfer()
             .service()
-            .unseen_prompt_sessions_noted()
-            .expect("reads the journal"),
-        "the first start did its noting"
-    );
-    assert!(noted(&world).is_empty());
+            .noting()
+            .expect("reads the journal")
+    };
 
-    // A start after it knows the session, and notes nothing.
+    // A journal this build made has nothing to note, whatever session the host comes to know.
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    assert_eq!(noting(&world), Noting::Done);
     let world = restarted(world).await;
+    assert_eq!(noting(&world), Noting::Done);
     assert!(noted(&world).is_empty());
 
     // A journal an earlier build wrote has never been noted, and its start notes the session.
-    let journal = rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
+    rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
         &world._temp.environment(),
     ))
-    .expect("opens the transfer journal");
-    journal
-        .execute("DELETE FROM unseen_prompts_noted", [])
-        .expect("makes the journal one that was never noted");
-    drop(journal);
+    .expect("opens the transfer journal")
+    .execute("UPDATE schema_version SET version = 2", [])
+    .expect("makes the journal one an earlier build wrote");
+    let world = restarted(world).await;
+    assert_eq!(noting(&world), Noting::Held);
+    assert_eq!(noted(&world), BTreeSet::from([world.session_id]));
+
+    // A start after that notes nothing more.
     let world = restarted(world).await;
     assert_eq!(noted(&world), BTreeSet::from([world.session_id]));
+    world.serving.abort();
+}
+
+/// KR-REQ-14.11: the sessions noted at a first start are settled once none of them can run a worker,
+/// and not before. Settling puts what a noted session names under that session's retention, as if
+/// it had been submitted to it, and forgets the sessions, so the sweep no longer reads them. A start
+/// that follows notes nothing again, and an attachment that names no noted session is not touched.
+///
+/// A noted session that is live keeps the noting, and so does a fenced launch whose process still
+/// runs: the host never reaches its worker and has no closure for it. A session that closed, a launch
+/// that failed and a fenced launch whose process has ended do not, though only the first has a
+/// closure record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sessions_noted_at_a_first_start_are_settled_once_none_of_them_can_run_a_worker() {
+    use std::collections::BTreeSet;
+
+    use crate::registry::LaunchPhase;
+    use crate::service::a_close_a_worker_never_answers::Silent;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
+        self as scripted, Scripted, closure_of, restarted,
+    };
+
+    let noted = |world: &Silent| -> BTreeSet<kr_protocol::ids::SessionId> {
+        world
+            .controller
+            .transfer()
+            .service()
+            .unseen_prompt_sessions()
+            .expect("reads the journal")
+    };
+    let sweep = |world: &Silent| {
+        let swept = world
+            .controller
+            .transfer()
+            .sweep(&std::sync::Arc::downgrade(&world.controller));
+        async move { swept.await.expect("the sweep runs") }
+    };
+    let submitted = |world: &Silent,
+                     actor: &kr_protocol::ids::ActorId,
+                     handle: &kr_protocol::transfer::AttachmentHandle| {
+        world
+            .controller
+            .transfer()
+            .service()
+            .attachment_handle(actor, handle.transfer_id)
+            .expect("reads the attachment")
+            .submitted
+    };
+
+    // A start over a journal no earlier build noted finds a live session and two launches that
+    // never started, and notes all three.
+    let script = Scripted::new();
+    let world = scripted::reported_late(&script).await;
+    let failed = scripted::reserved(&world, None, "/").await;
+    let fenced = scripted::reserved(&world, None, "/").await;
+    let path = kr_transfer::staging::StagingArea::store_path(&world._temp.environment());
+    let journal = || rusqlite::Connection::open(&path).expect("opens the transfer journal");
+    let tables = |journal: &rusqlite::Connection| -> i64 {
+        journal
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                     ('unseen_prompt_sessions', 'unseen_prompts_noted')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reads the journal's tables")
+    };
+    assert_eq!(
+        tables(&journal()),
+        0,
+        "a journal this build made has neither"
+    );
+    journal()
+        .execute("UPDATE schema_version SET version = 2", [])
+        .expect("makes the journal one an earlier build wrote");
+    let world = restarted(world).await;
+    let controller = &world.controller;
+    let all = BTreeSet::from([world.session_id, failed.session_id, fenced.session_id]);
+    assert_eq!(noted(&world), all);
+    assert_eq!(tables(&journal()), 2, "the noting is kept in two tables");
+    for launch in [&failed, &fenced] {
+        assert_eq!(
+            controller
+                .registry
+                .lock()
+                .await
+                .reservation(launch.reservation_id)
+                .expect("the registry answers")
+                .expect("the launch's reservation")
+                .phase,
+            LaunchPhase::Failed,
+            "the start resolved a launch that never started"
+        );
+    }
+
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let belonging = a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &actor,
+        "belonging.bin",
+        Some(world.session_id),
+    );
+    let loose = a_published_attachment(controller, world.environment_id, &actor, "loose.bin");
+
+    // The session runs, so nothing is settled.
+    sweep(&world).await;
+    assert_eq!(noted(&world), all);
+    assert_eq!(tables(&journal()), 2);
+    assert!(!submitted(&world, &actor, &belonging));
+
+    // It closes, but one launch was fenced after all, and its process runs.
+    controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    {
+        let mut registry = controller.registry.lock().await;
+        registry
+            .fence(fenced.reservation_id)
+            .expect("fences the reservation");
+        registry
+            .record_launch(
+                fenced.reservation_id,
+                &kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+            )
+            .expect("records the launcher");
+    }
+    sweep(&world).await;
+    assert_eq!(noted(&world), all);
+    assert_eq!(tables(&journal()), 2);
+    assert!(!submitted(&world, &actor, &belonging));
+
+    // Its process has ended, and nothing noted can run a worker.
+    controller
+        .registry
+        .lock()
+        .await
+        .record_launch(
+            fenced.reservation_id,
+            &kr_ipc::identity::ended_process_identity(4_000_001),
+        )
+        .expect("records the launcher");
+    sweep(&world).await;
+    assert!(noted(&world).is_empty(), "the sessions are forgotten");
+    assert_eq!(tables(&journal()), 0, "and both tables are gone");
+    assert!(
+        submitted(&world, &actor, &belonging),
+        "what a noted session names is under its retention"
+    );
+    assert!(
+        !submitted(&world, &actor, &loose),
+        "what names no noted session is on its own window"
+    );
+
+    // A start after that notes nothing: the sessions are in the registry still, and what was
+    // settled stays settled.
+    let world = restarted(world).await;
+    assert!(noted(&world).is_empty());
+    assert_eq!(tables(&journal()), 0);
     world.serving.abort();
 }
 

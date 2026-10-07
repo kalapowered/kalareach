@@ -43,7 +43,7 @@ use crate::clock::Clock;
 use crate::error::{Result, TransferError};
 use crate::staging::{StagingArea, StorageName};
 use crate::store::{
-    ActionFailure, ActionOutcome, ActionRecord, BindingRow, DraftRow, GrantRow, Limits,
+    ActionFailure, ActionOutcome, ActionRecord, BindingRow, DraftRow, GrantRow, Limits, Noting,
     RetainedAction, ScopeRow, SnapshotState, Store, UploadRow,
 };
 
@@ -2375,14 +2375,15 @@ impl TransferService {
         admission.commit(|| store.record_prompt(draft_id, session_id, now))
     }
 
-    /// Returns whether the sessions whose agents may be sent a prompt that names a draft without
-    /// this host being told have been noted ([`Self::note_unseen_prompt_sessions`]).
+    /// Returns where the journal stands with the sessions whose agents may be sent a prompt that
+    /// names a draft without this host being told ([`Self::note_unseen_prompt_sessions`]): owed the
+    /// noting, holding the noted sessions, or done.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read.
-    pub fn unseen_prompt_sessions_noted(&self) -> Result<bool> {
-        self.locked()?.unseen_prompt_sessions_noted()
+    pub fn noting(&self) -> Result<Noting> {
+        self.locked()?.noting()
     }
 
     /// Notes `sessions` as ones whose agents may be sent a prompt that names a draft without this
@@ -2395,8 +2396,9 @@ impl TransferService {
     /// or holds another attachment that belongs to it. Nothing is recorded per draft, so a binding
     /// made at any time, in any order, between any drafts is covered when the sweep looks.
     ///
-    /// The host notes every session it knows when a daemon of this build first starts over the
-    /// journal, which are the sessions of earlier builds, and notes nothing after.
+    /// The host notes every session it knows when a daemon of this build first starts over a journal
+    /// an earlier build wrote ([`Noting::Owed`]), which are the sessions of earlier builds, and
+    /// notes nothing after. A journal this build makes is [`Noting::Done`] from the start.
     ///
     /// An attachment that none of those relations ties to a session, one held only by a draft that
     /// names no session included, stays on the seven-day window of an unused attachment. The host
@@ -2404,10 +2406,16 @@ impl TransferService {
     /// draft holds while any noted session is retained would end that window indefinitely, since
     /// the registry keeps a record of every session it has listed.
     ///
-    /// Remove this, with the journal's two tables and the sweep's reading of them, once no worker of
-    /// a build before the one that serves draft prompts only to the daemon can still be running and
-    /// no session noted here is still retained, since what an earlier worker was sent stays with
-    /// its session for as long as the session does.
+    /// What an earlier worker was sent stays with its session for as long as the session does, and
+    /// the registry keeps a record of every session it has listed, so the sessions noted here are
+    /// not retained any less as time passes. The noting ends instead when no session noted here can
+    /// run a worker, which every one of them reaches: the host then calls
+    /// [`Self::settle_unseen_prompt_sessions`], which puts what each names under its retention and
+    /// forgets the sessions.
+    ///
+    /// Remove this, the settling, the sweep's reading of the noted sessions and the journal's
+    /// unsettled schema version once no supported upgrade starts from a build before the one that
+    /// serves draft prompts only to the daemon.
     ///
     /// # Errors
     ///
@@ -2418,13 +2426,39 @@ impl TransferService {
         self.locked()?.note_unseen_prompt_sessions(sessions, now)
     }
 
-    /// Returns the sessions noted by [`Self::note_unseen_prompt_sessions`].
+    /// Returns the sessions noted by [`Self::note_unseen_prompt_sessions`] and not yet settled by
+    /// [`Self::settle_unseen_prompt_sessions`].
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read.
     pub fn unseen_prompt_sessions(&self) -> Result<BTreeSet<SessionId>> {
         self.locked()?.unseen_prompt_sessions()
+    }
+
+    /// Ends the noting of the sessions whose agents may have been sent a prompt that names a draft
+    /// without this host being told: what each noted session names is put under that session's
+    /// retention, as it would be had a prompt this host knows of submitted it, and the sessions are
+    /// forgotten, so the sweep reads none of them after. Returns how many attachments were put under
+    /// a session.
+    ///
+    /// The host calls this once no noted session can run a worker, because only then is what a
+    /// session names, as the relations read it, all there will be: a session that cannot take a
+    /// prompt cannot be sent one. A session whose worker is still running, or may be, is kept noted.
+    /// An attachment that two noted sessions name and that belongs to neither goes to the first of
+    /// them by identifier, and follows that session's retention from then on.
+    ///
+    /// Both tables the noting kept in the journal go with it, and the journal moves to the schema
+    /// version that holds nothing noted ([`Noting::Done`]), so no later start notes the sessions
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be written; nothing is
+    /// settled then.
+    pub fn settle_unseen_prompt_sessions(&self) -> Result<usize> {
+        let now = self.clock.now_ms();
+        self.locked()?.settle_unseen_prompt_sessions(now)
     }
 
     /// Returns one draft with its bindings.
