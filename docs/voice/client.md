@@ -1,9 +1,9 @@
 # Voice on the client
 
 The companion application holds the parts of a voice call that belong on the device: capture,
-playback and the WebRTC connection in native code on each platform, the capture gate that decides
+playback and the WebRTC connection in native code on each phone, the capture gate that decides
 when the microphone may carry speech, and the voice screen. The device-owner confirmation ceremony
-is the phones' own. The application runs on macOS, iOS and Android.
+is the phones' own. The desktop application opens no call.
 
 ## What a person is told before a call exists
 
@@ -31,11 +31,6 @@ to decline something that cost nothing.
 Section 15 ¶2 explicitly forbids capturing or playing audio through a WebView `getUserMedia` path.
 The native client implements media directly:
 
-- **Desktop (macOS)**: `apps/companion/src-tauri/src/audio/` uses `AudioUnit` with
-  `kAudioUnitSubType_VoiceProcessingIO` for echo cancellation, automatic gain control, and voice
-  isolation. Audio samples are framed as 20ms Opus frames (48 kHz mono) and buffered in a ring buffer
-  with 120ms target depth. Opening a desktop call refuses, and says so, rather than answering with
-  an offer no transport on this platform could carry.
 - **iOS**: `apps/companion/native/ios/KalaReachNative/VoiceCall.swift` holds a native WebRTC
   connection from the pinned `stasel/WebRTC` framework. Its audio session is WebRTC's
   `RTCAudioSession`, configured for play and record in the voice chat mode, with Bluetooth headsets
@@ -48,10 +43,9 @@ The native client implements media directly:
   gate before the encoder sees it: a frame the gate refuses is replaced with silence.
 
 On iOS and Android the connection reads the provider's data channel and never writes to it. The
-voice screen starts a call through the application's own command, which asks this build's call for
-an offer before anything else; it has no connection to offer on any platform, so a start from the
-screen is refused before the host is asked for anything, and the phone connections above are not
-started from the screen.
+voice screen starts a call through the application's own command, which refuses a start on every
+platform before the host is asked for anything: the application's own process negotiates no
+connection. The phone connections above are not started from the screen.
 
 ## Screen lock and background audio
 
@@ -71,21 +65,20 @@ Android's microphone foreground service:
   the service closes it. On the phones one control, `VoiceCallControl`, then decides every step,
   and it is the only code that turns a recorder or a microphone on: it takes audio focus and the
   foreground service on Android, or the audio session on iOS, and a refusal of any of them ends the
-  call; on Android nothing records until the service holds the foreground; and on every platform
-  the microphone carries speech only once audio is arriving from it. Android takes that from its
-  recorder's own start and stop, the desktop from the first captured frame, and iOS from the local
-  source's count of audio taken in, read four times a second, which grows only while the microphone
-  delivers; there the record vouches for time only up to the last reading that saw it grow, however
-  capture ends and whatever the screen said while the stop was not yet noticed. The deadline is
-  kept on the device's monotonic clock, read again after the platform's own steps so their time
-  counts against it. The call ends at the deadline on its own thread rather than the main one. On
-  the phones, anything that reaches the call's control after the deadline ends it at once: a
-  change, a report from the recorder or the service, or a second permit, including for a call still
-  waiting for its foreground service; on iOS a question asked of the call does too. On Android and
-  the desktop every frame after the deadline is refused as well; iOS checks no frames, so there the
-  microphone keeps its state until the call's own queue runs the end or something reaches the call,
-  and audio reported after the deadline is not counted as heard. A stopped call never reopens, and a
-  second permit for the same call is refused.
+  call; on Android nothing records until the service holds the foreground; and on both phones the
+  microphone carries speech only once audio is arriving from it. Android takes that from its
+  recorder's own start and stop, and iOS from the local source's count of audio taken in, read four
+  times a second, which grows only while the microphone delivers; there the record vouches for time
+  only up to the last reading that saw it grow, however capture ends and whatever the screen said
+  while the stop was not yet noticed. The deadline is kept on the device's monotonic clock, read
+  again after the platform's own steps so their time counts against it. The call ends at the
+  deadline on its own thread rather than the main one. On the phones, anything that reaches the
+  call's control after the deadline ends it at once: a change, a report from the recorder or the
+  service, or a second permit, including for a call still waiting for its foreground service; on iOS
+  a question asked of the call does too. On Android every frame after the deadline is refused as
+  well; iOS checks no frames, so there the microphone keeps its state until the call's own queue
+  runs the end or something reaches the call, and audio reported after the deadline is not counted
+  as heard. A stopped call never reopens, and a second permit for the same call is refused.
 - **One call at a time**: the audio belongs to one call. On iOS a second call is refused before its
   control can change the shared audio, and a change named for a call that does not hold the audio
   does nothing. A call let go of before it opened the audio leaves it free; one that has opened it is
@@ -118,11 +111,10 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 
 ## Context requests and admission
 
-The control-frame rules in `apps/companion/src-tauri/src/audio/control.rs` hold every context
-request to the managed service's bounds: an append over `VOICE_CONTEXT_BYTES` (500) is refused
-before it would be sent rather than truncated, and a delegation identifier the call never heard is
-refused. Reading what the host selected for a call is a read from the host, and the screen shows it
-as the host's selection.
+The client library's `VoiceContextFrame` (`crates/kr-client/src/services/voice.rs`) holds every
+context request to the managed service's bounds: an append over `VOICE_CONTEXT_BYTES` (500) is
+refused before it would be sent rather than truncated. Reading what the host selected for a call is
+a read from the host, and the screen shows it as the host's selection.
 
 A delegation the host admits without performing it is shown as **admission**, never as execution
 (KR-REQ-15.17), with the host's note that admission is not evidence anything ran. Host action
