@@ -23,6 +23,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
+# The tests act in the seams the project service compiles only for them.
+kr-project = { workspace = true, features = ["git-fixtures"] }
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]

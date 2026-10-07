@@ -4868,6 +4868,7 @@ dependencies = [
  "kr-cbor",
  "kr-flush",
  "kr-ipc",
+ "kr-project",
  "kr-protocol",
  "kr-transfer",
  "landlock",
