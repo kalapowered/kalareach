@@ -105,8 +105,8 @@ minutes, and memory and every view's progress are read every five seconds. The s
 Every measurement runs in a release build, one at a time.
 
 With `KR_PERF_SETTLE_LOAD` set to a load, `scripts/performance.sh` starts each measurement only once
-the one-minute load is under it, and takes no figure if five minutes pass first. The load is waited
-out, not a host condition.
+the one-minute load is under it, and fails without taking the figure if ten minutes pass first. The
+load is waited out, not a host condition.
 
 | Identifier | Target | Measured by | What is measured |
 | --- | --- | --- | --- |

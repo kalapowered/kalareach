@@ -14,7 +14,7 @@
 # Section 27 measures an idle host, and a machine that has just built the workspace or finished
 # another measurement is not one. A run that names a one-minute load in KR_PERF_SETTLE_LOAD has each
 # measurement wait, before it starts anything, for the load to fall under it, and takes no figure
-# on a machine whose load has not fallen within five minutes. A run that names none measures at
+# on a machine whose load has not fallen within ten minutes. A run that names none measures at
 # whatever load the machine has, which every figure records.
 #
 # Nothing here reaches the person's own credential store. A measurement that needs a key store
@@ -71,30 +71,36 @@ power_mode() {
 
 load_average() {
   local reading
-  reading="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }')"
+  reading="$(LC_ALL=C sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }')"
   if [ -z "$reading" ] && [ -r /proc/loadavg ]; then
     reading="$(cut -d' ' -f1-3 /proc/loadavg)"
   fi
   echo "${reading:-unknown}"
 }
 
-# Waits, when a bound was named, until the one-minute load is under it: at most sixty looks, five
-# seconds apart. Says what it found, and fails when the load never fell or could not be read.
+# Waits, when a bound was named, until the one-minute load is under it: at most sixty waits, ten
+# seconds apart. Says what it found, and fails when the load never fell or could not be read as a
+# number, which a host that writes its decimal separator as a comma, for one, would not allow.
+number='^[0-9]+([.][0-9]+)?$'
 settle() {
-  local name="$1" waits=0 load
+  local name="$1" waits=0 load _
   [ -n "$settle_load" ] || return 0
   while :; do
-    load="$(load_average | awk '{ print $1 }')"
-    if awk -v load="$load" -v bound="$settle_load" \
-      'BEGIN { exit !(load ~ /^[0-9]+([.][0-9]+)?$/ && load + 0 < bound + 0) }'; then
-      echo "  settled: the one-minute load was $load, under the $settle_load asked for, after $waits waits of five seconds"
+    read -r load _ <<<"$(load_average)"
+    if [[ "$load" =~ $number ]] &&
+      awk -v load="$load" -v bound="$settle_load" 'BEGIN { exit !(load + 0 < bound + 0) }'; then
+      echo "  settled: the one-minute load was $load, under the $settle_load asked for, after $waits waits of ten seconds"
       return 0
     fi
     [ "$waits" -lt 60 ] || break
     waits=$((waits + 1))
-    sleep 5
+    sleep 10
   done
-  echo "  the one-minute load was still $load after five minutes, not under the $settle_load asked for"
+  if [[ "$load" =~ $number ]]; then
+    echo "  the one-minute load was still $load after ten minutes, not under the $settle_load asked for"
+  else
+    echo "  the one-minute load could not be read as a number: the host gave \"$load\""
+  fi
   echo "FAILED: $name was not measured: the machine did not settle"
   return 1
 }

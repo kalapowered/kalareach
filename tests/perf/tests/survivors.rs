@@ -94,7 +94,8 @@ fn performance(directory: &Path, plant: Option<&Path>) -> Output {
         )
         // Through a link and with a trailing slash, as macOS gives it.
         .env("TMPDIR", format!("{}/", temporary.display()))
-        .env_remove("KR_PERF_PLANT");
+        .env_remove("KR_PERF_PLANT")
+        .env_remove("KR_PERF_SETTLE_LOAD");
     if let Some(plant) = plant {
         command.env("KR_PERF_PLANT", plant);
     }

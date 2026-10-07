@@ -3,8 +3,8 @@
 //! Section 27 measures an idle host, and a machine that has just built the workspace, or has just
 //! finished another measurement, is not one: a figure taken then is a figure about whatever the
 //! machine was still doing. A run that names a one-minute load in `KR_PERF_SETTLE_LOAD` starts each
-//! measurement only once the load is under it, and does not take the figure at all when the load
-//! does not fall. A run that names none measures at whatever load the machine has, as it always has.
+//! measurement only once the load is under it, and fails without taking the figure when the load does
+//! not fall. A run that names none measures at whatever load the machine has, as it always has.
 //!
 //! These checks run the script itself with `cargo` standing in for the build and every suite, and
 //! with `sysctl` and `sleep` standing in for the machine's load and for the passing of time. The
@@ -151,6 +151,24 @@ fn a_machine_that_does_not_settle_is_not_measured() {
     assert!(
         run.printed.contains("did not settle") && run.printed.contains("3.29"),
         "the run says the machine did not settle, and at what load:\n{}",
+        run.printed
+    );
+}
+
+#[test]
+fn a_load_that_cannot_be_read_as_a_number_is_not_a_settled_machine() {
+    // What the script prints when nothing answers is read by awk as zero, which is under every
+    // bound, so only the script's own check keeps an unreadable load from counting as a quiet one.
+    let run = performance(&["unknown"], Some("1.5"));
+    assert_ne!(run.status, Some(0), "{}", run.printed);
+    assert!(
+        run.started.is_empty(),
+        "no measurement started on a load that could not be read: {:?}",
+        run.started
+    );
+    assert!(
+        run.printed.contains("could not be read") && run.printed.contains("did not settle"),
+        "the run says the load could not be read:\n{}",
         run.printed
     );
 }
