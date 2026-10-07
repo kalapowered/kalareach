@@ -1,10 +1,12 @@
-//! Every collection that lets go of a record by the wall clock reads one host time contract.
+//! Every collection of the daemon that lets go of a record by the wall clock reads its one record
+//! of the clock.
 //!
 //! The transfer sweep's de-duplication records, the voice coordinator's spent delegations and the
 //! attention store's action records are forgotten when the wall clock says they are old, and the
 //! wall clock is the one thing section 9 lets a host doubt. A rollback any reader finds withholds
 //! all three, and the owner's one retrust frees all three: no collection keeps a private opinion
-//! of the clock. Each test runs a real daemon on clocks it moves by hand.
+//! of the clock. Each test runs a real daemon on clocks it moves by hand. A worker's own contract
+//! is a second record, which the owner's retrust reaches through the clock floor.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -312,8 +314,10 @@ impl kr_worker::action::time::WallClock for SameWall {
 /// daemon's. A worker maps the daemon's clock floor as a worker process does; the wall clock goes
 /// back, and the daemon and the worker both stop trusting it; the owner establishes the clock at
 /// the terminal, and the worker, whose own clock still agrees with what the owner established,
-/// trusts its clock again. The daemon's contract and the worker's are two records, and the owner's
-/// action is the one thing that ends both.
+/// trusts its clock again. A worker that begins afterwards, on a time service that vouches for
+/// nothing, follows the confirmation the daemon holds; one that begins after the daemon found
+/// another rollback does not. The daemon's contract and the worker's are two records, and the
+/// owner's action is the one thing that ends both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
     use kr_ipc::clock::SharedClock as _;
@@ -334,6 +338,21 @@ async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
         )
         .expect("a worker maps the daemon's floor"),
     );
+    let worker_on = |reading: kr_protocol::action::TimeAdapterReading| {
+        TimeContract::new(
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            String::new(),
+            TimeSources {
+                continuous: Arc::new(kr_ipc::clock::SystemSharedClock),
+                active: Arc::new(kr_worker::action::time::SystemActiveClock::new()),
+                wall: Arc::new(SameWall(Arc::clone(&wall))),
+                adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(
+                    reading,
+                )),
+                floor: Some(Arc::clone(&floor)),
+            },
+        )
+    };
     let synchronised = kr_worker::action::adapter::classify_unix(
         "macos",
         "ntp_adjtime(2)",
@@ -345,19 +364,12 @@ async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
         },
         kr_protocol::scalars::TimestampMs::new(wall.load(Ordering::SeqCst)),
     );
-    let worker = TimeContract::new(
-        kr_ipc::identity::boot_identity().expect("a boot identity"),
-        String::new(),
-        TimeSources {
-            continuous: Arc::new(kr_ipc::clock::SystemSharedClock),
-            active: Arc::new(kr_worker::action::time::SystemActiveClock::new()),
-            wall: Arc::new(SameWall(Arc::clone(&wall))),
-            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(
-                synchronised,
-            )),
-            floor: Some(floor),
-        },
+    let vouching_for_nothing = kr_worker::action::adapter::unavailable(
+        "macos",
+        "ntp_adjtime(2)",
+        kr_protocol::scalars::TimestampMs::new(wall.load(Ordering::SeqCst)),
     );
+    let worker = worker_on(synchronised);
     let start = wall.load(Ordering::SeqCst);
     worker.observe();
     assert_eq!(
@@ -379,13 +391,24 @@ async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
         "and so does the daemon"
     );
 
+    let before = kr_ipc::clock::SystemSharedClock.boot_elapsed_ms();
     super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    let after = kr_ipc::clock::SystemSharedClock.boot_elapsed_ms();
     assert!(super::an_owner_establishes_the_clock::proven(&controller));
     let established = controller
         .utc_floor()
         .words()
         .established()
         .expect("the owner's establishment is published in the floor");
+    assert_eq!(
+        established.wall_ms,
+        start - 60_000,
+        "the reading published is the one the daemon took"
+    );
+    assert!(
+        (before..=after).contains(&established.boot_ms),
+        "and the machine's continuous reading taken with it"
+    );
     // The wall clock reads what the owner established, carried forward by the time since on the
     // machine's own clock, which is what a clock the owner was right about reads.
     wall.store(
@@ -398,6 +421,26 @@ async fn the_owners_one_establishment_frees_a_workers_own_contract_too() {
         worker.trust(),
         kr_protocol::action::WallClockTrust::Trusted,
         "the worker's clock agrees with what the owner established, so it trusts it again"
+    );
+
+    // A worker that begins now has a time service that vouches for nothing, and follows the
+    // confirmation the daemon holds.
+    let beginning = worker_on(vouching_for_nothing.clone());
+    beginning.observe();
+    assert_eq!(
+        beginning.trust(),
+        kr_protocol::action::WallClockTrust::Trusted
+    );
+
+    // The daemon finds another rollback and withdraws the confirmation: a worker that begins
+    // after that has nothing to follow.
+    wall.store(wall.load(Ordering::SeqCst) - 60_000, Ordering::SeqCst);
+    assert!(!super::an_owner_establishes_the_clock::proven(&controller));
+    let late = worker_on(vouching_for_nothing);
+    late.observe();
+    assert_eq!(
+        late.trust(),
+        kr_protocol::action::WallClockTrust::Unresolved
     );
 }
 

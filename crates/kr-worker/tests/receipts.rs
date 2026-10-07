@@ -4179,6 +4179,10 @@ fn the_owners_establishment_of_the_host_clock_ends_a_workers_distrust() {
     drop(session);
     let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert!(
+        session.time().durable_state().0.owner_confirmed,
+        "the owner is why it trusts its clock"
+    );
 }
 
 /// KR-REQ-09.19: a worker that followed the owner's establishment is trusting its clock because
@@ -4213,12 +4217,14 @@ fn a_worker_that_followed_the_owner_keeps_a_clock_its_time_service_stops_keeping
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
 }
 
-/// KR-REQ-09.19: a worker follows an establishment only when its own clock agrees with it, and
-/// only once. An owner who established the clock cannot speak for a wall clock that has been
-/// stepped since; and a rollback after the establishment is not undone by it, however the clock
-/// reads later. Only the next establishment ends either.
+/// KR-REQ-09.19: a worker follows an establishment once, and not when its own wall clock has been
+/// stepped back since. The owner cannot speak for a rollback they did not see: the establishment
+/// is spent, and the clock reading right again later does not bring it back. Only the next one
+/// ends the distrust. A step forward is not held against it, as it is not held against a worker
+/// that never distrusted its clock. A rollback after an establishment the worker followed stays a
+/// rollback, and the clock put right again does not undo it.
 #[test]
-fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_once() {
+fn a_worker_follows_an_establishment_once_and_not_when_its_clock_was_stepped_back_since() {
     let an_hour = std::time::Duration::from_secs(3_600);
     let a_minute = std::time::Duration::from_secs(60);
     let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
@@ -4230,14 +4236,11 @@ fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_onc
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
 
-    // The wall clock is stepped forward an hour after the owner established it: the worker's clock
-    // no longer reads what the owner established, so the worker stays distrusted, and the clock
-    // reading right again later does not bring the establishment back.
     machine.owner_establishes(&floor);
-    machine.wall.advance(an_hour);
+    machine.steps_back(an_hour);
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
-    machine.steps_back(an_hour);
+    machine.wall.advance(an_hour);
     session.observe_time();
     assert_eq!(
         session.time().trust(),
@@ -4245,10 +4248,23 @@ fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_onc
         "an establishment the worker met and could not follow is spent"
     );
 
-    // The next one ends it.
     machine.owner_establishes(&floor);
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+
+    // A step forward after an establishment is not held against it.
+    machine.runs(AN_HOUR);
+    machine.steps_back(a_minute);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+    machine.owner_establishes(&floor);
+    machine.wall.advance(an_hour);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "a clock that reads later than the owner established is not a rollback"
+    );
 
     // A rollback after that establishment stays a rollback, and the clock put right again does not
     // undo it.
@@ -4266,10 +4282,212 @@ fn a_worker_follows_an_establishment_only_when_its_own_clock_agrees_and_only_onc
     assert_eq!(session.collect_expired(), 0);
 }
 
-/// KR-REQ-09.19: an establishment made before a worker began is not one for the clock that worker
-/// has come to doubt. A worker that restarts on a journal recording its clock as unresolved stays
-/// distrusted although the owner established the clock while it was down: the owner may have done
-/// so before the clock went wrong. The next establishment ends it.
+/// KR-REQ-09.19: how far behind the owner's reading a worker's clock may be and still be the clock
+/// the owner established: the rollback tolerance, and the rate allowance for the time between. A
+/// continuous clock running 50 parts per million fast carries the owner's reading eight and a half
+/// seconds past the wall clock in two days, which the allowance covers; a step back of exactly the
+/// tolerance is followed and one millisecond more is not.
+#[test]
+fn a_worker_follows_within_the_tolerance_and_the_rate_allowance_and_no_further() {
+    let a_minute = std::time::Duration::from_secs(60);
+    let distrusting = |ppm: u64| {
+        let (temp, environment, session_id) = a_journal_with_a_record_past_retention();
+        let machine = DriftingMachine::fast_by(ppm);
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+        machine.runs(AN_HOUR);
+        machine.steps_back(a_minute);
+        session.observe_time();
+        assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+        (temp, machine, floor, session)
+    };
+
+    let (_temp, machine, floor, mut session) = distrusting(50);
+    machine.owner_establishes(&floor);
+    machine.runs(std::time::Duration::from_secs(2 * 86_400));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "eight and a half seconds of a fast continuous clock are inside the allowance"
+    );
+
+    let (_temp, machine, floor, mut session) = distrusting(0);
+    machine.owner_establishes(&floor);
+    machine.steps_back(std::time::Duration::from_millis(5_000));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+
+    let (_temp, machine, floor, mut session) = distrusting(0);
+    machine.owner_establishes(&floor);
+    machine.steps_back(std::time::Duration::from_millis(5_001));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "one millisecond more than the tolerance is a clock the owner did not establish"
+    );
+}
+
+/// A wall clock that, once armed, runs a closure right after the next reading it gives: how a
+/// test moves the world between a worker's reading of its clock and what the worker does next.
+struct WallThatMovesAfterItsNextReading {
+    inner: kr_worker::action::time::ManualWallClock,
+    after: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for WallThatMovesAfterItsNextReading {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WallThatMovesAfterItsNextReading")
+    }
+}
+
+impl kr_worker::action::time::WallClock for WallThatMovesAfterItsNextReading {
+    fn now_ms(&self) -> TimestampMs {
+        let reading = self.inner.now_ms();
+        let after = self
+            .after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(after) = after {
+            after();
+        }
+        reading
+    }
+}
+
+/// KR-REQ-09.19: a worker whose clock reading predates the owner's establishment does not spend
+/// the establishment on it. The worker reads its clock at the start of an observation; while it
+/// waits, the owner corrects the wall clock and establishes it; the worker then finds the
+/// establishment and judges it against a reading taken after it, which agrees, and trusts its clock.
+#[test]
+fn a_worker_judges_an_establishment_against_a_reading_taken_after_it() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let wall = Arc::new(WallThatMovesAfterItsNextReading {
+        inner: machine.wall.clone(),
+        after: std::sync::Mutex::new(None),
+    });
+    let mut session = Session::open(SessionConfig {
+        time: kr_worker::action::time::TimeSources {
+            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            ..machine.sources_on(&floor)
+        },
+        ..session_config(&environment, session_id)
+    })
+    .expect("opens");
+    machine.runs(AN_HOUR);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+
+    let right = machine.wall.clone();
+    let continuous = machine.continuous.clone();
+    let published = Arc::clone(&floor);
+    *wall
+        .after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        right.advance(std::time::Duration::from_secs(60));
+        published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
+    }));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "the reading the worker took before the owner corrected the clock is not the one it is judged on"
+    );
+}
+
+/// The mark a worker's journal holds for its contract, in UTC milliseconds.
+fn recorded_mark(journal: &std::path::Path) -> u64 {
+    let row: Vec<u8> = rusqlite::Connection::open(journal)
+        .expect("the same database")
+        .query_row("SELECT state FROM host_time WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("the recorded state");
+    let state: kr_protocol::action::HostTimeState =
+        kr_cbor::from_canonical_slice(&row, &kr_cbor::Limits::DEFAULT).expect("decodes");
+    state.proven.0.expect("a recorded mark").wall_clock_ms.get()
+}
+
+/// KR-REQ-09.19: every establishment a worker follows leaves its new mark in the journal, even
+/// when nothing else about its trust changed. A worker that trusts its clock and has followed one
+/// is stepped back four seconds, which is inside the tolerance, and follows the next: a restart
+/// reads the mark that establishment set, not the higher one before it, which would measure the
+/// next rollback from a reading the owner had put right.
+#[test]
+fn every_establishment_a_worker_follows_leaves_its_mark_in_the_journal() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    let journal = environment.journal_database(session_id);
+    let first = recorded_mark(&journal);
+
+    machine.steps_back(std::time::Duration::from_secs(4));
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert_eq!(
+        recorded_mark(&journal),
+        first - 4_000,
+        "the second establishment's mark is what the journal holds"
+    );
+}
+
+/// KR-REQ-09.19: a worker that begins after the owner confirmed the clock trusts it, although its
+/// own time service does not vouch for it, because the confirmation in force answers that doubt.
+/// A worker that begins after the daemon withdrew the confirmation (its own record distrusts the
+/// clock) does not.
+#[test]
+fn a_worker_that_begins_after_the_owner_confirmed_the_clock_trusts_it() {
+    let machine = DriftingMachine::fast_by(0);
+    machine.time_service_stops();
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the time service vouches for nothing and the owner has confirmed nothing"
+    );
+
+    machine.runs(AN_HOUR);
+    machine.owner_establishes(&floor);
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert_eq!(
+        session.collect_expired(),
+        1,
+        "and collects what retention covers"
+    );
+
+    floor.withdraw();
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the daemon's record distrusts the clock, so there is nothing to follow"
+    );
+}
+
+/// KR-REQ-09.19: an establishment made before a worker restarted is not one for the clock that
+/// worker has come to doubt. A worker that restarts on a journal recording its clock as unresolved
+/// stays distrusted although the owner established the clock while it was down: the owner may have
+/// done so before the clock went wrong. The next establishment ends it.
 #[test]
 fn a_worker_started_after_an_establishment_does_not_follow_it() {
     let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();

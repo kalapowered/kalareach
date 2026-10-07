@@ -362,12 +362,13 @@ struct TimeState {
     /// anchor is what tells a step from time passing: without it, five seconds of uptime would
     /// look like a five-second correction.
     saved: Option<HighWater>,
-    /// The owner's latest establishment of the host's clock this contract has met, followed or
-    /// not, as the clock floor counts them.
+    /// The owner's confirmation of the host's clock, as the clock floor counts them, that this
+    /// contract has met, followed or not.
     ///
-    /// An establishment is acted on once. A contract starts at the count the floor stands at, so
-    /// an owner who established the clock before this worker began has not established it for a
-    /// clock this worker has since come to doubt.
+    /// A confirmation is acted on once. A contract that restored a record starts at the count the
+    /// floor stands at, so a confirmation made before this worker began is not one for a clock it
+    /// has since come to doubt. A contract with nothing recorded starts at nought, because its
+    /// doubt is the platform's and the owner's confirmation in force answers that.
     followed: u64,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
@@ -591,10 +592,14 @@ impl TimeContract {
             });
         let owner_confirmed_at_restore =
             recorded.as_ref().is_some_and(|state| state.owner_confirmed);
-        let followed = floor
-            .as_ref()
-            .and_then(|floor| floor.established())
-            .map_or(0, |established| established.count);
+        let followed = if recorded.is_some() {
+            floor
+                .as_ref()
+                .and_then(|floor| floor.established())
+                .map_or(0, |established| established.count)
+        } else {
+            0
+        };
         let (checkpoint, tombstones) = recorded.map_or_else(
             || (None, BTreeMap::new()),
             |state| {
@@ -862,7 +867,7 @@ impl TimeContract {
             state.trust = WallClockTrust::Unresolved;
             state.critical = state.critical.saturating_add(1);
         }
-        self.follow_the_owner(&mut state, continuous_ms, wall_ms, &reading);
+        self.follow_the_owner(&mut state, &reading);
         let trust = state.trust;
         drop(state);
 
@@ -1176,12 +1181,14 @@ impl TimeContract {
         ))
     }
 
-    /// Returns the clock to trusted at the reading taken at `continuous_ms` and `wall_ms`, and says
-    /// whether the owner is why.
+    /// Returns the clock to trusted at the reading taken at `continuous_ms` and `wall_ms`, with
+    /// `owner` saying whether the owner's confirmation is why.
     ///
     /// The trust, the mark and the high-water projection move together, and the tombstones stay
     /// exactly where they are: section 9 keeps old expiration tombstones through a retrust, and an
-    /// object that had already run out does not come back because the clock was corrected.
+    /// object that had already run out does not come back because the clock was corrected. The new
+    /// mark is owed a write however little else changed: a restart that read an older mark back
+    /// would measure the next rollback against a reading the retrust had put right.
     fn trust_again(
         &self,
         state: &mut TimeState,
@@ -1197,48 +1204,42 @@ impl TimeContract {
             reading,
             trust: WallClockTrust::Trusted,
         };
-        if state.trust != WallClockTrust::Trusted {
-            state.critical = state.critical.saturating_add(1);
-        }
+        state.critical = state.critical.saturating_add(1);
         state.trust = WallClockTrust::Trusted;
-        if state.owner_confirmed != owner {
-            // What the owner confirmed is something a restarted host cannot work out for itself,
-            // so it is one of the facts that has to be written down.
-            state.critical = state.critical.saturating_add(1);
-        }
         state.owner_confirmed = owner;
         state.checkpoint = Some(checkpoint.clone());
         state.high_water = Some(HighWater {
             wall_ms,
             continuous_ms,
         });
+        // The mark is this host's own reading now, so the full rollback tolerance applies again.
+        state.restored = None;
         checkpoint
     }
 
-    /// Follows the owner's establishment of the host's clock, once, when this worker's own clock
-    /// agrees with it.
+    /// Follows the owner's confirmation of the host's clock, once, unless this worker's own clock
+    /// shows it behind.
     ///
-    /// The owner's one action ends the distrust of the host's clock everywhere, and the daemon
-    /// publishes it in the clock floor every worker maps: the wall reading the owner established
-    /// and the machine's continuous reading taken with it. What the owner said is what the time
-    /// was then, so a worker does not take it as a statement about a clock it has not looked at:
-    /// its own wall clock has to read what the owner established carried forward by the continuous
-    /// time since, within the rollback tolerance and the rate allowance. A wall clock stepped
-    /// since does not, and then the establishment is spent all the same, because an establishment
-    /// a worker met and could not follow is not one it follows when the clock next reads right:
-    /// the owner has said nothing about the clock in between. Only the next establishment ends
-    /// that distrust. The same holds for a rollback after the one it followed.
+    /// The owner's one action is meant to end the distrust of the host's clock where the worker
+    /// maps the host's clock floor, where the daemon publishes the wall reading the owner
+    /// confirmed and the machine's continuous reading taken with it, and withdraws it again when
+    /// its own record distrusts the clock. What the owner said is what the time was then, so the
+    /// worker's own wall clock has to read that carried forward by the continuous time since, or
+    /// later: it may be behind it by no more than the rollback tolerance and the rate allowance. A
+    /// wall clock stepped back since is a rollback the owner did not see, and the confirmation is
+    /// spent all the same, because one a worker met and could not follow is not one it follows when
+    /// the clock next reads right: the owner has said nothing about the clock in between. Only the
+    /// next confirmation ends that distrust. A step forward is not held against it, as it is not
+    /// held against a worker that never distrusted its clock: forward steps expire conservatively.
+    ///
+    /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
+    /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
+    /// the confirmation on a reading from before it.
     ///
     /// A worker that trusted its clock already follows too, and from then on the owner is why it
     /// trusts it, so the platform's time service stopping later does not undo what the owner
     /// confirmed, as it does not for the daemon's record.
-    fn follow_the_owner(
-        &self,
-        state: &mut TimeState,
-        continuous_ms: u64,
-        wall_ms: u64,
-        reading: &TimeAdapterReading,
-    ) {
+    fn follow_the_owner(&self, state: &mut TimeState, reading: &TimeAdapterReading) {
         let Some(established) = self.floor.as_ref().and_then(|floor| floor.established()) else {
             return;
         };
@@ -1246,11 +1247,13 @@ impl TimeContract {
             return;
         }
         state.followed = established.count;
+        let continuous_ms = self.continuous.boot_elapsed_ms();
+        let wall_ms = self.wall.now_ms().get();
         let elapsed = continuous_ms.saturating_sub(established.boot_ms);
         let expected = established.wall_ms.saturating_add(elapsed);
         let slack = MAX_WALL_CLOCK_ROLLBACK_MS
             .saturating_add(elapsed.saturating_sub(kr_ipc::clock::credited(elapsed)));
-        if wall_ms.abs_diff(expected) > slack {
+        if wall_ms.saturating_add(slack) < expected {
             return;
         }
         self.trust_again(state, continuous_ms, wall_ms, reading.clone(), true);
