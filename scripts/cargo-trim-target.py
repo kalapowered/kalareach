@@ -20,7 +20,8 @@ Every directory below the target directory that holds `deps` is a profile's (`de
 and the same inside a directory named for a target triple). In each, a unit is a name and a
 16-digit hash, and its files, its fingerprint directory and its build directories carry both;
 the few files of a workspace package that carry no hash (a dynamic or static library, a program
-on Windows) are found by the package's name. What cannot be told is left alone, which costs a
+on Windows) are found by the crate's name, which Cargo's own outputs for a third-party crate never
+share. What cannot be told is left alone, which costs a
 build and never a wrong result. A file that cannot be removed is reported and left.
 """
 import os

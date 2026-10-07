@@ -6,9 +6,10 @@
 #
 # One line, `<settings>-<week>-<dependencies>`, each part sixteen hex digits or an ISO week.
 #
-# settings   The toolchain, the build settings of `.cargo/config.toml` and the `[profile]` tables of
-#            the workspace's `Cargo.toml`, comments left out: a crate built with other settings is
-#            not the crate a cache holds, and an edit to a comment changes none.
+# settings   The toolchain, the build settings of `.cargo/config.toml`, the `[profile]` tables of the
+#            workspace's `Cargo.toml` and the `CARGO_PROFILE_*` and `RUSTFLAGS` variables of the
+#            environment, comments left out: a crate built with other settings is not the crate a
+#            cache holds, and an edit to a comment changes none.
 # week       The ISO week, so that what a cache holds is rebuilt from nothing at least weekly. A
 #            cache that is restored and saved again only grows: Cargo never removes a unit that no
 #            build asks for, and a feature a manifest turns on changes no line of Cargo.lock.
@@ -33,10 +34,12 @@ else
     digest() { shasum -a 256 | cut -c1-16; }
 fi
 
-settings="$({
-    grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/config.toml
-    awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } keep && !/^[[:space:]]*(#|$)/' Cargo.toml
-} | digest)"
+# Each part is assigned to a variable first, so that a file that cannot be read stops the script.
+toolchain="$(grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/config.toml)"
+profiles="$(awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } keep && !/^[[:space:]]*(#|$)/' Cargo.toml)"
+# The settings the workflow gives every build by environment variable.
+environment="$(env | grep -E '^(CARGO_PROFILE_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)' | LC_ALL=C sort || true)"
+settings="$(printf '%s\n%s\n%s\n' "$toolchain" "$profiles" "$environment" | digest)"
 week="$(date -u +%G-W%V)"
 dependencies="$(awk 'BEGIN { RS = ""; ORS = "\n\n" } /\nsource = / { print }' Cargo.lock | digest)"
 
