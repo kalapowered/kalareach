@@ -1319,6 +1319,42 @@ async fn links_to_one_target_with_different_identifiers_reach_a_client_as_differ
     );
 }
 
+/// A cursor saved while the locking shift selected the shift-out set is sent with that shift, which
+/// is not the shift the session is in now: a restore puts the one back that was saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_cursor_reaches_a_client_with_the_shift_it_was_saved_under() {
+    let host = host(
+        "stty -echo -echonl || exit 1; \
+         printf '\\033)0\\016\\0337\\017'; read -r _",
+    )
+    .await;
+    produced(&host.runtime, b"\x1b7\x0f").await;
+    let mut attached = attach(
+        &host,
+        Dimensions::new(SMALLER.0, SMALLER.1),
+        Some("xterm-256color"),
+    )
+    .await;
+    let events = collect_until_installed(&mut attached.client).await;
+    let Some(Event::Snapshot(header)) = events.get(1) else {
+        panic!("the state of the screen follows the reset: {events:?}");
+    };
+    assert!(
+        !header.charsets.shift_out,
+        "the session has shifted back in since it saved"
+    );
+    let saved = header
+        .saved_cursors
+        .iter()
+        .find(|saved| saved.buffer == ProjectedBuffer::Primary)
+        .expect("the cursor this session saved");
+    assert_eq!(saved.charsets.g1, "DecLineDrawing");
+    assert!(
+        saved.charsets.shift_out,
+        "the saved cursor says the shifted-out set was selected when it was saved"
+    );
+}
+
 /// The links the ranges of the updates among `events` carry, and the links they open.
 fn update_links(events: &[Event]) -> (Vec<ProjectedHyperlink>, Vec<ProjectedHyperlink>) {
     let deltas = events.iter().filter_map(|event| match event {

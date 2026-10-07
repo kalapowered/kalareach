@@ -6778,25 +6778,6 @@
       ],
       "type": "object"
     },
-    "CharsetDesignations": {
-      "additionalProperties": false,
-      "description": "The character sets a saved cursor carries.",
-      "properties": {
-        "g0": {
-          "description": "The set designated as G0.",
-          "type": "string"
-        },
-        "g1": {
-          "description": "The set designated as G1.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "g0",
-        "g1"
-      ],
-      "type": "object"
-    },
     "CharsetState": {
       "additionalProperties": false,
       "description": "The designated character sets and the locking shift.",
@@ -31250,8 +31231,8 @@
           "description": "Which buffer saved it."
         },
         "charsets": {
-          "$ref": "#/$defs/CharsetDesignations",
-          "description": "The character sets designated when it was saved."
+          "$ref": "#/$defs/CharsetState",
+          "description": "The character sets designated when it was saved, and which of them the locking shift had\nselected. A restore puts the shift back as it was then, not as it is now."
         },
         "column": {
           "$ref": "#/$defs/U64",
