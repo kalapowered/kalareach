@@ -136,25 +136,50 @@ impl StagingArea {
         name
     }
 
-    /// Opens the three areas beneath a staging directory, creating whatever is missing.
+    /// Opens the staging directory, and the three areas beneath it, creating whatever is missing.
+    ///
+    /// `recorded` is the identity a store recorded for this staging directory, when it recorded
+    /// one. The directory is decided against it before anything is created inside it, so a
+    /// directory that took the place of the recorded one gets no areas made in it, and the answer
+    /// says what the record becomes ([`Settled`]) when it is the recorded one. The decision is
+    /// [`AuthorisedDirectory::check_recorded`]'s: the directory's inode and its filesystem decide,
+    /// and a device number that is not the recorded one is taken in when the directory is on the
+    /// filesystem of the directory it was created in, which a mount over it is not.
+    ///
+    /// The record is a row of the journal, which lives in the directory above the staging
+    /// directory, so what this settles is that the directory is the one that journal was written
+    /// for. It does not make a tree genuine: whoever can put another filesystem under that
+    /// directory can put a journal beside it, which is a privilege this check does not defend
+    /// against. It is there for a directory replaced by the account's own processes, and for a
+    /// filesystem that is not the one the journal was written on.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::StagingUnavailable`] when a directory cannot be created or opened.
-    pub fn open(root: &AuthorisedDirectory, staging_name: &str) -> Result<Self> {
+    /// Returns [`TransferError::StagingUnavailable`] when a directory cannot be created or opened,
+    /// and [`TransferError::Escape`] when the directory is not the recorded one.
+    pub fn open(
+        root: &AuthorisedDirectory,
+        staging_name: &str,
+        recorded: Option<RecordedIdentity>,
+    ) -> Result<(Self, Option<Settled>)> {
         let name = RelativeName::parse(staging_name).map_err(|escape| {
             TransferError::staging(format!(
                 "{staging_name} is not a staging directory: {escape}"
             ))
         })?;
         let staging = create_private_staging_directory(root, &name)?;
-        Ok(Self {
+        let settled = recorded
+            .map(|recorded| staging.check_recorded(recorded))
+            .transpose()
+            .map_err(TransferError::from)?;
+        let area = Self {
             environment_id: root.environment_id(),
             incomplete: subdirectory(&staging, INCOMPLETE_DIRECTORY)?,
             complete: subdirectory(&staging, COMPLETE_DIRECTORY)?,
             snapshots: subdirectory(&staging, SNAPSHOTS_DIRECTORY)?,
             directory: staging,
-        })
+        };
+        Ok((area, settled))
     }
 
     /// Returns the environment this area belongs to.
@@ -172,30 +197,6 @@ impl StagingArea {
     /// on.
     pub fn recorded(&self) -> Result<RecordedIdentity> {
         self.directory.recorded().map_err(TransferError::from)
-    }
-
-    /// Checks that this area is the one whose identity was recorded earlier, and says what the
-    /// record becomes when it is.
-    ///
-    /// The decision is [`AuthorisedDirectory::check_recorded`]'s: the directory's inode and its
-    /// filesystem decide, and a device number that is not the recorded one is taken in when the
-    /// directory is on the filesystem of the directory it was created in, which a mount over it is
-    /// not.
-    ///
-    /// The record is a row of the journal, which lives in the directory above the staging
-    /// directory, so what this settles is that the directory is the one that journal was written
-    /// for. It does not make a tree genuine: whoever can put another filesystem under that
-    /// directory can put a journal beside it, which is a privilege this check does not defend
-    /// against. It is there for a directory replaced by the account's own processes, and for a
-    /// filesystem that is not the one the journal was written on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransferError::Escape`] when it is not the recorded directory.
-    pub fn check_identity(&self, expected: RecordedIdentity) -> Result<Settled> {
-        self.directory
-            .check_recorded(expected)
-            .map_err(TransferError::from)
     }
 
     /// Returns the area uploads receive chunks into.
@@ -481,7 +482,8 @@ mod tests {
         )
         .expect("opens the root");
         let staging_name = StagingArea::random_name();
-        let area = StagingArea::open(&authority, &staging_name).expect("opens the areas");
+        let (area, _) =
+            StagingArea::open(&authority, &staging_name, None).expect("opens the areas");
         assert_ne!(area.incomplete().identity(), area.complete().identity());
         assert_ne!(area.complete().identity(), area.snapshots().identity());
         assert!(
@@ -490,7 +492,8 @@ mod tests {
                 .ends_with(format!("{staging_name}/{INCOMPLETE_DIRECTORY}"))
         );
         // Opening the same area again finds the same directories rather than making new ones.
-        let again = StagingArea::open(&authority, &staging_name).expect("opens the areas");
+        let (again, _) =
+            StagingArea::open(&authority, &staging_name, None).expect("opens the areas");
         assert_eq!(again.incomplete().identity(), area.incomplete().identity());
     }
 
@@ -502,12 +505,16 @@ mod tests {
             root.path(),
         )
         .expect("opens the root");
-        let area =
-            StagingArea::open(&authority, &StagingArea::random_name()).expect("opens the areas");
+        let name = StagingArea::random_name();
+        let (area, _) = StagingArea::open(&authority, &name, None).expect("opens the areas");
         let found = area.recorded().expect("reads its own identity");
+        drop(area);
+        let opened_as = |recorded: RecordedIdentity| {
+            StagingArea::open(&authority, &name, Some(recorded)).map(|(_, settled)| settled)
+        };
         assert_eq!(
-            area.check_identity(found).expect("as recorded"),
-            Settled::AsRecorded
+            opened_as(found).expect("as recorded"),
+            Some(Settled::AsRecorded)
         );
 
         let renumbered = RecordedIdentity::from_parts(
@@ -518,16 +525,16 @@ mod tests {
         // The filesystem was recorded under another device number: the same directory.
         #[cfg(unix)]
         assert_eq!(
-            area.check_identity(renumbered).expect("the same directory"),
-            Settled::Revised {
+            opened_as(renumbered).expect("the same directory"),
+            Some(Settled::Revised {
                 was: renumbered,
                 now: found
-            }
+            })
         );
         // A device number there is the volume's serial number, which another mounting of the same
         // volume does not change, so another one is another volume's.
         #[cfg(windows)]
-        assert!(area.check_identity(renumbered).is_err(), "{renumbered}");
+        assert!(opened_as(renumbered).is_err(), "{renumbered}");
 
         // Another directory is refused under either number.
         for device in [found.object.device, renumbered.object.device] {
@@ -536,7 +543,7 @@ mod tests {
                 found.object.file_id.wrapping_add(1),
                 found.filesystem,
             );
-            assert!(area.check_identity(other).is_err(), "{other}");
+            assert!(opened_as(other).is_err(), "{other}");
         }
     }
 
@@ -548,8 +555,8 @@ mod tests {
             root.path(),
         )
         .expect("opens the root");
-        assert!(StagingArea::open(&authority, "../elsewhere").is_err());
-        assert!(StagingArea::open(&authority, "").is_err());
+        assert!(StagingArea::open(&authority, "../elsewhere", None).is_err());
+        assert!(StagingArea::open(&authority, "", None).is_err());
     }
 
     #[test]

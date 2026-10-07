@@ -59,6 +59,44 @@ fn begin_from_scope(
     )
 }
 
+/// KR-REQ-14.10: a directory that took the staging directory's place is refused, and nothing is
+/// made in it: the areas beneath a staging directory are made only in the directory the journal
+/// recorded.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_took_the_staging_directorys_place_gets_nothing_made_in_it() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let host = kr_ipc::testing::TempHost::create();
+    drop(TransferService::open(&host.environment()).expect("opens and records"));
+    let name: String = journal(&host)
+        .query_row("SELECT staging_name FROM environment", [], |row| row.get(0))
+        .expect("the journal records the staging directory");
+    let staging = StagingArea::root_of(&host.environment()).join(&name);
+    let moved = StagingArea::root_of(&host.environment()).join(format!("{name}-moved"));
+    std::fs::rename(&staging, &moved).expect("the staging directory is moved away");
+    // Another directory, shut to every other account as a staging directory is, is at its name.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .expect("another directory at the name");
+
+    let refusal = TransferService::open(&host.environment())
+        .expect_err("another directory is not the recorded staging directory");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert_eq!(
+        std::fs::read_dir(&staging)
+            .expect("the directory is there")
+            .count(),
+        0,
+        "nothing was made in the directory that took the place"
+    );
+    assert!(
+        moved.join("complete").is_dir(),
+        "the recorded directory is as it was"
+    );
+}
+
 /// KR-REQ-14.10: a staging directory is refused on another filesystem that gives it the numbers
 /// the recorded one had, and accepted on the filesystem it was recorded on.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
