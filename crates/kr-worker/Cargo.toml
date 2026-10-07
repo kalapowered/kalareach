@@ -100,10 +100,11 @@ tempfile.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
 
 # The workspace forbids unsafe code, which a crate that waits on the terminal's own descriptor
-# cannot honour. This crate denies it instead and allows it in exactly two modules:
-# `pty::descriptor`, which owns that single wait, and `action::adapter::unix`, which reads the
-# kernel's clock discipline through the one interface the platform exposes for it. Nothing else in
-# this crate may relax the rule.
+# cannot honour. This crate denies it instead and allows it, with the reason stated beside the
+# allowance, only in a module or a test whose native call has no safe form: `pty::descriptor`,
+# which owns the wait on the terminal's descriptor, `action::adapter::unix`, which reads the
+# kernel's clock discipline through the one interface the platform exposes for it, and on Windows
+# the modules that create processes, jobs and the pseudo-console.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
