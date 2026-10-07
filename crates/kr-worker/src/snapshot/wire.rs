@@ -347,9 +347,10 @@ pub fn saved_cursor(value: &SavedCursor) -> SavedCursorState {
         row: cells(value.row),
         pending_wrap: value.pending_wrap,
         rendition: rendition(value.rendition),
-        charsets: kr_protocol::projection::CharsetDesignations {
+        charsets: CharsetState {
             g0: value.charsets.g0.clone(),
             g1: value.charsets.g1.clone(),
+            shift_out: value.shift_out,
         },
         origin_mode: value.origin_mode,
         style: cells(value.style),
