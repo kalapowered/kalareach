@@ -30,6 +30,11 @@
 //! entering the other buffer saved, as a session that never saved one has none. When the alternate
 //! buffer is showing, the switch back into it saves the plain state.
 //!
+//! Each soft reset comes after a carriage return and a plain rendition. It is the only soft reset a
+//! direct terminal reads, and xterm's saves a fresh cursor that keeps a wrap the terminal had
+//! pending and leaves faint, crossed-out and doubly underlined set; the return and the plain
+//! rendition leave it nothing to keep.
+//!
 //! What a byte stream still cannot carry is named here rather than approximated, and every one of
 //! them is counted in [`Restoration::carried`] rather than left for a caller to discover:
 //!
@@ -290,18 +295,14 @@ impl Writer {
             // completely. It is not a hard reset: that would clear the scrollback the person can
             // still scroll back through, and reset a palette the next operation sets anyway.
             RestoreOp::ResetProjection { .. } => {
-                self.csi(b"!p");
-                // A soft reset leaves the terminal in the default rendition, which is a fact about
-                // the terminal rather than an assumption about it.
-                self.pen = Some(Rendition::default());
+                self.soft_reset();
                 if self.selected == ActiveBuffer::Primary {
                     // The other buffer is painted from here, in the terminal the reset has just
                     // put in order, and the reset is repeated: it forgets the cursor that going
                     // into the other buffer saved, which the session has no counterpart of.
                     if !self.inactive.is_empty() {
                         self.paint_inactive_buffer();
-                        self.csi(b"!p");
-                        self.pen = Some(Rendition::default());
+                        self.soft_reset();
                     }
                 }
                 self.erase(b"2J");
@@ -400,6 +401,21 @@ impl Writer {
             RestoreOp::SetSavedCursor { cursor } => self.saved_cursor(cursor),
             RestoreOp::SetCursor { cursor } => self.cursor(*cursor),
         }
+    }
+
+    /// Writes a soft reset with nothing in front of it for xterm's reset to keep.
+    ///
+    /// A restoration's reset is the only one a direct terminal reads, because the application's own
+    /// make every direct terminal begin again rather than reaching it. xterm's reset saves a fresh
+    /// cursor at home that keeps any wrap the terminal had pending, and it leaves faint,
+    /// crossed-out and doubly underlined set. A return clears the wrap and a plain rendition
+    /// clears the three, both before the reset, so what the reset saves and the pen it leaves are
+    /// what this writer says they are.
+    fn soft_reset(&mut self) {
+        self.out.push(b'\r');
+        self.csi(b"0m");
+        self.csi(b"!p");
+        self.pen = Some(Rendition::default());
     }
 
     /// Writes one CSI sequence.
@@ -1716,6 +1732,50 @@ mod tests {
             "plain pen, default shape and home before it saves the cursor: {:?}",
             String::from_utf8_lossy(&rendered.bytes[enter.saturating_sub(24)..enter + 8])
         );
+    }
+
+    /// A direct terminal reads no soft reset but the restoration's own, so what xterm's reset
+    /// leaves is what the restoration has to take away before it: the reset saves a fresh cursor
+    /// that keeps a wrap the terminal had pending, and it leaves faint, crossed-out and doubly
+    /// underlined set. A return clears the wrap and a plain rendition clears the three, so every
+    /// reset has both in front of it, whichever buffer is showing.
+    #[test]
+    fn every_soft_reset_a_restoration_makes_comes_after_a_return_and_a_plain_rendition() {
+        for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
+            let rendered = render(
+                &[
+                    RestoreOp::ResetProjection { generation: 1 },
+                    RestoreOp::SelectBuffer { buffer: active },
+                    RestoreOp::PaintInactiveRow {
+                        row: row(0, 0, "other"),
+                    },
+                    RestoreOp::PaintRow {
+                        row: row(0, 0, "showing"),
+                    },
+                ],
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            let resets: Vec<usize> = rendered
+                .bytes
+                .windows(4)
+                .enumerate()
+                .filter(|(_, window)| *window == b"\x1b[!p")
+                .map(|(at, _)| at)
+                .collect();
+            assert!(
+                !resets.is_empty(),
+                "{active:?} draws a screen after a reset"
+            );
+            for at in resets {
+                assert!(
+                    rendered.bytes[..at].ends_with(b"\r\x1b[0m"),
+                    "a reset at byte {at} with {active:?} showing follows neither: {:?}",
+                    String::from_utf8_lossy(&rendered.bytes[at.saturating_sub(12)..at + 4])
+                );
+            }
+        }
     }
 
     #[test]
