@@ -421,6 +421,11 @@ pub struct Controller {
     /// shipped build.
     #[cfg(feature = "testing")]
     before_the_lease: ReadPause,
+    /// Where this host's own tests stop an announcement of an authority revision once a worker's
+    /// acknowledgement is recorded and before the pages of evidence that follow it are asked for,
+    /// so that the worker can be made busy in between. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_an_acknowledgement: ReadPause,
     /// Where this host's own tests stop a barrier's first step once it has advanced the revision
     /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
     /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
@@ -753,6 +758,17 @@ impl Controller {
             .qualification
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = proved;
+    }
+
+    /// Stops the next announcement of an authority revision once a worker's acknowledgement is
+    /// recorded, before the pages of evidence that follow it are asked for, for this host's own
+    /// tests. Returns the end that says the announcement has arrived there, and the end that lets
+    /// it go. The stop fires once.
+    #[cfg(feature = "testing")]
+    pub fn stop_after_an_acknowledgement_for_tests(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.after_an_acknowledgement.arm()
     }
 
     /// Replaces what this host holds of its qualification, for a test of the door on a host that
