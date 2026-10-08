@@ -4580,12 +4580,34 @@ A grant is the authority a request is decided against. It names its issuer and i
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
 
-Two stores hold grants. A pairing writes its grant into the device record, and a paired device's
-session request is decided at the network boundary against that grant, the session and environment
-it covers, and the rights the method registry requires. `crates/kr-controller/src/grants/` holds the
-grants this daemon issues through the sharing method group, and `grants::decide` is the intersection
-those are decided by. Both read the registry's required-rights column, so neither invents a right
-the other does not ask for.
+Two stores hold grants. A pairing writes its grant into the device record.
+`crates/kr-controller/src/grants/` holds the grants this daemon issues through the sharing method
+group, among them the session shares a device redeems. `grants::decide` is the intersection both are
+decided by, and both read the registry's required-rights column, so neither invents a right the
+other does not ask for.
+
+**A device acts under one grant.** A paired device's request is decided under a single grant, never
+a mix of two, because rights, selectors, history scope and lifetime belong together. A mutation
+names the grant it acts under in `grant_id`, and may name only the device's pairing grant or a share
+issued to that device; any other grant, a voice grant and an identifier nobody issued are refused
+alike. A request that names none is decided under the pairing grant when its selectors admit the
+session, and otherwise under the one live share that does. When several shares admit the session
+and nothing names one, the request is refused and says to name the grant, which a mutation does and
+a read cannot: a client that acts under a share names it in its first mutation, `session.attach`
+for a subscription. A request that names no session is decided under the pairing grant.
+
+The pairing grant stays the condition for connecting at all. It has to be unexpired, and it has to
+stand under this host's policy, whichever grant a request acts under, so a share is reachable only
+while the device's pairing grant lasts. A connection serves one session, and the grant it opened its
+link to that session under is the grant it acts under for that session until it ends. The worker
+keeps state that belongs to a grant, the history scope a subscription carries and the lease an
+attachment holds, and deciding a later request under another grant would leave that state outliving
+the grant it was made under. The worker is told which grant a request was decided under, and holds
+its answer to that grant's rights and history scope.
+
+A share's own end is a time bound beside the others a decision holds. A share that has run out
+refuses what it would decide and ends a subscription it was carrying, and it writes nothing on the
+device's record: the device was paired under a grant of its own, and is served under it afterwards.
 
 `grants::decide` takes the intersection in this order:
 
@@ -4675,10 +4697,19 @@ invitation is one whose issuer believes something untrue about it. Persistent co
 explicit owner pairing, not a longer invitation.
 
 **A grant is a proposal until its invitation is redeemed.** `grant.create` writes the grant and its
-invitation together and the grant authorises nothing; redemption activates it, for exactly the
-device the invitation names, once. A second redemption by anybody finds the work done. Withdrawing
-an invitation withdraws the proposal with it, so cancelling is a complete answer rather than a note
-beside live authority.
+invitation together and the grant authorises nothing. Its answer gives the issuer the invitation's
+identity, which the issuer hands to the recipient by its own means; this host sends it to no device.
+The device the invitation names redeems it with `grant.redeem` over its own paired connection, and
+the redemption activates the grant, once. The activation, the invitation's new state and the answer
+to the redeeming action are one commit, so a repeat of the action is answered as it was even when
+this host stopped before it replied. Any other action finds the work done and is refused. A device
+the invitation does not name is told the same thing whether the invitation exists or not. The
+answer is the grant, which names the session and what it reaches, and none of the text the issuer
+was shown.
+
+An invitation that was withdrawn or has expired activates nothing. Withdrawing one is revoking the
+grant it carries with `grant.revoke`, which settles the invitation as withdrawn in the same commit,
+so cancelling is a complete answer rather than a note beside live authority.
 
 **Transfer of control is not a delegation.** The transferring device does not keep what it hands
 over: the recipient receives an active grant over the session named in the plan, and the
