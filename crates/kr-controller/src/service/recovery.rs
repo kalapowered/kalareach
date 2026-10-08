@@ -154,10 +154,12 @@ impl Controller {
                 _ => {}
             }
         }
+        // The workers a start meets are started beside the claimed ones, so a daemon that finds
+        // both kinds waits for the longest cleanup and not for one kind and then the other.
+        crashed.extend(self.start_recovering_workers().await?);
         for task in crashed {
             let _ = task.await;
         }
-        self.recover_workers().await?;
         Ok(())
     }
 
@@ -362,6 +364,19 @@ impl Controller {
     /// everything a challenge needs, and the worker's own answer carries everything a descriptor
     /// needs.
     pub(super) async fn recover_workers(&self) -> Result<()> {
+        for task in self.start_recovering_workers().await? {
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    /// [`Self::recover_workers`] up to the point where each worker confirmed gone has what its
+    /// session owned stopped, on a task this daemon owns. The tasks are returned for the caller to
+    /// wait for.
+    async fn start_recovering_workers(
+        &self,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<Option<kr_protocol::session::ClosureRecord>>>>>
+    {
         let rows = {
             let registry = self.registry.lock().await;
             registry.workers()?
@@ -426,10 +441,7 @@ impl Controller {
                 }
             }
         }
-        for task in reconciling {
-            let _ = task.await;
-        }
-        Ok(())
+        Ok(reconciling)
     }
 
     /// Challenges a worker against a key this daemon already holds, presents its generation, and
