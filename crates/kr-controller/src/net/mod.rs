@@ -614,6 +614,12 @@ impl NetworkHost {
                 // device reconnect and restore its state from the cursor it holds rather than go
                 // on against a stream that has stopped without saying so.
                 _ = &mut relay => break,
+                // A grant this connection stands on has ended, whether or not the device says
+                // anything. Nothing more is written to it, and its link to the worker goes with it.
+                () = remote.grant_ended() => {
+                    remote.output().withdraw();
+                    break;
+                }
             }
         }
         relay.abort();

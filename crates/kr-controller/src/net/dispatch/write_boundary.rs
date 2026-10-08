@@ -2253,3 +2253,79 @@ async fn kr_req_25_10_a_share_does_not_outlive_the_lease_of_the_pairing_grant() 
         drop(controller);
     }
 }
+
+/// KR-REQ-25.10: the revocation of a share fences the connections that act under it and no others.
+/// A device with two connections, one acting under the share and one under its pairing grant, and
+/// the owner's own connection, all have a frame waiting for their turn when the share is
+/// revoked: the frame of the connection under the share is refused, and the other two are sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_25_10_a_shares_revocation_stops_the_frames_of_what_acted_under_it_alone() {
+    use crate::service::Reach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+    let device = DeviceId::new(kr_ipc::new_uuid());
+    let share = kr_protocol::ids::GrantId::new(kr_ipc::new_uuid());
+    let streams = [
+        HeldStream::new(false),
+        HeldStream::new(false),
+        HeldStream::new(false),
+    ];
+    for stream in &streams {
+        stream.writer.add_permits(1);
+    }
+    let principal = kr_transport::listener::device_principal(&device);
+    let under_the_share = Arc::new(output_for(&controller, &streams[0], principal.clone()));
+    let under_the_pairing_grant = Arc::new(output_for(&controller, &streams[1], principal));
+    let owners = Arc::new(output_for(
+        &controller,
+        &streams[2],
+        ActorId::new("local:the-owner").expect("a principal"),
+    ));
+    assert!(
+        controller.note_acting(under_the_share.authority.connection_id, share),
+        "the connection is registered"
+    );
+
+    let outputs = [&under_the_share, &under_the_pairing_grant, &owners];
+    let turns = [
+        under_the_share.hold_the_turn().await,
+        under_the_pairing_grant.hold_the_turn().await,
+        owners.hold_the_turn().await,
+    ];
+    let writes: Vec<_> = outputs
+        .iter()
+        .map(|output| {
+            let output = Arc::clone(output);
+            tokio::spawn(async move { output.write(&batch(), &[], None).await })
+        })
+        .collect();
+    for output in outputs {
+        queued(output, 1).await;
+    }
+
+    let debt = controller
+        .owe_debt("the revocation of a share", Reach::Grants([share].into()))
+        .expect("the debt is written");
+    let own = controller.publish_debts(&[(debt, Reach::Grants([share].into()))]);
+    controller
+        .barrier(own)
+        .await
+        .expect("the barrier is raised");
+    drop(turns);
+
+    let mut written = Vec::new();
+    for write in writes {
+        written.push(write.await.expect("the write ends"));
+    }
+    assert_eq!(
+        written,
+        vec![Written::Withdrawn, Written::Sent, Written::Sent]
+    );
+    assert!(streams[0].reached().is_empty());
+    assert!(
+        streams[0].closed(),
+        "the connection under the share is closed"
+    );
+    assert!(!streams[1].closed() && !streams[2].closed());
+}
