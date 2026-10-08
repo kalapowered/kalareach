@@ -241,6 +241,13 @@ struct Backend {
     launch_failure: Mutex<Option<String>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
+    /// Whether the files and the directory of this backend have been removed, held while they are.
+    ///
+    /// A backend is retired by whichever finds it over first (its program ending, its line ending,
+    /// the session closing), and the directory's name is free for another backend once it is gone.
+    /// A second retirement that removed the files again could remove the files of the backend that
+    /// took the name, so the removal runs once, and a second retirement waits for it.
+    removed: Mutex<bool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The operating-system user the session runs as.
     os_user: String,
@@ -1047,6 +1054,7 @@ impl CommandBackends {
             #[cfg(windows)]
             launch_failure: Mutex::new(None),
             stopped: Arc::new(AtomicBool::new(false)),
+            removed: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             os_user: self.os_user.clone(),
             host_directory: Arc::new(std::sync::OnceLock::new()),
@@ -1278,6 +1286,13 @@ impl Backend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        let mut removed = self
+            .removed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::replace(&mut *removed, true) {
+            return;
+        }
         let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::CREDENTIAL_FILE));
         let _ = std::fs::remove_file(&self.registration);
         let _ = std::fs::remove_file(self.directory.join(LAUNCH_RECORD_FILE));
@@ -1287,7 +1302,7 @@ impl Backend {
             let _ = std::fs::remove_file(socket);
         }
         // The directory goes with what was in it, so the names a session draws from are used up
-        // only by its live backends and not by every backend it ever had.
+        // only by the backends it still holds and not by every backend it ever had.
         let _ = std::fs::remove_dir(&self.directory);
     }
 

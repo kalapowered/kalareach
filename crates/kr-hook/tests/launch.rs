@@ -1193,6 +1193,35 @@ fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     );
 }
 
+/// KR-REQ-12.07: a backend that its program's end has retired is retired once. Its directory's
+/// name is free from then, so when its line ends afterwards and retires it again, the files of
+/// another backend that took the name are left where they are.
+#[test]
+fn kr_req_12_07_a_backend_retired_by_its_programs_end_is_not_retired_again_by_its_line() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    let child = shell.launch(&answer, "twice", &[]);
+    let instance = instance_of(&shell.report("twice"));
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    eventually("the instance ends with its program", || {
+        shell.broker.binding_state(instance).is_err()
+    });
+    eventually("its directory goes with it", || !directory.exists());
+
+    // Another backend now holds the name.
+    std::fs::create_dir(&directory).expect("the free name is taken");
+    let credential = directory.join("credential");
+    std::fs::write(&credential, "another backend's").expect("another backend's credential");
+
+    shell.backends.line_ended(answer.prompt_generation);
+    assert!(
+        credential.exists(),
+        "the line's end retired the backend again, and took the other one's credential"
+    );
+}
+
 /// KR-REQ-05.09, KR-REQ-12.07: a launch the backend refuses runs as typed, without the flags and
 /// without the variable, whichever check refused it.
 #[test]
