@@ -835,7 +835,7 @@ fn staged_file(acting: &Acting, handle: &AttachmentHandle) -> std::path::PathBuf
         None
     }
     find(
-        &acting.hosted.environment().state_dir(),
+        acting.hosted.environment().state_dir(),
         &staged_stem(handle),
     )
     .expect("the attachment's file is staged")
@@ -1399,11 +1399,16 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
     )
     .await
     .expect("connects to the daemon");
-    let prompt = acting.prompting(&caller, draft.draft_id);
+    let mut prompt = acting.prompting(&caller, draft.draft_id);
+    prompt.request_id = RequestId::new(1);
     let Outcome::Error(refusal) = plugin_world::submit(&mut caller, prompt).await else {
         panic!("a prompt was sent for a draft whose attachment was being offered");
     };
     assert_eq!(refusal.code, ErrorCode::DraftConflict, "{refusal:?}");
+    assert!(
+        refusal.message.contains("being offered"),
+        "the refusal says why: {refusal:?}"
+    );
 
     release.notify_one();
     let accepted = until_binding(
@@ -1414,11 +1419,14 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
     )
     .await;
     assert_eq!(accepted.attachments[0].handle, handle);
+    let offered = answer(&mut client, Some(1)).await;
+    assert!(matches!(offered, Outcome::Ok(_)), "{offered:?}");
 
     // The other order: a draft a prompt has already sent to the session is not offered from.
     let sent = acting.publish(&[21; 64], "sent.png");
     let sent_draft = acting.bind(&acting.new_draft(), &sent);
-    let prompt = acting.prompting(&caller, sent_draft.draft_id);
+    let mut prompt = acting.prompting(&caller, sent_draft.draft_id);
+    prompt.request_id = RequestId::new(2);
     // The worker may answer the prompt or not; what matters is that the daemon recorded the draft
     // as sent before it passed the prompt on.
     let _ = plugin_world::submit(&mut caller, prompt).await;
@@ -1433,6 +1441,10 @@ async fn kr_req_12_30_a_prompt_naming_a_draft_whose_attachment_is_being_offered_
         panic!("an attachment was offered from a draft a prompt had sent");
     };
     assert_eq!(refusal.code, ErrorCode::DraftConflict, "{refusal:?}");
+    assert!(
+        refusal.message.contains("by a prompt"),
+        "the refusal says the prompt sent it: {refusal:?}"
+    );
     assert_eq!(
         state_of(&acting.draft(sent_draft.draft_id), &sent),
         InsertionState::Recorded
