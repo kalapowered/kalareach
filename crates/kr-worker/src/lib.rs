@@ -53,6 +53,7 @@ pub mod input;
 pub mod journal;
 pub mod lifecycle;
 pub mod output;
+pub mod owned_writer;
 pub mod ownership;
 pub mod persistence;
 pub mod privacy;

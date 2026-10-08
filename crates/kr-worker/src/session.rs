@@ -331,6 +331,9 @@ pub struct Session {
     /// bridge's writer has not written yet.
     pending_input: std::collections::VecDeque<Queued>,
     owned: Option<OwnedProcesses>,
+    /// Writes what the session owns to the journal, off this session's lock, where the journal is
+    /// a file.
+    owned_writer: Option<crate::owned_writer::OwnedWriter>,
     root_exit: Option<ShellExit>,
     /// The desktop this session is bound to, where it is bound to one.
     ///
@@ -695,6 +698,7 @@ impl Session {
             environment_sources: None,
             pending_input: std::collections::VecDeque::new(),
             owned: None,
+            owned_writer: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
             resource_views: BTreeMap::new(),
@@ -773,6 +777,7 @@ impl Session {
                 {
                     self.note_journal_failure(error);
                 }
+                self.start_recording_owned();
                 Ok(())
             }
             Err(error) => {
@@ -1234,6 +1239,38 @@ impl Session {
     pub fn observe_owned(&mut self) {
         if let Some(owned) = self.owned.as_mut() {
             owned.observe();
+        }
+        self.submit_owned();
+    }
+
+    /// Writes the record of what the session owns, once, before the shell can run anything, and
+    /// starts the thread that keeps it up to date.
+    ///
+    /// The first record is written here and waited for, beside the session's summary: a worker
+    /// that dies a moment later leaves the root shell named. Every later one goes through the
+    /// thread, so nothing waits for the disk while the session is locked.
+    fn start_recording_owned(&mut self) {
+        let (Some(owned), Some(journal)) = (self.owned.as_ref(), self.journal.as_mut()) else {
+            return;
+        };
+        let record = owned.record();
+        if let Err(error) = journal.record_owned(self.config.session_id, &record) {
+            self.note_journal_failure(error);
+            return;
+        }
+        let Some(path) = journal.path() else {
+            return;
+        };
+        if let Ok(writer) = crate::owned_writer::OwnedWriter::start(path, self.config.session_id) {
+            writer.submit(record);
+            self.owned_writer = Some(writer);
+        }
+    }
+
+    /// Hands the thread the record of what the session owns as it stands.
+    fn submit_owned(&self) {
+        if let (Some(owned), Some(writer)) = (self.owned.as_ref(), self.owned_writer.as_ref()) {
+            writer.submit(owned.record());
         }
     }
 
@@ -4622,9 +4659,7 @@ impl Session {
     pub fn request_stop(&mut self) -> Result<()> {
         // Everything the boundary holds is asked to stop, not only the root. A shell that has
         // already exited leaves descendants behind, and they are what this reaches.
-        if let Some(owned) = self.owned.as_mut() {
-            owned.observe();
-        }
+        self.observe_owned();
         let outcome = match self.shell.as_mut() {
             Some(shell) => shell.request_stop(),
             None => Ok(()),
@@ -4641,9 +4676,7 @@ impl Session {
     ///
     /// Returns an error when the signal cannot be sent.
     pub fn force_close(&mut self) -> Result<bool> {
-        if let Some(owned) = self.owned.as_mut() {
-            owned.observe();
-        }
+        self.observe_owned();
         let remaining = self
             .owned
             .as_ref()
@@ -4761,9 +4794,7 @@ impl Session {
         let _ = self.quiesce_output();
         // One last look before the record is written, so a process that started late is still
         // accounted for.
-        if let Some(owned) = self.owned.as_mut() {
-            owned.observe();
-        }
+        self.observe_owned();
         // Only confirmed terminations are listed, and coverage follows the boundary this host
         // actually has rather than the outcome it would prefer. A terminal process group cannot
         // see a descendant that left it, so a host with only that never reports complete.
