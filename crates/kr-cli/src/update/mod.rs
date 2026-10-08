@@ -168,6 +168,22 @@ pub struct Transaction {
 
 kr_client::debug_as_name!(Transaction);
 
+impl Transaction {
+    /// The directories the daemons it recorded read their configuration documents in, by
+    /// environment, where they said.
+    fn published_directories(&self) -> Vec<(EnvironmentId, PathBuf)> {
+        self.restarts
+            .iter()
+            .filter_map(|restart| {
+                restart
+                    .configuration_directory
+                    .as_ref()
+                    .map(|directory| (restart.environment, PathBuf::from(directory)))
+            })
+            .collect()
+    }
+}
+
 /// How far an update has come.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,6 +207,11 @@ pub struct Restart {
     pub runtime_root: String,
     /// The state root it served.
     pub state_root: String,
+    /// The directory it read its configuration document in, as the daemon said when it was asked to
+    /// make way: where a switch looks at the document for as long as the daemon is to be started
+    /// again. Absent for a daemon whose release did not say.
+    #[serde(default)]
+    pub configuration_directory: Option<String>,
     /// How it is started.
     pub start: Start,
 }
@@ -211,6 +232,14 @@ pub enum Start {
         arguments: Vec<String>,
         /// Its working directory.
         working_directory: String,
+        /// The variables that decide where it keeps something, with the values it had, null where
+        /// it had none. Absent for a daemon an earlier release recorded, which is started in the
+        /// environment of the command that starts it, as it always was.
+        ///
+        /// Remove the absent case, and the reading of it in `start_one`, once no supported updater
+        /// leaves a transaction that recorded a daemon without them.
+        #[serde(default)]
+        environment: Option<Vec<kr_protocol::update::PathVariable>>,
     },
 }
 
@@ -1494,7 +1523,12 @@ async fn hand_over(
     // brought forward: a switch the target cannot read the stores for is refused with nothing
     // changed, and every daemon it stopped is started again.
     if holding.is_none() {
-        let refusals = formats::check(target, store, &every);
+        let published = record
+            .update
+            .as_ref()
+            .map(Transaction::published_directories)
+            .unwrap_or_default();
+        let refusals = formats::check(target, store, &every, &published);
         if !refusals.is_empty() {
             drop(held);
             drop(install);
@@ -1712,18 +1746,20 @@ async fn start_one(
                 environment_id: environment.environment_id,
                 paths: environment.paths.clone(),
             };
-            crate::startup::open_or_start(&environment.host, &known).await?;
+            crate::startup::start_by_service(&known).await?;
             handover::answers_as(store, &environment, current, None).await
         }
         Start::Arguments {
             arguments,
             working_directory,
+            environment: variables,
         } => {
             let mut child = crate::startup::start_as_before(
                 &environment.paths,
                 &store.stable(kr_ipc::install::Program::Controller),
                 arguments,
                 std::path::Path::new(working_directory),
+                variables.as_deref(),
             )?;
             let answered =
                 handover::answers_as(store, &environment, current, Some(&mut child)).await;
@@ -1852,8 +1888,12 @@ fn settle(store: &Store, record: &mut Record) -> Result<()> {
     record.write(store)
 }
 
-/// How a daemon that answered `prepare` is started again: by the service manager where its
-/// environment chooses the service start, and as it was started otherwise.
+/// How a daemon that answered `prepare` is started again: by the service manager where the daemon
+/// was started by it, and as it was started otherwise.
+///
+/// Which it was is decided by the configuration document the daemon itself reads, at the directory
+/// it said, and not by the one this command reads: a daemon started with variables of its own may
+/// read another, and the document of this command's environment says nothing of how it was started.
 #[cfg(unix)]
 fn restart_of(
     environment: &inventory::Environment,
@@ -1868,18 +1908,27 @@ fn restart_of(
             ))
         })
     };
-    let service = crate::startup::Chosen::read(&environment.paths).controller
-        == Some(kr_protocol::hostinfo::configuration::ControllerStartup::Service);
+    let published = started_as.configuration_directory.as_ref();
+    let chosen = match published {
+        Some(directory) => crate::startup::Chosen::read_at(
+            &std::path::Path::new(directory).join(kr_protocol::hostinfo::configuration::FILE_NAME),
+        ),
+        None => crate::startup::Chosen::read(&environment.paths),
+    };
+    let service =
+        chosen.controller == Some(kr_protocol::hostinfo::configuration::ControllerStartup::Service);
     Ok(Restart {
         environment: environment.environment_id,
         runtime_root: text(environment.host.runtime_root())?,
         state_root: text(environment.host.state_root())?,
+        configuration_directory: published.cloned(),
         start: if service {
             Start::Service
         } else {
             Start::Arguments {
                 arguments: started_as.arguments.clone(),
                 working_directory: started_as.working_directory.clone(),
+                environment: Some(started_as.environment.clone()),
             }
         },
     })
@@ -2033,9 +2082,11 @@ mod tests {
                 environment: environment.environment_id,
                 runtime_root: "/runtime".to_owned(),
                 state_root: "/state".to_owned(),
+                configuration_directory: None,
                 start: Start::Arguments {
                     arguments: vec!["a".repeat(usize::try_from(RECORD_LIMIT).expect("fits") + 1)],
                     working_directory: "/".to_owned(),
+                    environment: Some(Vec::new()),
                 },
             }],
         });
@@ -2270,6 +2321,7 @@ mod tests {
             environment: environment.environment_id,
             runtime_root: text(temp.paths().runtime_root()),
             state_root: text(temp.paths().state_root()),
+            configuration_directory: None,
             start: Start::Service,
         };
         let current = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");

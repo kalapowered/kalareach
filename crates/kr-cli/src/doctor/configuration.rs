@@ -31,8 +31,13 @@ pub fn document_path(paths: &EnvironmentPaths) -> PathBuf {
 /// Reads this environment's configuration document, bounded and owner-only.
 #[must_use]
 pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
-    let path = document_path(paths);
-    match configuration::read_file(&path, configuration::MAX_LEN) {
+    load_at(&document_path(paths))
+}
+
+/// Reads the configuration document at `path`, bounded and owner-only.
+#[must_use]
+pub fn load_at(path: &std::path::Path) -> configuration::Loaded {
+    match configuration::read_file(path, configuration::MAX_LEN) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
         Err(error) => configuration::unreadable(error),
     }

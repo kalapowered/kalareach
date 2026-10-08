@@ -59,6 +59,19 @@ impl TempHost {
     /// unusable rather than that the case under test failed.
     #[must_use]
     pub fn create_in(parent: &Path) -> Self {
+        Self::create_with_state_name(parent, "s")
+    }
+
+    /// Creates a fresh tree under `parent` whose state root is the tree's directory `state_name`.
+    ///
+    /// A test that needs the state root to be the one a default install of a platform gives, which
+    /// is a directory of a fixed name inside the directory a variable names, names it here.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::create`].
+    #[must_use]
+    pub fn create_with_state_name(parent: &Path, state_name: &str) -> Self {
         // Short on purpose: a Unix socket address is 104 bytes on macOS, and a command backend's
         // socket in a test host's runtime directory is the root's length and 39 bytes more. A name
         // this short can be taken, and then another is tried; it is never adopted.
@@ -66,8 +79,8 @@ impl TempHost {
             let suffix = crate::new_uuid().to_string();
             format!("kr-{}", &suffix[..8])
         });
-        let paths =
-            HostPaths::new(root.path().join("r"), root.path().join("s")).expect("absolute roots");
+        let paths = HostPaths::new(root.path().join("r"), root.path().join(state_name))
+            .expect("absolute roots");
         let environment_id = paths.open_environment_id().expect("environment identity");
         paths
             .environment(environment_id)

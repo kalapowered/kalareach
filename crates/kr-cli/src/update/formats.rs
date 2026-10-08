@@ -140,18 +140,22 @@ pub fn unlookable(target: &ReleaseManifest) -> Vec<Refusal> {
 /// a version the target does not read, with those [`unlookable`] too.
 ///
 /// `environments` are the environments whose daemons have stopped and whose locks are held.
+/// `published` are the directories the daemons said they read their configuration documents in,
+/// by environment: each is looked at beside the places this command's own environment gives.
 #[must_use]
 pub fn check(
     target: &ReleaseManifest,
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
+    published: &[(EnvironmentId, PathBuf)],
 ) -> Vec<Refusal> {
     let mut refusals = unlookable(target);
     for listed in &target.stores {
         if listed.scope == StoreScope::Unknown || listed.recording == Recording::Unknown {
             continue;
         }
-        for (environment, directory) in directories(listed.scope, install, environments) {
+        for (environment, directory) in directories(listed.scope, install, environments, published)
+        {
             let mut refuse = |place: PathBuf, why: Why| {
                 refusals.push(Refusal {
                     store: listed.store.clone(),
@@ -181,6 +185,7 @@ fn directories(
     scope: StoreScope,
     install: &kr_ipc::install::Store,
     environments: &[&Environment],
+    published: &[(EnvironmentId, PathBuf)],
 ) -> Vec<(Option<EnvironmentId>, PathBuf)> {
     let mut found: Vec<(Option<EnvironmentId>, PathBuf)> = Vec::new();
     match scope {
@@ -203,6 +208,11 @@ fn directories(
                 for directory in configuration_directories(environment) {
                     found.push((Some(environment.environment_id), directory));
                 }
+                for (published_for, directory) in published {
+                    if *published_for == environment.environment_id {
+                        found.push((Some(environment.environment_id), directory.clone()));
+                    }
+                }
             }
         }
         StoreScope::Unknown => {}
@@ -212,10 +222,15 @@ fn directories(
     found
 }
 
-/// Where an environment's configuration document can be: with the rest of its state, where this
-/// process's own environment says, and where an account with a home puts it by default. The
-/// daemon that reads it may have been started with an environment of its own, so each is looked at;
-/// one started with variables of its own that put the document somewhere else is not covered.
+/// Where an environment's configuration document can be, apart from where its daemon said: with the
+/// rest of its state, where this process's own environment says, and where an account with a home
+/// puts it by default.
+///
+/// A daemon is started again with the variables it had, so it reads where it said. These are the
+/// places a daemon started later by a command of this process's environment, or by the account's
+/// service manager, reads it, which are looked at for the same reason: the document that daemon
+/// loads decides the owner's ceilings. A daemon that is not running said nothing, and one started
+/// later with variables that are neither this process's nor the account's is not covered.
 fn configuration_directories(environment: &Environment) -> Vec<PathBuf> {
     let mut found = vec![environment.paths.state_dir().to_path_buf()];
     let documented = kr_protocol::hostinfo::configuration::document_path(

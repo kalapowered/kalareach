@@ -141,6 +141,17 @@ impl Tree {
         }
     }
 
+    /// Creates a fresh tree whose state root is the tree's directory `state_name`.
+    pub fn create_with_state_name(state_name: &str) -> Self {
+        Self {
+            tree: Some(TempHost::create_with_state_name(
+                &std::env::temp_dir(),
+                state_name,
+            )),
+            launches: Arc::default(),
+        }
+    }
+
     /// Something that can keep this tree when it is dropped.
     pub fn holder(&self) -> Holder {
         Holder(Arc::clone(&self.launches))

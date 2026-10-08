@@ -902,8 +902,19 @@ impl Host {
 
     /// A tree with nothing at the store's place yet.
     fn bare() -> Self {
+        Self::bare_in(teardown::Tree::create())
+    }
+
+    /// A tree with nothing at the store's place yet whose state root is named as a default install
+    /// on Linux names it, `kalareach`, inside the tree's own directory: the state home a daemon is
+    /// given there.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn bare_as_a_default_install() -> Self {
+        Self::bare_in(teardown::Tree::create_with_state_name("kalareach"))
+    }
+
+    fn bare_in(tree: teardown::Tree) -> Self {
         let place = Place::take();
-        let tree = teardown::Tree::create();
         let store = Store::at(tree.root().join("host"));
         Self {
             daemons: Vec::new(),
@@ -992,6 +1003,64 @@ impl Host {
         (output, said)
     }
 
+    /// Runs `kr` of the current release with variables of its own, `set` given, and reads what it
+    /// printed as JSON.
+    fn kr_json_with(
+        &self,
+        set: &[(&str, &std::ffi::OsStr)],
+        arguments: &[&str],
+    ) -> (Output, Value) {
+        let mut command = self.command(&self.store.stable(Program::Kr), arguments);
+        for (name, value) in set {
+            command.env(name, value);
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("kr runs");
+        let output = finish_within(child, Duration::from_secs(300));
+        let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        (output, said)
+    }
+
+    /// What this host's daemon says of how it was started, asked as an update asks it and taken back
+    /// at once: its gate is open again when this returns.
+    async fn daemon_started_like(&self) -> kr_protocol::update::HostUpdateHandoverResult {
+        let endpoint = self
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the daemon");
+        let target = release("0.0.0+000000000000");
+        let environment = self.tree.environment_id();
+        let prepared: kr_protocol::update::HostUpdateHandoverResult = handover_step_of(
+            environment,
+            &mut client,
+            HandoverStep::Prepare,
+            None,
+            &target,
+        )
+        .await
+        .expect("the daemon prepares")
+        .to_typed()
+        .expect("decodes");
+        handover_step_of(
+            environment,
+            &mut client,
+            HandoverStep::Resume,
+            prepared.attempt.0,
+            &target,
+        )
+        .await
+        .expect("the daemon resumes");
+        prepared
+    }
+
     /// Runs `kr host update` of the current release with `archive` and `--json`, with a variable
     /// set that no control daemon of a store starts with: every daemon it starts refuses to run.
     fn update_whose_daemons_fail(&self, archive: &str) -> (Output, Value) {
@@ -1038,16 +1107,41 @@ impl Host {
     /// Starts `program` as this host's daemon, with `working_directory` as its own, and waits for
     /// it to answer.
     async fn start_daemon_in(&mut self, program: &Path, working_directory: &Path) {
+        let arguments = self.daemon_arguments();
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let mut command = self.command(program, &arguments);
+        command.current_dir(working_directory);
+        self.start_daemon_as(command).await;
+    }
+
+    /// Starts this host's daemon with variables of its own: each of `set` given, and each of
+    /// `unset` taken away from what [`Host::command`] gives every program.
+    async fn start_daemon_with(
+        &mut self,
+        program: &Path,
+        set: &[(&str, &std::ffi::OsStr)],
+        unset: &[&str],
+    ) {
+        let arguments = self.daemon_arguments();
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let mut command = self.command(program, &arguments);
+        for name in unset {
+            command.env_remove(name);
+        }
+        for (name, value) in set {
+            command.env(name, value);
+        }
+        self.start_daemon_as(command).await;
+    }
+
+    /// Starts `command` as this host's daemon, in the directory it names, and waits for it to answer.
+    async fn start_daemon_as(&mut self, mut command: Command) {
         let log = self
             .tree
             .root()
             .join(format!("daemon-{}.log", self.daemons.len()));
         let file = std::fs::File::create(&log).expect("the daemon's log");
-        let arguments = self.daemon_arguments();
-        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-        let child = self
-            .command(program, &arguments)
-            .current_dir(working_directory)
+        let child = command
             .stdin(Stdio::null())
             .stdout(file.try_clone().expect("duplicates the log"))
             .stderr(file)
@@ -5790,6 +5884,333 @@ async fn a_pipe_where_the_saved_terminal_preference_belongs_does_not_hold_kr() {
     assert!(
         said["preferred"].is_null(),
         "a pipe is no preference: {said}"
+    );
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* The variables a daemon started again keeps                                                    */
+/* -------------------------------------------------------------------------------------------- */
+
+/// The value a daemon says it has for a variable that decides its paths: `None` where it has none.
+fn variable_of(
+    started: &kr_protocol::update::HostUpdateHandoverResult,
+    name: &str,
+) -> Option<String> {
+    let found = started
+        .environment
+        .iter()
+        .find(|variable| variable.name == name)
+        .unwrap_or_else(|| panic!("the daemon states {name}"));
+    found.value.0.clone()
+}
+
+/// KR-REQ-26.10: a daemon an update, a rollback or the undo of a refused switch starts again has the
+/// variables that decide its paths that the daemon it replaces had, and none that the command which
+/// starts it has and the daemon did not: it keeps what it keeps where its predecessor did. What it
+/// states of itself is what it has, so this asks the restarted daemon and compares.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_started_again_has_the_variables_that_decide_its_paths_the_one_before_had() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let daemon_home = host.scratch("daemon-home");
+    let daemon_config = host.scratch("daemon-config");
+    let updater_home = host.scratch("updater-home");
+    let updater_run = host.scratch("updater-run");
+    let controller = host.store.stable(Program::Controller);
+    // The daemon has a home and a configuration home of its own, and an empty state home, which is
+    // not the same as none; the commands that start it again have another home, a runtime
+    // directory the daemon never had, and no configuration home.
+    host.start_daemon_with(
+        &controller,
+        &[
+            ("HOME", daemon_home.as_os_str()),
+            ("XDG_CONFIG_HOME", daemon_config.as_os_str()),
+            ("XDG_STATE_HOME", std::ffi::OsStr::new("")),
+        ],
+        &[],
+    )
+    .await;
+    let updater = [
+        ("HOME", updater_home.as_os_str()),
+        ("XDG_RUNTIME_DIR", updater_run.as_os_str()),
+    ];
+    let before = host.daemon_started_like().await;
+    assert_eq!(
+        variable_of(&before, "XDG_CONFIG_HOME").as_deref(),
+        daemon_config.to_str(),
+        "the daemon states the variables it was given"
+    );
+    assert_eq!(variable_of(&before, "XDG_STATE_HOME").as_deref(), Some(""));
+    assert_eq!(variable_of(&before, "XDG_RUNTIME_DIR"), None);
+
+    let scratch = host.scratch("archives");
+    let archive_two = scratch.join("two.tar.gz");
+    two.archive(&archive_two);
+    let (output, said) = host.kr_json_with(
+        &updater,
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive_two.display().to_string(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    let after_update = host.daemon_started_like().await;
+    assert_eq!(
+        after_update.environment, before.environment,
+        "after the update"
+    );
+    assert_eq!(
+        after_update.configuration_directory, before.configuration_directory,
+        "after the update"
+    );
+
+    let (output, said) = host.kr_json_with(&updater, &["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    let after_rollback = host.daemon_started_like().await;
+    assert_eq!(
+        after_rollback.environment, before.environment,
+        "after the rollback"
+    );
+
+    // A switch the stores refuse stops the daemon and starts it again from the release still
+    // current, which is the same restart.
+    let beyond = registry_version() + 1;
+    let ahead = Assembled::at_this_level("0.3.0+cccccccccccc", 3)
+        .reading(reading_the_registry_at(beyond, beyond));
+    let archive_ahead = scratch.join("ahead.tar.gz");
+    ahead.archive(&archive_ahead);
+    let (output, said) = host.kr_json_with(
+        &updater,
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive_ahead.display().to_string(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    let after_refusal = host.daemon_started_like().await;
+    assert_eq!(
+        after_refusal.environment, before.environment,
+        "after the refused switch"
+    );
+}
+
+/// KR-REQ-26.10: a daemon that cannot say which values of the variables that decide its paths it
+/// has, because one is not text, is not prepared to make way: it cannot be started again like itself.
+/// Its gate is not closed by the attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_with_a_path_variable_that_is_not_text_is_not_prepared() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    let not_text = std::ffi::OsStr::from_bytes(b"/home/\xff");
+    host.start_daemon_with(&controller, &[("HOME", not_text)], &[])
+        .await;
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let refused = handover_step(
+        &host,
+        &mut client,
+        HandoverStep::Prepare,
+        None,
+        &release("0.2.0+bbbbbbbbbbbb"),
+    )
+    .await
+    .expect_err("a daemon that cannot say its variables does not prepare");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "{refused:?}"
+    );
+    assert!(refused.message.contains("HOME"), "{}", refused.message);
+    // The gate was not closed: a session is created.
+    let kr = host.store.stable(Program::Kr);
+    let (display, _) = host.new_session(&kr);
+    host.close(&kr, &display);
+}
+
+/// What a default install on Linux gives a daemon of its own: a home, a configuration home and a state
+/// home that is the directory the tree's state root is in, and nothing that names the state root.
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn a_daemon_that_finds_its_document_under_its_own_configuration_home()
+-> (Host, Assembled, PathBuf) {
+    let mut host = Host::bare_as_a_default_install();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.install(&one);
+    let daemon_home = host.scratch("daemon-home");
+    let daemon_config = host.scratch("daemon-config");
+    let controller = host.store.stable(Program::Controller);
+    let state_home = host.tree.root().to_path_buf();
+    host.start_daemon_with(
+        &controller,
+        &[
+            ("HOME", daemon_home.as_os_str()),
+            ("XDG_CONFIG_HOME", daemon_config.as_os_str()),
+            ("XDG_STATE_HOME", state_home.as_os_str()),
+        ],
+        &["KR_STATE_DIR", "KR_RUNTIME_DIR"],
+    )
+    .await;
+    let document = daemon_config
+        .join("kalareach")
+        .join("environments")
+        .join(kr_ipc::paths::short_prefix(host.tree.environment_id()))
+        .join("config.json");
+    std::fs::create_dir_all(document.parent().expect("a directory")).expect("the directory");
+    // The daemon resolves its document from its own variables, under its own configuration home,
+    // and not beside the rest of its state, where the commands that update it look first.
+    let started = host.daemon_started_like().await;
+    assert_eq!(
+        started.configuration_directory.0.as_deref(),
+        document.parent().and_then(Path::to_str),
+        "the daemon states where it reads its document"
+    );
+    (host, one, document)
+}
+
+/// KR-REQ-26.10: a daemon that reads its configuration document under a configuration home of its
+/// own is checked like any other: the document it published is looked at, and a switch to a release
+/// that cannot read that document is refused naming it, where this command's own environment finds
+/// nothing there. The places this command's environment gives are looked at too, so a document a
+/// daemon started later from there would read is not passed over because the daemon in front of
+/// the update read another.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked() {
+    let (host, one, document) =
+        a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let archive = archive.display().to_string();
+    let update = || host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+
+    // The daemon's document is at a version the release cannot read.
+    std::fs::write(&document, br#"{"version": 99}"#).expect("a document");
+    let (output, said) = update();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&document.display().to_string()) && message.contains("records version 99"),
+        "the document the daemon reads is named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+
+    // The daemon's document is one the release reads, and the document where this command's
+    // environment puts it is not: that one is refused too.
+    std::fs::write(&document, br#"{"version": 1}"#).expect("a document");
+    let beside = host.tree.environment().state_dir().join("config.json");
+    std::fs::write(&beside, br#"{"version": 99}"#).expect("a document");
+    let (output, said) = update();
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&beside.display().to_string()),
+        "the document beside the daemon's state is named: {said}"
+    );
+
+    // The control: with both in range the update goes ahead.
+    std::fs::remove_file(&beside).expect("removed");
+    let (output, said) = update();
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+}
+
+/// KR-REQ-26.10: a daemon is started again as its own document chose, and not as the document of the
+/// environment of the command that starts it: this command's environment chooses the service start
+/// and finds no service definition, and the daemon in front of the update was started by hand and reads
+/// a document of its own that chooses nothing, so it is started again as it was.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_is_started_again_as_its_own_document_chose() {
+    let (host, _one, document) =
+        a_daemon_that_finds_its_document_under_its_own_configuration_home().await;
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    std::fs::write(&document, br#"{"version": 1}"#).expect("a document");
+    std::fs::write(
+        host.tree.environment().state_dir().join("config.json"),
+        br#"{"version": 1, "startup": {"controller": "service"}}"#,
+    )
+    .expect("a document that chooses the service start");
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
     );
 }
 

@@ -84,13 +84,20 @@ impl Chosen {
     /// A document this build cannot use chooses nothing, and says why in `state`.
     #[must_use]
     pub fn read(paths: &EnvironmentPaths) -> Self {
-        let loaded = crate::doctor::configuration::load(paths);
+        Self::read_at(&crate::doctor::configuration::document_path(paths))
+    }
+
+    /// Reads the document at `document`: where a daemon that was started with variables of its own
+    /// reads it.
+    #[must_use]
+    pub fn read_at(document: &std::path::Path) -> Self {
+        let loaded = crate::doctor::configuration::load_at(document);
         Self {
             controller: loaded
                 .document
                 .as_ref()
                 .and_then(|document| document.startup.controller()),
-            document: crate::doctor::configuration::document_path(paths),
+            document: document.to_path_buf(),
             state: loaded.status.state,
             revision: loaded.revision(),
         }
@@ -494,23 +501,9 @@ async fn open_or_start_within(
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
-    let error = match reach(&endpoint, bounds.answer).await {
-        Reached::Answered(client) => return Ok((*client, None)),
-        Reached::Silent => {
-            return Err(unanswered(shown!(
-                "the control daemon listening for environment {} accepted the connection and \
-                     did not answer within {} seconds; nothing was started beside it",
-                environment.environment_id,
-                bounds.answer.as_secs_f64()
-            )));
-        }
-        Reached::Refused(error) if nothing_listening(&error) => error,
-        Reached::Refused(error) => {
-            return Err(resolve::not_running(
-                &error,
-                Shown::said(resolve::SETUP_ACTION),
-            ));
-        }
+    let error = match find(environment, &endpoint, bounds).await? {
+        Found::Answering(client) => return Ok((*client, None)),
+        Found::Vacant(error) => error,
     };
     // The daemon beside this command serves the environment its roots name as this installation's
     // own, and no other, so for any other environment there is nothing to choose here.
@@ -535,6 +528,60 @@ async fn open_or_start_within(
         }
         None => Err(resolve::not_running(&error, chosen.setup_action())),
     }
+}
+
+/// Whether a control daemon answers at an environment's endpoint, or nothing listens there.
+enum Found {
+    /// A daemon answered, and this is the connection to it.
+    Answering(Box<LocalClient>),
+    /// Nothing listens at the endpoint; the failure says so.
+    Vacant(kr_ipc::IpcError),
+}
+
+/// Looks for the daemon of an environment before anything is started: one that answers is the
+/// environment's, and one that is there and answers badly, or does not answer, is reported as it is.
+async fn find(
+    environment: &KnownEnvironment,
+    endpoint: &kr_ipc::paths::Endpoint,
+    bounds: Bounds,
+) -> Result<Found> {
+    match reach(endpoint, bounds.answer).await {
+        Reached::Answered(client) => Ok(Found::Answering(client)),
+        Reached::Silent => Err(unanswered(shown!(
+            "the control daemon listening for environment {} accepted the connection and \
+                 did not answer within {} seconds; nothing was started beside it",
+            environment.environment_id,
+            bounds.answer.as_secs_f64()
+        ))),
+        Reached::Refused(error) if nothing_listening(&error) => Ok(Found::Vacant(error)),
+        Reached::Refused(error) => Err(resolve::not_running(
+            &error,
+            Shown::said(resolve::SETUP_ACTION),
+        )),
+    }
+}
+
+/// Has this user's service manager start the control daemon of an environment, when none answers
+/// there, and waits for it to answer: what an update does for a daemon it stopped that was started
+/// by the service.
+///
+/// The environment's document is not read to choose. The daemon was started by the service, so it is
+/// started that way again, whatever the document this command reads says.
+///
+/// # Errors
+///
+/// Returns what [`open_or_start`] returns for a daemon that is there and answers badly, and for a
+/// definition the manager would not take or a daemon that did not answer.
+#[cfg(unix)]
+pub async fn start_by_service(
+    environment: &KnownEnvironment,
+) -> Result<(LocalClient, Option<Started>)> {
+    let endpoint = environment.paths.controller_endpoint()?;
+    let error = match find(environment, &endpoint, BOUNDS).await? {
+        Found::Answering(client) => return Ok((*client, None)),
+        Found::Vacant(error) => error,
+    };
+    managed(&environment.paths, &endpoint, &error, BOUNDS).await
 }
 
 /// What one attempt to reach a daemon found.
@@ -749,10 +796,22 @@ pub(crate) fn start_as_before(
     program: &std::path::Path,
     arguments: &[String],
     working_directory: &std::path::Path,
+    variables: Option<&[kr_protocol::update::PathVariable]>,
 ) -> Result<std::process::Child> {
     environment.create()?;
     let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
-    std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    // Each variable the daemon had that decides where it keeps something is given again with the
+    // value it had, or taken away where it had none, whatever this command's own environment holds;
+    // everything else is this command's, as it always was. A record that states none is a daemon an
+    // earlier release recorded, which is started in this command's environment.
+    for variable in variables.unwrap_or_default() {
+        match variable.value.as_ref() {
+            Some(value) => command.env(&variable.name, value),
+            None => command.env_remove(&variable.name),
+        };
+    }
+    command
         .args(arguments)
         .current_dir(working_directory)
         .stdin(std::process::Stdio::null())
