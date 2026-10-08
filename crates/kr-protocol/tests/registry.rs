@@ -695,6 +695,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + environments.len()
             + delivery.len()
             + privacy.len()
+            + account.len()
             + updates.len()
             + descriptions.len()
             + machines.len()

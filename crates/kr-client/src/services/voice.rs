@@ -35,9 +35,9 @@
 //!
 //! # The account token
 //!
-//! [`AccountToken`] holds it. Its [`fmt::Debug`] prints a placeholder, it has no [`fmt::Display`],
-//! and the only way to the bytes is [`AccountToken::expose`], which this module calls exactly once
-//! per request while building the `Authorization` header.
+//! [`super::account::AccountToken`] holds it. Its [`fmt::Debug`] prints a placeholder, it has no
+//! [`fmt::Display`], and the only way to the bytes is [`super::account::AccountToken::expose`],
+//! which this module calls exactly once per request while building the `Authorization` header.
 
 use std::fmt;
 use std::sync::Arc;
