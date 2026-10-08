@@ -7160,7 +7160,7 @@ fn on_any_thread<T: Send>(work: T) -> T {
     work
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_generation_admitted_is_uploaded_part_by_part_and_published_once() {
     let host = Host::open();
     let upload = host.admit(1, &[TWO_PARTS, 64]);
@@ -7253,7 +7253,7 @@ async fn a_generation_admitted_is_uploaded_part_by_part_and_published_once() {
 
 /// A process can stop after any step. A restart settles what was on its way, reconciles, and goes
 /// on: every generation finishes once, and no request that was answered is sent again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_nothing_sent_twice() {
     let uninterrupted = {
         let host = Host::open();
@@ -7345,7 +7345,7 @@ async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_no
 /// and it changes nothing newer. Reaching the service after the next generation is published, it
 /// is refused, because the service takes no generation at or below the newest it has held; the
 /// newer generation stays the one a fetch of the newest is answered with.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publication_that_lands_after_a_newer_generation_is_refused_and_hides_nothing() {
     for lands_first in [false, true] {
         let mut host = Host::open();
@@ -7411,7 +7411,7 @@ async fn a_publication_that_lands_after_a_newer_generation_is_refused_and_hides_
 /// the same archive can never be published, since the service takes no generation at or below the
 /// newest it has held. It ends once, naming the newer generation that carries its content, and its
 /// publication is not sent again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_older_generation_the_service_has_passed_ends_once_and_is_not_sent_again() {
     let host = Host::open();
     host.admit(1, &[TWO_PARTS]);
@@ -7484,7 +7484,7 @@ async fn stop_between_dispatch_and_send(host: &Host, publication: u64) {
 /// unknown is never success. The store holds it cancelled with its outcome unknown, and each pass
 /// after the restart names it unknown and says the next generation carries its content; only the
 /// next generation is counted as a completed backup.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_a_crash_a_generation_the_service_does_not_hold_is_reported_unknown_never_complete() {
     let mut host = Host::open();
     let publication = host.admit(1, &[64]) + 1;
@@ -7640,7 +7640,7 @@ fn deletions(host: &Host) -> usize {
 /// it does not, deletes each of its objects once and writes each deletion down; the service gives
 /// their storage back after its tombstone window. Nothing is deleted before that, and nothing
 /// twice, in this process or the next.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_generations_objects_are_deleted_once_a_newer_one_is_published() {
     let (mut host, mut uploader) =
         a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
@@ -7706,7 +7706,7 @@ async fn an_unknown_generations_objects_are_deleted_once_a_newer_one_is_publishe
 
 /// A deletion whose answer never came back waits for the next pass, which asks again; the service
 /// answers with the tombstone it already made, and the release is written down once.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deletion_whose_answer_was_lost_is_asked_again_in_the_next_pass() {
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
     host.web.fail(Kind::Delete, 1, Fault::Lost);
@@ -7715,7 +7715,7 @@ async fn a_deletion_whose_answer_was_lost_is_asked_again_in_the_next_pass() {
     assert!(
         steps.iter().any(|step| matches!(
             step,
-            Stepped::Waiting { reason } if reason.contains("was not deleted at the service yet")
+            Stepped::Waiting { reason, .. } if reason.contains("was not deleted at the service yet")
         )),
         "{steps:?}"
     );
@@ -7742,7 +7742,7 @@ async fn a_deletion_whose_answer_was_lost_is_asked_again_in_the_next_pass() {
 /// A deletion delayed on its way reaches no object admitted after it. Once a deletion has been asked
 /// for, no generation this host admits names that object again, so the request that answers first
 /// and the one that lands later both find only the object they were about.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deletion_delayed_on_its_way_reaches_no_object_admitted_after_it() {
     let member = member_of(1, 0);
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member, 64)]).await;
@@ -7805,7 +7805,7 @@ async fn a_deletion_delayed_on_its_way_reaches_no_object_admitted_after_it() {
 /// No generation admitted while a deletion is on its way names that object. The deletion is written
 /// down before it leaves, and admission refuses the name from then on, so a generation offered in
 /// between is refused rather than having its object deleted from under it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_generation_admitted_while_a_deletion_is_on_its_way_names_that_object() {
     let member = member_of(1, 0);
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member, 64)]).await;
@@ -7870,7 +7870,7 @@ async fn no_generation_admitted_while_a_deletion_is_on_its_way_names_that_object
 
 /// Privacy mode drawn while the service is asked about an unknown generation keeps everything it
 /// left there: what happens after the answer reads privacy mode afresh.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fence_raised_while_the_service_is_asked_keeps_the_unknown_generation_whole() {
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
     host.admit(2, &[64]);
@@ -7903,7 +7903,7 @@ async fn a_fence_raised_while_the_service_is_asked_keeps_the_unknown_generation_
 
 /// The report of an unknown generation reads privacy mode after the service answered, so a fence
 /// raised while this host asked is named in it, and no later generation is said to carry it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_generation_given_up_while_a_fence_goes_up_names_privacy_modes_line() {
     let mut host = Host::open();
     let publication = host.admit(1, &[64]) + 1;
@@ -7946,7 +7946,7 @@ async fn an_unknown_generation_given_up_while_a_fence_goes_up_names_privacy_mode
 /// same object, and the service holds one object under that name: deleting it for one generation
 /// would delete it for the other. A generation still producing keeps every object it names, and
 /// what no other generation names is deleted.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_object_a_producing_generation_names_is_never_deleted() {
     let shared = object_id(0x51);
     let own = object_id(0x52);
@@ -7981,7 +7981,7 @@ async fn an_object_a_producing_generation_names_is_never_deleted() {
 
 /// A generation the service holds as published keeps every object it names, when a generation
 /// whose outcome is unknown names one of them too.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_object_a_published_generation_names_is_never_deleted() {
     let shared = object_id(0x61);
     let own = object_id(0x62);
@@ -8026,7 +8026,7 @@ async fn an_object_a_published_generation_names_is_never_deleted() {
 /// An unknown generation the service turns out to hold keeps its objects: its publication reached
 /// the service before the newer one, so the service holds it as published, and so does this host
 /// once it asks.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_generation_the_service_holds_is_written_down_published_and_keeps_its_objects() {
     let mut host = Host::open();
     host.admit(1, &[64]);
@@ -8081,7 +8081,7 @@ async fn an_unknown_generation_the_service_holds_is_written_down_published_and_k
 /// Privacy mode's retained artifacts are deleted only by the person's own action. An unknown
 /// generation stays as it is while privacy mode is on, and after it is off again, since it belongs
 /// to the work privacy mode drew its line under.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_generation_privacy_mode_keeps_is_never_deleted() {
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
     host.admit(2, &[64]);
@@ -8135,7 +8135,7 @@ async fn an_unknown_generation_privacy_mode_keeps_is_never_deleted() {
 
 /// A collection deleted from the account console is the service's to empty: this host asks for
 /// nothing of it once it has been told.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_generation_whose_collection_was_deleted_is_never_deleted() {
     let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
     host.admit(2, &[64]);
@@ -8149,7 +8149,7 @@ async fn an_unknown_generation_whose_collection_was_deleted_is_never_deleted() {
 
 /// A process can also stop while an answer is on its way back. The request it had sent is asked
 /// for again, or found, and the service stores nothing twice.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_lost_before_a_crash_is_asked_for_again_and_nothing_is_stored_twice() {
     for (kind, nth) in [
         (Kind::Create, 1),
@@ -8211,7 +8211,7 @@ async fn an_answer_lost_before_a_crash_is_asked_for_again_and_nothing_is_stored_
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_a_crash_an_upload_goes_on_at_the_part_after_the_last_one_acknowledged() {
     let mut host = Host::open();
     host.admit(1, &[THREE_PARTS]);
@@ -8242,7 +8242,7 @@ async fn after_a_crash_an_upload_goes_on_at_the_part_after_the_last_one_acknowle
 /// Section 23: a publication that may have left without an answer is established by a fetch and
 /// never sent again. One the service holds is recorded; one it still does not hold after the wait is
 /// given up on, with its outcome unknown and its generation's production over.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publication_that_may_have_left_is_fetched_and_never_sent_again() {
     // The request never arrived, which nothing here can tell from one still on its way.
     let host = Host::open();
@@ -8302,7 +8302,7 @@ async fn a_publication_that_may_have_left_is_fetched_and_never_sent_again() {
 
 /// A pass cancelled while its publication is on its way leaves the next pass asking the service,
 /// never sending the publication again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publication_cancelled_on_its_way_is_asked_about_and_never_sent_again() {
     let host = Host::open();
     host.admit(1, &[64]);
@@ -8343,7 +8343,7 @@ async fn a_publication_cancelled_on_its_way_is_asked_about_and_never_sent_again(
 
 /// A publication given up on only once its stop is written down: a store that refuses the stop
 /// leaves the attempt dispatched, and the next pass asks the service again rather than sending.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publication_whose_stop_the_store_refused_is_asked_about_again_and_never_sent() {
     let host = Host::open();
     host.admit(1, &[64]);
@@ -8385,7 +8385,7 @@ async fn a_publication_whose_stop_the_store_refused_is_asked_about_again_and_nev
 /// An upload the service completed, whose answer never reached this host, is not abandoned when
 /// privacy mode asks, and the report makes no promise about it: what the service holds of the
 /// object is written down as unknown.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_the_service_completed_is_reported_unknown_when_it_will_not_be_abandoned() {
     let host = Host::open();
     let upload = host.admit(1, &[64]);
@@ -8411,7 +8411,7 @@ async fn an_upload_the_service_completed_is_reported_unknown_when_it_will_not_be
     host.web.stored_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
     let host = Host::open();
     let first = host.admit(1, &[THREE_PARTS]);
@@ -8469,7 +8469,7 @@ async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deleted_collection_stops_the_attempt_and_says_to_enrol_a_new_one() {
     // An upload meets it, with another generation of the archive queued behind.
     let host = Host::open();
@@ -8534,7 +8534,7 @@ async fn a_deleted_collection_stops_the_attempt_and_says_to_enrol_a_new_one() {
     assert_eq!(host.generation(1).production, Production::Cancelled);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attempt_the_store_no_longer_holds_is_never_sent() {
     // Ended by another hand between two steps: nothing of it is sent.
     let host = Host::open();
@@ -8583,7 +8583,7 @@ async fn an_attempt_the_store_no_longer_holds_is_never_sent() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_sent_while_backup_storage_is_off_or_before_the_store_is_reconciled() {
     let mut host = Host::open();
     let upload = host.admit(1, &[64]);
@@ -8625,7 +8625,7 @@ async fn nothing_is_sent_while_backup_storage_is_off_or_before_the_store_is_reco
     assert_eq!(host.web.asked(), [Asked::Status]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_refused_as_not_permitted_is_abandoned_and_uploaded_again_under_a_new_one() {
     let host = Host::open();
     host.admit(1, &[TWO_PARTS]);
