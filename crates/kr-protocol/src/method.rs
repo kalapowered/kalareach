@@ -1344,6 +1344,15 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "List grants this issuer may see, with their revisions and expiry.";
 
+    GrantRedeem = "grant.redeem", Sharing,
+    effect: Write, ingress: [PairedDevice], rights: [basis(InvitedDevice)],
+    selectors: [SessionInvitation, Grant],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Redeem a session invitation, once, and activate the grant it carries. Only the device \
+          the invitation names redeems it, and a withdrawn, expired or already redeemed \
+          invitation activates nothing. The answer is the grant and carries no session text.";
+
     // ----- Services -------------------------------------------------------------------------
     PushInstallationRegister = "push.installation.register", Services,
     effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
