@@ -836,28 +836,23 @@ pub struct AccountArguments {
 /// One `kr account` operation.
 #[derive(Subcommand)]
 pub enum AccountCommand {
-    /// Manage the account token this host presents to managed services.
-    #[command(subcommand)]
-    Token(AccountTokenCommand),
-}
-
-/// One `kr account token` operation.
-#[derive(Subcommand)]
-pub enum AccountTokenCommand {
-    /// Read an account token from a file and write it where this host reads it.
+    /// Sign this host in to the managed account service, in a browser.
     ///
-    /// The token's value is never printed. What is reported is where it was written, the origin it
-    /// belongs to, the scopes it carries and when it stops.
-    Import(AccountTokenImportArguments),
-    /// Report where this host reads its account token, and what the stored one carries.
-    Show,
+    /// The control daemon listens on 127.0.0.1:8765 for the browser's answer and keeps the account
+    /// it signs in; nothing the daemon holds is ever printed. This command opens the address and
+    /// always prints it. On a host with no display, forward the port from the machine that has the
+    /// browser (`ssh -L 8765:127.0.0.1:8765 <host>`) and open the printed address there.
+    SignIn(AccountEnvironmentArguments),
+    /// Show whether this host is signed in to the managed account service, and to which.
+    Show(AccountEnvironmentArguments),
 }
 
-/// `kr account token import`.
+/// The environment one `kr account` command acts in.
 #[derive(Args)]
-pub struct AccountTokenImportArguments {
-    /// The file to read the token from.
-    pub path: std::path::PathBuf,
+pub struct AccountEnvironmentArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr host`.
@@ -891,6 +886,8 @@ pub enum HostCommand {
     Update(UpdateArguments),
     /// Show the releases this host keeps, and which one is current.
     Versions,
+    /// Show where this installation keeps its runtime files and its state.
+    Paths,
     /// Show the machine group an environment records for itself, or take one owner-approved step
     /// that changes it.
     Machine(MachineArguments),

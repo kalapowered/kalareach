@@ -271,6 +271,7 @@ impl Controller {
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
             Method::PrivacyStatus => self.privacy_status().await,
+            Method::AccountStatus => self.account_status(&request.params),
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
@@ -769,6 +770,20 @@ impl Controller {
                             }
                         }
                     })
+                    .await;
+            }
+            // The host's own sign-in to the managed account service is this daemon's, started once
+            // per actor's action: the action is claimed first, and what it came to is kept under
+            // the claim before it is answered, so a retry is answered from that record.
+            Method::AccountSignIn => {
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        connection_id,
+                        admitted,
+                        self.account_sign_in(mutation),
+                    )
                     .await;
             }
             // A machine group step changes this environment's own record under the revision it was

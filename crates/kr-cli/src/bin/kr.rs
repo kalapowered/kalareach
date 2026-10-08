@@ -6,9 +6,7 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use kr_cli::bridge::environments::Selected;
-use kr_cli::cli::{
-    AccountCommand, AccountTokenCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand,
-};
+use kr_cli::cli::{AccountCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand};
 use kr_cli::error::{CliError, Result};
 use kr_cli::output::{self, Asked, Document, Request};
 use kr_cli::report::Completion;
@@ -979,6 +977,25 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::Machine(machine) => kr_cli::machine::run(&paths, machine, cli.json).await,
+            HostCommand::Paths => {
+                // Nothing here reaches the host: these are the directories this user's environment
+                // names, which a daemon started as this user uses.
+                if cli.json {
+                    output::document(
+                        &Document::new()
+                            .with("ok", true)
+                            .with("runtime_root", Shown::host_path(paths.runtime_root()))
+                            .with("state_root", Shown::host_path(paths.state_root())),
+                    );
+                } else {
+                    output::say(&shown!(
+                        "Runtime files: {}",
+                        Shown::host_path(paths.runtime_root())
+                    ));
+                    output::say(&shown!("State: {}", Shown::host_path(paths.state_root())));
+                }
+                Ok(Completion::Done)
+            }
             HostCommand::Versions => {
                 let kept = kr_cli::update::versions()?;
                 if cli.json {
@@ -999,43 +1016,14 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
         },
         Command::Account(arguments) => match arguments.command {
-            AccountCommand::Token(token) => match token {
-                AccountTokenCommand::Import(import) => {
-                    // Nothing here reaches the host or the network. It reads the operator's file
-                    // and writes this host's, and what it reports never carries the token.
-                    let imported = kr_cli::account::import(&import.path)?;
-                    if cli.json {
-                        output::document(
-                            &Document::new()
-                                .with("ok", true)
-                                .with("imported", imported.document()),
-                        );
-                    } else {
-                        for line in imported.lines() {
-                            output::say(&line);
-                        }
-                    }
-                    Ok(Completion::Done)
-                }
-                AccountTokenCommand::Show => {
-                    let path = kr_cli::account::token_path()?;
-                    let stored = kr_client::services::voice::AccountTokenFile::at(path.clone())
-                        .stored()
-                        .ok();
-                    // The origin as a diagnostic names one and the scopes as this build knows
-                    // them, for a person and for a script alike. The token itself is never
-                    // printed by anything.
-                    let held = kr_cli::account::Held::of(&path, stored.as_ref());
-                    if cli.json {
-                        output::document(&held.document());
-                    } else {
-                        for line in held.lines() {
-                            output::say(&line);
-                        }
-                    }
-                    Ok(Completion::Done)
-                }
-            },
+            AccountCommand::SignIn(arguments) => {
+                kr_cli::account::sign_in(&arguments.selector, cli.json).await?;
+                Ok(Completion::Done)
+            }
+            AccountCommand::Show(arguments) => {
+                kr_cli::account::show(&arguments.selector, cli.json).await?;
+                Ok(Completion::Done)
+            }
         },
         Command::Shell(arguments) => {
             // Nothing here reaches the host: setup configures this user's own shell, and the

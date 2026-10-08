@@ -38,11 +38,13 @@ worker directly for what a session owns.
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 | `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
+| `kr account [sign-in/show]` | — | Sign this host in to the managed account service, in a browser, or show where the sign-in stands |
+| `kr host paths` | — | Show where this installation keeps its runtime files and its state |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
 
-The commands from `kr project` to `kr privacy` act in this installation's own environment, or in the
+The commands from `kr project` to `kr account` act in this installation's own environment, or in the
 one `--environment <id>` names. Each is a client of one method the control daemon serves, and
 the daemon decides every refusal. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
@@ -1636,6 +1638,36 @@ what had already left it before privacy mode was turned on: backup archives and 
 with whether this host holds any way to ask for its removal. It changes nothing. A paired device
 whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
 `docs/host/README.md` has what each step does and what privacy mode does not reach.
+
+## `kr account`
+
+Managed voice spends an account's balance, so the host signs an account in on its own, and the
+control daemon alone holds the sign-in:
+
+```sh
+kr account sign-in    # print the address to open in a browser, and open it
+kr account show       # signed out, waiting for the browser, signed in at which service, or ended
+```
+
+`kr account sign-in` asks the daemon to listen on `127.0.0.1:8765`, the loopback address the desktop
+client is registered with, and prints the address to open with the port to forward for a host with
+no display (`ssh -L 8765:127.0.0.1:8765 <host>`). It opens the address in the default browser where
+there is one and always prints it. The command ends when the daemon is listening; the browser's page
+says how the sign-in ended, and `kr account show` says it again, with how the last attempt ended.
+Nothing either command prints is a token. `docs/host/README.md` has the rest, and
+`docs/voice/README.md` what a call does with the account.
+
+`--json` prints `{ "ok", "opened", "authorise_url", "redirect_address", "expires_at_ms" }` for
+`sign-in`, and `{ "ok", "state", "service", "email", "scopes", "last_attempt" }` for `show`, where
+`state` is `signed_out`, `waiting_for_browser`, `finishing`, `signed_in` or `ended` and the other
+fields are present only when they apply. A host whose configuration names no managed service refuses
+`sign-in` with `HOST_NOT_CONFIGURED`.
+
+## `kr host paths`
+
+`kr host paths` prints the directories this user's environment gives this installation: the runtime
+directory, where a daemon keeps its sockets and locks, and the state directory. It reaches no daemon.
+`--json` prints `{ "ok", "runtime_root", "state_root" }`.
 
 ## `kr host import-journals`
 

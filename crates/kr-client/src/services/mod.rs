@@ -50,7 +50,6 @@
 //! | [`account::AccountToken`], [`account::RefreshToken`] | A bearer token | A placeholder |
 //! | [`account::AuthorisationRequest`], [`account::AuthorisationGrant`] | A state, a verifier, a nonce and a code | The client, the redirect, the attempt |
 //! | [`account::IssuedGrant`], [`account::StoredGrant`] | Tokens and a nonce | The lifetime or the grant's identifier and revision, the client, the scopes |
-//! | [`voice::StoredAccountToken`], [`voice::AccountTokenFile`] | An address, which may carry a user name and a password before its host | The scheme, the host and the port |
 //! | [`voice::VoiceSessionRequest`], [`voice::VoiceSession`] | Session descriptions, which carry the connection's ICE credentials | What the call is and how long it lasts, and the description's length |
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
 //! | [`signed::SignedService`] | The key that signs a managed-service call | The gateway, the signer kind |
