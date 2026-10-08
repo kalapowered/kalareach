@@ -149,6 +149,8 @@ mod tests {
     async fn a_host_with_nowhere_to_report_in_does_not_serve() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
+        let packages = environment.state_dir().join("packages");
+        std::fs::create_dir_all(&packages).expect("the packages directory");
         let options = Options {
             reservation: kr_protocol::scalars::Uuid::from_bytes([1; 16]),
             environment: host.environment_id().get(),
@@ -159,7 +161,7 @@ mod tests {
                 .to_string(),
             runtime_dir: environment.runtime_root().to_path_buf(),
             state_dir: environment.state_root().to_path_buf(),
-            packages_dir: environment.state_dir().join("packages"),
+            packages_dir: packages,
         };
         let error = run(options)
             .await
