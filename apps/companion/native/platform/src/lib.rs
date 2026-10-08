@@ -11,8 +11,6 @@
 //! * the Android TLS verifier's start: the platform verifier the HTTPS client uses needs the JVM
 //!   and the application context before its first connection, and the plugin's Kotlin half hands
 //!   them over when it loads.
-//! * [`loopback`]: the desktop sign-in's loopback address, bound so that no other process can
-//!   share it while the sign-in waits.
 //!
 //! The native halves are this crate's Swift package (`ios/`) and Android library (`android/`),
 //! registered with Tauri as one plugin. They report facts; the decisions are taken here, in Rust,
@@ -22,7 +20,6 @@ use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{Manager as _, Runtime};
 
 pub mod browser;
-pub mod loopback;
 pub mod secrets;
 #[cfg(target_os = "android")]
 mod tls;

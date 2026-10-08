@@ -17,6 +17,7 @@ members = [
     "crates/kr-flush",
     "crates/kr-hook",
     "crates/kr-ipc",
+    "crates/kr-loopback",
     "crates/kr-pairing",
     "crates/kr-plugin-catalogue",
     "crates/kr-plugin-host",
@@ -122,6 +123,7 @@ kr-delivery = { path = "crates/kr-delivery", version = "=0.1.0" }
 kr-describe = { path = "crates/kr-describe", version = "=0.1.0" }
 kr-flush = { path = "crates/kr-flush", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
+kr-loopback = { path = "crates/kr-loopback", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
 kr-plugin-catalogue = { path = "crates/kr-plugin-catalogue", version = "=0.1.0" }
 kr-plugin-host = { path = "crates/kr-plugin-host", version = "=0.1.0" }
