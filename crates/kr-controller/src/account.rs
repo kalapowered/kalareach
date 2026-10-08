@@ -23,6 +23,11 @@
 //!
 //! The grant is refreshed when a call needs a token and the one held is about to end, never before,
 //! so a host that makes no call spends no refresh token.
+//!
+//! Signing out removes the grant and asks the service to end it, under the same scope rule as
+//! signing in: a host can sign out of the account service it can sign in at, and of no other.
+//! Both are refused while a managed call is open, because a call closes under the account it
+//! started under.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,7 +42,8 @@ use kr_crypto::store::SecretStore;
 use kr_loopback::{BindError, Listener};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::host_account::{
-    AccountAttempt, AccountReport, AccountSignInStarted, AccountState, SignInUnavailable,
+    AccountAttempt, AccountReport, AccountSignInStarted, AccountSignedOut, AccountState,
+    SignInUnavailable,
 };
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::{Nullable, TimestampMs};
@@ -280,38 +286,12 @@ impl HostAccount {
     /// sign-in is finishing, a managed call is open, or another program holds the loopback
     /// address.
     pub async fn sign_in(&self) -> Result<AccountSignInStarted> {
-        if self.inner.held.is_none() {
-            return Err(ControllerError::NotConfigured(
-                match self.inner.unavailable {
-                    Some(SignInUnavailable::BrokerIsAnotherService) => {
-                        "this host's voice.broker_origin names another service than the managed \
-                         account service it signs in at, so there is nothing to sign in to"
-                    }
-                    Some(SignInUnavailable::NotUsable) => {
-                        "this host cannot reach the managed account service the way its \
-                         configuration says: see the daemon's log"
-                    }
-                    Some(SignInUnavailable::NoBroker) | None => {
-                        "this host names no managed voice service: set voice.broker_origin in its \
-                         configuration document to the managed account service's origin"
-                    }
-                }
-                .to_owned(),
-            ));
-        }
+        self.inner.service()?;
         if self.inner.a_call_is_open() {
             return Err(Inner::call_is_open());
         }
         let mut running = self.inner.running.lock().await;
-        if matches!(
-            self.inner.state.lock().expect("the sign-in state").phase,
-            Phase::Finishing
-        ) {
-            return Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "a sign-in is finishing; ask again when it has".to_owned(),
-            });
-        }
+        self.inner.not_finishing()?;
         if let Some(older) = running.take() {
             let _ = older.cancel.send(true);
             let _ = older.task.await;
@@ -367,6 +347,41 @@ impl HostAccount {
         })
     }
 
+    /// Signs the host out: ends the sign-in that is waiting, removes the grant and asks the service
+    /// to end it. A host with no account answers that there was none and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host cannot sign out: it signs in nowhere, a sign-in is finishing, a managed
+    /// call is open, or the store could not be changed (the host is then still signed in).
+    pub async fn sign_out(&self) -> Result<AccountSignedOut> {
+        let held = self.inner.service()?;
+        if self.inner.a_call_is_open() {
+            return Err(Inner::call_is_open());
+        }
+        let mut running = self.inner.running.lock().await;
+        self.inner.not_finishing()?;
+        if let Some(older) = running.take() {
+            let _ = older.cancel.send(true);
+            let _ = older.task.await;
+        }
+        self.inner.recover().await;
+        let done = held
+            .signed_in
+            .sign_out()
+            .await
+            .map_err(|error| ControllerError::Storage {
+                operation: "sign this host out",
+                detail: error.to_string(),
+            })?;
+        // What came of earlier attempts says nothing about a host with no account.
+        self.inner.state.lock().expect("the sign-in state").last = None;
+        Ok(AccountSignedOut {
+            was_signed_in: done.was_signed_in,
+            service_told: done.service_told,
+        })
+    }
+
     fn listener(&self) -> std::result::Result<Listener, BindError> {
         #[cfg(feature = "testing")]
         if let Some(address) = *self.inner.loopback.lock().expect("the test address") {
@@ -417,6 +432,43 @@ impl Inner {
             .await;
     }
 
+    /// Where this host signs in and out, or why it cannot.
+    fn service(&self) -> Result<&Held> {
+        self.held.as_ref().ok_or_else(|| {
+            ControllerError::NotConfigured(
+                match self.unavailable {
+                    Some(SignInUnavailable::BrokerIsAnotherService) => {
+                        "this host's voice.broker_origin names another service than the managed \
+                         account service it signs in at, so there is nothing to sign in to"
+                    }
+                    Some(SignInUnavailable::NotUsable) => {
+                        "this host cannot reach the managed account service the way its \
+                         configuration says: see the daemon's log"
+                    }
+                    Some(SignInUnavailable::NoBroker) | None => {
+                        "this host names no managed voice service: set voice.broker_origin in its \
+                         configuration document to the managed account service's origin"
+                    }
+                }
+                .to_owned(),
+            )
+        })
+    }
+
+    /// Refuses while a sign-in is finishing: its code is spent and its grant is being kept.
+    fn not_finishing(&self) -> Result<()> {
+        if matches!(
+            self.state.lock().expect("the sign-in state").phase,
+            Phase::Finishing
+        ) {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "a sign-in is finishing; ask again when it has".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn a_call_is_open(&self) -> bool {
         self.call_open.get().is_some_and(|open| open())
     }
@@ -424,9 +476,10 @@ impl Inner {
     fn call_is_open() -> ControllerError {
         ControllerError::Refused {
             code: ErrorCode::ResourceUnavailable,
-            detail: "a voice call is open on this host; end it before signing in, because a call \
-                     closes under the account it started under"
-                .to_owned(),
+            detail:
+                "a voice call is open on this host; end it before signing in or out, because a \
+                     call closes under the account it started under"
+                    .to_owned(),
         }
     }
 

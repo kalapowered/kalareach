@@ -105,8 +105,8 @@ use crate::gateway::{DeclarativeTable, EvidenceGap, PendingResource, RichMethodT
 use crate::grant::Grant;
 use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
 use crate::host_account::{
-    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
-    AccountStatusParams,
+    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountSignOutParams,
+    AccountSignedOut, AccountState, AccountStatusParams,
 };
 use crate::hostinfo::{
     EffectiveConfiguration, EnvironmentListResult, HostDoctorResult, HostInfoResult, SupportBundle,
@@ -805,6 +805,8 @@ pub fn protocol_schema() -> Value {
         "account_report" => AccountReport,
         "account_sign_in_params" => AccountSignInParams,
         "account_sign_in_started" => AccountSignInStarted,
+        "account_sign_out_params" => AccountSignOutParams,
+        "account_signed_out" => AccountSignedOut,
         "account_state" => AccountState,
         "account_status_params" => AccountStatusParams,
         // Session descriptions: the setup read and the two writes, the facts a worker keeps per

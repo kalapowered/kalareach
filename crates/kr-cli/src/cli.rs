@@ -843,6 +843,12 @@ pub enum AccountCommand {
     /// always prints it. On a host with no display, forward the port from the machine that has the
     /// browser (`ssh -L 8765:127.0.0.1:8765 <host>`) and open the printed address there.
     SignIn(AccountEnvironmentArguments),
+    /// Sign this host out of the managed account service.
+    ///
+    /// The control daemon removes the account it holds and asks the service to end the sign-in. It
+    /// is refused while a voice call is open on this host, because a call closes under the account
+    /// it started under.
+    SignOut(AccountEnvironmentArguments),
     /// Show whether this host is signed in to the managed account service, and to which.
     Show(AccountEnvironmentArguments),
 }
