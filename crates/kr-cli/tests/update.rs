@@ -7291,9 +7291,16 @@ async fn a_rescue_the_stores_refuse_leaves_the_failed_update_owing_the_daemon_as
             .find(|restart| restart["environment"] == environment.as_str())
             .unwrap_or_else(|| panic!("a restart of {environment}: {record}"))
     };
+    // The directory the daemon runs in, as the daemon states it: the system resolves a link in the
+    // temporary directory's name (macOS reaches it through `/var`), so both are compared resolved.
+    let recorded_in =
+        of(second.tree.environment_id().to_string())["start"]["arguments"]["working_directory"]
+            .as_str()
+            .expect("a directory")
+            .to_owned();
     assert_eq!(
-        of(second.tree.environment_id().to_string())["start"]["arguments"]["working_directory"],
-        second.tree.root().display().to_string().as_str(),
+        std::fs::canonicalize(&recorded_in).expect("the directory is there"),
+        std::fs::canonicalize(second.tree.root()).expect("the tree is there"),
         "the daemon that runs is owed as the rescue recorded it: {record}"
     );
     assert_eq!(
