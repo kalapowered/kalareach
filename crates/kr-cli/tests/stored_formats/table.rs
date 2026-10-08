@@ -74,16 +74,20 @@ pub fn table() -> Vec<Store> {
                 kr_cli::update::OLDEST_RECORD_FORMAT,
             ),
             owned: Vec::new(),
-            kept: vec![Kept::Source(
-                "crates/kr-cli/src/update/mod.rs",
-                &[
-                    "Record",
-                    "Transaction",
-                    "TransactionState",
-                    "Restart",
-                    "Start",
-                ],
-            )],
+            kept: vec![
+                Kept::Source(
+                    "crates/kr-cli/src/update/mod.rs",
+                    &[
+                        "Record",
+                        "Transaction",
+                        "Abandoned",
+                        "TransactionState",
+                        "Restart",
+                        "Start",
+                    ],
+                ),
+                protocol::<kr_protocol::update::PathVariable>("PathVariable"),
+            ],
         },
         // The startup files an install wrote an entry to, which a removal works from.
         Store {
