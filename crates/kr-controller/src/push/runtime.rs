@@ -419,29 +419,41 @@ impl DeliveryRuntime {
         let Some(adapters) = self.adapters.get() else {
             return;
         };
+        // A request is written down before the lock is tried for, and read after the lock is let
+        // go of. A request that fails the lock was written before the holder lets go, so the
+        // holder reads it; one that comes after finds the lock free.
         self.sweep_wanted.store(true, Ordering::SeqCst);
-        let Ok(_one_sweep) = self.sweeping.try_lock() else {
-            return;
-        };
-        // Cleared before each round reads the list, and read after it: a request that comes in
-        // between is either answered by this round, which reads the list after it, or seen here.
-        while self.sweep_wanted.swap(false, Ordering::SeqCst) {
-            let credentials = Arc::clone(&self.credentials);
-            let forget = move |sender_record_id| match credentials.forget(sender_record_id) {
-                Ok(()) => true,
-                Err(detail) => {
-                    eprintln!(
-                        "kr-controller: a delivery credential could not be removed from the \
-                         secret store: {detail}"
-                    );
-                    false
-                }
-            };
-            if let Err(error) =
-                self.module
-                    .settle_revocations(adapters.senders.as_ref(), &forget, &SystemClock)
+        loop {
             {
-                eprintln!("kr-controller: owed revocations were not asked about: {error}");
+                let Ok(_one_sweep) = self.sweeping.try_lock() else {
+                    return;
+                };
+                // Cleared before each round reads the list: a request that comes in meanwhile is
+                // either answered by a round that reads the list after it, or seen below.
+                while self.sweep_wanted.swap(false, Ordering::SeqCst) {
+                    let credentials = Arc::clone(&self.credentials);
+                    let forget = move |sender_record_id| match credentials.forget(sender_record_id)
+                    {
+                        Ok(()) => true,
+                        Err(detail) => {
+                            eprintln!(
+                                "kr-controller: a delivery credential could not be removed from \
+                                 the secret store: {detail}"
+                            );
+                            false
+                        }
+                    };
+                    if let Err(error) = self.module.settle_revocations(
+                        adapters.senders.as_ref(),
+                        &forget,
+                        &SystemClock,
+                    ) {
+                        eprintln!("kr-controller: owed revocations were not asked about: {error}");
+                        return;
+                    }
+                }
+            }
+            if !self.sweep_wanted.load(Ordering::SeqCst) {
                 return;
             }
         }

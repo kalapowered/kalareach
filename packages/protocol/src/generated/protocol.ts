@@ -11187,6 +11187,10 @@ export interface DeliveryDestinationRemoveResult {
    */
   destination_id: string
   /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  fenced: string
+  /**
    * Whether a destination was configured under it.
    */
   found: boolean
