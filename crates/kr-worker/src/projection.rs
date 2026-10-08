@@ -583,6 +583,41 @@ impl TerminalEngine {
         }
     }
 
+    /// The text of the visible lines of the buffer that is showing, top to bottom.
+    ///
+    /// Each line is what its cells print, with the gaps between runs filled with spaces and the
+    /// blanks at its end dropped, and the blank lines at the bottom are dropped too, so a screen
+    /// that is mostly empty is a few lines and not a page of nothing. The buffer that is not
+    /// showing and what has scrolled off are not here: this is the screen as a viewer first sees
+    /// it, and nothing behind it.
+    #[must_use]
+    pub fn visible_text(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .engine
+            .grid()
+            .visible_rows()
+            .iter()
+            .map(|row| {
+                let mut text = String::new();
+                let mut column = 0_u32;
+                for run in &row.runs {
+                    while column < run.column {
+                        text.push(' ');
+                        column += 1;
+                    }
+                    text.push_str(&run.text);
+                    column = run.column.saturating_add(run.cells);
+                }
+                text.truncate(text.trim_end().len());
+                text
+            })
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
     /// The window a client of these dimensions is looking at.
     ///
     /// The top row is read from the grid rather than guessed at, because eviction and scrolling
