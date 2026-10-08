@@ -278,6 +278,13 @@ cd apps/companion/src-tauri/gen/apple && xcodebuild test \
   -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 cd apps/companion/src-tauri/gen/android && ./gradlew :krnative:test
 
+# The same tests through the scripts the conformance report runs. They leave what the tool wrote
+# where `--results` says and take the tool's own arguments after `--`. The Android script also runs
+# in a checkout that has not packaged the application, which has neither of the Gradle files Tauri's
+# build writes and the first command above needs; it writes them as comments and removes them again.
+scripts/android-unit-tests.sh
+scripts/ios-unit-tests.sh
+
 # The hand-written Android tree, compiled by the application module. A syntax error anywhere
 # under native/android/android/ fails this.
 cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugKotlin

@@ -54,10 +54,15 @@ could be read.
 | `performance` | The measurements `scripts/performance.sh` takes, and the release-build terminal and transport measurements | As on Linux | Not run: these drive Unix pseudo-terminals |
 | `typescript` | Each package's `test` script with vitest's JSON report, and the report's own TypeScript reading test | As on Linux | Not run |
 | `applications` | The application matrix | As on Linux | Not run: each program is recorded with its reason |
+| `phones` | `scripts/android-unit-tests.sh`: the Android application's Kotlin unit tests, run by Gradle on a JDK; the Android SDK is not needed | `scripts/ios-unit-tests.sh`: the iOS application's Swift unit tests, run by Xcode in an iPhone simulator | Not run: the Kotlin tests run in the Linux report and the Swift tests in the macOS report |
 
 The report's own tests check the `end-to-end` and `performance` lists against the two scripts, and
 the macOS and Windows plans against the landing workflow's jobs, so the report cannot drift from
 them unnoticed.
+
+`.github/workflows/conformance.yml` runs the report on each platform every night, with every group
+the platform runs. A run started by hand takes a `groups` input, written as `--group` names
+separated by spaces, and the switches `linux`, `macos` and `windows`, which leave a job out.
 
 Every `cargo test` step that keeps each test's output captured runs with `--show-output`, which
 prints what every passing test wrote under its name. A step that shows the output as it is written,
@@ -288,15 +293,36 @@ command that selects the title runs them all.
 
 ### Tests another toolchain builds
 
-| Files | Why the report does not run them |
+| Files | Where they run |
 | --- | --- |
-| `apps/companion/native/android/src/test/**` | Android unit tests: the Android build runs them |
-| `apps/companion/native/ios/Tests/**` | iOS unit tests: Xcode runs them |
+| `apps/companion/native/android/src/test/**` | The `phones` group in the Linux report, with Gradle |
+| `apps/companion/native/ios/Tests/**` | The `phones` group in the macOS report, with Xcode |
 | `apps/companion/e2e/**` | Playwright over the built interface: the landing workflow's companion job runs it |
 
-A comment in a Kotlin or Swift file of these lanes keys that file as a whole, which the report
-shows as not built. A Playwright test is keyed as any TypeScript test is, and shown as not run with
-the lane's reason.
+A comment in a Kotlin or Swift file of the first two lanes keys that file as a whole: every case
+the lane reports for a class the file declares belongs to the rows its comments name, whichever
+test in the file the comment sits above. A failing case therefore fails every row its file names.
+The report reads the classes a file declares from the lines that begin with modifiers, attributes
+and `class` (a Kotlin or Java class by its package-qualified name), and it stops before it runs
+anything when a file that names a row declares none. A case the lane reports that no file of the
+lane declares, or that two declare, is a problem of the result.
+
+The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:
+Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttool get test-results
+tests` prints for the result bundle, in one file with the bundle beside it. They print
+`kr-tool: <name>: <value>` lines for the JDK and Gradle, or Xcode and the simulator, and the result
+lists them under `run.toolchain.phones`. The report checks the results before it uses them. A JUnit
+file has to agree with the counts its test suite states. A suite recorded as failed has to have a
+failed case under it. A result the report does not know (`unknown`) is refused, an expected failure
+counts as a failure, and the tool's exit status has to agree with the failed cases. Results that
+fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
+passed.
+
+In the report of a platform that does not run a lane, that lane's files are shown as not run, with
+the platform that does. In a report that does, a file whose classes the results do not name is
+failed: the lane ran, and nothing of the file ran with it. The record of each case has the command
+that runs it alone, which is the script with the tool's own filter after `--`. A Playwright test is
+keyed as any TypeScript test is, and shown as not built with the lane's reason.
 
 ## Outcomes and verdicts
 
@@ -307,8 +333,8 @@ Each keyed test has one outcome on this platform:
 | `passed` | A step ran it and it passed |
 | `failed` | A step ran it and it failed, or its binary's output could not be read against the summary the harness printed |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
-| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
-| `not_built` | A step ran its target and this platform's build of it has no such test |
+| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another platform's report runs its lane, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
+| `not_built` | A step ran its target and this platform's build of it has no such test, or a Playwright test, which only the landing workflow's companion job builds |
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
 A test that returns early, because what it needs is absent, passes as far as the harness is
@@ -352,11 +378,11 @@ identifier's `references` and `figures`.
     "platform": "linux",
     "system": { "os": "linux", "release": "Ubuntu 24.04.3 LTS, Linux 6.11.0", "arch": "x86_64", "target": "x86_64-unknown-linux-gnu" },
     "commit": { "id": "<40 hex digits>", "modified": false },
-    "toolchain": { "rustc": "rustc 1.97.1 (...)", "cargo": "cargo 1.97.1 (...)", "node": "v22.23.1", "pnpm": "11.14.0" },
+    "toolchain": { "rustc": "rustc 1.97.1 (...)", "cargo": "cargo 1.97.1 (...)", "node": "v22.23.1", "pnpm": "11.14.0", "phones": { "gradle": "8.14.3", "java": "17.0.20 (Eclipse Adoptium 17.0.20+101)" } },
     "terminal_profile": { "profile": "kr-vt/1", "term": "xterm-256color" },
     "packages": [ { "name": "kr-term", "version": "0.1.0" }, { "name": "@kalareach/protocol", "version": "0.34.0" } ],
     "applications": [ { "id": "neovim", "version": "0.12.5", "status": "installed", "url": "https://...", "sha256": "...", "build": "release", "reason": null } ],
-    "selection": ["rust", "end-to-end", "performance", "typescript", "applications"],
+    "selection": ["rust", "end-to-end", "performance", "typescript", "applications", "phones"],
     "all_terminals": false,
     "evidence_directory": "/tmp/kr-test-artifacts"
   },
