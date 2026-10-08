@@ -601,6 +601,15 @@ when their parameters differ. That is what keeps a link that wraps onto the next
 two links to one target two. A client that draws the screen into a terminal opens each link with its
 parameters.
 
+A client shown the live screen alone, which is every caller acting under a grant, is told the
+screen's text and how it is drawn, and none of what sits behind that text. The titles, the virtual
+title stack and every link target are left out of a restoration, of a snapshot's header and rows,
+of an update and of the bytes that follow: the text of a linked word arrives and its target does
+not, and no title does. The bytes that follow are the stream without the operating system commands
+that only describe the screen (a title, a link, a working directory, a shell's marks), which the
+engine names apart from the commands that change its colours. What such a client is sent is what the
+issuer of its share was shown, because the issuer's preview is the screen's text.
+
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`
 returns what that settling produced alongside the snapshot, so a direct attachment that is already

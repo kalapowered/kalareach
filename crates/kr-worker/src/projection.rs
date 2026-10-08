@@ -88,6 +88,19 @@ impl LaneReply {
     }
 }
 
+/// A span of the raw stream a direct attachment may be shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectSpan {
+    /// Where the span starts in the raw stream.
+    pub cursor: u64,
+    /// The bytes, as the application wrote them.
+    pub bytes: Vec<u8>,
+    /// The ranges of `bytes`, in order, that only describe the screen: a title, the target of a
+    /// link, a working directory, a shell's marks. A caller shown the live screen alone is sent
+    /// the rest of the span, and the gaps it leaves are positions of the raw stream like any other.
+    pub behind_the_screen: Vec<std::ops::Range<usize>>,
+}
+
 /// What one batch of raw output became.
 #[derive(Clone, Debug, Default)]
 pub struct Filtered {
@@ -96,7 +109,7 @@ pub struct Filtered {
     /// The cursors are positions in the raw stream, so they stay comparable with the session's
     /// history and with a snapshot's own cursor. They are not contiguous: what the engine withheld
     /// leaves a gap, which is the point.
-    pub direct: Vec<(u64, Vec<u8>)>,
+    pub direct: Vec<DirectSpan>,
     /// The side effects that belong to the one attachment holding the input lease, in the order
     /// the application caused them.
     pub effects: Vec<crate::output::OwedEffect>,
@@ -942,9 +955,21 @@ impl TerminalEngine {
                 filtered.lost = true;
                 continue;
             }
-            filtered
-                .direct
-                .push((start, self.tail[offset..end].to_vec()));
+            let behind_the_screen: Vec<std::ops::Range<usize>> = outcome
+                .behind_the_screen
+                .iter()
+                .filter(|named| named.start() >= start && named.end() <= span.end())
+                .filter_map(|named| {
+                    let from = usize::try_from(named.start() - start).ok()?;
+                    let to = usize::try_from(named.end() - start).ok()?;
+                    (from < to && to <= end - offset).then_some(from..to)
+                })
+                .collect();
+            filtered.direct.push(DirectSpan {
+                cursor: start,
+                bytes: self.tail[offset..end].to_vec(),
+                behind_the_screen,
+            });
         }
         // Everything up to the engine's committed offset has been decided. Nothing before it can
         // be forwarded afterwards, so nothing before it needs keeping.
@@ -1065,7 +1090,7 @@ mod tests {
         let forwarded: Vec<u8> = filtered
             .direct
             .iter()
-            .flat_map(|(_, bytes)| bytes.clone())
+            .flat_map(|span| span.bytes.clone())
             .collect();
         // The last scalar waits for a combining mark, so a settled screen needs the quiesce the
         // session loop performs when the read goes quiet.
@@ -1073,7 +1098,7 @@ mod tests {
         let tail: Vec<u8> = settled
             .direct
             .iter()
-            .flat_map(|(_, bytes)| bytes.clone())
+            .flat_map(|span| span.bytes.clone())
             .collect();
         assert_eq!([forwarded, tail].concat(), b"hello".to_vec());
     }

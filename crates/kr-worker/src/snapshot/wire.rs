@@ -125,6 +125,9 @@ pub const fn rendition(value: Rendition) -> CellRendition {
 }
 
 /// Converts one hyperlink, with the parameters that tell it from another link to the same target.
+///
+/// A caller whose authority does not reach a link's target is sent no link at all, so a place that
+/// sends a link decides that first: [`hyperlink_within`] does, and so does a delta.
 #[must_use]
 pub fn hyperlink(value: &Link) -> ProjectedHyperlink {
     ProjectedHyperlink {
@@ -133,15 +136,32 @@ pub fn hyperlink(value: &Link) -> ProjectedHyperlink {
     }
 }
 
-/// Converts one run of cells.
+/// Converts the hyperlink that is open, or says none is when the client's authority does not reach
+/// a link's target.
+///
+/// Every link a client is sent passes through here or through [`run`] and [`hyperlinks_within`],
+/// which is what keeps a target out of a screen whose issuer was shown the text alone.
 #[must_use]
-pub fn run(value: &Run) -> CellRun {
+pub fn hyperlink_within(
+    value: Option<&Link>,
+    scope: crate::render::Scope,
+) -> Nullable<ProjectedHyperlink> {
+    Nullable(
+        value
+            .filter(|_| scope.names_titles_and_links())
+            .map(hyperlink),
+    )
+}
+
+/// Converts one run of cells, with its link when the client's authority reaches the target.
+#[must_use]
+pub fn run(value: &Run, scope: crate::render::Scope) -> CellRun {
     CellRun {
         column: cells(value.column),
         cells: cells(value.cells),
         text: value.text.clone(),
         rendition: rendition(value.rendition),
-        hyperlink: Nullable(value.hyperlink.as_ref().map(hyperlink)),
+        hyperlink: hyperlink_within(value.hyperlink.as_ref(), scope),
     }
 }
 
@@ -150,12 +170,12 @@ pub fn run(value: &Run) -> CellRun {
 /// # Errors
 ///
 /// Returns an error when the row's stable identifier is not a forward count.
-pub fn row(value: &GridRow) -> Result<ProjectedRow> {
+pub fn row(value: &GridRow, scope: crate::render::Scope) -> Result<ProjectedRow> {
     Ok(ProjectedRow {
         row: row_id(value.stable_id)?,
         soft_wrapped: value.soft_wrapped,
         truncated: value.truncated,
-        runs: value.runs.iter().map(run).collect(),
+        runs: value.runs.iter().map(|value| run(value, scope)).collect(),
     })
 }
 
@@ -164,8 +184,8 @@ pub fn row(value: &GridRow) -> Result<ProjectedRow> {
 /// # Errors
 ///
 /// Returns an error when any row's stable identifier is not a forward count.
-pub fn rows(values: &[GridRow]) -> Result<Vec<ProjectedRow>> {
-    values.iter().map(row).collect()
+pub fn rows(values: &[GridRow], scope: crate::render::Scope) -> Result<Vec<ProjectedRow>> {
+    values.iter().map(|value| row(value, scope)).collect()
 }
 
 /// Converts the cursor.
@@ -290,7 +310,7 @@ pub fn saved_cursors_within(
         .iter()
         .flatten()
         .filter(|cursor| scope == crate::render::Scope::WholeScreen || cursor.buffer == active)
-        .map(saved_cursor)
+        .map(|cursor| saved_cursor(cursor, scope))
         .collect()
 }
 
@@ -329,18 +349,9 @@ pub const fn provenance(value: PaletteSource) -> PaletteProvenance {
     }
 }
 
-/// Converts the saved cursors of both buffers, leaving out a buffer that has saved none.
-///
-/// # Errors
-///
-/// Returns an error when a saved cursor cannot be converted.
-pub fn saved_cursors(values: &[Option<SavedCursor>; 2]) -> Vec<SavedCursorState> {
-    values.iter().flatten().map(saved_cursor).collect()
-}
-
-/// Converts one saved cursor.
-#[must_use]
-pub fn saved_cursor(value: &SavedCursor) -> SavedCursorState {
+/// Converts one saved cursor, with the link its pen was inside when the client's authority reaches
+/// the target.
+fn saved_cursor(value: &SavedCursor, scope: crate::render::Scope) -> SavedCursorState {
     SavedCursorState {
         buffer: buffer(value.buffer),
         column: cells(value.col),
@@ -354,11 +365,15 @@ pub fn saved_cursor(value: &SavedCursor) -> SavedCursorState {
         },
         origin_mode: value.origin_mode,
         style: cells(value.style),
-        hyperlink: Nullable(value.hyperlink.as_ref().map(hyperlink)),
+        hyperlink: hyperlink_within(value.hyperlink.as_ref(), scope),
     }
 }
 
 /// Converts the current titles.
+///
+/// A title is text a person set to describe a window, and a screen's issuer is shown the screen's
+/// text, not the titles behind it, so a place that sends one decides that first: [`title_within`]
+/// does, and so does a delta.
 #[must_use]
 pub fn title(value: &TitleEntry) -> ProjectedTitle {
     ProjectedTitle {
@@ -376,12 +391,46 @@ pub fn saved_title(value: &SavedTitle) -> SavedTitleEntry {
     }
 }
 
-/// Converts the hyperlink ranges of a set of rows.
+/// Converts the current titles for a screen's header, which has to carry some: none when the
+/// client's authority does not reach them.
+#[must_use]
+pub fn title_within(value: &TitleEntry, scope: crate::render::Scope) -> ProjectedTitle {
+    if scope.names_titles_and_links() {
+        title(value)
+    } else {
+        ProjectedTitle {
+            icon: String::new(),
+            window: String::new(),
+        }
+    }
+}
+
+/// Converts the virtual title stack for a screen's header: empty when the client's authority does
+/// not reach titles.
+#[must_use]
+pub fn title_stack_within(
+    values: &[SavedTitle],
+    scope: crate::render::Scope,
+) -> Vec<SavedTitleEntry> {
+    if !scope.names_titles_and_links() {
+        return Vec::new();
+    }
+    values.iter().map(saved_title).collect()
+}
+
+/// Converts the hyperlink ranges of a set of rows, or none when the client's authority does not
+/// reach a link's target.
 ///
 /// # Errors
 ///
 /// Returns an error when a range names a row that is not a forward count.
-pub fn hyperlinks(values: &[kr_term::snapshot::HyperlinkRange]) -> Result<Vec<HyperlinkRange>> {
+pub fn hyperlinks_within(
+    values: &[kr_term::snapshot::HyperlinkRange],
+    scope: crate::render::Scope,
+) -> Result<Vec<HyperlinkRange>> {
+    if !scope.names_titles_and_links() {
+        return Ok(Vec::new());
+    }
     values
         .iter()
         .map(|range| {

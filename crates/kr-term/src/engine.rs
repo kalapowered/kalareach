@@ -117,6 +117,10 @@ pub struct FeedOutcome {
     pub events: usize,
     /// Spans whose original bytes a direct-mode attachment may forward unchanged.
     pub forward: Vec<ByteSpan>,
+    /// The parts of `forward` that only describe the screen and draw none of it: a title, the
+    /// target of a link, a working directory, a shell's marks. A caller that may be shown no more
+    /// than the screen's text and colours is sent `forward` without them.
+    pub behind_the_screen: Vec<ByteSpan>,
     /// Where the attachment must move to projected mode, when something arrived that direct mode
     /// cannot carry.
     pub projection_required_at: Option<u64>,
@@ -694,7 +698,14 @@ impl Engine {
                     .record(kind, event.span.start(), now_ms, detail);
             }
             match disposition {
-                DirectDisposition::Forward => push_span(&mut outcome.forward, event.span),
+                DirectDisposition::Forward => {
+                    push_span(&mut outcome.forward, event.span);
+                    if let EventKind::Osc { selector, .. } = &event.kind
+                        && !crate::classify::osc_draws_the_screen(*selector)
+                    {
+                        push_span(&mut outcome.behind_the_screen, event.span);
+                    }
+                }
                 DirectDisposition::RequireProjection => {
                     outcome
                         .projection_required_at

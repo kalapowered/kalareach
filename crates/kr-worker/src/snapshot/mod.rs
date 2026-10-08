@@ -470,9 +470,9 @@ pub fn install(
                 .collect(),
             keypad_application: snapshot.keypad_application,
             keyboard: wire::keyboard_within(&snapshot.keyboard, snapshot.active_buffer, scope),
-            title: wire::title(&snapshot.title),
-            title_stack: snapshot.title_stack.iter().map(wire::saved_title).collect(),
-            hyperlink: Nullable(snapshot.hyperlink.as_ref().map(wire::hyperlink)),
+            title: wire::title_within(&snapshot.title, scope),
+            title_stack: wire::title_stack_within(&snapshot.title_stack, scope),
+            hyperlink: wire::hyperlink_within(snapshot.hyperlink.as_ref(), scope),
             palette: wire::palette(&snapshot.palette),
             oldest_retained_row: oldest,
             evicted: snapshot.evicted,
@@ -545,7 +545,7 @@ pub fn install(
                     kept.push(empty);
                     continue;
                 }
-                let mut row = wire::row(row)?;
+                let mut row = wire::row(row, scope)?;
                 truncate_row(&mut row);
                 let cost = wire::row_cost(&row).bytes;
                 if cost > budget.saturating_sub(held) {
@@ -803,7 +803,7 @@ pub fn advance(
     scope: crate::render::Scope,
     held_viewport: Option<Viewport>,
 ) -> Result<Owed> {
-    let mut rows = wire::rows(&delta.rows)?;
+    let mut rows = wire::rows(&delta.rows, scope)?;
     if !fits_one_page(&rows) {
         // More rows changed than one page carries. That is a repaint rather than an update, and a
         // repaint is a snapshot: it pages, and a client that applied a delta this size would have
@@ -835,17 +835,30 @@ pub fn advance(
                 .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
         ),
         charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
-        hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
-        hyperlink: Nullable(delta.hyperlink.as_ref().map(|link| {
-            kr_protocol::projection::HyperlinkChange {
-                link: Nullable(link.as_ref().map(wire::hyperlink)),
-            }
-        })),
-        title: Nullable(delta.title.as_ref().map(wire::title)),
+        hyperlinks: wire::hyperlinks_within(&delta.hyperlinks, scope)?,
+        // A caller that may be shown no title and no target is sent no change of either: the
+        // client holds none to change.
+        hyperlink: Nullable(
+            delta
+                .hyperlink
+                .as_ref()
+                .filter(|_| scope.names_titles_and_links())
+                .map(|link| kr_protocol::projection::HyperlinkChange {
+                    link: Nullable(link.as_ref().map(wire::hyperlink)),
+                }),
+        ),
+        title: Nullable(
+            delta
+                .title
+                .as_ref()
+                .filter(|_| scope.names_titles_and_links())
+                .map(wire::title),
+        ),
         title_stack: Nullable(
             delta
                 .title_stack
                 .as_ref()
+                .filter(|_| scope.names_titles_and_links())
                 .map(|stack| stack.iter().map(wire::saved_title).collect()),
         ),
         keyboard: Nullable(
