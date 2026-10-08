@@ -247,6 +247,15 @@ pub struct Landed {
     pub window_revision: u64,
 }
 
+/// The text of the screen that is showing ([`TerminalEngine::visible_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleText {
+    /// The lines, top to bottom.
+    pub lines: Vec<String>,
+    /// Whether the grid cut a row to keep it inside its byte bound, so a line is not all of its row.
+    pub cut: bool,
+}
+
 /// The canonical grid of one session.
 pub struct TerminalEngine {
     engine: Engine,
@@ -589,13 +598,13 @@ impl TerminalEngine {
     /// blanks at its end dropped, and the blank lines at the bottom are dropped too, so a screen
     /// that is mostly empty is a few lines and not a page of nothing. The buffer that is not
     /// showing and what has scrolled off are not here: this is the screen as a viewer first sees
-    /// it, and nothing behind it.
+    /// it, and nothing behind it. A row the grid had to cut to keep inside its byte bound is
+    /// counted, so a caller that must show all of the screen can tell it did not get all of it.
     #[must_use]
-    pub fn visible_text(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .engine
-            .grid()
-            .visible_rows()
+    pub fn visible_text(&self) -> VisibleText {
+        let rows = self.engine.grid().visible_rows();
+        let cut = rows.iter().any(|row| row.truncated);
+        let mut lines: Vec<String> = rows
             .iter()
             .map(|row| {
                 let mut text = String::new();
@@ -615,7 +624,7 @@ impl TerminalEngine {
         while lines.last().is_some_and(String::is_empty) {
             lines.pop();
         }
-        lines
+        VisibleText { lines, cut }
     }
 
     /// The window a client of these dimensions is looking at.
