@@ -396,8 +396,8 @@ final class VoiceCallControlTests: XCTestCase {
     /// KR-REQ-15.34: the call's end is scheduled at the deadline itself, and ends everything.
     func testTheCallEndsAtItsDeadline() {
         let (control, platform, switches) = running(seconds: 30)
-        let scheduled: [UInt64] = platform.timers.map { $0.atMs }
-        XCTAssertEqual(scheduled, [1_000 + 30_000], "scheduled against the deadline")
+        let deadline: UInt64 = 1_000 + 30_000
+        XCTAssertEqual(platform.timers.map { $0.atMs }, [deadline], "scheduled against the deadline")
         platform.now = 1_000 + 29_999
         platform.runDueTimers()
         XCTAssertTrue(switches.microphoneOn)
