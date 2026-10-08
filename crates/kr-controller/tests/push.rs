@@ -1823,6 +1823,138 @@ fn a_delivery_is_not_presented_again_until_the_renewal_has_happened() {
         .expect("a read");
 }
 
+/// Longer than the longest backoff between two attempts, so a look at this distance finds a
+/// notification due however many attempts it has used.
+const LONGER_THAN_ANY_BACKOFF_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS + 60_000;
+
+/// A renewal at a gateway that refuses it until it is told to answer, and counts the asks.
+#[derive(Debug, Default)]
+struct RenewalThatWaitsToBeAllowed {
+    allowed: std::sync::atomic::AtomicBool,
+    asked: Mutex<u32>,
+}
+
+impl RenewalThatWaitsToBeAllowed {
+    fn asked(&self) -> u32 {
+        *self.asked.lock().expect("the double is not poisoned")
+    }
+
+    fn allow(&self) {
+        self.allowed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl CredentialRenewal for RenewalThatWaitsToBeAllowed {
+    fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+        *self.asked.lock().expect("the double is not poisoned") += 1;
+        if !self.allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the gateway refused the renewal (403)".to_owned());
+        }
+        Ok(PushDeliveryCredential {
+            secret: SecretBytes32::from_bytes([0xee; 32]),
+            expires_at_ms: TimestampMs::new(NOW + 30 * 24 * 60 * 60 * 1000),
+            revision: kr_protocol::ids::PushSenderRevision::new(held.revision.get() + 1),
+            ..held.clone()
+        })
+    }
+}
+
+/// KR-REQ-16.09, KR-REQ-16.12: a notification whose credential has expired and cannot be renewed
+/// yet waits for the renewal without using up its attempts. The gateway is asked once and refuses,
+/// and for as long as the host waits to ask again, every look at the notification leaves it as it
+/// was: pending, one attempt used, nothing presented, the gateway not asked. When a bearer arrives
+/// the notification goes out. The control for the first half is the same notification the first
+/// time: that look is the one that asked, and it used its attempt.
+#[test]
+fn a_notification_waiting_for_a_renewal_keeps_its_attempts_and_goes_out_when_a_bearer_arrives() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let credentials = HeldCredentials::new();
+    credentials.hold(credential(NOW - 1));
+    let renewal = Arc::new(RenewalThatWaitsToBeAllowed::default());
+    credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+    let gateway = GatewayDouble::queued();
+    let pass = |now_ms: u64| {
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &gateway,
+                &credentials,
+                &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
+                &at(now_ms),
+            )
+            .expect("a pass")
+    };
+    let record = || {
+        environment
+            .module
+            .with(|producer| Ok(producer.journal().deliveries().expect("a read").remove(0)))
+            .expect("a read")
+    };
+
+    // The control: the look that asked the gateway is an attempt.
+    assert_eq!(pass(NOW), 1);
+    assert_eq!(renewal.asked(), 1);
+    assert_eq!(record().attempts, 1);
+
+    // Far more looks than the notification has attempts, each further on than any backoff.
+    let attempts = kr_delivery::push::MAX_ATTEMPTS;
+    let mut now_ms = NOW;
+    for look in 1..=attempts * 3 {
+        now_ms += LONGER_THAN_ANY_BACKOFF_MS;
+        let before = record();
+        assert_eq!(
+            before.state,
+            DeliveryState::Retrying,
+            "still pending before look {look}: {:?}",
+            before.detail
+        );
+        assert_eq!(pass(now_ms), 1, "the notification is looked at");
+    }
+    let waiting = record();
+    assert_eq!(waiting.state, DeliveryState::Retrying);
+    assert_eq!(waiting.attempts, 1, "no look since the ask used an attempt");
+    assert_eq!(
+        renewal.asked(),
+        1,
+        "the gateway is not asked while the host waits"
+    );
+    assert!(gateway.sent().is_empty(), "nothing was presented");
+    assert!(!waiting.dispatched, "nothing left this host");
+    assert!(
+        waiting
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("asks again in")),
+        "it says what it is waiting for: {:?}",
+        waiting.detail
+    );
+
+    // A bearer arrives and the gateway renews again: the notification goes out.
+    renewal.allow();
+    let mut fresh = credential(NOW + 30 * 24 * 60 * 60 * 1000);
+    fresh.secret = SecretBytes32::from_bytes([0xaa; 32]);
+    fresh.revision = kr_protocol::ids::PushSenderRevision::new(2);
+    credentials.keep(fresh).expect("the bearer is kept");
+    now_ms += LONGER_THAN_ANY_BACKOFF_MS;
+    assert_eq!(pass(now_ms), 1);
+    assert_eq!(gateway.sent().len(), 1, "presented once the bearer arrived");
+    assert_eq!(record().state, DeliveryState::Accepted);
+}
+
 /// KR-REQ-16.12: the burst is admitted, the rest collapse, and every request is retained.
 #[test]
 fn the_host_collapses_its_own_excess_and_keeps_every_request() {

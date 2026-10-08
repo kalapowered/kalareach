@@ -237,6 +237,14 @@ const REVOCATION_PATIENCE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How many times a revocation is asked for at least before it is given up.
 const REVOCATION_MIN_ATTEMPTS: u32 = 3;
 
+/// The soonest a delivery waiting out a renewal's wait is looked at again, in milliseconds.
+const RENEWAL_LOOK_AT_LEAST_MS: u64 = 1_000;
+
+/// The latest a delivery waiting out a renewal's wait is looked at again, in milliseconds: a
+/// device can end the wait at any moment by handing over a bearer, and the delivery then goes out
+/// at the next look.
+const RENEWAL_LOOK_AT_MOST_MS: u64 = 10_000;
+
 /// How long after an unsettled attempt a revocation is asked for again: five minutes, doubling
 /// each time, to at most six hours.
 fn revocation_backoff_ms(attempts: u32) -> u64 {
@@ -1222,54 +1230,81 @@ impl DeliveryModule {
     /// and a status question stays a status question. Turning a question into a send would present
     /// a notification the gateway is already holding, and it would also strand the record, which
     /// holds no request once its next step is a question.
+    ///
+    /// Two things can have kept the renewal from happening. The gateway was asked and refused, or
+    /// did not answer: this attempt used the ask, so it is spent and the next is due after the
+    /// usual backoff. Or the gateway was not asked at all, because it refused the last ask and the
+    /// wait that follows a refusal has not ended ([`DeliveryError::RenewalWaits`]): the attempt
+    /// asked nothing of anybody, so it is given back, and the delivery stays as able to be sent as
+    /// it was, looked at again shortly rather than after a backoff that grows with each look. A
+    /// notification that has to wait out an hour for a renewal would otherwise use up its attempts
+    /// in the first few minutes of it and be given up on while the host was still waiting.
     fn wait_for_renewal(
         &self,
         delivery: &ClaimedDelivery,
-        detail: &str,
+        error: &kr_delivery::DeliveryError,
         now_ms: u64,
     ) -> Result<()> {
-        let next_attempt_at_ms = kr_delivery::push::next_attempt(
-            delivery.notification_id,
-            delivery.attempt,
-            now_ms,
-            delivery.expires_at_ms,
-        );
         let owed = if delivery.next == NextAction::Receipt {
             NextAction::Receipt
         } else {
             NextAction::RenewThenSend
         };
+        let (next_attempt_at_ms, spends_the_attempt) = match error {
+            kr_delivery::DeliveryError::RenewalWaits { remaining_ms, .. } => {
+                // The wait can end sooner than it was said to: a device that hands over a new
+                // bearer ends it. So the next look is never further off than the most, and a
+                // wait that ends sooner than the least is looked at when it does. The last look
+                // before the notification's own deadline is the one just before it.
+                let look = now_ms.saturating_add(
+                    (*remaining_ms).clamp(RENEWAL_LOOK_AT_LEAST_MS, RENEWAL_LOOK_AT_MOST_MS),
+                );
+                let look = look.min(delivery.expires_at_ms.get().saturating_sub(1));
+                ((look > now_ms).then(|| TimestampMs::new(look)), false)
+            }
+            _ => (
+                kr_delivery::push::next_attempt(
+                    delivery.notification_id,
+                    delivery.attempt,
+                    now_ms,
+                    delivery.expires_at_ms,
+                ),
+                true,
+            ),
+        };
         let (state, next) = match next_attempt_at_ms {
             Some(_) => (DeliveryState::Retrying, owed),
             None => (DeliveryState::Expired, NextAction::None),
         };
+        let transition = Transition {
+            notification_id: delivery.notification_id,
+            attempt: delivery.attempt,
+            state,
+            started_at_ms: TimestampMs::new(now_ms),
+            settled_at_ms: Some(TimestampMs::new(now_ms)),
+            next_attempt_at_ms,
+            next,
+            detail: Some(if owed == NextAction::Receipt {
+                format!(
+                    "the credential has to be renewed before this host asks what became of it: \
+                     {error}"
+                )
+            } else {
+                format!("the credential has to be renewed before this is presented again: {error}")
+            }),
+            suppression: None,
+            left_this_host: false,
+            reported_by_destination: false,
+        };
         self.with(|producer| {
-            producer
-                .journal_mut()
-                .record_attempt(&Transition {
-                    notification_id: delivery.notification_id,
-                    attempt: delivery.attempt,
-                    state,
-                    started_at_ms: TimestampMs::new(now_ms),
-                    settled_at_ms: Some(TimestampMs::new(now_ms)),
-                    next_attempt_at_ms,
-                    next,
-                    detail: Some(if owed == NextAction::Receipt {
-                        format!(
-                            "the credential has to be renewed before this host asks what became \
-                             of it: {detail}"
-                        )
-                    } else {
-                        format!(
-                            "the credential has to be renewed before this is presented again: \
-                             {detail}"
-                        )
-                    }),
-                    suppression: None,
-                    left_this_host: false,
-                    reported_by_destination: false,
-                })
-                .map_err(unavailable)?;
+            let journal = producer.journal_mut();
+            if spends_the_attempt {
+                journal.record_attempt(&transition).map_err(unavailable)?;
+            } else {
+                journal
+                    .record_unattempted(&transition)
+                    .map_err(unavailable)?;
+            }
             Ok(())
         })
     }
@@ -1379,7 +1414,7 @@ impl DeliveryModule {
                     // authorisation can have been let go of or given a new bearer meanwhile. A
                     // bearer the gateway refused, and one past its expiry, are another matter.
                     if delivery.next != NextAction::Send {
-                        return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                        return self.wait_for_renewal(delivery, &error, now_ms);
                     }
                     match credentials.current(push.sender_record_id) {
                         None => {
@@ -1396,7 +1431,7 @@ impl DeliveryModule {
                             current
                         }
                         Some(_) => {
-                            return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                            return self.wait_for_renewal(delivery, &error, now_ms);
                         }
                     }
                 }
