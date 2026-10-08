@@ -51,6 +51,16 @@ async fn recipient(
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
 async fn shared(host: &Host, session_id: SessionId, recipient: DeviceId) -> GrantCreateResult {
+    shared_for(host, session_id, recipient, None).await
+}
+
+/// As [`shared`], for `lifetime_ms` when it names one.
+async fn shared_for(
+    host: &Host,
+    session_id: SessionId,
+    recipient: DeviceId,
+    lifetime_ms: Option<u64>,
+) -> GrantCreateResult {
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let params = GrantCreateParams {
         session_id,
@@ -58,7 +68,7 @@ async fn shared(host: &Host, session_id: SessionId, recipient: DeviceId) -> Gran
         parent_grant_id: Nullable::null(),
         accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
         selection,
-        lifetime_ms: Nullable::null(),
+        lifetime_ms: Nullable(lifetime_ms.map(kr_protocol::scalars::DurationMs::new)),
         owner_confirmation: Nullable::null(),
     };
     host.client()
@@ -267,5 +277,76 @@ async fn kr_req_25_10_an_expired_invitation_activates_nothing() {
     assert!(refused.message.contains("expired"), "{refused:?}");
     assert!(!is_active(&host, issued.grant.grant_id));
     connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-25.10: a connection is ended at the end of the share it acts under though a request of
+/// its is still waiting to be served. The device read under a share that lasts thirty seconds, and
+/// then sent a redemption that is held at the store; the host closes the connection when the share
+/// ends and does not wait for the request. (The end of the device's own pairing grant is bounded
+/// by the connection's deadline, so it would end this connection whatever else the host did.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_pending() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let shared_at = std::time::Instant::now();
+    let short = shared_for(&host, session_id, record.device_id, Some(30_000)).await;
+    let other = shared(&host, SessionId::new(kr_ipc::new_uuid()), record.device_id).await;
+
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: short.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the short share is redeemed");
+    // A read of the session it was shared with is decided under the share. The session has no
+    // worker here, so the read is refused after it was decided, and the connection has acted
+    // under the share all the same.
+    let _ = connection
+        .read(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await;
+
+    let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+    connection
+        .submit(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: other.preview.invitation_id,
+            },
+        )
+        .await;
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(std::time::Duration::from_secs(60)))
+        .await
+        .expect("the wait for the request ran")
+        .expect("the redemption reached the store and is held there");
+    assert!(
+        !is_active(&host, other.grant.grant_id),
+        "the request is pending: nothing was written"
+    );
+
+    // The share ends thirty seconds after it was written. A request that waits for the store gives
+    // up on its own after the host's wait for an effect, forty-five seconds on, and a connection
+    // that is only looked at between requests is ended then and not before. Both are the host's
+    // own times, and the bound is between them: this is the one place the test must tell two
+    // behaviours apart by when the connection ends, since they differ in nothing else.
+    let patience = std::time::Duration::from_secs(40).saturating_sub(shared_at.elapsed());
+    assert!(
+        connection.is_closed_within(patience).await,
+        "the connection was ended with its share while a request of its was still pending"
+    );
+    go.send(()).expect("the held redemption is let go");
     host.stop().await;
 }

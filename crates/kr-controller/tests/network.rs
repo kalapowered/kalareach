@@ -5591,8 +5591,9 @@ fn sets_a_title_and_a_link(title: &str, link: &str, word: &str) -> String {
 /// KR-REQ-25.10 and KR-REQ-10.50: what a recipient is sent of the live screen is what its issuer was
 /// shown. The issuer's preview is the screen's text; a window title and the target of a link are
 /// behind that text, so a recipient is sent neither, in the screen it joins, in the updates that
-/// follow, or in the bytes that follow, whichever way it is served. The owner's own terminal,
-/// drawn the whole screen, is sent both.
+/// follow, or in the bytes that follow, whichever way it is served. So is a device that acts under
+/// its pairing grant, which the host narrows by the same rule. The owner's own terminal, drawn the
+/// whole screen, is sent both.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer_was_not_shown() {
@@ -5710,6 +5711,30 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
         .expect("the share includes the live screen");
     restoration.subscribed().expect("the order is kept");
 
+    // And a device that acts under its pairing grant, which reaches the session and its live
+    // screen: the host narrows every caller that is not the owner at this machine by one rule.
+    let own_device = Device::create(&loopback()).await;
+    let mut own_grant = proposing(&[ActionRight::SessionView], SessionSelector::Any);
+    own_grant.history.include_live_screen = true;
+    let own_record = pair_with(&daemon, &own_device, &owner, own_grant).await;
+    let own = connect(&daemon, &own_device, &own_record).await;
+    let mut own_events = own.events();
+    let own_watching = attach_one(
+        &own,
+        host.environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+    let mut restoration = Restoration::start(output_stream(), &own.cursors().await);
+    let params = restoration
+        .subscribe_params(session_id, own_watching, &[EventStream::Output])
+        .expect("the stream is waiting to subscribe");
+    own.subscribe_events(&params)
+        .await
+        .expect("the pairing grant includes the live screen");
+    restoration.subscribed().expect("the order is kept");
+
     // The screen each was joined on, and then what the application sets next.
     terminal
         .type_and_read(
@@ -5725,6 +5750,7 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
     }
     let (by_bytes, byte_kinds) = received_until(&mut raw_events, "shown-after").await;
     let (by_rendering, rendering_kinds) = received_until(&mut drawn_events, "shown-after").await;
+    let (by_pairing_grant, _) = received_until(&mut own_events, "shown-after").await;
     assert!(
         byte_kinds.contains("session.output"),
         "one recipient is served the session's bytes: {byte_kinds:?}"
@@ -5734,7 +5760,11 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
             && rendering_kinds.contains("session.projection.delta"),
         "the other is served a rendering of its grid, installed and then updated: {rendering_kinds:?}"
     );
-    for (how, received) in [("bytes", &by_bytes), ("a rendering", &by_rendering)] {
+    for (how, received) in [
+        ("bytes", &by_bytes),
+        ("a rendering", &by_rendering),
+        ("bytes, under a pairing grant", &by_pairing_grant),
+    ] {
         for hidden in [HIDDEN_TITLE, HIDDEN_LINK, LATER_TITLE, LATER_LINK] {
             assert!(
                 !received.contains(hidden),
@@ -5749,6 +5779,7 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
 
     raw.session.close();
     drawn.session.close();
+    own.close();
     drop(terminal);
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;

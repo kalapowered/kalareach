@@ -483,11 +483,11 @@ fn kr_req_10_50_a_live_screen_projection_carries_no_title_and_no_link_target_now
         viewport: engine.anchored_viewport(window),
         screen_top_row: engine.live_top_row(),
     };
-    // A new title, kept on the stack, a linked word and a link left open.
+    // A new title, kept on the stack, a linked word, and a link left open with the cursor saved in it.
     let later = format!(
         "\r\n\x1b]2;{LATER_TITLE}\x1b\\\x1b[22;2t\
          \x1b]8;;{LATER_LINK_TARGET}\x1b\\a later word\x1b]8;;\x1b\\\
-         \x1b]8;;{LATER_OPEN_LINK_TARGET}\x1b\\"
+         \x1b]8;;{LATER_OPEN_LINK_TARGET}\x1b\\\x1b7"
     );
     let at = engine.output_cursor();
     engine.feed(at, later.as_bytes(), LaneGate::default());

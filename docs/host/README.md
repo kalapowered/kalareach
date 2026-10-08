@@ -1198,7 +1198,7 @@ history keeps the raw stream underneath.
 
 | What arrives | What an attached terminal gets |
 | --- | --- |
-| Ordinary output | the same bytes, forwarded unchanged, in direct mode |
+| Ordinary output | the same bytes, forwarded unchanged, in direct mode; a caller shown the live screen alone is sent them without the commands that only describe the screen |
 | A query | nothing; the host answers it once, into the application's own input |
 | A bell, clipboard write, notification or progress report | delivered to the one attachment holding the input lease, and to nobody else |
 | A sequence the profile does not name | nothing; it is consumed with a rate-limited diagnostic |
@@ -4761,7 +4761,17 @@ another host, in an earlier boot, or past its lifetime authorises nothing.
 The transfer hands over no more than the transferring grant carries, and it advances the revision
 and fences like any other revocation.
 
-**Nothing is lent through an intermediary.** A plugin action, an attachment action and a workflow are each decided where they act, by the rights their own class needs, and none of them takes rights from the share a recipient holds. The worker holds a plugin action to the rights its declared class needs, so a recipient whose share carries `session.view` prompts no agent. `agent.draft.add_attachment` needs `files.upload` and `agent.prompt` from the device's pairing grant, since it names no session, and no share carries either; a terminal attachment is granted the capabilities the rights of the grant it was decided under allow, so a viewer's has no input and no input lease. A workflow acts under the grant it names, which for a paired device is its pairing grant and never a share, and each node needs its own rights in that grant: a node that types needs `terminal.input`.
+**Nothing is lent through an intermediary.** A plugin action, an attachment action and a workflow
+are each decided where they act, by the rights their own class needs. A plugin action and a terminal
+attachment are decided under the grant the request acts under, which is a share when the session was
+shared: the worker holds a plugin action to the rights its declared class needs, so a recipient
+whose share carries `session.view` prompts no agent, and a terminal attachment is granted the
+capabilities the rights of that grant allow, so a viewer's has no input and no input lease.
+`agent.draft.add_attachment` and a workflow act on no session and are decided under the device's
+pairing grant, never a share. The first needs `files.upload` and `agent.prompt` in that grant, and
+no share carries `files.upload`. A workflow acts under the grant it names, which for a paired device
+is its pairing grant, and each node needs its own rights in that grant: a node that types needs
+`terminal.input`.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from (naming one is not holding one), and that grant has to carry `session.share`.

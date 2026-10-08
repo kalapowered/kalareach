@@ -960,9 +960,10 @@ impl TerminalEngine {
                 .iter()
                 .filter(|named| named.start() >= start && named.end() <= span.end())
                 .filter_map(|named| {
+                    // A command the tail bound cut through is named as far as the span goes.
                     let from = usize::try_from(named.start() - start).ok()?;
-                    let to = usize::try_from(named.end() - start).ok()?;
-                    (from < to && to <= end - offset).then_some(from..to)
+                    let to = usize::try_from(named.end() - start).ok()?.min(end - offset);
+                    (from < to).then_some(from..to)
                 })
                 .collect();
             filtered.direct.push(DirectSpan {

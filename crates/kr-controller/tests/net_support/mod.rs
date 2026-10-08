@@ -717,18 +717,19 @@ impl RawDevice {
         self.action_window_id.clone()
     }
 
-    /// Submits one mutation under the action identity and the action window given, which is how a
-    /// device presents an action again on a later connection.
-    pub async fn mutate_in<P: serde::Serialize + ?Sized>(
+    /// The frame that submits one mutation, and the request it is.
+    fn mutation_frame<P: serde::Serialize + ?Sized>(
         &self,
         action_window_id: kr_protocol::ids::ActionWindowId,
         method: Method,
         action_id: kr_protocol::ids::ActionId,
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
-    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
-        use kr_client::transport::ControlTransport as _;
-        use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
+    ) -> (
+        kr_protocol::ids::RequestId,
+        kr_protocol::envelope::ControlFrame,
+    ) {
+        use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 
         let request_id = kr_protocol::ids::RequestId::new(
             self.next_request
@@ -746,6 +747,62 @@ impl RawDevice {
             requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
             params: ParamsValue::from_typed(params).expect("the parameters encode"),
         }));
+        (request_id, frame)
+    }
+
+    /// Submits one mutation and does not wait for the answer.
+    pub async fn submit<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) {
+        use kr_client::transport::ControlTransport as _;
+
+        let (_, frame) = self.mutation_frame(
+            self.action_window_id.clone(),
+            method,
+            action_id,
+            target,
+            params,
+        );
+        self.transport
+            .send(&frame)
+            .await
+            .expect("the frame is sent");
+    }
+
+    /// Reads whatever the host still sends until it closes the control stream, and says whether it
+    /// did within `within`.
+    pub async fn is_closed_within(&self, within: Duration) -> bool {
+        use kr_client::transport::ControlTransport as _;
+
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+                Err(_) => return false,
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None) | Err(_)) => return true,
+            }
+        }
+    }
+
+    /// Submits one mutation under the action identity and the action window given, which is how a
+    /// device presents an action again on a later connection.
+    pub async fn mutate_in<P: serde::Serialize + ?Sized>(
+        &self,
+        action_window_id: kr_protocol::ids::ActionWindowId,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::{ControlFrame, Outcome};
+
+        let (request_id, frame) =
+            self.mutation_frame(action_window_id, method, action_id, target, params);
         self.transport
             .send(&frame)
             .await
