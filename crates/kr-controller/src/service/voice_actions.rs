@@ -49,12 +49,13 @@ impl Controller {
                 .to_owned(),
         );
         let module = Arc::new(module);
-        // A sign-in never changes the account a call closes under: it waits for the call to end.
+        // The account never changes under a call: from the moment a start asks the broker to the
+        // moment the close has been told, the call is open, and signing in or out waits for it.
         let calls = Arc::downgrade(&module);
         self.account.watch_calls(move || {
             calls
                 .upgrade()
-                .is_some_and(|module| module.coordinator().live_sessions() > 0)
+                .is_some_and(|module| module.coordinator().calls_open())
         });
         let _ = self.voice.set(module);
     }
