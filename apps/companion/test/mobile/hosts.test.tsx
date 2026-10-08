@@ -121,6 +121,27 @@ describe('the lists of a phone', () => {
   })
 })
 
+describe('the lists of a phone, when the host changes', () => {
+  // KR-REQ-13.08: choosing another host while one is reached shows nothing of the first host's
+  // sessions, before the second answers and when it refuses to: a row of one host is never a row
+  // that asks another.
+  it('shows no row of the first host once the connection goes to another', async () => {
+    const { controls } = start()
+    await openTab('Sessions')
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
+
+    act(() => {
+      controls.switchHost('another-environment', { refuseSessionList: true })
+    })
+    expect(await screen.findByTestId('voice-entry')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByText('Session 1')).toBeNull()
+    })
+    expect(await screen.findByText(/may not list the sessions of this host/)).toBeInTheDocument()
+    expect(screen.queryByText('Session 1')).toBeNull()
+  })
+})
+
 describe('the voice entry of a phone', () => {
   // KR-REQ-15.01: there is no one to talk to while no host is reached, so there is no entry.
   it('appears while a host is reached, and goes when it is lost', async () => {

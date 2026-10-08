@@ -12,7 +12,7 @@
  * reads the protocol's table, so this screen cannot word an action more softly than the host does.
  */
 
-import { useEffect, useId, useState, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
 import type { HostPort, VoiceAllowed, VoiceScope } from '../host/port'
 import { failureMessage } from '../host/port'
@@ -47,6 +47,7 @@ export function VoiceGrantStep({
   const [granted, setGranted] = useState<VoiceAllowed | null>(null)
   /** The sessions the host granted, held while the person reads what it could not carry. */
   const [allowedIds, setAllowedIds] = useState<readonly string[] | null>(null)
+  const continueButton = useRef<HTMLButtonElement | null>(null)
 
   useEffect(() => {
     let current = true
@@ -82,6 +83,11 @@ export function VoiceGrantStep({
       current = false
     }
   }, [named, port])
+
+  // The result is read before the call is shown, and the way on is the one control left to press.
+  useEffect(() => {
+    if (granted !== null) continueButton.current?.focus()
+  }, [granted])
 
   const allow = () => {
     if (busy || chosen.size === 0) return
@@ -169,6 +175,7 @@ export function VoiceGrantStep({
                   <input
                     type="checkbox"
                     checked={chosen.has(choice.id)}
+                    disabled={granted !== null}
                     onChange={(event) => {
                       setChosen((before) => {
                         const next = new Set(before)
@@ -196,6 +203,7 @@ export function VoiceGrantStep({
             }.`}
           </p>
           <button
+            ref={continueButton}
             type="button"
             className="kr-voice__start"
             data-testid="voice-grant-continue"
