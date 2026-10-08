@@ -1957,46 +1957,13 @@ fn a_notification_waiting_for_a_renewal_keeps_its_attempts_and_goes_out_once_the
     assert_eq!(record().state, DeliveryState::Accepted);
 }
 
-/// A status route that counts the places it gives out in the gateway's allowance, the places given
-/// back, and the questions put.
-#[derive(Debug, Default)]
-struct CountedStatus {
-    taken: std::sync::atomic::AtomicU64,
-    released: std::sync::atomic::AtomicU64,
-    asked: std::sync::atomic::AtomicU64,
-}
-
-impl DeliveryStatus for CountedStatus {
-    fn status(
-        &self,
-        _credential: &PushDeliveryCredential,
-        _notification_id: NotificationId,
-    ) -> StatusAnswer {
-        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        StatusAnswer::Unanswered {
-            detail: "the gateway did not answer".to_owned(),
-        }
-    }
-
-    fn reserve(&self, _steady_ms: u64) -> bool {
-        self.taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        true
-    }
-
-    fn release(&self) {
-        self.released
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// KR-REQ-16.13: a status question that waits for a renewal is looked at again without putting a
 /// question to the gateway, so it does not spend the pass's share of the gateway's allowance for
-/// questions either: every place taken for a look goes back, and the question is put, and takes its
-/// place, when the renewal has happened.
+/// questions either. The share here is one place: every look finds it, because each look gives
+/// back what it took, and the question is put, and takes the place, when the renewal has happened.
+/// Without the give-back the second look finds no place and the pass leaves the question alone.
 #[test]
 fn a_status_question_waiting_for_a_renewal_gives_its_place_in_the_allowance_back() {
-    use std::sync::atomic::Ordering::SeqCst;
-
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
@@ -2014,7 +1981,16 @@ fn a_status_question_waiting_for_a_renewal_gives_its_place_in_the_allowance_back
     let renewal = Arc::new(RenewalThatWaitsToBeAllowed::default());
     credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
     let gateway = GatewayDouble::answering(vec![gateway_retrying()]);
-    let status = CountedStatus::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let asked = Arc::new(DeliveringGateway::retrying());
+    let one_place = kr_controller::push::status::StatusAllowance {
+        burst: 1,
+        per_hour: 1,
+    };
+    let (status, _) = status_shares(&asked, &runtime, one_place, one_place);
     let pass = |now_ms: u64| {
         environment
             .module
@@ -2034,17 +2010,12 @@ fn a_status_question_waiting_for_a_renewal_gives_its_place_in_the_allowance_back
     let mut now_ms = NOW;
     for _ in 0..20 {
         now_ms += LONGER_THAN_ANY_BACKOFF_MS;
-        assert_eq!(pass(now_ms), 1);
+        assert_eq!(pass(now_ms), 1, "the look finds the one place every time");
     }
-    assert_eq!(status.asked.load(SeqCst), 0, "no question was put");
-    assert_eq!(
-        status.taken.load(SeqCst),
-        status.released.load(SeqCst),
-        "every place taken for a look went back"
-    );
-    assert!(status.taken.load(SeqCst) >= 20);
+    assert!(asked.questions().is_empty(), "no question was put");
 
-    // The renewal happens: the question is put, and keeps its place.
+    // A fresh bearer arrives, outside the renewal window, so the question needs no renewal: it is
+    // put.
     renewal.allow();
     let mut fresh = credential(NOW + 30 * 24 * 60 * 60 * 1000);
     fresh.secret = SecretBytes32::from_bytes([0xaa; 32]);
@@ -2052,12 +2023,8 @@ fn a_status_question_waiting_for_a_renewal_gives_its_place_in_the_allowance_back
     credentials.keep(fresh).expect("the bearer is kept");
     now_ms += LONGER_THAN_ANY_BACKOFF_MS;
     assert_eq!(pass(now_ms), 1);
-    assert_eq!(status.asked.load(SeqCst), 1, "the question is put");
-    assert_eq!(
-        status.taken.load(SeqCst) - status.released.load(SeqCst),
-        1,
-        "and it keeps the place it took"
-    );
+    assert_eq!(asked.questions().len(), 1, "the question is put");
+    assert_eq!(renewal.asked(), 1, "and no second renewal was asked");
 }
 
 /// A renewal that takes long and then fails: what it does while it waits is the test's.
@@ -2817,33 +2784,61 @@ fn a_grant_that_ends_or_a_deadline_that_passes_while_a_credential_is_read_sends_
     }
 }
 
-/// KR-REQ-25.23: a credential given with a configuration is kept with it or not at all. The write
-/// asks its admission once the journal's lock is held, and a refusal there, like a refusal of the
-/// record itself, puts the store back as it was found: a destination being replaced goes on with the
-/// credential and the stamp it had, and a first configuration leaves nothing kept. The control is
-/// the same configuration admitted, which replaces both.
-#[test]
-fn a_configuration_the_write_refuses_puts_back_the_credential_it_replaced() {
-    let slack = |text: &str| kr_protocol::delivery::DestinationSecret::Slack {
-        webhook_url: kr_protocol::delivery::SecretText::new(text).expect("a credential"),
-    };
-    let store: Arc<dyn kr_crypto::store::SecretStore> =
-        Arc::new(kr_crypto::store::MemoryStore::new());
-    let secrets = || {
-        kr_controller::push::secrets::DestinationSecrets::new(
-            Arc::clone(&store),
-            kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
-        )
-    };
-    let directory = tempfile::tempdir().expect("a directory");
-    let module = DeliveryModule::open_at(
-        &directory.path().join("delivery.sqlite3"),
-        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
-        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
-        secrets(),
-    )
-    .expect("a delivery module");
-    let chat = |name: &str, endpoint: &str| DestinationRecord {
+/// A secret store that counts what is written to it and can be told to refuse writes.
+struct RecordingStore {
+    inner: kr_crypto::store::MemoryStore,
+    changes: std::sync::atomic::AtomicU64,
+    refuse_writes: std::sync::atomic::AtomicBool,
+}
+
+impl RecordingStore {
+    fn new() -> Self {
+        Self {
+            inner: kr_crypto::store::MemoryStore::new(),
+            changes: std::sync::atomic::AtomicU64::new(0),
+            refuse_writes: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// How many writes and deletions the store has been asked for.
+    fn changes(&self) -> u64 {
+        self.changes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl kr_crypto::store::SecretStore for RecordingStore {
+    fn set(&self, name: &kr_crypto::store::SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        self.changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(kr_crypto::CryptoError::SecretStore {
+                message: "this store refuses writes".to_owned(),
+            });
+        }
+        self.inner.set(name, secret)
+    }
+
+    fn get(
+        &self,
+        name: &kr_crypto::store::SecretName,
+    ) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        self.inner.get(name)
+    }
+
+    fn delete(&self, name: &kr_crypto::store::SecretName) -> kr_crypto::Result<()> {
+        self.changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.delete(name)
+    }
+
+    fn describe(&self) -> String {
+        "a store that counts its changes".to_owned()
+    }
+}
+
+/// A Slack destination named `name`, sending to `endpoint`.
+fn slack_destination(name: &str, endpoint: &str) -> DestinationRecord {
+    DestinationRecord {
         id: DestinationId::new(name).expect("an identifier"),
         destination: Destination::External(ExternalDestination {
             kind: DestinationKind::Slack,
@@ -2857,39 +2852,99 @@ fn a_configuration_the_write_refuses_puts_back_the_credential_it_replaced() {
         }),
         enabled: true,
         configured_at_ms: TimestampMs::new(NOW),
-    };
-    let first = "https://hooks.slack.com/services/T000/B000/first-credential";
-    let second = "https://hooks.slack.com/services/T000/B000/second-credential";
+    }
+}
+
+fn slack_credential(text: &str) -> kr_protocol::delivery::DestinationSecret {
+    kr_protocol::delivery::DestinationSecret::Slack {
+        webhook_url: kr_protocol::delivery::SecretText::new(text).expect("a credential"),
+    }
+}
+
+/// A delivery module over `store`, with its journal in a directory the caller keeps.
+fn module_over(store: &Arc<RecordingStore>, directory: &tempfile::TempDir) -> DeliveryModule {
+    DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::clone(store) as Arc<dyn kr_crypto::store::SecretStore>,
+            kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
+        ),
+    )
+    .expect("a delivery module")
+}
+
+fn kept_under(
+    store: &Arc<RecordingStore>,
+    name: &str,
+) -> Option<kr_controller::push::secrets::HeldSecret> {
+    kr_controller::push::secrets::DestinationSecrets::new(
+        Arc::clone(store) as Arc<dyn kr_crypto::store::SecretStore>,
+        kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
+    )
+    .get(&DestinationId::new(name).expect("an identifier"))
+    .expect("a read")
+}
+
+/// KR-REQ-25.23: a credential given with a configuration is kept with it or not at all. The record
+/// is written first, under the admission the journal asks once its lock is held, and the credential
+/// is kept only after the record stands, so a refusal there, like a refusal of the record itself,
+/// asks nothing of the secret store: a destination being replaced goes on with the credential and
+/// the stamp it had, and a first configuration leaves nothing kept. The control is the same
+/// configuration admitted, which replaces both.
+#[test]
+fn a_configuration_the_write_refuses_asks_nothing_of_the_credential_store() {
+    let (first, second) = (
+        "https://hooks.slack.com/services/T000/B000/first-credential",
+        "https://hooks.slack.com/services/T000/B000/second-credential",
+    );
+    let store = Arc::new(RecordingStore::new());
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = module_over(&store, &directory);
     let refusal = || -> kr_controller::error::Result<()> {
         Err(kr_controller::error::ControllerError::PermissionDenied {
             detail: "the grant stopped standing".to_owned(),
         })
     };
-    let kept = |name: &str| {
-        secrets()
-            .get(&DestinationId::new(name).expect("an identifier"))
-            .expect("a read")
-    };
 
     assert!(
         module
-            .configure_with_secret_if(&chat("chat", "first"), &slack(first), &|| Ok(()))
+            .configure_with_secret_if(
+                &slack_destination("chat", "first"),
+                &slack_credential(first),
+                &|| Ok(())
+            )
             .expect("the first configuration")
     );
-    let original = kept("chat").expect("the credential is kept");
+    let original = kept_under(&store, "chat").expect("the credential is kept");
 
     // A replacement the write refuses, and a first configuration the write refuses.
+    let before = store.changes();
     module
-        .configure_with_secret_if(&chat("chat", "second"), &slack(second), &refusal)
+        .configure_with_secret_if(
+            &slack_destination("chat", "second"),
+            &slack_credential(second),
+            &refusal,
+        )
         .expect_err("the write is refused");
     module
-        .configure_with_secret_if(&chat("fresh", "second"), &slack(second), &refusal)
+        .configure_with_secret_if(
+            &slack_destination("fresh", "second"),
+            &slack_credential(second),
+            &refusal,
+        )
         .expect_err("the write is refused");
-    let after = kept("chat").expect("the credential is still kept");
+    assert_eq!(
+        store.changes(),
+        before,
+        "a refused configuration wrote nothing to the credential store and deleted nothing"
+    );
+    let after = kept_under(&store, "chat").expect("the credential is still kept");
     assert_eq!(after.stamp, original.stamp, "under the stamp it had");
     assert_eq!(after.secret, original.secret, "and unchanged");
     assert!(
-        kept("fresh").is_none(),
+        kept_under(&store, "fresh").is_none(),
         "nothing is kept for a refused first"
     );
     let record = module
@@ -2910,22 +2965,147 @@ fn a_configuration_the_write_refuses_puts_back_the_credential_it_replaced() {
     // The control.
     assert!(
         module
-            .configure_with_secret_if(&chat("chat", "second"), &slack(second), &|| Ok(()))
+            .configure_with_secret_if(
+                &slack_destination("chat", "second"),
+                &slack_credential(second),
+                &|| Ok(())
+            )
             .expect("the replacement")
     );
-    let replaced = kept("chat").expect("kept");
+    let replaced = kept_under(&store, "chat").expect("kept");
     assert_ne!(replaced.stamp, original.stamp);
-    assert_eq!(replaced.secret, slack(second));
+    assert_eq!(replaced.secret, slack_credential(second));
 
     // A credential of another service than the destination's is refused before anything is kept.
-    let mut discord = chat("chat", "second");
+    let mut discord = slack_destination("chat", "second");
     if let Destination::External(external) = &mut discord.destination {
         external.kind = DestinationKind::Discord;
     }
+    let before = store.changes();
     module
-        .configure_with_secret_if(&discord, &slack(first), &|| Ok(()))
+        .configure_with_secret_if(&discord, &slack_credential(first), &|| Ok(()))
         .expect_err("a Slack credential is not a Discord destination's");
-    assert_eq!(kept("chat").expect("kept").stamp, replaced.stamp);
+    assert_eq!(store.changes(), before);
+    assert_eq!(
+        kept_under(&store, "chat").expect("kept").stamp,
+        replaced.stamp
+    );
+}
+
+/// KR-REQ-25.23: a configuration whose record is written and whose credential the secret store then
+/// refuses says so, and the destination it left sends nothing: the record names a credential the
+/// store does not hold, and a pass sends only with the credential its record names. Handing the
+/// credential over again repairs it, and the next notification is sent to the new endpoint.
+#[test]
+fn a_credential_the_store_refuses_after_the_record_is_written_leaves_a_destination_that_sends_nothing()
+ {
+    let store = Arc::new(RecordingStore::new());
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = module_over(&store, &directory);
+    let environment = Environment {
+        module,
+        device_preview: kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        path: directory.path().join("delivery.sqlite3"),
+        _directory: directory,
+    };
+    let id = DestinationId::new("chat").expect("an identifier");
+    environment
+        .module
+        .configure_with_secret_if(
+            &slack_destination("chat", "#old"),
+            &slack_credential("https://hooks.slack.com/services/T000/B000/old-credential"),
+            &|| Ok(()),
+        )
+        .expect("the first configuration");
+    let old_stamp = kept_under(&store, "chat").expect("kept").stamp;
+
+    store
+        .refuse_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = environment
+        .module
+        .configure_with_secret_if(
+            &slack_destination("chat", "#new"),
+            &slack_credential("https://hooks.slack.com/services/T000/B000/new-credential"),
+            &|| Ok(()),
+        )
+        .expect_err("the store refuses the credential");
+    assert!(
+        matches!(error, kr_controller::error::ControllerError::Storage { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("hand it over again"),
+        "the owner is told what to do: {error}"
+    );
+    assert_eq!(
+        kept_under(&store, "chat").expect("kept").stamp,
+        old_stamp,
+        "the store still holds the earlier credential"
+    );
+    let record = |environment: &Environment| {
+        environment
+            .module
+            .with(|producer| Ok(producer.journal().destination(&id).expect("a read")))
+            .expect("a read")
+            .expect("the destination")
+    };
+    let configured = record(&environment);
+    assert_ne!(
+        configured
+            .as_external()
+            .and_then(|external| external.credential.clone()),
+        Some(old_stamp),
+        "the record names the credential that was not kept"
+    );
+
+    let pass = |environment: &Environment, external: &ExternalDouble| {
+        environment
+            .module
+            .run_due(
+                &GatewayDouble::queued(),
+                &GatewayDouble::queued(),
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                external,
+                &Granted(BTreeSet::new()),
+                &|| NOW,
+            )
+            .expect("a pass");
+    };
+    let external = ExternalDouble::answering(Vec::new());
+    take_and_produce(
+        &environment,
+        &notice(1, "a command failed"),
+        std::slice::from_ref(&configured),
+        1,
+    );
+    pass(&environment, &external);
+    assert!(
+        external.sent().is_empty(),
+        "nothing is sent with a credential the record does not name"
+    );
+
+    // The credential handed over again repairs it.
+    store
+        .refuse_writes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment
+        .module
+        .configure_with_secret_if(
+            &slack_destination("chat", "#new"),
+            &slack_credential("https://hooks.slack.com/services/T000/B000/new-credential"),
+            &|| Ok(()),
+        )
+        .expect("the configuration with a working store");
+    let repaired = record(&environment);
+    take_and_produce(
+        &environment,
+        &notice(2, "a command failed again"),
+        std::slice::from_ref(&repaired),
+        2,
+    );
+    pass(&environment, &external);
+    assert_eq!(external.endpoints(), vec!["#new".to_owned()]);
 }
 
 /// A rotation neither store will take changes neither of them: section 16 keeps one replaced key,
