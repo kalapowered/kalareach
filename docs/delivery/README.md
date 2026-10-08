@@ -431,16 +431,17 @@ is asked where the destination is written, under the locks a revocation of a gra
 every pass asks it again. And a service that sends with a credential has one: the one in the call,
 or the one already kept under the identifier, handed over with `delivery.destination.secret.set`.
 
-A credential in the call is kept together with the destination or not at all. The record is written
-first, under the admission the journal asks once its lock is held, and it names the stamp the
-credential will be kept under; the credential is kept only after the record stands. A configuration
-that is refused therefore asks nothing of the secret store: a destination being replaced goes on
-sending to where it was configured to send, under the credential and the grant it had, and a first
-configuration that is refused leaves no credential kept. If the secret store then refuses the
-credential, or the host stops between the two writes, the destination is configured and sends
-nothing, because a pass sends only with the credential its record names; the answer says so, and
-handing the credential over again repairs it. Configuring under an identifier that is in use
-replaces that destination. A webhook, which sends with none, takes away any credential kept for
+A credential in the call is kept after the destination, and the two are not one write. The record
+is written first, under the admission the journal asks once its lock is held, and it names the
+stamp the credential will be kept under; the credential is kept only after the record stands. A
+configuration that is refused therefore asks nothing of the secret store: a destination being
+replaced goes on sending to where it was configured to send, under the credential and the grant it
+had, and a first configuration that is refused leaves no credential kept. If the host stops
+between the two writes, or the secret store refuses the credential, the destination is configured
+and sends nothing, because a pass sends only with the credential its record names; a store that
+refuses is told in the answer ("may send nothing", since a store can fail at its last step after
+it has written), and handing the credential over again repairs either. Configuring under an
+identifier that is in use replaces that destination. A webhook, which sends with none, takes away any credential kept for
 what it replaced, once the new destination is written.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
@@ -448,9 +449,11 @@ told, and every pass asks the grant again, so a destination under a grant that s
 told nothing.
 
 `delivery.destination.list` lists the destinations that have a rule: the paired devices' and the
-owner's, with where each sends, the grant it is told under and whether it is in force. It never
-carries a credential, and it does not say whether one is kept. A webhook's address is listed
-without its query and fragment, which can carry a token.
+owner's, with where each sends, the grant it is told under and whether it is in force. It carries
+no credential kept in the secret store, and it does not say whether one is kept: a destination
+whose configuration was written and whose credential was not is listed as in force and sends
+nothing, and its records say why. A webhook's address is listed without its query and fragment,
+which can carry a token; its path is listed as it was configured, and a path can carry one too.
 
 `delivery.destination.remove` takes a destination away with the credential kept for it. What was
 queued for it and not sent is taken back, and the answer says how many notifications that was, how
