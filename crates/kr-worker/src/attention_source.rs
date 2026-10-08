@@ -1,10 +1,11 @@
 //! One session's attention sources, as the environment's attention store reads them.
 //!
 //! The store is the control daemon's, and it keeps none of a session's text: an item names the
-//! record its text comes from. What a session holds for it is its question ledger and its host
-//! events, in the session's own journal, and this module is how the daemon reads them: a page of
-//! the records past where the store has read, and the text of records the store names when it
-//! serves them. The same reads serve a live session over its worker's attention connection and a
+//! record its text comes from. What a session holds for it is its question ledger, the
+//! transitions its broker records for pending approvals, and its host events, in the session's own
+//! journal, and this module is how the daemon reads them: a page of the records past where the
+//! store has read, and the text of records the store names when it serves them. A broker
+//! transition carries no text at all: what an approval asks is the application's to show. The same reads serve a live session over its worker's attention connection and a
 //! closed one from its journal file.
 //!
 //! # What is served as text
@@ -32,10 +33,10 @@
 //! in a journal.
 
 use kr_protocol::attention::{
-    AttentionHostRecord, AttentionHostSlice, AttentionQuestionRecord, AttentionQuestionSlice,
-    AttentionRecordText, AttentionSource, AttentionSourcePage, AttentionSourcesRequest,
-    AttentionTextAnswer, AttentionTextRequest, MAX_ATTENTION_SOURCE_RECORDS,
-    MAX_ATTENTION_SUMMARY_LEN, MAX_ATTENTION_TEXT_RECORDS,
+    AttentionApprovalSlice, AttentionHostRecord, AttentionHostSlice, AttentionQuestionRecord,
+    AttentionQuestionSlice, AttentionRecordText, AttentionSource, AttentionSourcePage,
+    AttentionSourcesRequest, AttentionTextAnswer, AttentionTextRequest,
+    MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SUMMARY_LEN, MAX_ATTENTION_TEXT_RECORDS,
 };
 use kr_protocol::question::QuestionEventKind;
 use kr_protocol::scalars::{Digest256, Nullable, U64};
@@ -89,8 +90,8 @@ pub fn serves(privacy: Option<&PrivacyRecord>, source: AttentionSource, sequence
 /// Returns one page of the session's attention source records past the cursors `request` names.
 ///
 /// The reads are made in order, each a statement of its own: the question ledger's head and its
-/// records after the cursor, then the host events' head and theirs, then the privacy record,
-/// which decides which records carry text. `built_at_boot_ms` is the caller's reading of the
+/// records after the cursor, then the broker's approvals', then the host events' head and theirs,
+/// then the privacy record, which decides which records carry text. `built_at_boot_ms` is the caller's reading of the
 /// continuous clock, taken before the first of them. A page carries at most `request.max_records`
 /// records from each source and, encoded, at most `max_bytes`; what it leaves out is read by the
 /// next request. A page with records to carry always carries one, so the reading moves on; a
@@ -115,6 +116,8 @@ pub fn page(
     .unwrap_or(1);
     let questions_head = journal.question_events_head()?;
     let questions = journal.question_events_after(request.questions_after.get(), limit)?;
+    let approvals_head = journal.broker_approvals_head()?;
+    let approvals = journal.broker_approvals_after(request.approvals_after.get(), limit)?;
     let host_events_head = journal.host_events_head()?;
     let host_events = journal.host_events_after(request.host_events_after.get(), limit)?;
     let privacy = journal.read_privacy()?;
@@ -125,6 +128,10 @@ pub fn page(
         built_at_boot_ms: U64::new(built_at_boot_ms),
         questions: AttentionQuestionSlice {
             head: U64::new(questions_head),
+            records: Vec::new(),
+        },
+        approvals: AttentionApprovalSlice {
+            head: U64::new(approvals_head),
             records: Vec::new(),
         },
         host_events: AttentionHostSlice {
@@ -139,7 +146,7 @@ pub fn page(
     // room for each list's length to grow.
     let mut used = frame_size(&page)
         .saturating_add(measure(&U64::new(u64::MAX)))
-        .saturating_add(2 * LIST_SLACK);
+        .saturating_add(3 * LIST_SLACK);
 
     for (sequence, event) in questions {
         if sequence > questions_head {
@@ -159,6 +166,21 @@ pub fn page(
             break;
         }
         page.questions.records.push(record);
+    }
+
+    for record in approvals {
+        if record.sequence.get() > approvals_head {
+            break;
+        }
+        if !fits(
+            &mut used,
+            measure(&record),
+            max_bytes,
+            carries_nothing(&page),
+        ) {
+            break;
+        }
+        page.approvals.records.push(record);
     }
 
     for (sequence, event) in host_events {
@@ -301,8 +323,8 @@ fn host_record(
 /// Cuts records from the end of a page until the frame that carries it fits `max_bytes`, and
 /// answers whether it does.
 ///
-/// Host events go before questions, and each source keeps the records nearest its cursor, so what
-/// is cut is read by the next request. A page that had records keeps at least one: if one record
+/// Host events go first, then approvals, then questions, and each source keeps the records
+/// nearest its cursor, so what is cut is read by the next request. A page that had records keeps at least one: if one record
 /// does not fit, the page does not fit.
 #[must_use]
 pub fn fit(page: &mut AttentionSourcePage, max_bytes: usize) -> bool {
@@ -310,10 +332,14 @@ pub fn fit(page: &mut AttentionSourcePage, max_bytes: usize) -> bool {
         if frame_size(page) <= max_bytes {
             return true;
         }
-        if page.questions.records.len() + page.host_events.records.len() <= 1 {
+        if page.questions.records.len()
+            + page.approvals.records.len()
+            + page.host_events.records.len()
+            <= 1
+        {
             return false;
         }
-        if page.host_events.records.pop().is_none() {
+        if page.host_events.records.pop().is_none() && page.approvals.records.pop().is_none() {
             page.questions.records.pop();
         }
     }
@@ -339,7 +365,9 @@ fn fits(used: &mut usize, cost: usize, max_bytes: usize, nothing_yet: bool) -> b
 }
 
 fn carries_nothing(page: &AttentionSourcePage) -> bool {
-    page.questions.records.is_empty() && page.host_events.records.is_empty()
+    page.questions.records.is_empty()
+        && page.approvals.records.is_empty()
+        && page.host_events.records.is_empty()
 }
 
 /// Returns the encoded size of a value, as a frame carries it.
