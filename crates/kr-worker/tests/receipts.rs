@@ -5084,6 +5084,37 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
     );
 }
 
+/// KR-REQ-09.17, KR-REQ-09.19: a worker follows a confirmation once, so the mark it sets stays
+/// the furthest it has proved. The owner confirms the clock and the worker follows it; the wall
+/// clock then steps forward an hour, which the confirmation does not mind, and the worker proves
+/// that reading; and the clock goes back three seconds at each of the next three looks, every one
+/// of them inside the tolerance. Nine seconds behind its mark is a rollback, as it is for a worker
+/// that never met a confirmation. A worker that took the same confirmation again at every look
+/// would set its mark to the lower reading each time, and never find it.
+#[test]
+fn a_worker_follows_a_confirmation_once_so_a_clock_that_slips_after_it_is_found() {
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    machine.runs(AN_HOUR);
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert!(session.time().durable_state().0.owner_confirmed);
+    machine.wall.advance(AN_HOUR);
+    session.observe_time();
+    for _ in 0..3 {
+        machine.runs(std::time::Duration::from_secs(1));
+        machine.steps_back(std::time::Duration::from_secs(3));
+        session.observe_time();
+    }
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "nine seconds behind its mark, at three looks, is a rollback"
+    );
+}
+
 /// KR-REQ-09.18, KR-REQ-09.19: a worker that restarts on a journal recording its clock as
 /// distrusted takes no confirmation made before it restarted as the answer, even when it finds the
 /// rollback again at once. The worker proves its clock; the owner, whose clock is ten minutes
@@ -5262,6 +5293,24 @@ fn a_worker_started_after_an_establishment_does_not_follow_it() {
     session.observe_time();
     assert_eq!(session.time().trust(), WallClockTrust::Trusted);
     assert_eq!(session.collect_expired(), 1);
+
+    // A worker that trusted its clock when it stopped does not take an establishment made before
+    // it restarted for its own reason to trust the clock, either.
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    drop(session);
+    machine.runs(std::time::Duration::from_secs(1));
+    machine.owner_establishes(&floor);
+    machine.runs(std::time::Duration::from_secs(1));
+    let mut session = a_worker_on_floor(&machine, &floor, &environment, session_id);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    assert!(
+        !session.time().durable_state().0.owner_confirmed,
+        "a clock its own time service vouches for is not the owner's"
+    );
 }
 
 /// KR-REQ-09.12, 09.13: a fence report bigger than one acknowledgement is delivered a page at a
