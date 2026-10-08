@@ -126,14 +126,14 @@ for its own installation together with the other device's sender record identifi
 pass when both authorisations name this host: the bearer is active, and the gateway holds a record
 under that identifier for the host's key. The host then holds the other device's authorisation
 under the first device's destination. While that destination names it the other device cannot
-register it, and when the destination is replaced or its device unpaired the host asks the gateway
-to revoke it.
+register it, and when the destination is replaced, removed, or its device unpaired, the host asks
+the gateway to revoke it.
 
 It needs the other device's identifier, a 128-bit UUID its installation chose that no host method
-returns, so only a leak of it makes the attack possible. The fix is not in the host alone. The gateway's answer
-to the first question has to name the sender record a bearer was issued for, and the host then
-refuses a registration whose claimed record differs. Until the gateway says it, the host cannot
-tell the two apart.
+returns, so only a leak of it makes the attack possible. The fix is not in the host alone. The
+gateway's answer to the first question has to name the sender record a bearer was issued for, and
+the host then refuses a registration whose claimed record differs. Until the gateway says it, the
+host cannot tell the two apart.
 
 A bearer for another authorisation is found at the first delivery, which the gateway refuses. The
 host's renewal repairs that only for the same installation, and only in the last week of the
@@ -162,12 +162,15 @@ loads the item, and a daemon that stopped for it would deliver to nobody.
 The gateway keeps one bearer for an authorisation. A renewal replaces it, and so does an issue by
 the device's installation, and the host learns of the first from the gateway's answer and of the
 second from the device. The two can be in flight together and arrive in either order, and the order
-they arrive in says nothing of the order the gateway made them in. The gateway stamps each
-credential with its own clock, so the host keeps whichever of two credentials was issued later: a
-registration leaves a newer renewal in place, and a renewal that comes back late leaves a newer
-registration in place. The issue time on a credential a device hands over is the device's word, but
-a device that lies about it can keep a retired bearer for its own destination and nothing else, and
-a credential issued in the future is refused before it is kept.
+they arrive in says nothing of the order the gateway made them in. The gateway adds one to the
+record's revision with each renewal and each issue, so when the credential held changed while the
+other was on its way, the host keeps the one with the higher revision: a registration leaves a
+newer renewal in place, and a renewal that comes back late leaves a newer registration in place. A
+renewal that finds nothing changed since it was asked is the gateway's latest by construction and
+is kept whatever the held credential claims. The revision on a credential a device hands over is
+the device's word. A device that lies about it can decide that race for its own destination, which
+costs it a retired bearer and costs no other destination anything, and the next renewal asked for
+with nothing changed meanwhile replaces it.
 
 A rejected token takes the destination out of service, and the next start removes its stored
 credential. After the host's first renewal the phone's copy of the bearer is dead too, so the phone
@@ -175,17 +178,21 @@ issues again before it registers.
 
 A renewal the gateway refuses or does not answer is asked for again after five minutes, then ten,
 doubling to an hour. A credential's expiry is the device's word, and one that says it is due while
-the gateway holds a longer life is refused at every ask. Each ask is two requests of the gateway's
-sixty. Asked at every round of questions it would cost twenty-four requests an hour for as long as
-the credential lasts; with the wait it costs eight in the first hour and two an hour after that.
-A new bearer from the device ends the wait, because it opens the hour after an issue in which the
-gateway renews again. The same bearer handed over again does not.
+the gateway holds a longer life is refused at every ask, and so is one that says it has already
+expired, or a record the gateway has revoked. Each ask is two requests of the gateway's sixty.
+Asked at every round of questions it would cost twenty-four requests an hour for as long as the
+credential lasts, and eight more for every notification that waits on it; with the wait it costs
+eight in the first hour and two an hour after that, expired or not. A new bearer from the device
+ends the wait, because it opens the hour after an issue in which the gateway renews again. The same
+bearer handed over again does not.
 
 A renewal that fails does not hold a notification back while the bearer held still works. The
 gateway has not refused it, and it works until its expiry, so the notification is sent under it and
-the host goes on asking for the renewal after its wait. A bearer the gateway refused, and one past
-its expiry, are renewed first: nothing presents them until they are, and a credential past its
-expiry is asked about at every attempt, wait or no wait.
+the host goes on asking for the renewal after its wait. What is presented is what is held after the
+renewal returned, and only if it has not expired by the clock then: the renewal waited on the
+gateway, and the authorisation can have been let go of or given a new bearer meanwhile. A bearer
+the gateway refused, one past its expiry, and a question about what became of a notification are
+renewed first, and wait for it; the notification's attempts run while it waits.
 
 ### Unpairing
 
@@ -399,22 +406,27 @@ an identifier the host chooses.
 
 Three checks come before anything is kept. The identifier is not a paired device's: that
 destination is made by the device's own registration, and a configuration under its identifier
-would take it over. The grant stands now, which means it is found, redeemed, inside its bounds and
-not revoked, and a grant issued to a paired device is only as good as that device's pairing. And a
-service that sends with a credential has one kept under the identifier already, handed over with
-`delivery.destination.secret.set`. Configuring under an identifier that is in use replaces that
-destination.
+would take it over. The grant stands, which means it is found, redeemed, inside its bounds and not
+revoked, it carries a right a notification can ask for (`session.view`, `automation.manage` or
+`host.manage`), and a grant issued to a paired device is only as good as that device's pairing; it
+is asked where the destination is written, under the locks a revocation of a grant takes, and
+every pass asks it again. And a service that sends with a credential has one kept under the
+identifier already, handed over with `delivery.destination.secret.set`. Configuring under an
+identifier that is in use replaces that destination, and the credential kept for what it replaced
+is removed once the new destination is written.
 
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
 told nothing.
 
 `delivery.destination.remove` takes a destination away with the credential kept for it. What was
-queued for it and not sent is taken back, and the answer says how many notifications that was and
-how many were already on the wire and now have an outcome nobody can settle. Removing a paired
-device's destination ends its delivery as unpairing does, without unpairing the device. The host
-owes the gateway a revocation of the device's authorisation, so the device's installation issues
-another before the device registers again.
+queued for it and not sent is taken back, and the answer says how many notifications that was, how
+many had been sent once and now have an outcome nobody can settle, and how many attempts were on
+the wire at that moment: each of those finishes and reports its answer, and the destination may
+still receive the message. Removing a paired device's destination ends its delivery as unpairing
+does, without unpairing the device. The host owes the gateway a revocation of the device's
+authorisation, so the device's installation issues another before the device registers again, and
+a device that registers again does not owe the revocation a second time.
 
 ### Credentials
 
