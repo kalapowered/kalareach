@@ -69,8 +69,8 @@ impl Controller {
         };
         if hello.client != LocalClientKind::Worker {
             return Err(ControllerError::rendezvous(
-                "only a worker's startup claim or its request for the plugin runtime is accepted \
-                 here",
+                "only a worker's startup claim, its request for the plugin runtime or its questions \
+                 about a draft are accepted here",
             ));
         }
         let outcome = self

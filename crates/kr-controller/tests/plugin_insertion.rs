@@ -303,6 +303,39 @@ async fn kr_req_23_30_a_plan_that_offers_another_attachment_claims_nothing() {
     assert_eq!(after.revision, draft.revision);
 }
 
+/// KR-REQ-23.30: a plan that is of the declared class and names the attachment, but proposes
+/// another operation than the one the action declares, is refused before the draft is claimed: the
+/// attachment is not marked and the draft does not move for a plan that is refused after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_a_plan_that_proposes_another_operation_claims_nothing() {
+    let Some((acting, draft, handle)) = offering().await else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let mutation = acting.offering(
+        &client,
+        "attach.as.cancel",
+        draft.draft_id,
+        handle.transfer_id,
+    );
+    let action_id = mutation.action_id;
+    let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+        panic!("a plan that proposes another operation was carried");
+    };
+    assert_eq!(refusal.code, ErrorCode::InvalidArgument, "{refusal:?}");
+    assert_eq!(
+        read_receipt(&mut client, action_id)
+            .await
+            .expect("a receipt")
+            .state,
+        ReceiptState::Rejected
+    );
+    assert!(acting.frames().is_empty());
+    let after = acting.draft(draft.draft_id);
+    assert_eq!(state_of(&after, &handle), InsertionState::Recorded);
+    assert_eq!(after.revision, draft.revision, "nothing was claimed");
+}
+
 /// KR-REQ-24.09 and KR-REQ-12.30: an upstream that refuses leaves the binding `failed` with the
 /// reason, one that does not answer leaves it `unknown`, and in both the draft and the completed
 /// upload are kept; the same upload is then offered again as a new attempt and is accepted, and no
@@ -912,7 +945,7 @@ async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refuse
             "a binding recorded to be inserted another way",
             composer.draft_id,
             Box::new(|_| {}),
-            ErrorCode::DraftConflict,
+            ErrorCode::InvalidArgument,
         ),
         (
             "a draft for another application instance",

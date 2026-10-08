@@ -68,6 +68,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("cancel.reasoned", "upstream.cancel"),
     ("attach.photo", "upstream.attachment"),
     ("attach.other", "upstream.attachment"),
+    ("attach.as.cancel", "upstream.attachment"),
     ("cancel.other.action", "upstream.cancel"),
     ("cancel.other.class", "upstream.cancel"),
     ("cancel.as.prompt", "upstream.cancel"),

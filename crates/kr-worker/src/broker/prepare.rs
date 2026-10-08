@@ -34,7 +34,6 @@ use kr_protocol::broker::{PreparedEffect, PreparedOperation};
 use kr_protocol::ids::{ActionId, ActorId, BrokerBindingId, TransferId};
 use kr_protocol::insertion::{DraftFacts, InsertionBegin};
 use kr_protocol::scalars::{Digest256, Nullable, U64};
-use kr_protocol::transfer::{DraftState, InsertionMethod, InsertionState};
 
 use crate::daemon_link::{ClaimHold, ReportSlot};
 
@@ -245,8 +244,9 @@ impl Broker {
     /// and [`BrokerError::UnsupportedCapability`] when it never will be: the broker refused it
     /// (the admissions and the package's manifest name different components), or it is disabled.
     /// A component the runtime refused is offered again by the link after a delay, so it is
-    /// waited for. A draft-acting action gets `UNSUPPORTED_CAPABILITY` too, because this worker
-    /// does not read drafts from the control daemon yet.
+    /// waited for. An action that offers an attachment is refused `UNSUPPORTED_CAPABILITY` when its
+    /// package does not contribute attachments by an upload to the upstream, or the action does
+    /// not declare the one parameter that names the attachment.
     pub fn prepare_request(
         &self,
         caller: &Caller,
@@ -577,7 +577,7 @@ impl Broker {
         let remaining = until.saturating_duration_since(tokio::time::Instant::now());
         let Some(call) = remaining
             .checked_sub(ROUND_TRIP_ALLOWANCE)
-            .filter(|call| !call.is_zero() && call.as_millis() > 0)
+            .filter(|call| call.as_millis() > 0)
         else {
             return Err(BrokerError::ResourceUnavailable {
                 detail: "the time to prepare this action ran out before the component was asked"
@@ -747,9 +747,15 @@ fn left_until(until: tokio::time::Instant) -> Duration {
     until.saturating_duration_since(tokio::time::Instant::now())
 }
 
-/// Checks the draft against what the action's package declares it offers: the draft is open, is
-/// for the instance the call names, holds the attachment as a binding nothing has claimed yet, and
-/// the binding is what the package's contribution accepts.
+/// Checks the draft against what the action's package declares it offers: the draft is for the
+/// instance the call names, holds the attachment as a binding, and the attachment is what the
+/// package's contribution accepts.
+///
+/// What the control daemon owns it decides when it claims the binding: that the draft is open, that
+/// the binding is `recorded` and is a typed submission, and how many attachments the draft may
+/// hold, which the claim is given the package's figure for. This checks what only the worker sees,
+/// the package's declaration, so that an attachment the package would not take is refused before
+/// anything is claimed.
 fn check_declared_attachment(
     needs: &DraftNeeds,
     facts: &DraftFacts,
@@ -757,12 +763,6 @@ fn check_declared_attachment(
 ) -> Result<U64> {
     let contribution = &needs.contribution;
     let moved = |detail: String| BrokerError::PreconditionFailed { detail };
-    if facts.state != DraftState::Open {
-        return Err(moved(format!(
-            "{action} acts on a draft that is {}",
-            facts.state.as_str()
-        )));
-    }
     if let Some(named) = facts.application_instance_id.as_ref()
         && *named != needs.application_instance_id
     {
@@ -780,27 +780,6 @@ fn check_declared_attachment(
                 needs.transfer_id
             ))
         })?;
-    if binding.state != InsertionState::Recorded {
-        return Err(moved(format!(
-            "{} is {} on the draft, and only a recorded binding is offered",
-            needs.transfer_id,
-            binding.state.as_str()
-        )));
-    }
-    if binding.insertion_method != InsertionMethod::TypedSubmission {
-        return Err(moved(format!(
-            "{} was recorded to be inserted by {}, which is not how this package offers it",
-            needs.transfer_id,
-            binding.insertion_method.as_str()
-        )));
-    }
-    if facts.bindings.len() as u64 > u64::from(contribution.max_count.get()) {
-        return Err(moved(format!(
-            "the package accepts {} attachments and the draft holds {}",
-            contribution.max_count.get(),
-            facts.bindings.len()
-        )));
-    }
     if binding.byte_len.get() > contribution.max_bytes.get() {
         return Err(BrokerError::invalid(format!(
             "the package accepts {} bytes of an attachment and this one is {}",
@@ -907,6 +886,15 @@ fn effect_of(plan: &WirePlan, request: &PreparationRequest) -> Result<PreparedEf
             )));
         }
     };
+    // The operation the declaration names is the only one this action carries, and a plan that
+    // proposes another is refused here, before anything is claimed for it. The broker compares it
+    // again against the declaration in force when the plan comes back to be validated.
+    if request.declared.operation != Some(operation) {
+        return Err(BrokerError::invalid(format!(
+            "the component's plan for {action} prepares a different operation than the one the \
+             action declares"
+        )));
+    }
     Ok(PreparedEffect {
         action: action.clone(),
         class: kr_protocol::authority::EffectClass::Write,
