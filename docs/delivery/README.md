@@ -192,7 +192,11 @@ the host goes on asking for the renewal after its wait. What is presented is wha
 renewal returned, and only if it has not expired by the clock then: the renewal waited on the
 gateway, and the authorisation can have been let go of or given a new bearer meanwhile. A bearer
 the gateway refused, one past its expiry, and a question about what became of a notification are
-renewed first, and wait for it; the notification's attempts run while it waits.
+renewed first, and wait for it. While the host waits out a refusal, the notification stays pending
+and is looked at again every few seconds. A look asks the gateway nothing and uses no attempt, so
+the wait costs the notification none of its eight, and it goes out as soon as a renewal succeeds or
+the device hands over a new bearer. An attempt is spent only when the gateway is asked and refuses or
+does not answer. A notification that expires before the renewal comes expires; it is never sent late.
 
 ### Unpairing
 
@@ -215,7 +219,10 @@ is not this authorisation's, revoked, leaves the revocation owed. The debt survi
 start forgets whatever the secret store still keeps of an authorisation a debt names, so a stop
 between ending a destination and deleting its item leaves nothing behind. A device revoked while
 the daemon was down, or whose grant the host has found to have run out, has its destination ended
-the same way at the next start. A destination that already received a notification stays in the
+the same way at the next start. A grant that runs out while the daemon is up ends the destination
+when the host finds it: the next notification that asks about the device, or the next round of
+questions, which asks where every paired device's grant stands. A device record that cannot be
+marked revoked ends the destination all the same, before the unpairing answers with its error. A destination that already received a notification stays in the
 journal, out of service and with no rule, as the name of what was sent to it.
 
 ## Who may be told
@@ -252,9 +259,11 @@ the send. A bound, a revocation, an unpairing or a narrower rights ceiling that 
 asking is not caught: the notification is presented. What the grant reaches is digested with the
 notification, so a change to it settles the notification as revoked rather than sending it.
 
-An external destination asks twice, when the notification is produced and when it is claimed. After
-the claim, the send reads the destination's credential from the secret store and takes the privacy
-admission before it sends. A bound or a deadline that ends in those waits is not caught.
+An external destination asks three times: when the notification is produced, when it is claimed,
+and once more after the send has read the destination's credential from the secret store, which can
+take as long as the store does. A grant that ends, or a device that is unpaired, while the
+credential is being read sends nothing. The last asking comes before the send takes the privacy
+admission. A bound or a deadline that ends in that wait for the admission is not caught.
 
 ## Two sizes, measured rather than estimated
 
@@ -399,7 +408,7 @@ own message, which names the address.
 ### Configuring and removing a destination
 
 The owner creates an external destination with `delivery.destination.configure`, on the host's own
-socket and nowhere else. The call names an identifier, the service (webhook, Slack, Discord,
+socket and nowhere else, and `kr destination` is the command that calls it (`docs/cli/README.md`). The call names an identifier, the service (webhook, Slack, Discord,
 Telegram or email), where it sends, a rule's name, and a grant. A webhook may also name the header
 it deduplicates by. The other four take none, because none of those services recognises a repeat by
 an identifier the host chooses.
@@ -418,6 +427,10 @@ is removed once the new destination is written.
 The rule's name is a label; nothing selects a rule by it. The grant decides what the destination is
 told, and every pass asks the grant again, so a destination under a grant that stops standing is
 told nothing.
+
+`delivery.destination.list` says which destinations are in service: the paired devices' and the
+owner's, with where each sends and the grant it is told under. It never carries a credential, and it
+does not say whether one is kept.
 
 `delivery.destination.remove` takes a destination away with the credential kept for it. What was
 queued for it and not sent is taken back, and the answer says how many notifications that was, how
