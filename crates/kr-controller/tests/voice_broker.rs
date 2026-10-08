@@ -1933,6 +1933,8 @@ async fn a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended() {
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
     listen_for_sign_ins_on(&host, free_port());
     sign_in_with(&host, broker.issue_grant(600)).await;
+    // The preparation asks for a token, which settles what the daemon found when it started.
+    let _prepared = ready(&host, &owner).await;
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
     // The kept grant cannot be read, so the new one cannot replace it: a directory stands in its
