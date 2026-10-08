@@ -711,8 +711,14 @@ impl Controller {
             | Method::DeviceRevoke
             | Method::DevicePreviewKeyUpdate
             | Method::DeliveryDestinationSecretSet => {
-                self.authority_change(actor_id, mutation, method, carried)
-                    .await
+                self.authority_change(
+                    actor_id,
+                    super::authority_changes::AuthorityCaller::Owner,
+                    mutation,
+                    method,
+                    carried,
+                )
+                .await
             }
             Method::EnvironmentEnrol | Method::EnvironmentForget | Method::EnvironmentRefresh => {
                 // The envelope this host built for the connection, not anything the caller sent.

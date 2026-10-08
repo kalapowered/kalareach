@@ -906,12 +906,16 @@ pub(crate) fn offline_anchor(
 /// A paired device's request, as this host decided it.
 ///
 /// The time bounds it was decided under travel inside it, each as the snapshot the decision loaded
-/// with its cell: the membership lease ([`crate::grants::Permitted::lease`]) and the bounded offline
-/// validity ([`crate::grants::Permitted::offline`]).
+/// with its cell: the membership lease ([`crate::grants::Permitted::lease`]), the bounded offline
+/// validity ([`crate::grants::Permitted::offline`]) and, for a request decided under a share, the
+/// share's own end.
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceDecision {
     /// The decision itself.
     pub decided: crate::config::ceilings::Decided,
+    /// The end of the share the request was decided under, when it was decided under one: a bound
+    /// of its own, held as the others are.
+    pub share: Option<crate::grants::policy::HeldBound>,
 }
 
 impl DeviceDecision {
@@ -923,6 +927,7 @@ impl DeviceDecision {
             .lease
             .iter()
             .chain(permitted.offline.iter())
+            .chain(self.share.iter())
             .cloned()
             .collect()
     }
@@ -1854,7 +1859,10 @@ impl Controller {
                     },
                 ))
             }
-            decided => decided.map(|decided| DeviceDecision { decided }),
+            decided => decided.map(|decided| DeviceDecision {
+                decided,
+                share: None,
+            }),
         };
         if matches!(
             &decided,

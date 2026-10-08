@@ -50,7 +50,7 @@ mod admission_rounds;
 
 mod admission;
 mod attention_reach;
-mod authority_changes;
+pub(crate) mod authority_changes;
 mod barrier;
 mod capabilities;
 mod close;

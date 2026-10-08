@@ -426,31 +426,28 @@ impl SharingService {
     /// Section 25: an invitation is single use. Redemption is where that is true of the *grant*:
     /// the ledger's row and the grant's activation are one commit, the redeeming device has to be
     /// the one the invitation names, and a second attempt by anybody finds the work done. An
-    /// invitation that was withdrawn or has expired activates nothing, so cancelling one is a
+    /// invitation that was withdrawn or has expired activates nothing, so withdrawing one is a
     /// complete answer rather than a note beside a live grant.
+    ///
+    /// `still_admitted` is run inside the commit, before anything is written, and `claim` is the
+    /// hold of the action performing the redemption, when an action performs it: the answer is
+    /// written beside it in the same commit ([`GrantDirectory::redeem`]).
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
-    /// [`ControllerError::PermissionDenied`] when it was withdrawn, has expired, has already been
-    /// redeemed, or names another device.
+    /// Returns [`ControllerError::PermissionDenied`] when the invitation is unknown or names
+    /// another device, and, for the device it names, when it was withdrawn, has expired or has
+    /// already been redeemed.
     pub fn redeem(
         &self,
         invitation_id: InvitationId,
         device_id: DeviceId,
         now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<Grant> {
-        self.grants.redeem(invitation_id, device_id, now_ms)
-    }
-
-    /// Withdraws an invitation, and with it the proposal it carries, in one commit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::PermissionDenied`] when it is no longer open.
-    pub fn cancel(&self, invitation_id: InvitationId, now_ms: u64) -> Result<()> {
-        self.grants.cancel_invitation(invitation_id, now_ms)?;
-        Ok(())
+        self.grants
+            .redeem(invitation_id, device_id, now_ms, still_admitted, claim)
     }
 
     /// Transfers control of a session from one device to another, in one commit.
