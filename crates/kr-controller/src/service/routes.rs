@@ -786,6 +786,19 @@ impl Controller {
                     )
                     .await;
             }
+            // Signing out is claimed the same way: a retry of a request whose answer was lost is
+            // answered from the first, and does not sign out an account signed in since.
+            Method::AccountSignOut => {
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        connection_id,
+                        admitted,
+                        self.account_sign_out(mutation),
+                    )
+                    .await;
+            }
             // A machine group step changes this environment's own record under the revision it was
             // admitted at, read before anything waited rather than again here: a revocation of
             // another device stamps every surviving connection with the revision it advanced to,

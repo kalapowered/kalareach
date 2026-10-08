@@ -14,6 +14,10 @@
 //! | KR-REQ-17.23 | `a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_why` |
 //! | KR-REQ-17.23 | `a_sign_in_request_sent_again_is_answered_from_the_first` |
 //! | KR-REQ-17.23 | `a_sign_in_never_changes_the_account_a_call_closes_under` |
+//! | KR-REQ-17.23 | `signing_the_host_out_ends_the_grant_and_a_call_presents_no_account_after_it` |
+//! | KR-REQ-17.23 | `a_sign_out_never_changes_the_account_a_call_closes_under` |
+//! | KR-REQ-17.23 | `a_sign_out_request_sent_again_is_answered_from_the_first` |
+//! | KR-REQ-17.23 | `a_sign_out_ends_the_sign_in_that_is_waiting` |
 //! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
 //! | KR-REQ-17.23 | `an_account_signed_in_at_one_service_is_reached_only_through_that_service` |
 //! | KR-REQ-17.23 | `a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts` |
@@ -34,9 +38,10 @@ use kr_client::services::account::{
 };
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
+use kr_protocol::error::ProtocolError;
 use kr_protocol::host_account::{
-    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountState,
-    AccountStatusParams, SignInUnavailable,
+    AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountSignOutParams,
+    AccountSignedOut, AccountState, AccountStatusParams, SignInUnavailable,
 };
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{ActionId, EnvironmentId, SessionId};
@@ -658,6 +663,75 @@ async fn mutate<P: serde::Serialize + ?Sized>(
         .expect("the host answers")
 }
 
+/// Signs the host out at its local socket under the action given, on the connection given.
+async fn sign_out_on(
+    client: &mut kr_ipc::client::LocalClient,
+    host: &net_support::Host,
+    action: ActionId,
+) -> Result<AccountSignedOut, ProtocolError> {
+    client
+        .mutate(
+            Method::AccountSignOut,
+            action,
+            ActionTarget::environment(host.environment_id),
+            &AccountSignOutParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("a sign-out answer"))
+}
+
+/// Signs the host out at its local socket under the action given.
+async fn sign_out_as(
+    host: &net_support::Host,
+    action: ActionId,
+) -> Result<AccountSignedOut, ProtocolError> {
+    sign_out_on(&mut host.client().await, host, action).await
+}
+
+/// Signs the host out, under a new action.
+async fn sign_out(host: &net_support::Host) -> AccountSignedOut {
+    sign_out_as(host, ActionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect("the daemon signs the host out")
+}
+
+/// A call a paired device starts, brokered under the account the host is signed in as.
+async fn start_a_call(
+    host: &net_support::Host,
+    owner: &DeviceKeys,
+) -> (
+    net_support::Device,
+    kr_client::session::Session,
+    Box<kr_protocol::voice::VoiceSessionDescriptor>,
+) {
+    let (device, session, session_id, prepared) = ready(host, owner).await;
+    let terms = prepared
+        .managed
+        .as_ref()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+    let started: VoiceStartResult = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStart,
+        &VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
+            expected_rate_version: Nullable::some(terms.rate.version.clone()),
+        },
+    )
+    .await
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the broker created the call: {:?}", started.outcome);
+    };
+    (device, session, call)
+}
+
 /// A paired device with a voice grant, and the preparation it read.
 async fn ready(
     host: &net_support::Host,
@@ -1116,30 +1190,7 @@ async fn a_sign_in_never_changes_the_account_a_call_closes_under() {
     // A sign-in begins, and then a call opens while the person is in the browser.
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
-    let (_device, session, session_id, prepared) = ready(&host, &owner).await;
-    let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
-    let started: VoiceStartResult = mutate(
-        &session,
-        host.environment_id,
-        Method::VoiceStart,
-        &VoiceStartParams {
-            session_ids: [session_id].into_iter().collect(),
-            offer_sdp: "v=0\r\n".to_owned(),
-            duration_seconds: 600,
-            reasoning_budget_minor: Nullable::null(),
-            prepared: prepared.prepared,
-            expected_rate_version: Nullable::some(terms.rate.version.clone()),
-        },
-    )
-    .await
-    .to_typed()
-    .expect("a start result");
-    let VoiceStartOutcome::Started { session: call } = started.outcome else {
-        panic!("the broker created the call: {:?}", started.outcome);
-    };
+    let (_device, session, call) = start_a_call(&host, &owner).await;
     let _ = browser_answers(&address, &url, "the-code").await;
     let report = settled(&host).await;
     assert_eq!(
@@ -1183,6 +1234,186 @@ async fn a_sign_in_never_changes_the_account_a_call_closes_under() {
     )
     .await;
     start_sign_in(&host).await;
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: signing the host out removes the grant at once and asks the service to end it, so
+/// a call after it presents no account; a revocation the service does not acknowledge is sent
+/// again when the daemon next starts; and signing out a host with no account changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_the_host_out_ends_the_grant_and_a_call_presents_no_account_after_it() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::SignedIn { .. }
+    ));
+
+    let done = sign_out(&host).await;
+    assert_eq!(
+        done,
+        AccountSignedOut {
+            was_signed_in: true,
+            service_told: true
+        }
+    );
+    assert_eq!(broker.revoked(), [broker.refresh(1)]);
+    let report = account_report(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut);
+    assert_eq!(report.last_attempt.as_ref(), None);
+    let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
+    assert!(
+        prepared.managed.as_ref().is_none(),
+        "no terms were read without an account"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .all(|request| request.authorization.is_none()),
+        "the broker was shown no account"
+    );
+
+    // With no account signed in there is nothing to end, and nothing more is sent.
+    assert_eq!(
+        sign_out(&host).await,
+        AccountSignedOut {
+            was_signed_in: false,
+            service_told: true
+        }
+    );
+    assert_eq!(broker.revoked().len(), 1);
+
+    // A service that cannot be told leaves the grant gone from this host, and is told when the
+    // daemon next starts.
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    broker.refuse_revocations(true);
+    assert_eq!(
+        sign_out(&host).await,
+        AccountSignedOut {
+            was_signed_in: true,
+            service_told: false
+        }
+    );
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    assert_eq!(broker.revoked().len(), 1, "the service refused it");
+    let stopped = host.shut_down().await;
+    broker.refuse_revocations(false);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while broker.revoked().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the daemon sends the revocation again");
+    assert_eq!(broker.revoked(), [broker.refresh(1), broker.refresh(2)]);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call closes under the account it started under, so a sign-out is
+/// refused while a call is open and leaves the account as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_never_changes_the_account_a_call_closes_under() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, call) = start_a_call(&host, &owner).await;
+
+    let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect_err("a call is open");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::SignedIn { .. }
+    ));
+    assert!(broker.revoked().is_empty(), "nothing was revoked");
+
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
+    assert!(sign_out(&host).await.was_signed_in);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a request to sign out that is sent again, as one whose answer was lost is, is
+/// answered from the first and does not sign out an account signed in since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_request_sent_again_is_answered_from_the_first() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    // On one connection, as a retry of a request whose answer was lost is: the digest the host
+    // keeps covers the window the request was sent under.
+    let mut client = host.client().await;
+    let first = sign_out_on(&mut client, &host, action)
+        .await
+        .expect("the daemon signs the host out");
+    assert!(first.was_signed_in);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let again = sign_out_on(&mut client, &host, action)
+        .await
+        .expect("the repeat is answered");
+    assert_eq!(first, again, "the repeat is the first one's answer");
+    assert!(
+        matches!(
+            account_report(&host).await.state,
+            AccountState::SignedIn { .. }
+        ),
+        "the account signed in since is still signed in"
+    );
+    assert_eq!(broker.revoked(), [broker.refresh(1)]);
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: signing the host out ends a sign-in that is waiting for the browser, so it cannot
+/// sign the host in again afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins_on(&host, free_port());
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+
+    assert!(!sign_out(&host).await.was_signed_in);
+    let report = account_report(&host).await;
+    assert_eq!(report.state, AccountState::SignedOut);
+    assert_eq!(report.last_attempt.as_ref(), None);
+    assert!(
+        TcpStream::connect(&address).await.is_err(),
+        "nothing listens for the browser any more"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .all(|request| !request.path.starts_with("/auth/")),
+        "no code was exchanged"
+    );
     host.stop().await;
 }
 
@@ -1415,6 +1646,14 @@ async fn a_host_whose_broker_is_not_the_account_service_signs_in_nowhere() {
         .await
         .expect("the call reaches the daemon")
         .expect_err("there is no account service to sign in at");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refused:?}"
+    );
+    let refused = sign_out_as(&host, ActionId::new(kr_ipc::new_uuid()))
+        .await
+        .expect_err("there is no account service to sign out of");
     assert_eq!(
         refused.code,
         kr_protocol::error::ErrorCode::HostNotConfigured,

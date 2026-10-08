@@ -222,7 +222,7 @@ Brokering a managed call spends an account's balance, so the host presents the a
 account an operator signed in on it. `kr account sign-in` asks the control daemon, which listens on
 the loopback address the desktop client is registered with, `127.0.0.1:8765`, while a browser signs
 in; the daemon exchanges the answer with the service and keeps the account in the host's secret
-store, and `kr account show` says where that stands. Only the daemon holds it, because its refresh
+store, `kr account show` says where that stands and `kr account sign-out` ends it. Only the daemon holds it, because its refresh
 token rotates on every use and a second holder would end the sign-in. The setup is in
 [Account sign-in](../host/README.md#account-sign-in).
 

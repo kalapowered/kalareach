@@ -434,6 +434,16 @@ methods! {
           the person's browser in this host's secret store. The address the person opens is read \
           with account.status. Nothing in the answer is a token.";
 
+    AccountSignOut = "account.sign_out", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "End this host's own sign-in to the managed account service: remove the grant from this \
+          host's secret store and ask the service to end it. Refused while a voice call is open, \
+          because a call closes under the account it started under. The answer says whether an \
+          account was signed in and whether the service acknowledged ending it; nothing in it is \
+          a token.";
+
     AccountStatus = "account.status", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
@@ -1730,6 +1740,7 @@ mod tests {
         // This host's own sign-in to the managed account service: whose balance a phone's call
         // spends is the owner's choice at this machine.
         ("account.sign_in", &[ActionRight::HostManage]),
+        ("account.sign_out", &[ActionRight::HostManage]),
         ("account.status", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
         ("description.setup", &[ActionRight::HostManage]),
