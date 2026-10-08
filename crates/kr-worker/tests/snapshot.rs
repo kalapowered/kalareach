@@ -2958,6 +2958,18 @@ async fn forwarded_for_device<T: serde::Serialize>(
     method: Method,
     params: &T,
 ) -> kr_protocol::envelope::ParamsValue {
+    forwarded_for_device_under(host, client, method, params, false).await
+}
+
+/// As [`forwarded_for_device`], for a mutation the daemon decided under a share when
+/// `under_a_share` says so.
+async fn forwarded_for_device_under<T: serde::Serialize>(
+    host: &Host,
+    client: &mut LocalClient,
+    method: Method,
+    params: &T,
+    under_a_share: bool,
+) -> kr_protocol::envelope::ParamsValue {
     use kr_protocol::envelope::{MutationRequest, Outcome};
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2_000_000);
     let request_id =
@@ -2999,6 +3011,7 @@ async fn forwarded_for_device<T: serde::Serialize>(
             kr_ipc::clock::boot_elapsed_ms() + 30_000,
         ),
         history: None,
+        previewed_screen: under_a_share,
     }));
     client
         .writer()
@@ -3086,6 +3099,72 @@ async fn a_device_shown_the_live_screen_alone_is_kept_off_the_stream_from_its_at
         (report.presentation, report.presentation_reason.0),
         kept_off,
         "and so does its first window report"
+    );
+}
+
+/// KR-REQ-10.50: an attachment decided under a share is drawn the screen its issuer was shown,
+/// which is the text, and one decided under the device's pairing grant is drawn the live screen
+/// with the titles and the link targets the application set. The screen is the same; what differs
+/// is the grant the daemon says the attach was decided under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_decided_under_a_share_is_drawn_the_screen_its_issuer_was_shown() {
+    let session = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; \
+         printf '\\033]2;a-window-title\\033\\\\\\033]8;;https://example.invalid/a-target\\033\\\\a linked word\\033]8;;\\033\\\\ and plain text\\n'; \
+         read -r _",
+        session,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"and plain text").await;
+
+    let mut restored = Vec::new();
+    for under_a_share in [false, true] {
+        let mut device = device_connection(&host).await;
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        let attached: kr_protocol::attachment::SessionAttachResult = forwarded_for_device_under(
+            &host,
+            &mut device,
+            Method::SessionAttach,
+            &SessionAttachParams {
+                session_id: host.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(session),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+            under_a_share,
+        )
+        .await
+        .to_typed()
+        .expect("an attachment");
+        let (_, bytes) = host
+            .runtime
+            .session()
+            .restoration(attached.attachment.attachment_id)
+            .expect("the screen it is drawn");
+        restored.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let [pairing_grant, share] = restored.as_slice() else {
+        panic!("two restorations");
+    };
+    for named in ["a-window-title", "https://example.invalid/a-target"] {
+        assert!(
+            pairing_grant.contains(named),
+            "a device under its pairing grant is drawn {named}: {pairing_grant:?}"
+        );
+        assert!(
+            !share.contains(named),
+            "the recipient of a share is not drawn {named}: {share:?}"
+        );
+    }
+    assert!(
+        share.contains("a linked word") && share.contains("and plain text"),
+        "but it is drawn the text: {share:?}"
     );
 }
 

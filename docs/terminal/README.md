@@ -36,8 +36,8 @@ Every sequence gets exactly one class. There is no sixth class for "probably har
 
 | Class | Meaning |
 | --- | --- |
-| `D` | Display. Applied to the canonical grid, and forwarded unchanged in direct mode, except to a caller shown the live screen alone, which is not sent the commands that set a title, open a link or report a working directory |
-| `M` | Mode. Tracked and forwarded live; a title is not forwarded to a caller shown the live screen alone |
+| `D` | Display. Applied to the canonical grid, and forwarded unchanged in direct mode, except to the recipient of a share, who is not sent the commands that set a title, open a link, report a working directory or mark a shell's prompt |
+| `M` | Mode. Tracked and forwarded live; a title is not forwarded to the recipient of a share |
 | `Q` | Query. Consumed here; the broker answers |
 | `S` | Side effect. Consumed here and routed to one named destination under policy |
 | `X` | Extension. Consumed, with a rate-limited diagnostic |
@@ -601,19 +601,18 @@ when their parameters differ. That is what keeps a link that wraps onto the next
 two links to one target two. A client that draws the screen into a terminal opens each link with its
 parameters.
 
-A client shown the live screen alone, which is every caller acting under a grant (a device under
-its pairing grant as much as the recipient of a share), is told the screen's text and how it is
-drawn, and none of what sits behind that text. The titles, the virtual title stack and every link
+The recipient of a share is told the screen as the share's issuer was shown it: the text and how it
+is drawn, and none of what sits behind that text. The titles, the virtual title stack and every link
 target are left out of a restoration, of a snapshot's header and rows, of an update and of the
 bytes that follow: the text of a linked word arrives and its target does not, and no title does.
 The bytes that follow are the stream without the operating system commands that only describe the
 screen (a title, a link, a working directory, a shell's marks), which the engine names apart from
 the commands that change its colours. The pieces that remain keep the positions of the raw stream
 they started at, so a gap between two of them shows how many bytes were left out and not what they
-said. The reason is the share's: its issuer is shown the screen's text and is not shown the titles
-or the targets behind it, so the recipient is sent no more than that. A device under its pairing
-grant is narrowed the same way, because the host narrows every caller that is not the owner at this
-machine by one rule; only the owner's own terminal is sent the titles and the link targets.
+said. The daemon says that an attach was decided under a share, and the worker draws that attachment
+this screen; a device under its pairing grant, whose pairing no preview described, is drawn the live
+screen with its titles and link targets, as the owner's own terminal is drawn the whole screen. A
+worker that does not state it narrows an attachment this way is not asked to attach a share.
 
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`

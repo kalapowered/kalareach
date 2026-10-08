@@ -623,6 +623,7 @@ async fn forward<T: serde::Serialize>(
         grant_rights: CanonicalSet::new(),
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
         history: None,
+        previewed_screen: false,
     }));
     exchange(daemon, frame, request_id).await
 }

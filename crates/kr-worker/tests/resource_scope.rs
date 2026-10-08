@@ -760,6 +760,7 @@ impl Viewer {
                     grant_rights: [ActionRight::SessionView].into_iter().collect(),
                     accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
                     history: None,
+                    previewed_screen: false,
                 }));
                 self.call(frame, request_id)
                     .await
