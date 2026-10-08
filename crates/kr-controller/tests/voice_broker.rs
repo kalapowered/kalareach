@@ -1463,10 +1463,15 @@ async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
     let report = account_report(&host).await;
     assert_eq!(report.state, AccountState::SignedOut);
     assert_eq!(report.last_attempt.as_ref(), None);
-    assert!(
-        TcpStream::connect(&address).await.is_err(),
-        "nothing listens for the browser any more"
-    );
+    // The address is let go when the last copy of the listener's socket is closed, which is a
+    // condition to wait for rather than an instant.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while TcpStream::connect(&address).await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("nothing listens for the browser any more");
     assert!(
         broker
             .seen()
