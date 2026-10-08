@@ -36,7 +36,9 @@ use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::InvitationId;
 use kr_protocol::ids::{ActionId, ActorId, DeviceId, GrantId, SessionId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
-use kr_protocol::sharing::{GrantState, GrantSummary, InvitationPreview, InvitationState};
+use kr_protocol::sharing::{
+    GrantRedeemResult, GrantState, GrantSummary, InvitationPreview, InvitationState,
+};
 
 use crate::sharing::invitation::{InvitationRecord, state_of};
 
@@ -1012,6 +1014,15 @@ impl GrantDirectory {
                 // moment and ancestor stand, and this call did not withdraw anything.
                 continue;
             }
+            // An invitation still waiting for this grant is withdrawn with it, so the invitation
+            // says what became of it and a late redemption is told the same.
+            connection
+                .execute(
+                    "UPDATE session_invitations SET state = 'cancelled'
+                      WHERE grant_id = ?1 AND state = 'open'",
+                    params![record.grant.grant_id.get().as_bytes().as_slice()],
+                )
+                .map_err(ControllerError::registry)?;
             devices.insert(record.grant.recipient_device_id);
             match &record.grant.session_selector {
                 kr_protocol::grant::SessionSelector::Any => covers_every_session = true,
@@ -1157,24 +1168,36 @@ impl GrantDirectory {
     /// its grant. The precondition travels in the `WHERE` clauses, so two devices racing the same
     /// invitation produce one activation and one refusal.
     ///
+    /// Only the device the invitation names learns anything about it. Every other caller is told
+    /// the same thing whether the invitation exists or not, before any state is read, so a refusal
+    /// is no way to find out which invitations this host holds.
+    ///
+    /// `still_admitted` is run inside the transaction, once the invitation has been read and
+    /// immediately before the first write, as [`Self::revoke`] runs it. When an action performs
+    /// the redemption, `claim` is its hold: the answer is written beside the claim in the same
+    /// commit, so a redemption that committed can always be answered to a repeat of its action.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
-    /// [`ControllerError::PermissionDenied`] when it names another device, was withdrawn, has
-    /// expired, has already been redeemed, or carries a grant that is revoked or expired.
+    /// Returns [`ControllerError::PermissionDenied`] when the invitation is unknown or names
+    /// another device, and, for the device it names, when it was withdrawn, has expired, has
+    /// already been redeemed, or carries a grant that is revoked or expired.
     pub fn redeem(
         &self,
         invitation_id: InvitationId,
         device_id: DeviceId,
         now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+        claim: Option<&ClaimHold>,
     ) -> Result<Grant> {
         // The anchor of the grant the invitation carries, taken before the transaction, because
-        // taking it can write to this store. An invitation this host does not hold when the
-        // redemption begins is refused here, whatever is written meanwhile: the transaction
-        // decides only a grant this read anchored.
-        let invitation = self.invitation(invitation_id)?.ok_or_else(|| {
-            ControllerError::InvalidArgument("this host holds no such invitation".to_owned())
-        })?;
+        // taking it can write to this store. An invitation this host does not hold, or does not
+        // hold for this device, when the redemption begins is refused here, whatever is written
+        // meanwhile: the transaction decides only a grant this read anchored.
+        let invitation = self
+            .invitation(invitation_id)?
+            .filter(|invitation| invitation.recipient_device_id == device_id)
+            .ok_or_else(not_open_to_this_device)?;
         let carried = self.record(invitation.grant_id)?.ok_or_else(|| {
             ControllerError::InvalidArgument("this host holds no such grant".to_owned())
         })?;
@@ -1189,12 +1212,10 @@ impl GrantDirectory {
         self.before_effect.wait();
         let redeemed = self.in_transaction(|connection| {
             let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
-                return Ok(Err(ControllerError::InvalidArgument(
-                    "this host holds no such invitation".to_owned(),
-                )));
+                return Ok(Err(not_open_to_this_device()));
             };
             if invitation.recipient_device_id != device_id {
-                return Ok(Err(refusal("that invitation was issued to another device")));
+                return Ok(Err(not_open_to_this_device()));
             }
             // Both deadlines are decided at the moment of the redemption. A lapse found here is
             // written down with the invitation, in this commit, so it needs no clock floor to
@@ -1228,7 +1249,7 @@ impl GrantDirectory {
                 ControllerError::InvalidArgument("this host holds no such grant".to_owned())
             })?;
             if record.revoked_at_ms.is_some() {
-                return Ok(Err(refusal("that invitation's grant has been revoked")));
+                return Ok(Err(refusal("this invitation was withdrawn")));
             }
             // A grant this host could not anchor in this boot is not in force here: nothing proves
             // it. Its anchor on the continuous clock is read against that clock now, so a grant
@@ -1241,16 +1262,17 @@ impl GrantDirectory {
             };
             if self.lapsed_on_the_continuous_clock(record.grant.grant_id, grant_anchor) {
                 ran_out.set(Some(record.grant.grant_id));
-                return Ok(Err(refusal("that invitation has expired")));
+                return Ok(Err(refusal("this invitation has expired")));
             }
             let grant_bound = self.bound_at_effect(record.grant.expiry, now_ms);
             if grant_bound.passed {
                 settle_invitation(connection, invitation_id, InvitationState::Expired)?;
-                return Ok(Err(refusal("that invitation has expired")));
+                return Ok(Err(refusal("this invitation has expired")));
             }
             if grant_bound.owed {
                 return Ok(Err(self.unanswerable(&grant_bound)));
             }
+            still_admitted()?;
             let activated = connection
                 .execute(
                     "UPDATE grants SET activated_at_ms = ?2
@@ -1280,48 +1302,22 @@ impl GrantDirectory {
                         .to_owned(),
                 ));
             }
+            if let Some(hold) = claim {
+                let answer = kr_protocol::envelope::ParamsValue::from_typed(&GrantRedeemResult {
+                    invitation_id,
+                    grant: record.grant.clone(),
+                })
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                record_result(
+                    connection,
+                    hold,
+                    &kr_cbor::encode(answer.as_value()),
+                    now_ms,
+                )?;
+            }
             Ok(Ok(record.grant))
         });
         self.after_effect(redeemed.and_then(|redeemed| redeemed), ran_out.get())
-    }
-
-    /// Withdraws an invitation and the proposal it carries, in one transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
-    /// [`ControllerError::PermissionDenied`] when it is no longer open.
-    pub fn cancel_invitation(
-        &self,
-        invitation_id: InvitationId,
-        now_ms: u64,
-    ) -> Result<GrantRevocation> {
-        self.in_transaction(|connection| {
-            let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
-                return Err(ControllerError::InvalidArgument(
-                    "this host holds no such invitation".to_owned(),
-                ));
-            };
-            let changed = connection
-                .execute(
-                    "UPDATE session_invitations SET state = 'cancelled'
-                      WHERE invitation_id = ?1 AND state = 'open'",
-                    params![invitation_id.get().as_bytes().as_slice()],
-                )
-                .map_err(ControllerError::registry)?;
-            if changed == 0 {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "this invitation is no longer open".to_owned(),
-                });
-            }
-            // The proposal goes with it. It was never active, so this leaves nothing to fence.
-            Self::revoke_within(
-                connection,
-                invitation.grant_id,
-                now_ms,
-                &format!("the withdrawal of invitation {invitation_id}"),
-            )
-        })
     }
 
     /// Transfers control: issues the replacement authority and revokes the source, in one
@@ -2279,6 +2275,40 @@ fn record_withdrawal(
     }
 }
 
+/// Writes what one action produced beside its claim, inside the transaction that produced it.
+///
+/// Once: the row takes it only while it holds no outcome. A claim with no row to take it refuses,
+/// and the effect with it, because an effect whose answer the claim does not record would read
+/// later as one nobody can answer.
+fn record_result(
+    connection: &Connection,
+    hold: &ClaimHold,
+    result: &[u8],
+    now_ms: u64,
+) -> Result<()> {
+    let written = connection
+        .execute(
+            "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+              WHERE actor_id = ?1 AND action_id = ?2
+                AND result IS NULL AND refusal_code IS NULL",
+            params![
+                hold.key.0,
+                hold.key.1.as_slice(),
+                result,
+                i64::try_from(now_ms).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    if written == 1 {
+        Ok(())
+    } else {
+        Err(ControllerError::Storage {
+            operation: "record an answer beside its action's claim",
+            detail: "the action's claim holds no row that can take it".to_owned(),
+        })
+    }
+}
+
 /// One claim row, as the store reads it back: the digest, the result once there is one, and the
 /// refusal's code and words once there is one of those.
 type ClaimRow = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
@@ -2676,6 +2706,12 @@ pub(crate) fn unrecorded() -> ControllerError {
         code: ErrorCode::StorageUnavailable,
         detail: super::FLOOR_UNRECORDED.to_owned(),
     }
+}
+
+/// What every caller but the device an invitation names is told, whether the invitation exists or
+/// not.
+fn not_open_to_this_device() -> ControllerError {
+    refusal("this invitation is not open to this device")
 }
 
 /// A refusal a transaction returns as a value, so its own writes still commit.

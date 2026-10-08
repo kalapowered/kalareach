@@ -1,0 +1,291 @@
+//! The grant a connection acts under for a session.
+//!
+//! A paired device holds the grant its pairing recorded, and may hold others: a session shared
+//! with it is a grant issued to it and activated when it redeemed the invitation. A request is
+//! decided under **one** of them, never under a combination, because rights, selectors, history
+//! scope and lifetime belong together and mixing two grants would give a device what neither of
+//! them gives.
+//!
+//! Which one is decided by the request, and then fixed:
+//!
+//! 1. A mutation names the grant it is acting under. It may name only a grant this device holds.
+//! 2. A request that names none is decided under the pairing grant when that grant's selectors
+//!    admit the session, and otherwise under the one live share that admits it. Several shares and
+//!    no pairing grant that admits the session leave nothing to choose by, and the request is
+//!    refused with the way out: name the grant.
+//! 3. A request that names no session is decided under the pairing grant.
+//!
+//! Once a connection has a link to a session's worker, the grant it opened that link under is the
+//! grant it acts under for that session until the connection ends. The worker keeps state that
+//! belongs to the grant a request was decided under (the history scope a subscription carries, the
+//! lease an attachment holds), so deciding a later request under another grant would leave that
+//! state outliving the grant it was made under.
+
+use std::sync::PoisonError;
+
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{GrantId, SessionId};
+use kr_protocol::rights::ActionRight;
+
+use crate::grants::GrantRecord;
+use crate::grants::policy::{BoundCell, BoundIdentity, HeldBound};
+use crate::service::net::lifetimes::{Anchored, GrantStanding};
+
+use super::RemoteConnection;
+
+/// Where a grant a request is decided under comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Held {
+    /// The grant this device's pairing recorded.
+    Pairing,
+    /// A grant issued to this device and activated when it redeemed an invitation.
+    Share,
+}
+
+/// The grant one request is decided under.
+#[derive(Clone, Debug)]
+pub(super) struct Acting {
+    /// The grant itself.
+    pub(super) grant: Grant,
+    /// Where it comes from, which is where its standing is read.
+    pub(super) held: Held,
+}
+
+impl Acting {
+    fn pairing(grant: &Grant) -> Self {
+        Self {
+            grant: grant.clone(),
+            held: Held::Pairing,
+        }
+    }
+}
+
+/// What a device is told about a grant it does not hold, however it came to name it: that one is
+/// another device's, one that does not admit the session, one that is not a share, and one that
+/// does not exist all read the same.
+fn not_held() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        "this device holds no such grant for this session",
+    )
+}
+
+impl RemoteConnection {
+    /// The grant this device's pairing recorded, as a test decides a request under it.
+    #[cfg(test)]
+    pub(super) fn pairing_acting(&self) -> Acting {
+        Acting::pairing(&self.device.grant)
+    }
+
+    /// The grant this device acts under for `session_id`, when it names `named` or none.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a grant this device does not hold for the session, a grant other than the one this
+    /// connection already acts under for it, and a session several of this device's shares admit
+    /// when nothing names one.
+    pub(super) fn acting_for(
+        &self,
+        session_id: Option<SessionId>,
+        named: Option<GrantId>,
+    ) -> std::result::Result<Acting, ProtocolError> {
+        let pairing = &self.device.grant;
+        let Some(session_id) = session_id else {
+            return match named {
+                Some(named) if named != pairing.grant_id => Err(not_held()),
+                _ => Ok(Acting::pairing(pairing)),
+            };
+        };
+        let fixed = *self.fixed.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((fixed_session, fixed_grant)) = fixed
+            && fixed_session == session_id
+        {
+            if named.is_some_and(|named| named != fixed_grant) {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection acts for this session under another grant; open another \
+                     connection to act under the one named",
+                ));
+            }
+            return self.held_grant(fixed_grant, session_id);
+        }
+        match named {
+            Some(named) => self.held_grant(named, session_id),
+            None => self.selected(session_id),
+        }
+    }
+
+    /// The grant this connection acts under, once `acting` has opened its link to `session_id`.
+    ///
+    /// Taken under the lock that guards the link, so two requests that open it at once do not fix
+    /// two grants.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a grant other than the one already fixed for the session.
+    pub(super) fn fix(
+        &self,
+        session_id: SessionId,
+        acting: &Acting,
+    ) -> std::result::Result<(), ProtocolError> {
+        let mut fixed = self.fixed.lock().unwrap_or_else(PoisonError::into_inner);
+        match *fixed {
+            Some((fixed_session, fixed_grant))
+                if fixed_session == session_id && fixed_grant != acting.grant.grant_id =>
+            {
+                Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection acts for this session under another grant; open another \
+                     connection to act under the one named",
+                ))
+            }
+            Some(_) => Ok(()),
+            None => {
+                *fixed = Some((session_id, acting.grant.grant_id));
+                Ok(())
+            }
+        }
+    }
+
+    /// The named grant, when this device holds it for `session_id`.
+    fn held_grant(
+        &self,
+        grant_id: GrantId,
+        session_id: SessionId,
+    ) -> std::result::Result<Acting, ProtocolError> {
+        if grant_id == self.device.grant.grant_id {
+            return Ok(Acting::pairing(&self.device.grant));
+        }
+        let record = self.share_record(grant_id)?;
+        if self.admits(&record.grant, session_id) {
+            Ok(Acting {
+                grant: record.grant,
+                held: Held::Share,
+            })
+        } else {
+            Err(not_held())
+        }
+    }
+
+    /// The grant a request that names none is decided under.
+    fn selected(&self, session_id: SessionId) -> std::result::Result<Acting, ProtocolError> {
+        let pairing = &self.device.grant;
+        if self.admits(pairing, session_id) {
+            return Ok(Acting::pairing(pairing));
+        }
+        let now_ms = self.controller.wall_now_ms();
+        let mut shares: Vec<Grant> = self
+            .controller
+            .sharing()
+            .grants()
+            .records_for_device(self.device.device_id)
+            .map_err(|error| error.to_protocol_error())?
+            .into_iter()
+            .filter(|record| {
+                record.is_active()
+                    && record.revoked_at_ms.is_none()
+                    && record.grant.expiry.is_valid_at(now_ms)
+                    && !record.grant.permits(ActionRight::VoiceUse)
+                    && self.admits(&record.grant, session_id)
+            })
+            .map(|record| record.grant)
+            .collect();
+        match shares.len() {
+            // Nothing admits it, and the decision under the pairing grant says so.
+            0 => Ok(Acting::pairing(pairing)),
+            1 => Ok(Acting {
+                grant: shares.remove(0),
+                held: Held::Share,
+            }),
+            _ => Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "several grants this device holds admit this session; name the one to act under \
+                 in the request, or in session.attach before any read",
+            )),
+        }
+    }
+
+    /// Whether a grant's selectors admit this session in this environment.
+    fn admits(&self, grant: &Grant, session_id: SessionId) -> bool {
+        grant
+            .environment_selector
+            .admits(self.controller.paths().environment_id())
+            && grant.session_selector.admits(session_id)
+    }
+
+    /// A share of this device's, as the grant store holds it now.
+    ///
+    /// Whether it is in force is the decision's; this finds the record and refuses one that is not
+    /// this device's or is a voice grant, which the voice coordinator selects for itself.
+    pub(super) fn share_record(
+        &self,
+        grant_id: GrantId,
+    ) -> std::result::Result<GrantRecord, ProtocolError> {
+        self.controller
+            .sharing()
+            .grants()
+            .record(grant_id)
+            .map_err(|error| error.to_protocol_error())?
+            .filter(|record| {
+                record.grant.recipient_device_id == self.device.device_id
+                    && !record.grant.permits(ActionRight::VoiceUse)
+            })
+            .ok_or_else(not_held)
+    }
+
+    /// The time bound a share stands under, as the host anchors it on the continuous clock and
+    /// reads it in UTC, or the refusal that it has run out.
+    ///
+    /// A bound of its own, beside the pairing grant's and the policy's, so the write boundary that
+    /// holds a response or a relayed batch to the bounds it was decided under holds it to the
+    /// share's end as well, and a share that runs out under a live subscription ends that
+    /// subscription without touching the pairing grant.
+    pub(super) fn share_bound(
+        &self,
+        record: &GrantRecord,
+    ) -> std::result::Result<HeldBound, ProtocolError> {
+        let lifetimes = self.controller.lifetimes();
+        let grants = self.controller.sharing().grants();
+        match lifetimes
+            .stored_standing(grants, record)
+            .map_err(|error| error.to_protocol_error())?
+        {
+            GrantStanding::InForce => {}
+            GrantStanding::OutOfForce => {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this grant has expired",
+                ));
+            }
+            GrantStanding::Unrecorded => {
+                return Err(crate::grants::Refusal::FloorUnrecorded.to_protocol_error());
+            }
+        }
+        let continuous_deadline = match lifetimes
+            .stored(grants, record)
+            .map_err(|error| error.to_protocol_error())?
+        {
+            Anchored::Until(deadline) => Some(deadline),
+            Anchored::Unlimited => None,
+            Anchored::Over => {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this grant has expired",
+                ));
+            }
+        };
+        let utc_deadline_ms = match record.grant.expiry {
+            kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+            kr_protocol::grant::GrantExpiry::Never => None,
+        };
+        Ok(HeldBound::load(&BoundCell::new(
+            BoundIdentity::Share {
+                grant_id: record.grant.grant_id,
+            },
+            continuous_deadline,
+            utc_deadline_ms,
+            false,
+        )))
+    }
+}

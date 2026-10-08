@@ -65,7 +65,7 @@ use crate::service::net::devices::DeviceRecord;
 /// What the played worker holds for the daemon's own reads, as each test sets it, and what it was
 /// asked.
 #[derive(Default)]
-struct Holding {
+pub(super) struct Holding {
     /// The resources the broker arbitrates, in identifier order, as `events.snapshot` pages them.
     resources: Vec<PendingResource>,
     /// How many resources one page carries; nought carries them all in one.
@@ -80,7 +80,7 @@ struct Holding {
     /// ledger when the live arbitration no longer holds it.
     records: BTreeMap<PendingResourceId, Result<AgentApprovalInspectResult, ProtocolError>>,
     /// The session's questions, by identity.
-    questions: BTreeMap<QuestionId, Question>,
+    pub(super) questions: BTreeMap<QuestionId, Question>,
     /// Whether the worker ends the link when it is asked for an approval's record.
     ends_on_inspect: bool,
     /// Whether the worker never answers when it is asked for an approval's record.
@@ -90,7 +90,9 @@ struct Holding {
     /// Every request the daemon made on its own link, in order.
     asked: Vec<Request>,
     /// Every read the daemon forwarded for a device, in order.
-    forwarded: Vec<ForwardedRequest>,
+    pub(super) forwarded: Vec<ForwardedRequest>,
+    /// Every mutation the daemon forwarded for a device, in order.
+    pub(super) mutations: Vec<kr_protocol::local::ForwardedMutation>,
 }
 
 impl Holding {
@@ -262,6 +264,7 @@ fn reply(holding: &Mutex<Holding>, session_id: SessionId, frame: ControlFrame) -
             Reply::Frame(response(forwarded.request.request_id, outcome))
         }
         ControlFrame::Forwarded(forwarded) => {
+            held.mutations.push(forwarded.as_ref().clone());
             Reply::Frame(response(forwarded.mutation.request_id, Err(refused())))
         }
         _ => Reply::Nothing,
@@ -322,7 +325,7 @@ fn serving(
 
 /// What a worker of this build states about a forwarded read's scope: it reads one, and it holds a
 /// question read to it.
-fn holds_question_reads() -> CanonicalSet<CapabilityId> {
+pub(super) fn holds_question_reads() -> CanonicalSet<CapabilityId> {
     [
         kr_protocol::local::FORWARDED_HISTORY_SCOPE,
         kr_protocol::local::FORWARDED_QUESTION_SCOPE,
@@ -341,7 +344,7 @@ fn reads_scopes_only() -> CanonicalSet<CapabilityId> {
 }
 
 /// A daemon whose one worker is the played worker, holding `holding` and stating `stated`.
-async fn world(
+pub(super) async fn world(
     holding: Holding,
     stated: CanonicalSet<CapabilityId>,
 ) -> (fake::Silent, Arc<Mutex<Holding>>) {
@@ -378,7 +381,7 @@ fn resource_id(byte: u8) -> PendingResourceId {
     PendingResourceId::new(Uuid::from_bytes([byte; 16]))
 }
 
-fn question_id(byte: u8) -> QuestionId {
+pub(super) fn question_id(byte: u8) -> QuestionId {
     QuestionId::new(Uuid::from_bytes([byte; 16]))
 }
 
@@ -472,7 +475,7 @@ fn relayed_request(request_id: &str) -> Vec<u8> {
 }
 
 /// A question an application inside `session_id` asked, in `state`.
-fn question(
+pub(super) fn question(
     session_id: SessionId,
     byte: u8,
     state: QuestionState,
@@ -580,6 +583,7 @@ async fn shared(
         .controller
         .authority_change(
             &ActorId::new("local:test").expect("a principal"),
+            crate::service::authority_changes::AuthorityCaller::Owner,
             mutation,
             Method::GrantCreate,
             carried,
@@ -1871,7 +1875,7 @@ async fn a_share_naming_nothing_asks_no_worker() {
 // ---------------------------------------------------------------------------------------------
 
 /// A device committed to `controller`'s records, holding `grant`.
-fn holding_grant(
+pub(super) fn holding_grant(
     controller: &crate::service::Controller,
     byte: u8,
     grant: kr_protocol::grant::Grant,
@@ -1912,7 +1916,11 @@ fn scoped_device(
 }
 
 /// One read from a device.
-fn device_read<P: serde::Serialize>(request_id: u64, method: Method, params: &P) -> Request {
+pub(super) fn device_read<P: serde::Serialize>(
+    request_id: u64,
+    method: Method,
+    params: &P,
+) -> Request {
     Request {
         request_id: RequestId::new(request_id),
         method: method.into(),
@@ -1922,7 +1930,7 @@ fn device_read<P: serde::Serialize>(request_id: u64, method: Method, params: &P)
 }
 
 /// The refusal an answer carries, or a panic naming what it carries instead.
-fn refused(answer: ControlFrame) -> ProtocolError {
+pub(super) fn refused(answer: ControlFrame) -> ProtocolError {
     match answer {
         ControlFrame::Response(Response {
             outcome: Outcome::Error(error),
@@ -2377,6 +2385,7 @@ impl Served {
         self.controller
             .authority_change(
                 &ActorId::new("local:test").expect("a principal"),
+                crate::service::authority_changes::AuthorityCaller::Owner,
                 &mutation,
                 Method::GrantCreate,
                 carried,
@@ -2475,6 +2484,8 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
             issued.preview.invitation_id,
             recipient(),
             kr_ipc::now_ms().get(),
+            || Ok(()),
+            None,
         )
         .expect("the invitation is redeemed");
     let device = holding_grant(&served.controller, 31, redeemed);

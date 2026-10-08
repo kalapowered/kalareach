@@ -4546,14 +4546,14 @@ fn asked_ids(
         .collect()
 }
 
-/// KR-REQ-10.51 over the real network path: the local owner shares a session with a paired device,
-/// naming a question an application inside the session asked before the history bound the share
-/// sets. The owner is shown the question as the session's own worker holds it. A device holding
-/// the grant the invitation carries reads that question from the worker while it is open, and not
-/// once it has been answered, and a device whose grant reaches back to the same moment and names
-/// nothing never reads it. A device's connection is decided under the grant its record holds, so
-/// the test redeems the invitation and writes the device's record with the grant it carries, as a
-/// pairing writes a record with the grant it carries.
+/// KR-REQ-10.51, KR-REQ-25.10 and KR-REQ-18.03 over the real network path: the local owner shares
+/// a session with a paired device, naming a question an application inside the session asked
+/// before the history bound the share sets. The owner is shown the question as the session's own
+/// worker holds it. The device, whose own pairing grant reaches no session, reads nothing of the
+/// session until it redeems the invitation, and then reads that question from the worker while it
+/// is open, and not once it has been answered. A device whose grant reaches back to the same
+/// moment and names nothing never reads it, and a device the invitation does not name cannot
+/// redeem it and is told nothing about it.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_open() {
@@ -4574,9 +4574,28 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
         session_ids: [session_id].into_iter().collect(),
     };
 
-    // The device the owner shares with, and the identity the host gives it.
+    // The device the owner shares with is paired the way a person who was only ever asked to look
+    // at one session is: under a grant that reaches no session at all.
     let named = Device::create(&loopback()).await;
-    let named_device_id = DeviceId::new(kr_ipc::new_uuid());
+    let named_record = pair_with(
+        &daemon,
+        &named,
+        &owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let named_device_id = named_record.device_id;
+    let questions = kr_protocol::question::QuestionReadParams {
+        session_id,
+        question_id: Nullable::null(),
+        include_resolved: true,
+    };
+    let session = connect(&daemon, &named, &named_record).await;
+    let before = session
+        .read::<_, kr_protocol::question::QuestionReadResult>(Method::QuestionRead, &questions)
+        .await
+        .expect_err("a device whose grant reaches no session reads nothing of it");
+    assert_eq!(before.code(), ErrorCode::PermissionDenied);
 
     // The owner shares the session with it, reaching back to just after the question and naming
     // it, and is shown the question as the worker holds it.
@@ -4615,44 +4634,74 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
             created_at_ms: asked.created_at_ms,
         }]
     );
+    // The invitation authorises nothing until it is redeemed.
+    let still_nothing = session
+        .read::<_, kr_protocol::question::QuestionReadResult>(Method::QuestionRead, &questions)
+        .await
+        .expect_err("a share nobody redeemed reads nothing");
+    assert_eq!(still_nothing.code(), ErrorCode::PermissionDenied);
 
-    // The device holds the grant the invitation carries, in a record of its own keys.
-    let redeemed = daemon
-        .controller
-        .sharing()
-        .redeem(
-            issued.preview.invitation_id,
-            named_device_id,
-            kr_ipc::now_ms().get(),
+    // A device the invitation does not name cannot redeem it, and is told what it would be told
+    // of an invitation that does not exist.
+    let other = Device::create(&loopback()).await;
+    let other_record = pair_with(
+        &daemon,
+        &other,
+        &owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::None),
+    )
+    .await;
+    let other_session = connect(&daemon, &other, &other_record).await;
+    let redeem = |invitation_id| kr_protocol::sharing::GrantRedeemParams { invitation_id };
+    let on_the_host = || ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let not_theirs = other_session
+        .mutate(
+            Method::GrantRedeem,
+            on_the_host(),
+            None,
+            &ParamsValue::empty(),
+            &redeem(issued.preview.invitation_id),
+            DurationMs::new(120_000),
         )
-        .expect("the invitation is redeemed");
-    let keys = named.keys.public_keys();
-    let named_record = DeviceRecord {
-        device_id: named_device_id,
-        endpoint_id: keys.transport,
-        device_key_revision: DeviceKeyRevision::new(1),
-        authorisation: keys.authorisation,
-        stored_envelope: Some(keys.stored_envelope),
-        notification_preview: Some(keys.notification_preview),
-        device_name: DeviceName::new("A test phone").expect("a name"),
-        platform: DevicePlatform::Android,
-        grant: redeemed,
-        paired_at_ms: kr_ipc::now_ms(),
-        revoked_at_ms: None,
-        committed_invitation_id: None,
-        expired_at_ms: None,
-    };
-    daemon
-        .network
-        .devices()
-        .commit(&named_record)
-        .expect("the device holds the grant");
-    let questions = kr_protocol::question::QuestionReadParams {
-        session_id,
-        question_id: Nullable::null(),
-        include_resolved: true,
-    };
-    let session = connect(&daemon, &named, &named_record).await;
+        .await
+        .expect_err("a device the invitation does not name redeems nothing");
+    let unknown = other_session
+        .mutate(
+            Method::GrantRedeem,
+            on_the_host(),
+            None,
+            &ParamsValue::empty(),
+            &redeem(kr_protocol::ids::InvitationId::new(kr_ipc::new_uuid())),
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("an invitation nobody issued is redeemed by nobody");
+    assert_eq!(not_theirs.code(), ErrorCode::PermissionDenied);
+    assert_eq!(not_theirs.code(), unknown.code());
+    assert_eq!(not_theirs.to_string(), unknown.to_string());
+    other_session.close();
+
+    // The device the invitation names redeems it over its own connection.
+    let redeemed: kr_protocol::sharing::GrantRedeemResult = session
+        .mutate(
+            Method::GrantRedeem,
+            on_the_host(),
+            None,
+            &ParamsValue::empty(),
+            &redeem(issued.preview.invitation_id),
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the invitation is redeemed")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(redeemed.grant.grant_id, issued.grant.grant_id);
     let read: kr_protocol::question::QuestionReadResult = session
         .read(Method::QuestionRead, &questions)
         .await

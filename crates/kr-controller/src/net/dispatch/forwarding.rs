@@ -17,6 +17,7 @@ use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
 
+use super::acting::Acting;
 use super::decision::{Asked, session_of};
 use super::output::{RELAY_DECISIONS, RelayGrant, Relaying, Written};
 use super::{RemoteConnection, failure, outcome_unknown};
@@ -171,11 +172,11 @@ impl RemoteConnection {
         // action is what says where to ask.
         let proxy = match session_of(&request.params, entry) {
             Ok(session_id) => self
-                .proxy_for(session_id)
+                .proxy_for(session_id, &asked.acting)
                 .await
                 .map_err(|error| error.to_protocol_error()),
             Err(_) if entry.method == Method::ActionRead => {
-                self.receipt_owner(request, entry).await
+                self.receipt_owner(request, entry, &asked.acting).await
             }
             Err(error) => return failure(request.request_id, error),
         };
@@ -183,7 +184,7 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return failure(request.request_id, error),
         };
-        let envelope = self.envelope(validated);
+        let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = match self.authority_deadline(asked) {
             Ok(authority) => authority,
             Err(error) => return failure(request.request_id, error),
@@ -193,7 +194,7 @@ impl RemoteConnection {
                 request,
                 &envelope,
                 authority,
-                Some(&self.device.grant.history),
+                Some(&asked.acting.grant.history),
             )
             .await
         {
@@ -216,6 +217,7 @@ impl RemoteConnection {
         accepted: AcceptedDeadline,
         validated: AuthorityRevision,
         grant_rights: CanonicalSet<ActionRight>,
+        acting: &Acting,
         asked: &mut Option<Asked>,
     ) -> ControlFrame {
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
@@ -227,14 +229,14 @@ impl RemoteConnection {
                 ),
             );
         };
-        let proxy = match self.proxy_for(session_id).await {
+        let proxy = match self.proxy_for(session_id, acting).await {
             Ok(proxy) => proxy,
             Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
         };
         if let Err(refusal) = self.claim_route(mutation, Some(session_id)) {
             return failure(mutation.request_id, refusal.into_error());
         }
-        let envelope = self.envelope(validated);
+        let envelope = self.envelope(acting.grant.grant_id, validated);
         let deadline = match self
             .controller
             .forwarded_deadline(session_id, &envelope, accepted)
@@ -292,7 +294,7 @@ impl RemoteConnection {
         let request_id = mutation.request_id;
         // The grant's history scope travels with it too, so what the worker shows of its answer,
         // now and when the action is read again, is held to what this device's grant reaches.
-        let history = self.device.grant.history.clone();
+        let history = acting.grant.history.clone();
         // The rights this request was decided with travel with the mutation: the grant as this
         // host's policy and its configured ceiling leave it. The worker admits an attachment and
         // holds no grants: section 8's intersection of requested capabilities with the actor's
@@ -321,7 +323,7 @@ impl RemoteConnection {
                     if !answered.holds_results_to_scopes {
                         return failure(request_id, held_by_an_earlier_worker(answering));
                     }
-                    match self.may_read_receipts(Some(session_id), answering) {
+                    match self.may_read_receipts(Some(session_id), answering, acting) {
                         Ok(read) => *asked = Some(read),
                         Err(error) => return failure(request_id, error),
                     }
@@ -339,6 +341,10 @@ impl RemoteConnection {
     /// Decides whether this device may be told what one of its own actions produced, and returns
     /// the decision the answer is to be written under.
     ///
+    /// The read is made under the grant the action was decided under (`acting`): selecting one again
+    /// could pick another grant than the one the action was performed under, and the answer would
+    /// then be shown under authority the action never had.
+    ///
     /// A retained answer is a read of a receipt, and section 23 has present view authority over the
     /// subject decide whether either half of a retained result is returned. The rights that
     /// decide it are `action.read`'s over the session the receipt belongs to, not the ones the
@@ -351,12 +357,15 @@ impl RemoteConnection {
         &self,
         session_id: Option<SessionId>,
         answering: Method,
+        acting: &Acting,
     ) -> std::result::Result<Asked, ProtocolError> {
         let entry = self.admit(
             Method::ActionRead.as_str(),
             Method::ActionRead.entry().version,
         )?;
-        Ok(self.ask(session_id, entry, false)?.answering(answering))
+        Ok(self
+            .ask_under(acting.clone(), session_id, entry, false)?
+            .answering(answering))
     }
 
     /// Decides the read a retained answer of this daemon's own is written under, when it has one.
@@ -385,6 +394,7 @@ impl RemoteConnection {
         method: Method,
         mutation: &MutationRequest,
         retained: &ControlFrame,
+        acting: &Acting,
     ) -> std::result::Result<Option<Asked>, ProtocolError> {
         if matches!(
             method,
@@ -401,7 +411,7 @@ impl RemoteConnection {
             .copied()
             .or_else(|| super::routes::answered_session(retained));
         if subject.is_some() {
-            return self.may_read_receipts(subject, method).map(Some);
+            return self.may_read_receipts(subject, method, acting).map(Some);
         }
         Ok(None)
     }
@@ -410,11 +420,19 @@ impl RemoteConnection {
     ///
     /// One link per connection, and one worker per link: a device attaches to one session at a
     /// time on one connection, and its attachment, its subscription and its input all have to
-    /// belong to the same worker connection for the worker's own ownership rules to hold.
-    async fn proxy_for(&self, session_id: SessionId) -> Result<Arc<WorkerProxy>> {
+    /// belong to the same worker connection for the worker's own ownership rules to hold. The grant
+    /// the link is opened under is the grant the connection acts under for that session from then
+    /// on ([`Self::fix`]).
+    async fn proxy_for(&self, session_id: SessionId, acting: &Acting) -> Result<Arc<WorkerProxy>> {
         let mut held = self.proxy.lock().await;
+        // The grant this connection acts under for the session is the one its link was opened
+        // under, and a request decided under another is refused here, where the link is.
+        let fixed = |error: ProtocolError| ControllerError::PermissionDenied {
+            detail: error.message,
+        };
         if let Some(proxy) = held.as_ref() {
             if proxy.session_id() == session_id && proxy.is_open() {
+                self.fix(session_id, acting).map_err(fixed)?;
                 return Ok(Arc::clone(proxy));
             }
             if proxy.session_id() != session_id {
@@ -449,6 +467,7 @@ impl RemoteConnection {
             }
             Err(error) => return Err(error),
         };
+        self.fix(session_id, acting).map_err(fixed)?;
         *held = Some(Arc::clone(&proxy));
         Ok(proxy)
     }
@@ -566,7 +585,7 @@ impl RemoteConnection {
         // device may not read. A close is the one exception: it is made whether or not its
         // receipt may be read, and what a worker answers a retried one with is checked on its way
         // back.
-        let read = match self.may_read_receipts(Some(session_id), answering) {
+        let read = match self.may_read_receipts(Some(session_id), answering, &asked.acting) {
             Ok(read) => read,
             Err(_) if answering == Method::SessionClose => return Ok(None),
             Err(error) => return Err(RouteRefusal::Conflict(error)),
@@ -574,7 +593,7 @@ impl RemoteConnection {
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.
-        let Ok(proxy) = self.proxy_for(session_id).await else {
+        let Ok(proxy) = self.proxy_for(session_id, &asked.acting).await else {
             return Ok(None);
         };
         let request = Request {
@@ -594,12 +613,12 @@ impl RemoteConnection {
                 ))
             })?,
         };
-        let envelope = self.envelope(validated);
+        let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = self
             .authority_deadline(asked)
             .map_err(RouteRefusal::Conflict)?;
         let holds = proxy.holds_results_to_scopes();
-        let scope = holds.then_some(&self.device.grant.history);
+        let scope = holds.then_some(&asked.acting.grant.history);
         let Ok(response) = proxy
             .forward_read(&request, &envelope, authority, scope)
             .await
@@ -655,6 +674,7 @@ impl RemoteConnection {
         &self,
         request: &Request,
         entry: &'static MethodEntry,
+        acting: &Acting,
     ) -> std::result::Result<Arc<WorkerProxy>, ProtocolError> {
         let params: kr_protocol::receipt::ActionReadParams = request
             .params
@@ -698,8 +718,8 @@ impl RemoteConnection {
                 ));
             }
         };
-        self.check_grant(Some(session_id), entry, false)?;
-        self.proxy_for(session_id)
+        self.ask_under(acting.clone(), Some(session_id), entry, false)?;
+        self.proxy_for(session_id, acting)
             .await
             .map_err(|error| error.to_protocol_error())
     }
@@ -759,8 +779,16 @@ impl RemoteConnection {
         // on the continuous clock, which a decision taken again finds unchanged, and the moment in
         // UTC the decision stops holding.
         let epoch = self.controller.authority_epoch();
+        // A batch is relayed only on a link, and the link's grant is the one this connection
+        // acts under for the session: no other is ever chosen for it.
+        let acting = self.acting_for(Some(session_id), None).ok()?;
         let decision = self
-            .check_grant(Some(session_id), Method::EventsSubscribe.entry(), false)
+            .check_grant(
+                Some(session_id),
+                Method::EventsSubscribe.entry(),
+                false,
+                &acting,
+            )
             .ok()?;
         Some(RelayGrant {
             epoch,
