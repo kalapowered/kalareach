@@ -214,6 +214,9 @@ pub struct WorkerService {
     plugin_admissions: Arc<crate::broker::catalogue::Admissions>,
     /// The connectors those admissions carry, which the command backends resolve from.
     connector_sources: Arc<crate::broker::connectors::ConnectorSources>,
+    /// How this worker reaches the plugin runtime for the bindings whose packages ship a
+    /// component, where it was started by a control daemon that can start one.
+    plugin_runtime: Option<crate::plugin_runtime::RuntimeRequest>,
     /// The frozen copies the connections of this worker are reading their recoveries out of.
     recoveries: crate::recovery::RecoveryCopies,
     build_id: kr_protocol::ids::BuildId,
@@ -471,6 +474,7 @@ impl WorkerService {
             broker,
             plugin_admissions: Arc::new(crate::broker::catalogue::Admissions::new()),
             connector_sources: Arc::new(crate::broker::connectors::ConnectorSources::new()),
+            plugin_runtime: None,
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
             #[cfg(feature = "testing")]
@@ -505,6 +509,15 @@ impl WorkerService {
         admissions.install_into(&self.broker, kr_ipc::now_ms());
         self.plugin_admissions = admissions;
         self.connector_sources = sources;
+        self
+    }
+
+    /// Has this worker register the components of its bindings with the plugin runtime, asking the
+    /// control daemon for it when a binding first wants one. Without this a binding's component
+    /// is reported pending and nothing is asked for.
+    #[must_use]
+    pub fn with_plugin_runtime(mut self, request: crate::plugin_runtime::RuntimeRequest) -> Self {
+        self.plugin_runtime = Some(request);
         self
     }
 
@@ -1043,6 +1056,14 @@ impl WorkerService {
             Arc::downgrade(&self),
             Arc::clone(&self.broker),
         ));
+        // The components of this session's bindings are registered with the plugin runtime from
+        // here. Nothing is asked of anybody until a binding wants one.
+        if let Some(request) = self.plugin_runtime.clone() {
+            tokio::spawn(crate::plugin_runtime::link(
+                request,
+                Arc::downgrade(&self.broker),
+            ));
+        }
         loop {
             let (connection, peer) = listener.accept().await?;
             // One session serves a bounded number of connections at once. Without a bound a caller
@@ -5081,8 +5102,9 @@ impl WorkerService {
                 }
                 // And the refusal this host makes whatever the caller does. It is decided here,
                 // before the marker, so it is a rejection rather than an outcome nobody can
-                // establish. An action the package's component prepares needs a component this
-                // host does not run; any other such action needs an upstream method this host does
+                // establish. An action the package's component prepares needs the component's
+                // `prepare-action` export, which this host does not call; any other such action
+                // needs an upstream method this host does
                 // not send for a plugin, and the broker transmits nothing it has not validated
                 // against the invocation it was prepared under.
                 let detail = if registered
@@ -5090,10 +5112,9 @@ impl WorkerService {
                     .is_some_and(|registered| registered.component)
                 {
                     format!(
-                        "{} is prepared by its package's component, whose capabilities are \
-                         temporarily unavailable: {}, so nothing is transmitted for it",
-                        params.action,
-                        crate::broker::catalogue::NO_COMPONENT_RUNS
+                        "{} is prepared by its package's component, and this host calls no export \
+                         of a component to prepare an effect, so nothing is transmitted for it",
+                        params.action
                     )
                 } else {
                     format!(

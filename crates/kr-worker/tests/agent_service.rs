@@ -2137,10 +2137,10 @@ async fn plugin_refusal(
 }
 
 /// Section 5: an action the package's component prepares is admitted as any other, and refused
-/// before its dispatch marker because the component's capabilities are temporarily unavailable,
-/// with the reason: the plugin runtime is not running on this host.
+/// before its dispatch marker because this host calls no export of a component to prepare an
+/// effect, with that reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_action_the_component_prepares_is_refused_as_temporarily_unavailable() {
+async fn an_action_the_component_prepares_is_refused_because_no_component_is_called_to_prepare() {
     let host = host().await;
     let upstream = Arc::new(CountingUpstream::default());
     register(
@@ -2152,10 +2152,9 @@ async fn an_action_the_component_prepares_is_refused_as_temporarily_unavailable(
     let (error, action_id) = plugin_refusal(&mut client, &host, 40, Nullable::null()).await;
     assert_eq!(error.code, ErrorCode::UnsupportedCapability);
     assert!(
-        error.message.contains("temporarily unavailable")
-            && error
-                .message
-                .contains("the plugin runtime is not running on this host"),
+        error
+            .message
+            .contains("this host calls no export of a component to prepare an effect"),
         "{}",
         error.message
     );
