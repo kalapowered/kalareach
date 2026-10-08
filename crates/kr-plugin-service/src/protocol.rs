@@ -29,7 +29,11 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 
 /// The protocol a worker and the plugin host speak.
-pub const PROTOCOL: &str = "kr-plugin-host/1";
+///
+/// A host and a worker of another protocol refuse each other at the handshake, and a descriptor
+/// that names another protocol is not one a worker uses: the control daemon takes it away and
+/// starts a runtime of its own. The second protocol adds the request that prepares an action.
+pub const PROTOCOL: &str = "kr-plugin-host/2";
 
 /// The domain separating the plugin host's startup claim.
 pub const RENDEZVOUS_DOMAIN: &str = "kr-plugin-host/1/rendezvous";
@@ -266,6 +270,121 @@ pub struct BindingRegistration {
     pub component: ComponentSource,
 }
 
+/// One value of an action's argument, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireArgument {
+    /// Text.
+    Text(String),
+    /// A whole number.
+    Integer(i64),
+    /// A decision.
+    Boolean(bool),
+    /// A chosen identifier.
+    Choice(String),
+    /// A completed attachment handle.
+    AttachmentHandle(String),
+    /// A node of the package's presentation document.
+    NodeRef(String),
+}
+
+/// One named argument of an action, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireNamedArgument {
+    /// The parameter's name.
+    pub name: String,
+    /// Its value.
+    pub value: WireArgument,
+}
+
+/// The authority of one invocation, as a component reads it.
+///
+/// The host issues it and the component only reads it; nothing in it is a handle the component
+/// could present to anybody. The broker's own token, with its handle, is issued separately and
+/// never leaves the worker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireToken {
+    /// The verified actor the action is for.
+    pub actor_id: String,
+    /// The grant record the actor acts under, empty for the local owner, who has none.
+    pub grant_id: String,
+    /// The binding revision the invocation was admitted at.
+    pub binding_revision: u64,
+    /// The thread revision, where the application has one apart from the binding's.
+    pub thread_revision: Option<u64>,
+    /// The declared action.
+    pub action_id: String,
+    /// The SHA-256 of exactly the parameters a person saw.
+    #[serde(with = "serde_bytes_vec")]
+    pub parameter_hash: Vec<u8>,
+    /// When the token stops being one a plan should be prepared under, in milliseconds since the
+    /// Unix epoch.
+    pub expires_at_ms: u64,
+}
+
+/// One step of a path into an upstream request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireSegment {
+    /// A member name.
+    Member(String),
+    /// An array index.
+    Index(u32),
+}
+
+/// One field of an upstream request and the value that goes in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireField {
+    /// The path into the request, from its root.
+    pub path: Vec<WireSegment>,
+    /// The value.
+    pub value: WireArgument,
+}
+
+/// What a component says the broker should do, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireOperation {
+    /// Redraw the component's own document.
+    Present,
+    /// Send one routed upstream method with its fields filled in.
+    UpstreamMethod {
+        /// The method.
+        method: String,
+        /// The fields.
+        fields: Vec<WireField>,
+    },
+    /// Cancel the bound execution's current turn.
+    UpstreamCancel,
+    /// Contribute a completed attachment to the upstream draft.
+    UpstreamAttachment {
+        /// The attachment the component names.
+        attachment_id: String,
+    },
+    /// Write text into the terminal.
+    TerminalText(String),
+}
+
+/// The effect a component proposes, as it travels.
+///
+/// A proposal and nothing more: the worker compares every part of it with the invocation and the
+/// declaration before anything is dispatched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePlan {
+    /// The action the component says it prepared.
+    pub action_id: String,
+    /// The effect class it says the action has.
+    pub class: kr_plugin_sdk::effect::EffectClass,
+    /// What it asks the broker to do.
+    pub operation: WireOperation,
+    /// The arguments it says it filled in.
+    pub arguments: Vec<WireNamedArgument>,
+}
+
 /// What a worker asks the plugin host to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -306,6 +425,8 @@ pub enum RequestBody {
         /// The caller's own deadline.
         deadline_ms: u64,
     },
+    /// Asks a binding's component to turn an invoked control into a proposed effect.
+    PrepareAction(Box<PrepareActionCall>),
     /// Takes a binding's resumable state.
     Checkpoint {
         /// The binding.
@@ -332,12 +453,27 @@ pub enum RequestBody {
     Health,
 }
 
+/// Everything a `prepare-action` call carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareActionCall {
+    /// The binding.
+    pub binding_id: kr_protocol::scalars::Uuid,
+    /// The invocation's authority, as the component reads it.
+    pub token: WireToken,
+    /// The arguments the action was invoked with, in the declaration's order.
+    pub arguments: Vec<WireNamedArgument>,
+    /// The caller's own deadline.
+    pub deadline_ms: u64,
+}
+
 impl RequestBody {
     /// Returns the binding this request concerns, where it concerns one.
     #[must_use]
     pub const fn binding_id(&self) -> Option<kr_protocol::scalars::Uuid> {
         match self {
             Self::RegisterBinding(registration) => Some(registration.binding_id),
+            Self::PrepareAction(call) => Some(call.binding_id),
             Self::Event { binding_id, .. }
             | Self::Snapshot { binding_id, .. }
             | Self::Checkpoint { binding_id, .. }
@@ -356,6 +492,7 @@ impl RequestBody {
             Self::RegisterBinding(_) => "register_binding",
             Self::Event { .. } => "event",
             Self::Snapshot { .. } => "snapshot",
+            Self::PrepareAction(_) => "prepare_action",
             Self::Checkpoint { .. } => "checkpoint",
             Self::Restore { .. } => "restore",
             Self::Unbind { .. } => "unbind",
@@ -452,6 +589,8 @@ pub enum ResponseBody {
 pub enum CallValue {
     /// Nothing but the document.
     Document,
+    /// The effect a component proposed.
+    Plan(Box<WirePlan>),
     /// A component's own resumable state.
     State(#[serde(with = "serde_bytes_vec")] Vec<u8>),
 }
@@ -616,6 +755,23 @@ mod tests {
                 binding_id,
                 deadline_ms: 200,
             },
+            RequestBody::PrepareAction(Box::new(PrepareActionCall {
+                binding_id,
+                token: WireToken {
+                    actor_id: "local:501".to_owned(),
+                    grant_id: String::new(),
+                    binding_revision: 3,
+                    thread_revision: None,
+                    action_id: "turn.cancel".to_owned(),
+                    parameter_hash: vec![7; 32],
+                    expires_at_ms: 1_700_000_005_000,
+                },
+                arguments: vec![WireNamedArgument {
+                    name: "reason".to_owned(),
+                    value: WireArgument::Text("because".to_owned()),
+                }],
+                deadline_ms: 500,
+            })),
             RequestBody::Checkpoint {
                 binding_id,
                 deadline_ms: 200,
@@ -682,6 +838,21 @@ mod tests {
                 value: Some(CallValue::State(b"resumable".to_vec())),
                 fault: None,
                 document: Some(3),
+            },
+        });
+        round_trip(&Frame::Response {
+            reply_to: 4,
+            body: ResponseBody::Called {
+                value: Some(CallValue::Plan(Box::new(WirePlan {
+                    action_id: "attach".to_owned(),
+                    class: kr_plugin_sdk::effect::EffectClass::UpstreamAttachment,
+                    operation: WireOperation::UpstreamAttachment {
+                        attachment_id: "t-1".to_owned(),
+                    },
+                    arguments: Vec::new(),
+                }))),
+                fault: None,
+                document: None,
             },
         });
         // The document a call drew travels as its own frames, so a caller reads it from the
@@ -781,7 +952,7 @@ mod tests {
 
     #[test]
     fn the_domains_and_names_are_the_ones_this_protocol_publishes() {
-        assert_eq!(PROTOCOL, "kr-plugin-host/1");
+        assert_eq!(PROTOCOL, "kr-plugin-host/2");
         assert_eq!(RENDEZVOUS_DOMAIN, "kr-plugin-host/1/rendezvous");
         assert_eq!(VERIFY_DOMAIN, "kr-plugin-host/1/verify");
         assert_ne!(RENDEZVOUS_DOMAIN, VERIFY_DOMAIN);
