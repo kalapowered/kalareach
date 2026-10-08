@@ -6280,7 +6280,17 @@ async fn an_update_goes_on_past_a_failed_one() {
 async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
     let mut host = Host::bare();
     let log = host.tree.root().join("starts.log");
-    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let stores = release_stores()
+        .into_iter()
+        .map(|store| match store.store.as_str() {
+            "transfers" => ReleaseStore {
+                migrates_from: 2,
+                ..store
+            },
+            _ => store,
+        })
+        .collect();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(stores);
     let controller_state = host.tree.paths().state_root().to_path_buf();
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
         .whose_daemon_cannot_start_in(&controller_state, &log);
@@ -6304,6 +6314,47 @@ async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
         "the second environment's daemon started from the new release"
     );
 
+    // A rescue the stores refuse stops the daemon that runs and starts it again from the release
+    // still current, and leaves the failed update recorded owing both daemons, the one that runs
+    // with the newer record it made of it.
+    let journal = kr_transfer::staging::StagingArea::store_path(&host.tree.environment());
+    let set = |version: i64| {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .execute("UPDATE schema_version SET version = ?1", [version])
+            .expect("a version");
+    };
+    set(1);
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(
+        second.build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rescue stopped is started again from the release still current"
+    );
+    let owed: std::collections::BTreeSet<String> = host.record()["update"]["restarts"]
+        .as_array()
+        .expect("the restarts")
+        .iter()
+        .map(|restart| {
+            restart["environment"]
+                .as_str()
+                .expect("an environment")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        owed,
+        [
+            host.tree.environment_id().to_string(),
+            second.tree.environment_id().to_string()
+        ]
+        .into(),
+        "the failed update is recorded owing both daemons: {}",
+        host.record()
+    );
+    set(kr_transfer::store::SCHEMA_VERSION);
+
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -6324,6 +6375,67 @@ async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], two.name().as_str(), "{record}");
     assert_eq!(starts_in(&log), 1, "the failed daemon was tried once");
+}
+
+/// KR-REQ-26.10: an update that goes on past a failed one and fails in its turn leaves both owing, as
+/// one record, and an update after them starts the daemon each owed from the release that fixes them:
+/// a chain of failed updates is never more than the daemons owed and the root that was recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_goes_on_past_two_failed_ones() {
+    let mut host = Host::bare();
+    let log = host.tree.root().join("starts.log");
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3).whose_daemon_cannot_start(&log);
+    let four = Assembled::at_this_level("0.4.0+dddddddddddd", 4);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled, name: &str| {
+        let archive = scratch.join(name);
+        release.archive(&archive);
+        host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ])
+    };
+    let (output, said) = update(&two, "two.tar.gz");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let (output, said) = update(&three, "three.tar.gz");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the update goes on past the first, switches, and its daemon cannot start: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(three.name().clone())
+    );
+    let record = host.record();
+    assert_eq!(record["update"]["abandoned"]["source"], one.name().as_str());
+    assert!(
+        record["update"]["abandoned"]["abandoned"].is_null(),
+        "what is owed is one record, not a chain: {record}"
+    );
+
+    let (output, said) = update(&four, "four.tar.gz");
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", four.name()),
+        "the daemon the first update stopped is started from the release that fixes both"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], three.name().as_str(), "{record}");
 }
 
 /// KR-REQ-26.10: a rescue that stopped after its switch is finished by the next run, which starts the
