@@ -448,9 +448,9 @@ async fn a_revocation_is_pending_while_a_worker_is_isolated_and_holds_when_it_re
             .await
             .expect("the waiting thread finishes");
     if !reached {
-        // What the announcement met, for the failure message: an answer (which may be a refusal or
-        // a transport failure) or none, and how many announcements the worker refused for the
-        // boundary. None, and none refused, is a worker that never took the frame up.
+        // What the announcement had met when the wait ended, for the failure message: whether the
+        // client's task had an answer (a refusal or a transport failure among them), and how many
+        // announcements the worker has refused for the boundary.
         let met = if announcing.is_finished() {
             format!(
                 "answered {:?}",
@@ -2177,12 +2177,12 @@ async fn add_worker(daemon: &HostedDaemon, apart: bool) -> Hosted {
 /// runnable on a thread and then left behind by a task that blocks it waits in that thread's run
 /// slot, where no other thread of the runtime takes it from, until the block ends: on one runtime a
 /// connection's task could wait there for as long as the hold lasted, and the announcement it was
-/// to read would go unread. Only the connections' runtime serves a connection. The tasks that
-/// wait for the session or the boundary on it are the announcement's handler where a case holds the
-/// session, the worker's maintenance pass (at its start and every minute), a generation presented
-/// while the boundary is held, and a mutation a case has paused inside it. None of them is woken by
-/// the signal for a finished child process, which every test of this binary shares and which woke
-/// the session's monitor from outside.
+/// to read would go unread. Only the connections' runtime serves a connection. The worker's own
+/// tasks that take the session or the boundary with a blocking lock still run on it, and a case
+/// that holds either holds up the ones it meets, which is what holding it is for. What the split
+/// takes off that runtime is the session's own tasks, which the signal for a finished child
+/// process wakes from outside the runtime whatever a case is doing, because every test of this
+/// binary shares that signal.
 struct ApartWorker {
     /// The thread that keeps the connections' runtime polling, ended before that runtime is told to
     /// stop.
@@ -2306,8 +2306,7 @@ impl ApartWorker {
 /// release it has not yet given. A task handed to the runtime from outside wakes a sleeping thread,
 /// which polls the sockets and timers when it goes to sleep again. A task comes every few
 /// milliseconds, which is far inside the daemon's exchange bound; a thread of the runtime has to be
-/// free to take it. The tasks that can wait on that runtime are few (see [`ApartWorker`]), and it
-/// has four threads.
+/// free to take it.
 struct Awake {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
