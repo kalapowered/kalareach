@@ -202,6 +202,7 @@ an older build read joins nothing because of them.
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
 | `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
+| `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every

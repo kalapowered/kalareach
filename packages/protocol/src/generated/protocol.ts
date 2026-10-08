@@ -10547,6 +10547,7 @@ export interface ConfigurationDocument {
    */
   secrets?: SecretReference[]
   startup?: StartupSelection
+  storage?: StorageSelection
   /**
    * The schema version this document is written against.
    */
@@ -10852,6 +10853,19 @@ export interface StartupSelection {
    * How the control daemon is started. Absent starts none.
    */
   controller?: ControllerStartup | null
+}
+/**
+ * The managed storage service this host uploads its backups to.
+ *
+ * Read when the daemon starts, so a change applies at the next start. No environment
+ * variable reaches it.
+ */
+export interface StorageSelection {
+  /**
+   * The service's origin: an `https` origin, or an `http` origin on a loopback address,
+   * spelled as a gateway origin is, with no path and no trailing slash.
+   */
+  origin?: string | null
 }
 /**
  * The managed voice broker this host names to its paired devices.
