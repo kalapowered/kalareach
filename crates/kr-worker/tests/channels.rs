@@ -20,6 +20,7 @@ use kr_worker::broker::channel_fixture::{
 };
 use kr_worker::broker::channels::ChannelEnd;
 use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
+use kr_worker::broker::ledger::TransitionCause;
 use kr_worker::persistence::JournalHealth;
 
 mod common;
@@ -420,6 +421,20 @@ fn approvals_page(
     .approvals
 }
 
+/// The events the broker's ledger holds, in order.
+fn recorded_events(broker: &Broker) -> Vec<kr_worker::broker::TransitionEvent> {
+    let mut cursor = broker.stream_start();
+    let mut recorded = Vec::new();
+    loop {
+        let replay = broker.replay_after(cursor).expect("the ledger replays");
+        recorded.extend(replay.events);
+        cursor = replay.cursor;
+        if !replay.more {
+            return recorded;
+        }
+    }
+}
+
 /// KR-REQ-25.01: what the broker records for a relayed approval is carried to the attention source,
 /// in one numbering with every other record of the broker, and the transition that interpreted it
 /// is the one that says so. A request nothing interprets (no binding of the connector's package)
@@ -626,8 +641,10 @@ async fn kr_req_25_01_the_numbering_carries_on_when_the_broker_starts_again() {
 /// session's approvals once the journal is back. Transitions made then are announced and not
 /// recorded, and the recovery that follows writes the state each resource reached; it writes the
 /// event that says so with it, so the follower reads the end without waiting for some later
-/// transition to show that numbers were spent. The control is an approval that stayed open through
-/// the whole gap, which the recovery gives no event, and whose item is therefore not ended.
+/// transition to show that numbers were spent. That event names the last event the ledger holds
+/// about the approval as its parent, and an approval the ledger first hears of in the recovery has
+/// no parent. The control is an approval that stayed open through the whole gap, which the recovery
+/// gives no event, and whose item is therefore not ended.
 #[tokio::test]
 async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_when_it_returns() {
     let mut store = common::SharedStore::open();
@@ -664,6 +681,12 @@ async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_
             .any(|record| record.resource_id == ended && record.interpreted),
         "the approval was raised"
     );
+    let last_recorded = recorded_events(&broker)
+        .iter()
+        .rev()
+        .find(|event| event.resource_id == ended)
+        .map(|event| event.sequence)
+        .expect("the ledger holds events of the approval");
 
     // The store fails under the next approval, and the fence goes up. The channel that relayed the
     // approval closes inside the gap, which settles what it relayed in memory only.
@@ -715,6 +738,27 @@ async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_
             .all(|record| record.resource_id != stayed),
         "an approval that stayed open through the gap is given no event"
     );
+    let first_heard = relayed(&broker, 3, "qrstu").expect("recorded").resource_id;
+    let recovery_events: Vec<_> = recorded_events(&broker)
+        .into_iter()
+        .filter(|event| event.cause == TransitionCause::Reconciliation)
+        .collect();
+    let parent_of = |resource_id| {
+        recovery_events
+            .iter()
+            .find(|event| event.resource_id == resource_id)
+            .map(|event| event.parent_sequence)
+    };
+    assert_eq!(
+        parent_of(ended),
+        Some(Some(last_recorded)),
+        "the end names the last event the ledger holds about the approval"
+    );
+    assert_eq!(
+        parent_of(first_heard),
+        Some(None),
+        "an approval the ledger first hears of in the recovery follows no event"
+    );
     open_through.close().await;
     assert!(matches!(
         open_through.ended().await,
@@ -723,32 +767,75 @@ async fn kr_req_25_01_an_approval_that_ends_while_the_journal_is_out_is_carried_
 }
 
 /// KR-REQ-25.01: whoever follows a session's approvals is woken by each transition the broker
-/// commits, on the connection that writes it, so that a held request for the session's sources
-/// answers at once. The signal is subscribed to before the approval is relayed, so a commit that
-/// lands before the wait begins is still seen.
+/// commits, on the connection that writes it, and by the event a recovery writes for a transition
+/// made while the journal was out, so that a held request for the session's sources answers at
+/// once. The signal is subscribed to before each is made, so a commit that lands before the wait
+/// begins is still seen.
 #[tokio::test]
 async fn kr_req_25_01_a_relayed_approval_wakes_whoever_follows_the_approvals() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let (broker, _journal) = broker_over_a_journal(&directory.path().join("journal.sqlite3"));
+    let mut store = common::SharedStore::open();
+    let broker = Arc::new(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+    );
     let changes = Arc::new(tokio::sync::Notify::new());
     broker.attach_attention_changes(Arc::clone(&changes));
-    register(&broker, 2);
     let package = Package::laid_out();
-    package.bind(&broker, 2);
-    let mut channel = Channel::open(
-        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
-        2,
-        launched(2),
-    );
+    let mut channels = Vec::new();
+    for number in [2, 3] {
+        register(&broker, number);
+        package.bind(&broker, number);
+        channels.push(Channel::open(
+            package.launch(&broker, number, Some(fixture::QUALIFIED_VERSION)),
+            number,
+            launched(number),
+        ));
+    }
+    let mut open_through = channels.pop().expect("two channels");
+    let mut ending = channels.pop().expect("two channels");
 
+    // The first commit: a relayed approval is recorded on the connection that writes it.
     let mut woken = std::pin::pin!(changes.notified());
     woken.as_mut().enable();
-    channel.relay("abcde").await;
+    ending.relay("abcde").await;
     tokio::time::timeout(LIVENESS_DEADLINE, woken)
         .await
         .expect("the relayed approval's commit wakes the follower");
-    channel.close().await;
-    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+
+    // The journal goes out under the next request, and the approval ends inside the gap, which
+    // settles it in memory only.
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    open_through.relay("qrstu").await;
+    eventually("the fence is up", || {
+        broker.mode() == GatewayMode::NativeOnlyVolatile
+    })
+    .await;
+    ending.close().await;
+    assert!(matches!(ending.ended().await, ChannelEnd::Ended { .. }));
+
+    // The recovery writes the end the gap hid, and wakes the follower with it.
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(20);
+    let mut woken = std::pin::pin!(changes.notified());
+    woken.as_mut().enable();
+    broker
+        .recover(TimestampMs::new(20))
+        .expect("the gap is committed");
+    tokio::time::timeout(LIVENESS_DEADLINE, woken)
+        .await
+        .expect("the recovery's event wakes the follower");
+    open_through.close().await;
+    assert!(matches!(
+        open_through.ended().await,
+        ChannelEnd::Ended { .. }
+    ));
 }
 
 /// KR-REQ-12.18: a channel closed while the gateway is fenced, one closed while it recovers and one

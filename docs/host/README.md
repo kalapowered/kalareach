@@ -4003,9 +4003,11 @@ withdrawn, expired or left uncertain; a request nothing has interpreted, a claim
 back and every other transition move the cursor and raise nothing. A transition made while the
 journal was out is announced and not recorded, and the recovery that writes the states reached
 writes the event that says so with them, so the end of an approval that came in that stretch
-reaches the store when the journal is back. None of the three carries text but the question
-ledger and the host events: what an approval asks is the application's to show. For each live
-session the daemon opens a connection of its own to the session's worker, verified and bound to
+reaches the store when the journal is back. That event is numbered above the numbers the broker
+spent while the journal was out, so the store notes a gap before it, and each other approval of the
+session that is still pending is shown as uncertain until it ends. None of the three carries text
+but the question ledger and the host events: what an approval asks is the application's to show.
+For each live session the daemon opens a connection of its own to the session's worker, verified and bound to
 the daemon's generation like every other, and declared for attention: it carries the daemon's
 requests for these records and nothing else, and a newer one replaces the one before it. The daemon
 keeps one request for records past the store's cursors waiting on it. The worker answers that

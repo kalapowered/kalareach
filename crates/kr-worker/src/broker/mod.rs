@@ -2768,7 +2768,9 @@ impl Broker {
             // the ledger's last event about a resource can say less than the state it reaches
             // here. Each such resource is given the event that says so, written with its state,
             // and numbered above everything the broker spent while the journal was out: a
-            // consumer that follows the ledger reads the end of what it saw begin.
+            // consumer that follows the ledger reads the end of what it saw begin. Its parent is
+            // the last event the ledger holds about the resource, which is the last one a consumer
+            // can have read.
             let owed = match recorder.as_ref() {
                 Some(recorder) => recorder.records_without_their_event(&fresh)?,
                 None => self.state().ledger.records_without_their_event(&fresh)?,
@@ -2776,13 +2778,15 @@ impl Broker {
             let events: Vec<_> = {
                 let mut state = self.state();
                 owed.iter()
-                    .map(|position| {
-                        state.next_transition_event(
+                    .map(|(position, parent)| {
+                        let mut event = state.next_transition_event(
                             &fresh[*position].0,
                             now,
                             crate::broker::ledger::TransitionCause::Reconciliation,
                             None,
-                        )
+                        );
+                        event.parent_sequence = *parent;
+                        event
                     })
                     .collect()
             };

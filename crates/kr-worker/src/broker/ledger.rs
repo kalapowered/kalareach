@@ -194,7 +194,8 @@ pub enum TransitionCause {
     HostAnswer,
     /// The upstream answered or withdrew its own request.
     Upstream,
-    /// A reconciliation after a reconnection or a recovery settled it.
+    /// A reconciliation after a reconnection settled it, or a recovery wrote down the state it
+    /// reached while the journal was out.
     Reconciliation,
 }
 
@@ -301,7 +302,8 @@ pub struct TransitionEvent {
     pub causal_root: String,
     /// The previous event about this same resource, where there is one.
     pub parent_sequence: Option<u64>,
-    /// When the transition happened.
+    /// When the transition happened, or, for the event a recovery writes for a transition made
+    /// while the journal was out, when the recovery wrote it.
     pub recorded_at: TimestampMs,
 }
 
@@ -1546,11 +1548,13 @@ impl Ledger {
     }
 
     /// Returns the position of each of `records` whose state the ledger's last event about it
-    /// does not say.
+    /// does not say, with the number of that last event, which is the event a recovery writes
+    /// next to as its parent.
     ///
     /// While the journal is faulted a transition is announced and not written, so the ledger's
     /// last event about a resource can be an earlier state than the one the broker holds, or
-    /// there can be none. Those are the resources a recovery owes an event.
+    /// there can be none. Those are the resources a recovery owes an event. A resource the
+    /// ledger has no event about has no parent number.
     ///
     /// # Errors
     ///
@@ -1558,21 +1562,24 @@ impl Ledger {
     pub fn records_without_their_event(
         &self,
         records: &[(PendingResource, Option<BrokerBindingId>, bool)],
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Vec<(usize, Option<u64>)>> {
         let mut owed = Vec::new();
         for (position, (resource, _, _)) in records.iter().enumerate() {
-            let last: Option<String> = self
+            let last: Option<(String, i64)> = self
                 .connection
                 .query_row(
-                    "SELECT state FROM broker_events WHERE resource_id = ?1
+                    "SELECT state, sequence FROM broker_events WHERE resource_id = ?1
                      ORDER BY sequence DESC LIMIT 1",
                     params![resource.resource_id.get().as_bytes().as_slice()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(|error| self.fault(error))?;
-            if last.as_deref() != Some(resource.state.as_str()) {
-                owed.push(position);
+            if last.as_ref().map(|(state, _)| state.as_str()) != Some(resource.state.as_str()) {
+                owed.push((
+                    position,
+                    last.map(|(_, sequence)| u64::try_from(sequence).unwrap_or_default()),
+                ));
             }
         }
         Ok(owed)
