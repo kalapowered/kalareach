@@ -854,7 +854,8 @@ impl<'a> Resolver<'a> {
 
     /// The records of one keyed file of a phone lane: one for each case the lane's tool reported
     /// for a class the file declares; or one, when this run's platform does not run the lane, when
-    /// the lane's tool reported nothing, or when it reported nothing of this file.
+    /// the lane's tool reported nothing, when it reported a class that no single file of the lane
+    /// declares, or when it reported nothing of this file.
     fn lane(&self, file: &str, reason: &str, key: &map::Key) -> Vec<TestRecord> {
         let record = |test: String,
                       outcome: Outcome,
@@ -1434,10 +1435,21 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
+            // A lane's case is compared with the keyed files of the step's own lane only: a class
+            // of another lane that has the same name is not its class.
+            let own_lane = |file: &str| match &step.step.reading {
+                plan::Reading::Lane(tests) => self
+                    .options
+                    .lanes
+                    .iter()
+                    .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file)),
+                _ => false,
+            };
             for case in step.lane.iter().flatten() {
                 let keyed_class = map.keys.values().flat_map(|places| places.keys()).any(|place| {
                     matches!(place, Place::Lane { file, .. }
-                        if map.lane_classes.get(file).is_some_and(|classes| lane::declares(classes, &case.class)))
+                        if own_lane(file)
+                            && map.lane_classes.get(file).is_some_and(|classes| lane::declares(classes, &case.class)))
                 });
                 if case.outcome == LibtestOutcome::Failed && !keyed_class {
                     failed.insert(format!("step {}: {} {}", index + 1, case.class, case.name));

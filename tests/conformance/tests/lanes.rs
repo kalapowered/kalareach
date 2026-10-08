@@ -359,6 +359,35 @@ fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
 }
 
 #[test]
+fn an_expected_failure_that_leaves_the_exit_status_at_0_still_fails_the_run() {
+    // Xcode ends 0 over a case that failed as expected. The case is named for the class of a file
+    // of the iOS lane that names no row, and an Android file that names rows has a class of the
+    // same name: the case is compared with the files of its own lane only, so it is listed among
+    // the failures outside any row and the report fails.
+    let mut map = map_of(&fixtures().join("lanes"));
+    map.lane_classes
+        .get_mut("apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/VoiceCaptureGateTest.kt")
+        .expect("the Android file's classes")
+        .push("LaunchPlanTests".to_owned());
+    let mut cases = xcode("ios.json");
+    let case = cases
+        .iter_mut()
+        .find(|case| case.class == "LaunchPlanTests")
+        .expect("a case of the file that names no row");
+    case.outcome = LibtestOutcome::Failed;
+    case.note = Some("the case expected to fail".to_owned());
+    let document = assemble(
+        Platform::MacOs,
+        &map,
+        &[executed(step(Platform::MacOs), 0, Ok(cases))],
+    );
+    assert!(document.problems.is_empty(), "{:?}", document.problems);
+    assert!(!document.passed());
+    assert_eq!(document.failures_outside_identifiers.len(), 1);
+    assert!(document.failures_outside_identifiers[0].contains("LaunchPlanTests"));
+}
+
+#[test]
 fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
     // The limit of the rule: a class missed in its own file and listed in another that names no row
     // stays attributed to that other file. Its failure then fails the run and is listed among the
@@ -385,8 +414,19 @@ fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
         &[executed(step(Platform::MacOs), 65, Ok(cases))],
     );
     assert!(!document.passed());
+    assert!(document.problems.is_empty(), "{:?}", document.problems);
     assert_eq!(document.failures_outside_identifiers.len(), 1);
     assert!(document.failures_outside_identifiers[0].contains("VoiceRecorderReaderTests"));
+    // The rows of the file that holds the class read from its other classes: the limit.
+    for row in [
+        "KR-REQ-15.13",
+        "KR-REQ-15.34",
+        "KR-REQ-15.35",
+        "KR-REQ-15.36",
+        "KR-ACC-014",
+    ] {
+        assert_eq!(document.identifiers[row].verdict, Verdict::Passed, "{row}");
+    }
 }
 
 #[test]
