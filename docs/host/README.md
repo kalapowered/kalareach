@@ -2929,10 +2929,12 @@ left. A worker that ran as a systemd service also ran in that service's control 
 the reservation and unable to name anything else. The cleanup reads the group from the kernel, asks
 the manager to kill what it still holds, and reaches a process the worker never saw.
 
-**What it cannot reach, and what a survivor means.** On macOS and on a Linux host with no service
-manager, a process that left the terminal's session, a process the worker started outside it and a
-process that began after the worker's last record are not found: there the record and the terminal
-are all there is, and a recorded process that left the session is still stopped. Where a service's
+**What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
+session, a process the worker started outside it and a process that began after the worker's last
+record are not found; on a Linux host with no service manager, a process that left the session
+after its parent had ended, a process the worker started outside the session and a process that
+began after the last record are not. There the record and the worker's own tree or terminal are
+all there is, and a recorded process that left the session is still stopped. Where a service's
 control group is read, those three are reached by the group, and a process that moved itself to
 another service or scope is the one that is not found. A process that outlasts the attempt, such as
 one the platform will not let this host signal, is fenced rather than stopped: the worker that
@@ -2945,10 +2947,12 @@ worker ran in and the kernel read empty, or a job that needed no help.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
-process ignores the request, and up to four more after force: two for the service manager's answer,
-which is not waited for past that, and two for the end that follows.
-A start runs every crashed session's cleanup before waiting for any of them. A list or a barrier
-that meets several crashed sessions one after another waits for each in turn.
+process ignores the request or the unit's control group still holds something (a group the host
+cannot read counts as holding something, so the period then runs out), and up to four more after
+force: two for the service manager's answer, which is not waited for past that, and two for the end
+that follows. A start runs the cleanup of every crashed session it finds, claimed or published,
+before waiting for any of them, so it waits for the longest and not for each in turn. A list or a
+barrier that meets several crashed sessions one after another waits for each in turn.
 
 **A closed session can be collected.** A session with no worker has no maintenance tick, so the
 archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging
