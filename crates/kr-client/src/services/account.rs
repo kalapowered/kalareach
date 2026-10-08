@@ -2165,18 +2165,27 @@ impl SignedInAccount {
     }
 
     /// Ends a refresh token this account was issued and will not keep, such as one that came for a
-    /// sign-in an open call turned away. It is queued before it is sent, so a service that cannot
-    /// be reached is told again at the next recovery, and returns how many revocations the service
-    /// has still not acknowledged.
+    /// sign-in an open call turned away, or one a refused exchange left behind. It is queued before
+    /// it is sent, so a service that cannot be reached is told again at the next recovery, and the
+    /// number of revocations the service has still not acknowledged is returned.
+    ///
+    /// When the queue cannot be written the token is still sent to the service once, and the
+    /// failure is returned: a token that cannot be remembered is not dropped unsent.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be changed; nothing is queued then.
+    /// Returns an error when the store cannot be read or changed. When it could not queue the token,
+    /// the token was sent once all the same and nothing is queued; when it could not read the queue
+    /// afterwards, the token is queued.
     pub async fn revoke_unkept(&self, refresh_token: RefreshToken) -> Result<usize> {
-        {
+        let queued = {
             let _held = self.hold().await?;
             // A name no kept grant carries, so recovery never takes it for a grant's own queue.
-            self.queue("unkept", refresh_token)?;
+            self.queue("unkept", refresh_token.clone())
+        };
+        if let Err(error) = queued {
+            let _ = self.service.revoke(&refresh_token).await;
+            return Err(error);
         }
         self.send_pending().await
     }
