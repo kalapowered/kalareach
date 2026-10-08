@@ -1242,6 +1242,10 @@ impl Registry {
     /// exists when it opens the file, and the other writers are opened before a version moves, so
     /// a file that records 8 has them. Nothing in a row changes.
     ///
+    /// The version also stands for the move of the host's clock record out of the attention
+    /// store's `attention-time.cbor`: a daemon takes that file into this table once, when it
+    /// starts, after the registry records 8, and removes it.
+    ///
     /// This migration goes in the first release after every install has opened the registry at
     /// this version: nothing before it is installed anywhere it has to be read from again.
     fn migrate_7_to_8(&self) -> Result<()> {

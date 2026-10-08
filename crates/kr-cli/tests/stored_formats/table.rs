@@ -145,9 +145,11 @@ pub fn table() -> Vec<Store> {
                         "StoredRevocation",
                     ],
                 ),
+                // `ActionSubject` has a variant for each method a recorded pairing action can name,
+                // and the reader of the row matches the stored method against them.
                 Kept::Source(
                     "crates/kr-controller/src/net/invitations.rs",
-                    &["StoredCommitment"],
+                    &["StoredCommitment", "ActionSubject"],
                 ),
                 Kept::Source(
                     "crates/kr-controller/src/net/devices.rs",
@@ -172,6 +174,10 @@ pub fn table() -> Vec<Store> {
                 version(kr_attention::store::SCHEMA_VERSION),
                 version(kr_attention::store::OLDEST_SCHEMA_VERSION),
             ),
+            // An earlier build kept the host's clock record in `attention-time.cbor`, a
+            // `HostTimeState`. A daemon now takes it into the registry once, when it starts, and
+            // removes it. That file and that type leave this entry when the code that takes it in
+            // does.
             owned: vec![Claim {
                 name: "attention-time.cbor",
                 children: &[],
