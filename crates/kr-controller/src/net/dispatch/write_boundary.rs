@@ -2093,3 +2093,163 @@ async fn a_device_revocation_stops_its_own_frames_and_not_another_devices() {
     assert_eq!(kept_write.await.expect("the write ends"), Written::Sent);
     assert_eq!(kept_stream.reached(), vec![Reached::Whole]);
 }
+
+/// A share of `session_id` issued to `device_id` for viewing, active, ending at `expiry`.
+fn a_share_of(
+    controller: &Controller,
+    device_id: DeviceId,
+    session_id: kr_protocol::ids::SessionId,
+    expiry: kr_protocol::grant::GrantExpiry,
+) -> kr_protocol::grant::Grant {
+    let (mut grant, _) =
+        super::super::tests::granted(expiry, controller.policy().authority_revision());
+    grant.issuer_device_id = controller.sharing().host_device_id();
+    grant.recipient_device_id = device_id;
+    grant.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [session_id].into_iter().collect(),
+    };
+    grant.actions = [ActionRight::SessionView].into_iter().collect();
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: grant.clone(),
+                session_id: Some(session_id),
+                issued_at_ms: 1,
+                activated_at_ms: Some(2),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the share is written");
+    grant
+}
+
+/// KR-REQ-25.10: a response decided under a share is held to the share's end like any other bound
+/// it was decided under. It was permitted, and then waited for the writer while the share ran
+/// out: it is not written, the stream is whole, and the request is decided again. The control is
+/// the same response with the share still in force, which goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_25_10_a_response_decided_under_a_share_is_not_written_once_the_share_ran_out() {
+    for ran_out in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let (grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let share = a_share_of(
+            &controller,
+            device.device_id,
+            session_id,
+            kr_protocol::grant::GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(now + 60_000),
+            },
+        );
+        let connection = super::RemoteConnection::for_test(&controller, device);
+        let asked = connection
+            .ask_naming(
+                Some(session_id),
+                Method::QuestionRead.entry(),
+                false,
+                Some(share.grant_id),
+            )
+            .expect("the share answers for the session");
+
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let bounds = asked.decision.bounds();
+        let frame = batch();
+        let (written, ()) = tokio::join!(output.write(&frame, &bounds, None), async {
+            stream.waited(1).await;
+            if ran_out {
+                wall.store(now + 120_000, Ordering::SeqCst);
+                continuous.advance(Duration::from_secs(120));
+            }
+            stream.writer.add_permits(1);
+        });
+        if ran_out {
+            assert_eq!(written, Written::Undecided);
+            assert!(stream.reached().is_empty());
+        } else {
+            assert_eq!(written, Written::Sent);
+            assert_eq!(stream.reached(), vec![Reached::Whole]);
+        }
+        drop(controller);
+    }
+}
+
+/// KR-REQ-25.10: a device whose pairing grant is an organisation's is a member only while its lease
+/// lasts, and a share does not outlive that. The lease that has lapsed refuses a request that names
+/// the share, and a request decided before it lapsed carries the lease as one of its bounds, so a
+/// response held at the writer is not written once the lease has ended. The control is the member
+/// with the lease in force, whose request under the share goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_25_10_a_share_does_not_outlive_the_lease_of_the_pairing_grant() {
+    for lapsed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let organisation = TestOrganisation::new(0x48, now - 60 * 60 * 1000);
+        let (grant, _) = super::super::tests::leased_member(&controller, &organisation, now);
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let share = a_share_of(
+            &controller,
+            device.device_id,
+            session_id,
+            kr_protocol::grant::GrantExpiry::Never,
+        );
+        let connection = super::RemoteConnection::for_test(&controller, device);
+        let ask = || {
+            connection.ask_naming(
+                Some(session_id),
+                Method::QuestionRead.entry(),
+                false,
+                Some(share.grant_id),
+            )
+        };
+        let asked = ask().expect("the member's lease is in force");
+        assert!(
+            asked.decision.bounds().iter().any(|bound| matches!(
+                bound.snapshot().identity,
+                crate::grants::policy::BoundIdentity::Lease(_)
+            )),
+            "the request holds the lease of the grant that lets the device in"
+        );
+
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let bounds = asked.decision.bounds();
+        let frame = batch();
+        let (written, ()) = tokio::join!(output.write(&frame, &bounds, None), async {
+            stream.waited(1).await;
+            if lapsed {
+                continuous.advance(Duration::from_secs(15 * 60 + 30));
+            }
+            stream.writer.add_permits(1);
+        });
+        if lapsed {
+            assert_eq!(
+                written,
+                Written::Undecided,
+                "the lease ended under the response"
+            );
+            assert!(stream.reached().is_empty());
+            let refused = ask().expect_err("a lapsed lease decides no request under the share");
+            assert!(refused.message.contains("lease"), "{refused:?}");
+        } else {
+            assert_eq!(written, Written::Sent);
+        }
+        drop(controller);
+    }
+}
