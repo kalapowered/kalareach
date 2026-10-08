@@ -887,3 +887,103 @@ async fn kr_req_25_10_a_connection_is_ended_by_the_clock_that_ends_a_grant_it_st
         world.serving.abort();
     }
 }
+
+/// KR-REQ-19.01: a view-only recipient binds no attachment through `agent.draft.add_attachment`. The
+/// call needs the right to upload and the right to prompt an agent, which no share a session is
+/// shared with carries and which a call that names no session takes from the device's pairing
+/// grant alone: the recipient's pairing grant holds neither, and naming the share does not lend the
+/// call anything, since a share is no grant for a call that acts on no session. The control is a
+/// device whose pairing grant holds both: its call is not refused for its rights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_01_a_view_only_share_binds_no_attachment_for_its_holder() {
+    use kr_protocol::transfer::{
+        AgentDraftAddAttachmentParams, AttachmentContribution, InsertionMethod,
+    };
+
+    let (world, holding) = world(Holding::default(), holds_results()).await;
+    let viewer = paired(&world.controller, 51, SessionSelector::None);
+    let viewing = share(
+        &world,
+        &viewer,
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        GrantExpiry::Never,
+    );
+    let (mut able, _) = crate::service::net::tests::granted(
+        GrantExpiry::Never,
+        world.controller.policy().authority_revision(),
+    );
+    able.session_selector = SessionSelector::None;
+    able.actions = [ActionRight::FilesUpload, ActionRight::AgentPrompt]
+        .into_iter()
+        .collect();
+    let uploader = holding_grant(&world.controller, 52, able);
+
+    let mut answers = Vec::new();
+    for (device, named, byte) in [
+        (viewer.clone(), None, 61_u8),
+        (viewer, Some(viewing.grant_id), 62),
+        (uploader, None, 63),
+    ] {
+        let connection = super::RemoteConnection::for_test(&world.controller, device);
+        let window = connection
+            .windows
+            .issue(connection.connection_id, world.controller.boot_epoch)
+            .expect("a window");
+        let mutation = kr_protocol::envelope::MutationRequest {
+            request_id: RequestId::new(u64::from(byte)),
+            method: Method::AgentDraftAddAttachment.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16])),
+            grant_id: Nullable(named),
+            target: kr_protocol::envelope::ActionTarget::environment(world.environment_id),
+            expected: kr_protocol::envelope::ParamsValue::empty(),
+            action_window_id: window.action_window_id,
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: kr_protocol::envelope::ParamsValue::from_typed(
+                &AgentDraftAddAttachmentParams {
+                    draft_id: kr_protocol::ids::DraftId::new(
+                        kr_protocol::scalars::Uuid::from_bytes([byte; 16]),
+                    ),
+                    expected_revision: kr_protocol::ids::DraftRevision::new(1),
+                    transfer_id: kr_protocol::ids::TransferId::new(
+                        kr_protocol::scalars::Uuid::from_bytes([byte; 16]),
+                    ),
+                    contribution: AttachmentContribution {
+                        operation_id: "attach".to_owned(),
+                        accepted_media_types: vec!["text/plain".to_owned()],
+                        max_byte_len: kr_protocol::scalars::U64::new(1024),
+                        max_count: kr_protocol::scalars::U64::new(1),
+                        insertion_method: InsertionMethod::TypedSubmission,
+                        external_destination: Nullable::null(),
+                        model_media_capability: false,
+                    },
+                },
+            )
+            .expect("encodes"),
+        };
+        let answer = connection.mutate(&mutation).await;
+        answers.push(refusal_of(&answer).code);
+    }
+    assert_eq!(
+        answers[0],
+        ErrorCode::PermissionDenied,
+        "the recipient's pairing grant"
+    );
+    assert_eq!(
+        answers[1],
+        ErrorCode::PermissionDenied,
+        "naming the share lends nothing"
+    );
+    assert_ne!(
+        answers[2],
+        ErrorCode::PermissionDenied,
+        "a pairing grant that holds the rights is not refused for them"
+    );
+    assert!(
+        holding.lock().expect("held").mutations.is_empty(),
+        "and nothing reached the worker"
+    );
+    world.serving.abort();
+}

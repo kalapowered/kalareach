@@ -19,11 +19,11 @@
 //! # Indirection
 //!
 //! Section 19: "A view-only invitation cannot obtain terminal input through an attachment action,
-//! plugin call or workflow." An intermediary declares rights of its own, and an actor that invokes
-//! one is tempted to inherit them. [`effective_rights`] refuses that: what an indirect call may do
-//! is the *intersection* of what the actor holds and what the intermediary declares, so a
-//! view-only actor calling a plugin that declares `terminal.input` obtains no terminal input. The
-//! intermediary's declaration bounds the call; it never supplies authority.
+//! plugin call or workflow." Nothing here decides that: each of the three is decided where it
+//! acts, by the right its own class needs (the worker's check of a plugin action's class, the
+//! automation service's check of a node's rights against the grant the workflow names, and the
+//! method table's rights and the attachment's capability cut), and a share is no grant a workflow
+//! acts under.
 
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, SessionSelector};
 use kr_protocol::ids::SessionId;
@@ -169,84 +169,4 @@ pub fn check_delegation(child: &Grant, parent: &Grant) -> Result<()> {
             detail: "a delegated grant narrows its parent; it never extends one".to_owned(),
         })
     }
-}
-
-/// Something that acts for an actor and declares rights of its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Intermediary {
-    /// A plugin action the actor invoked.
-    PluginAction {
-        /// The rights the registered action declares.
-        declared: CanonicalSet<ActionRight>,
-    },
-    /// An attachment action: a button or command an adapter contributed.
-    AttachmentAction {
-        /// The rights the contributed action declares.
-        declared: CanonicalSet<ActionRight>,
-    },
-    /// A workflow node running under a workflow's declared grant.
-    Workflow {
-        /// The rights the workflow definition declares.
-        declared: CanonicalSet<ActionRight>,
-    },
-}
-
-impl Intermediary {
-    /// The rights this intermediary declares.
-    #[must_use]
-    pub const fn declared(&self) -> &CanonicalSet<ActionRight> {
-        match self {
-            Self::PluginAction { declared }
-            | Self::AttachmentAction { declared }
-            | Self::Workflow { declared } => declared,
-        }
-    }
-
-    /// A name for a refusal.
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::PluginAction { .. } => "a plugin action",
-            Self::AttachmentAction { .. } => "an attachment action",
-            Self::Workflow { .. } => "a workflow",
-        }
-    }
-}
-
-/// What an actor may do through an intermediary.
-///
-/// The intersection, and only the intersection. A view-only actor invoking something that declares
-/// `terminal.input` gets no terminal input: an intermediary bounds a call, it does not fund one.
-#[must_use]
-pub fn effective_rights(
-    actor: &CanonicalSet<ActionRight>,
-    via: &Intermediary,
-) -> CanonicalSet<ActionRight> {
-    actor
-        .iter()
-        .copied()
-        .filter(|right| via.declared().contains(right))
-        .collect()
-}
-
-/// Checks that an actor may reach one right through an intermediary.
-///
-/// # Errors
-///
-/// Returns [`ControllerError::PermissionDenied`] naming the right and the intermediary.
-pub fn check_indirect(
-    actor: &CanonicalSet<ActionRight>,
-    via: &Intermediary,
-    right: ActionRight,
-) -> Result<()> {
-    if effective_rights(actor, via).contains(&right) {
-        return Ok(());
-    }
-    Err(ControllerError::PermissionDenied {
-        detail: format!(
-            "{} cannot obtain {} for an actor whose grant does not carry it",
-            via.as_str(),
-            right.as_str()
-        ),
-    })
 }
