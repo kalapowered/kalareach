@@ -20,9 +20,6 @@ use kr_protocol::update::{Recording, ReleaseManifest, ReleaseStore, StoreScope};
 use super::inventory::Environment;
 use crate::error::CliError;
 
-/// The largest record a version is read out of.
-const RECORD_LIMIT: u64 = 1024 * 1024;
-
 /// A store the target cannot read as it is, and where.
 pub struct Refusal {
     store: String,
@@ -353,10 +350,13 @@ fn refused(refusal: kr_controller::registry::VersionRefusal) -> Shown {
             shown!("it could not be looked at: {}", Shown::io(&error))
         }
         VersionRefusal::LogNotTaken => Shown::said(
-            "what a daemon that ended by a signal left in its log could not be taken into it",
+            "its write-ahead log could not be taken into it, so what a daemon left in the log is \
+             not known",
         ),
         VersionRefusal::Unopened => Shown::said("it could not be opened to be read"),
-        VersionRefusal::NoTable => Shown::said("it has no table that records a version"),
+        VersionRefusal::NoTable => {
+            Shown::said("it has no table that records a version, or is not a database")
+        }
         VersionRefusal::NoVersion => Shown::said("it records no version"),
         VersionRefusal::SeveralVersions => Shown::said("it records more than one version"),
         VersionRefusal::NotAVersion => Shown::said("it records a version that is not a number"),
@@ -374,10 +374,11 @@ enum Member {
 
 /// Reads the version a JSON record states in `member`; `absent` where it states none. A record that
 /// cannot be read as a JSON object with a whole number there is refused, unless `lenient`, which is
-/// the configuration document: every release loads one it cannot read as defaults, so it has no
-/// version to refuse a switch for.
+/// the configuration document: every release loads one it cannot read as defaults, so a document
+/// that states no version it can make out has none to refuse a switch for. A whole number it can
+/// make out is a version like any other, and one outside the range is refused.
 fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<u32>, Shown> {
-    let bytes = match kr_ipc::install::read_regular_file(file, RECORD_LIMIT) {
+    let bytes = match kr_ipc::install::read_regular_file(file, super::RECORD_LIMIT) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) if lenient => return Ok(None),
@@ -400,13 +401,9 @@ fn json(file: &Path, member: &str, absent: u32, lenient: bool) -> Result<Option<
     };
     match document.get(member) {
         None => Ok(Some(absent)),
-        Some(Member::Number(stated)) => match u32::try_from(*stated) {
-            Ok(stated) => Ok(Some(stated)),
-            Err(_) if lenient => Ok(None),
-            Err(_) => Err(Shown::said(
-                "the member that records its version is not a whole number",
-            )),
-        },
+        // A whole number too large for any release to read is far above every range, and is read
+        // as the largest version there is, so that it is refused as above them.
+        Some(Member::Number(stated)) => Ok(Some(u32::try_from(*stated).unwrap_or(u32::MAX))),
         Some(Member::Other(_)) if lenient => Ok(None),
         Some(Member::Other(_)) => Err(Shown::said(
             "the member that records its version is not a whole number",
@@ -454,6 +451,14 @@ mod tests {
                 read(&at(refused), 1, true),
                 Some(None),
                 "the configuration document is not refused for it: {refused}"
+            );
+        }
+        // A whole number too large for any release to read is above every range, not no version.
+        for lenient in [false, true] {
+            assert_eq!(
+                read(&at(r#"{"version": 4294967296}"#), 0, lenient),
+                Some(Some(u32::MAX)),
+                "a version far above any range is read as the largest there is (lenient: {lenient})"
             );
         }
         assert_eq!(
@@ -512,6 +517,31 @@ mod tests {
             .expect("reads"),
             None
         );
+    }
+
+    /// A directory of records is listed, and one that cannot be listed is a store that cannot be
+    /// read: only a directory that is not there holds no record.
+    #[test]
+    fn a_directory_of_records_that_cannot_be_listed_is_refused_and_one_that_is_not_there_is_not() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let records = directory.path().join("records");
+        assert!(
+            files(directory.path(), "records/*.json")
+                .expect("no directory holds no record")
+                .is_empty()
+        );
+        std::fs::create_dir(&records).expect("a directory");
+        record(&records, "one.json", "{}");
+        record(&records, ".hidden.json", "{}");
+        record(&records, "note.txt", "");
+        assert_eq!(
+            files(directory.path(), "records/*.json").expect("lists"),
+            vec![records.join("one.json")]
+        );
+        // A file where the directory belongs cannot be listed.
+        std::fs::remove_dir_all(&records).expect("removed");
+        std::fs::write(&records, b"not a directory").expect("a file");
+        assert!(files(directory.path(), "records/*.json").is_err());
     }
 
     fn rusqlite_open(path: &Path) -> rusqlite::Connection {

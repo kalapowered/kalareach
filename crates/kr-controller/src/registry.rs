@@ -93,6 +93,18 @@ pub enum LaunchPhase {
 }
 
 impl LaunchPhase {
+    /// Every phase, for what reads the words the registry stores for them. A phase added to the
+    /// type is added here too, beside `as_str` and `parse`, whose matches the compiler checks.
+    pub const ALL: [Self; 7] = [
+        Self::Reserved,
+        Self::Spawned,
+        Self::Claimed,
+        Self::Live,
+        Self::Fenced,
+        Self::Failed,
+        Self::Closed,
+    ];
+
     /// Returns the stable stored string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -911,9 +923,11 @@ impl Registry {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(ControllerError::registry)?;
-        // The other writers first and the version last: a file that records a version has all four
-        // writers at the shape that version stands for. A file of a later version is refused below
-        // as it is, without a table of theirs being made in it.
+        // The other writers first and the version last: a file this brought to a version has all
+        // four writers at least at the shape that version stands for. A file of a later version is
+        // refused below as it is, without a table of theirs being made in it; a file an earlier
+        // build recorded at the current version before the others had opened it is not brought
+        // here, and each writer brings its own tables the next time it opens the file.
         if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
             self.bring_the_other_writers_forward()?;
         }

@@ -1,5 +1,5 @@
 //! The releases this host keeps side by side, and updating between them: `kr host install`,
-//! `kr host update` and `kr host versions`.
+//! `kr host update`, `kr host rollback` and `kr host versions`.
 //!
 //! What a release is and how a process holds the one it runs is [`kr_ipc::install`]'s. This module
 //! is the command line's side: putting a checked release into the store, handing each control
@@ -247,6 +247,11 @@ impl Record {
             ))
         })?;
         bytes.push(b'\n');
+        if !u64::try_from(bytes.len()).is_ok_and(|length| length <= RECORD_LIMIT) {
+            return Err(CliError::Other(Shown::said(
+                "the store's record would be larger than this host reads, so it was not written",
+            )));
+        }
         kr_ipc::paths::write_owner_only_file(&store.record(), &bytes)?;
         Ok(())
     }
@@ -946,22 +951,6 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
     if record.update.is_some() {
         recover(&store, &mut record).await?;
     }
-    // The root this host trusts is read before anything is switched: a record of it that cannot be
-    // read, or that disagrees with a release's root of the same version, would let the settling
-    // that follows lower the trust it holds.
-    if let Some(kept) = record.trusted_root.clone() {
-        let kept = release::ChannelRoot::kept(kept)?;
-        if let Ok(Some(current)) = release::ChannelRoot::read(&store.release_directory(&source))
-            && current.version() == kept.version()
-            && !current.is(&kept)
-        {
-            return Err(CliError::Other(shown!(
-                "release {} carries an update channel root, and the store recorded another of the \
-                 same version: this host trusts neither, and nothing was switched",
-                crate::shown::release(&source)
-            )));
-        }
-    }
     let target = match to {
         Some(name) => ReleaseName::new(name).map_err(|_| {
             CliError::Usage(Shown::said(
@@ -1040,6 +1029,10 @@ async fn carry_out(
     if !unlookable.is_empty() {
         return Err(formats::refusal(&target, &unlookable));
     }
+    // The root this host will trust once the switch settles is worked out before anything is
+    // stopped: a root that cannot be read, or two of one version that differ, would otherwise be
+    // found only after the switch, when settling it could not lower the trust it holds.
+    trusted_after(store, record, &source, &target.release)?;
     let inventory::Surveyed {
         environments,
         unreached,
@@ -1761,31 +1754,55 @@ fn forget_update(store: &Store, record: &mut Record) {
     let _ = record.write(store);
 }
 
-/// Records an update as settled: its target current, its source the previous release, and the
-/// newest update channel root among the one recorded, the source's and the target's the root this
-/// host trusts from now on. A recorded root that cannot be read is left as it is, never replaced by
-/// an older one.
+/// The update channel root this host trusts after a switch from `source` to `target`: the newest
+/// by version of the one recorded, the source's and the target's, each of which was trusted when it
+/// was current. Going back to a release never gives a newer root up.
+///
+/// # Errors
+///
+/// Returns a refusal when the recorded root, or either release's, cannot be read or does not
+/// verify against itself, and when two roots of one version are not the same document: the trust
+/// this host holds is never settled on a root it cannot establish.
+#[cfg(unix)]
+fn trusted_after(
+    store: &Store,
+    record: &Record,
+    source: &ReleaseName,
+    target: &ReleaseName,
+) -> Result<Option<release::ChannelRoot>> {
+    let mut newest = record
+        .trusted_root
+        .clone()
+        .map(release::ChannelRoot::kept)
+        .transpose()?;
+    for release in [source, target] {
+        let Some(root) = release::ChannelRoot::read(&store.release_directory(release))? else {
+            continue;
+        };
+        match &newest {
+            Some(known) if root.version() == known.version() && !root.is(known) => {
+                return Err(CliError::Other(shown!(
+                    "release {} carries an update channel root, and this host trusts another of \
+                     the same version: it trusts neither, and nothing was switched",
+                    crate::shown::release(release)
+                )));
+            }
+            Some(known) if root.version() <= known.version() => {}
+            _ => newest = Some(root),
+        }
+    }
+    Ok(newest)
+}
+
+/// Records an update as settled: its target current, its source the previous release, and the root
+/// [`trusted_after`] names the root this host trusts from now on. A root that cannot be established
+/// leaves the update recorded, for the next run to settle.
 #[cfg(unix)]
 fn settle(store: &Store, record: &mut Record) -> Result<()> {
-    if let Some(update) = record.update.take() {
-        // A recorded root that cannot be read is left exactly as it is.
-        match record.trusted_root.clone().map(release::ChannelRoot::kept) {
-            Some(Err(_)) => {}
-            recorded => {
-                let mut newest = recorded.and_then(std::result::Result::ok);
-                for release in [&update.source, &update.target] {
-                    if let Ok(Some(root)) =
-                        release::ChannelRoot::read(&store.release_directory(release))
-                        && newest
-                            .as_ref()
-                            .is_none_or(|known| root.version() > known.version())
-                    {
-                        newest = Some(root);
-                    }
-                }
-                record.trusted_root = newest.map(|root| root.to_kept());
-            }
-        }
+    if let Some(update) = record.update.clone() {
+        let trusted = trusted_after(store, record, &update.source, &update.target)?;
+        record.update = None;
+        record.trusted_root = trusted.map(|root| root.to_kept());
         record.previous = Some(update.source);
         if record.staged.as_ref() == Some(&update.target) {
             record.staged = None;
@@ -1952,6 +1969,47 @@ mod tests {
             .map(|environment| environment.environment_id)
             .collect();
         assert_eq!(every, vec![one, two]);
+    }
+
+    /// The store's record is read up to a size, and one that would be larger than that is not
+    /// written: a record this host wrote and could not read again would end every later command.
+    #[test]
+    fn a_record_larger_than_this_host_reads_is_not_written() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (store, environment) = store_and_environment(&temp);
+        let mut record = Record {
+            format: RECORD_FORMAT,
+            ..Record::default()
+        };
+        record.write(&store).expect("a small record is written");
+        let release = |name| ReleaseName::new(name).expect("a release name");
+        record.update = Some(Transaction {
+            source: release("0.1.0+aaaaaaaaaaaa"),
+            target: release("0.2.0+bbbbbbbbbbbb"),
+            state: TransactionState::Prepared,
+            restarts: vec![Restart {
+                environment: environment.environment_id,
+                runtime_root: "/runtime".to_owned(),
+                state_root: "/state".to_owned(),
+                start: Start::Arguments {
+                    arguments: vec!["a".repeat(usize::try_from(RECORD_LIMIT).expect("fits") + 1)],
+                    working_directory: "/".to_owned(),
+                },
+            }],
+        });
+        let refused = record
+            .write(&store)
+            .expect_err("too large to be read again");
+        assert!(
+            refused.to_string().contains("larger than this host reads"),
+            "{refused}"
+        );
+        assert!(
+            Record::read(&store)
+                .expect("the record on disk is the small one")
+                .update
+                .is_none()
+        );
     }
 
     /// A store of this test's own, and an environment in it.
