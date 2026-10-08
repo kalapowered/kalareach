@@ -100,6 +100,27 @@ describe('the Hosts screen of a phone', () => {
   })
 })
 
+describe('the lists of a phone', () => {
+  // KR-REQ-13.08: what one host listed is not left on the screen once that host is not the one being
+  // reached, and the lists are read again from the host that is.
+  it('shows nothing of a host once it is lost, and reads the lists again when one is reached', async () => {
+    const { controls } = start()
+    await openTab('Sessions')
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    expect(await screen.findByText('No host is being reached.')).toBeInTheDocument()
+    expect(screen.queryByText('Session 1')).toBeNull()
+
+    act(() => {
+      controls.setConnected(true)
+    })
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
+  })
+})
+
 describe('the voice entry of a phone', () => {
   // KR-REQ-15.01: there is no one to talk to while no host is reached, so there is no entry.
   it('appears while a host is reached, and goes when it is lost', async () => {
