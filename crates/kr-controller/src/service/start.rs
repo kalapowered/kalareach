@@ -41,6 +41,9 @@ pub const JOB_SWEEP_BOUND: std::time::Duration = std::time::Duration::from_secs(
 /// How often privacy mode's record retries what it owes and tells each worker it owes a notice.
 pub const PRIVACY_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the watch over paired devices looks for one that is no longer paired.
+pub const DEVICE_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// How long one worker is given to take a privacy generation and answer.
 ///
 /// A generation that turns privacy mode on waits, in the worker, for the attention store to stop
@@ -873,23 +876,9 @@ impl Controller {
         // A device whose grant runs out while the daemon runs is no longer paired, and its
         // destination, the credential held for it and the authorisation behind it end with that,
         // as they do at its unpairing. Whatever finds the end writes it down, and the writing
-        // starts the ending, on a blocking thread of its own: the finder may hold a lock the
-        // ending needs.
-        {
-            let daemon = Arc::downgrade(&controller);
-            let runtime = tokio::runtime::Handle::current();
-            controller
-                .lifetimes()
-                .pending_expiry()
-                .on_recorded(move |device_id| {
-                    let daemon = daemon.clone();
-                    drop(runtime.spawn_blocking(move || {
-                        if let Some(daemon) = daemon.upgrade() {
-                            daemon.retire_push_destination(device_id);
-                        }
-                    }));
-                });
-        }
+        // wakes the watch that ends it: the finder may hold a lock the ending needs, so it starts
+        // nothing itself.
+        controller.start_device_watch();
         // Delivery the same way: what an earlier daemon left on the wire becomes an outcome
         // nobody knows, and what is no longer authorised is taken back, before a pass can claim
         // anything. The loop then drives the outbox until the daemon goes.
@@ -933,6 +922,38 @@ impl Controller {
         // nothing at all.
         controller.automation.start();
         Ok(controller)
+    }
+
+    /// Starts the watch that ends the push destination of every device that is no longer paired,
+    /// which runs until the daemon goes.
+    ///
+    /// It runs when an expiry is written down and every [`DEVICE_WATCH_INTERVAL`] besides. The
+    /// second is what finds a grant that ran out while nothing asked about it, and what tries
+    /// again an ending that failed: the expiry is on record by then, so nothing writes it a second
+    /// time to wake the first.
+    fn start_device_watch(self: &Arc<Self>) {
+        let woken = Arc::new(tokio::sync::Notify::new());
+        let waking = Arc::clone(&woken);
+        self.lifetimes()
+            .pending_expiry()
+            .on_recorded(move |_device| waking.notify_one());
+        let daemon = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let _ = tokio::time::timeout(DEVICE_WATCH_INTERVAL, woken.notified()).await;
+                // The daemon is held for the length of one pass, and let go of across the wait.
+                let Some(held) = daemon.upgrade() else {
+                    return;
+                };
+                if let Ok(Err(error)) =
+                    tokio::task::spawn_blocking(move || held.recover_push_destinations()).await
+                {
+                    eprintln!(
+                        "kr-controller: the paired devices' destinations were not looked at: {error}"
+                    );
+                }
+            }
+        });
     }
 
     /// Starts privacy mode's tick, which runs until the daemon goes.

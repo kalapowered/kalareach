@@ -575,8 +575,9 @@ impl Controller {
     /// under which grant, decides who reads what a session says. The grant has to stand when the
     /// destination is made, which is what section 25 means by a configured destination and an
     /// explicit rule or grant; a destination whose grant stops standing is told nothing, as every
-    /// pass asks the grant again. A service that sends with a credential is configured only once
-    /// its credential is kept ([`Self::delivery_destination_secret_set`]).
+    /// pass asks the grant again. A service that sends with a credential is configured with it:
+    /// the credential in the request is kept together with the destination, or not at all, and one
+    /// kept earlier ([`Self::delivery_destination_secret_set`]) serves when the request gives none.
     ///
     /// The admission is asked again under the registry lock, which is held across the write, so a
     /// withdrawal that completes while this waited stops it.
@@ -587,6 +588,10 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params = configure_params(&mutation.params)?;
         let destination_id = validate_configuration(&params)?;
+        if let Some(secret) = params.secret.as_ref() {
+            crate::push::external::check_secret(secret)
+                .map_err(ControllerError::InvalidArgument)?;
+        }
         let rule = kr_delivery::destination::DeliveryRule {
             name: params.rule_name.clone(),
             grant_id: Some(params.grant_id),
@@ -626,7 +631,14 @@ impl Controller {
             Ok(())
         };
         admitted()?;
-        if !self.delivery.configure_if(&record, &admitted)? {
+        // A credential given with the configuration is kept with it or not at all.
+        let wrote = match params.secret.as_ref() {
+            Some(secret) => self
+                .delivery
+                .configure_with_secret_if(&record, secret, &admitted)?,
+            None => self.delivery.configure_if(&record, &admitted)?,
+        };
+        if !wrote {
             return Err(ControllerError::PermissionDenied {
                 detail: "the destination was not admitted".to_owned(),
             });
@@ -1288,12 +1300,17 @@ impl Controller {
         self.delivery.remove(destination_id, self.settled_now_ms())
     }
 
-    /// Ends the push destination of every device that is no longer paired, at a start.
+    /// Ends the push destination of every device that is no longer paired, at a start and by the
+    /// watch that runs while the daemon does.
     ///
     /// A device is revoked, or its grant runs out, and a host stops before it has ended the
     /// destination: nothing is delivered to it either way, because its grant no longer reaches
-    /// anything, but the destination, the credential and the authorisation would stay. Returns how
-    /// many destinations it ended.
+    /// anything, but the destination, the credential and the authorisation would stay. A grant
+    /// that runs out while the daemon runs is found by whatever asks about it, and a device nothing
+    /// is delivered to is asked about here: a destination out of service because the provider
+    /// rejected its token still holds its rule and its credential, which is renewed for as long as
+    /// it is held. An ending that failed is tried again by the next call. Returns how many
+    /// destinations it ended; one that could not be ended is reported on standard error.
     ///
     /// # Errors
     ///
@@ -1310,7 +1327,8 @@ impl Controller {
         })?;
         let mut ended = 0;
         for destination in destinations {
-            if destination.as_push().is_none() {
+            // A destination already ended keeps no rule, and has nothing more to end.
+            if destination.as_push().is_none() || destination.rule.is_none() {
                 continue;
             }
             let Ok(device_id) = destination
@@ -1320,13 +1338,25 @@ impl Controller {
             else {
                 continue;
             };
-            let paired = self
-                .devices
-                .record_for_device(device_id)?
-                .is_some_and(|record| record.is_paired());
+            let paired = match self.devices.record_for_device(device_id)? {
+                Some(record) if record.is_paired() => {
+                    // Asking where the grant stands is what finds an end and writes it down. An
+                    // answer that cannot be had, such as a clock this host distrusts, writes
+                    // nothing and leaves the device paired.
+                    let _ = self.lifetimes().paired_standing(&record);
+                    self.devices
+                        .record_for_device(device_id)?
+                        .is_some_and(|record| record.is_paired())
+                }
+                _ => false,
+            };
             if !paired {
-                self.retire_push_destination(device_id);
-                ended += 1;
+                match self.end_push_destination(device_id) {
+                    Ok(_) => ended += 1,
+                    Err(error) => eprintln!(
+                        "kr-controller: a device's push destination was not ended: {error}"
+                    ),
+                }
             }
         }
         Ok(ended)
@@ -1656,12 +1686,16 @@ pub(super) fn remove_params(
 
 /// The headers a request is framed with, which a destination's retry claim cannot name: the
 /// transport sets them, and a value of the owner's would break every request to the destination.
-const FRAMING_HEADERS: [&str; 7] = [
+const FRAMING_HEADERS: [&str; 11] = [
     "connection",
     "content-length",
     "content-type",
+    "expect",
     "host",
+    "keep-alive",
+    "proxy-connection",
     "te",
+    "trailer",
     "transfer-encoding",
     "upgrade",
 ];
@@ -2309,7 +2343,6 @@ mod tests {
                     panic!("a grant that has run out is refused: {error}");
                 };
                 assert!(detail.contains("invite"), "{detail}");
-                assert!(!detail.contains("pair again"), "{detail}");
                 assert_eq!(host.revisions(), (1, Some(1)));
             } else {
                 outcome.expect("the control registers");

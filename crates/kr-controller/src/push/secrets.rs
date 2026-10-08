@@ -137,6 +137,33 @@ impl DestinationSecrets {
         Ok(stamp)
     }
 
+    /// Puts back what [`Self::get`] read before a replacement, with the stamp it had: the
+    /// destination it belongs to is still configured with that stamp. `None` puts back nothing,
+    /// which removes what the replacement wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the store refuses the write or the removal.
+    pub fn restore(&self, destination_id: &DestinationId, held: Option<&HeldSecret>) -> Result<()> {
+        let Some(held) = held else {
+            return self.remove(destination_id);
+        };
+        let item = StoredItem {
+            stamp: held.stamp.as_str().to_owned(),
+            secret: held.secret.clone(),
+        };
+        let encoded =
+            SecretVec::new(
+                serde_json::to_vec(&item).map_err(|_| ControllerError::Storage {
+                    operation: "keep a destination's credential",
+                    detail: "the credential could not be encoded".to_owned(),
+                })?,
+            );
+        self.store
+            .set(&self.name(destination_id)?, encoded.expose())
+            .map_err(unavailable)
+    }
+
     /// Reads one destination's credential and the stamp it was stored under, or `None` when none
     /// is stored.
     ///

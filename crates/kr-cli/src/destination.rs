@@ -21,10 +21,8 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::delivery::{
     DeliveryDestinationConfigureParams, DeliveryDestinationConfigureResult,
     DeliveryDestinationKind, DeliveryDestinationListParams, DeliveryDestinationListResult,
-    DeliveryDestinationRemoveParams, DeliveryDestinationRemoveResult,
-    DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult,
-    DeliveryDestinationSummary, DestinationSecret, ExternalDestinationKind, MailAccount,
-    SecretText,
+    DeliveryDestinationRemoveParams, DeliveryDestinationRemoveResult, DeliveryDestinationSummary,
+    DestinationSecret, ExternalDestinationKind, MailAccount, SecretText,
 };
 use kr_protocol::ids::GrantId;
 use kr_protocol::method::Method;
@@ -90,17 +88,6 @@ async fn configure(
     // fix, and nothing has been sent anywhere.
     let secret = credential(kind, arguments.credential_file.as_deref())?;
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
-    if let Some(secret) = secret {
-        let _: DeliveryDestinationSecretSetResult = daemon
-            .mutate(
-                Method::DeliveryDestinationSecretSet,
-                &DeliveryDestinationSecretSetParams {
-                    destination_id: arguments.destination.clone(),
-                    secret,
-                },
-            )
-            .await?;
-    }
     let configured: DeliveryDestinationConfigureResult = daemon
         .mutate(
             Method::DeliveryDestinationConfigure,
@@ -114,6 +101,7 @@ async fn configure(
                     .clone()
                     .unwrap_or_else(|| arguments.destination.clone()),
                 grant_id,
+                secret: Nullable(secret),
             },
         )
         .await?;
@@ -209,17 +197,27 @@ fn credential(
 
 /// The credential file's bytes, in a buffer that clears itself.
 fn read_credential(file: &Path) -> Result<SecretVec> {
-    let metadata = std::fs::metadata(file)
-        .map_err(|error| CliError::Usage(shown!("{}: {}", named(file), Shown::io(&error))))?;
-    if metadata.len() > CREDENTIAL_FILE_LIMIT {
+    use std::io::Read as _;
+
+    let unreadable =
+        |error: &std::io::Error| CliError::Usage(shown!("{}: {}", named(file), Shown::io(error)));
+    // Read through a bound, not from a length the file reports: a pipe or a device reports none.
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .and_then(|opened| {
+            opened
+                .take(CREDENTIAL_FILE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| unreadable(&error))?;
+    let bytes = SecretVec::new(bytes);
+    if bytes.len() as u64 > CREDENTIAL_FILE_LIMIT {
         return Err(CliError::Usage(shown!(
             "{} is larger than a credential",
             named(file)
         )));
     }
-    std::fs::read(file)
-        .map(SecretVec::new)
-        .map_err(|error| CliError::Usage(shown!("{}: {}", named(file), Shown::io(&error))))
+    Ok(bytes)
 }
 
 /// A credential that is a line of text, without the line ending an editor leaves after it.
@@ -245,9 +243,9 @@ const fn kind_word(kind: DeliveryDestinationKind) -> &'static str {
 
 /// One destination as a line for a person. The names are the owner's own, shown back to them.
 fn line(destination: &DeliveryDestinationSummary) -> Line {
-    let endpoint = destination.endpoint.as_ref().map_or_else(
+    let endpoint = endpoint_of(destination).map_or_else(
         || stdout_line!("-"),
-        |endpoint| stdout_line!("{}", Asked::text(Request::Destinations, endpoint)),
+        |endpoint| stdout_line!("{}", endpoint),
     );
     let grant = destination.grant_id.as_ref().map_or_else(
         || stdout_line!("no grant"),
@@ -267,7 +265,21 @@ fn line(destination: &DeliveryDestinationSummary) -> Line {
     )
 }
 
-/// The destinations in service, for a script, in the shape the protocol answers them. The
+/// Where a destination sends, as the owner named it. A webhook's address is shown as every address
+/// is: its scheme, host, port and path, and never a query or a fragment, where a receiver may have
+/// asked for a token. The other services' endpoints are a channel's name, a chat or an address of
+/// a mailbox, which the owner wrote as they are.
+fn endpoint_of(destination: &DeliveryDestinationSummary) -> Option<Asked> {
+    destination.endpoint.as_ref().map(|endpoint| {
+        if destination.kind == DeliveryDestinationKind::Webhook {
+            Asked::location(Request::Destinations, endpoint)
+        } else {
+            Asked::text(Request::Destinations, endpoint)
+        }
+    })
+}
+
+/// The destinations, for a script, in the shape the protocol answers them. The
 /// identifiers, addresses and names are the owner's own, shown back to them.
 fn list_document(listed: &DeliveryDestinationListResult) -> Document {
     Document::new()
@@ -283,13 +295,7 @@ fn list_document(listed: &DeliveryDestinationListResult) -> Document {
                             Asked::text(Request::Destinations, &destination.destination_id),
                         )
                         .with("kind", kind_word(destination.kind))
-                        .with(
-                            "endpoint",
-                            destination
-                                .endpoint
-                                .as_ref()
-                                .map(|endpoint| Asked::text(Request::Destinations, endpoint)),
-                        )
+                        .with("endpoint", endpoint_of(destination))
                         .with(
                             "idempotency_header",
                             destination
@@ -383,7 +389,7 @@ fn remove_lines(removed: &DeliveryDestinationRemoveResult) -> Vec<Line> {
     }
     if fenced > 0 {
         lines.push(stdout_line!(
-            "{} attempt{} on the wire when it was removed, and the destination may still \
+            "{} attempt{} under way when it was removed, and the destination may still \
              receive {}.",
             fenced,
             if fenced == 1 { " was" } else { "s were" },
@@ -430,7 +436,7 @@ mod tests {
                 "kr destination list",
                 &document,
                 &serde_json::to_value(&listed).expect("the list encodes"),
-                &[],
+                &["destinations[].endpoint"],
                 &["ok"],
             );
             only_asked_lines(
@@ -475,6 +481,42 @@ mod tests {
                 "{asked} shows what was asked for: {shown:?}"
             );
         }
+    }
+
+    /// A webhook's address can carry a token in its query, and the list shows the address as every
+    /// address is shown: without its query or its fragment. A channel's name is shown as written.
+    #[test]
+    fn a_webhook_address_is_listed_without_its_query() {
+        let destination = |kind, endpoint: &str| DeliveryDestinationSummary {
+            destination_id: "ops".to_owned(),
+            kind,
+            endpoint: Nullable::some(endpoint.to_owned()),
+            idempotency_header: Nullable::null(),
+            rule_name: "tell the team".to_owned(),
+            grant_id: Nullable::null(),
+            in_force: true,
+            configured_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        let webhook = destination(
+            DeliveryDestinationKind::Webhook,
+            "https://hooks.example.test/in/ops?token=query-token-6b1f#fragment-6b1f",
+        );
+        let listed = DeliveryDestinationListResult {
+            destinations: vec![webhook.clone()],
+        };
+        let shown = format!(
+            "{}\n{}",
+            line(&webhook).text(),
+            list_document(&listed).json()
+        );
+        assert!(
+            shown.contains("https://hooks.example.test/in/ops"),
+            "{shown}"
+        );
+        assert!(!shown.contains("6b1f"), "{shown}");
+
+        let channel = destination(DeliveryDestinationKind::Slack, "#alerts");
+        assert!(line(&channel).text().contains("#alerts"));
     }
 
     /// A credential is read from the file the owner named, and the failure for a file that does not

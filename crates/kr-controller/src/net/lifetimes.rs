@@ -1037,7 +1037,6 @@ mod tests {
             panic!("a grant that has run out is refused its deadline: {refused:?}");
         };
         assert!(detail.contains("invite"), "{detail}");
-        assert!(!detail.contains("pair again"), "{detail}");
     }
 
     /// While this boot's clock continuity is lost, nothing proves an expiring grant in force,

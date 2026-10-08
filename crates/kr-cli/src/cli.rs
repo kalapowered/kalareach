@@ -531,7 +531,7 @@ pub struct PrivacyArguments {
 /// One `kr destination` operation.
 #[derive(Subcommand)]
 pub enum DestinationCommand {
-    /// List the notification destinations in service: paired devices' and the ones you configured.
+    /// List the notification destinations: paired devices' and the ones you configured.
     List(DestinationListArguments),
     /// Create an external notification destination, or replace the one with the same identifier.
     ///

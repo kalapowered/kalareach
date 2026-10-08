@@ -1928,18 +1928,8 @@ async fn unpairing_ends_the_destination_even_when_the_device_record_cannot_be_wr
 /// grant runs out: its destination is in service and the question is delivered to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_runs() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    let continuous = kr_transport::clock::ManualClock::new();
-    let wall = Arc::new(AtomicU64::new(now()));
-    let environment = Environment::start_on_clocks(kr_controller::service::Clocks {
-        continuous: Arc::new(continuous.clone()),
-        wall: kr_controller::service::WallClock::from_fn({
-            let wall = Arc::clone(&wall);
-            move || wall.load(Ordering::SeqCst)
-        }),
-    })
-    .await;
+    let (moved, clocks) = Moved::new();
+    let environment = Environment::start_on_clocks(clocks).await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x73));
     let credential =
@@ -1963,10 +1953,7 @@ async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_run
     );
     assert!(credentials.held(sender).is_some());
 
-    // The grant `proposal` gives a session invitation lasts a day.
-    let day = Duration::from_secs(24 * 60 * 60);
-    wall.fetch_add(2 * day.as_millis() as u64, Ordering::SeqCst);
-    continuous.advance(2 * day);
+    moved.past_the_grant();
     environment
         ._worker
         .ask("deploy-2", "Deploy the release again?");
@@ -1993,6 +1980,201 @@ async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_run
             .iter()
             .any(|debt| debt.sender_record_id == sender),
         "the authorisation is owed a revocation"
+    );
+}
+
+/// The clocks of a daemon the test moves by hand, and a way to take both past a day.
+struct Moved {
+    wall: Arc<std::sync::atomic::AtomicU64>,
+    continuous: kr_transport::clock::ManualClock,
+}
+
+impl Moved {
+    fn new() -> (Self, kr_controller::service::Clocks) {
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(now()));
+        let clocks = kr_controller::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: kr_controller::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || wall.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+        };
+        (Self { wall, continuous }, clocks)
+    }
+
+    /// Takes the wall clock two days on and leaves the continuous clock where it is: the grant
+    /// `proposal` gives a session invitation has run out by UTC, and the deadlines a request was
+    /// admitted under, which are counted on the continuous clock, have not.
+    fn past_the_grant_by_utc(&self) {
+        let days = Duration::from_secs(2 * 24 * 60 * 60);
+        self.wall.fetch_add(
+            u64::try_from(days.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Takes both clocks two days on, past the day the grant `proposal` gives a session invitation
+    /// lasts.
+    fn past_the_grant(&self) {
+        let days = Duration::from_secs(2 * 24 * 60 * 60);
+        self.wall.fetch_add(
+            u64::try_from(days.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.continuous.advance(days);
+    }
+}
+
+/// KR-REQ-16.10: a device nothing is delivered to is still found when its grant runs out. A
+/// destination the provider rejected the token of is out of service and keeps its rule, its
+/// credential and the authorisation behind it, and the watch over the paired devices asks where its
+/// device's grant stands: the control is the same destination before the grant ran out, which the
+/// watch leaves as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_watch_over_paired_devices_ends_the_destination_nothing_is_delivered_to() {
+    let (moved, clocks) = Moved::new();
+    let environment = Environment::start_on_clocks(clocks).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x74));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let credentials = environment.controller().delivery_runtime().credentials();
+    let rejected = environment
+        .destination(phone.device_id())
+        .expect("the destination");
+    environment
+        .controller()
+        .delivery()
+        .disable(&rejected)
+        .expect("the provider rejects the token");
+
+    let watch = || {
+        environment
+            .controller()
+            .recover_push_destinations()
+            .expect("the watch")
+    };
+    assert_eq!(watch(), 0, "the control: the grant stands");
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_some_and(|record| !record.enabled && record.rule.is_some()),
+        "out of service, with its rule"
+    );
+    assert!(credentials.held(sender).is_some());
+
+    moved.past_the_grant();
+    assert_eq!(watch(), 1, "the watch finds the grant has run out");
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none()),
+        "the destination is ended"
+    );
+    assert!(credentials.held(sender).is_none());
+    assert!(
+        owed(&environment)
+            .iter()
+            .any(|debt| debt.sender_record_id == sender),
+        "the authorisation is owed a revocation"
+    );
+    assert_eq!(watch(), 0, "and ending it again is ending it once");
+}
+
+/// KR-REQ-16.10: an ending that failed is tried again. The expiry is on record by then, so nothing
+/// writes it a second time to start the ending; the watch finds the device unpaired and the
+/// destination still there. Here the delivery journal refuses the revocation the host owes the
+/// gateway, so the ending stops before anything is removed, and the watch ends it once the journal
+/// takes the debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_ending_that_failed_when_the_grant_ran_out_is_tried_again() {
+    let (moved, clocks) = Moved::new();
+    let environment = Environment::start_on_clocks(clocks).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x75));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let credentials = environment.controller().delivery_runtime().credentials();
+
+    let journal = rusqlite::Connection::open(
+        environment
+            .host
+            .tree()
+            .environment()
+            .state_dir()
+            .join(kr_controller::push::DELIVERY_JOURNAL),
+    )
+    .expect("opens the delivery journal");
+    journal
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    journal
+        .execute_batch(
+            "CREATE TRIGGER refuse_the_debt BEFORE INSERT ON delivery_revocations
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+
+    moved.past_the_grant();
+    // The expiry is found and written down, which starts the ending, which the journal refuses.
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the expiry being on record", || {
+        environment
+            .controller()
+            .devices()
+            .record_for_device(phone.device_id())
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.expired_at_ms.is_some())
+    })
+    .await;
+    // Looked at while the journal refuses the debt: nothing was removed, and nothing was ended.
+    assert_eq!(
+        environment
+            .controller()
+            .recover_push_destinations()
+            .expect("the watch"),
+        0
+    );
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_some_and(|record| record.rule.is_some()),
+        "the destination is still there"
+    );
+    assert!(credentials.held(sender).is_some());
+
+    journal
+        .execute_batch("DROP TRIGGER refuse_the_debt;")
+        .expect("removes the fault");
+    // The watch's own pass, or this one, ends it.
+    environment
+        .controller()
+        .recover_push_destinations()
+        .expect("the watch");
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_none_or(|record| !record.enabled && record.rule.is_none())
+    );
+    assert!(credentials.held(sender).is_none());
+    assert!(
+        owed(&environment)
+            .iter()
+            .any(|debt| debt.sender_record_id == sender)
     );
 }
 
@@ -3231,7 +3413,17 @@ fn configuration(
         idempotency_header: Nullable::from(idempotency_header.map(str::to_owned)),
         rule_name: "tell the team".to_owned(),
         grant_id,
+        secret: Nullable::null(),
     }
+}
+
+/// `params` carrying the credential the destination sends with.
+fn with_secret(
+    mut params: kr_protocol::delivery::DeliveryDestinationConfigureParams,
+    secret: kr_protocol::delivery::DestinationSecret,
+) -> kr_protocol::delivery::DeliveryDestinationConfigureParams {
+    params.secret = Nullable::some(secret);
+    params
 }
 
 /// KR-REQ-18.08, KR-REQ-25.23: the owner creates a webhook with `delivery.destination.configure`,
@@ -3301,9 +3493,14 @@ async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_
         .await
         .expect("the owner removes it");
     assert!(removed.found);
-    let posts = environment.gateway.posted().len();
+    let (posts, records) = (
+        environment.gateway.posted().len(),
+        environment.deliveries_to("ops").len(),
+    );
     environment._worker.ask("deploy-2", WORDS);
     until_the_questions_are_settled(&environment, 3).await;
+    // Nothing is written for it, so there is nothing for a later pass to send.
+    assert_eq!(environment.deliveries_to("ops").len(), records);
     assert_eq!(environment.gateway.posted().len(), posts);
     assert!(
         environment
@@ -3314,6 +3511,44 @@ async fn a_webhook_the_owner_creates_is_told_of_the_next_question_and_not_after_
         .remove("ops")
         .await
         .expect("removing twice is removing once");
+}
+
+/// KR-REQ-25.23: the grant a destination is made under is asked again where the row is written, after
+/// every wait the write could have had, and not only before. The daemon runs on clocks the test
+/// moves by hand, and the configuration is held after it has read everything and before the
+/// journal's write asks its admission; the grant runs out in that wait, and nothing is configured.
+/// The control is the same configuration with the grant left standing, which is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_that_runs_out_while_a_configuration_waits_to_be_written_configures_nothing() {
+    for runs_out in [false, true] {
+        let (moved, clocks) = Moved::new();
+        let environment = Environment::start_on_clocks(clocks).await;
+        let phone = environment.phone().await;
+        let grant = phone.record.grant.grant_id;
+        let (arrived, go) = environment
+            .controller()
+            .delivery()
+            .pause_before_destination_write();
+        let hold = async {
+            tokio::task::spawn_blocking(move || arrived.recv())
+                .await
+                .expect("the pause reports its arrival")
+                .expect("the write arrives");
+            if runs_out {
+                moved.past_the_grant_by_utc();
+            }
+            go.send(()).expect("the write is waiting");
+        };
+        let params = webhook("ops", "https://hooks.example.test/in/ops", None, grant);
+        let (configured, ()) = tokio::join!(environment.configure(&params), hold);
+        if runs_out {
+            configured.expect_err("the grant ran out before the row was written");
+            assert!(environment.destination_named("ops").is_none());
+        } else {
+            configured.expect("the control is made");
+            assert!(environment.destination_named("ops").is_some());
+        }
+    }
 }
 
 /// KR-REQ-25.23: a destination is made only where the owner may make it and only under authority
@@ -3387,6 +3622,20 @@ async fn a_destination_is_refused_unless_the_owner_may_make_it_under_a_grant_tha
     let mut unnamed = webhook("ops", endpoint, None, grant);
     unnamed.rule_name = String::new();
     refusals.push(("a rule with no name", unnamed));
+    // The headers a request is framed with are the transport's, and a value of the owner's would
+    // break every request to the destination.
+    for framing in [
+        "Content-Length",
+        "host",
+        "Transfer-Encoding",
+        "Expect",
+        "Connection",
+    ] {
+        refusals.push((
+            "a header the request is framed with",
+            webhook("ops", endpoint, Some(framing), grant),
+        ));
+    }
     for (what, params) in &refusals {
         let refused = environment
             .configure(params)
@@ -3408,10 +3657,10 @@ async fn a_destination_is_refused_unless_the_owner_may_make_it_under_a_grant_tha
     assert!(environment.destination_named("ops").is_some());
 }
 
-/// KR-REQ-25.23: the credentialed kinds are configured through the same method once their
-/// credential is kept with `delivery.destination.secret.set`, and each sends from the host to the
-/// service it names: Slack and Discord to the webhook address the owner handed over, Telegram to
-/// the Bot API under the bot's token. The credential is in none of the messages, and removing a
+/// KR-REQ-25.23: the credentialed kinds are configured through the same method, with their
+/// credential in the request or kept before with `delivery.destination.secret.set`, and each sends
+/// from the host to the service it names: Slack and Discord to the webhook address the owner
+/// handed over, Telegram to the Bot API under the bot's token. The credential is in none of the messages, and removing a
 /// destination takes its credential away. An email destination is made the same way; its sending
 /// is the mail adapter's own suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -3429,14 +3678,8 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
     let phone = environment.phone().await;
     let grant = phone.record.grant.grant_id;
 
-    environment
-        .keep_secret(
-            "slack",
-            DestinationSecret::Slack {
-                webhook_url: secret_text(SLACK),
-            },
-        )
-        .await;
+    // Discord is made after its credential is kept on its own; Slack and Telegram are made with
+    // theirs in one request.
     environment
         .keep_secret(
             "discord",
@@ -3445,23 +3688,25 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
             },
         )
         .await;
-    environment
-        .keep_secret(
-            "telegram",
+    for params in [
+        with_secret(
+            configuration(Slack, "slack", "ops-channel", None, grant),
+            DestinationSecret::Slack {
+                webhook_url: secret_text(SLACK),
+            },
+        ),
+        configuration(Discord, "discord", "ops-channel", None, grant),
+        with_secret(
+            configuration(Telegram, "telegram", "@ops_team", None, grant),
             DestinationSecret::Telegram {
                 bot_token: secret_text(TELEGRAM_TOKEN),
             },
-        )
-        .await;
-    for params in [
-        configuration(Slack, "slack", "ops-channel", None, grant),
-        configuration(Discord, "discord", "ops-channel", None, grant),
-        configuration(Telegram, "telegram", "@ops_team", None, grant),
+        ),
     ] {
         let made = environment
             .configure(&params)
             .await
-            .expect("the owner makes it once its credential is kept");
+            .expect("the owner makes it with its credential kept");
         assert!(made.in_force);
     }
 
@@ -3531,6 +3776,92 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
         .await
         .expect("an email destination is made the same way");
     environment.remove("mail").await.expect("removed");
+}
+
+/// KR-REQ-25.23: a configuration the host refuses changes nothing, the credential in it included. A
+/// Slack destination replaced under a grant that does not stand goes on sending to the channel it
+/// was made for, under the credential it was made with and the rule it had; a destination refused
+/// at its first configuration leaves no credential kept. The credential and the destination change
+/// together or not at all, so a refused replacement never leaves the new credential at work under
+/// the old grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_refused_configuration_leaves_the_destination_and_its_credential_as_they_were() {
+    use kr_protocol::delivery::DestinationSecret;
+    use kr_protocol::delivery::ExternalDestinationKind::Slack;
+
+    const FIRST: &str = "https://hooks.slack.com/services/T0000/B0000/first-credential";
+    const SECOND: &str = "https://hooks.slack.com/services/T0000/B0000/second-credential";
+    let slack = |text: &str| DestinationSecret::Slack {
+        webhook_url: kr_protocol::delivery::SecretText::new(text).expect("a credential"),
+    };
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+    let nobody = kr_protocol::ids::GrantId::new(uuid(0xee));
+
+    environment
+        .configure(&with_secret(
+            configuration(Slack, "chat", "first-channel", None, grant),
+            slack(FIRST),
+        ))
+        .await
+        .expect("the owner makes it");
+    let original = environment.destination_named("chat").expect("configured");
+    let stamp_of = |record: &kr_delivery::destination::DestinationRecord| match &record.destination
+    {
+        kr_delivery::destination::Destination::External(external) => external.credential.clone(),
+        kr_delivery::destination::Destination::Push(_) => None,
+    };
+    assert!(stamp_of(&original).is_some());
+
+    // The replacement is refused: the grant it names was never issued.
+    environment
+        .configure(&with_secret(
+            configuration(Slack, "chat", "second-channel", None, nobody),
+            slack(SECOND),
+        ))
+        .await
+        .expect_err("a grant that does not stand is refused");
+    // And so is a first configuration.
+    environment
+        .configure(&with_secret(
+            configuration(Slack, "fresh", "second-channel", None, nobody),
+            slack(SECOND),
+        ))
+        .await
+        .expect_err("a grant that does not stand is refused");
+
+    assert_eq!(
+        environment.destination_named("chat"),
+        Some(original),
+        "the destination is as it was"
+    );
+    assert!(environment.destination_named("fresh").is_none());
+    let secrets = environment.host.tree().environment().secrets_dir();
+    let vault = |text: &str| !files_holding(&secrets, text.as_bytes()).is_empty();
+    assert!(vault(FIRST), "the credential it sends with is still kept");
+    assert!(
+        !vault(SECOND),
+        "the credential of a refused configuration is kept nowhere"
+    );
+
+    // It still sends where it was made to send, with what it was made with.
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    until("the first channel being posted to", || {
+        environment
+            .gateway
+            .posted()
+            .iter()
+            .any(|posted| posted.url == FIRST)
+    })
+    .await;
+    assert!(
+        environment
+            .gateway
+            .posted()
+            .iter()
+            .all(|posted| posted.url != SECOND)
+    );
 }
 
 /// KR-REQ-24.12, KR-REQ-25.24: after an attempt whose outcome nobody knows, a destination that said
@@ -3753,9 +4084,12 @@ async fn removing_a_paired_devices_destination_ends_its_delivery_and_leaves_it_p
     assert!(owed(&environment).is_empty());
 }
 
-/// KR-REQ-16.12: a bearer past its expiry is not presented because a renewal failed. The renewal
-/// ahead of need that fails leaves a bearer that still works to carry the notification; one that
-/// no longer works is renewed first, and the notification waits for the renewal.
+/// KR-REQ-16.12: a bearer past its expiry is not presented because a renewal failed, and the
+/// notification that waits for the renewal keeps its attempts. The daemon holds a bearer that has
+/// expired (the held credential is replaced by one that says so, the way a bearer that went unused
+/// for its thirty days does), the gateway refuses the renewal, and the notification stays pending:
+/// the one ask is its one attempt, and no look since has asked the gateway again or presented the
+/// bearer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
     use kr_delivery::journal::DeliveryState;
@@ -3763,8 +4097,6 @@ async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
     let environment = Environment::start().await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x6f));
-    // A credential that expires a moment after it is registered.
-    environment.gateway.issue_for(3_000);
     let credential =
         environment
             .gateway
@@ -3773,14 +4105,22 @@ async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
         .register(&environment, &credential)
         .await
         .expect("the credential is registered");
-    let expires_at = credential.expires_at_ms.get();
-    until("the credential expiring", || now() >= expires_at).await;
+    environment
+        .controller()
+        .delivery_runtime()
+        .credentials()
+        .hold(PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(now() - 1_000),
+            ..credential.clone()
+        });
 
+    // The registration's own confirmation opened a renewal at the gateway.
+    let before = environment.gateway.answers_on(RENEW_ROUTE).len();
     environment
         .gateway
         .answer_route_with(RENEW_ROUTE, Some((503, "unavailable")));
     environment._worker.ask("deploy-1", "Deploy the release?");
-    until("the notification waiting for a renewal", || {
+    let waiting = |wait: &str| {
         environment
             .deliveries_to(&phone.device_id().to_string())
             .first()
@@ -3789,15 +4129,37 @@ async fn a_renewal_that_fails_leaves_a_bearer_past_its_expiry_unpresented() {
                     && record
                         .detail
                         .as_deref()
-                        .is_some_and(|detail| detail.contains("has to be renewed"))
+                        .is_some_and(|detail| detail.contains(wait))
             })
+    };
+    until("the notification waiting for a renewal", || {
+        waiting("has to be renewed")
     })
     .await;
+    // A look since the refusal found the wait and asked nothing.
+    until("a look at the wait", || waiting("asks again in")).await;
+    let record = environment
+        .deliveries_to(&phone.device_id().to_string())
+        .remove(0);
+    // The gateway was asked once, by the notification or by the daemon's own round of questions,
+    // whichever came first; the wait then held against the other and against every later look. An
+    // ask the notification made is its one attempt, and a look that found the wait used none.
+    assert!(
+        record.attempts <= 1,
+        "the looks spent attempts: {:?} {:?}",
+        record.state,
+        record.detail
+    );
     assert!(
         environment.gateway.delivered().is_empty(),
         "the expired bearer was not presented"
     );
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+    let asked = environment.gateway.answers_on(RENEW_ROUTE).len() - before;
+    assert_eq!(
+        asked, 1,
+        "the gateway was asked to renew once and not again while the wait holds"
+    );
 }
 
 /// KR-REQ-24.12: removing a destination takes back what waits for it, unsent, and says how much.
@@ -3842,10 +4204,57 @@ async fn removing_a_destination_takes_back_what_waits_for_it_and_says_so() {
         Some(DeliveryState::Revoked)
     );
     environment.gateway.answer_route_with("/in/slow", None);
-    let posts = environment.gateway.posted().len();
+    let (posts, records) = (
+        environment.gateway.posted().len(),
+        environment.deliveries_to("slow").len(),
+    );
     environment
         ._worker
         .ask("deploy-2", "Deploy the release again?");
     until_the_questions_are_settled(&environment, 2).await;
+    assert_eq!(environment.deliveries_to("slow").len(), records);
     assert_eq!(environment.gateway.posted().len(), posts);
+}
+
+/// KR-REQ-24.12: removing a destination while a message is on the wire says so. The attempt is
+/// held at the destination's end, the destination is removed, and the answer counts the attempt:
+/// it finishes and reports its answer, can never be followed by another, and the destination may
+/// still receive it. The control is the count of the same removal with nothing on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn removing_a_destination_with_a_message_on_the_wire_counts_the_attempt() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+    environment
+        .configure(&webhook(
+            "quiet",
+            "https://hooks.example.test/in/quiet",
+            None,
+            grant,
+        ))
+        .await
+        .expect("a webhook");
+    let idle = environment.remove("quiet").await.expect("removed");
+    assert_eq!(
+        (idle.revoked.get(), idle.unresolved.get(), idle.fenced.get()),
+        (0, 0, 0),
+        "the control: nothing was on the wire"
+    );
+
+    let held = environment.gateway.hold_before("/in/busy", 0);
+    environment
+        .configure(&webhook(
+            "busy",
+            "https://hooks.example.test/in/busy",
+            None,
+            grant,
+        ))
+        .await
+        .expect("a webhook");
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    held.reached().await;
+    let removed = environment.remove("busy").await.expect("removed");
+    assert!(removed.found);
+    assert_eq!(removed.fenced.get(), 1, "the attempt on the wire");
+    held.release();
 }

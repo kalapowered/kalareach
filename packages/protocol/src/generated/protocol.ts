@@ -617,25 +617,6 @@ export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'termina
  */
 export type UpstreamMethod = string
 /**
- * The kinds of destination this host delivers to: the five an owner configures and a paired
- * device's own, made by the device's registration.
- */
-export type DeliveryDestinationKind =
-  'push' | 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
-/**
- * How fetching the selected profile's files is going.
- */
-export type DescriptionDownload = 'not_started' | 'running' | 'verified' | 'cancelled' | 'failed'
-/**
- * What `description.download` is asked to do.
- */
-export type DescriptionDownloadAction = 'start' | 'cancel'
-/**
- * The kinds of semantic event a description may be built from.
- */
-export type DescriptionEventKind =
-  'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
-/**
  * The credential one external destination sends with.
  */
 export type DestinationSecret =
@@ -664,6 +645,25 @@ export type DestinationSecret =
       account: MailAccount
       kind: 'email'
     }
+/**
+ * The kinds of destination this host delivers to: the five an owner configures and a paired
+ * device's own, made by the device's registration.
+ */
+export type DeliveryDestinationKind =
+  'push' | 'webhook' | 'slack' | 'discord' | 'telegram' | 'email'
+/**
+ * How fetching the selected profile's files is going.
+ */
+export type DescriptionDownload = 'not_started' | 'running' | 'verified' | 'cancelled' | 'failed'
+/**
+ * What `description.download` is asked to do.
+ */
+export type DescriptionDownloadAction = 'start' | 'cancel'
+/**
+ * The kinds of semantic event a description may be built from.
+ */
+export type DescriptionEventKind =
+  'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
 /**
  * The kinds of external destination that send with a credential.
  */
@@ -11153,6 +11153,42 @@ export interface DeliveryDestinationConfigureParams {
    * What the owner calls the rule that sends to this destination. A label: it selects nothing.
    */
   rule_name: string
+  /**
+   * The credential the destination sends with, for every service but a webhook, or null to
+   * leave the one already kept under the identifier. When it is given, it is kept and the
+   * destination is configured together: a configuration the host refuses leaves the credential
+   * kept before it as it was. It has to be the credential of the destination's service.
+   */
+  secret: DestinationSecret | null
+}
+/**
+ * The account.
+ */
+export interface MailAccount {
+  /**
+   * The address the message is sent from.
+   */
+  from_address: string
+  /**
+   * Its password.
+   */
+  password: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  port: string
+  /**
+   * How the connection is protected.
+   */
+  security: 'implicit_tls' | 'starttls'
+  /**
+   * The submission server's host name or IP address.
+   */
+  server: string
+  /**
+   * The account name the server authenticates.
+   */
+  username: string
 }
 /**
  * The result of `delivery.destination.configure`.
@@ -11183,8 +11219,8 @@ export interface DeliveryDestinationConfigureResult {
  */
 export interface DeliveryDestinationListParams {}
 /**
- * The result of `delivery.destination.list`: the destinations that have a rule, by identifier.
- * One that was removed is not listed.
+ * The result of `delivery.destination.list`: the destinations that have a rule, by identifier,
+ * in force or not. One that was removed is not listed.
  */
 export interface DeliveryDestinationListResult {
   /**
@@ -11194,7 +11230,7 @@ export interface DeliveryDestinationListResult {
 }
 /**
  * One destination this host delivers to, as `delivery.destination.list` says it. It never carries
- * a credential, and says only whether one is kept.
+ * a credential.
  */
 export interface DeliveryDestinationSummary {
   /**
@@ -11221,7 +11257,7 @@ export interface DeliveryDestinationSummary {
    */
   idempotency_header: string | null
   /**
-   * Whether the destination is in service. A destination the gateway rejected the token of is
+   * Whether the destination is in force. A destination the gateway rejected the token of is
    * not, and stays listed until it is removed or its device registers again.
    */
   in_force: boolean
@@ -11278,7 +11314,7 @@ export interface DeliveryDestinationSecretSetParams {
    */
   destination_id: string
   /**
-   * The credential it sends with.
+   * The credential one external destination sends with.
    */
   secret:
     | {
@@ -11306,35 +11342,6 @@ export interface DeliveryDestinationSecretSetParams {
         account: MailAccount
         kind: 'email'
       }
-}
-/**
- * The account.
- */
-export interface MailAccount {
-  /**
-   * The address the message is sent from.
-   */
-  from_address: string
-  /**
-   * Its password.
-   */
-  password: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  port: string
-  /**
-   * How the connection is protected.
-   */
-  security: 'implicit_tls' | 'starttls'
-  /**
-   * The submission server's host name or IP address.
-   */
-  server: string
-  /**
-   * The account name the server authenticates.
-   */
-  username: string
 }
 /**
  * The result of `delivery.destination.secret.set`. It never carries the credential.
