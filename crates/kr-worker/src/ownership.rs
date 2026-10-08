@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::identity::{BootIdentity, ProcessStartIdentity};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{OwnershipCoverage, SurvivingResource, TerminatedProcess};
 
@@ -128,6 +128,65 @@ pub struct OwnedProcesses {
     /// the reason the second produced would be written after the receipt had copied the reasons.
     /// So the boundary is asked once and the answer is kept.
     boundary_empty: std::sync::Mutex<Option<bool>>,
+    /// The processes of `seen` that have not been read as ended: the ones a crash would leave to
+    /// be stopped, and what [`Self::record`] hands to the journal.
+    ///
+    /// `seen` only grows, because a closure reports on everything the session ever owned. This is
+    /// the part of it that is still running, so its size follows the processes that run and not the
+    /// session's history. A process stays in it until the kernel says it has ended, whether or not
+    /// the boundary still lists it: one that left the boundary after it was seen is still the
+    /// session's to stop.
+    live: BTreeMap<(u64, u64), ProcessStartIdentity>,
+    /// The boot this session began in. A process identity is only a statement about one boot.
+    boot: Option<BootIdentity>,
+    /// The control group the worker itself runs in, where the platform has one.
+    cgroup: Option<String>,
+}
+
+/// What a worker knows about its session's processes, in the form a later control daemon reads
+/// after the worker has gone.
+///
+/// A recorded identity is a process identifier and the time the process started, read together, so
+/// it can name only the process that was recorded. The record is a statement about one boot: the
+/// start values it holds mean nothing in another.
+///
+/// What it cannot say is what it did not see. A process that began after the last record was
+/// written is not in it, and neither is one that left the boundary before it was first seen; the
+/// closure's coverage says so.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedRecord {
+    /// The boot the record was written in. Absent in a record made from the session's summary by
+    /// a schema step, whose start values cannot be tied to any boot.
+    pub boot: Option<BootIdentity>,
+    /// The session's root shell.
+    pub root: ProcessStartIdentity,
+    /// The root shell and every process seen below it that has not been read as ended.
+    pub processes: Vec<ProcessStartIdentity>,
+    /// The control group the worker ran in, on a platform that has them.
+    pub cgroup: Option<String>,
+    /// What the session's ownership rests on, in words.
+    pub boundary: String,
+    /// What this worker could not establish about the session's processes.
+    pub limits: Vec<String>,
+}
+
+/// Reads the control group this process is in, from the unified hierarchy's line.
+#[must_use]
+pub fn own_cgroup() -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -151,7 +210,11 @@ impl OwnedProcesses {
             seen: BTreeMap::new(),
             unestablished: std::sync::Mutex::new(Vec::new()),
             boundary_empty: std::sync::Mutex::new(None),
+            live: BTreeMap::new(),
+            boot: kr_ipc::identity::boot_identity().ok(),
+            cgroup: own_cgroup(),
         };
+        owned.live.insert(key(&root), root.clone());
         owned.seen.insert(
             key(&root),
             Recorded {
@@ -160,6 +223,39 @@ impl OwnedProcesses {
             },
         );
         owned
+    }
+
+    /// Returns what a later control daemon needs to stop this session's processes if this worker
+    /// dies: the processes not yet read as ended, the boot, the control group, and what this host
+    /// could not establish.
+    #[must_use]
+    pub fn record(&self) -> OwnedRecord {
+        OwnedRecord {
+            boot: self.boot.clone(),
+            root: self.root.clone(),
+            processes: self.live.values().cloned().collect(),
+            cgroup: self.cgroup.clone(),
+            boundary: self.boundary.describe(),
+            limits: self.unestablished(),
+        }
+    }
+
+    /// Notes processes found in the boundary, each already tied to the boundary by the reading
+    /// that gave its start, and forgets those the kernel now says have ended.
+    fn take(&mut self, found: impl IntoIterator<Item = ProcessStartIdentity>) {
+        for identity in found {
+            self.live.insert(key(&identity), identity.clone());
+            self.seen.entry(key(&identity)).or_insert(Recorded {
+                identity,
+                forced: false,
+            });
+        }
+        self.live.retain(|_, identity| {
+            !matches!(
+                kr_ipc::identity::process_state(identity),
+                kr_ipc::identity::ProcessState::Ended
+            )
+        });
     }
 
     /// Returns the boundary this session's ownership rests on.
@@ -282,6 +378,12 @@ impl OwnedProcesses {
     /// This is called while the session runs and again during closure. A process that appears once
     /// and is gone by the next look is still recorded, because it was this session's; a process
     /// that never appears was never seen and is never claimed.
+    ///
+    /// Each process is recorded from one reading that gives its start and the fact that puts it in
+    /// the boundary together: its parent, session, terminal or group on a Unix host, the job's
+    /// own answer on Windows. A list of identifiers is only a list of hints, and an identifier
+    /// whose process ended after it was listed can belong to a stranger by the time its start is
+    /// read; the stranger's reading does not agree with the list, and it is not recorded.
     pub fn observe(&mut self) {
         #[cfg(windows)]
         if let OwnershipBoundary::JobObject { root } = self.boundary {
@@ -295,29 +397,38 @@ impl OwnedProcesses {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let tree = self.tree();
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let tree: Option<Vec<u32>> = None;
+        let tree: Option<Vec<ProcessStartIdentity>> = None;
+        if let Some(tree) = tree {
+            self.take(tree);
+            return;
+        }
         // Otherwise the terminal, where the kernel names it: an interactive shell puts each job in
         // its own process group, so the group finds the shell and nothing it started, while every
         // one of those jobs keeps the terminal.
-        let members = match (tree, terminal) {
-            (Some(tree), _) => Ok(tree),
-            (None, Some(terminal)) => kr_ipc::identity::processes_on_terminal(terminal),
-            (None, None) => kr_ipc::identity::processes_in_group(group),
+        let listed = match terminal {
+            Some(terminal) => kr_ipc::identity::processes_on_terminal(terminal),
+            None => kr_ipc::identity::processes_in_group(group),
         };
-        let Ok(members) = members else {
+        let Ok(listed) = listed else {
+            self.note_unestablished(
+                "the processes of the session could not be listed, so those begun since the last \
+                 listing are not recorded",
+            );
             return;
         };
-        for pid in members {
-            // An identity the kernel will not describe is not recorded. A process identifier on
-            // its own is a hint; the start time is what makes it an identity, and what tells a
-            // reused identifier from the process that had it before.
-            if let Ok(identity) = kr_ipc::identity::process_start_identity(pid) {
-                self.seen.entry(key(&identity)).or_insert(Recorded {
-                    identity,
-                    forced: false,
-                });
-            }
-        }
+        let agreeing = listed.into_iter().filter_map(|pid| {
+            // An identity the kernel will not describe is not recorded. And one whose reading
+            // does not put the process on the terminal or in the group it was listed under is a
+            // different process holding the identifier now.
+            let lineage = kr_ipc::identity::process_lineage(pid).ok()?;
+            let agrees = match terminal {
+                Some(terminal) => lineage.terminal == Some(terminal),
+                None => lineage.group == group,
+            };
+            agrees.then_some(lineage.identity)
+        });
+        let agreeing: Vec<ProcessStartIdentity> = agreeing.collect();
+        self.take(agreeing);
     }
 
     /// Returns the session's processes as this worker's own process tree holds them: the root
@@ -331,41 +442,63 @@ impl OwnedProcesses {
     /// own, or of another session this process hosts, or a process that called `setsid` after its
     /// parent exited, which nothing ties to this session any more.
     ///
+    /// A process is in the tree only if the one reading that gave its start also names its parent
+    /// as the process it was listed under (or, for one adopted by this worker, this worker as its
+    /// parent and the root's session as its own). And a parent's children count only if the parent
+    /// is still the process that was recorded after they were listed.
+    ///
     /// The worker's own children are read after everything below the root shell, and again until
     /// they hold nothing new: a process whose parent exits while the tree is being read is the
     /// worker's child by then, so it is in one reading or the other.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn tree(&self) -> Option<Vec<u32>> {
+    fn tree(&self) -> Option<Vec<ProcessStartIdentity>> {
         if !matches!(rustix::process::child_subreaper(), Ok(Some(_))) {
             return None;
         }
         let root = u32::try_from(self.root.pid.get()).ok()?;
-        // The root shell leads its session, so the session keeps the root shell's identifier
-        // after the root shell has gone, and so do the processes still in it.
-        let session = rustix::process::Pid::from_raw(i32::try_from(root).ok()?)?;
-        let in_session = |pid: u32| {
-            i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-                .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
-                == Some(session)
-        };
-        let mut members = Vec::new();
+        let worker = std::process::id();
+        let mut members: Vec<ProcessStartIdentity> = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
-        let mut pending = vec![root];
+        let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
+        // The root shell, if it is still the process that was recorded. A shell that has gone
+        // leaves its session's processes to this worker, and the second list finds them.
+        if kr_ipc::identity::process_start_identity(root).is_ok_and(|now| now == self.root) {
+            pending.push((root, self.root.clone()));
+        }
         loop {
-            while let Some(pid) = pending.pop() {
+            while let Some((pid, identity)) = pending.pop() {
                 if !walked.insert(pid) {
                     continue;
                 }
-                members.push(pid);
-                pending.extend(kr_ipc::identity::children_of(pid).ok()?);
+                members.push(identity.clone());
+                let children = kr_ipc::identity::children_of(pid).ok()?;
+                // The children are this process's only if it is the same process still.
+                if kr_ipc::identity::process_start_identity(pid).ok().as_ref() != Some(&identity) {
+                    continue;
+                }
+                for child in children {
+                    if walked.contains(&child) {
+                        continue;
+                    }
+                    if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
+                        && lineage.parent == pid
+                    {
+                        pending.push((child, lineage.identity));
+                    }
+                }
             }
-            pending = kr_ipc::identity::children_of(std::process::id())
-                .ok()?
-                .into_iter()
-                .filter(|child| !walked.contains(child) && in_session(*child))
-                .collect();
+            let adopted = kr_ipc::identity::children_of(worker).ok()?;
+            for child in adopted {
+                if walked.contains(&child) {
+                    continue;
+                }
+                if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
+                    && lineage.parent == worker
+                    && lineage.session == Some(root)
+                {
+                    pending.push((child, lineage.identity));
+                }
+            }
             if pending.is_empty() {
                 return Some(members);
             }
@@ -388,39 +521,41 @@ impl OwnedProcesses {
             return;
         };
         self.note_reduced_agents(&job);
-        let mut members = match job.process_ids() {
-            Ok(members) => members,
-            Err(error) => {
-                self.note_unestablished(format!(
-                    "the session's job object would not say which processes it holds: {error}"
-                ));
-                Vec::new()
+        let mut found = Vec::new();
+        let mut unreadable = 0_usize;
+        let mut read = |reading: crate::windows::job::MemberReading, this: &Self| match reading {
+            crate::windows::job::MemberReading::Held(identity) => found.push(identity),
+            // A number the job listed that a process outside the job holds now is a stranger.
+            crate::windows::job::MemberReading::NotHeld => {}
+            // An identifier the operating system will not describe is not an identity, so it is
+            // not recorded - and not silently forgotten either, because the session owned
+            // whatever it names.
+            crate::windows::job::MemberReading::Unreadable(why) => {
+                unreadable += 1;
+                this.note_unestablished(format!("a process of the session's job: {why}"));
             }
         };
+        match job.process_ids() {
+            Ok(members) => {
+                for pid in members {
+                    read(job.member(pid), self);
+                }
+            }
+            Err(error) => self.note_unestablished(format!(
+                "the session's job object would not say which processes it holds: {error}"
+            )),
+        }
         for agent in job.reduced_agents() {
             match agent.process_ids() {
-                Ok(held) => members.extend(held),
+                Ok(held) => {
+                    for pid in held {
+                        read(agent.member(pid), self);
+                    }
+                }
                 Err(error) => self.note_unestablished(format!(
                     "the job of an agent that ran under reduced ownership would not say which \
                      processes it holds: {error}"
                 )),
-            }
-        }
-        let mut unreadable = 0_usize;
-        for pid in members {
-            // Asked about every time, not only the first: an identifier the record already holds
-            // can belong to a second process by now, and that process is this session's too.
-            match kr_ipc::identity::process_start_identity(pid) {
-                Ok(identity) => {
-                    self.seen.entry(key(&identity)).or_insert(Recorded {
-                        identity,
-                        forced: false,
-                    });
-                }
-                // An identifier the operating system will not describe is not an identity, so it
-                // is not recorded - and not silently forgotten either, because the session owned
-                // whatever it names.
-                Err(_) => unreadable += 1,
             }
         }
         if unreadable > 0 {
@@ -429,6 +564,7 @@ impl OwnedProcesses {
                  describe, so they are not in the record"
             ));
         }
+        self.take(found);
     }
 
     /// Records that an agent of this session ran under the reduced-ownership profile, which keeps
