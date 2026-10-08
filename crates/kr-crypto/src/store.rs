@@ -115,6 +115,16 @@ impl SecretName {
         Self::new(format!("{scope}/device-key/{}", purpose.as_str()))
     }
 
+    /// Returns the name of the key a host signs its backup generations and its managed-storage
+    /// requests with, inside `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resulting name breaks a name rule.
+    pub fn backup_writer(scope: &str) -> Result<Self> {
+        Self::new(format!("{scope}/backup-writer"))
+    }
+
     /// Returns the name of the recovery seed inside `scope`.
     ///
     /// # Errors
@@ -1381,6 +1391,33 @@ pub fn load_notification_preview_key(
     .map(Some)
 }
 
+/// Reads the key a host signs its backup generations with, creating it on the first call.
+///
+/// The key is the host's alone and stands for one purpose. An owner enrols its public half at the
+/// managed service as the writer of a collection, so a host that lost it, or made a second one
+/// each time it started, would publish as a writer nobody enrolled. It is created once and loaded
+/// afterwards, and a stored item that is not a seed is an error rather than a reason to make a
+/// new key.
+///
+/// # Errors
+///
+/// Returns an error when the store fails, when the stored item is not 32 bytes, or when libsodium
+/// is unavailable.
+pub fn load_or_create_backup_writer(
+    store: &dyn SecretStore,
+    scope: &str,
+) -> Result<AuthorisationKeyPair> {
+    let name = SecretName::backup_writer(scope)?;
+    if let Some(stored) = store.get(&name)? {
+        return AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(
+            stored.expose(),
+        )?);
+    }
+    let keys = AuthorisationKeyPair::generate()?;
+    store.set(&name, keys.seed().expose())?;
+    Ok(keys)
+}
+
 /// Writes the recovery seed to its own item.
 ///
 /// # Errors
@@ -1444,6 +1481,36 @@ mod tests {
         store
             .delete(&name)
             .expect("deleting a missing item succeeds");
+    }
+
+    /// The writer a host publishes as is made once. An owner enrols its public key, so a second
+    /// start that made another would publish as a writer nobody enrolled; and a stored item that
+    /// is not a seed is refused and not replaced.
+    #[test]
+    fn a_hosts_backup_writer_is_made_once_and_never_replaced() {
+        let store = MemoryStore::new();
+        let first = load_or_create_backup_writer(&store, "host").expect("a new writer");
+        let again = load_or_create_backup_writer(&store, "host").expect("the same writer");
+        assert_eq!(first.public(), again.public());
+        let other = load_or_create_backup_writer(&store, "another").expect("a writer of its own");
+        assert_ne!(first.public(), other.public());
+
+        let damaged = MemoryStore::new();
+        damaged
+            .set(
+                &SecretName::backup_writer("host").expect("a name"),
+                b"short",
+            )
+            .expect("a write");
+        assert!(load_or_create_backup_writer(&damaged, "host").is_err());
+        assert_eq!(
+            damaged
+                .get(&SecretName::backup_writer("host").expect("a name"))
+                .expect("a read")
+                .expect("still there")
+                .expose(),
+            b"short"
+        );
     }
 
     #[test]
