@@ -37,20 +37,39 @@ interface Row {
   readonly tone: 'muted' | 'success' | 'warning'
 }
 
+/** What a list read, and the connection it was read under. */
+interface Held {
+  readonly at: boolean | null | undefined
+  readonly rows: readonly Row[]
+}
+
+/** Why a list could not be read, and the connection it was read under. */
+interface Problem {
+  readonly at: boolean | null | undefined
+  readonly message: string
+}
+
 /** The sessions on every host this device can see. */
 export function MobileSessions({
   surface,
   onOpen,
-  onOpenVoice
+  onOpenVoice,
+  connected
 }: {
   readonly surface: Surface
   readonly onOpen: (sessionId: string) => void
   /** Opens the voice screen. Absent while no host is reached, when there is no one to talk to. */
   readonly onOpenVoice?: () => void
+  /** Whether a host is being reached now, or null before anything has said. */
+  readonly connected?: boolean | null
 }): ReactNode {
   const { port } = useApp()
-  const [rows, setRows] = useState<readonly Row[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  // What was read is kept with the connection it was read under, and shown only while that is the
+  // connection there is: a list one host gave is never shown as another's.
+  const [held, setHeld] = useState<Held | null>(null)
+  const rows = held !== null && held.at === connected ? held.rows : null
+  const [problem, setProblem] = useState<Problem | null>(null)
+  const error = problem !== null && problem.at === connected ? problem.message : null
   const target = minimumTarget(surface)
   // The host is asked about the rows a person can see, and the few either side of them.
   const { onScreen, track } = useOnScreen()
@@ -62,7 +81,10 @@ export function MobileSessions({
 
   // The list is read under a watch with no listeners, one for each port, so only the newest read's
   // answer or failure is shown, and nothing once the list has gone.
+  // What a host listed is not shown once that host is not the one being reached: the list is read
+  // again each time the connection comes or goes, and nothing is shown while there is none.
   useEffect(() => {
+    if (connected === false) return undefined
     const reads: Watch = watch([], () => {
       const current = reads.read()
       if (current === null) return
@@ -70,8 +92,9 @@ export function MobileSessions({
         .then((answer) => {
           if (!current()) return
           const sessions = (answer satisfies SessionListResult).sessions ?? []
-          setRows(
-            sessions.map((session) => ({
+          setHeld({
+            at: connected,
+            rows: sessions.map((session) => ({
               id: session.session_id,
               title: `Session ${session.display_number}`,
               directory: directoryName(session.cwd),
@@ -84,16 +107,16 @@ export function MobileSessions({
                   : `${applicationName(session)} · ${describeSessionState(session.state, session.attachment_count)}`,
               tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
             }))
-          )
-          setError(null)
+          })
+          setProblem(null)
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          setError(failureMessage(failure))
+          setProblem({ at: connected, message: failureMessage(failure) })
         })
     })
     return reads.stop
-  }, [port])
+  }, [port, connected])
 
   return (
     <>
@@ -163,7 +186,12 @@ export function MobileSessions({
           })}
         </ul>
       ) : null}
-      {!rows && !error ? <p className="m-empty">Reading the sessions…</p> : null}
+      {!rows && !error && connected === false ? (
+        <p className="m-empty">No host is being reached.</p>
+      ) : null}
+      {!rows && !error && connected !== false ? (
+        <p className="m-empty">Reading the sessions…</p>
+      ) : null}
     </>
   )
 }
@@ -184,20 +212,26 @@ export function MobileHosts({
   readonly connected?: boolean | null
 }): ReactNode {
   const { port } = useApp()
-  const [rows, setRows] = useState<readonly Row[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  // What was read is kept with the connection it was read under, and shown only while that is the
+  // connection there is: a list one host gave is never shown as another's.
+  const [held, setHeld] = useState<Held | null>(null)
+  const rows = held !== null && held.at === connected ? held.rows : null
+  const [problem, setProblem] = useState<Problem | null>(null)
+  const error = problem !== null && problem.at === connected ? problem.message : null
   const target = minimumTarget(surface)
 
   // Read as the session list is: only the newest read shows, and nothing once the list has gone.
   useEffect(() => {
+    if (connected === false) return undefined
     const reads: Watch = watch([], () => {
       const current = reads.read()
       if (current === null) return
       ask(() => port.environmentList())
         .then((answer: EnvironmentListResult) => {
           if (!current()) return
-          setRows(
-            answer.environments.map((environment) => ({
+          setHeld({
+            at: connected,
+            rows: answer.environments.map((environment) => ({
               id: environment.environment_id,
               title: environment.label,
               where: `${environment.os} · ${environment.arch} · ${accountName(environment)}`,
@@ -206,12 +240,12 @@ export function MobileHosts({
               detail: `${environment.live_sessions} live ${environment.live_sessions === '1' ? 'session' : 'sessions'}`,
               tone: 'success' as const
             }))
-          )
-          setError(null)
+          })
+          setProblem(null)
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          setError(failureMessage(failure))
+          setProblem({ at: connected, message: failureMessage(failure) })
         })
     })
     return reads.stop
@@ -239,7 +273,12 @@ export function MobileHosts({
           ))}
         </ul>
       ) : null}
-      {!rows && !error ? <p className="m-empty">Reading the hosts…</p> : null}
+      {!rows && !error && connected === false ? (
+        <p className="m-empty">No host is being reached.</p>
+      ) : null}
+      {!rows && !error && connected !== false ? (
+        <p className="m-empty">Reading the hosts…</p>
+      ) : null}
     </>
   )
 }

@@ -94,6 +94,38 @@ describe('allowing voice for the first time', () => {
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
 
+  // KR-REQ-15.21: an action the grant could not carry is read before the call is shown. The person
+  // goes on when they have read it, not before.
+  it('says what the grant could not carry and waits for the person to go on', async () => {
+    start((fake) => {
+      fake.holdBackOnNextVoiceAllow(['compose_prompt'])
+    })
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    const result = await screen.findByTestId('voice-grant-result')
+    expect(result).toHaveTextContent('Allowed, except compose prompt')
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
+    await userEvent.click(screen.getByTestId('voice-grant-continue'))
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
+  // KR-REQ-15.21: an answer the host never confirmed does not move the person on as if voice were
+  // allowed, and allowing it again is what settles it.
+  it('stays on the question when the host did not confirm the grant', async () => {
+    const { controls } = start((fake) => {
+      fake.leaveNextVoiceAllowUnconfirmed()
+    })
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    expect((await screen.findByTestId('voice-grant-failure')).textContent).toContain(
+      'did not confirm'
+    )
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+    expect(controls.voiceAllows).toHaveLength(2)
+  })
+
   it('shows no question to a device the host already allowed', async () => {
     const { port, controls } = fakeHost()
     render(

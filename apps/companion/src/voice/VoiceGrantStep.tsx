@@ -14,9 +14,7 @@
 
 import { useEffect, useId, useState, type ReactNode } from 'react'
 
-import type { VoiceGrantResult } from '@kalareach/protocol'
-
-import type { HostPort, VoiceScope } from '../host/port'
+import type { HostPort, VoiceAllowed, VoiceScope } from '../host/port'
 import { failureMessage } from '../host/port'
 
 /** A session the person can choose, as the host lists it. */
@@ -46,7 +44,9 @@ export function VoiceGrantStep({
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set())
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
-  const [granted, setGranted] = useState<VoiceGrantResult | null>(null)
+  const [granted, setGranted] = useState<VoiceAllowed | null>(null)
+  /** The sessions the host granted, held while the person reads what it could not carry. */
+  const [allowedIds, setAllowedIds] = useState<readonly string[] | null>(null)
 
   useEffect(() => {
     let current = true
@@ -91,8 +91,22 @@ export function VoiceGrantStep({
     port.voiceAllow({ sessionIds, actions: null }, {}).then(
       (settled) => {
         setBusy(false)
-        if (settled.value) setGranted(settled.value)
-        onAllowed(sessionIds)
+        // An answer with no result is a host that did not confirm: the grant may or may not stand,
+        // so the person is not moved on, and allowing it again settles it.
+        if (!settled.value) {
+          setFailure(
+            'The host did not confirm that voice was allowed. Allow it again to be sure.'
+          )
+          return
+        }
+        // What the host could not carry is read before the call is shown, not after: the person
+        // goes on once they have seen it.
+        if (settled.value.not_held_by_device.length === 0) {
+          onAllowed(sessionIds)
+          return
+        }
+        setGranted(settled.value)
+        setAllowedIds(sessionIds)
       },
       (error: unknown) => {
         setBusy(false)
@@ -108,8 +122,8 @@ export function VoiceGrantStep({
       </h1>
       <p className="kr-voice__note">
         Voice lets you talk to your host. Before it can, you say what speaking is allowed to do, and
-        for which sessions. You can stop a call at any time, and ending a call ends this allowance
-        for it.
+        for which sessions. You can stop a call at any time. What you allow here stays until you
+        change it.
       </p>
       {refusal === null ? null : (
         <p className="kr-voice__refusal" role="status" data-testid="voice-grant-refusal">
@@ -172,16 +186,26 @@ export function VoiceGrantStep({
         )}
       </section>
 
-      {granted === null ? null : (
-        <p className="kr-voice__note" role="status" data-testid="voice-grant-result">
-          {granted.not_held_by_device.length === 0
-            ? 'Allowed.'
-            : `Allowed, except ${granted.not_held_by_device
-                .map((action) => action.replace(/_/g, ' '))
-                .join(', ')}: this phone’s own access to the host does not include ${
-                granted.not_held_by_device.length === 1 ? 'it' : 'them'
-              }.`}
-        </p>
+      {granted === null || allowedIds === null ? null : (
+        <div className="kr-voice__panel" role="status" data-testid="voice-grant-result">
+          <p className="kr-voice__note">
+            {`Allowed, except ${granted.not_held_by_device
+              .map((action) => action.replace(/_/g, ' '))
+              .join(', ')}: this phone’s own access to the host does not include ${
+              granted.not_held_by_device.length === 1 ? 'it' : 'them'
+            }.`}
+          </p>
+          <button
+            type="button"
+            className="kr-voice__start"
+            data-testid="voice-grant-continue"
+            onClick={() => {
+              onAllowed(allowedIds)
+            }}
+          >
+            Continue
+          </button>
+        </div>
       )}
       {failure === null ? null : (
         <p className="kr-voice__refusal" role="status" data-testid="voice-grant-failure">
@@ -193,7 +217,7 @@ export function VoiceGrantStep({
         type="button"
         className="kr-voice__start"
         onClick={allow}
-        disabled={busy || chosen.size === 0 || scope === null}
+        disabled={busy || chosen.size === 0 || scope === null || granted !== null}
         data-testid="voice-allow"
       >
         {busy ? 'Allowing…' : 'Allow voice'}
