@@ -103,7 +103,8 @@ iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 jiff.workspace = true
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }
-kr-changeset.workspace = true
+# The change-set tests stop an apply where a crash would stop it.
+kr-changeset = { workspace = true, features = ["fault-injection"] }
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 # The bundle a test seeds a catalogue from is made of files of its own, trusting what the test names.

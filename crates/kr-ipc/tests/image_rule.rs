@@ -27,7 +27,10 @@
 //!
 //! The `testing` feature makes an item test code, so it must not be one a program turns on: a
 //! normal or build dependency among the host's crates that asks for it, and a default feature that
-//! enables it, fail the guard too.
+//! enables it, fail the guard too. So does any other feature that exists for tests
+//! ([`TEST_FEATURES`]), which compiles into a program a way in that only a test acts through, and
+//! a feature of a host crate that is not named as one of those or as a part of the product
+//! ([`PRODUCT_FEATURES`]), so that a feature added for tests cannot go unnamed.
 //!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
@@ -41,6 +44,15 @@ const ALLOWED: &str = "crates/kr-ipc/src/install.rs";
 /// The names nothing else may use: the standard library's path of the running program, and macOS's
 /// own call for it. The kernel's record of the image is `kr_ipc::install`'s to read.
 const NAMES: [&str; 2] = ["current_exe", "_NSGetExecutablePath"];
+
+/// The features that exist for tests, in whichever crate they are: each compiles seams into its
+/// crate that only a test acts through, so a program built with one carries a way in that nothing
+/// in the product uses. A host crate's feature that is for tests is named here.
+const TEST_FEATURES: [&str; 3] = ["testing", "fault-injection", "git-fixtures"];
+
+/// The features of the host's crates that are part of the product, as `(crate, feature)`: each
+/// adds code or a dependency that the product uses, and none is a seam for a test.
+const PRODUCT_FEATURES: [(&str, &str); 2] = [("kr-client", "terminal"), ("kr-term", "conformance")];
 
 /// One token of a source, as far as this reading needs to tell them apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -654,15 +666,15 @@ fn production_roots(metadata: &serde_json::Value, workspace: &Path) -> Roots {
     roots
 }
 
-/// Where the `testing` feature of one of the host's crates, whose items this reading passes over
-/// as test code, could be turned on in a program, as `crate: how`.
+/// Where a feature that exists for tests ([`TEST_FEATURES`]) of one of the host's crates could be
+/// turned on in a program, as `crate: how`.
 ///
 /// A program is built from one of the host's crates with its default features and with what its
 /// normal and build dependencies ask of theirs. Each of those starts a walk over the features that
 /// turn others on, in the crate's own table and in its dependencies' (`feature`, `dep:name`,
-/// `name/feature`, `name?/feature`), and any walk that reaches a `testing` feature of one of the
-/// host's crates is named. A dev dependency is not part of a program.
-fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
+/// `name/feature`, `name?/feature`), and any walk that reaches a test feature of one of the host's
+/// crates is named. A dev dependency is not part of a program.
+fn test_features_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
     /// A package's dependency as its feature table names it, and what it asks of it.
     struct Asked<'a> {
         package: &'a str,
@@ -782,19 +794,52 @@ fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<
         }
         for (how, start) in starts {
             for (turned_on, feature) in walk(start) {
-                let host_feature = feature == "testing"
+                let host_feature = TEST_FEATURES.contains(&feature.as_str())
                     && packages
                         .get(turned_on.as_str())
                         .is_some_and(|turned_on| is_host_crate(turned_on));
                 if host_feature {
                     found.insert(format!(
-                        "{name}: the testing feature of {turned_on} is turned on by {how}"
+                        "{name}: the {feature} feature of {turned_on} is turned on by {how}"
                     ));
                 }
             }
         }
     }
     found.into_iter().collect()
+}
+
+/// The features of the host's crates that [`TEST_FEATURES`] and [`PRODUCT_FEATURES`] both leave
+/// unnamed, as `crate: feature`. A feature added for tests under a name the first list lacks would
+/// otherwise be turned on in a program without anything noticing.
+fn unclassified_features(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
+    let host_crates = workspace.join("crates");
+    let mut found = Vec::new();
+    for package in metadata["packages"].as_array().into_iter().flatten() {
+        let (Some(name), Some(manifest)) =
+            (package["name"].as_str(), package["manifest_path"].as_str())
+        else {
+            continue;
+        };
+        if !normalise(Path::new(manifest)).starts_with(&host_crates) {
+            continue;
+        }
+        for feature in package["features"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(feature, _)| feature)
+        {
+            let named = feature == "default"
+                || TEST_FEATURES.contains(&feature.as_str())
+                || PRODUCT_FEATURES.contains(&(name, feature.as_str()));
+            if !named {
+                found.push(format!("{name}: {feature}"));
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -1024,13 +1069,6 @@ fn only_the_install_module_asks_where_its_program_is() {
          which this reading covers, so nothing of them was read:\n{}",
         production.outside.join("\n")
     );
-    let testing = testing_in_production(&metadata, &workspace);
-    assert!(
-        testing.is_empty(),
-        "the testing feature, whose items this reading passes over as test code, could be turned \
-         on in a program:\n{}",
-        testing.join("\n")
-    );
     // The control on the real tree: the roots were looked at, the host's own among them.
     for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
         assert!(
@@ -1067,6 +1105,30 @@ fn only_the_install_module_asks_where_its_program_is() {
     assert!(
         uses.iter().any(|(file, _)| file == ALLOWED),
         "the reading found the install module's own use"
+    );
+}
+
+/// No feature that exists for tests is on in a program, and every feature of the host's crates is
+/// named as one for tests or as part of the product. The `testing` feature is the one whose items
+/// the reading above passes over as test code.
+#[test]
+fn no_feature_that_exists_for_tests_is_on_in_a_program() {
+    let workspace = workspace();
+    let metadata = cargo_metadata(&workspace);
+    let turned_on = test_features_in_production(&metadata, &workspace);
+    assert!(
+        turned_on.is_empty(),
+        "a feature that exists for tests could be turned on in a program; a crate's default \
+         features and a normal or build dependency must not enable it, and a test turns it on \
+         through a dev dependency:\n{}",
+        turned_on.join("\n")
+    );
+    let unnamed = unclassified_features(&metadata, &workspace);
+    assert!(
+        unnamed.is_empty(),
+        "these features are named neither in TEST_FEATURES nor in PRODUCT_FEATURES; say which \
+         they are, so that a feature for tests is never left on in a program unnoticed:\n{}",
+        unnamed.join("\n")
     );
 }
 
@@ -1479,7 +1541,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
         }),
     ]});
     assert_eq!(
-        testing_in_production(&metadata, Path::new("/w")),
+        test_features_in_production(&metadata, Path::new("/w")),
         vec![
             "a: the testing feature of b is turned on by a normal or build dependency on b",
             "a: the testing feature of c is turned on by a normal or build dependency on c",
@@ -1524,12 +1586,12 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
             ]})
         };
         assert_eq!(
-            testing_in_production(&listed(&["extra"], &[]), Path::new("/w")),
+            test_features_in_production(&listed(&["extra"], &[]), Path::new("/w")),
             vec!["a: the testing feature of b is turned on by a normal or build dependency on b"],
             "the program's entry asks: {first} then {second}"
         );
         assert!(
-            testing_in_production(&listed(&[], &["extra"]), Path::new("/w")).is_empty(),
+            test_features_in_production(&listed(&[], &["extra"]), Path::new("/w")).is_empty(),
             "only the dev entry asks: {first} then {second}"
         );
     }
@@ -1552,7 +1614,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
             ),
         ]});
         assert_eq!(
-            testing_in_production(&joined, Path::new("/w")),
+            test_features_in_production(&joined, Path::new("/w")),
             vec!["a: the testing feature of b is turned on by a normal or build dependency on b"],
             "{first_asks:?} then {second_asks:?}"
         );
@@ -1582,7 +1644,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
         ]})
     };
     assert_eq!(
-        testing_in_production(
+        test_features_in_production(
             &defaults_of(
                 without_defaults(serde_json::Value::Null),
                 dependency("b", serde_json::json!("build"), &[])
@@ -1596,7 +1658,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
     );
     // The same with the entry that has them first, so that the last entry does not decide.
     assert_eq!(
-        testing_in_production(
+        test_features_in_production(
             &defaults_of(
                 dependency("b", serde_json::json!("build"), &[]),
                 without_defaults(serde_json::Value::Null)
@@ -1609,7 +1671,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
         ]
     );
     assert_eq!(
-        testing_in_production(
+        test_features_in_production(
             &defaults_of(
                 without_defaults(serde_json::Value::Null),
                 without_defaults(serde_json::json!("build"))
@@ -1632,7 +1694,7 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
         host("b", serde_json::json!([]), serde_json::json!({ "testing": [] })),
     ]});
     assert_eq!(
-        testing_in_production(&doubled, Path::new("/w")),
+        test_features_in_production(&doubled, Path::new("/w")),
         vec!["a: the testing feature of b is turned on by its default features"]
     );
     // The control: dev dependencies and a testing feature that nothing turns on are fine.
@@ -1644,5 +1706,58 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
         ),
         host("d", serde_json::json!([]), serde_json::json!({ "testing": [] })),
     ]});
-    assert!(testing_in_production(&fine, Path::new("/w")).is_empty());
+    assert!(test_features_in_production(&fine, Path::new("/w")).is_empty());
+}
+
+/// A feature for tests is named under any of [`TEST_FEATURES`], and a feature of a host crate that
+/// neither list names is found, while the product's own, the tests' and `default` are not.
+#[test]
+fn a_feature_for_tests_is_named_whatever_it_is_called_and_an_unnamed_one_is_found() {
+    let package = |name: &str, dependencies: serde_json::Value, features: serde_json::Value| {
+        serde_json::json!({
+            "name": name,
+            "manifest_path": format!("/w/crates/{name}/Cargo.toml"),
+            "dependencies": dependencies,
+            "features": features,
+        })
+    };
+    let metadata = serde_json::json!({ "packages": [
+        package(
+            "a",
+            serde_json::json!([]),
+            serde_json::json!({ "default": ["fault-injection"], "fault-injection": [] }),
+        ),
+        package(
+            "b",
+            serde_json::json!([{
+                "name": "c",
+                "kind": null,
+                "features": ["git-fixtures"],
+                "uses_default_features": true,
+            }]),
+            serde_json::json!({}),
+        ),
+        package("c", serde_json::json!([]), serde_json::json!({ "git-fixtures": [] })),
+        package(
+            "kr-client",
+            serde_json::json!([]),
+            serde_json::json!({ "default": ["terminal"], "terminal": [], "testing": [] }),
+        ),
+        package(
+            "d",
+            serde_json::json!([]),
+            serde_json::json!({ "default": [], "hooks": [], "terminal": [] }),
+        ),
+    ]});
+    assert_eq!(
+        test_features_in_production(&metadata, Path::new("/w")),
+        vec![
+            "a: the fault-injection feature of a is turned on by its default features",
+            "b: the git-fixtures feature of c is turned on by a normal or build dependency on c",
+        ]
+    );
+    assert_eq!(
+        unclassified_features(&metadata, Path::new("/w")),
+        vec!["d: hooks", "d: terminal"]
+    );
 }
