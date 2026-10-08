@@ -162,6 +162,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::SessionClose
         | Method::SessionDescribe
         | Method::SessionRename => None,
+        Method::SessionScreenPreview => at(HOST, "Grants, sharing and revocation"),
 
         Method::SessionAttach => at(PROTOCOL, "Rights and capabilities are not the same thing"),
         Method::SessionDetach

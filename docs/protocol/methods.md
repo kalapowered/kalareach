@@ -119,6 +119,7 @@ links to its document.
 | `session.close` | write | `local_ipc`, `paired_device`, `workflow` | Close a session and hand its final metadata to the archive service. |  |
 | `session.describe` | read | `local_ipc`, `paired_device`, `workflow` | An authorised read of filtered session metadata, not arbitrary model control. |  |
 | `session.rename` | write | `local_ipc`, `paired_device`, `workflow` | Set a session's pinned label. |  |
+| `session.screen.preview` | read | `local_ipc` | The text of the visible lines of the screen showing now, as a viewer holding a history scope would first see it, for the issuer of a share to be shown before it exists. It reaches neither the buffer that is not showing nor scrollback, and the host's own owner is the only caller. | [Host: Grants, sharing and revocation](../host/README.md) |
 
 ## Attachments
 
