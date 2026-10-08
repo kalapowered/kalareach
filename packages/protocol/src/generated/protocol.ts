@@ -10716,8 +10716,8 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-   * and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
-   * Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
+   * and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker, and
+   * plugin repositories. Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
    * submission do not use it. It is this machine's own choice: no invitation or host bundle
    * carries it. It names no user and no password, because a proxy that needs credentials is
    * not supported.
@@ -10868,7 +10868,7 @@ export interface StorageSelection {
   origin?: string | null
 }
 /**
- * The managed voice broker this host names to its paired devices.
+ * The managed voice broker this host starts its paired devices' calls at.
  *
  * Read when the daemon starts, so a change applies at the next start. No environment
  * variable reaches it.

@@ -133,8 +133,8 @@ impl VoiceModule {
     ///
     /// # Errors
     ///
-    /// Returns why the broker client refuses the origin, which a host that started anyway would
-    /// hide behind a refusal that says no service is configured.
+    /// Returns why the broker client refuses the origin. The caller reports it and attaches no
+    /// provider, so that the host still starts.
     pub fn managed_provider(
         origin: &str,
         http: Arc<dyn ServiceHttp>,

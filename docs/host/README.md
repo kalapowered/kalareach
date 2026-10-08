@@ -167,7 +167,7 @@ answering, and none of them settles it.
 ### The network and the voice broker
 
 Whether this host joins the network, and every service it uses there, is the document's `network`
-section. The managed voice broker it names to its paired devices is the `voice` section. Nothing
+section. The managed voice broker it starts its paired devices' calls at is the `voice` section. Nothing
 else chooses either. No environment variable reaches them, so a daemon started with the variables
 an older build read joins nothing because of them.
 
