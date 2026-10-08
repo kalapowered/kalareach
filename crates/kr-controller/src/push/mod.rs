@@ -695,17 +695,18 @@ impl DeliveryModule {
     }
 
     /// Records a destination of a credentialed kind as [`Self::configure_if`] does, with the
-    /// credential it sends with, in one operation: the record names the credential's stamp, and the
-    /// credential is kept under that stamp once the record is written.
+    /// credential it sends with: the record names a stamp, and the credential is kept under that
+    /// stamp once the record is written.
     ///
     /// The record goes first, so a write the admission or the journal refuses has touched nothing:
     /// a destination being replaced goes on sending with the credential it had, to where it was
-    /// configured to send, and a refused first configuration leaves no credential kept. A host
-    /// that stops between the record and the credential, or a store that then refuses the
-    /// credential, leaves a destination whose record names a stamp the store does not hold. A
-    /// pass refuses to send with a credential whose stamp is not the record's, so such a
-    /// destination sends nothing until its credential is handed over again, and the refusal says
-    /// so.
+    /// configured to send, and a refused first configuration leaves no credential kept. The two
+    /// writes are not one, though. A host that stops between the record and the credential, or a
+    /// store that then refuses the credential, leaves a destination whose record names a stamp the
+    /// store does not hold, and a pass refuses to send with a credential whose stamp is not the
+    /// record's, so such a destination sends nothing until its credential is handed over again.
+    /// A store that refuses the credential after it has written it (a failure of its last
+    /// step) leaves one that sends, though the caller is told it may not.
     ///
     /// # Errors
     ///
@@ -824,7 +825,7 @@ impl DeliveryModule {
                     return Err(ControllerError::Storage {
                         operation: "keep a destination's credential",
                         detail: format!(
-                            "the destination was configured and sends nothing until its \
+                            "the destination was configured and may send nothing until its \
                              credential is kept: hand it over again ({error})"
                         ),
                     });

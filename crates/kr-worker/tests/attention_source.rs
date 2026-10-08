@@ -614,9 +614,11 @@ async fn a_held_page_answers_when_a_host_event_is_committed() {
 }
 
 /// KR-REQ-25.01: a relayed approval committed to the broker's ledger while a request is held
-/// answers it at once, with the transitions the broker recorded, and the transition that interpreted
-/// the approval is among what the next request reads. The request is held for twenty seconds and the
-/// answer is waited for five, so a commit that did not wake it fails here.
+/// answers it at once, with the transitions the broker recorded. The test waits until the worker
+/// counts the request as held, so the approval is committed after the request found nothing and
+/// began to wait, and the request is held for twenty seconds while the answer is waited for five: a
+/// commit that did not wake it fails here. The request is not answered by the recorded request that
+/// comes before the approval is interpreted, which no one is waiting on, but by the interpretation.
 #[tokio::test]
 async fn a_held_page_answers_when_an_approval_is_committed() {
     use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
@@ -625,7 +627,7 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
     let host = host().await;
     let broker = host.service.broker();
     register(broker, 2);
-    let package = Package::new();
+    let package = Package::laid_out();
     package.bind(broker, 2);
     let mut channel = Channel::open(
         package.launch(broker, 2, Some(fixture::QUALIFIED_VERSION)),
@@ -633,63 +635,122 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
         launched(2),
     );
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let held_before = host.service.held_attention_requests();
     link.writer()
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
-            .await
-            .is_err(),
-        "nothing past the cursors, so the request is held before the approval is relayed"
-    );
+    let service = Arc::clone(&host.service);
+    tokio::time::timeout(Duration::from_secs(30), async move {
+        while service.held_attention_requests() == held_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the worker holds the request");
 
     channel.relay("abcde").await;
     let Answer::Page(woken) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected the held page");
     };
-    assert!(
-        !woken.approvals.records.is_empty(),
-        "the commit that woke the request is in the page"
-    );
-    assert_eq!(woken.approvals.records[0].sequence, U64::new(1));
-
-    // The interpretation is the next transition: read from where the first page stopped, until the
-    // page carries it.
-    let mut after = woken
-        .approvals
-        .records
-        .last()
-        .map_or(0, |last| last.sequence.get());
-    let mut interpreted = woken
-        .approvals
-        .records
-        .iter()
-        .any(|record| record.interpreted);
-    while !interpreted {
-        let next = page(
-            &mut link,
-            AttentionSourcesRequest {
-                approvals_after: U64::new(after),
-                ..sources(0, 0, 5_000)
-            },
-        )
-        .await;
-        assert!(
-            !next.approvals.records.is_empty(),
-            "the interpretation is committed within the wait"
-        );
-        after = next
-            .approvals
-            .records
-            .last()
-            .map_or(after, |last| last.sequence.get());
-        interpreted = next
+    assert_eq!(
+        woken
             .approvals
             .records
             .iter()
-            .any(|record| record.interpreted);
-    }
+            .map(|record| record.sequence.get())
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "the commit that woke the request is in the page, with the one before it"
+    );
+    assert!(
+        woken.approvals.records[1].interpreted,
+        "and the second is the interpretation"
+    );
+    channel.close().await;
+}
+
+/// KR-REQ-25.01: a broker transition serves no text, in a live worker or from its closed journal,
+/// with privacy mode off, on, or off again: what an approval asks is the application's to show. The
+/// control is a host event committed beside it, whose words are served in the same request while
+/// privacy mode is off.
+#[tokio::test]
+async fn a_broker_transition_serves_no_text_whatever_privacy_mode_says() {
+    use kr_worker::broker::channel_fixture::{Channel, Package, launched, register};
+    use kr_worker::broker::connectors::fixture;
+
+    let host = host().await;
+    notify(&host, "the build finished");
+    let broker = host.service.broker();
+    register(broker, 2);
+    let package = Package::laid_out();
+    package.bind(broker, 2);
+    let mut channel = Channel::open(
+        package.launch(broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.relay("abcde").await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    // The relay is read and interpreted on the channel's own task, so the page is read until it
+    // carries the interpretation.
+    let started = std::time::Instant::now();
+    let carried = loop {
+        let carried = page(&mut link, sources(0, 0, 0)).await;
+        if carried
+            .approvals
+            .records
+            .iter()
+            .any(|record| record.interpreted)
+        {
+            break carried;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the approval is interpreted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let wanted: Vec<(AttentionSource, u64)> = carried
+        .approvals
+        .records
+        .iter()
+        .map(|record| (AttentionSource::Approvals, record.sequence.get()))
+        .chain([(AttentionSource::HostEvents, 1)])
+        .collect();
+    let host_event = wanted.len() - 1;
+
+    let served = text(&mut link, texts(&wanted)).await;
+    assert_eq!(
+        served.texts[host_event].text,
+        Nullable::some(said("the build finished")),
+        "the control: a host event's words are served"
+    );
+    assert!(
+        served.texts[..host_event]
+            .iter()
+            .all(|answer| answer.text.0.is_none()),
+        "and a broker transition's are not"
+    );
+
+    // From the closed session's journal, the same reads.
+    let journal = Journal::open_read_only(&host.journal_path).expect("the journal reads");
+    let from_the_journal =
+        kr_worker::attention_source::texts(&journal, &texts(&wanted)).expect("the journal answers");
+    assert_eq!(
+        from_the_journal.texts[host_event].text,
+        Nullable::some(said("the build finished"))
+    );
+    assert!(
+        from_the_journal.texts[..host_event]
+            .iter()
+            .all(|answer| answer.text.0.is_none())
+    );
+
+    // With privacy mode on, nothing is served, and nothing of an approval was before it.
+    enable_privacy(&host);
+    let private = text(&mut link, texts(&wanted)).await;
+    assert!(private.texts.iter().all(|answer| answer.text.0.is_none()));
     channel.close().await;
 }
 

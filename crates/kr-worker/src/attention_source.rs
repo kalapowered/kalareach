@@ -5,8 +5,9 @@
 //! transitions its broker records for pending approvals, and its host events, in the session's own
 //! journal, and this module is how the daemon reads them: a page of the records past where the
 //! store has read, and the text of records the store names when it serves them. A broker
-//! transition carries no text at all: what an approval asks is the application's to show. The same reads serve a live session over its worker's attention connection and a
-//! closed one from its journal file.
+//! transition carries no text at all: what an approval asks is the application's to show. The
+//! same reads serve a live session over its worker's attention connection and a closed one from
+//! its journal file.
 //!
 //! # What is served as text
 //!
@@ -91,8 +92,8 @@ pub fn serves(privacy: Option<&PrivacyRecord>, source: AttentionSource, sequence
 ///
 /// The reads are made in order, each a statement of its own: the question ledger's head and its
 /// records after the cursor, then the broker's approvals', then the host events' head and theirs,
-/// then the privacy record, which decides which records carry text. `built_at_boot_ms` is the caller's reading of the
-/// continuous clock, taken before the first of them. A page carries at most `request.max_records`
+/// then the privacy record, which decides which records carry text. `built_at_boot_ms` is the
+/// caller's reading of the continuous clock, taken before the first of them. A page carries at most `request.max_records`
 /// records from each source and, encoded, at most `max_bytes`; what it leaves out is read by the
 /// next request. A page with records to carry always carries one, so the reading moves on; a
 /// caller whose frame cannot hold even that is told so by measuring the page.
@@ -324,8 +325,8 @@ fn host_record(
 /// answers whether it does.
 ///
 /// Host events go first, then approvals, then questions, and each source keeps the records
-/// nearest its cursor, so what is cut is read by the next request. A page that had records keeps at least one: if one record
-/// does not fit, the page does not fit.
+/// nearest its cursor, so what is cut is read by the next request. A page that had records keeps
+/// at least one: if one record does not fit, the page does not fit.
 #[must_use]
 pub fn fit(page: &mut AttentionSourcePage, max_bytes: usize) -> bool {
     loop {

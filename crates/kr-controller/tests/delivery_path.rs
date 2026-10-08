@@ -910,7 +910,7 @@ impl Worker {
     fn open_channel(&self, number: u8, bound: bool) -> OpenChannel {
         let broker = self.service.broker();
         register(broker, number);
-        let package = Package::new();
+        let package = Package::laid_out();
         if bound {
             package.bind(broker, number);
         }
@@ -1388,6 +1388,27 @@ async fn until_the_questions_are_settled(environment: &Environment, questions: u
     .await;
 }
 
+/// How many pending approvals the attention store holds.
+fn pending_approvals(environment: &Environment) -> usize {
+    environment
+        .controller()
+        .attention()
+        .take_for_delivery(|store, _| {
+            store
+                .engine()
+                .map(|engine| {
+                    engine
+                        .items()
+                        .filter(|item| {
+                            item.rule == kr_protocol::attention::AttentionRule::PendingApproval
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
 /// Waits until the attention store has read every transition the worker's broker has announced,
 /// holds nothing it has not given the delivery journal, and the journal has produced from
 /// everything it took.
@@ -1612,22 +1633,42 @@ async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_appr
         "one notification for the approval, whatever the broker recorded of it"
     );
     assert_eq!(environment.gateway.delivered().len(), 1);
+
+    // The approval is pending in the inbox until it ends, and ends with its channel: the item
+    // leaves, and the end is no new notification.
+    assert_eq!(
+        pending_approvals(&environment),
+        1,
+        "the control: it is pending"
+    );
+    bound.channel.close().await;
+    until("the approval's item leaving the inbox", || {
+        pending_approvals(&environment) == 0
+    })
+    .await;
+    until_the_approvals_are_settled(&environment).await;
+    assert_eq!(
+        environment
+            .deliveries_to(&phone.device_id().to_string())
+            .len(),
+        1,
+        "the end of an approval raises nothing"
+    );
 }
 
 /// KR-REQ-16.17, KR-REQ-25.01: twenty-two distinct approvals relayed at once are all retained by
-/// the host, and the gateway is given no more than the free limit allows. The first twenty are sent
-/// as approval alerts; the twenty-first opens the one attention update the five-minute window lets
-/// through, which is sent in their place; the twenty-second is collapsed into it, recorded and never
-/// sent, with the suppression the host shows locally. The allowance refills with the clock, a token
-/// every three seconds, so the figures are bounded by the time the daemon took over the burst, and
-/// are exactly these when it took less than three seconds.
+/// the host, and the gateway is given no more than the free limit allows. The daemon's passes read a
+/// time the test holds still, so the allowance has no time to refill and the figures are exact on
+/// any machine: the first twenty are sent as approval alerts; the twenty-first opens the one
+/// attention update the five-minute window lets through, which is sent in their place; the
+/// twenty-second is collapsed into it, recorded and never sent, with the suppression the host shows
+/// locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn twenty_two_approvals_at_once_are_all_retained_and_sent_within_the_burst_limit() {
     use kr_delivery::journal::DeliveryState;
 
     const RELAYED: usize = 22;
     const BURST: usize = 20;
-    const MS_PER_TOKEN: u64 = 3_000;
     let environment = Environment::start().await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x92));
@@ -1639,6 +1680,10 @@ async fn twenty_two_approvals_at_once_are_all_retained_and_sent_within_the_burst
         .register(&environment, &credential)
         .await
         .expect("the credential is registered");
+    environment
+        .controller()
+        .delivery_runtime()
+        .hold_time_at(now());
 
     // Distinct request identifiers of the five-letter form Claude Code uses.
     let requests: Vec<String> = ('a'..='z')
@@ -1667,40 +1712,18 @@ async fn twenty_two_approvals_at_once_are_all_retained_and_sent_within_the_burst
         .filter(|record| record.state != DeliveryState::Collapsed && record.suppression.is_some())
         .collect();
     let alerts = records.len() - collapsed.len() - updates.len();
-    let took_ms = records
-        .iter()
-        .map(|record| record.admitted_at_ms.get())
-        .max()
-        .zip(
-            records
-                .iter()
-                .map(|record| record.admitted_at_ms.get())
-                .min(),
-        )
-        .map_or(0, |(last, first)| last - first);
-    let refilled = usize::try_from(took_ms / MS_PER_TOKEN).unwrap_or(usize::MAX);
-    assert!(
-        (BURST..=BURST + refilled).contains(&alerts),
-        "{alerts} alerts for the burst of {BURST} and {refilled} refilled: {records:?}"
+    assert_eq!(
+        (alerts, updates.len(), collapsed.len()),
+        (BURST, 1, RELAYED - BURST - 1),
+        "twenty alerts, the attention update, and what it took the place of: {records:?}"
     );
-    assert!(updates.len() <= 1, "one attention update in the window");
-    if refilled == 0 {
-        assert_eq!(
-            (alerts, updates.len(), collapsed.len()),
-            (BURST, 1, 1),
-            "twenty alerts, the attention update, and the one it collapsed"
-        );
-    }
     for record in &collapsed {
         assert!(record.content.is_none() && !record.dispatched, "never sent");
-        assert!(record.suppression.is_some(), "the suppression is recorded");
-    }
-    for update in &updates {
         assert!(
-            collapsed.iter().all(|record| record
+            record
                 .suppression
                 .as_ref()
-                .is_some_and(|suppression| suppression.collapsed_into == update.notification_id)),
+                .is_some_and(|suppression| suppression.collapsed_into == updates[0].notification_id),
             "what was collapsed names the update that took its place"
         );
     }
@@ -1715,13 +1738,13 @@ async fn twenty_two_approvals_at_once_are_all_retained_and_sent_within_the_burst
         sent.iter()
             .filter(|request| request.hints.alert == PushAlert::ApprovalWaiting)
             .count(),
-        alerts
+        BURST
     );
     assert_eq!(
         sent.iter()
             .filter(|request| request.hints.alert == PushAlert::AttentionUpdate)
             .count(),
-        updates.len()
+        1
     );
 }
 
@@ -4103,9 +4126,8 @@ async fn each_credentialed_kind_is_made_after_its_credential_and_sends_to_its_ow
 /// KR-REQ-25.23: a configuration the host refuses changes nothing, the credential in it included. A
 /// Slack destination replaced under a grant that does not stand goes on sending to the channel it
 /// was made for, under the credential it was made with and the rule it had; a destination refused
-/// at its first configuration leaves no credential kept. The credential and the destination change
-/// together or not at all, so a refused replacement never leaves the new credential at work under
-/// the old grant.
+/// at its first configuration leaves no credential kept. A refused replacement never leaves the new
+/// credential at work under the old grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_refused_configuration_leaves_the_destination_and_its_credential_as_they_were() {
     use kr_protocol::delivery::DestinationSecret;
