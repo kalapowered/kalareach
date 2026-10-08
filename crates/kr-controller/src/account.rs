@@ -196,19 +196,27 @@ impl HostAccount {
     }
 
     /// Keeps a sign-in the service issued, as a finished browser sign-in would, for a test that
-    /// is about what a call does with an account rather than about signing in.
+    /// is about what a call does with an account rather than about signing in. The service it was
+    /// signed in at is recorded unless `recorded` is false, which is what a sign-in the daemon
+    /// stopped before it recorded leaves.
     ///
     /// # Panics
     ///
     /// Panics when this host names no service or the store refuses the grant.
     #[cfg(feature = "testing")]
-    pub async fn keep_for_test(&self, issued: kr_client::services::account::IssuedGrant) {
+    pub async fn keep_for_test(
+        &self,
+        issued: kr_client::services::account::IssuedGrant,
+        recorded: bool,
+    ) {
         let held = self.inner.held.as_ref().expect("a service to sign in at");
         held.signed_in
             .commit(issued, "a-nonce")
             .await
             .expect("the grant is kept");
-        self.inner.record(held).expect("the service is recorded");
+        if recorded {
+            self.inner.record(held).expect("the service is recorded");
+        }
     }
 
     /// The token source a managed call presents: this host's sign-in, for the service it was
